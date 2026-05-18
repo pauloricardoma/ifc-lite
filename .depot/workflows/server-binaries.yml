@@ -1,0 +1,234 @@
+# Depot CI Migration
+# Source: .github/workflows/server-binaries.yml
+#
+# Changes made:
+# - Removed unsupported trigger "release"
+# - Rewrote .github/ path references to .depot/
+
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+name: Server Binaries
+# Removed unsupported trigger: release. Release events are not supported.
+on:
+  # push:main intentionally dropped — branch-protected PR runs already
+  # validate the same SHA, and the release event re-validates before
+  # uploading binaries. See PR that introduced this change.
+  pull_request:
+    paths:
+      - '.depot/workflows/server-binaries.yml'
+      - '.depot/workflows/release.yml'
+      - '.cargo/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'apps/server/**'
+      - 'rust/**'
+      - 'rust-toolchain.toml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Cancel obsolete runs on force-push; release/workflow_dispatch
+  # runs share the workflow group too, but those are gated by
+  # event_name so they won't trample real releases.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+permissions:
+  contents: read
+jobs:
+  validate-server-binaries:
+    name: Validate Server Binary (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            os: ubuntu-latest
+            rust-target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - target: linux-arm64
+            os: ubuntu-latest
+            rust-target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+            cross: true
+          - target: linux-x64-musl
+            os: ubuntu-latest
+            rust-target: x86_64-unknown-linux-musl
+            archive: tar.gz
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          lfs: false
+          persist-credentials: false
+      - name: Setup Rust
+        # Pin to a master-branch SHA + explicit `toolchain: stable`;
+        # see docs.yml note for rationale.
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05
+        with:
+          toolchain: stable
+          targets: ${{ matrix.rust-target }}
+      - name: Install cross
+        if: matrix.target == 'linux-x64-musl'
+        uses: taiki-e/install-action@b47b3b9ab771927700bcf4ef8a4f79e1d7c9a8cd # cross (snapshot pinned 2026-05)
+      - name: Install Linux Cross-Compilation Tools
+        if: matrix.cross == true && runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Install musl Tools
+        if: matrix.target == 'linux-x64-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools musl-dev
+      - name: Build Server Binary
+        run: |
+          if [ "${{ matrix.target }}" = "linux-x64-musl" ]; then
+            cross build --release --package ifc-lite-server --target ${{ matrix.rust-target }}
+          else
+            cargo build --release --package ifc-lite-server --target ${{ matrix.rust-target }}
+          fi
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      - name: Prepare Binary (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.rust-target }}/release/ifc-lite-server dist/
+          chmod +x dist/ifc-lite-server
+      - name: Prepare Binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item "target/${{ matrix.rust-target }}/release/ifc-lite-server.exe" -Destination "dist/"
+      - name: Create Archive (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          cd dist
+          tar -czf ../ifc-lite-server-${{ matrix.target }}.tar.gz ifc-lite-server
+      - name: Create Archive (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist/ifc-lite-server.exe" -DestinationPath "ifc-lite-server-${{ matrix.target }}.zip"
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ifc-lite-server-${{ matrix.target }}
+          path: ifc-lite-server-${{ matrix.target }}.${{ matrix.archive }}
+          if-no-files-found: error
+  release-server-binaries:
+    name: Release Server Binary (${{ matrix.target }})
+    # Only build + upload server binaries for version-tagged releases (e.g.
+    # `v2.1.9`). Without this filter every published release fires this job,
+    # so non-version tags like `fixtures-v1` end up with stray server
+    # tarballs uploaded to the wrong release. Manual `workflow_dispatch`
+    # is still allowed for ad-hoc rebuilds.
+    if: |
+      (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v'))
+      || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            os: ubuntu-latest
+            rust-target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - target: linux-arm64
+            os: ubuntu-latest
+            rust-target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+            cross: true
+          - target: linux-x64-musl
+            os: ubuntu-latest
+            rust-target: x86_64-unknown-linux-musl
+            archive: tar.gz
+          - target: darwin-x64
+            os: macos-14
+            rust-target: x86_64-apple-darwin
+            archive: tar.gz
+          - target: darwin-arm64
+            os: macos-14
+            rust-target: aarch64-apple-darwin
+            archive: tar.gz
+          - target: win32-x64
+            os: windows-latest
+            rust-target: x86_64-pc-windows-msvc
+            archive: zip
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          lfs: false
+          persist-credentials: false
+      - name: Setup Rust
+        # Pin to a master-branch SHA + explicit `toolchain: stable`;
+        # see docs.yml note for rationale.
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05
+        with:
+          toolchain: stable
+          targets: ${{ matrix.rust-target }}
+      - name: Install cross
+        if: matrix.target == 'linux-x64-musl'
+        uses: taiki-e/install-action@b47b3b9ab771927700bcf4ef8a4f79e1d7c9a8cd # cross (snapshot pinned 2026-05)
+      - name: Install Linux Cross-Compilation Tools
+        if: matrix.cross == true && runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Install musl Tools
+        if: matrix.target == 'linux-x64-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools musl-dev
+      - name: Build Server Binary
+        run: |
+          if [ "${{ matrix.target }}" = "linux-x64-musl" ]; then
+            cross build --release --package ifc-lite-server --target ${{ matrix.rust-target }}
+          else
+            cargo build --release --package ifc-lite-server --target ${{ matrix.rust-target }}
+          fi
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      - name: Prepare Binary (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.rust-target }}/release/ifc-lite-server dist/
+          chmod +x dist/ifc-lite-server
+      - name: Prepare Binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item "target/${{ matrix.rust-target }}/release/ifc-lite-server.exe" -Destination "dist/"
+      - name: Create Archive (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          cd dist
+          tar -czf ../ifc-lite-server-${{ matrix.target }}.tar.gz ifc-lite-server
+      - name: Create Archive (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist/ifc-lite-server.exe" -DestinationPath "ifc-lite-server-${{ matrix.target }}.zip"
+      - name: Upload Build Artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ifc-lite-server-${{ matrix.target }}
+          path: ifc-lite-server-${{ matrix.target }}.${{ matrix.archive }}
+          if-no-files-found: error
+      - name: Upload to GitHub Release
+        if: github.event_name == 'release'
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            ifc-lite-server-${{ matrix.target }}.${{ matrix.archive }} \
+            --clobber
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

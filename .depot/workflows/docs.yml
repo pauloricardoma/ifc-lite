@@ -1,0 +1,112 @@
+# Depot CI Migration
+# Source: .github/workflows/docs.yml
+#
+# Changes made:
+# - Rewrote .github/ path references to .depot/
+# - Changed GitHub runs-on labels to their Depot equivalents
+
+name: Deploy Documentation
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'rust/**'
+      - '.depot/workflows/docs.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: pages
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: depot-ubuntu-latest # was: ubuntu-latest. Mapped standard GitHub runner to Depot equivalent.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          lfs: false
+          persist-credentials: false
+      - name: Setup Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+      - name: Setup Rust
+        # Pin to a commit on the action's `master` branch and pass
+        # `toolchain: stable` explicitly. The `stable`/`nightly`/`beta`
+        # branches force-push snapshot commits that get garbage-collected
+        # when the toolchain advances — pinning to a `stable`-branch SHA
+        # would silently break the build the next time stable ships.
+        # See dtolnay/rust-toolchain README and PR #692 Codex review.
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05
+        with:
+          toolchain: stable
+      - name: Cache pip dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements-docs.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      - name: Cache Cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libglib2.0-dev libcairo2-dev libpango1.0-dev libatk1.0-dev libgdk-pixbuf2.0-dev libgtk-3-dev
+      - name: Install Python dependencies
+        run: pip install -r requirements-docs.txt
+      - name: Build MkDocs
+        run: mkdocs build --strict
+      - name: Build Rustdoc
+        run: cargo doc --no-deps --workspace
+        continue-on-error: true
+      - name: Copy Rustdoc to site
+        run: |
+          if [ -d "target/doc" ]; then
+            mkdir -p site/api/rust
+            cp -r target/doc/* site/api/rust/
+          fi
+        continue-on-error: true
+      - name: Create .nojekyll file
+        run: touch site/.nojekyll
+      - name: Verify site structure
+        run: |
+          echo "Site directory contents:"
+          ls -la site/ | head -20
+          echo ""
+          echo "Checking for index.html:"
+          ls -la site/index.html || echo "index.html not found!"
+          echo ""
+          echo "Site directory size:"
+          du -sh site/
+      - name: Setup Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: depot-ubuntu-latest # was: ubuntu-latest. Mapped standard GitHub runner to Depot equivalent.
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
