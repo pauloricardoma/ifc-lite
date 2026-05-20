@@ -228,6 +228,14 @@ export interface CameraCallbacks {
   frameSelection?: () => void;
   orbit?: (deltaX: number, deltaY: number) => void;
   projectToScreen?: (worldPos: { x: number; y: number; z: number }) => { x: number; y: number } | null;
+  /**
+   * Unproject a screen pixel onto the horizontal plane at the
+   * specified world Y. Used by drag handles (wall endpoints,
+   * georeference move) to convert a cursor position back into
+   * world coordinates on the storey floor. Returns null when the
+   * camera ray is parallel to the plane or points the wrong way.
+   */
+  unprojectToFloor?: (clientX: number, clientY: number, worldY: number) => { x: number; y: number; z: number } | null;
   setProjectionMode?: (mode: ProjectionMode) => void;
   toggleProjectionMode?: () => void;
   getProjectionMode?: () => ProjectionMode;
@@ -242,7 +250,18 @@ export interface CameraCallbacks {
 import type { IfcDataStore } from '@ifc-lite/parser';
 import type { CoordinateInfo, GeometryResult } from '@ifc-lite/geometry';
 
-/** Compound identifier for entities across multiple models */
+/**
+ * Compound identifier for entities across multiple models.
+ *
+ * Structurally identical to `@ifc-lite/sdk`'s EntityRef, but
+ * defined locally because the desktop app bundles viewer source
+ * via tsconfig path aliases and does not declare `@ifc-lite/sdk`
+ * as a workspace dep — re-exporting from the SDK breaks the
+ * desktop Vite build with an unresolvable module. Keep the
+ * shapes in sync manually; both packages exhaustively test
+ * EntityRef-shaped values, so drift will surface at the
+ * federation boundary.
+ */
 export interface EntityRef {
   modelId: string;
   expressId: number;

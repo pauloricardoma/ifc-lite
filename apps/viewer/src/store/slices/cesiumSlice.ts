@@ -136,7 +136,17 @@ function resolveIonToken(): string {
   return userToken || DEFAULT_ION_TOKEN;
 }
 
-export const createCesiumSlice: StateCreator<CesiumSlice, [], [], CesiumSlice> = (set) => ({
+/**
+ * Cross-slice surface CesiumSlice writes into. `editEnabled` lives on
+ * UISlice — turning on the placement editor implies global edit mode,
+ * so the slice writes it directly here to keep the toolbar pill in
+ * sync atomically.
+ */
+export interface CesiumCrossSliceState {
+  editEnabled: boolean;
+}
+
+export const createCesiumSlice: StateCreator<CesiumSlice & CesiumCrossSliceState, [], [], CesiumSlice> = (set) => ({
   cesiumAvailable: false,
   cesiumEnabled: false,
   cesiumDataSource: loadDataSource(),
@@ -202,16 +212,31 @@ export const createCesiumSlice: StateCreator<CesiumSlice, [], [], CesiumSlice> =
   toggleShowModelBasepoints: () => set((s) => ({ showModelBasepoints: !s.showModelBasepoints })),
   setCesiumTerrainClipY: (y) => set({ cesiumTerrainClipY: y }),
   setCesiumGlbLoaded: (loaded) => set({ cesiumGlbLoaded: loaded }),
-  setCesiumPlacementEditMode: (enabled) => set({ cesiumPlacementEditMode: enabled }),
-  toggleCesiumPlacementEditMode: () => set((s) => ({
-    cesiumPlacementEditMode: !s.cesiumPlacementEditMode,
-    ...(!s.cesiumPlacementEditMode
-      ? {}
+  setCesiumPlacementEditMode: (enabled) => set(
+    // Turning the placement editor on implies global edit mode — keeps
+    // the toolbar pill in sync so the user can't end up "moving the
+    // georef" while the rest of the UI claims it's read-only. Turning
+    // it off does *not* exit global edit; other sub-tools (properties,
+    // geometry) may still be in use — but we DO clear the placement
+    // draft so callers exiting via the setter don't leave stale draft
+    // state behind (matches the toggle's disable branch).
+    enabled
+      ? { cesiumPlacementEditMode: true, editEnabled: true }
       : {
+          cesiumPlacementEditMode: false,
           cesiumPlacementDraftModelId: null,
           cesiumPlacementDraft: null,
-        }),
-  })),
+        },
+  ),
+  toggleCesiumPlacementEditMode: () => set((s) => (
+    s.cesiumPlacementEditMode
+      ? {
+          cesiumPlacementEditMode: false,
+          cesiumPlacementDraftModelId: null,
+          cesiumPlacementDraft: null,
+        }
+      : { cesiumPlacementEditMode: true, editEnabled: true }
+  )),
   beginCesiumPlacementDraft: (modelId, conversion) => set({
     cesiumPlacementDraftModelId: modelId,
     cesiumPlacementDraft: {
