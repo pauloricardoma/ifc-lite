@@ -99,8 +99,13 @@ export function WorkbenchDesktopLayout({ analysisExtensionState }: WorkbenchDesk
         <PanelGroup
           orientation="horizontal"
           className="h-full"
-          onLayout={(sizes) => {
-            if (sizes.length === 3) setSizes([sizes[0], sizes[1], sizes[2]]);
+          onLayoutChanged={(sizes) => {
+            const left = sizes['left-panel'];
+            const viewport = sizes['viewport-panel'];
+            const right = sizes['right-panel'];
+            if (left !== undefined && viewport !== undefined && right !== undefined) {
+              setSizes([left, viewport, right]);
+            }
           }}
         >
           <Panel
@@ -221,7 +226,7 @@ function WorkbenchPanel({ panelId, zone }: { panelId: string; zone: WorkbenchZon
     return (
       <ScrollArea className="h-full">
         <div className="p-3">
-          <WidgetRenderer node={personal.widget as Parameters<typeof WidgetRenderer>[0]['node']} ctx={ctx} />
+          <WidgetRenderer node={personal.widget as unknown as Parameters<typeof WidgetRenderer>[0]['node']} ctx={ctx} />
         </div>
       </ScrollArea>
     );
