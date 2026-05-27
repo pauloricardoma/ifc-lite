@@ -658,20 +658,64 @@ export function useSymbolicAnnotationsForDrawing(params: {
     if (axis !== 'down') return EMPTY_DRAWING_ANNOTATIONS;
     void version;
 
-    // Section view range in world Y. Matches the convention used by
-    // `profile-projector.isInProjectionRange`:
-    //   not flipped → [sectionPos, sectionPos + viewDepth]
-    //   flipped     → [sectionPos - viewDepth, sectionPos]
-    // We expand the range by a small tolerance so annotations sitting
-    // exactly on the cut plane still match (storey elevations are
-    // typically the cut Y).
+    // Section view range in world Y.
+    //
+    // For a floor-plan cut at axis='down' the camera looks DOWN through the
+    // cut. "In front of the camera" is therefore the side BELOW the cut —
+    // where the floor and authored dimensions sit (IFC convention places
+    // dimension annotations at the storey's floor elevation, not at the
+    // cut height). The user's complaint: with the slab on the +normal
+    // side, you had to scrub the section DOWN into the floor before
+    // anything showed, and then the dimensions appeared one storey BELOW
+    // the cut. Mirror that — keep the slab on the −normal side for the
+    // unflipped down section, and flip it for the reflected-ceiling case.
+    //
+    // Note this DIVERGES from `profile-projector.isInProjectionRange`,
+    // which projects above the cut by default. Annotations live with the
+    // storey floor, the projection lives with the upper-storey volume —
+    // they're naturally on opposite sides of the cut plane.
+    //
+    // Tolerance lets annotations authored exactly on the cut plane (e.g.
+    // a storey at Z=0 with a section right at the storey datum) survive.
     const TOL = 1e-3;
-    const rangeMin = (flipped ? sectionPosWorld - viewDepth : sectionPosWorld) - TOL;
-    const rangeMax = (flipped ? sectionPosWorld : sectionPosWorld + viewDepth) + TOL;
+    const rangeMin = (flipped ? sectionPosWorld : sectionPosWorld - viewDepth) - TOL;
+    const rangeMax = (flipped ? sectionPosWorld + viewDepth : sectionPosWorld) + TOL;
 
     const lines: DrawingLine2D[] = [];
     const texts: AnnotationText2D[] = [];
     const fills: AnnotationFill2D[] = [];
+
+    // The drawing-2d cutter negates the 2D U axis on flipped cardinal cuts
+    // (see `projectTo2D` in @ifc-lite/drawing-2d/math.ts and `flipU` in the
+    // GPU cutter). Annotation primitives come out of WASM in the cutter's
+    // UNFLIPPED basis, so on a flipped section they'd sit beside the model
+    // (mirrored across X=0) instead of on top of it — exactly the
+    // "dimensions floating to the right of the floor plan" symptom. Mirror
+    // X for lines/texts/fills here so they line up with the section cut
+    // output drawn underneath. Y stays put (the cutter only flips U).
+    const pushLine = flipped
+      ? (ln: DrawingLine2D) => lines.push({
+          line: {
+            start: { x: -ln.line.start.x, y: ln.line.start.y },
+            end:   { x: -ln.line.end.x,   y: ln.line.end.y   },
+          },
+          category: ln.category,
+        })
+      : (ln: DrawingLine2D) => lines.push(ln);
+    const pushText = flipped
+      ? (t: AnnotationText2D) => texts.push({ ...t, x: -t.x, dirX: -t.dirX })
+      : (t: AnnotationText2D) => texts.push(t);
+    const pushFill = flipped
+      ? (f: AnnotationFill2D) => {
+          const src = f.points;
+          const dst = new Float32Array(src.length);
+          for (let i = 0; i < src.length; i += 2) {
+            dst[i]     = -src[i];
+            dst[i + 1] =  src[i + 1];
+          }
+          fills.push({ ...f, points: dst });
+        }
+      : (f: AnnotationFill2D) => fills.push(f);
 
     for (const store of stores) {
       const key = sourceKey(store);
@@ -682,9 +726,9 @@ export function useSymbolicAnnotationsForDrawing(params: {
       for (const bucket of cached.byStorey.values()) {
         const bucketY = resolveBucketY(bucket.storeyElevation, fallbackY);
         if (bucketY < rangeMin || bucketY > rangeMax) continue;
-        for (const ln of bucket.lines) lines.push(ln);
-        for (const t of bucket.texts) texts.push(t);
-        for (const f of bucket.fills) fills.push(f);
+        for (const ln of bucket.lines) pushLine(ln);
+        for (const t of bucket.texts) pushText(t);
+        for (const f of bucket.fills) pushFill(f);
       }
 
       // Loose annotations have no resolvable storey — include them if the
@@ -692,9 +736,9 @@ export function useSymbolicAnnotationsForDrawing(params: {
       // (e.g. 3DEXPERIENCE files with orphaned storeys) usable when the
       // user is looking at the storey the fallback resolves to.
       if (fallbackY >= rangeMin && fallbackY <= rangeMax) {
-        for (const ln of cached.loose) lines.push(ln);
-        for (const t of cached.looseTexts) texts.push(t);
-        for (const f of cached.looseFills) fills.push(f);
+        for (const ln of cached.loose) pushLine(ln);
+        for (const t of cached.looseTexts) pushText(t);
+        for (const f of cached.looseFills) pushFill(f);
       }
     }
 
