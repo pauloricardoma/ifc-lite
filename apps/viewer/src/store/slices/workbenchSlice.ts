@@ -4,8 +4,10 @@
 
 import type { StateCreator } from 'zustand';
 import {
+  applyWorkbenchPatch,
   createDefaultWorkbenchLayout,
   normalizeWorkbenchLayout,
+  type FloatingPanelPlacement,
   type PersonalPanelDefinition,
   type UiAutomation,
   type WorkbenchLayoutState,
@@ -13,6 +15,7 @@ import {
   type WorkbenchModeSnapshot,
   type WorkbenchPanelChrome,
   type WorkbenchPanelId,
+  type WorkbenchPatch,
   type WorkbenchZoneId,
 } from '@ifc-lite/extensions';
 
@@ -29,6 +32,9 @@ export interface WorkbenchSlice {
   setWorkbenchBottomHeight: (height: number) => void;
   setWorkbenchCollapsed: (zone: WorkbenchZoneId, collapsed: boolean) => void;
   setWorkbenchPanelChrome: (panelId: WorkbenchPanelId, chrome: WorkbenchPanelChrome) => void;
+  setWorkbenchFloatingPanel: (placement: FloatingPanelPlacement) => void;
+  removeWorkbenchFloatingPanel: (panelId: WorkbenchPanelId) => void;
+  applyWorkbenchPatch: (patch: WorkbenchPatch) => void;
   addWorkbenchPersonalPanel: (panel: PersonalPanelDefinition, zone?: WorkbenchZoneId) => void;
   updateWorkbenchPersonalPanel: (panel: PersonalPanelDefinition) => void;
   removeWorkbenchPersonalPanel: (panelId: WorkbenchPanelId) => void;
@@ -112,6 +118,50 @@ export const createWorkbenchSlice: StateCreator<WorkbenchSlice, [], [], Workbenc
           [panelId]: { ...layout.panelChrome[panelId], ...chrome },
         },
       },
+    });
+  },
+
+  setWorkbenchFloatingPanel: (placement) => {
+    const layout = get().workbenchLayout;
+    set({
+      workbenchLayout: {
+        ...layout,
+        floating: [
+          ...layout.floating.filter((entry) => entry.panelId !== placement.panelId),
+          placement,
+        ],
+      },
+    });
+  },
+
+  removeWorkbenchFloatingPanel: (panelId) => {
+    const layout = get().workbenchLayout;
+    set({
+      workbenchLayout: {
+        ...layout,
+        floating: layout.floating.filter((entry) => entry.panelId !== panelId),
+      },
+    });
+  },
+
+  applyWorkbenchPatch: (patch) => {
+    const layout = get().workbenchLayout;
+    set({
+      workbenchLayout: applyWorkbenchPatch(layout, {
+        ...patch,
+        operations: [
+          ...patch.operations,
+          {
+            op: 'appendHistory',
+            entry: {
+              id: crypto.randomUUID(),
+              label: `Applied patch: ${patch.id}`,
+              patchId: patch.id,
+              createdAt: new Date().toISOString(),
+            },
+          },
+        ],
+      }),
     });
   },
 

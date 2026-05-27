@@ -5,7 +5,7 @@
 import { useCallback, useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode, type RefObject } from 'react';
 import { Panel, Group as PanelGroup, Separator as PanelResizeHandle } from 'react-resizable-panels';
 import type { PanelImperativeHandle } from 'react-resizable-panels';
-import { EyeOff, GripVertical, Pencil } from 'lucide-react';
+import { EyeOff, GripVertical, Maximize2, Pencil } from 'lucide-react';
 import {
   BUILTIN_PANEL_IDS,
   type WorkbenchPanelId,
@@ -30,6 +30,8 @@ import { getWorkbenchPanelTitle, ZONE_LABEL } from './panelRegistry';
 import { WorkbenchPanelHost } from './WorkbenchPanelHost';
 import { WorkspaceModesDialog } from './WorkspaceModesDialog';
 import { firePanelOpenedAutomation, useWorkbenchAutomations } from '@/hooks/useWorkbenchAutomations';
+import { WorkbenchFloatingPanels } from './WorkbenchFloatingPanels';
+import { WorkbenchPatchDialog } from './WorkbenchPatchDialog';
 
 const BOTTOM_PANEL_MIN_HEIGHT = 120;
 const BOTTOM_PANEL_MAX_RATIO = 0.7;
@@ -167,6 +169,8 @@ export function WorkbenchDesktopLayout({ analysisExtensionState }: WorkbenchDesk
       />
       <PanelChromeDialog panelId={editingPanelId} onClose={() => setEditingPanelId(null)} />
       <WorkspaceModesDialog open={modesOpen} onClose={() => setModesOpen(false)} />
+      <WorkbenchFloatingPanels />
+      <WorkbenchPatchDialog />
     </div>
   );
 }
@@ -223,6 +227,7 @@ function PanelTab({
 }) {
   const title = usePanelTitle(panelId);
   const setChrome = useViewerStore((s) => s.setWorkbenchPanelChrome);
+  const setFloating = useViewerStore((s) => s.setWorkbenchFloatingPanel);
   const [editingPanelId, setEditingPanelId] = useWorkbenchPanelEditor();
   return (
     <div
@@ -247,6 +252,17 @@ function PanelTab({
             onClick={() => setEditingPanelId(panelId)}
           >
             <Pencil className="h-3 w-3" />
+          </button>
+          <button
+            type="button"
+            className="rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+            aria-label={`Float ${title}`}
+            onClick={() => {
+              setFloating({ panelId, x: 96, y: 96, width: 420, height: 520 });
+              setChrome(panelId, { hidden: true });
+            }}
+          >
+            <Maximize2 className="h-3 w-3" />
           </button>
           <button
             type="button"
