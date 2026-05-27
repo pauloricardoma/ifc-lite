@@ -1,5 +1,6 @@
 ---
 "@ifc-lite/extensions": minor
+"@ifc-lite/customization": minor
 "@ifc-lite/viewer": minor
 ---
 

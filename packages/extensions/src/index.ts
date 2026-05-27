@@ -39,6 +39,8 @@ export type {
   ManifestAuthor,
   ManifestContributions,
   ManifestEntry,
+  PanelContribution,
+  PanelPlacement,
   ManifestTest,
   ManifestTestExpect,
   RiskTier,

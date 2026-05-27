@@ -32,6 +32,7 @@ import { WorkspaceModesDialog } from './WorkspaceModesDialog';
 import { firePanelOpenedAutomation, useWorkbenchAutomations } from '@/hooks/useWorkbenchAutomations';
 import { WorkbenchFloatingPanels } from './WorkbenchFloatingPanels';
 import { WorkbenchPatchDialog } from './WorkbenchPatchDialog';
+import { CustomizationStudioDialog } from './CustomizationStudioDialog';
 
 const BOTTOM_PANEL_MIN_HEIGHT = 120;
 const BOTTOM_PANEL_MAX_RATIO = 0.7;
@@ -51,6 +52,7 @@ export function WorkbenchDesktopLayout({ analysisExtensionState }: WorkbenchDesk
   const [personalOpen, setPersonalOpen] = useState(false);
   const [libraryOpen, setLibraryOpen] = useState(false);
   const [modesOpen, setModesOpen] = useState(false);
+  const [studioOpen, setStudioOpen] = useState(false);
   const [editingPanelId, setEditingPanelId] = useState<string | null>(null);
   const leftPanelRef = useRef<PanelImperativeHandle>(null);
   const rightPanelRef = useRef<PanelImperativeHandle>(null);
@@ -66,6 +68,12 @@ export function WorkbenchDesktopLayout({ analysisExtensionState }: WorkbenchDesk
   useLegacyPanelSync();
   useAutoPersistLayout();
   useWorkbenchAutomations();
+
+  useEffect(() => {
+    const openStudio = () => setStudioOpen(true);
+    window.addEventListener('ifc-lite:open-customization-studio', openStudio);
+    return () => window.removeEventListener('ifc-lite:open-customization-studio', openStudio);
+  }, []);
 
   useEffect(() => {
     const panel = leftPanelRef.current;
@@ -91,6 +99,7 @@ export function WorkbenchDesktopLayout({ analysisExtensionState }: WorkbenchDesk
         onAddPanel={() => setPersonalOpen(true)}
         onLibrary={() => setLibraryOpen(true)}
         onModes={() => setModesOpen(true)}
+        onStudio={() => setStudioOpen(true)}
         onReset={() => {
           resetLayout();
           toast.success('Layout reset to IFC Lite default.');
@@ -169,6 +178,7 @@ export function WorkbenchDesktopLayout({ analysisExtensionState }: WorkbenchDesk
       />
       <PanelChromeDialog panelId={editingPanelId} onClose={() => setEditingPanelId(null)} />
       <WorkspaceModesDialog open={modesOpen} onClose={() => setModesOpen(false)} />
+      <CustomizationStudioDialog open={studioOpen} onClose={() => setStudioOpen(false)} />
       <WorkbenchFloatingPanels />
       <WorkbenchPatchDialog />
     </div>

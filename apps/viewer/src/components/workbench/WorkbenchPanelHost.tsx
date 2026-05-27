@@ -2,9 +2,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-import { useCallback, useMemo } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { X } from 'lucide-react';
-import { BUILTIN_PANEL_IDS, type WorkbenchZoneId } from '@ifc-lite/extensions';
+import { BUILTIN_PANEL_IDS, validateWidget, type PanelContribution, type SlotContribution, type WorkbenchZoneId } from '@ifc-lite/extensions';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { AddElementPanel } from '@/components/viewer/AddElementPanel';
 import { BCFPanel } from '@/components/viewer/BCFPanel';
@@ -17,12 +17,15 @@ import { ListPanel } from '@/components/viewer/lists/ListPanel';
 import { PropertiesPanel } from '@/components/viewer/PropertiesPanel';
 import { ScriptPanel } from '@/components/viewer/ScriptPanel';
 import { WidgetRenderer, type WidgetRendererContext } from '@/components/extensions/widget/WidgetRenderer';
+import { useSlotContributions } from '@/hooks/useSlotContributions';
 import { useOptionalExtensionHost } from '@/sdk/ExtensionHostProvider';
 import { useViewerStore } from '@/store';
+import { parseExtensionPanelWorkbenchId } from './panelRegistry';
 
 export function WorkbenchPanelHost({ panelId, zone }: { panelId: string; zone: WorkbenchZoneId }) {
   const closePanel = useClosePanel(panelId, zone);
   const personal = useViewerStore((s) => s.workbenchLayout.personalPanels[panelId]);
+  const extensionPanels = useSlotContributions<PanelContribution>('workbench.panels');
   const ctx = usePersonalWidgetContext();
   if (personal) {
     return (
@@ -32,6 +35,14 @@ export function WorkbenchPanelHost({ panelId, zone }: { panelId: string; zone: W
         </div>
       </ScrollArea>
     );
+  }
+  const parsedExtensionPanel = parseExtensionPanelWorkbenchId(panelId);
+  if (parsedExtensionPanel) {
+    const contribution = extensionPanels.find((entry) =>
+      entry.extensionId === parsedExtensionPanel.extensionId
+      && entry.payload.id === parsedExtensionPanel.panelId,
+    );
+    return contribution ? <ExtensionWorkbenchPanel contribution={contribution} ctx={ctx} /> : <EmptyPanel panelId={panelId} />;
   }
   switch (panelId) {
     case BUILTIN_PANEL_IDS.hierarchy: return <HierarchyPanel />;
@@ -46,6 +57,50 @@ export function WorkbenchPanelHost({ panelId, zone }: { panelId: string; zone: W
     case BUILTIN_PANEL_IDS.gantt: return <GanttPanel onClose={closePanel} />;
     default: return <EmptyPanel panelId={panelId} />;
   }
+}
+
+function ExtensionWorkbenchPanel({
+  contribution,
+  ctx,
+}: {
+  contribution: SlotContribution<PanelContribution>;
+  ctx: WidgetRendererContext;
+}) {
+  const host = useOptionalExtensionHost();
+  const [state, setState] = useState<{ widget?: Parameters<typeof WidgetRenderer>[0]['node']; error?: string }>({});
+  useEffect(() => {
+    let cancelled = false;
+    try {
+      const bundle = host?.loader.getBundle(contribution.extensionId);
+      const file = bundle?.files.get(contribution.payload.widget);
+      if (!file) {
+        setState({ error: `Widget ${contribution.payload.widget} not found.` });
+        return;
+      }
+      const text = file.text ?? new TextDecoder().decode(file.bytes);
+      const json = JSON.parse(text);
+      const validated = validateWidget(json, contribution.payload.widget);
+      if (!validated.ok) {
+        const first = validated.errors[0];
+        setState({ error: `${first?.path ?? 'widget'} ${first?.message ?? 'failed validation'}` });
+        return;
+      }
+      if (!cancelled) setState({ widget: validated.value });
+    } catch (err) {
+      if (!cancelled) setState({ error: err instanceof Error ? err.message : String(err) });
+    }
+    return () => { cancelled = true; };
+  }, [contribution, host]);
+
+  if (state.error) return <div className="p-3 text-xs text-destructive">{state.error}</div>;
+  if (!state.widget) return <div className="p-3 text-xs text-muted-foreground">Loading extension panel...</div>;
+  return (
+    <ScrollArea className="h-full">
+      <div className="p-3">
+        <WidgetRenderer node={state.widget} ctx={ctx} />
+      </div>
+    </ScrollArea>
+  );
 }
 
 function useClosePanel(panelId: string, zone: WorkbenchZoneId): () => void {

@@ -5,6 +5,7 @@
 import { useEffect, useState } from 'react';
 import { Check, Wand2, X } from 'lucide-react';
 import type { WorkbenchPatch } from '@ifc-lite/extensions';
+import { simulateWorkbenchPatch } from '@ifc-lite/customization';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -14,7 +15,9 @@ const PATCH_EVENT = 'ifc-lite:preview-workbench-patch';
 
 export function WorkbenchPatchDialog() {
   const applyPatch = useViewerStore((s) => s.applyWorkbenchPatch);
+  const layout = useViewerStore((s) => s.workbenchLayout);
   const [patch, setPatch] = useState<WorkbenchPatch | null>(null);
+  const simulation = patch ? simulateWorkbenchPatch(layout, patch) : null;
 
   useEffect(() => {
     const handler = (event: Event) => {
@@ -41,10 +44,23 @@ export function WorkbenchPatchDialog() {
             <div><span className="font-medium">Patch:</span> <code>{patch.id}</code></div>
             <div><span className="font-medium">Author:</span> {patch.author}</div>
             <div><span className="font-medium">Operations:</span> {patch.operations.length}</div>
+            {simulation && simulation.warnings.length > 0 && (
+              <div className="mt-2 rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs text-amber-700 dark:text-amber-300">
+                {simulation.warnings.join(' ')}
+              </div>
+            )}
           </div>
           <ScrollArea className="max-h-[360px] rounded border">
             <div className="divide-y">
-              {patch.operations.map((operation, index) => (
+              {(simulation?.changes ?? []).map((change, index) => (
+                <div key={`${change.operation}-${index}`} className="p-3">
+                  <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{change.operation}</div>
+                  <div className="mt-1 text-sm font-medium">{change.label}</div>
+                  {change.detail && <div className="text-xs text-muted-foreground">{change.detail}</div>}
+                  <pre className="mt-1 overflow-x-auto text-[11px]">{JSON.stringify(patch.operations[index], null, 2)}</pre>
+                </div>
+              ))}
+              {!simulation && patch.operations.map((operation, index) => (
                 <div key={`${operation.op}-${index}`} className="p-3">
                   <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{operation.op}</div>
                   <pre className="mt-1 overflow-x-auto text-[11px]">{JSON.stringify(operation, null, 2)}</pre>

@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-import { LayoutDashboard, Library, Plus, RotateCcw, Wand2 } from 'lucide-react';
+import { LayoutDashboard, Library, Plus, RotateCcw, Sparkles, Wand2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 
 interface MorphToolbarProps {
@@ -11,6 +11,7 @@ interface MorphToolbarProps {
   onAddPanel: () => void;
   onLibrary: () => void;
   onModes: () => void;
+  onStudio: () => void;
   onReset: () => void;
 }
 
@@ -20,6 +21,7 @@ export function MorphToolbar({
   onAddPanel,
   onLibrary,
   onModes,
+  onStudio,
   onReset,
 }: MorphToolbarProps) {
   return (
@@ -38,6 +40,9 @@ export function MorphToolbar({
           </Button>
           <Button type="button" size="icon-sm" variant="ghost" onClick={onModes} aria-label="Open workspace modes and automations">
             <Wand2 className="h-3.5 w-3.5" />
+          </Button>
+          <Button type="button" size="icon-sm" variant="ghost" onClick={onStudio} aria-label="Open Customization Studio">
+            <Sparkles className="h-3.5 w-3.5" />
           </Button>
           <Button type="button" size="icon-sm" variant="ghost" onClick={onReset} aria-label="Reset layout">
             <RotateCcw className="h-3.5 w-3.5" />

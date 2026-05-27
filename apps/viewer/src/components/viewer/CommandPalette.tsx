@@ -462,6 +462,12 @@ export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
           const state = useViewerStore.getState();
           state.setWorkbenchMorphMode(!state.workbenchMorphMode);
         } },
+      { id: 'customization:studio', label: 'Open Customization Studio…',
+        keywords: 'customize studio morph templates extensions panels automations ai',
+        category: 'Panels', icon: Sparkles,
+        action: () => {
+          window.dispatchEvent(new CustomEvent('ifc-lite:open-customization-studio'));
+        } },
       { id: 'layout:reset', label: 'Reset UI layout',
         keywords: 'customize workbench panels default reset',
         category: 'Preferences', icon: RotateCcw,

@@ -3,12 +3,13 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import { Eye, EyeOff, MoveRight } from 'lucide-react';
-import type { WorkbenchPanelId, WorkbenchZoneId } from '@ifc-lite/extensions';
+import type { PanelContribution, WorkbenchPanelId, WorkbenchZoneId } from '@ifc-lite/extensions';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import { useSlotContributions } from '@/hooks/useSlotContributions';
 import { useViewerStore } from '@/store';
-import { listWorkbenchPanels, ZONE_LABEL } from './panelRegistry';
+import { extensionPanelWorkbenchId, listWorkbenchPanels, ZONE_LABEL, type WorkbenchPanelSummary } from './panelRegistry';
 
 interface PanelLibraryDialogProps {
   open: boolean;
@@ -20,7 +21,20 @@ export function PanelLibraryDialog({ open, onClose, onEdit }: PanelLibraryDialog
   const layout = useViewerStore((s) => s.workbenchLayout);
   const setChrome = useViewerStore((s) => s.setWorkbenchPanelChrome);
   const movePanel = useViewerStore((s) => s.moveWorkbenchPanel);
-  const panels = listWorkbenchPanels(layout);
+  const extensionPanels = useSlotContributions<PanelContribution>('workbench.panels');
+  const panels: WorkbenchPanelSummary[] = [
+    ...listWorkbenchPanels(layout),
+    ...extensionPanels.map((contribution) => {
+      const id = extensionPanelWorkbenchId(contribution.extensionId, contribution.payload.id);
+      return {
+        id,
+        title: layout.panelChrome[id]?.title ?? contribution.payload.title,
+        kind: 'extension' as const,
+        zone: findPanelZone(id),
+        hidden: layout.panelChrome[id]?.hidden === true,
+      };
+    }),
+  ];
 
   const showInZone = (panelId: string, zone: WorkbenchZoneId) => {
     setChrome(panelId, { hidden: false });
@@ -76,4 +90,12 @@ export function PanelLibraryDialog({ open, onClose, onEdit }: PanelLibraryDialog
       </DialogContent>
     </Dialog>
   );
+}
+
+function findPanelZone(panelId: string): WorkbenchZoneId | undefined {
+  const layout = useViewerStore.getState().workbenchLayout;
+  if (layout.zones.left.includes(panelId)) return 'left';
+  if (layout.zones.right.includes(panelId)) return 'right';
+  if (layout.zones.bottom.includes(panelId)) return 'bottom';
+  return undefined;
 }

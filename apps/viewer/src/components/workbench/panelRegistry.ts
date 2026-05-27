@@ -7,9 +7,19 @@ import { BUILTIN_PANEL_IDS, type WorkbenchLayoutState, type WorkbenchPanelId, ty
 export interface WorkbenchPanelSummary {
   id: WorkbenchPanelId;
   title: string;
-  kind: 'built-in' | 'personal' | 'missing';
+  kind: 'built-in' | 'personal' | 'extension' | 'missing';
   zone?: WorkbenchZoneId;
   hidden: boolean;
+}
+
+export function extensionPanelWorkbenchId(extensionId: string, panelId: string): string {
+  return `extension:${extensionId}:panel:${panelId}`;
+}
+
+export function parseExtensionPanelWorkbenchId(panelId: string): { extensionId: string; panelId: string } | undefined {
+  const match = /^extension:([^:]+):panel:(.+)$/.exec(panelId);
+  if (!match) return undefined;
+  return { extensionId: match[1], panelId: match[2] };
 }
 
 export const BUILTIN_TITLES: Record<string, string> = {
