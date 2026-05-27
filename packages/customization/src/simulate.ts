@@ -48,8 +48,12 @@ export function describeOperation(operation: WorkbenchOperation): PatchChangeSum
       return { operation: operation.op, label: 'Configure automation', detail: operation.automation.name };
     case 'deleteAutomation':
       return { operation: operation.op, label: 'Delete automation', detail: operation.automationId };
+    case 'appendAutomationRun':
+      return { operation: operation.op, label: 'Append automation run log', detail: operation.entry.automationName };
     case 'appendHistory':
       return { operation: operation.op, label: 'Append history', detail: operation.entry.label };
+    case 'setPanelConfig':
+      return { operation: operation.op, label: 'Update built-in panel config', detail: operation.panelId };
     case 'setHorizontalSizes':
       return { operation: operation.op, label: 'Resize horizontal layout', detail: operation.sizes.join(' / ') };
     case 'setBottomHeight':

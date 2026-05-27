@@ -8,7 +8,9 @@ import {
   createDefaultWorkbenchLayout,
   normalizeWorkbenchLayout,
   type FloatingPanelPlacement,
+  type JsonValue,
   type PersonalPanelDefinition,
+  type AutomationRunLogEntry,
   type UiAutomation,
   type WorkbenchLayoutState,
   type WorkbenchMode,
@@ -32,6 +34,7 @@ export interface WorkbenchSlice {
   setWorkbenchBottomHeight: (height: number) => void;
   setWorkbenchCollapsed: (zone: WorkbenchZoneId, collapsed: boolean) => void;
   setWorkbenchPanelChrome: (panelId: WorkbenchPanelId, chrome: WorkbenchPanelChrome) => void;
+  setWorkbenchPanelConfig: (panelId: WorkbenchPanelId, config: JsonValue) => void;
   setWorkbenchFloatingPanel: (placement: FloatingPanelPlacement) => void;
   removeWorkbenchFloatingPanel: (panelId: WorkbenchPanelId) => void;
   applyWorkbenchPatch: (patch: WorkbenchPatch) => void;
@@ -43,6 +46,7 @@ export interface WorkbenchSlice {
   deleteWorkbenchMode: (modeId: string) => void;
   upsertWorkbenchAutomation: (automation: UiAutomation) => void;
   deleteWorkbenchAutomation: (automationId: string) => void;
+  appendWorkbenchAutomationRun: (entry: AutomationRunLogEntry) => void;
   appendWorkbenchHistory: (label: string, patchId?: string) => void;
 }
 
@@ -117,6 +121,16 @@ export const createWorkbenchSlice: StateCreator<WorkbenchSlice, [], [], Workbenc
           ...layout.panelChrome,
           [panelId]: { ...layout.panelChrome[panelId], ...chrome },
         },
+      },
+    });
+  },
+
+  setWorkbenchPanelConfig: (panelId, config) => {
+    const layout = get().workbenchLayout;
+    set({
+      workbenchLayout: {
+        ...layout,
+        panelConfigs: { ...layout.panelConfigs, [panelId]: config },
       },
     });
   },
@@ -282,6 +296,16 @@ export const createWorkbenchSlice: StateCreator<WorkbenchSlice, [], [], Workbenc
     set({ workbenchLayout: { ...layout, automations: layout.automations.filter((entry) => entry.id !== automationId) } });
   },
 
+  appendWorkbenchAutomationRun: (entry) => {
+    const layout = get().workbenchLayout;
+    set({
+      workbenchLayout: {
+        ...layout,
+        automationRuns: [...layout.automationRuns, entry].slice(-100),
+      },
+    });
+  },
+
   appendWorkbenchHistory: (label, patchId) => {
     const layout = get().workbenchLayout;
     set({
@@ -308,6 +332,7 @@ function snapshotLayout(layout: WorkbenchLayoutState): WorkbenchModeSnapshot {
     activeTabs: structuredClone(layout.activeTabs),
     floating: structuredClone(layout.floating),
     panelChrome: structuredClone(layout.panelChrome),
+    panelConfigs: structuredClone(layout.panelConfigs),
   };
 }
 

@@ -6,3 +6,5 @@ export * from './types.js';
 export * from './simulate.js';
 export * from './templates.js';
 export * from './plan.js';
+export * from './zones.js';
+export * from './ai.js';

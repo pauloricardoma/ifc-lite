@@ -4,7 +4,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { BUILTIN_PANEL_IDS, createDefaultWorkbenchLayout } from '@ifc-lite/extensions';
-import { createReviewWorkspaceTemplate, simulateWorkbenchPatch, validateCustomizationPlan } from './index.js';
+import { createReviewWorkspaceTemplate, draftCustomizationPlanFromPrompt, listBuiltInEditableZones, simulateWorkbenchPatch, validateCustomizationPlan } from './index.js';
 
 describe('@ifc-lite/customization', () => {
   it('simulates a workbench patch and summarizes changes', () => {
@@ -24,5 +24,12 @@ describe('@ifc-lite/customization', () => {
     expect(validateCustomizationPlan({ ...template.plan, patch: undefined, widget: undefined })).toContain(
       'Plan must include a workbench patch or widget.',
     );
+  });
+
+  it('drafts AI customization plans and exposes built-in editable zones', () => {
+    const plan = draftCustomizationPlanFromPrompt('make a fire safety workspace', '2026-01-01T00:00:00.000Z');
+    expect(plan.intent).toBe('create-panel');
+    expect(plan.patch?.operations.some((operation) => operation.op === 'addPersonalPanel')).toBe(true);
+    expect(listBuiltInEditableZones().map((zone) => zone.panelId)).toContain(BUILTIN_PANEL_IDS.properties);
   });
 });

@@ -79,10 +79,20 @@ export function applyWorkbenchOperation(
         ...layout,
         automations: layout.automations.filter((automation) => automation.id !== operation.automationId),
       };
+    case 'appendAutomationRun':
+      return {
+        ...layout,
+        automationRuns: [...layout.automationRuns.filter((entry) => entry.id !== operation.entry.id), operation.entry].slice(-100),
+      };
     case 'appendHistory':
       return {
         ...layout,
         history: [...layout.history.filter((entry) => entry.id !== operation.entry.id), operation.entry].slice(-50),
+      };
+    case 'setPanelConfig':
+      return {
+        ...layout,
+        panelConfigs: { ...layout.panelConfigs, [operation.panelId]: operation.config },
       };
     case 'setHorizontalSizes':
       return { ...layout, sizes: { ...layout.sizes, horizontal: operation.sizes } };

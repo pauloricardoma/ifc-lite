@@ -8,6 +8,9 @@ import { toast } from '@/components/ui/toast';
 import { useOptionalExtensionHost } from '@/sdk/ExtensionHostProvider';
 import { useViewerStore } from '@/store';
 
+const RUN_GUARD_MS = 1_000;
+const recentRuns = new Map<string, number>();
+
 export function useWorkbenchAutomations() {
   const host = useOptionalExtensionHost();
   const automations = useViewerStore((s) => s.workbenchLayout.automations);
@@ -38,7 +41,7 @@ export function firePanelOpenedAutomation(panelId: string) {
     && automation.trigger.kind === 'panel.opened'
     && automation.trigger.panelId === panelId,
   );
-  for (const automation of automations) runAutomation(automation);
+  for (const automation of automations) runAutomation(automation, undefined, 'panel.opened');
 }
 
 function runAutomations(
@@ -49,20 +52,50 @@ function runAutomations(
   for (const automation of automations) {
     if (!automation.enabled || automation.trigger.kind !== trigger) continue;
     if (!whenMatches(automation.when)) continue;
-    runAutomation(automation, host);
+    runAutomation(automation, host, trigger);
   }
 }
 
-function runAutomation(automation: UiAutomation, host?: ReturnType<typeof useOptionalExtensionHost>): void {
+function runAutomation(automation: UiAutomation, host?: ReturnType<typeof useOptionalExtensionHost>, trigger = automation.trigger.kind): void {
   const state = useViewerStore.getState();
-  for (const action of automation.actions) {
-    if (action.kind === 'layout.openPanel') state.openWorkbenchPanel(action.panelId);
-    else if (action.kind === 'layout.movePanel') state.moveWorkbenchPanel(action.panelId, action.zone);
-    else if (action.kind === 'layout.collapse') state.setWorkbenchCollapsed(action.zone, action.collapsed);
-    else if (action.kind === 'layout.applyMode') state.applyWorkbenchMode(action.modeId);
-    else if (action.kind === 'toast.show') toast.info(action.message);
-    else if (action.kind === 'command.run') void host?.runCommand(action.commandId);
+  const guardKey = `${automation.id}:${trigger}`;
+  const now = Date.now();
+  const last = recentRuns.get(guardKey) ?? 0;
+  if (now - last < RUN_GUARD_MS) {
+    appendRun(automation, trigger, 'skipped', 'Skipped to prevent rapid automation loop.');
+    return;
   }
+  recentRuns.set(guardKey, now);
+  try {
+    for (const action of automation.actions.slice(0, 12)) {
+      if (action.kind === 'layout.openPanel') state.openWorkbenchPanel(action.panelId);
+      else if (action.kind === 'layout.movePanel') state.moveWorkbenchPanel(action.panelId, action.zone);
+      else if (action.kind === 'layout.collapse') state.setWorkbenchCollapsed(action.zone, action.collapsed);
+      else if (action.kind === 'layout.applyMode') state.applyWorkbenchMode(action.modeId);
+      else if (action.kind === 'toast.show') toast.info(action.message);
+      else if (action.kind === 'command.run') void host?.runCommand(action.commandId);
+    }
+    appendRun(automation, trigger, 'success');
+  } catch (err) {
+    appendRun(automation, trigger, 'failed', err instanceof Error ? err.message : String(err));
+  }
+}
+
+function appendRun(
+  automation: UiAutomation,
+  trigger: string,
+  status: 'success' | 'failed' | 'skipped',
+  message?: string,
+) {
+  useViewerStore.getState().appendWorkbenchAutomationRun({
+    id: crypto.randomUUID(),
+    automationId: automation.id,
+    automationName: automation.name,
+    trigger,
+    status,
+    message,
+    createdAt: new Date().toISOString(),
+  });
 }
 
 function whenMatches(when: string | undefined): boolean {

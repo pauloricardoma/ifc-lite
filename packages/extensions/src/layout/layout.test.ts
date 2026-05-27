@@ -61,6 +61,7 @@ describe('applyWorkbenchPatch', () => {
         { op: 'setPanelChrome', panelId: BUILTIN_PANEL_IDS.ids, chrome: { title: 'QA checks' } },
         { op: 'setFloatingPanel', placement: { panelId: BUILTIN_PANEL_IDS.bcf, x: 10, y: 20, width: 300, height: 400 } },
         { op: 'setBottomHeight', height: 420 },
+        { op: 'setPanelConfig', panelId: BUILTIN_PANEL_IDS.properties, config: { density: 'compact' } },
         { op: 'appendHistory', entry: { id: 'hist.one', label: 'AI layout morph', createdAt: '2026-01-01T00:00:00.000Z' } },
       ],
     });
@@ -68,6 +69,7 @@ describe('applyWorkbenchPatch', () => {
     expect(next.panelChrome[BUILTIN_PANEL_IDS.ids].title).toBe('QA checks');
     expect(next.floating[0]).toMatchObject({ panelId: BUILTIN_PANEL_IDS.bcf, x: 10 });
     expect(next.sizes.bottomHeight).toBe(420);
+    expect(next.panelConfigs[BUILTIN_PANEL_IDS.properties]).toEqual({ density: 'compact' });
     expect(next.history[0].label).toBe('AI layout morph');
   });
 });

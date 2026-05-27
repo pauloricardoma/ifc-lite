@@ -55,9 +55,11 @@ export function normalizeWorkbenchLayout(input: unknown): WorkbenchLayoutState {
     activeTabs,
     floating: readFloating(raw.floating),
     panelChrome: readRecord(raw.panelChrome, isPanelChrome),
+    panelConfigs: readJsonRecord(raw.panelConfigs),
     personalPanels: readRecord(raw.personalPanels, isPersonalPanel),
     workspaceModes: readRecord(raw.workspaceModes, isWorkbenchMode),
     automations: readAutomations(raw.automations),
+    automationRuns: Array.isArray(raw.automationRuns) ? raw.automationRuns.filter(isAutomationRun).slice(-100) : [],
     history: Array.isArray(raw.history) ? raw.history.filter(isHistoryEntry).slice(-50) : [],
   };
 }
@@ -109,6 +111,15 @@ function readRecord<T>(raw: unknown, guard: (value: unknown) => value is T): Rec
   return out;
 }
 
+function readJsonRecord(raw: unknown): Record<string, JsonValue> {
+  if (!isPlainObject(raw)) return {};
+  const out: Record<string, JsonValue> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (isJsonValue(value)) out[key] = value;
+  }
+  return out;
+}
+
 function isPanelChrome(value: unknown): value is WorkbenchPanelChrome {
   if (!isPlainObject(value)) return false;
   return ['title', 'icon', 'accent'].every((key) => value[key] === undefined || typeof value[key] === 'string')
@@ -150,6 +161,16 @@ function isAutomation(value: unknown): value is UiAutomation {
     && isPlainObject(value.trigger)
     && typeof value.trigger.kind === 'string'
     && Array.isArray(value.actions);
+}
+
+function isAutomationRun(value: unknown): value is WorkbenchLayoutState['automationRuns'][number] {
+  return isPlainObject(value)
+    && typeof value.id === 'string'
+    && typeof value.automationId === 'string'
+    && typeof value.automationName === 'string'
+    && typeof value.trigger === 'string'
+    && typeof value.status === 'string'
+    && typeof value.createdAt === 'string';
 }
 
 function isHistoryEntry(value: unknown): value is WorkbenchLayoutState['history'][number] {

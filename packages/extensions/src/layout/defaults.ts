@@ -55,9 +55,11 @@ export function createDefaultWorkbenchLayout(): WorkbenchLayoutState {
     },
     floating: [],
     panelChrome: {},
+    panelConfigs: {},
     personalPanels: {},
     workspaceModes: {},
     automations: [],
+    automationRuns: [],
     history: [],
   };
 }

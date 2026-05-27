@@ -41,6 +41,7 @@ export interface WorkbenchModeSnapshot {
   activeTabs: Partial<Record<WorkbenchZoneId, WorkbenchPanelId>>;
   floating: FloatingPanelPlacement[];
   panelChrome: Record<WorkbenchPanelId, WorkbenchPanelChrome>;
+  panelConfigs: Record<WorkbenchPanelId, JsonValue>;
 }
 
 export interface WorkbenchMode {
@@ -81,6 +82,16 @@ export interface WorkbenchHistoryEntry {
   patchId?: string;
 }
 
+export interface AutomationRunLogEntry {
+  id: string;
+  automationId: string;
+  automationName: string;
+  trigger: string;
+  status: 'dry-run' | 'success' | 'failed' | 'skipped';
+  message?: string;
+  createdAt: string;
+}
+
 export interface WorkbenchLayoutState {
   schemaVersion: 1;
   /**
@@ -98,9 +109,11 @@ export interface WorkbenchLayoutState {
   activeTabs: Partial<Record<WorkbenchZoneId, WorkbenchPanelId>>;
   floating: FloatingPanelPlacement[];
   panelChrome: Record<WorkbenchPanelId, WorkbenchPanelChrome>;
+  panelConfigs: Record<WorkbenchPanelId, JsonValue>;
   personalPanels: Record<WorkbenchPanelId, PersonalPanelDefinition>;
   workspaceModes: Record<string, WorkbenchMode>;
   automations: UiAutomation[];
+  automationRuns: AutomationRunLogEntry[];
   history: WorkbenchHistoryEntry[];
 }
 
@@ -129,7 +142,9 @@ export type WorkbenchOperation =
   | { op: 'addAutomation'; automation: UiAutomation }
   | { op: 'updateAutomation'; automation: UiAutomation }
   | { op: 'deleteAutomation'; automationId: string }
+  | { op: 'appendAutomationRun'; entry: AutomationRunLogEntry }
   | { op: 'appendHistory'; entry: WorkbenchHistoryEntry }
+  | { op: 'setPanelConfig'; panelId: WorkbenchPanelId; config: JsonValue }
   | { op: 'setHorizontalSizes'; sizes: [number, number, number] }
   | { op: 'setBottomHeight'; height: number }
   | { op: 'setCollapsed'; zone: WorkbenchZoneId; collapsed: boolean };
