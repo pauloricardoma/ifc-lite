@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import { describe, expect, it } from 'vitest';
-import { BUILTIN_PANEL_IDS, createDefaultWorkbenchLayout, mergeWorkbenchLayouts, normalizeWorkbenchLayout } from './index.js';
+import { applyWorkbenchPatch, BUILTIN_PANEL_IDS, createDefaultWorkbenchLayout, mergeWorkbenchLayouts, normalizeWorkbenchLayout } from './index.js';
 
 describe('workbench layout normalization', () => {
   it('defaults legacy empty layout state', () => {
@@ -46,5 +46,24 @@ describe('mergeWorkbenchLayouts', () => {
     ours.zones.right = ours.zones.right.filter((id) => id !== BUILTIN_PANEL_IDS.bcf);
     const result = mergeWorkbenchLayouts(base, theirs, ours);
     expect(result.conflicts.some((c) => c.kind === 'panel_move')).toBe(true);
+  });
+});
+
+describe('applyWorkbenchPatch', () => {
+  it('applies AI-friendly layout operations in order', () => {
+    const base = createDefaultWorkbenchLayout();
+    const next = applyWorkbenchPatch(base, {
+      id: 'patch.one',
+      author: 'ai',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      operations: [
+        { op: 'movePanel', panelId: BUILTIN_PANEL_IDS.ids, toZone: 'bottom', toIndex: 0 },
+        { op: 'setPanelChrome', panelId: BUILTIN_PANEL_IDS.ids, chrome: { title: 'QA checks' } },
+        { op: 'setBottomHeight', height: 420 },
+      ],
+    });
+    expect(next.zones.bottom[0]).toBe(BUILTIN_PANEL_IDS.ids);
+    expect(next.panelChrome[BUILTIN_PANEL_IDS.ids].title).toBe('QA checks');
+    expect(next.sizes.bottomHeight).toBe(420);
   });
 });

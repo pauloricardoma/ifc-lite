@@ -66,3 +66,19 @@ export interface LayoutMergeResult {
   merged: WorkbenchLayoutState;
   conflicts: LayoutMergeConflict[];
 }
+
+export type WorkbenchOperation =
+  | { op: 'movePanel'; panelId: WorkbenchPanelId; toZone: WorkbenchZoneId; toIndex?: number }
+  | { op: 'setPanelChrome'; panelId: WorkbenchPanelId; chrome: WorkbenchPanelChrome }
+  | { op: 'addPersonalPanel'; panel: PersonalPanelDefinition; zone?: WorkbenchZoneId }
+  | { op: 'removePanel'; panelId: WorkbenchPanelId }
+  | { op: 'setHorizontalSizes'; sizes: [number, number, number] }
+  | { op: 'setBottomHeight'; height: number }
+  | { op: 'setCollapsed'; zone: WorkbenchZoneId; collapsed: boolean };
+
+export interface WorkbenchPatch {
+  id: string;
+  author: 'user' | 'ai' | 'extension' | 'system';
+  createdAt: string;
+  operations: WorkbenchOperation[];
+}

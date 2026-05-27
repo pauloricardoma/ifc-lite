@@ -6,3 +6,4 @@ export * from './types.js';
 export * from './defaults.js';
 export * from './normalize.js';
 export * from './merge.js';
+export * from './patch.js';

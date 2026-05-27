@@ -2,33 +2,20 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode, type RefObject } from 'react';
+import { useCallback, useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode, type RefObject } from 'react';
 import { Panel, Group as PanelGroup, Separator as PanelResizeHandle } from 'react-resizable-panels';
 import type { PanelImperativeHandle } from 'react-resizable-panels';
-import { GripVertical, LayoutDashboard, Plus, RotateCcw, X } from 'lucide-react';
+import { EyeOff, GripVertical, Pencil } from 'lucide-react';
 import {
   BUILTIN_PANEL_IDS,
   type WorkbenchPanelId,
   type WorkbenchZoneId,
 } from '@ifc-lite/extensions';
-import { Button } from '@/components/ui/button';
-import { ScrollArea } from '@/components/ui/scroll-area';
 import { toast } from '@/components/ui/toast';
 import { cn } from '@/lib/utils';
 import { useViewerStore } from '@/store';
-import { AddElementPanel } from '@/components/viewer/AddElementPanel';
-import { BCFPanel } from '@/components/viewer/BCFPanel';
-import { ExtensionsPanel } from '@/components/extensions/ExtensionsPanel';
-import { GanttPanel } from '@/components/viewer/schedule/GanttPanel';
-import { HierarchyPanel } from '@/components/viewer/HierarchyPanel';
-import { IDSPanel } from '@/components/viewer/IDSPanel';
-import { LensPanel } from '@/components/viewer/LensPanel';
-import { ListPanel } from '@/components/viewer/lists/ListPanel';
-import { PropertiesPanel } from '@/components/viewer/PropertiesPanel';
-import { ScriptPanel } from '@/components/viewer/ScriptPanel';
 import { ViewportContainer } from '@/components/viewer/ViewportContainer';
 import { ExtensionDockHost } from '@/components/extensions/ExtensionDockHost';
-import { WidgetRenderer, type WidgetRendererContext } from '@/components/extensions/widget/WidgetRenderer';
 import { useOptionalExtensionHost } from '@/sdk/ExtensionHostProvider';
 import {
   closeActiveAnalysisExtension,
@@ -36,8 +23,12 @@ import {
   getAnalysisExtensionsSnapshot,
 } from '@/services/analysis-extensions';
 import { PersonalPanelDialog } from './PersonalPanelDialog';
+import { PanelChromeDialog } from './PanelChromeDialog';
+import { PanelLibraryDialog } from './PanelLibraryDialog';
+import { MorphToolbar } from './MorphToolbar';
+import { getWorkbenchPanelTitle, ZONE_LABEL } from './panelRegistry';
+import { WorkbenchPanelHost } from './WorkbenchPanelHost';
 
-const ZONE_LABEL: Record<WorkbenchZoneId, string> = { left: 'Left dock', right: 'Right dock', bottom: 'Bottom dock' };
 const BOTTOM_PANEL_MIN_HEIGHT = 120;
 const BOTTOM_PANEL_MAX_RATIO = 0.7;
 
@@ -54,6 +45,8 @@ export function WorkbenchDesktopLayout({ analysisExtensionState }: WorkbenchDesk
   const setCollapsed = useViewerStore((s) => s.setWorkbenchCollapsed);
   const resetLayout = useViewerStore((s) => s.resetWorkbenchLayout);
   const [personalOpen, setPersonalOpen] = useState(false);
+  const [libraryOpen, setLibraryOpen] = useState(false);
+  const [editingPanelId, setEditingPanelId] = useState<string | null>(null);
   const leftPanelRef = useRef<PanelImperativeHandle>(null);
   const rightPanelRef = useRef<PanelImperativeHandle>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -90,6 +83,7 @@ export function WorkbenchDesktopLayout({ analysisExtensionState }: WorkbenchDesk
         enabled={morphMode}
         onToggle={() => setMorphMode(!morphMode)}
         onAddPanel={() => setPersonalOpen(true)}
+        onLibrary={() => setLibraryOpen(true)}
         onReset={() => {
           resetLayout();
           toast.success('Layout reset to IFC Lite default.');
@@ -158,6 +152,15 @@ export function WorkbenchDesktopLayout({ analysisExtensionState }: WorkbenchDesk
         <ExtensionDockHost slot="dock.bottom" />
       </div>
       <PersonalPanelDialog open={personalOpen} onClose={() => setPersonalOpen(false)} />
+      <PanelLibraryDialog
+        open={libraryOpen}
+        onClose={() => setLibraryOpen(false)}
+        onEdit={(panelId) => {
+          setLibraryOpen(false);
+          setEditingPanelId(panelId);
+        }}
+      />
+      <PanelChromeDialog panelId={editingPanelId} onClose={() => setEditingPanelId(null)} />
     </div>
   );
 }
@@ -190,7 +193,7 @@ function WorkbenchZone({ zone, morphMode }: { zone: WorkbenchZoneId; morphMode: 
           )}
         </div>
         <div className="flex-1 min-h-0 overflow-hidden">
-          {activePanel ? <WorkbenchPanel panelId={activePanel} zone={zone} /> : <EmptyZone zone={zone} />}
+          {activePanel ? <WorkbenchPanelHost panelId={activePanel} zone={zone} /> : <EmptyZone zone={zone} />}
         </div>
         {zone !== 'bottom' && <ExtensionDockHost slot={zone === 'left' ? 'dock.left' : 'dock.right'} className="max-h-[35%] border-t" />}
       </div>
@@ -198,71 +201,55 @@ function WorkbenchZone({ zone, morphMode }: { zone: WorkbenchZoneId; morphMode: 
   );
 }
 
-function PanelTab({ panelId, active, morphMode, onClick }: { panelId: string; active: boolean; morphMode: boolean; onClick: () => void }) {
+function PanelTab({
+  panelId,
+  active,
+  morphMode,
+  onClick,
+}: {
+  panelId: string;
+  active: boolean;
+  morphMode: boolean;
+  onClick: () => void;
+}) {
   const title = usePanelTitle(panelId);
+  const setChrome = useViewerStore((s) => s.setWorkbenchPanelChrome);
+  const [editingPanelId, setEditingPanelId] = useWorkbenchPanelEditor();
   return (
-    <button
-      type="button"
+    <div
       draggable={morphMode}
       onDragStart={(event) => event.dataTransfer.setData('application/x-ifc-lite-panel', panelId)}
-      onClick={onClick}
       className={cn(
         'shrink-0 flex items-center gap-1 px-2.5 py-1.5 text-xs border-b-2 transition-colors',
         active ? 'border-primary text-primary' : 'border-transparent text-muted-foreground hover:text-foreground',
       )}
       title={morphMode ? `Drag ${title} to another dock` : title}
     >
-      {morphMode && <GripVertical className="h-3 w-3" />}
-      {title}
-    </button>
-  );
-}
-
-function WorkbenchPanel({ panelId, zone }: { panelId: string; zone: WorkbenchZoneId }) {
-  const closePanel = useClosePanel(panelId, zone);
-  const personal = useViewerStore((s) => s.workbenchLayout.personalPanels[panelId]);
-  const ctx = usePersonalWidgetContext();
-  if (personal) {
-    return (
-      <ScrollArea className="h-full">
-        <div className="p-3">
-          <WidgetRenderer node={personal.widget as unknown as Parameters<typeof WidgetRenderer>[0]['node']} ctx={ctx} />
-        </div>
-      </ScrollArea>
-    );
-  }
-  switch (panelId) {
-    case BUILTIN_PANEL_IDS.hierarchy: return <HierarchyPanel />;
-    case BUILTIN_PANEL_IDS.properties: return <PropertiesPanel />;
-    case BUILTIN_PANEL_IDS.bcf: return <BCFPanel onClose={closePanel} />;
-    case BUILTIN_PANEL_IDS.ids: return <IDSPanel onClose={closePanel} />;
-    case BUILTIN_PANEL_IDS.lens: return <LensPanel onClose={closePanel} />;
-    case BUILTIN_PANEL_IDS.extensions: return <ExtensionsPanel onClose={closePanel} />;
-    case BUILTIN_PANEL_IDS.addElement: return <AddElementPanel onClose={closePanel} />;
-    case BUILTIN_PANEL_IDS.lists: return <ListPanel onClose={closePanel} />;
-    case BUILTIN_PANEL_IDS.script: return <ScriptPanel onClose={closePanel} />;
-    case BUILTIN_PANEL_IDS.gantt: return <GanttPanel onClose={closePanel} />;
-    default: return <EmptyPanel panelId={panelId} />;
-  }
-}
-
-function MorphToolbar({ enabled, onToggle, onAddPanel, onReset }: { enabled: boolean; onToggle: () => void; onAddPanel: () => void; onReset: () => void }) {
-  return (
-    <div className="absolute right-3 top-3 z-20 flex items-center gap-1 rounded border bg-background/90 p-1 shadow-sm backdrop-blur">
-      <Button type="button" size="sm" variant={enabled ? 'default' : 'secondary'} onClick={onToggle}>
-        <LayoutDashboard className="mr-1 h-3.5 w-3.5" />
-        {enabled ? 'Morphing' : 'Morph UI'}
-      </Button>
-      {enabled && (
+      <button type="button" className="flex items-center gap-1" onClick={onClick}>
+        {morphMode && <GripVertical className="h-3 w-3" />}
+        {title}
+      </button>
+      {morphMode && (
         <>
-          <Button type="button" size="icon-sm" variant="ghost" onClick={onAddPanel} aria-label="Add personal panel">
-            <Plus className="h-3.5 w-3.5" />
-          </Button>
-          <Button type="button" size="icon-sm" variant="ghost" onClick={onReset} aria-label="Reset layout">
-            <RotateCcw className="h-3.5 w-3.5" />
-          </Button>
+          <button
+            type="button"
+            className="ml-1 rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+            aria-label={`Edit ${title}`}
+            onClick={() => setEditingPanelId(panelId)}
+          >
+            <Pencil className="h-3 w-3" />
+          </button>
+          <button
+            type="button"
+            className="rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+            aria-label={`Hide ${title}`}
+            onClick={() => setChrome(panelId, { hidden: true })}
+          >
+            <EyeOff className="h-3 w-3" />
+          </button>
         </>
       )}
+      <PanelChromeDialog panelId={editingPanelId} onClose={() => setEditingPanelId(null)} />
     </div>
   );
 }
@@ -312,41 +299,14 @@ function useLegacyPanelSync() {
   }, [addElement, bcf, extensions, gantt, ids, lens, lists, open, script]);
 }
 
-function useClosePanel(panelId: string, zone: WorkbenchZoneId): () => void {
-  return useCallback(() => {
-    const state = useViewerStore.getState();
-    if (panelId === BUILTIN_PANEL_IDS.bcf) state.setBcfPanelVisible(false);
-    if (panelId === BUILTIN_PANEL_IDS.ids) state.setIdsPanelVisible(false);
-    if (panelId === BUILTIN_PANEL_IDS.lens) state.setLensPanelVisible(false);
-    if (panelId === BUILTIN_PANEL_IDS.extensions) state.setExtensionsPanelVisible(false);
-    if (panelId === BUILTIN_PANEL_IDS.lists) state.setListPanelVisible(false);
-    if (panelId === BUILTIN_PANEL_IDS.script) state.setScriptPanelVisible(false);
-    if (panelId === BUILTIN_PANEL_IDS.gantt) state.setGanttPanelVisible(false);
-    if (panelId === BUILTIN_PANEL_IDS.addElement) state.setActiveTool('select');
-    state.setWorkbenchActiveTab(zone, zone === 'right' ? BUILTIN_PANEL_IDS.properties : undefined);
-  }, [panelId, zone]);
-}
-
 function usePanelTitle(panelId: string): string {
   return useViewerStore((s) => {
-    const chromeTitle = s.workbenchLayout.panelChrome[panelId]?.title;
-    if (chromeTitle) return chromeTitle;
-    const personal = s.workbenchLayout.personalPanels[panelId];
-    if (personal) return personal.title;
-    return BUILTIN_TITLES[panelId] ?? panelId;
+    return getWorkbenchPanelTitle(s.workbenchLayout, panelId);
   });
 }
 
-function usePersonalWidgetContext(): WidgetRendererContext {
-  const host = useOptionalExtensionHost();
-  return useMemo(() => ({
-    state: {},
-    invokeCommand: (commandId: string) => {
-      host?.runCommand(commandId).catch((err) => {
-        console.warn('[WorkbenchDesktopLayout] personal panel command failed:', err);
-      });
-    },
-  }), [host]);
+function useWorkbenchPanelEditor(): [string | null, (panelId: string | null) => void] {
+  return useState<string | null>(null);
 }
 
 function useAutoPersistLayout() {
@@ -408,24 +368,4 @@ function EmptyZone({ zone }: { zone: WorkbenchZoneId }) {
   return <div className="p-4 text-xs text-muted-foreground">Drop a panel into the {ZONE_LABEL[zone].toLowerCase()}.</div>;
 }
 
-function EmptyPanel({ panelId }: { panelId: string }) {
-  return (
-    <div className="flex h-full items-center justify-center p-4 text-xs text-muted-foreground">
-      <X className="mr-2 h-4 w-4" />
-      Panel unavailable: {panelId}
-    </div>
-  );
-}
 
-const BUILTIN_TITLES: Record<string, string> = {
-  [BUILTIN_PANEL_IDS.hierarchy]: 'Hierarchy',
-  [BUILTIN_PANEL_IDS.properties]: 'Properties',
-  [BUILTIN_PANEL_IDS.bcf]: 'BCF',
-  [BUILTIN_PANEL_IDS.ids]: 'IDS',
-  [BUILTIN_PANEL_IDS.lens]: 'Lens',
-  [BUILTIN_PANEL_IDS.extensions]: 'Extensions',
-  [BUILTIN_PANEL_IDS.addElement]: 'Add element',
-  [BUILTIN_PANEL_IDS.lists]: 'Lists',
-  [BUILTIN_PANEL_IDS.script]: 'Script',
-  [BUILTIN_PANEL_IDS.gantt]: 'Schedule',
-};

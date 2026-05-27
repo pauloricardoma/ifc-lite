@@ -27,6 +27,8 @@ export interface WorkbenchSlice {
   setWorkbenchCollapsed: (zone: WorkbenchZoneId, collapsed: boolean) => void;
   setWorkbenchPanelChrome: (panelId: WorkbenchPanelId, chrome: WorkbenchPanelChrome) => void;
   addWorkbenchPersonalPanel: (panel: PersonalPanelDefinition, zone?: WorkbenchZoneId) => void;
+  updateWorkbenchPersonalPanel: (panel: PersonalPanelDefinition) => void;
+  removeWorkbenchPersonalPanel: (panelId: WorkbenchPanelId) => void;
 }
 
 export const createWorkbenchSlice: StateCreator<WorkbenchSlice, [], [], WorkbenchSlice> = (set, get) => ({
@@ -117,6 +119,43 @@ export const createWorkbenchSlice: StateCreator<WorkbenchSlice, [], [], Workbenc
         personalPanels: { ...layout.personalPanels, [panel.id]: panel },
         activeTabs: { ...layout.activeTabs, [zone]: panel.id },
         collapsed: { ...layout.collapsed, [zone]: false },
+      },
+    });
+  },
+
+  updateWorkbenchPersonalPanel: (panel) => {
+    const layout = get().workbenchLayout;
+    set({
+      workbenchLayout: {
+        ...layout,
+        personalPanels: { ...layout.personalPanels, [panel.id]: panel },
+        panelChrome: {
+          ...layout.panelChrome,
+          [panel.id]: { ...layout.panelChrome[panel.id], title: panel.title },
+        },
+      },
+    });
+  },
+
+  removeWorkbenchPersonalPanel: (panelId) => {
+    const layout = get().workbenchLayout;
+    const { [panelId]: _removedPanel, ...personalPanels } = layout.personalPanels;
+    const { [panelId]: _removedChrome, ...panelChrome } = layout.panelChrome;
+    set({
+      workbenchLayout: {
+        ...layout,
+        zones: {
+          left: layout.zones.left.filter((id) => id !== panelId),
+          right: layout.zones.right.filter((id) => id !== panelId),
+          bottom: layout.zones.bottom.filter((id) => id !== panelId),
+        },
+        activeTabs: {
+          left: layout.activeTabs.left === panelId ? undefined : layout.activeTabs.left,
+          right: layout.activeTabs.right === panelId ? undefined : layout.activeTabs.right,
+          bottom: layout.activeTabs.bottom === panelId ? undefined : layout.activeTabs.bottom,
+        },
+        panelChrome,
+        personalPanels,
       },
     });
   },
