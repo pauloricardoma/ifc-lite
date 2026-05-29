@@ -419,11 +419,6 @@
       "size": 19846535
     },
     {
-      "path": "ifc5/Linear_placement_of_signals_linear-placement-of-signal.ifc",
-      "sha256": "5f2f1b1bf14ddef048a49f4136189e83469a9b15db43b1708bb4c42d0494de13",
-      "size": 228220
-    },
-    {
       "path": "ifc5/Linear_placement_of_signals_linear-placement-of-signal.ifcx",
       "sha256": "2c5613b0235d2bc4943a989014e6173dc95d0becd59ee2177cd8ded10cef10c2",
       "size": 639359
@@ -737,6 +732,11 @@
       "path": "issues/856_wall_decode_failed.ifc",
       "sha256": "5f8a7eda3e63b0e3d4c5f0c986aeb4e8bbfeb9c84f6ccc42845bc5c704ef4849",
       "size": 18659
+    },
+    {
+      "path": "issues/859_linear_placement_of_signal.ifc",
+      "sha256": "5f2f1b1bf14ddef048a49f4136189e83469a9b15db43b1708bb4c42d0494de13",
+      "size": 228220
     },
     {
       "path": "issues/858_indexed_colour_map.ifc",

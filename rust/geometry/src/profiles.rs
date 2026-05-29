@@ -1437,6 +1437,29 @@ impl ProfileProcessor {
             IfcType::IfcCompositeCurve => {
                 self.process_composite_curve_3d_with_depth(curve, decoder, depth)
             }
+            // IFC4x3 IfcGradientCurve = IfcCompositeCurve subtype that adds a
+            // 2D BaseCurve (attr 2) supplying the horizontal layout + own
+            // segments supplying the vertical (z) profile. The minimum-viable
+            // sampler for #859's IfcLinearPlacement use case returns the
+            // horizontal track of points by recursing into BaseCurve and
+            // dropping Z to 0 — every signal lands at the correct (x, y)
+            // station, just at the alignment's reference elevation instead
+            // of the true grade-corrected z. Full grade evaluation is a
+            // follow-up; "every signal pinned to its alignment station" is
+            // already a vast improvement over the pre-fix "all signals at
+            // world origin" state.
+            IfcType::IfcGradientCurve => {
+                if let Some(base_attr) = curve.get(2) {
+                    if !base_attr.is_null() {
+                        if let Some(base) = decoder.resolve_ref(base_attr)? {
+                            return self.get_curve_points_with_depth(&base, decoder, depth + 1);
+                        }
+                    }
+                }
+                // No BaseCurve → fall through to the segments-as-composite path
+                // so we at least produce something rather than erroring.
+                self.process_composite_curve_3d_with_depth(curve, decoder, depth)
+            }
             IfcType::IfcCircle => self.process_circle_3d(curve, decoder),
             IfcType::IfcIndexedPolyCurve => {
                 // Native 3D path: handles both IfcCartesianPointList2D (z=0) and
@@ -1648,8 +1671,77 @@ impl ProfileProcessor {
 
         let segments = decoder.resolve_ref_list(segments_attr)?;
         let mut result = Vec::new();
+        // Track the last IfcCurveSegment we sampled so we can extrapolate its
+        // terminal point after the loop. Each segment in the loop body emits
+        // only its START placement; without the terminal, every product whose
+        // `DistanceAlong` falls inside the FINAL segment after its start
+        // station gets clamped by `sample_polyline_at_distance` to that
+        // segment's start (i.e. authored station 800 instead of 900 on a
+        // 932-m alignment with the last segment spanning 800..932). See the
+        // post-loop block below.
+        let mut last_curve_segment_terminal: Option<Point3<f64>> = None;
 
         for segment in segments {
+            // IFC4x3 IfcCurveSegment (alignment fixtures) has a different
+            // attribute layout from the IFC2x3/IFC4 IfcCompositeCurveSegment
+            // the original walker was written for:
+            //   IfcCurveSegment: 0 Transition, 1 Placement (IfcAxis2Placement2D/3D),
+            //                    2 SegmentStart (length measure), 3 SegmentLength,
+            //                    4 ParentCurve
+            // Without recognising it, every alignment-authored composite
+            // curve errored out at "Failed to resolve ParentCurve" (the old
+            // walker reading attr 2 hit the SegmentStart length measure),
+            // which broke #859's IfcLinearPlacement resolver — every
+            // linearly-placed signal/referent fell back to identity.
+            //
+            // Minimum-viable handling: emit the segment's Placement.Location
+            // as ONE sample point and let the linear-placement sampler
+            // interpolate linearly between segment starts. Sparse but
+            // already a vast improvement over "all at origin". A full
+            // alignment evaluator (sampling the ParentCurve inside each
+            // segment's authored start..start+length range) is follow-up
+            // scope.
+            if segment.ifc_type == IfcType::IfcCurveSegment {
+                if let Some(placement_attr) = segment.get(1) {
+                    if !placement_attr.is_null() {
+                        if let Some(placement) = decoder.resolve_ref(placement_attr)? {
+                            if let Some((origin, x_axis)) =
+                                axis2_placement_location_and_x_axis_3d(&placement, decoder)
+                            {
+                                if result.last().map_or(true, |last: &Point3<f64>| {
+                                    (last - origin).norm() > 1e-9
+                                }) {
+                                    result.push(origin);
+                                }
+                                // Stash the segment's projected terminal in
+                                // case this turns out to be the last segment.
+                                // Read SegmentLength (attr 3); the value may
+                                // be wrapped in an IfcLengthMeasure typed
+                                // record or be a bare REAL.
+                                let segment_length = segment
+                                    .get(3)
+                                    .and_then(|a| a.as_float())
+                                    .unwrap_or(0.0);
+                                if segment_length > 1e-9 {
+                                    last_curve_segment_terminal =
+                                        Some(origin + x_axis * segment_length);
+                                } else {
+                                    last_curve_segment_terminal = None;
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
+                // Couldn't read this segment's placement — skip rather than fail.
+                last_curve_segment_terminal = None;
+                continue;
+            }
+            // Non-IfcCurveSegment branch (IfcCompositeCurveSegment): the
+            // explicit ParentCurve samples below already give us the segment
+            // end, so clear the stashed terminal.
+            last_curve_segment_terminal = None;
+
             // IfcCompositeCurveSegment: Transition, SameSense, ParentCurve
             let parent_curve_attr = segment.get(2).ok_or_else(|| {
                 Error::geometry("CompositeCurveSegment missing ParentCurve".to_string())
@@ -1681,6 +1773,20 @@ impl ProfileProcessor {
                 result.extend(segment_points.into_iter().skip(1));
             } else {
                 result.extend(segment_points);
+            }
+        }
+
+        // Append the last IfcCurveSegment's terminal sample (exact for
+        // straight segments, tangent approximation for curves). Pre-fix the
+        // missing terminal made `sample_polyline_at_distance` clamp any
+        // product in the final segment to the segment's start station; this
+        // surfaces visibly as railway signals authored at station 900 m
+        // snapping onto the segment-start marker around station 800 m.
+        if let Some(terminal) = last_curve_segment_terminal {
+            if result.last().map_or(true, |last: &Point3<f64>| {
+                (last - terminal).norm() > 1e-9
+            }) {
+                result.push(terminal);
             }
         }
 
@@ -2564,6 +2670,67 @@ impl ProfileProcessor {
 
         Ok(result)
     }
+}
+
+/// Resolve an `IfcAxis2Placement2D` or `IfcAxis2Placement3D` into its
+/// origin point AND local X-axis (RefDirection) as a unit vector. Used to
+/// extrapolate the last `IfcCurveSegment`'s terminal point:
+/// `origin + x_axis * SegmentLength` is exact for straight segments and a
+/// tangent approximation for arcs / clothoids — both strictly better than
+/// dropping the terminal sample entirely, which caused
+/// `sample_polyline_at_distance` to clamp any product whose
+/// `DistanceAlong` fell inside the final segment to its start station.
+///
+/// IFC4x3 attribute layout:
+///   IfcAxis2Placement2D: 0 Location, 1 RefDirection
+///   IfcAxis2Placement3D: 0 Location, 1 Axis (local Z), 2 RefDirection (local X)
+///
+/// Returns `(origin, x_axis)` with `x_axis` defaulting to +X when the
+/// RefDirection is absent or zero-length (matches the EXPRESS default).
+fn axis2_placement_location_and_x_axis_3d(
+    placement: &DecodedEntity,
+    decoder: &mut EntityDecoder,
+) -> Option<(Point3<f64>, nalgebra::Vector3<f64>)> {
+    let is_3d = placement.ifc_type == IfcType::IfcAxis2Placement3D;
+    let is_2d = placement.ifc_type == IfcType::IfcAxis2Placement2D;
+    if !is_2d && !is_3d {
+        return None;
+    }
+    let location_attr = placement.get(0)?;
+    if location_attr.is_null() {
+        return None;
+    }
+    let location = decoder.resolve_ref(location_attr).ok().flatten()?;
+    if location.ifc_type != IfcType::IfcCartesianPoint {
+        return None;
+    }
+    let coords = location.get(0)?.as_list()?;
+    let x = coords.first().and_then(|v| v.as_float()).unwrap_or(0.0);
+    let y = coords.get(1).and_then(|v| v.as_float()).unwrap_or(0.0);
+    let z = coords.get(2).and_then(|v| v.as_float()).unwrap_or(0.0);
+    let origin = Point3::new(x, y, z);
+
+    // RefDirection slot: index 2 on 3D, index 1 on 2D.
+    let ref_dir_idx = if is_3d { 2 } else { 1 };
+    let mut x_axis = nalgebra::Vector3::x();
+    if let Some(dir_attr) = placement.get(ref_dir_idx) {
+        if !dir_attr.is_null() {
+            if let Some(dir) = decoder.resolve_ref(dir_attr).ok().flatten() {
+                if dir.ifc_type == IfcType::IfcDirection {
+                    if let Some(ratios) = dir.get(0).and_then(|a| a.as_list()) {
+                        let dx = ratios.first().and_then(|v| v.as_float()).unwrap_or(0.0);
+                        let dy = ratios.get(1).and_then(|v| v.as_float()).unwrap_or(0.0);
+                        let dz = ratios.get(2).and_then(|v| v.as_float()).unwrap_or(0.0);
+                        let v = nalgebra::Vector3::new(dx, dy, dz);
+                        if v.norm() > 1e-12 {
+                            x_axis = v.normalize();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Some((origin, x_axis))
 }
 
 #[cfg(test)]
