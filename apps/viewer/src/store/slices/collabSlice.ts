@@ -23,13 +23,16 @@
  */
 
 import type { StateCreator } from 'zustand';
-import {
-  createCollabSession,
-  type CollabSession,
-  type PresenceState,
-  type ProviderKind,
-  type UserIdentity,
-  type WebSocketStatus,
+// IMPORTANT: only *type* imports from '@ifc-lite/collab' at module scope. The
+// collab runtime (yjs, automerge, providers) is heavy and must stay out of the
+// main bundle so the feature ships dark — it is lazy-imported inside
+// `startCollab` and code-split into its own chunk.
+import type {
+  CollabSession,
+  PresenceState,
+  ProviderKind,
+  UserIdentity,
+  WebSocketStatus,
 } from '@ifc-lite/collab';
 import { collabServerUrl } from '@/lib/collab/config';
 import {
@@ -135,6 +138,8 @@ export const createCollabSlice: StateCreator<CollabSlice, [], [], CollabSlice> =
 
     let session: CollabSession;
     try {
+      // Lazy-load the collab runtime (code-split) — see the import note above.
+      const { createCollabSession } = await import('@ifc-lite/collab');
       session = await createCollabSession({
         roomId,
         user,

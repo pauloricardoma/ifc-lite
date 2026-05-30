@@ -12,9 +12,29 @@
  * in an account.
  */
 
-import { colorForUser } from '@ifc-lite/collab';
-
 const LS_IDENTITY_KEY = 'ifc-lite:collab:identity';
+
+/**
+ * Deterministic per-user color, replicated from `@ifc-lite/collab`'s
+ * `colorForUser` (FNV-1a over a 12-hue palette). Kept local so the identity
+ * bootstrap — which runs at store init even when collab is disabled — never
+ * pulls the collab runtime (yjs/automerge) into the main bundle. The palette
+ * and hash MUST stay in sync with the package so a peer's color matches what
+ * the server-side awareness would compute for the same id.
+ */
+const USER_PALETTE: readonly string[] = [
+  '#5b8def', '#ef6f6c', '#7ac74f', '#f5b041', '#a569bd', '#48c9b0',
+  '#ec7063', '#5d6d7e', '#f4d03f', '#ec407a', '#26a69a', '#7e57c2',
+];
+
+function colorForUser(userId: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < userId.length; i++) {
+    hash ^= userId.charCodeAt(i);
+    hash = (hash + ((hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24))) >>> 0;
+  }
+  return USER_PALETTE[(hash >>> 0) % USER_PALETTE.length];
+}
 
 export interface EphemeralIdentity {
   /** Stable per-browser id. Used for the presence color hash + audit keys. */

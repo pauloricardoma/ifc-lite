@@ -301,6 +301,11 @@ export default defineConfig({
     target: 'esnext',
     chunkSizeWarningLimit: 6000,
     rollupOptions: {
+      // `@ifc-lite/collab` ships an optional WebRTC provider that lazily
+      // `import('y-webrtc')` with a runtime fallback. The viewer only uses the
+      // indexeddb+websocket transport, so y-webrtc isn't installed — mark it
+      // external so Rollup doesn't fail resolving the (never-executed) import.
+      external: ['y-webrtc'],
       output: {
         manualChunks(id) {
           if (id.includes('/packages/sandbox/')) return 'sandbox';
@@ -333,6 +338,8 @@ export default defineConfig({
       'quickjs-emscripten',
       '@jitl/quickjs-wasmfile-release-asyncify',
       'esbuild-wasm',
+      // Optional collab WebRTC transport — not installed (see rollup external).
+      'y-webrtc',
     ],
   },
   worker: {
