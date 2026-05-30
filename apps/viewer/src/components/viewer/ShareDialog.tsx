@@ -25,6 +25,7 @@ import { Label } from '@/components/ui/label';
 import { useViewerStore } from '@/store';
 import type { CollabRole } from '@/store/slices/collabSlice';
 import { buildShareUrl, mintRoomId, mintRoomToken } from '@/lib/collab/share-link';
+import { buildStepSeedSource } from '@/lib/collab/step-seed';
 
 interface ShareDialogProps {
   open: boolean;
@@ -40,6 +41,7 @@ const ROLE_OPTIONS: ReadonlyArray<{ role: CollabRole; label: string; hint: strin
 export function ShareDialog({ open, onOpenChange }: ShareDialogProps) {
   const models = useViewerStore((s) => s.models);
   const activeModelId = useViewerStore((s) => s.activeModelId);
+  const ifcDataStore = useViewerStore((s) => s.ifcDataStore);
   const collabRoomId = useViewerStore((s) => s.collabRoomId);
   const collabPeers = useViewerStore((s) => s.collabPeers);
   const collabIdentity = useViewerStore((s) => s.collabIdentity);
@@ -72,7 +74,12 @@ export function ShareDialog({ open, onOpenChange }: ShareDialogProps) {
       const roomId = collabRoomId ?? mintRoomId();
       try {
         if (!collabRoomId) {
-          await startCollab({ roomId, role: 'admin' });
+          await startCollab({
+            roomId,
+            role: 'admin',
+            // Owner seeds the model so recipients hydrate from the room.
+            seed: () => (ifcDataStore ? buildStepSeedSource(ifcDataStore, modelName) : null),
+          });
         }
         const token = await mintRoomToken({ roomId, role });
         if (!cancelled) setLink(buildShareUrl(roomId, token));
@@ -86,7 +93,7 @@ export function ShareDialog({ open, onOpenChange }: ShareDialogProps) {
     return () => {
       cancelled = true;
     };
-  }, [open, hasModel, role, collabRoomId, startCollab]);
+  }, [open, hasModel, role, collabRoomId, startCollab, ifcDataStore, modelName]);
 
   const handleCopy = useCallback(async () => {
     if (!link) return;

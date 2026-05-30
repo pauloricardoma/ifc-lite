@@ -427,9 +427,10 @@ investment.
 
 - ☑ `session: CollabSession | null`, `status`, `role`, `peers` (from presence),
   `localIdentity { name, color }`, `roomId`.
-- ◐ `startCollab({ roomId, token, role })` → lazy `createCollabSession`,
-  presence + status subscriptions wired. GUID↔expressId maps, mutation binding,
-  and remote→local observer remain (M2, §7.5).
+- ◐ `startCollab({ roomId, token, role, seed })` → lazy `createCollabSession`,
+  presence + status subscriptions, and owner-side `seedFromStep` on first sync.
+  GUID↔expressId maps, mutation binding, and remote→local observer remain
+  (M2, §7.5).
 - ☑ `stopCollab()` → `session.dispose()`, teardown.
 - ◐ Selectors: `canCollabEdit` / `canCollabComment` (role gates) done; `isShared`
   derivable from `collabRoomId`.
@@ -483,11 +484,14 @@ investment.
 
 ### 7.9 Model transport for recipients (§4.6 — seed-into-room)
 
-- ☐ Owner mints a random room id on Share (store model→room in `localStorage`)
-  and seeds the full model into the Y.Doc via `seedFromStep` (§4.2).
-- ☐ Bake a bare `?room=…&t=…` link (no model url); recipient joins the room and
-  hydrates the model + geometry from the Y.Doc (hybrid geometry — §4.2
-  consequence 2).
+- ◐ Owner mints a random room id on Share and seeds the model into the Y.Doc
+  via `seedFromStep` once the room syncs (only if still empty). The viewer-side
+  `buildStepSeedSource` adapter (`lib/collab/step-seed.ts`) walks the parsed
+  `IfcDataStore` → GUID-keyed entities + core attributes. Persisting the
+  model→room map in `localStorage` is a follow-up.
+- ☑ Bare `?room=…&t=…` link (no model url); recipient joins and hydrates
+  entities from the Y.Doc. **Geometry** hydration (re-tessellation / mesh blobs
+  — §4.2 consequence 2) and **psets** in the seed are the next follow-ups.
 - ☐ Optional fallback: when the recipient already has the file locally, seed
   only the edit-layer diff instead of the whole model.
 

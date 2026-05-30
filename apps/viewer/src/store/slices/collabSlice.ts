@@ -31,6 +31,7 @@ import type {
   CollabSession,
   PresenceState,
   ProviderKind,
+  StepSeedSource,
   UserIdentity,
   WebSocketStatus,
 } from '@ifc-lite/collab';
@@ -58,6 +59,13 @@ export interface StartCollabOptions {
   role: CollabRole;
   /** Bearer room token forwarded to the collab-server (plan §3.1). */
   token?: string;
+  /**
+   * Owner-only: lazily produce the model seed (plan §4.6 seed-into-room). Built
+   * only when needed and applied only if the room's Y.Doc is still empty, so a
+   * recipient joining a populated room hydrates from the doc instead of
+   * re-seeding. Recipients (deep-link join) omit this.
+   */
+  seed?: () => StepSeedSource | null;
 }
 
 export interface CollabSlice {
@@ -128,7 +136,7 @@ export const createCollabSlice: StateCreator<CollabSlice, [], [], CollabSlice> =
     }
   },
 
-  startCollab: async ({ roomId, role, token }) => {
+  startCollab: async ({ roomId, role, token, seed }) => {
     // Tear down any existing session first (idempotent join).
     get().stopCollab();
     set({ collabConnecting: true, collabRoomId: roomId, collabRole: role });
@@ -137,10 +145,12 @@ export const createCollabSlice: StateCreator<CollabSlice, [], [], CollabSlice> =
     const user: UserIdentity = { id: identity.id, name: identity.name, color: identity.color };
 
     let session: CollabSession;
+    let seedFromStep: typeof import('@ifc-lite/collab')['seedFromStep'];
     try {
       // Lazy-load the collab runtime (code-split) — see the import note above.
-      const { createCollabSession } = await import('@ifc-lite/collab');
-      session = await createCollabSession({
+      const collab = await import('@ifc-lite/collab');
+      seedFromStep = collab.seedFromStep;
+      session = await collab.createCollabSession({
         roomId,
         user,
         provider: pickProvider(),
@@ -166,9 +176,23 @@ export const createCollabSlice: StateCreator<CollabSlice, [], [], CollabSlice> =
     });
     session.onStatus((status) => set({ collabStatus: status }));
 
-    // TODO(M1, plan §4.2): seed the active model into the Y.Doc via
-    // `seedFromStep` (legacy STEP) or `seedFromIfcx` (IFCX) so recipients can
-    // reconstruct it from the room. Until then a session only carries presence.
+    // Owner seeds the model into the Y.Doc (plan §4.6 seed-into-room) once the
+    // room has synced — but only if it's still empty, so we don't re-seed a
+    // populated room or clobber a peer's edits. Recipients pass no `seed` and
+    // hydrate from the doc instead.
+    if (seed) {
+      try {
+        await session.whenSynced;
+        if (get().collabRoomId === roomId && session.doc.getMap('entities').size === 0) {
+          const source = seed();
+          if (source) seedFromStep(session.doc, source);
+        }
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('[collab] model seeding failed:', err);
+      }
+    }
+
     // TODO(M2, plan §7.5): `bindMutationsToCollab` + remote→local observer.
 
     set({
