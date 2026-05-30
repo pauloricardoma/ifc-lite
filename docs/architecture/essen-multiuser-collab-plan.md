@@ -292,6 +292,50 @@ Strictly easier: `seedFromIfcx` already does the full round-trip end-to-end
 model is `.ifcx`, skip the GUID mapping and seed directly. The viewer simply
 branches on file type at session-creation time.
 
+### 4.6 How the recipient gets the model (share-link transport)
+
+A share link has **two jobs**: deliver the model **bytes** and join the collab
+**room**. The CRDT only carries the live *edit layer* (§4.2 approach 1), so —
+unless we seed the whole model into the Y.Doc — the recipient still needs the
+base model from somewhere. This is the one piece neither package provides today.
+
+**Reuse the embed viewer's URL pattern, not the embed app.** The embed viewer
+(`apps/viewer-embed`) already loads a model from `?modelUrl=https://…`
+(`bridge/urlParams.ts`, `EmbedViewer.tsx`) — the recipient's browser
+`fetch()`es the bytes and parses locally. The main viewer has the same hook via
+`?model=<url>` (`ViewerLayout.tsx:61`). But that URL must be **publicly
+fetchable** (http/https only — `data:`/`blob:` rejected), so it assumes the
+model is *already hosted*. The embed app itself is chrome-less (no toolbar /
+panels / Share button), so collab lives in the **full viewer**; we reuse the
+`?modelUrl` *mechanism*, and the embed app can later become a read-only
+`viewer`-role presentation of a room.
+
+Three transports, shipped in order:
+
+| # | Transport | Share link | New infra | When |
+|---|---|---|---|---|
+| 1 | **Public URL** (embed today) | `?model=<url>&room=…&t=…` | none | model already on a CDN/server |
+| 2 | **Upload-on-share** | `?model=<blobUrl>&room=…&t=…` | reuse `collab-server/blob-route.ts` | **M1 default** — share a local file |
+| 3 | **Seed-into-room** | `?room=…&t=…` (no model url) | M2.5 `seedFromStep` | "just send a link", offline-capable |
+
+- **(2) Upload-on-share is the missing piece, and it's small.** The
+  collab-server **already ships a content-addressed blob route**
+  (`packages/collab-server/src/blob-route.ts`, with size limits). On Share, PUT
+  the model to it (or an S3 presigned URL), get a content-hashed URL back, and
+  bake it into the link. Content addressing **pins an immutable base version** —
+  essential, because every peer must seed its edit-layer from the *exact same*
+  bytes or GUID-keyed edits won't line up. The room id (§4.1) is derived from
+  that same content hash, so "same file → same room" falls out for free.
+- **(3) Seed-into-room is the truest "send a link" UX.** The owner seeds the
+  full model into the Y.Doc (M2.5 `seedFromStep`); the recipient hydrates the
+  model **through the CRDT sync itself** — no separate fetch, and IndexedDB
+  makes it offline-capable. Cost: a larger Y.Doc (whole model, not just edits)
+  and the STEP→CRDT seeder must land first.
+
+**Recommendation:** M1 ships transport (2) — upload-on-share to the existing
+blob route — as the default, falling back to (1) when the model is already at a
+public URL. (3) becomes the default once `seedFromStep` lands at M2.5.
+
 ---
 
 ## 5. Architecture & data flow
@@ -401,6 +445,17 @@ investment.
   `verifyRoomToken` `AuthenticateFn`. Secret + key rotation via env.
 - ☐ Revocation deny-list in the chosen persistence backend.
 
+### 7.9 Model transport for recipients (§4.6)
+
+- ☐ Upload-on-share: PUT the active model to the collab-server blob route
+  (`blob-route.ts`) on Share → content-hashed URL; derive room id from the
+  same hash.
+- ☐ Bake `?model=<blobUrl>&room=…&t=…` into the link; reuse the existing
+  `?model=` autoload (`ViewerLayout.tsx`) so the recipient fetches + parses
+  the base model, then joins the room for the live layer.
+- ☐ Fallback to transport (1) when the model is already at a public URL
+  (skip upload).
+
 ### 7.8 Packaging
 
 - ☐ Add `@ifc-lite/collab` to `apps/viewer/package.json`.
@@ -413,16 +468,20 @@ investment.
 
 Each milestone is shippable behind `collab.enabled` and has a hard exit gate.
 
-### M1 — Presence + comments MVP (no model bytes uploaded) · ~1–1.5 wk
-**Goal:** Two people open the same file via a share link and see each other's
-cursors, selections, and avatars; comments sync live.
+### M1 — Presence + comments MVP · ~1.5–2 wk
+**Goal:** Owner clicks Share → sends a link → recipient opens it, the model
+loads for them, and they see each other's cursors, selections, and avatars;
+comments sync live.
+- Model transport: **upload-on-share** to the collab-server blob route (§4.6
+  transport 2), `?model=<blobUrl>&room=…&t=…` link, recipient autoload via the
+  existing `?model=` hook (transport 1 fallback when already public).
 - collabSlice (presence only), ephemeral identity, Share dialog (link mint),
   deep-link join, `mountPresenceInViewer`, avatar stack, comment subtree +
   BCF binding, token service (viewer/commenter/editor minting; only
   commenter+ write comments).
-- **Exit:** live cursors + selection halos + shared comments across two
-  browsers; `viewer` role provably cannot write (server drops it); links
-  expire/revoke.
+- **Exit:** a recipient with only the link loads the model and joins; live
+  cursors + selection halos + shared comments across two browsers; `viewer`
+  role provably cannot write (server drops it); links expire/revoke.
 
 ### M2 — Property editing over legacy STEP · ~2 wk
 **Goal:** `editor`s change properties and everyone converges.
@@ -493,6 +552,12 @@ cursors, selections, and avatars; comments sync live.
    acceptable for collaborative results.
 5. **Mobile** — presence/comments on `MobileToolbar` in M1; editing on mobile
    deferred.
+6. **Model bytes hosting (§4.6)** — upload-on-share to the collab-server blob
+   route vs an S3 presigned PUT vs requiring an already-public `?model=` URL.
+   *Recommendation:* blob route for M1 (no extra infra, content-addressed,
+   co-located with revocation/persistence), graduating to seed-into-room at
+   M2.5. Privacy note: a blob URL is itself a bearer capability — gate the
+   blob route behind the same room token so the model isn't world-readable.
 
 ---
 
