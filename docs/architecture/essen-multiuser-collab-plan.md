@@ -416,36 +416,46 @@ investment.
 
 ## 7. Viewer integration tasks (file-level)
 
+> **Status (scaffolding landed):** the slice, identity, Share dialog, deep-link
+> join, and presence overlay mount are in `apps/viewer` behind `collab.enabled`.
+> The collab runtime is lazy-imported (code-split) so the feature ships dark.
+> Remaining: seeding, mutation binding, conflict UX, token service, avatars.
+
 ### 7.1 New store slice — `collabSlice`
 
 `apps/viewer/src/store/slices/collabSlice.ts`:
 
-- ☐ `session: CollabSession | null`, `status`, `role`, `peers` (from presence),
+- ☑ `session: CollabSession | null`, `status`, `role`, `peers` (from presence),
   `localIdentity { name, color }`, `roomId`.
-- ☐ `startCollab(model, { roomId, token, role })` → `createCollabSession`,
-  build GUID↔expressId maps, bind mutations, mount presence overlay,
-  attach remote→local observer.
-- ☐ `stopCollab()` → `session.dispose()`, teardown overlay/observer.
-- ☐ Selectors: `isShared`, `canEdit` (role gate for UI affordances), `peers`.
+- ◐ `startCollab({ roomId, token, role })` → lazy `createCollabSession`,
+  presence + status subscriptions wired. GUID↔expressId maps, mutation binding,
+  and remote→local observer remain (M2, §7.5).
+- ☑ `stopCollab()` → `session.dispose()`, teardown.
+- ◐ Selectors: `canCollabEdit` / `canCollabComment` (role gates) done; `isShared`
+  derivable from `collabRoomId`.
 
 ### 7.2 Identity slice (ephemeral)
 
-- ☐ `localStorage`-backed `{ handle, color }`; generate friendly name + color
-  (reuse `awareness/color.ts`). Editable inline in the Share dialog.
+- ☑ `localStorage`-backed `{ id, name, color }` (`lib/collab/identity.ts`);
+  friendly name + FNV-1a color (replicated locally to avoid an eager collab
+  import). `setCollabIdentity` reflects renames into live presence. Inline
+  editing in the dialog is a follow-up.
 
 ### 7.3 Share UI
 
-- ☐ `ShareDialog.tsx` — role radio, link with token, copy, "live now" presence
-  list, expiry + revoke. Calls the token service.
-- ☐ Share button in `MainToolbar.tsx` (and `MobileToolbar.tsx`), beside Export.
-- ☐ Wire `?room=`/`?t=` deep-link handling in `ViewerLayout.tsx` (next to the
-  existing `?model=` autoload) → auto-join on open.
+- ☑ `ShareDialog.tsx` — access picker (view/comment/edit), link with token,
+  copy, "live now" presence list. Expiry/revoke + real token minting pending
+  (§7.7).
+- ☑ Share button in `MainToolbar.tsx` (flag-gated, beside Export) with a live
+  peer-count badge. `MobileToolbar.tsx` is a follow-up.
+- ☑ `?room=`/`?t=` deep-link auto-join in `ViewerLayout.tsx`.
 
 ### 7.4 Presence rendering
 
-- ☐ Call `mountPresenceInViewer({ session, container, viewport, raycastToWorld })`
-  from `Viewport.tsx`/`ViewportContainer.tsx`. Supply `raycastToWorld` from the
-  renderer's existing picking so cursors anchor in 3D.
+- ☑ `CollabPresenceLayer.tsx` mounts `mountPresenceInViewer({ session,
+  container, viewport })` over `[data-viewport]` (lazy import). Uses the 2D
+  cursor fallback for now.
+- ☐ Supply `raycastToWorld` from the renderer's picking so cursors anchor in 3D.
 - ☐ Avatar stack in the toolbar/StatusBar; selection halos from peers'
   `presence.selection`.
 - ☐ Settings toggle (existing settings panel) to hide others' cursors.

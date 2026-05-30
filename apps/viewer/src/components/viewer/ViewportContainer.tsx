@@ -12,6 +12,7 @@ import { AnnotationLayer } from './annotations/AnnotationLayer';
 import { Section2DPanel } from './Section2DPanel';
 import { BasketPresentationDock } from './BasketPresentationDock';
 import { BCFOverlay } from './bcf/BCFOverlay';
+import { CollabPresenceLayer } from './CollabPresenceLayer';
 import { CesiumOverlay } from './CesiumOverlay';
 import { CesiumPlacementEditor } from './CesiumPlacementEditor';
 import { getViewerStoreApi, useViewerStore } from '@/store';
@@ -1058,6 +1059,7 @@ export function ViewportContainer() {
       />
       <AnnotationLayer />
       {bcfOverlayVisible && <BCFOverlay />}
+      <CollabPresenceLayer />
       <ViewportOverlays />
       {/* Issue #540: non-modal "reload to apply" banner anchored to the
           top of the canvas. Only renders when the user has flipped the
