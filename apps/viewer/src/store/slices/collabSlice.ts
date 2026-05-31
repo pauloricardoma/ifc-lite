@@ -276,6 +276,7 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
 
     const geomApi: CollabGeomApi = {
       createGeometry: (doc, geomId, opts) => collabMod.createGeometry(doc, geomId, opts),
+      hasEntity: (doc, path) => collabMod.hasEntity(doc, path),
       addGeometryRef: (doc, path, geomId) => collabMod.addGeometryRef(doc, path, geomId),
       getGeometryRef: (doc, path) => collabMod.getGeometryRef(doc, path),
       getGeometry: (doc, geomId) => collabMod.getGeometry(doc, geomId),

@@ -7,6 +7,7 @@ import assert from 'node:assert';
 import {
   createCollabDoc,
   createGeometry,
+  hasEntity,
   addGeometryRef,
   getGeometryRef,
   getGeometry,
@@ -38,6 +39,7 @@ function sampleMesh(expressId: number): MeshData {
 
 const api: CollabGeomApi = {
   createGeometry: (doc, geomId, opts) => createGeometry(doc, geomId, opts),
+  hasEntity: (doc, path) => hasEntity(doc, path),
   addGeometryRef: (doc, path, geomId) => addGeometryRef(doc, path, geomId),
   getGeometryRef: (doc, path) => getGeometryRef(doc, path),
   getGeometry: (doc, geomId) => getGeometry(doc, geomId),

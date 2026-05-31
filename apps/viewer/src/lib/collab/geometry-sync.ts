@@ -34,6 +34,8 @@ export interface CollabGeomApi {
     geomId: string,
     opts: { type: 'mesh'; source: string; blobHash?: string },
   ): unknown;
+  /** Whether an entity exists at `path` (addGeometryRef throws otherwise). */
+  hasEntity(doc: CollabSession['doc'], path: string): boolean;
   /** Append a geomId to an entity's geometry refs (entities can own several meshes). */
   addGeometryRef(doc: CollabSession['doc'], path: string, geomId: string): void;
   getGeometryRef(doc: CollabSession['doc'], path: string): { geomIds: string[] } | undefined;
@@ -58,6 +60,7 @@ export async function seedGeometryToRoom(
   let count = 0;
   let skippedNoPath = 0;
   let skippedEmpty = 0;
+  let skippedNoEntity = 0;
   for (const mesh of meshes) {
     // A mesh whose CPU data was released (bounded-geometry mode) carries no
     // triangles — skip it so we don't seed an empty blob that renders nothing.
@@ -70,6 +73,13 @@ export async function seedGeometryToRoom(
       skippedNoPath++;
       continue;
     }
+    // The owning entity must already be in the doc (the structure seed creates
+    // it). Skip rather than let addGeometryRef throw and abort the whole seed —
+    // a non-zero count here means structure seeding missed some products.
+    if (!api.hasEntity(session.doc, path)) {
+      skippedNoEntity++;
+      continue;
+    }
     const meta = await blobStore.put(encodeMesh(mesh), 'application/octet-stream');
     const geomId = meta.hash; // content-addressed → identical meshes dedupe
     session.transact(() => {
@@ -78,11 +88,12 @@ export async function seedGeometryToRoom(
     });
     count++;
   }
-  if (skippedNoPath > 0 || skippedEmpty > 0) {
+  if (skippedNoPath > 0 || skippedEmpty > 0 || skippedNoEntity > 0) {
     // eslint-disable-next-line no-console
     console.warn(
       `[collab] seedGeometryToRoom: seeded ${count}/${meshes.length} meshes — ` +
-        `${skippedNoPath} skipped (mesh.expressId had no entity path), ` +
+        `${skippedNoPath} skipped (no entity path), ` +
+        `${skippedNoEntity} skipped (entity not seeded in doc), ` +
         `${skippedEmpty} skipped (empty/memory-released geometry).`,
     );
   }

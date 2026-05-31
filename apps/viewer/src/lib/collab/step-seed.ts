@@ -84,9 +84,16 @@ export function buildStepSeedSource(store: IfcDataStore, fileName?: string): Ste
 
   function* iterate(): Generator<StepSeedEntity> {
     for (const [expressId, ref] of store.entityIndex.byId.entries()) {
-      const attrs = extractEntityAttributesOnDemand(store, expressId);
+      // Resolve the GUID from the entity TABLE, not on-demand attribute
+      // extraction: on large models the compact index can't extract attributes
+      // for many geometric products, so the extraction-based GUID was empty and
+      // those products (and their geometry) were never seeded. The table carries
+      // their GlobalId reliably. `attrs` is still used (best-effort) for name /
+      // description / properties below.
+      const guid = store.entities.getGlobalId(expressId);
       // Only IfcRoot-derived entities carry a GUID — the CRDT key.
-      if (!attrs.globalId) continue;
+      if (!guid) continue;
+      const attrs = extractEntityAttributesOnDemand(store, expressId);
 
       // Proper-cased class from the entity table; fall back to the raw
       // (UPPERCASE) STEP type for resource-level entities ('Unknown').
@@ -137,10 +144,10 @@ export function buildStepSeedSource(store: IfcDataStore, fileName?: string): Ste
       }
 
       yield {
-        guid: attrs.globalId,
+        guid,
         ifcClass,
         attributes,
-        children: childrenByPath.get(`/${attrs.globalId}`),
+        children: childrenByPath.get(`/${guid}`),
       };
     }
   }

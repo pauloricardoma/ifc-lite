@@ -66,7 +66,15 @@ function entityMaps(store: IfcDataStore): EntityMaps {
 }
 
 export function pathForEntity(store: IfcDataStore, entityId: number): string | null {
-  return entityMaps(store).toPath.get(entityId) ?? null;
+  const cached = entityMaps(store).toPath.get(entityId);
+  if (cached) return cached;
+  // The compact `entityIndex.byId` (and on-demand attribute extraction) omits
+  // many geometric products on large models, so the pre-built map misses them —
+  // which dropped the vast majority of meshes at seed time. The entity *table*
+  // still carries their GlobalId, so fall back to it. (No-op for IFCX stores,
+  // whose maps are pre-registered via `registerEntityMaps`.)
+  const guid = store.entities?.getGlobalId?.(entityId);
+  return guid ? guidPath(guid) : null;
 }
 export function entityForPath(store: IfcDataStore, path: string): number | null {
   return entityMaps(store).toExpressId.get(path) ?? null;
