@@ -366,6 +366,11 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
         // Decoded-mesh cache (geomId → mesh), persisted across re-reconstructs so
         // a later doc update only fetches the *new* blobs, not the whole model.
         const geomCache = new Map<string, MeshData>();
+        // The recipient is registered as a real model (not the bare legacy store
+        // path) so it gets an activeModelId + an editable MutablePropertyView —
+        // which is what lets a recipient's edits flow back to the owner.
+        const roomModelId = `room:${roomId}`;
+        let modelCreated = false;
 
         // Re-derive the whole model from the doc. Cheap metadata refresh always;
         // geometry is re-hydrated from blobs only when the geometry set changed
@@ -384,7 +389,37 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
             if (payload.idToPath && payload.pathToId) {
               registerEntityMaps(payload.dataStore, payload.idToPath, payload.pathToId);
             }
-            get().setIfcDataStore(payload.dataStore);
+            if (!modelCreated) {
+              // First build: register a real model record (like a normal file
+              // load), giving the recipient an activeModelId + selection that
+              // resolves to a model (not 'legacy') so PropertiesPanel registers an
+              // editable MutablePropertyView. idOffset 0 — mesh expressIds are
+              // already in the reconstructed store's id space.
+              modelCreated = true;
+              let maxExpressId = 0;
+              if (payload.idToPath) {
+                for (const id of payload.idToPath.keys()) if (id > maxExpressId) maxExpressId = id;
+              }
+              get().upsertModel({
+                id: roomModelId,
+                name: 'Shared model',
+                ifcDataStore: payload.dataStore,
+                geometryResult: payload.geometryResult,
+                visible: true,
+                collapsed: false,
+                schemaVersion: payload.schemaVersion,
+                loadedAt: Date.now(),
+                fileSize: 0,
+                idOffset: 0,
+                maxExpressId,
+                loadState: 'complete',
+              });
+            } else {
+              // Re-derivation on a peer edit: refresh the active model's store in
+              // place (keeps the model id + activeModelId stable). setIfcDataStore
+              // also updates the global store the outbound mirror reads.
+              get().setIfcDataStore(payload.dataStore);
+            }
             const geomCount = session.doc.getMap('geometry').size;
             if (geomCount !== lastGeomCount) {
               lastGeomCount = geomCount;
@@ -445,6 +480,16 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
             session.doc.off('update', onDocUpdate);
           } catch {
             // ignore
+          }
+          // Drop the reconstructed room model on leave so rejoining a different
+          // room doesn't accumulate stale `room:*` models. (Only the recipient
+          // path creates this; the owner shares its own local model.)
+          if (modelCreated) {
+            try {
+              get().removeModel(roomModelId);
+            } catch {
+              // ignore
+            }
           }
         };
       } catch (err) {

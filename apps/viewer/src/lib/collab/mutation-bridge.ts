@@ -20,7 +20,7 @@
  */
 
 import { PropertyValueType } from '@ifc-lite/data';
-import { extractEntityAttributesOnDemand, type IfcDataStore } from '@ifc-lite/parser';
+import type { IfcDataStore } from '@ifc-lite/parser';
 import type { CollabSession } from '@ifc-lite/collab';
 
 /** The slice of the collab runtime this bridge needs (injected, never eager-imported). */
@@ -54,7 +54,12 @@ function entityMaps(store: IfcDataStore): EntityMaps {
   const toPath = new Map<number, string>();
   const toExpressId = new Map<string, number>();
   for (const [expressId] of store.entityIndex.byId.entries()) {
-    const guid = extractEntityAttributesOnDemand(store, expressId).globalId;
+    // Resolve the GUID from the entity TABLE, not on-demand attribute extraction:
+    // the compact index can't decode attributes for many geometric products on
+    // large models, so extraction returned no GUID and those products were absent
+    // from both maps — breaking geometry seeding AND inbound/outbound edit sync
+    // for them. The table carries their GlobalId reliably (see step-seed.ts).
+    const guid = store.entities?.getGlobalId?.(expressId);
     if (!guid) continue;
     const path = guidPath(guid);
     toPath.set(expressId, path);
