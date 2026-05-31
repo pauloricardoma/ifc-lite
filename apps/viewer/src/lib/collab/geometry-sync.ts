@@ -50,14 +50,28 @@ export interface CollabGeomApi {
  * multiple representation items), so refs are *appended* per path rather than
  * overwritten. Returns the number of meshes seeded.
  */
+export interface SeedGeometryOptions {
+  /** Max blob uploads in parallel. Default 16. */
+  concurrency?: number;
+  /** Upload progress (every ~50 blobs + once at the end), for a share UI. */
+  onProgress?: (uploaded: number, total: number) => void;
+}
+
 export async function seedGeometryToRoom(
   api: CollabGeomApi,
   session: CollabSession,
   blobStore: BlobStore,
   meshes: readonly MeshData[],
   pathFor: (expressId: number) => string | null,
+  opts: SeedGeometryOptions = {},
 ): Promise<number> {
-  let count = 0;
+  // 1. Resolve the seedable meshes up front (valid geometry + entity path + the
+  //    owning entity already in the doc), before any network I/O.
+  interface SeedJob {
+    mesh: MeshData;
+    path: string;
+  }
+  const jobs: SeedJob[] = [];
   let skippedNoPath = 0;
   let skippedEmpty = 0;
   let skippedNoEntity = 0;
@@ -80,14 +94,39 @@ export async function seedGeometryToRoom(
       skippedNoEntity++;
       continue;
     }
-    const meta = await blobStore.put(encodeMesh(mesh), 'application/octet-stream');
-    const geomId = meta.hash; // content-addressed → identical meshes dedupe
-    session.transact(() => {
-      api.createGeometry(session.doc, geomId, { type: 'mesh', source: 'mesh-blob', blobHash: meta.hash });
-      api.addGeometryRef(session.doc, path, geomId);
-    });
-    count++;
+    jobs.push({ mesh, path });
   }
+
+  // 2. Upload blobs with bounded concurrency. This was one-at-a-time, which took
+  //    *minutes* for a large model (thousands of serial network PUTs) and was the
+  //    main reason recipients saw geometry trickle in. Content-addressed, so
+  //    identical meshes dedupe server-side. Collect (path, hash) for step 3.
+  const concurrency = Math.max(1, Math.min(opts.concurrency ?? 16, jobs.length || 1));
+  const refs: { path: string; hash: string }[] = [];
+  let nextJob = 0;
+  let uploaded = 0;
+  const worker = async (): Promise<void> => {
+    while (nextJob < jobs.length) {
+      const job = jobs[nextJob++];
+      const meta = await blobStore.put(encodeMesh(job.mesh), 'application/octet-stream');
+      refs.push({ path: job.path, hash: meta.hash });
+      uploaded++;
+      if (opts.onProgress && uploaded % 50 === 0) opts.onProgress(uploaded, jobs.length);
+    }
+  };
+  await Promise.all(Array.from({ length: concurrency }, () => worker()));
+
+  // 3. Record geometry + refs in the doc — local Yjs ops (fast), batched into a
+  //    single transaction so peers receive one update instead of thousands.
+  session.transact(() => {
+    for (const { path, hash } of refs) {
+      api.createGeometry(session.doc, hash, { type: 'mesh', source: 'mesh-blob', blobHash: hash });
+      api.addGeometryRef(session.doc, path, hash);
+    }
+  });
+  opts.onProgress?.(jobs.length, jobs.length);
+
+  const count = refs.length;
   if (skippedNoPath > 0 || skippedEmpty > 0 || skippedNoEntity > 0) {
     // eslint-disable-next-line no-console
     console.warn(
