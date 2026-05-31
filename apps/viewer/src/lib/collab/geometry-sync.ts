@@ -27,8 +27,9 @@ export interface CollabGeomApi {
     geomId: string,
     opts: { type: 'mesh'; source: string; blobHash?: string },
   ): unknown;
-  setGeometryRef(doc: CollabSession['doc'], path: string, ref: { geomId: string }): void;
-  getGeometryRef(doc: CollabSession['doc'], path: string): { geomId: string } | undefined;
+  /** Append a geomId to an entity's geometry refs (entities can own several meshes). */
+  addGeometryRef(doc: CollabSession['doc'], path: string, geomId: string): void;
+  getGeometryRef(doc: CollabSession['doc'], path: string): { geomIds: string[] } | undefined;
   getGeometry(doc: CollabSession['doc'], geomId: string): { get(key: string): unknown } | undefined;
   iterEntities(doc: CollabSession['doc']): IterableIterator<[string, unknown]>;
 }
@@ -36,7 +37,9 @@ export interface CollabGeomApi {
 /**
  * Seed tessellated meshes into the room as blobs + per-entity `GeometryRef`s.
  * `pathFor` maps a mesh's `expressId` to its GUID entity path (skipped when it
- * returns null). Returns the number of meshes seeded.
+ * returns null). A single entity can own several meshes (multi-material /
+ * multiple representation items), so refs are *appended* per path rather than
+ * overwritten. Returns the number of meshes seeded.
  */
 export async function seedGeometryToRoom(
   api: CollabGeomApi,
@@ -53,7 +56,7 @@ export async function seedGeometryToRoom(
     const geomId = meta.hash; // content-addressed → identical meshes dedupe
     session.transact(() => {
       api.createGeometry(session.doc, geomId, { type: 'mesh', source: 'mesh-blob', blobHash: meta.hash });
-      api.setGeometryRef(session.doc, path, { geomId });
+      api.addGeometryRef(session.doc, path, geomId);
     });
     count++;
   }
@@ -61,25 +64,38 @@ export async function seedGeometryToRoom(
 }
 
 /**
- * Reconstruct `MeshData[]` from the room's geometry blobs. Used by a recipient
- * that joined a seed-into-room link with no source file. Missing blobs are
- * skipped (the seed may still be syncing).
+ * Reconstruct `MeshData[]` from the room's geometry blobs, keyed by entity. A
+ * recipient that joined a seed-into-room link has no source file, so it walks
+ * every entity's `GeometryRef`s, fetches the referenced blobs, and decodes
+ * them back to meshes. Walking by entity path (rather than the geometry store)
+ * lets us re-key each mesh's `expressId` into the recipient's own id space via
+ * `pathToId` — the recipient reconstructs its `IfcDataStore` from the same
+ * IFCX snapshot, so `pathToId.get(path)` is the entity's reconstructed
+ * expressId, which makes 3D selection resolve to the right inspector entry.
+ * Without `pathToId` (e.g. tests), the blob's embedded expressId is kept.
+ * Missing blobs are skipped (the seed may still be syncing).
  */
 export async function hydrateGeometryFromRoom(
   api: CollabGeomApi,
   session: CollabSession,
   blobStore: BlobStore,
+  pathToId?: Map<string, number>,
 ): Promise<MeshData[]> {
   const out: MeshData[] = [];
   for (const [path] of api.iterEntities(session.doc)) {
     const ref = api.getGeometryRef(session.doc, path);
     if (!ref) continue;
-    const node = api.getGeometry(session.doc, ref.geomId);
-    const blobHash = node?.get('blobHash');
-    if (typeof blobHash !== 'string') continue;
-    const bytes = await blobStore.get(blobHash);
-    if (!bytes) continue;
-    out.push(decodeMesh(bytes));
+    const expressId = pathToId?.get(path);
+    for (const geomId of ref.geomIds) {
+      const node = api.getGeometry(session.doc, geomId);
+      const blobHash = node?.get('blobHash');
+      if (typeof blobHash !== 'string') continue;
+      const bytes = await blobStore.get(blobHash);
+      if (!bytes) continue;
+      const mesh = decodeMesh(bytes);
+      if (expressId !== undefined) mesh.expressId = expressId;
+      out.push(mesh);
+    }
   }
   return out;
 }

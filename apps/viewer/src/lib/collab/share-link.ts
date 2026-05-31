@@ -17,6 +17,12 @@
  */
 
 import type { CollabRole } from '@/store/slices/collabSlice';
+import { collabServerUrl } from '@/lib/collab/config';
+
+/** ws(s):// → http(s):// base for the collab-server HTTP routes. */
+function collabHttpBase(serverUrl: string): string {
+  return serverUrl.replace(/^ws/, 'http').replace(/\/$/, '');
+}
 
 /** Generate an opaque, owner-minted room id (plan §4.1). */
 export function mintRoomId(): string {
@@ -32,17 +38,37 @@ export interface RoomTokenRequest {
   role: CollabRole;
   /** Time-to-live in seconds (default 7 days). */
   ttlSeconds?: number;
+  /**
+   * Admin bearer token. Required to mint a role-scoped link once a room exists;
+   * omit on the very first (room-creation) mint, where the server grants the
+   * creator admin (first-touch). Ignored in local-only/dev mode.
+   */
+  bearer?: string;
 }
 
 /**
- * Request a signed room token from the collab-server token route.
- *
- * TODO(plan §7.7): POST to `${collabServerHttpUrl}/collab/token` with the
- * owner token and have the server sign a JWT carrying { room, role, exp }.
- * For now this returns a non-cryptographic placeholder so the Share dialog
- * renders a complete link in local-only/dev mode.
+ * Mint a signed room token. With a collab-server configured this POSTs to its
+ * `/collab/token` route, which signs a JWT carrying { room, role, exp } (and
+ * enforces the mint policy — see the server's `tokenEndpoint.authorize`). In
+ * local-only/dev mode (no server) it falls back to a clearly-marked
+ * non-cryptographic placeholder so the Share flow still works offline.
  */
 export async function mintRoomToken(req: RoomTokenRequest): Promise<string> {
+  const serverUrl = collabServerUrl();
+  if (serverUrl) {
+    const headers: Record<string, string> = { 'content-type': 'application/json' };
+    if (req.bearer) headers['authorization'] = `Bearer ${req.bearer}`;
+    const res = await fetch(`${collabHttpBase(serverUrl)}/collab/token`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ roomId: req.roomId, role: req.role, ttlSeconds: req.ttlSeconds }),
+    });
+    if (!res.ok) throw new Error(`@ifc-lite: token mint failed (${res.status})`);
+    const json = (await res.json()) as { token?: string };
+    if (!json.token) throw new Error('@ifc-lite: token mint returned no token');
+    return json.token;
+  }
+
   const ttl = req.ttlSeconds ?? 7 * 24 * 60 * 60;
   const placeholder = {
     dev: true,
@@ -50,13 +76,30 @@ export async function mintRoomToken(req: RoomTokenRequest): Promise<string> {
     role: req.role,
     exp: Math.floor(Date.now() / 1000) + ttl,
   };
-  // base64url of the JSON — NOT a real signed token. Replaced by the server.
+  // base64url of the JSON — NOT a real signed token. Dev/local-only fallback.
   const json = JSON.stringify(placeholder);
   const b64 =
     typeof btoa !== 'undefined'
       ? btoa(json)
       : Buffer.from(json, 'utf8').toString('base64');
   return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/**
+ * Revoke a previously-minted share link via the collab-server. Requires an
+ * admin bearer token for the same room. No-op (returns false) in local-only
+ * mode. The server adds the link's `jti` to its deny-list so future joins with
+ * it are rejected.
+ */
+export async function revokeRoomToken(shareToken: string, adminBearer: string): Promise<boolean> {
+  const serverUrl = collabServerUrl();
+  if (!serverUrl) return false;
+  const res = await fetch(`${collabHttpBase(serverUrl)}/collab/revoke`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${adminBearer}` },
+    body: JSON.stringify({ token: shareToken }),
+  });
+  return res.ok;
 }
 
 /**

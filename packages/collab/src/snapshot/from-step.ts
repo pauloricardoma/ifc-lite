@@ -49,8 +49,18 @@ export interface StepSeedEntity {
   guid: string;
   /** IFC class name, e.g. `IfcWallStandardCase`. */
   ifcClass: string;
-  /** Core attributes (Name, Description, ObjectType, Tag, …). */
+  /**
+   * IFCX-native flat attributes (`bsi::ifc::class`, `bsi::ifc::prop::*`, …).
+   * Shaped this way so a recipient can reconstruct the model through the same
+   * IFCX path as IFC5 rooms — see the viewer's `buildStepSeedSource`.
+   */
   attributes?: Record<string, unknown>;
+  /**
+   * Spatial containment + decomposition as IFCX children: a unique key → the
+   * child entity's path (`/<guid>`). Lets the recipient rebuild the spatial
+   * tree (Project → Site → Building → Storey → elements).
+   */
+  children?: Record<string, string>;
   /** Property sets: psetName → propName → value. */
   psets?: Record<string, Record<string, PropertyValue>>;
 }
@@ -119,6 +129,7 @@ export function seedFromStep(
       createEntity(doc, path, {
         ifcClass: ent.ifcClass,
         attributes: ent.attributes ?? {},
+        children: ent.children,
         schemaVersion,
         meta: {
           ifcClass: ent.ifcClass,

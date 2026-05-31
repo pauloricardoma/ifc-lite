@@ -270,6 +270,13 @@ export default defineConfig({
       '@tauri-apps/api/core': path.resolve(__dirname, './src/services/tauri-core-stub.ts'),
       '@tauri-apps/plugin-dialog': path.resolve(__dirname, './src/services/tauri-dialog-stub.ts'),
       '@tauri-apps/plugin-fs': path.resolve(__dirname, './src/services/tauri-fs-stub.ts'),
+      // `@ifc-lite/collab` lazily `import('y-webrtc')` for its optional WebRTC
+      // transport, which the viewer never uses. y-webrtc isn't installed, so
+      // alias it to a stub — otherwise Vite's dev import-analysis fails to
+      // resolve the bare specifier and `import('@ifc-lite/collab')` rejects,
+      // silently disabling collab in dev. (The build also covers this via
+      // `rollupOptions.external` below.)
+      'y-webrtc': path.resolve(__dirname, './src/services/y-webrtc-stub.ts'),
     },
   },
   server: {

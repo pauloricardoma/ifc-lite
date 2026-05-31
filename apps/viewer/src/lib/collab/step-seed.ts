@@ -11,17 +11,75 @@
  * and yields one `StepSeedEntity` per GUID-bearing (`IfcRoot`-derived) entity,
  * keyed by its stable `IfcGloballyUniqueId`.
  *
- * v1 seeds entity identity + core attributes (Name/Description/ObjectType/Tag),
- * which is what recipients joining a seed-into-room link need for hierarchy,
- * selection, and presence. Property sets and geometry are follow-ups (psets
- * arrive via the mutation bridge in M2; geometry per plan §4.2 consequence 2).
+ * Future-aligned on IFCX/IFC5: even though the *source* is legacy STEP, the
+ * seed is shaped as IFCX-native data — entities carry flat `bsi::ifc::*`
+ * attributes and IFCX `children` for spatial containment. A recipient then
+ * reconstructs the full model (spatial tree + properties) through the very
+ * same IFCX path as a native IFC5 room (`snapshotToIfcx` → `parseIfcxViewerModel`),
+ * with no STEP-specific reconstruction code.
  */
 
-import { extractEntityAttributesOnDemand, type IfcDataStore } from '@ifc-lite/parser';
+import {
+  extractEntityAttributesOnDemand,
+  extractPropertiesOnDemand,
+  type IfcDataStore,
+} from '@ifc-lite/parser';
 import type { StepSeedEntity, StepSeedSource } from '@ifc-lite/collab';
 
-/** Adapt a parsed STEP `IfcDataStore` into a collab `StepSeedSource`. */
+const IFC_CLASS_URI = (code: string) =>
+  `https://identifier.buildingsmart.org/uri/buildingsmart/ifc/5/class/${code}`;
+
+/** A spatial-tree node as exposed on `IfcDataStore.spatialHierarchy.project`. */
+interface SpatialNodeLike {
+  expressId: number;
+  elevation?: number;
+  children: SpatialNodeLike[];
+  elements: number[];
+}
+
+/**
+ * Walk the parsed spatial hierarchy and build, per parent GUID path, the IFCX
+ * `children` map (`childPath → childPath`) covering both spatial decomposition
+ * (Project→Site→Building→Storey) and element containment. The key is arbitrary
+ * for IFCX composition, so we reuse the child path.
+ */
+function buildChildrenByPath(
+  store: IfcDataStore,
+  pathFor: (expressId: number) => string | null,
+): Map<string, Record<string, string>> {
+  const byPath = new Map<string, Record<string, string>>();
+  const root = (store.spatialHierarchy?.project ?? null) as SpatialNodeLike | null;
+  if (!root) return byPath;
+
+  const walk = (node: SpatialNodeLike) => {
+    const parentPath = pathFor(node.expressId);
+    if (parentPath) {
+      const children: Record<string, string> = {};
+      for (const child of node.children) {
+        const cp = pathFor(child.expressId);
+        if (cp) children[cp] = cp;
+      }
+      for (const elementId of node.elements) {
+        const ep = pathFor(elementId);
+        if (ep) children[ep] = ep;
+      }
+      if (Object.keys(children).length > 0) byPath.set(parentPath, children);
+    }
+    for (const child of node.children) walk(child);
+  };
+  walk(root);
+  return byPath;
+}
+
+/** Adapt a parsed STEP `IfcDataStore` into an IFCX-native collab `StepSeedSource`. */
 export function buildStepSeedSource(store: IfcDataStore, fileName?: string): StepSeedSource {
+  const guidPathFor = (expressId: number): string | null => {
+    const guid = store.entities.getGlobalId(expressId);
+    return guid ? `/${guid}` : null;
+  };
+  const childrenByPath = buildChildrenByPath(store, guidPathFor);
+  const storeyElevations = store.spatialHierarchy?.storeyElevations;
+
   function* iterate(): Generator<StepSeedEntity> {
     for (const [expressId, ref] of store.entityIndex.byId.entries()) {
       const attrs = extractEntityAttributesOnDemand(store, expressId);
@@ -33,13 +91,38 @@ export function buildStepSeedSource(store: IfcDataStore, fileName?: string): Ste
       const tableName = store.entities.getTypeName(expressId);
       const ifcClass = tableName && tableName !== 'Unknown' ? tableName : ref.type;
 
-      const attributes: Record<string, unknown> = {};
-      if (attrs.name) attributes.Name = attrs.name;
-      if (attrs.description) attributes.Description = attrs.description;
-      if (attrs.objectType) attributes.ObjectType = attrs.objectType;
-      if (attrs.tag) attributes.Tag = attrs.tag;
+      // IFCX-native flat attributes.
+      const attributes: Record<string, unknown> = {
+        'bsi::ifc::class': { code: ifcClass, uri: IFC_CLASS_URI(ifcClass) },
+      };
+      if (attrs.name) attributes['bsi::ifc::prop::Name'] = attrs.name;
+      if (attrs.description) attributes['bsi::ifc::prop::Description'] = attrs.description;
+      if (attrs.objectType) attributes['bsi::ifc::prop::ObjectType'] = attrs.objectType;
+      if (attrs.tag) attributes['bsi::ifc::prop::Tag'] = attrs.tag;
 
-      yield { guid: attrs.globalId, ifcClass, attributes };
+      // Storey elevation drives the hierarchy builder's storey ordering.
+      if (ifcClass === 'IfcBuildingStorey') {
+        const elevation = storeyElevations?.get(expressId);
+        if (typeof elevation === 'number') {
+          attributes['bsi::ifc::prop::Elevation'] = elevation;
+        }
+      }
+
+      // Property sets → IFCX flat property attributes, namespaced by pset so the
+      // recipient's `extractProperties` regroups them (`IFC Properties - <Pset>`).
+      for (const pset of extractPropertiesOnDemand(store, expressId)) {
+        for (const prop of pset.properties) {
+          if (prop.value === null || prop.value === undefined) continue;
+          attributes[`bsi::ifc::prop::${pset.name}::${prop.name}`] = prop.value;
+        }
+      }
+
+      yield {
+        guid: attrs.globalId,
+        ifcClass,
+        attributes,
+        children: childrenByPath.get(`/${attrs.globalId}`),
+      };
     }
   }
 

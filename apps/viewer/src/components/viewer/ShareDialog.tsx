@@ -74,15 +74,25 @@ export function ShareDialog({ open, onOpenChange }: ShareDialogProps) {
       const roomId = collabRoomId ?? mintRoomId();
       try {
         if (!collabRoomId) {
+          // The creator mints an admin token (first-touch) and joins with it,
+          // so it's authorized to mint role-scoped share links thereafter.
+          const adminToken = await mintRoomToken({ roomId, role: 'admin' });
           await startCollab({
             roomId,
             role: 'admin',
+            token: adminToken,
             // Owner seeds the model so recipients hydrate from the room.
             seed: () => (ifcDataStore ? buildStepSeedSource(ifcDataStore, modelName) : null),
           });
         }
-        const token = await mintRoomToken({ roomId, role });
-        if (!cancelled) setLink(buildShareUrl(roomId, token));
+        // Mint the role-scoped share link (server requires the owner's admin
+        // bearer once the room exists; ignored in local-only mode).
+        const adminBearer = useViewerStore.getState().collabSelfToken ?? undefined;
+        const token = await mintRoomToken({ roomId, role, bearer: adminBearer });
+        if (!cancelled) {
+          setLink(buildShareUrl(roomId, token));
+          useViewerStore.getState().setCollabLastShareToken(token);
+        }
       } catch (err) {
         // eslint-disable-next-line no-console
         console.error('[collab] share-link minting failed:', err);
@@ -169,13 +179,19 @@ export function ShareDialog({ open, onOpenChange }: ShareDialogProps) {
               </Label>
               <div className="flex flex-wrap items-center gap-2">
                 <PeerChip color={collabIdentity.color} name={`${collabIdentity.name} (you)`} />
-                {collabPeers.map((peer) => (
-                  <PeerChip
-                    key={peer.user.id}
-                    color={peer.user.color ?? '#888'}
-                    name={peer.user.name}
-                  />
-                ))}
+                {collabPeers
+                  // A peer's awareness state can arrive before its `user` is
+                  // populated (the identity patch flushes async). Skip those
+                  // half-initialized entries so a transient peer can't crash
+                  // the dialog with `peer.user.color` of undefined.
+                  .filter((peer) => peer?.user)
+                  .map((peer) => (
+                    <PeerChip
+                      key={peer.user.id}
+                      color={peer.user.color ?? '#888'}
+                      name={peer.user.name ?? 'Guest'}
+                    />
+                  ))}
               </div>
             </div>
 

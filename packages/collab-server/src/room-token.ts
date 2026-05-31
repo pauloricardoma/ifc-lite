@@ -381,3 +381,89 @@ export async function handleTokenMintRequest(
   res.end(JSON.stringify({ token, roomId: mintReq.roomId, role: grantedRole, exp: expSec }));
   return true;
 }
+
+// ── HTTP revoke route ────────────────────────────────────────────────────────
+
+export interface RevokeRequestBody {
+  /** The share token to invalidate. */
+  token: string;
+}
+
+export interface RevokeEndpointOptions {
+  /** Secret used to verify the target + bearer tokens. */
+  secret: SecretResolver;
+  /** Add a `jti` to the server's deny-list. The authenticator's `isRevoked`
+   *  should consult the same store so future joins with this token are rejected. */
+  recordRevocation: (jti: string, room: string) => void | Promise<void>;
+  allowOrigin?: string;
+  maxBodyBytes?: number;
+  now?: () => number;
+}
+
+/**
+ * Handle `POST /collab/revoke` (and its CORS preflight). The caller must
+ * present an `admin` bearer token for the same room as the token being revoked.
+ * Returns `true` when this route matched (and a response was sent).
+ */
+export async function handleRevokeRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  opts: RevokeEndpointOptions,
+): Promise<boolean> {
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  if (url.pathname !== '/collab/revoke') return false;
+
+  const allowOrigin = opts.allowOrigin ?? '*';
+  const cors = {
+    'access-control-allow-origin': allowOrigin,
+    'access-control-allow-methods': 'POST, OPTIONS',
+    'access-control-allow-headers': 'content-type, authorization',
+  };
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, cors);
+    res.end();
+    return true;
+  }
+  if (req.method !== 'POST') {
+    res.writeHead(405, { ...cors, 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'method-not-allowed' }));
+    return true;
+  }
+
+  let body: unknown;
+  try {
+    body = await readJsonBody(req, opts.maxBodyBytes ?? 4096);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : 'bad-request';
+    res.writeHead(reason === 'body-too-large' ? 413 : 400, { ...cors, 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: reason }));
+    return true;
+  }
+
+  const target = verifyRoomToken((body as Partial<RevokeRequestBody>)?.token ?? '', {
+    secret: opts.secret,
+    now: opts.now,
+  });
+  if (!target) {
+    res.writeHead(400, { ...cors, 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'invalid-token' }));
+    return true;
+  }
+
+  // Only an admin token for the *same room* may revoke.
+  const bearer = verifyRoomToken(bearerToken(req) ?? '', {
+    secret: opts.secret,
+    room: target.room,
+    now: opts.now,
+  });
+  if (!bearer || bearer.role !== 'admin') {
+    res.writeHead(403, { ...cors, 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'forbidden' }));
+    return true;
+  }
+
+  await opts.recordRevocation(target.jti, target.room);
+  res.writeHead(200, { ...cors, 'content-type': 'application/json' });
+  res.end(JSON.stringify({ revoked: true, jti: target.jti }));
+  return true;
+}

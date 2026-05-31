@@ -75,10 +75,11 @@ import { executeBasketIsolate } from '@/store/basket/basketCommands';
 import { useIfc } from '@/hooks/useIfc';
 import { cn } from '@/lib/utils';
 import { CSVExporter } from '@ifc-lite/export';
-import { FileSpreadsheet, FileJson, FileText, Filter, Upload, Pencil } from 'lucide-react';
+import { FileSpreadsheet, FileJson, FileText, Filter, Upload, Pencil, Users } from 'lucide-react';
 import { ExportDialog } from './ExportDialog';
 import { GLBExportDialog } from './GLBExportDialog';
 import { ShareDialog } from './ShareDialog';
+import { RoomPanel } from './RoomPanel';
 import { isCollabEnabled } from '@/lib/collab/config';
 import { BulkPropertyEditor } from './BulkPropertyEditor';
 import { DataConnector } from './DataConnector';
@@ -424,7 +425,9 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
   // Collaboration (M1): Share button is gated behind the collab feature flag.
   const collabEnabled = useMemo(() => isCollabEnabled(), []);
   const [shareDialogOpen, setShareDialogOpen] = useState(false);
+  const [roomPanelOpen, setRoomPanelOpen] = useState(false);
   const collabPeerCount = useViewerStore((s) => s.collabPeers.length);
+  const collabRoomId = useViewerStore((s) => s.collabRoomId);
   const {
     loadFile,
     loading,
@@ -1174,6 +1177,30 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
             <TooltipContent>Share</TooltipContent>
           </Tooltip>
           <ShareDialog open={shareDialogOpen} onOpenChange={setShareDialogOpen} />
+          {/* Room HUD — live presence + management, only while in a shared room. */}
+          {collabRoomId && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant={roomPanelOpen ? 'secondary' : 'ghost'}
+                  size="icon-sm"
+                  onClick={() => setRoomPanelOpen((v) => !v)}
+                  className="relative"
+                  aria-label="Room"
+                  aria-pressed={roomPanelOpen}
+                >
+                  <Users className="h-4 w-4" />
+                  {collabPeerCount > 0 && (
+                    <span className="absolute -right-0.5 -top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-emerald-500 px-1 text-[9px] font-medium text-white">
+                      {collabPeerCount + 1}
+                    </span>
+                  )}
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Room</TooltipContent>
+            </Tooltip>
+          )}
+          <RoomPanel open={roomPanelOpen} onOpenChange={setRoomPanelOpen} />
         </>
       )}
 

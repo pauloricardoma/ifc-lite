@@ -101,6 +101,10 @@ export interface CollabSlice {
   collabPeers: PresenceState[];
   /** True while a session is being established. */
   collabConnecting: boolean;
+  /** The room token this client joined with (admin for the owner). For minting + revoking links. */
+  collabSelfToken: string | null;
+  /** The most recently minted share link's token, so an admin can revoke it. */
+  collabLastShareToken: string | null;
 
   // ── Actions ──────────────────────────────────────────────────────────────
   /** Rename / recolor the local identity and persist it. */
@@ -109,6 +113,10 @@ export interface CollabSlice {
   startCollab: (opts: StartCollabOptions) => Promise<void>;
   /** Leave the current room and tear everything down. */
   stopCollab: () => void;
+  /** Record the latest minted share link token (for later revocation). */
+  setCollabLastShareToken: (token: string | null) => void;
+  /** Admin: invalidate the most recently minted share link. Returns success. */
+  revokeCollabLink: () => Promise<boolean>;
   /** Whether this client may write the model (editor/admin). */
   canCollabEdit: () => boolean;
   /** Whether this client may write comments (commenter/editor/admin). */
@@ -158,6 +166,8 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
   collabIdentity: loadOrCreateIdentity(),
   collabPeers: [],
   collabConnecting: false,
+  collabSelfToken: null,
+  collabLastShareToken: null,
 
   setCollabIdentity: (patch) => {
     const next: EphemeralIdentity = { ...get().collabIdentity, ...patch };
@@ -174,7 +184,10 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
   startCollab: async ({ roomId, role, token, seed }) => {
     // Tear down any existing session first (idempotent join).
     get().stopCollab();
-    set({ collabConnecting: true, collabRoomId: roomId, collabRole: role });
+    // Set the join token up front (not just at the end): setting collabRoomId
+    // re-renders subscribers (e.g. ShareDialog) that immediately mint a
+    // role-scoped share link, which needs our admin bearer to be available.
+    set({ collabConnecting: true, collabRoomId: roomId, collabRole: role, collabSelfToken: token ?? null });
 
     const identity = get().collabIdentity;
     const user: UserIdentity = { id: identity.id, name: identity.name, color: identity.color };
@@ -220,10 +233,17 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
       set({ collabPeers: remotePeers(peers, selfClientId) });
     });
     session.onStatus((status) => set({ collabStatus: status }));
+    // Broadcast our role so peers can show it in the roster (advisory; the
+    // authoritative role is the server-verified token).
+    try {
+      session.presence.patch({ role });
+    } catch {
+      // presence may not accept the patch in older runtimes — non-fatal
+    }
 
     const geomApi: CollabGeomApi = {
       createGeometry: (doc, geomId, opts) => collabMod.createGeometry(doc, geomId, opts),
-      setGeometryRef: (doc, path, ref) => collabMod.setGeometryRef(doc, path, ref),
+      addGeometryRef: (doc, path, geomId) => collabMod.addGeometryRef(doc, path, geomId),
       getGeometryRef: (doc, path) => collabMod.getGeometryRef(doc, path),
       getGeometry: (doc, geomId) => collabMod.getGeometry(doc, geomId),
       iterEntities: (doc) => collabMod.iterEntities(doc),
@@ -254,21 +274,46 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
         console.error('[collab] model seeding failed:', err);
       }
     } else {
-      // Recipient: hydrate geometry from the room's blobs and inject it into
-      // the renderer when we have no local model (plan §7.9). Best-effort —
-      // blobs may still be syncing; a later re-join picks up the rest.
+      // Recipient (deep-link join, no local model): reconstruct the full model
+      // from the CRDT as IFCX — the canonical format — then attach geometry
+      // hydrated from the room's blobs. IFC5 rooms carry containment +
+      // properties natively; legacy STEP rooms are seeded IFCX-shaped too (see
+      // `buildStepSeedSource`), so this single path serves both. The renderer
+      // and panels then use the standard legacy single-model path
+      // (`ifcDataStore` + `geometryResult`). Best-effort — blobs may still be
+      // syncing; a later re-join picks up the rest.
       try {
         await session.whenSynced;
-        if (get().collabRoomId === roomId && !get().geometryResult) {
+        if (get().collabRoomId === roomId && !get().ifcDataStore) {
+          const ifcxFile = collabMod.snapshotToIfcx(session.doc);
+          const buffer = new TextEncoder().encode(JSON.stringify(ifcxFile))
+            .buffer as ArrayBuffer;
+          // Reconstruct the IfcDataStore (entities + spatial hierarchy +
+          // properties) via the viewer's existing IFCX importer. Loaded lazily
+          // so the collab feature stays code-split.
+          const { parseIfcxViewerModel } = await import('@/hooks/ingest/viewerModelIngest');
+          const payload = await parseIfcxViewerModel(buffer, undefined, {
+            allowEmptyGeometry: true,
+          });
+          // Hydrate meshes from blobs, re-keyed into the reconstructed id space
+          // (via pathToId) so 3D selection resolves to the right inspector entry.
           const blobStore = await createSharedBlobStore(collabMod, collabServerUrl(), token);
-          const meshes = await hydrateGeometryFromRoom(geomApi, session, blobStore);
-          if (meshes.length > 0 && get().collabRoomId === roomId) {
-            get().setGeometryResult(buildGeometryResultFromMeshes(meshes));
+          const meshes = await hydrateGeometryFromRoom(
+            geomApi,
+            session,
+            blobStore,
+            payload.pathToId,
+          );
+          if (get().collabRoomId === roomId) {
+            get().setIfcDataStore(payload.dataStore);
+            get().setGeometryResult(
+              meshes.length > 0 ? buildGeometryResultFromMeshes(meshes) : payload.geometryResult,
+            );
           }
         }
       } catch (err) {
         // eslint-disable-next-line no-console
-        console.error('[collab] geometry hydration failed:', err);
+        console.error('[collab] model reconstruction failed:', err);
       }
     }
 
@@ -303,6 +348,7 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
       collabSession: session,
       collabStatus: session.status(),
       collabConnecting: false,
+      collabSelfToken: token ?? null,
     });
   },
 
@@ -332,7 +378,25 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
       collabRole: null,
       collabPeers: [],
       collabConnecting: false,
+      collabSelfToken: null,
+      collabLastShareToken: null,
     });
+  },
+
+  setCollabLastShareToken: (token) => set({ collabLastShareToken: token }),
+
+  revokeCollabLink: async () => {
+    const shareToken = get().collabLastShareToken;
+    const adminToken = get().collabSelfToken;
+    if (!shareToken || !adminToken) return false;
+    try {
+      const { revokeRoomToken } = await import('@/lib/collab/share-link');
+      return await revokeRoomToken(shareToken, adminToken);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error('[collab] revoke link failed:', err);
+      return false;
+    }
   },
 
   canCollabEdit: () => {
