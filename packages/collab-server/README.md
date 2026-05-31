@@ -2,17 +2,22 @@
 
 Reference websocket sync server for [`@ifc-lite/collab`](../collab).
 
-> **Status: v0.2 scaffold.** y-websocket-compatible sync, in-memory room
-> registry, append-only file persistence, JWT auth hook, healthcheck.
-> Production hardening (auth roles, S3 persistence, observability) lands
-> in v0.5 per `docs/architecture/collab-plan.md`.
+> **Status: v0.2.** y-websocket-compatible sync, append-only file persistence,
+> content-addressed blob route, healthcheck + Prometheus metrics, and
+> **signed-link access control** (room tokens with a first-touch-creator-admin
+> policy, revoke, and kick). Pluggable blob storage (S3/GCS/filesystem) via the
+> programmatic API. See the [Collaboration Server guide](../../docs/guide/collab-server.md).
 
 ## Run it
 
 ```sh
 pnpm --filter @ifc-lite/collab-server build
 pnpm --filter @ifc-lite/collab-server start
-# default port 1234, persistence at ./.collab-data/
+# default port 1234, persistence at ./.collab-data/, auth: anonymous
+
+# With signed-link access control (recommended off localhost):
+COLLAB_TOKEN_SECRET="$(openssl rand -hex 32)" \
+pnpm --filter @ifc-lite/collab-server start            # → auth: room-token
 ```
 
 Environment variables:
@@ -22,8 +27,14 @@ Environment variables:
 | `COLLAB_PORT` | `1234` | Listen port |
 | `COLLAB_HOST` | `0.0.0.0` | Listen host |
 | `COLLAB_DATA_DIR` | `./.collab-data` | Persistence root for room logs |
-| `COLLAB_JWT_SECRET` | _(unset = auth disabled)_ | HMAC secret for JWT validation |
+| `COLLAB_TOKEN_SECRET` | _(unset = anonymous)_ | HMAC secret that **enables room-token auth**. Unset → open (anonymous editor). |
 | `COLLAB_MAX_ROOMS` | `1024` | Soft cap on simultaneous rooms |
+
+HTTP routes: `GET /healthz`, `GET /metrics`, `/blobs[/<hash>]`, and — when a
+secret is set — `POST /collab/token`, `POST /collab/revoke`, `POST /collab/kick`.
+All carry permissive CORS by default. The CLI keeps blobs in memory and the
+revocation list in process; use a durable `blobStorage` + shared deny-list via
+the programmatic API for production / multi-instance.
 
 ## Programmatic use
 

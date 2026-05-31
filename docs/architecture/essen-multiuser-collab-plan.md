@@ -1,6 +1,11 @@
 # Multiuser Collaboration in the Essen Web Viewer — Implementation Plan
 
-**Status:** Draft v0.1 (planning only — no feature code yet).
+**Status:** Implemented (PR #897). Link-based sharing, IFCX-native recipient
+reconstruction (functional hierarchy + properties), the room HUD, presence +
+roles, and signed-link access control with revoke + kick are live. This document
+is the design record; for usage see the
+[Real-Time Collaboration guide](../guide/collaboration.md) and the
+[Collaboration Server guide](../guide/collab-server.md).
 **Branch:** `claude/essen-multiuser-collab-plan-uiSiJ`.
 **Owner:** Louis Trümpler (LT+).
 **Scope:** Wire the existing `@ifc-lite/collab` + `@ifc-lite/collab-server`

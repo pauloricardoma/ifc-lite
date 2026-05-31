@@ -116,6 +116,7 @@ nav:
     - CLI Toolkit: guide/cli.md
     - 3D Viewer & Analysis: guide/viewer-api.md
     - Server Guide: guide/server.md
+    - Collaboration Server: guide/collab-server.md
     - Desktop App: guide/desktop.md
     - Browser Requirements: guide/browser-requirements.md
   - User Guide:
@@ -125,6 +126,7 @@ nav:
     - Querying Data: guide/querying.md
     - Exporting Data: guide/exporting.md
     - Multi-Model Federation: guide/federation.md
+    - Real-Time Collaboration: guide/collaboration.md
     - BCF Collaboration: guide/bcf.md
     - IDS Validation: guide/ids.md
     - 2D Drawings: guide/drawing-2d.md
@@ -143,6 +145,8 @@ nav:
     - Rendering Pipeline: architecture/rendering-pipeline.md
     - Coordinate Handling: architecture/coordinate-handling.md
     - Federation: architecture/federation.md
+    - Collaboration (CRDT on IFCX): architecture/collab-plan.md
+    - Collaboration (viewer integration): architecture/essen-multiuser-collab-plan.md
   - API Reference:
     - TypeScript API: api/typescript.md
     - Rust API: api/rust.md
@@ -156,5 +160,6 @@ nav:
   - Contributing:
     - Development Setup: contributing/setup.md
     - Testing: contributing/testing.md
+    - Testing Collaboration: guide/collab-testing.md
     - Release Process: contributing/release.md
 
