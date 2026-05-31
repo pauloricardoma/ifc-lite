@@ -261,17 +261,27 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
     if (seed) {
       try {
         await session.whenSynced;
-        if (get().collabRoomId === roomId && session.doc.getMap('entities').size === 0) {
-          const source = seed();
-          if (source) seedFromStep(session.doc, source);
-          // Also seed tessellated geometry as blobs (plan §4.6, §7.9).
-          const meshes = get().geometryResult?.meshes;
-          const store = get().ifcDataStore;
-          if (meshes && meshes.length > 0 && store) {
-            const blobStore = await createSharedBlobStore(collabMod, collabServerUrl(), token);
-            await seedGeometryToRoom(geomApi, session, blobStore, meshes, (id) =>
-              pathForEntity(store, id),
-            );
+        if (get().collabRoomId === roomId) {
+          // Seed entities once — never clobber a populated room or a peer's edits.
+          if (session.doc.getMap('entities').size === 0) {
+            const source = seed();
+            if (source) seedFromStep(session.doc, source);
+          }
+          // Seed tessellated geometry as blobs (plan §4.6, §7.9) whenever the room
+          // has none yet — DECOUPLED from the entity-seed guard above. This lets a
+          // room whose entities were seeded by an earlier session/build (before
+          // geometry sync existed) backfill its geometry on the next owner join,
+          // instead of staying stuck with structure-but-no-3D. Blobs are
+          // content-addressed, so re-seeding the same model dedupes.
+          if (session.doc.getMap('geometry').size === 0) {
+            const meshes = get().geometryResult?.meshes;
+            const store = get().ifcDataStore;
+            if (meshes && meshes.length > 0 && store) {
+              const blobStore = await createSharedBlobStore(collabMod, collabServerUrl(), token);
+              await seedGeometryToRoom(geomApi, session, blobStore, meshes, (id) =>
+                pathForEntity(store, id),
+              );
+            }
           }
         }
       } catch (err) {
@@ -315,6 +325,13 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
               // Re-key meshes into the reconstructed id space (pathToId) so 3D
               // selection resolves to the right inspector entry.
               const meshes = await hydrateGeometryFromRoom(geomApi, session, blobStore, payload.pathToId);
+              if (geomCount > 0 && meshes.length === 0) {
+                // eslint-disable-next-line no-console
+                console.warn(
+                  `[collab] recipient: room has ${geomCount} geometry record(s) but 0 meshes hydrated — ` +
+                    'blobs may still be syncing, or the owner seeded a room with no geometry.',
+                );
+              }
               if (get().collabRoomId === roomId) {
                 get().setGeometryResult(
                   meshes.length > 0 ? buildGeometryResultFromMeshes(meshes) : payload.geometryResult,
