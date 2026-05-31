@@ -13,7 +13,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Check, Copy, Link2, LogOut, ShieldOff, X } from 'lucide-react';
+import { Check, Link2, LogOut, ShieldOff, UserMinus, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
@@ -78,6 +78,7 @@ function PeerRow({
   role,
   activity,
   index,
+  onKick,
 }: {
   color: string;
   name: string;
@@ -85,10 +86,11 @@ function PeerRow({
   role?: CollabRole;
   activity?: string;
   index: number;
+  onKick?: () => void;
 }) {
   return (
     <div
-      className="flex items-center gap-2 rounded-md px-1.5 py-1 transition-colors hover:bg-muted/60"
+      className="group flex items-center gap-2 rounded-md px-1.5 py-1 transition-colors hover:bg-muted/60"
       style={{ animationDelay: `${index * 30}ms` }}
     >
       <PresenceDot color={color} active={activity === 'active'} />
@@ -102,6 +104,22 @@ function PeerRow({
         )}
       </div>
       {role && <RoleBadge role={role} />}
+      {onKick && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              className="size-5 shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover:opacity-100"
+              onClick={onKick}
+              aria-label={`Remove ${name}`}
+            >
+              <UserMinus className="size-3" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="left">Remove from room</TooltipContent>
+        </Tooltip>
+      )}
     </div>
   );
 }
@@ -113,6 +131,7 @@ export function RoomPanel({ open, onOpenChange }: RoomPanelProps) {
   const collabIdentity = useViewerStore((s) => s.collabIdentity);
   const collabPeers = useViewerStore((s) => s.collabPeers);
   const stopCollab = useViewerStore((s) => s.stopCollab);
+  const kickPeer = useViewerStore((s) => s.kickPeer);
   const revokeCollabLink = useViewerStore(
     (s) => (s as { revokeCollabLink?: () => Promise<boolean> }).revokeCollabLink,
   );
@@ -167,17 +186,21 @@ export function RoomPanel({ open, onOpenChange }: RoomPanelProps) {
 
   const peerRows = useMemo(
     () =>
-      collabPeers.filter((p) => p?.user).map((p, i) => (
-        <PeerRow
-          key={p.user.id}
-          color={p.user.color ?? '#888'}
-          name={p.user.name ?? 'Guest'}
-          role={(p as { role?: CollabRole }).role}
-          activity={p.status ?? (p.tool && p.tool !== 'select' ? p.tool : undefined)}
-          index={i + 1}
-        />
-      )),
-    [collabPeers],
+      collabPeers.filter((p) => p?.user).map((p, i) => {
+        const clientId = (p as { clientId?: number }).clientId;
+        return (
+          <PeerRow
+            key={p.user.id}
+            color={p.user.color ?? '#888'}
+            name={p.user.name ?? 'Guest'}
+            role={(p as { role?: CollabRole }).role}
+            activity={p.status ?? (p.tool && p.tool !== 'select' ? p.tool : undefined)}
+            index={i + 1}
+            onKick={isAdmin && clientId != null ? () => void kickPeer(clientId) : undefined}
+          />
+        );
+      }),
+    [collabPeers, isAdmin, kickPeer],
   );
 
   if (!open || !collabRoomId) return null;

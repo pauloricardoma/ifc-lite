@@ -22,6 +22,8 @@
 import {
   extractEntityAttributesOnDemand,
   extractPropertiesOnDemand,
+  extractClassificationsOnDemand,
+  extractMaterialsOnDemand,
   type IfcDataStore,
 } from '@ifc-lite/parser';
 import type { StepSeedEntity, StepSeedSource } from '@ifc-lite/collab';
@@ -115,6 +117,23 @@ export function buildStepSeedSource(store: IfcDataStore, fileName?: string): Ste
           if (prop.value === null || prop.value === undefined) continue;
           attributes[`bsi::ifc::prop::${pset.name}::${prop.name}`] = prop.value;
         }
+      }
+
+      // Classifications + materials → IFCX attributes (the recipient's
+      // source-dependent cards can't run on a reconstructed store, so surface
+      // these as property groups instead).
+      for (const c of extractClassificationsOnDemand(store, expressId)) {
+        const code = c.identification ?? c.name;
+        if (c.system && code) attributes[`bsi::ifc::classification::${c.system}`] = code;
+      }
+      const material = extractMaterialsOnDemand(store, expressId);
+      if (material?.name) attributes['bsi::ifc::material::Name'] = material.name;
+      if (material?.layers && material.layers.length > 0) {
+        const layerSummary = material.layers
+          .map((l) => `${l.materialName ?? l.name ?? ''}${l.thickness ? ` (${l.thickness})` : ''}`)
+          .filter((s) => s.trim().length > 0)
+          .join(', ');
+        if (layerSummary) attributes['bsi::ifc::material::Layers'] = layerSummary;
       }
 
       yield {

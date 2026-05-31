@@ -44,6 +44,7 @@ async function start() {
         revoked.add(j);
       },
     },
+    kickEndpoint: { secret: SECRET },
   });
   const { port } = handle.httpServer.address() as { port: number };
   return `http://127.0.0.1:${port}`;
@@ -106,5 +107,29 @@ describe('room-token auth + revoke (bin policy)', () => {
     });
     expect(res.status).toBe(403);
     await res.body?.cancel();
+  });
+
+  it('kick requires an admin bearer; reports whether a peer matched', async () => {
+    const base = await start();
+    const admin = (await (await mint(base, { roomId: 'roomC', role: 'admin' })).json()) as { token: string };
+    const editor = (await (await mint(base, { roomId: 'roomC', role: 'editor' }, admin.token)).json()) as {
+      token: string;
+    };
+    // Non-admin cannot kick.
+    const denied = await fetch(`${base}/collab/kick`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${editor.token}` },
+      body: JSON.stringify({ roomId: 'roomC', clientId: 1 }),
+    });
+    expect(denied.status).toBe(403);
+    await denied.body?.cancel();
+    // Admin kick is accepted; no peer with that clientId is connected → kicked:false.
+    const ok = await fetch(`${base}/collab/kick`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${admin.token}` },
+      body: JSON.stringify({ roomId: 'roomC', clientId: 999 }),
+    });
+    expect(ok.status).toBe(200);
+    expect(((await ok.json()) as { kicked: boolean }).kicked).toBe(false);
   });
 });

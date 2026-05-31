@@ -14,6 +14,13 @@
  * eagerly. Re-tessellation (the lighter parametric path, plan §4.2 option a)
  * is a follow-up; mesh blobs are the universal fallback that works for any
  * model including imported meshes.
+ *
+ * Design note — why blobs, not inline IFCX geometry: even though the rest of
+ * the model is reconstructed as IFCX, tessellated geometry stays out-of-band as
+ * content-addressed blobs referenced from the doc. This is the USD/IFCX
+ * external-reference (payload) pattern, and it keeps the CRDT doc + IFCX
+ * snapshot small and bounded (inlining `usd::usdgeom::mesh` into the JSON would
+ * bloat both — see the SAB/IFCX memory). The doc holds only the blob hash.
  */
 
 import type { GeometryResult, MeshData } from '@ifc-lite/geometry';

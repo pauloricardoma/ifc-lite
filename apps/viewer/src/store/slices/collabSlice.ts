@@ -117,6 +117,8 @@ export interface CollabSlice {
   setCollabLastShareToken: (token: string | null) => void;
   /** Admin: invalidate the most recently minted share link. Returns success. */
   revokeCollabLink: () => Promise<boolean>;
+  /** Admin: force-disconnect a peer by awareness clientId. Returns success. */
+  kickPeer: (clientId: number) => Promise<boolean>;
   /** Whether this client may write the model (editor/admin). */
   canCollabEdit: () => boolean;
   /** Whether this client may write comments (commenter/editor/admin). */
@@ -146,7 +148,8 @@ function remotePeers(peers: Record<number, PresenceState>, selfClientId: number)
   const out: PresenceState[] = [];
   for (const [clientId, state] of Object.entries(peers)) {
     if (Number(clientId) === selfClientId) continue;
-    out.push(state);
+    // Annotate with the awareness clientId so admin actions (kick) can target it.
+    out.push({ ...state, clientId: Number(clientId) } as PresenceState);
   }
   return out;
 }
@@ -156,6 +159,8 @@ function remotePeers(peers: Record<number, PresenceState>, selfClientId: number)
 let docApi: CollabDocApi | null = null;
 // Teardown for the remote→local Y.Doc observer.
 let remoteApplyTeardown: (() => void) | null = null;
+// Teardown for the recipient's live re-reconstruction observer.
+let recipientLiveTeardown: (() => void) | null = null;
 
 export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> = (set, get) => ({
   // Initial state
@@ -284,33 +289,65 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
       // syncing; a later re-join picks up the rest.
       try {
         await session.whenSynced;
-        if (get().collabRoomId === roomId && !get().ifcDataStore) {
-          const ifcxFile = collabMod.snapshotToIfcx(session.doc);
-          const buffer = new TextEncoder().encode(JSON.stringify(ifcxFile))
-            .buffer as ArrayBuffer;
-          // Reconstruct the IfcDataStore (entities + spatial hierarchy +
-          // properties) via the viewer's existing IFCX importer. Loaded lazily
-          // so the collab feature stays code-split.
-          const { parseIfcxViewerModel } = await import('@/hooks/ingest/viewerModelIngest');
-          const payload = await parseIfcxViewerModel(buffer, undefined, {
-            allowEmptyGeometry: true,
-          });
-          // Hydrate meshes from blobs, re-keyed into the reconstructed id space
-          // (via pathToId) so 3D selection resolves to the right inspector entry.
-          const blobStore = await createSharedBlobStore(collabMod, collabServerUrl(), token);
-          const meshes = await hydrateGeometryFromRoom(
-            geomApi,
-            session,
-            blobStore,
-            payload.pathToId,
-          );
-          if (get().collabRoomId === roomId) {
+        // Reconstruct the IfcDataStore (entities + spatial hierarchy +
+        // properties) from the CRDT-as-IFCX via the viewer's existing importer.
+        // Loaded lazily so the collab feature stays code-split.
+        const { parseIfcxViewerModel } = await import('@/hooks/ingest/viewerModelIngest');
+        const blobStore = await createSharedBlobStore(collabMod, collabServerUrl(), token);
+        let lastGeomCount = -1;
+        let reconstructing = false;
+
+        // Re-derive the whole model from the doc. Cheap metadata refresh always;
+        // geometry is re-hydrated from blobs only when the geometry set changed
+        // (so a peer's property edit doesn't re-fetch every mesh).
+        const reconstruct = async () => {
+          if (reconstructing || get().collabRoomId !== roomId) return;
+          reconstructing = true;
+          try {
+            const ifcxFile = collabMod.snapshotToIfcx(session.doc);
+            const buffer = new TextEncoder().encode(JSON.stringify(ifcxFile)).buffer as ArrayBuffer;
+            const payload = await parseIfcxViewerModel(buffer, undefined, { allowEmptyGeometry: true });
+            if (get().collabRoomId !== roomId) return;
             get().setIfcDataStore(payload.dataStore);
-            get().setGeometryResult(
-              meshes.length > 0 ? buildGeometryResultFromMeshes(meshes) : payload.geometryResult,
-            );
+            const geomCount = session.doc.getMap('geometry').size;
+            if (geomCount !== lastGeomCount) {
+              lastGeomCount = geomCount;
+              // Re-key meshes into the reconstructed id space (pathToId) so 3D
+              // selection resolves to the right inspector entry.
+              const meshes = await hydrateGeometryFromRoom(geomApi, session, blobStore, payload.pathToId);
+              if (get().collabRoomId === roomId) {
+                get().setGeometryResult(
+                  meshes.length > 0 ? buildGeometryResultFromMeshes(meshes) : payload.geometryResult,
+                );
+              }
+            }
+          } finally {
+            reconstructing = false;
           }
+        };
+
+        // Initial build (only when we don't already have a local model).
+        if (get().collabRoomId === roomId && !get().ifcDataStore) {
+          await reconstruct();
         }
+
+        // Live updates: re-reconstruct (debounced) whenever a peer edits the doc.
+        let debounceHandle: ReturnType<typeof setTimeout> | null = null;
+        const onDocUpdate = () => {
+          if (debounceHandle) clearTimeout(debounceHandle);
+          debounceHandle = setTimeout(() => {
+            void reconstruct();
+          }, 800);
+        };
+        session.doc.on('update', onDocUpdate);
+        recipientLiveTeardown = () => {
+          if (debounceHandle) clearTimeout(debounceHandle);
+          try {
+            session.doc.off('update', onDocUpdate);
+          } catch {
+            // ignore
+          }
+        };
       } catch (err) {
         // eslint-disable-next-line no-console
         console.error('[collab] model reconstruction failed:', err);
@@ -361,6 +398,14 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
       }
       remoteApplyTeardown = null;
     }
+    if (recipientLiveTeardown) {
+      try {
+        recipientLiveTeardown();
+      } catch {
+        // ignore teardown errors
+      }
+      recipientLiveTeardown = null;
+    }
     docApi = null;
     const session = get().collabSession;
     if (session) {
@@ -395,6 +440,20 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
     } catch (err) {
       // eslint-disable-next-line no-console
       console.error('[collab] revoke link failed:', err);
+      return false;
+    }
+  },
+
+  kickPeer: async (clientId) => {
+    const roomId = get().collabRoomId;
+    const adminToken = get().collabSelfToken;
+    if (!roomId || !adminToken) return false;
+    try {
+      const { kickRoomPeer } = await import('@/lib/collab/share-link');
+      return await kickRoomPeer(roomId, clientId, adminToken);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error('[collab] kick peer failed:', err);
       return false;
     }
   },

@@ -48,6 +48,7 @@ function tokenOptions(secret: string): Partial<StartCollabServerOptions> {
         revoked.add(jti);
       },
     },
+    kickEndpoint: { secret },
   };
 }
 

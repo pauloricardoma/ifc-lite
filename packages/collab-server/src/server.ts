@@ -22,8 +22,10 @@ import {
 import {
   handleTokenMintRequest,
   handleRevokeRequest,
+  handleKickRequest,
   type TokenEndpointOptions,
   type RevokeEndpointOptions,
+  type KickEndpointOptions,
 } from './room-token.js';
 import { defaultMetrics, MetricsRegistry } from './metrics.js';
 
@@ -93,6 +95,12 @@ export interface StartCollabServerOptions {
    * consults). Omit to leave the route disabled (404).
    */
   revokeEndpoint?: RevokeEndpointOptions;
+  /**
+   * Enable the `POST /collab/kick` route so an admin can force-disconnect a
+   * peer by awareness clientId. The server binds the kick to its room manager;
+   * only the verifying `secret` is supplied here. Omit to disable (404).
+   */
+  kickEndpoint?: Pick<KickEndpointOptions, 'secret'>;
   /**
    * Cross-origin access for the HTTP routes. Default: enabled with origin
    * reflection (permissive). Pass an allow-list to restrict, or `false` to
@@ -222,6 +230,24 @@ export async function startCollabServer(
         // Revoke route: POST /collab/revoke (admin invalidates a share link).
         if (opts.revokeEndpoint && req.url && req.url.startsWith('/collab/revoke')) {
           const handled = await handleRevokeRequest(req, res, opts.revokeEndpoint);
+          if (handled) return;
+        }
+        // Kick route: POST /collab/kick (admin force-disconnects a peer).
+        if (opts.kickEndpoint && req.url && req.url.startsWith('/collab/kick')) {
+          const handled = await handleKickRequest(req, res, {
+            secret: opts.kickEndpoint.secret,
+            kick: async (room, clientId) => {
+              const pending = roomManager.peek(room);
+              if (!pending) return false;
+              const { kicked, jti } = (await pending).kickClient(clientId);
+              // Also revoke the peer's token so their y-websocket can't just
+              // reconnect with it. Requires the revoke endpoint's deny-list.
+              if (kicked && jti && opts.revokeEndpoint) {
+                await opts.revokeEndpoint.recordRevocation(jti, room);
+              }
+              return kicked;
+            },
+          });
           if (handled) return;
         }
         // Blob route: PUT / GET / HEAD / DELETE on /blobs/<hash>, GET /blobs.

@@ -103,6 +103,27 @@ export async function revokeRoomToken(shareToken: string, adminBearer: string): 
 }
 
 /**
+ * Admin: force-disconnect a peer by its awareness clientId. Requires an admin
+ * bearer token for the room. No-op (false) in local-only mode.
+ */
+export async function kickRoomPeer(
+  roomId: string,
+  clientId: number,
+  adminBearer: string,
+): Promise<boolean> {
+  const serverUrl = collabServerUrl();
+  if (!serverUrl) return false;
+  const res = await fetch(`${collabHttpBase(serverUrl)}/collab/kick`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${adminBearer}` },
+    body: JSON.stringify({ roomId, clientId }),
+  });
+  if (!res.ok) return false;
+  const json = (await res.json()) as { kicked?: boolean };
+  return json.kicked === true;
+}
+
+/**
  * Best-effort read of the role from a room token, for UI gating only.
  *
  * The authoritative role check happens on the collab-server via the signed

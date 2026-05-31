@@ -467,3 +467,85 @@ export async function handleRevokeRequest(
   res.end(JSON.stringify({ revoked: true, jti: target.jti }));
   return true;
 }
+
+// ── HTTP kick route ──────────────────────────────────────────────────────────
+
+export interface KickRequestBody {
+  roomId: string;
+  /** Awareness clientId of the peer to disconnect. */
+  clientId: number;
+}
+
+export interface KickEndpointOptions {
+  /** Secret used to verify the admin bearer token. */
+  secret: SecretResolver;
+  /** Force-disconnect a peer by awareness clientId; returns whether one matched. */
+  kick: (roomId: string, clientId: number) => boolean | Promise<boolean>;
+  allowOrigin?: string;
+  maxBodyBytes?: number;
+  now?: () => number;
+}
+
+/**
+ * Handle `POST /collab/kick` (and its CORS preflight). The caller must present
+ * an `admin` bearer token for the target room. Returns `true` when this route
+ * matched (and a response was sent).
+ */
+export async function handleKickRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  opts: KickEndpointOptions,
+): Promise<boolean> {
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  if (url.pathname !== '/collab/kick') return false;
+
+  const allowOrigin = opts.allowOrigin ?? '*';
+  const cors = {
+    'access-control-allow-origin': allowOrigin,
+    'access-control-allow-methods': 'POST, OPTIONS',
+    'access-control-allow-headers': 'content-type, authorization',
+  };
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, cors);
+    res.end();
+    return true;
+  }
+  if (req.method !== 'POST') {
+    res.writeHead(405, { ...cors, 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'method-not-allowed' }));
+    return true;
+  }
+
+  let body: unknown;
+  try {
+    body = await readJsonBody(req, opts.maxBodyBytes ?? 4096);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : 'bad-request';
+    res.writeHead(reason === 'body-too-large' ? 413 : 400, { ...cors, 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: reason }));
+    return true;
+  }
+
+  const reqBody = body as Partial<KickRequestBody>;
+  if (typeof reqBody?.roomId !== 'string' || !reqBody.roomId || typeof reqBody.clientId !== 'number') {
+    res.writeHead(400, { ...cors, 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'invalid-request' }));
+    return true;
+  }
+
+  const bearer = verifyRoomToken(bearerToken(req) ?? '', {
+    secret: opts.secret,
+    room: reqBody.roomId,
+    now: opts.now,
+  });
+  if (!bearer || bearer.role !== 'admin') {
+    res.writeHead(403, { ...cors, 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'forbidden' }));
+    return true;
+  }
+
+  const kicked = await opts.kick(reqBody.roomId, reqBody.clientId);
+  res.writeHead(200, { ...cors, 'content-type': 'application/json' });
+  res.end(JSON.stringify({ kicked }));
+  return true;
+}
