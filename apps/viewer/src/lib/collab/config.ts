@@ -5,10 +5,10 @@
 /**
  * Collaboration feature configuration (M1 scaffolding).
  *
- * Multiuser collab ships dark behind `collab.enabled` per the rollout plan
- * (`docs/architecture/essen-multiuser-collab-plan.md` §7.8). The flag is read
- * from the Vite build env, with a `localStorage` override so the feature can
- * be flipped on per-browser during development without a rebuild.
+ * Multiuser collab ships dark behind `collab.enabled` (see
+ * `docs/guide/collaboration.md`). The flag is read from the Vite build env,
+ * with a `localStorage` override so the feature can be flipped on per-browser
+ * during development without a rebuild.
  *
  *   VITE_COLLAB_ENABLED=true        — enable the Share button + collab UI
  *   VITE_COLLAB_SERVER_URL=wss://…  — collab-server websocket endpoint

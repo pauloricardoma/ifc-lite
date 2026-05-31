@@ -146,7 +146,6 @@ nav:
     - Coordinate Handling: architecture/coordinate-handling.md
     - Federation: architecture/federation.md
     - Collaboration (CRDT on IFCX): architecture/collab-plan.md
-    - Collaboration (viewer integration): architecture/essen-multiuser-collab-plan.md
   - API Reference:
     - TypeScript API: api/typescript.md
     - Rust API: api/rust.md
