@@ -204,10 +204,18 @@ export async function hydrateGeometryFromRoom(
       const job = jobs[nextJob++];
       let base = cache?.get(job.geomId);
       if (!base) {
-        const bytes = await blobStore.get(job.blobHash);
-        if (!bytes) continue;
-        base = decodeMesh(bytes);
-        cache?.set(job.geomId, base);
+        // Isolate per-blob failures: a missing/corrupt/half-synced blob must not
+        // abort the whole hydrate (which would lose every other mesh).
+        try {
+          const bytes = await blobStore.get(job.blobHash);
+          if (!bytes) continue;
+          base = decodeMesh(bytes);
+          cache?.set(job.geomId, base);
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.warn(`[collab] skipping geometry blob ${job.blobHash} (fetch/decode failed):`, err);
+          continue;
+        }
       }
       // Re-key into the recipient id space. Shallow-clone so a cached mesh shared
       // by several entities (instanced geometry) can carry distinct expressIds

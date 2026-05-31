@@ -162,6 +162,14 @@ export async function parseIfcxViewerModel(
   }
 
   const { bounds, stats } = calculateMeshBounds(meshes);
+  // Empty geometry (e.g. a collab recipient reconstructing before blob hydration
+  // with `allowEmptyGeometry`): calculateMeshBounds returns ±Infinity sentinels,
+  // which make coordinateInfo invalid. Collapse to a zero box; real bounds arrive
+  // once meshes hydrate.
+  if (meshes.length === 0 && pointClouds.length === 0) {
+    bounds.min = { x: 0, y: 0, z: 0 };
+    bounds.max = { x: 0, y: 0, z: 0 };
+  }
   // Expand bounds to include point cloud asset extents so fit-to-view, the
   // section-plane slider, and camera near/far all see the points too.
   for (const pc of pointClouds) {

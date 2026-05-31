@@ -83,8 +83,9 @@ export function loadOrCreateIdentity(): EphemeralIdentity {
         const parsed: unknown = JSON.parse(raw);
         if (isIdentity(parsed)) return parsed;
       }
-    } catch {
-      // fall through to mint a fresh identity
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('[collab] failed to read stored identity; minting a fresh one:', err);
     }
   }
   const id = randomId();
@@ -98,7 +99,8 @@ export function persistIdentity(identity: EphemeralIdentity): void {
   if (typeof localStorage === 'undefined') return;
   try {
     localStorage.setItem(LS_IDENTITY_KEY, JSON.stringify(identity));
-  } catch {
-    // ignore — non-fatal
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[collab] failed to persist identity to localStorage:', err);
   }
 }

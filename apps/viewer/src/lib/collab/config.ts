@@ -33,7 +33,9 @@ function readLocalStorageOverride(): boolean | null {
     if (v === 'true' || v === '1') return true;
     if (v === 'false' || v === '0') return false;
     return null;
-  } catch {
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[collab] failed to read enabled-override from localStorage:', err);
     return null;
   }
 }
@@ -51,8 +53,9 @@ export function setCollabEnabledOverride(enabled: boolean | null): void {
   try {
     if (enabled === null) localStorage.removeItem(LS_OVERRIDE_KEY);
     else localStorage.setItem(LS_OVERRIDE_KEY, enabled ? 'true' : 'false');
-  } catch {
-    // ignore — non-fatal
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[collab] failed to persist enabled-override to localStorage:', err);
   }
 }
 

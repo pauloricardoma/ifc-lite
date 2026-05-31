@@ -5,6 +5,8 @@
 
 /** CLI entry point: `ifc-lite-collab-server`. */
 
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { FilePersistence, startCollabServer, type StartCollabServerOptions } from './server.js';
 import { FsBlobStorage } from './blob-route.js';
 import { createRoomTokenAuthenticator } from './room-token.js';
@@ -27,18 +29,52 @@ const tokenSecret = process.env.COLLAB_TOKEN_SECRET;
  *     room may mint further links — so a link's holder can't escalate.
  *   - Admins can revoke a link by `jti` (deny-list).
  */
-function tokenOptions(secret: string): Partial<StartCollabServerOptions> {
+function tokenOptions(secret: string, dataDir: string): Partial<StartCollabServerOptions> {
+  // Persist the revocation deny-list + claimed-room set to disk so they survive
+  // restarts. Without this, a restart (a) forgets revocations and (b) lets the
+  // first POST /collab/token for an already-claimed persisted room take it over
+  // with a fresh admin token. (Needs a durable volume to actually persist.)
+  const statePath = path.join(dataDir, 'access-control.json');
   const revoked = new Set<string>();
   const claimedRooms = new Set<string>();
+  try {
+    const parsed = JSON.parse(fs.readFileSync(statePath, 'utf8')) as {
+      revoked?: string[];
+      claimedRooms?: string[];
+    };
+    for (const j of parsed.revoked ?? []) revoked.add(j);
+    for (const r of parsed.claimedRooms ?? []) claimedRooms.add(r);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      // eslint-disable-next-line no-console
+      console.warn('[collab-server] could not read access-control state:', err);
+    }
+  }
+  const persist = () => {
+    try {
+      fs.mkdirSync(dataDir, { recursive: true });
+      fs.writeFileSync(
+        statePath,
+        JSON.stringify({ revoked: [...revoked], claimedRooms: [...claimedRooms] }),
+      );
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('[collab-server] could not persist access-control state:', err);
+    }
+  };
   return {
     authenticate: createRoomTokenAuthenticator({ secret, isRevoked: (jti) => revoked.has(jti) }),
     tokenEndpoint: {
       secret,
       authorize: (request, { bearerClaims }): Role | null => {
         const room = request.roomId;
+        // A revoked bearer must not be able to keep minting links, even though
+        // its signature + expiry still verify.
+        if (bearerClaims?.jti && revoked.has(bearerClaims.jti)) return null;
         if (bearerClaims?.room === room && bearerClaims.role === 'admin') return request.role;
         if (!claimedRooms.has(room)) {
           claimedRooms.add(room);
+          persist();
           return 'admin'; // creator of a fresh room
         }
         return null; // claimed room + non-admin caller → denied
@@ -48,6 +84,7 @@ function tokenOptions(secret: string): Partial<StartCollabServerOptions> {
       secret,
       recordRevocation: (jti) => {
         revoked.add(jti);
+        persist();
       },
     },
     kickEndpoint: { secret },
@@ -64,7 +101,7 @@ async function main() {
     // them on restart. On a mounted volume this is durable + ~66× cheaper/GB.
     blobStorage: new FsBlobStorage(dataDir),
     maxRooms,
-    ...(tokenSecret ? tokenOptions(tokenSecret) : {}),
+    ...(tokenSecret ? tokenOptions(tokenSecret, dataDir) : {}),
   });
   // eslint-disable-next-line no-console
   console.log(

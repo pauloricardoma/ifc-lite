@@ -144,7 +144,7 @@ Collaboration is **two deployables** with different shapes:
 Set two **build-time** environment variables on the Vercel project (Production +
 Preview), then redeploy — Vite inlines them at build:
 
-```
+```ini
 VITE_COLLAB_ENABLED   = true
 VITE_COLLAB_SERVER_URL = wss://collab.ifclite.com
 ```

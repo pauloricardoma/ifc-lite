@@ -292,7 +292,7 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
     try {
       session.presence.patch({ role });
     } catch {
-      // presence may not accept the patch in older runtimes — non-fatal
+      /* cleanup — safe to ignore: presence may not accept the patch in older runtimes */
     }
 
     const geomApi: CollabGeomApi = {
@@ -500,7 +500,7 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
           try {
             session.doc.off('update', onDocUpdate);
           } catch {
-            // ignore
+            /* cleanup — safe to ignore */
           }
           // Drop the reconstructed room model on leave so rejoining a different
           // room doesn't accumulate stale `room:*` models. (Only the recipient
@@ -509,7 +509,7 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
             try {
               get().removeModel(roomModelId);
             } catch {
-              // ignore
+              /* cleanup — safe to ignore */
             }
           }
         };
@@ -521,24 +521,29 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
 
     // Remote → local apply (plan §7.5): replay peers' property/attribute edits
     // into the active model's MutablePropertyView (no undo tracking, no echo).
+    // The active model is resolved *per event* (not captured once) so switching
+    // models mid-session targets the currently-active view, not a stale one.
     const applyStore = get().ifcDataStore;
-    const applyModelId = get().activeModelId;
-    if (applyStore && applyModelId) {
+    if (applyStore) {
+      const activeView = () => {
+        const modelId = get().activeModelId;
+        return modelId ? get().mutationViews.get(modelId) : undefined;
+      };
       remoteApplyTeardown = attachRemoteApply(session, applyStore, {
         onProperty: (entityId, pset, prop, value, type) => {
-          const view = get().mutationViews.get(applyModelId);
+          const view = activeView();
           if (!view) return;
           view.setProperty(entityId, pset, prop, value, type);
           set((s) => ({ mutationVersion: s.mutationVersion + 1 }));
         },
         onPropertyDelete: (entityId, pset, prop) => {
-          const view = get().mutationViews.get(applyModelId);
+          const view = activeView();
           if (!view) return;
           view.deleteProperty(entityId, pset, prop);
           set((s) => ({ mutationVersion: s.mutationVersion + 1 }));
         },
         onAttribute: (entityId, attrName, value) => {
-          const view = get().mutationViews.get(applyModelId);
+          const view = activeView();
           if (!view) return;
           view.setAttribute(entityId, attrName, value === null ? '' : String(value));
           set((s) => ({ mutationVersion: s.mutationVersion + 1 }));
@@ -579,7 +584,7 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
       try {
         remoteApplyTeardown();
       } catch {
-        // ignore teardown errors
+        /* cleanup — safe to ignore */
       }
       remoteApplyTeardown = null;
     }
@@ -587,7 +592,7 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
       try {
         recipientLiveTeardown();
       } catch {
-        // ignore teardown errors
+        /* cleanup — safe to ignore */
       }
       recipientLiveTeardown = null;
     }
@@ -595,7 +600,7 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
       try {
         annotationInboundTeardown();
       } catch {
-        // ignore teardown errors
+        /* cleanup — safe to ignore */
       }
       annotationInboundTeardown = null;
     }

@@ -341,13 +341,11 @@ export function addMaterial(doc: Y.Doc, path: string, assignment: MaterialAssign
 /* Geometry reference                                                   */
 /* ------------------------------------------------------------------ */
 
-/** Read the geomIds list off a geometryRef map, with legacy single-`geomId` fallback. */
+/** Read the geomIds list off a geometryRef map. */
 function readGeomIds(refMap: Y.Map<unknown> | undefined): string[] {
   if (!refMap) return [];
   const ids = refMap.get('geomIds');
-  if (Array.isArray(ids)) return ids.filter((v): v is string => typeof v === 'string');
-  const legacy = refMap.get('geomId');
-  return typeof legacy === 'string' ? [legacy] : [];
+  return Array.isArray(ids) ? ids.filter((v): v is string => typeof v === 'string') : [];
 }
 
 /** Point an entity at one or more entries in the top-level geometry map (replaces any existing refs). */
@@ -357,7 +355,6 @@ export function setGeometryRef(doc: Y.Doc, path: string, ref: GeometryRefRecord)
   const refMap = entity.get(ENTITY_KEY.GEOMETRY_REF) as Y.Map<unknown> | undefined;
   if (!refMap) throw new Error(`@ifc-lite/collab: entity "${path}" missing geometryRef`);
   refMap.set('geomIds', [...ref.geomIds]);
-  if (refMap.has('geomId')) refMap.delete('geomId'); // drop legacy single-ref shape
 }
 
 /** Append a geomId to an entity's geometry refs (idempotent — no duplicates). */
@@ -369,7 +366,6 @@ export function addGeometryRef(doc: Y.Doc, path: string, geomId: string): void {
   const ids = readGeomIds(refMap);
   if (ids.includes(geomId)) return;
   refMap.set('geomIds', [...ids, geomId]);
-  if (refMap.has('geomId')) refMap.delete('geomId');
 }
 
 export function getGeometryRef(doc: Y.Doc, path: string): GeometryRefRecord | undefined {

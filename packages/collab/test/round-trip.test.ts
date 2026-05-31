@@ -20,6 +20,15 @@ import { snapshotToIfcx } from '../src/snapshot/to-ifcx.js';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, '../../..');
 const fixturesDir = path.join(repoRoot, 'tests/models/ifc5');
+const FIXTURE = 'Hello_Wall_hello-wall.ifcx';
+
+// Fixtures aren't committed (AGENTS.md §9); skip cleanly when absent rather than
+// throwing on a fresh clone. CI runs `pnpm fixtures` before the test step.
+const hasFixture = fs.existsSync(path.join(fixturesDir, FIXTURE));
+if (!hasFixture) {
+  // eslint-disable-next-line no-console
+  console.warn(`[round-trip] skipping — ${FIXTURE} missing; run \`pnpm fixtures\` to fetch it`);
+}
 
 function loadFixture(name: string): string {
   return fs.readFileSync(path.join(fixturesDir, name), 'utf-8');
@@ -40,7 +49,7 @@ function summarise(doc: ReturnType<typeof createCollabDoc>): {
 }
 
 describe('seedFromIfcx + snapshotToIfcx', () => {
-  it('preserves entity set and attributes across one round-trip', () => {
+  it.skipIf(!hasFixture)('preserves entity set and attributes across one round-trip', () => {
     const text = loadFixture('Hello_Wall_hello-wall.ifcx');
     const docA = createCollabDoc();
     seedFromIfcx(docA, text);
@@ -58,7 +67,7 @@ describe('seedFromIfcx + snapshotToIfcx', () => {
     expect(summaryB.attrCount).toBe(summaryA.attrCount);
   });
 
-  it('idempotent re-seed against same source', () => {
+  it.skipIf(!hasFixture)('idempotent re-seed against same source', () => {
     const text = loadFixture('Hello_Wall_hello-wall.ifcx');
     const doc = createCollabDoc();
     seedFromIfcx(doc, text);

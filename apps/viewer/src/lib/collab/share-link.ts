@@ -133,7 +133,13 @@ export async function kickRoomPeer(
  */
 export function parseRoleFromToken(token: string): CollabRole | null {
   try {
-    const b64 = token.replace(/-/g, '+').replace(/_/g, '/');
+    // A signed JWT is `header.payload.signature` — decode the middle (payload)
+    // segment. The dev placeholder is a single base64url JSON blob, so fall back
+    // to the whole token. Re-pad base64url before decoding.
+    const parts = token.split('.');
+    const segment = parts.length === 3 ? parts[1] : token;
+    const b64Raw = segment.replace(/-/g, '+').replace(/_/g, '/');
+    const b64 = b64Raw + '='.repeat((4 - (b64Raw.length % 4)) % 4);
     const json =
       typeof atob !== 'undefined' ? atob(b64) : Buffer.from(b64, 'base64').toString('utf8');
     const payload: unknown = JSON.parse(json);
