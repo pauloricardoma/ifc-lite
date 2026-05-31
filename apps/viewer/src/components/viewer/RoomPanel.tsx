@@ -13,7 +13,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Check, Link2, LogOut, ShieldOff, UserMinus, X } from 'lucide-react';
+import { Check, Link2, LocateFixed, LogOut, ShieldOff, UserMinus, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
@@ -71,13 +71,17 @@ function PresenceDot({ color, active }: { color: string; active?: boolean }) {
   );
 }
 
+type Vec3 = { x: number; y: number; z: number };
+
 function PeerRow({
   color,
   name,
   isSelf,
   role,
   activity,
+  selectionCount,
   index,
+  onJump,
   onKick,
 }: {
   color: string;
@@ -85,9 +89,16 @@ function PeerRow({
   isSelf?: boolean;
   role?: CollabRole;
   activity?: string;
+  selectionCount?: number;
   index: number;
+  onJump?: () => void;
   onKick?: () => void;
 }) {
+  // Sub-line: activity (idle/measuring…) and/or selection count.
+  const subParts: string[] = [];
+  if (activity && activity !== 'active') subParts.push(activity);
+  if (selectionCount && selectionCount > 0) subParts.push(`${selectionCount} selected`);
+  const subLine = subParts.join(' · ');
   return (
     <div
       className="group flex items-center gap-2 rounded-md px-1.5 py-1 transition-colors hover:bg-muted/60"
@@ -99,11 +110,25 @@ function PeerRow({
           <span className="truncate text-xs font-medium">{name}</span>
           {isSelf && <span className="text-[10px] text-muted-foreground">(you)</span>}
         </div>
-        {activity && activity !== 'active' && (
-          <span className="text-[10px] capitalize text-muted-foreground">{activity}</span>
-        )}
+        {subLine && <span className="text-[10px] capitalize text-muted-foreground">{subLine}</span>}
       </div>
       {role && <RoleBadge role={role} />}
+      {onJump && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              className="size-5 shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover:opacity-100"
+              onClick={onJump}
+              aria-label={`Jump to ${name}'s view`}
+            >
+              <LocateFixed className="size-3" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="left">Jump to view</TooltipContent>
+        </Tooltip>
+      )}
       {onKick && (
         <Tooltip>
           <TooltipTrigger asChild>
@@ -184,10 +209,32 @@ export function RoomPanel({ open, onOpenChange }: RoomPanelProps) {
     onOpenChange(false);
   }, [stopCollab, onOpenChange]);
 
+  const jumpToPeer = useCallback(
+    (camera: { position: Vec3; target: Vec3; fov: number } | undefined) => {
+      if (!camera) return;
+      const { cameraCallbacks, projectionMode } = useViewerStore.getState();
+      // Presence carries only position/target/fov; reconstruct a viewpoint with
+      // world-up + our own projection ("jump to roughly their view").
+      cameraCallbacks.applyViewpoint?.(
+        {
+          position: camera.position,
+          target: camera.target,
+          up: { x: 0, y: 1, z: 0 },
+          fov: camera.fov,
+          projectionMode,
+        },
+        true,
+      );
+    },
+    [],
+  );
+
   const peerRows = useMemo(
     () =>
       collabPeers.filter((p) => p?.user).map((p, i) => {
         const clientId = (p as { clientId?: number }).clientId;
+        const camera = (p as { camera?: { position: Vec3; target: Vec3; fov: number } }).camera;
+        const selection = (p as { selection?: string[] }).selection;
         return (
           <PeerRow
             key={p.user.id}
@@ -195,12 +242,14 @@ export function RoomPanel({ open, onOpenChange }: RoomPanelProps) {
             name={p.user.name ?? 'Guest'}
             role={(p as { role?: CollabRole }).role}
             activity={p.status ?? (p.tool && p.tool !== 'select' ? p.tool : undefined)}
+            selectionCount={selection?.length}
             index={i + 1}
+            onJump={camera ? () => jumpToPeer(camera) : undefined}
             onKick={isAdmin && clientId != null ? () => void kickPeer(clientId) : undefined}
           />
         );
       }),
-    [collabPeers, isAdmin, kickPeer],
+    [collabPeers, isAdmin, kickPeer, jumpToPeer],
   );
 
   if (!open || !collabRoomId) return null;
