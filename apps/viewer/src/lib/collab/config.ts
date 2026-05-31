@@ -59,5 +59,10 @@ export function setCollabEnabledOverride(enabled: boolean | null): void {
 /** Configured collab-server websocket URL, or `null` for local-only mode. */
 export function collabServerUrl(): string | null {
   const raw = import.meta.env.VITE_COLLAB_SERVER_URL;
-  return typeof raw === 'string' && raw.length > 0 ? raw : null;
+  if (typeof raw !== 'string') return null;
+  // Tolerate copy-paste artifacts from dashboard/CLI env entry: surrounding
+  // whitespace, and a trailing slash that would otherwise yield `wss://host//room`
+  // once y-websocket appends the room path.
+  const url = raw.trim().replace(/\/+$/, '');
+  return url.length > 0 ? url : null;
 }
