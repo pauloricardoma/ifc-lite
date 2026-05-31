@@ -123,16 +123,68 @@ const handle = await startCollabServer({
 See `packages/collab-server/src/bin.ts` for the exact reference policy the CLI
 uses, and `packages/collab-server/src/server.ts` for every option.
 
-## Deployment checklist
+## Deploying to production
 
-- [ ] Terminate TLS and serve over `wss://` (set `VITE_COLLAB_SERVER_URL` to the
-      `wss://` URL).
-- [ ] Set a strong `COLLAB_TOKEN_SECRET` (don't run public instances anonymous).
-- [ ] Use durable persistence (`COLLAB_DATA_DIR` on a real volume) and a durable
-      `blobStorage` (programmatic) — the in-memory blob store is dev-only.
-- [ ] Scrape `/metrics` and alert on `collab_rooms` / peer counts.
-- [ ] For multiple instances, share the revocation deny-list and blob store, and
-      pin a room to one instance (sticky sessions) or use a shared backend.
+Collaboration is **two deployables** with different shapes:
+
+| Piece | What it is | Where it goes |
+| --- | --- | --- |
+| Viewer (`apps/viewer`) | Static Vite SPA | **Vercel** (already at `ifclite.com`) — just add env vars |
+| Collab server (`@ifc-lite/collab-server`) | Long-lived, stateful WebSocket relay | A **container host** (Railway / Render / Fly / a VM) — **not** Vercel functions |
+
+!!! warning "The collab server is not a serverless function"
+    A room keeps a single authoritative Y.Doc + live WebSocket connections **in
+    one process's memory**. Serverless/edge functions are per-request and can't
+    guarantee every peer of a room hits the same instance, so the relay needs a
+    persistent process — the same way `apps/server` is hosted. Vercel stays the
+    perfect home for the viewer; the relay lives next to it on a stateful host.
+
+### 1. Viewer on Vercel
+
+Set two **build-time** environment variables on the Vercel project (Production +
+Preview), then redeploy — Vite inlines them at build:
+
+```
+VITE_COLLAB_ENABLED   = true
+VITE_COLLAB_SERVER_URL = wss://collab.ifclite.com
+```
+
+The viewer's required cross-origin-isolation headers (`COOP`/`COEP`) are already
+set in `vercel.json`. Cross-origin calls from the viewer to the relay's
+`/blobs` + `/collab/*` routes work because the relay sends CORS headers.
+
+### 2. Collab server on Railway (mirrors `apps/server`)
+
+The repo ships a reference `packages/collab-server/Dockerfile` and
+`railway.toml`. On Railway:
+
+1. New service → deploy from this repo → it picks up `railway.toml`
+   (Dockerfile build, `/healthz` healthcheck, single replica).
+2. Set service variables:
+    - `COLLAB_TOKEN_SECRET` — a strong, **stable** secret (rotating it invalidates
+      every live link). Keep it secret.
+    - (`PORT` is injected by Railway; the server already reads it.)
+3. Attach a **volume mounted at `/data`** (the image sets `COLLAB_DATA_DIR=/data`)
+   for durable room persistence.
+4. Add the custom domain `collab.ifclite.com` and point a DNS `CNAME` at the
+   Railway domain. Railway terminates TLS, so the public URL is `wss://…`.
+
+Render/Fly/a plain VM work identically — run `node packages/collab-server/dist/bin.js`
+with the same env, behind TLS.
+
+### Checklist
+
+- [ ] Viewer: `VITE_COLLAB_ENABLED=true` + `VITE_COLLAB_SERVER_URL=wss://collab.ifclite.com`, redeployed.
+- [ ] Relay served over `wss://` (TLS) — required, since `ifclite.com` is HTTPS.
+- [ ] Strong, stable `COLLAB_TOKEN_SECRET` (never run a public instance anonymous).
+- [ ] Durable persistence: `COLLAB_DATA_DIR` on a real volume.
+- [ ] **Single replica** (`numReplicas = 1`) unless you add room-affinity routing
+      **plus** a shared blob store and a shared revocation deny-list.
+- [ ] Geometry blobs are in-memory in the CLI — on a restart, recipients lose
+      meshes until the owner re-shares. For durability, wire a `blobStorage`
+      (S3/GCS/filesystem) via the [programmatic API](#programmatic-embedding).
+- [ ] Optionally lock CORS down (`cors: { origin: ['https://ifclite.com'] }`).
+- [ ] Scrape `/metrics`; alert on `collab_rooms` / peer counts.
 
 ## See also
 

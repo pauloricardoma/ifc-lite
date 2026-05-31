@@ -9,7 +9,8 @@ import { FilePersistence, startCollabServer, type StartCollabServerOptions } fro
 import { createRoomTokenAuthenticator } from './room-token.js';
 import { type Role } from './auth.js';
 
-const port = Number(process.env.COLLAB_PORT ?? 1234);
+// `PORT` is the convention most hosts inject (Railway, Render, Fly, …).
+const port = Number(process.env.COLLAB_PORT ?? process.env.PORT ?? 1234);
 const host = process.env.COLLAB_HOST ?? '0.0.0.0';
 const dataDir = process.env.COLLAB_DATA_DIR ?? './.collab-data';
 const maxRooms = Number(process.env.COLLAB_MAX_ROOMS ?? 1024);

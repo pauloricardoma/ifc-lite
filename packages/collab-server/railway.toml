@@ -1,0 +1,16 @@
+# Railway deployment for the IFC-Lite collaboration sync server.
+# Mirrors apps/server's setup. Build context is the repo root.
+
+[build]
+builder = "dockerfile"
+dockerfilePath = "packages/collab-server/Dockerfile"
+
+[deploy]
+# Each room holds authoritative in-memory CRDT state, so run a SINGLE replica.
+# Scaling out requires room-affinity routing plus a shared blob store and a
+# shared revocation deny-list (see the programmatic API).
+numReplicas = 1
+healthcheckPath = "/healthz"
+healthcheckTimeout = 10
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
