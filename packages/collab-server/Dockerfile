@@ -15,9 +15,13 @@ RUN corepack enable
 # frozen, filtered install). A root .dockerignore keeps build artifacts out.
 COPY . .
 
-# Install and build just @ifc-lite/collab-server and what it depends on.
+# Install just @ifc-lite/collab-server and its dependency subgraph (keeps the
+# image off the heavy viewer/wasm/native toolchain). `turbo` is a root-only
+# devDependency, so build the two packages directly with their own TypeScript
+# (collab first — collab-server's build resolves its dist).
 RUN pnpm install --frozen-lockfile --filter "@ifc-lite/collab-server..."
-RUN pnpm turbo build --filter=@ifc-lite/collab-server
+RUN pnpm --filter @ifc-lite/collab build \
+ && pnpm --filter @ifc-lite/collab-server build
 
 ENV NODE_ENV=production
 # Durable Y.Doc persistence — mount a volume here in production.

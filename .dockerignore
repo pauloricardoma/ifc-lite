@@ -1,0 +1,18 @@
+# Keep build contexts lean (collab-server image + any root-context Docker build).
+# Source + manifests + lockfile are kept; only artifacts/vendored output excluded.
+**/node_modules
+.git
+.turbo
+**/dist
+**/build
+target
+**/target
+site
+.vercel
+.collab-data*
+**/*.log
+**/.DS_Store
+coverage
+.claude
+playwright-report
+test-results
