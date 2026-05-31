@@ -53,6 +53,7 @@ import {
   type CollabDocApi,
 } from '@/lib/collab/mutation-bridge';
 import type { IfcDataStore } from '@ifc-lite/parser';
+import type { MeshData } from '@ifc-lite/geometry';
 import {
   buildGeometryResultFromMeshes,
   hydrateGeometryFromRoom,
@@ -361,6 +362,9 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
         const blobStore = await createSharedBlobStore(collabMod, collabServerUrl(), token);
         let lastGeomCount = -1;
         let reconstructing = false;
+        // Decoded-mesh cache (geomId → mesh), persisted across re-reconstructs so
+        // a later doc update only fetches the *new* blobs, not the whole model.
+        const geomCache = new Map<string, MeshData>();
 
         // Re-derive the whole model from the doc. Cheap metadata refresh always;
         // geometry is re-hydrated from blobs only when the geometry set changed
@@ -384,8 +388,24 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
             if (geomCount !== lastGeomCount) {
               lastGeomCount = geomCount;
               // Re-key meshes into the reconstructed id space (pathToId) so 3D
-              // selection resolves to the right inspector entry.
-              const meshes = await hydrateGeometryFromRoom(geomApi, session, blobStore, payload.pathToId);
+              // selection resolves to the right inspector entry. Blobs are
+              // fetched in parallel (cached by geomId) and rendered incrementally
+              // via onProgress so a large model fills in progressively instead of
+              // staying blank until every blob arrives.
+              const meshes = await hydrateGeometryFromRoom(
+                geomApi,
+                session,
+                blobStore,
+                payload.pathToId,
+                {
+                  cache: geomCache,
+                  onProgress: (soFar) => {
+                    if (get().collabRoomId === roomId && soFar.length > 0) {
+                      get().setGeometryResult(buildGeometryResultFromMeshes(soFar.slice()));
+                    }
+                  },
+                },
+              );
               if (geomCount > 0 && meshes.length === 0) {
                 // eslint-disable-next-line no-console
                 console.warn(

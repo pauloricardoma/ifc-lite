@@ -100,14 +100,36 @@ export async function seedGeometryToRoom(
  * expressId, which makes 3D selection resolve to the right inspector entry.
  * Without `pathToId` (e.g. tests), the blob's embedded expressId is kept.
  * Missing blobs are skipped (the seed may still be syncing).
+ *
+ * Blobs are fetched with bounded concurrency (not one-at-a-time, which left a
+ * large model blank for a minute+) and decoded meshes are memoised by geomId in
+ * `opts.cache` so a later re-hydrate (e.g. after a peer edit) only fetches the
+ * *new* blobs. `opts.onProgress` fires with the growing mesh list so the caller
+ * can render incrementally instead of waiting for every blob.
  */
+export interface HydrateOptions {
+  /** Max blobs fetched in parallel. Default 12. */
+  concurrency?: number;
+  /** Decoded-mesh cache keyed by geomId, persisted across re-hydrates. */
+  cache?: Map<string, MeshData>;
+  /** Called as meshes accumulate (throttled by batch), for incremental render. */
+  onProgress?: (meshesSoFar: readonly MeshData[]) => void;
+}
+
 export async function hydrateGeometryFromRoom(
   api: CollabGeomApi,
   session: CollabSession,
   blobStore: BlobStore,
   pathToId?: Map<string, number>,
+  opts: HydrateOptions = {},
 ): Promise<MeshData[]> {
-  const out: MeshData[] = [];
+  // 1. Collect all (blobHash, expressId, geomId) jobs up front.
+  interface Job {
+    geomId: string;
+    blobHash: string;
+    expressId: number | undefined;
+  }
+  const jobs: Job[] = [];
   for (const [path] of api.iterEntities(session.doc)) {
     const ref = api.getGeometryRef(session.doc, path);
     if (!ref) continue;
@@ -116,13 +138,40 @@ export async function hydrateGeometryFromRoom(
       const node = api.getGeometry(session.doc, geomId);
       const blobHash = node?.get('blobHash');
       if (typeof blobHash !== 'string') continue;
-      const bytes = await blobStore.get(blobHash);
-      if (!bytes) continue;
-      const mesh = decodeMesh(bytes);
-      if (expressId !== undefined) mesh.expressId = expressId;
-      out.push(mesh);
+      jobs.push({ geomId, blobHash, expressId });
     }
   }
+
+  // 2. Fetch + decode with bounded concurrency; serve cache hits without refetch.
+  const cache = opts.cache;
+  const out: MeshData[] = [];
+  let nextJob = 0;
+  let sinceProgress = 0;
+  const concurrency = Math.max(1, Math.min(opts.concurrency ?? 12, jobs.length || 1));
+
+  const worker = async (): Promise<void> => {
+    while (nextJob < jobs.length) {
+      const job = jobs[nextJob++];
+      let base = cache?.get(job.geomId);
+      if (!base) {
+        const bytes = await blobStore.get(job.blobHash);
+        if (!bytes) continue;
+        base = decodeMesh(bytes);
+        cache?.set(job.geomId, base);
+      }
+      // Re-key into the recipient id space. Shallow-clone so a cached mesh shared
+      // by several entities (instanced geometry) can carry distinct expressIds
+      // without mutating the cached copy; the typed arrays are shared (read-only).
+      const mesh = job.expressId !== undefined ? { ...base, expressId: job.expressId } : base;
+      out.push(mesh);
+      if (opts.onProgress && ++sinceProgress >= 50) {
+        sinceProgress = 0;
+        opts.onProgress(out);
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: concurrency }, () => worker()));
+  if (opts.onProgress) opts.onProgress(out);
   return out;
 }
 
