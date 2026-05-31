@@ -251,6 +251,17 @@ export function AnnotationPopover({
           </>
         ) : (
           <>
+            {annotation.authorName && (
+              <div className="mb-1.5 flex items-center gap-1.5" title={`By ${annotation.authorName}`}>
+                <span
+                  className="inline-block h-2 w-2 rounded-full shrink-0"
+                  style={{ background: annotation.authorColor ?? '#888888' }}
+                />
+                <span className="text-[9.5px] font-mono uppercase tracking-wider text-zinc-500 dark:text-zinc-400 truncate">
+                  {annotation.authorName}
+                </span>
+              </div>
+            )}
             {annotation.note ? (
               <p className="font-mono text-[11px] leading-relaxed text-zinc-800 dark:text-zinc-200 whitespace-pre-wrap break-words max-h-48 overflow-y-auto">
                 {annotation.note}

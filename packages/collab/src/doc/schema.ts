@@ -17,6 +17,12 @@ export const TOP = {
   RELATIONSHIPS: 'relationships',
   GEOMETRY: 'geometry',
   META: 'meta',
+  /**
+   * Collaboration annotation pins (markup), keyed by annotation id. Synced by
+   * Yjs alongside the model but intentionally NOT part of the IFCX snapshot/seed
+   * (snapshotToIfcx only walks ENTITIES) — markup is room overlay data, not BIM.
+   */
+  ANNOTATIONS: 'annotations',
 } as const;
 
 /** Origin tag used for transactions originated by the local CollabSession. */
@@ -153,6 +159,7 @@ export function createCollabDoc(opts: { gc?: boolean } = {}): Y.Doc {
   doc.getMap(TOP.RELATIONSHIPS);
   doc.getMap(TOP.GEOMETRY);
   doc.getMap(TOP.META);
+  doc.getMap(TOP.ANNOTATIONS);
   return doc;
 }
 

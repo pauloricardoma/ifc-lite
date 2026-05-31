@@ -61,6 +61,12 @@ import {
   type CollabGeomApi,
 } from '@/lib/collab/geometry-sync';
 import { createSharedBlobStore } from '@/lib/collab/blob-store';
+import {
+  attachAnnotationInbound,
+  annotationToCrdtFields,
+  type AnnotationDocApi,
+} from '@/lib/collab/annotation-sync';
+import type { Annotation } from '@/store/slices/annotationsSlice';
 
 /**
  * Access roles, mirrored from `@ifc-lite/collab-server`'s `Role`. Kept as a
@@ -156,6 +162,11 @@ export interface CollabSlice {
   ) => void;
   mirrorPropertyDelete: (entityId: number, psetName: string, propName: string) => void;
   mirrorAttributeEdit: (entityId: number, attrName: string, value: unknown) => void;
+
+  // ── Annotation mirror (collab markup) — called by annotationsSlice after a
+  //    local create/edit/delete. No-ops without a session or comment permission.
+  mirrorAnnotationUpsert: (annotation: Annotation) => void;
+  mirrorAnnotationDelete: (id: string) => void;
 }
 
 function pickProvider(): ProviderKind {
@@ -185,6 +196,9 @@ function toArrayBuffer(u8: Uint8Array): ArrayBuffer {
 // Collab doc helpers captured from the lazy-loaded runtime (see startCollab),
 // so the synchronous mutation mirror can write to the doc without re-importing.
 let docApi: CollabDocApi | null = null;
+// Annotation CRDT helpers + inbound-observer teardown (collab markup sync).
+let annotationDocApi: AnnotationDocApi | null = null;
+let annotationInboundTeardown: (() => void) | null = null;
 // Teardown for the remote→local Y.Doc observer.
 let remoteApplyTeardown: (() => void) | null = null;
 // Teardown for the recipient's live re-reconstruction observer.
@@ -240,6 +254,13 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
         deletePropertyValue: collab.deletePropertyValue,
         setAttribute: collab.setAttribute,
         PROPERTY_TYPE_NAMES: collab.PROPERTY_TYPE_NAMES,
+      };
+      // Capture the annotation (markup) CRDT helpers for the sync bridge.
+      annotationDocApi = {
+        annotationsMap: (doc) => collab.annotationsMap(doc),
+        createAnnotation: (doc, id, fields) => collab.createAnnotation(doc, id, fields),
+        deleteAnnotation: (doc, id) => collab.deleteAnnotation(doc, id),
+        iterAnnotations: (doc) => collab.iterAnnotations(doc),
       };
       session = await collab.createCollabSession({
         roomId,
@@ -525,6 +546,26 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
       });
     }
 
+    // Annotation (markup) sync: reflect peers' pins into the local slice, and
+    // seed our existing local pins into the room ("share existing + new").
+    if (annotationDocApi) {
+      try {
+        annotationInboundTeardown = attachAnnotationInbound(session, annotationDocApi, {
+          getLocal: () => get().annotations,
+          upsertRemote: (a) => get().upsertRemoteAnnotation(a),
+          removeRemote: (id) => get().removeRemoteAnnotation(id),
+        });
+        if (get().canCollabComment()) {
+          for (const a of get().annotations.values()) {
+            if (!a.remote) get().mirrorAnnotationUpsert(a);
+          }
+        }
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('[collab] annotation sync setup failed:', err);
+      }
+    }
+
     set({
       collabSession: session,
       collabStatus: session.status(),
@@ -550,7 +591,16 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
       }
       recipientLiveTeardown = null;
     }
+    if (annotationInboundTeardown) {
+      try {
+        annotationInboundTeardown();
+      } catch {
+        // ignore teardown errors
+      }
+      annotationInboundTeardown = null;
+    }
     docApi = null;
+    annotationDocApi = null;
     const session = get().collabSession;
     if (session) {
       try {
@@ -635,5 +685,19 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
     const store = get().ifcDataStore;
     if (!session || !store || !docApi) return;
     mirrorAttribute(docApi, session, store, entityId, attrName, value);
+  },
+
+  mirrorAnnotationUpsert: (annotation) => {
+    const session = get().collabSession;
+    if (!session || !annotationDocApi || !get().canCollabComment()) return;
+    const api = annotationDocApi;
+    session.transact(() => api.createAnnotation(session.doc, annotation.id, annotationToCrdtFields(annotation)));
+  },
+
+  mirrorAnnotationDelete: (id) => {
+    const session = get().collabSession;
+    if (!session || !annotationDocApi || !get().canCollabComment()) return;
+    const api = annotationDocApi;
+    session.transact(() => api.deleteAnnotation(session.doc, id));
   },
 });

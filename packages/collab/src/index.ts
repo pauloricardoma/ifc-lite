@@ -13,6 +13,7 @@ export * from './doc/schema.js';
 export * from './doc/entity.js';
 export * from './doc/relationship.js';
 export * from './doc/geometry.js';
+export * from './doc/annotation.js';
 
 // Snapshot / IFCX bridge
 export * from './snapshot/index.js';
