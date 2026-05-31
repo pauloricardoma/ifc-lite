@@ -16,12 +16,13 @@ RUN corepack enable
 COPY . .
 
 # Install just @ifc-lite/collab-server and its dependency subgraph (keeps the
-# image off the heavy viewer/wasm/native toolchain). `turbo` is a root-only
-# devDependency, so build the two packages directly with their own TypeScript
-# (collab first — collab-server's build resolves its dist).
+# image off the heavy viewer/wasm/native toolchain).
 RUN pnpm install --frozen-lockfile --filter "@ifc-lite/collab-server..."
-RUN pnpm --filter @ifc-lite/collab build \
- && pnpm --filter @ifc-lite/collab-server build
+# Build the whole upstream chain in topological order (data → mutations →
+# pointcloud → ifcx → collab → collab-server). `turbo` is a root-only
+# devDependency excluded by the filtered install, so run it via `pnpm dlx`;
+# its `build` task (`dependsOn: ["^build"]`) resolves the order.
+RUN pnpm dlx turbo@2.9.14 build --filter=@ifc-lite/collab-server
 
 ENV NODE_ENV=production
 # Durable Y.Doc persistence — mount a volume here in production.
