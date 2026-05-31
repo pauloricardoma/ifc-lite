@@ -48,8 +48,16 @@ import {
   mirrorAttribute,
   mirrorProperty,
   mirrorPropertyDelete,
+  pathForEntity,
   type CollabDocApi,
 } from '@/lib/collab/mutation-bridge';
+import {
+  buildGeometryResultFromMeshes,
+  hydrateGeometryFromRoom,
+  seedGeometryToRoom,
+  type CollabGeomApi,
+} from '@/lib/collab/geometry-sync';
+import { createSharedBlobStore } from '@/lib/collab/blob-store';
 
 /**
  * Access roles, mirrored from `@ifc-lite/collab-server`'s `Role`. Kept as a
@@ -173,9 +181,11 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
 
     let session: CollabSession;
     let seedFromStep: typeof import('@ifc-lite/collab')['seedFromStep'];
+    let collabMod: typeof import('@ifc-lite/collab');
     try {
       // Lazy-load the collab runtime (code-split) — see the import note above.
       const collab = await import('@ifc-lite/collab');
+      collabMod = collab;
       seedFromStep = collab.seedFromStep;
       // Capture the doc helpers the synchronous mutation mirror needs.
       docApi = {
@@ -211,6 +221,14 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
     });
     session.onStatus((status) => set({ collabStatus: status }));
 
+    const geomApi: CollabGeomApi = {
+      createGeometry: (doc, geomId, opts) => collabMod.createGeometry(doc, geomId, opts),
+      setGeometryRef: (doc, path, ref) => collabMod.setGeometryRef(doc, path, ref),
+      getGeometryRef: (doc, path) => collabMod.getGeometryRef(doc, path),
+      getGeometry: (doc, geomId) => collabMod.getGeometry(doc, geomId),
+      iterEntities: (doc) => collabMod.iterEntities(doc),
+    };
+
     // Owner seeds the model into the Y.Doc (plan §4.6 seed-into-room) once the
     // room has synced — but only if it's still empty, so we don't re-seed a
     // populated room or clobber a peer's edits. Recipients pass no `seed` and
@@ -221,10 +239,36 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
         if (get().collabRoomId === roomId && session.doc.getMap('entities').size === 0) {
           const source = seed();
           if (source) seedFromStep(session.doc, source);
+          // Also seed tessellated geometry as blobs (plan §4.6, §7.9).
+          const meshes = get().geometryResult?.meshes;
+          const store = get().ifcDataStore;
+          if (meshes && meshes.length > 0 && store) {
+            const blobStore = await createSharedBlobStore(collabMod, collabServerUrl(), token);
+            await seedGeometryToRoom(geomApi, session, blobStore, meshes, (id) =>
+              pathForEntity(store, id),
+            );
+          }
         }
       } catch (err) {
         // eslint-disable-next-line no-console
         console.error('[collab] model seeding failed:', err);
+      }
+    } else {
+      // Recipient: hydrate geometry from the room's blobs and inject it into
+      // the renderer when we have no local model (plan §7.9). Best-effort —
+      // blobs may still be syncing; a later re-join picks up the rest.
+      try {
+        await session.whenSynced;
+        if (get().collabRoomId === roomId && !get().geometryResult) {
+          const blobStore = await createSharedBlobStore(collabMod, collabServerUrl(), token);
+          const meshes = await hydrateGeometryFromRoom(geomApi, session, blobStore);
+          if (meshes.length > 0 && get().collabRoomId === roomId) {
+            get().setGeometryResult(buildGeometryResultFromMeshes(meshes));
+          }
+        }
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('[collab] geometry hydration failed:', err);
       }
     }
 

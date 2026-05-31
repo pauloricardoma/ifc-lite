@@ -494,16 +494,18 @@ investment.
   model→room map in `localStorage` is a follow-up.
 - ☑ Bare `?room=…&t=…` link (no model url); recipient joins and hydrates
   entities from the Y.Doc.
-- ◐ **Geometry** (mesh-blob path, §4.2 option b): the data transport is built
-  and unit-tested — `lib/collab/mesh-codec.ts` (MeshData ⇄ bytes) +
-  `lib/collab/geometry-sync.ts` (`seedGeometryToRoom` / `hydrateGeometryFromRoom`
-  over a content-addressed blob store, round-trip test green). **Remaining
-  (needs live-render verification):** wire a shared blob store (HttpBlobStore →
-  collab-server `/blobs`, or IndexedDB for local multi-tab), call
-  `seedGeometryToRoom` after the owner's entity seed, and on the recipient
-  assemble a `GeometryResult` from the hydrated meshes + inject it into the
-  renderer pipeline. Re-tessellation (§4.2 option a) and **psets** in the seed
-  remain follow-ups.
+- ◐ **Geometry** (mesh-blob path, §4.2 option b) — wired end to end, pending
+  live-render verification:
+  - `lib/collab/mesh-codec.ts` (MeshData ⇄ bytes) + `lib/collab/geometry-sync.ts`
+    (`seedGeometryToRoom` / `hydrateGeometryFromRoom` / `buildGeometryResultFromMeshes`),
+    unit-tested over a content-addressed blob store.
+  - `lib/collab/blob-store.ts` picks the shared store: `HttpBlobStore` →
+    collab-server `/blobs` in server mode, IndexedDB for local multi-tab.
+  - `collabSlice.startCollab`: the **owner** seeds geometry blobs + `GeometryRef`s
+    after the entity seed; a **recipient** (no `seed`) hydrates meshes and injects
+    them via `setGeometryResult`, so a bare `?room=…&t=…` link now renders the
+    model. Selection/properties on a store-less recipient and re-tessellation
+    (§4.2 option a) + **psets** in the seed remain follow-ups.
 - ☐ Optional fallback: when the recipient already has the file locally, seed
   only the edit-layer diff instead of the whole model.
 

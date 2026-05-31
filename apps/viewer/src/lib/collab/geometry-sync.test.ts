@@ -20,6 +20,7 @@ import { encodeMesh, decodeMesh } from './mesh-codec.js';
 import {
   seedGeometryToRoom,
   hydrateGeometryFromRoom,
+  buildGeometryResultFromMeshes,
   type CollabGeomApi,
 } from './geometry-sync.js';
 
@@ -97,5 +98,23 @@ describe('geometry-sync seed → hydrate', () => {
     for (const m of hydrated) {
       assert.deepEqual(Array.from(m.positions), Array.from(sampleMesh(m.expressId).positions));
     }
+  });
+});
+
+describe('buildGeometryResultFromMeshes', () => {
+  it('computes totals + bounds for the renderer', () => {
+    const result = buildGeometryResultFromMeshes([sampleMesh(1), sampleMesh(2)]);
+    assert.equal(result.meshes.length, 2);
+    assert.equal(result.totalTriangles, 2); // one triangle each
+    assert.equal(result.totalVertices, 6); // three verts each
+    assert.deepEqual(result.coordinateInfo.originShift, { x: 0, y: 0, z: 0 });
+    assert.equal(result.coordinateInfo.shiftedBounds.max.x, 1);
+    assert.equal(result.coordinateInfo.shiftedBounds.max.y, 1);
+  });
+
+  it('returns zero bounds for an empty mesh list', () => {
+    const result = buildGeometryResultFromMeshes([]);
+    assert.equal(result.totalVertices, 0);
+    assert.deepEqual(result.coordinateInfo.shiftedBounds.min, { x: 0, y: 0, z: 0 });
   });
 });

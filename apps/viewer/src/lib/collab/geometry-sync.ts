@@ -16,7 +16,7 @@
  * model including imported meshes.
  */
 
-import type { MeshData } from '@ifc-lite/geometry';
+import type { GeometryResult, MeshData } from '@ifc-lite/geometry';
 import type { BlobStore, CollabSession } from '@ifc-lite/collab';
 import { decodeMesh, encodeMesh } from './mesh-codec';
 
@@ -82,4 +82,40 @@ export async function hydrateGeometryFromRoom(
     out.push(decodeMesh(bytes));
   }
   return out;
+}
+
+/**
+ * Wrap hydrated meshes into a `GeometryResult` the renderer accepts. Meshes
+ * arrive already in the owner's shifted coordinate space, so we report a zero
+ * origin shift and just compute bounds + totals for camera framing.
+ */
+export function buildGeometryResultFromMeshes(meshes: MeshData[]): GeometryResult {
+  let totalTriangles = 0;
+  let totalVertices = 0;
+  const min = { x: Infinity, y: Infinity, z: Infinity };
+  const max = { x: -Infinity, y: -Infinity, z: -Infinity };
+  for (const m of meshes) {
+    totalTriangles += m.indices.length / 3;
+    totalVertices += m.positions.length / 3;
+    for (let i = 0; i + 2 < m.positions.length; i += 3) {
+      const x = m.positions[i], y = m.positions[i + 1], z = m.positions[i + 2];
+      if (x < min.x) min.x = x; if (y < min.y) min.y = y; if (z < min.z) min.z = z;
+      if (x > max.x) max.x = x; if (y > max.y) max.y = y; if (z > max.z) max.z = z;
+    }
+  }
+  const bounds = meshes.length
+    ? { min, max }
+    : { min: { x: 0, y: 0, z: 0 }, max: { x: 0, y: 0, z: 0 } };
+  const zero = { x: 0, y: 0, z: 0 };
+  return {
+    meshes,
+    totalTriangles,
+    totalVertices,
+    coordinateInfo: {
+      originShift: zero,
+      originalBounds: bounds,
+      shiftedBounds: bounds,
+      hasLargeCoordinates: false,
+    },
+  };
 }
