@@ -3,51 +3,33 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * Collaboration presence layer (M1, plan §7.4).
+ * Collaboration presence layer (plan §7.4).
  *
- * Mounts `@ifc-lite/collab`'s `mountPresenceInViewer` bridge over the
- * viewport when a collab session is active. The bridge appends its own
- * `pointer-events:none` canvas overlay into the viewport container and
- * forwards local mousemove as a presence cursor, so peers' cursors and
- * selections render without touching the WebGPU render loop.
+ * Shows live peer cursors when a collab session is active:
+ *   - `PresenceBroadcaster` publishes this client's cursor (projected onto the
+ *     world ground plane) + active tool over Yjs awareness.
+ *   - `PeerPresenceLayer` re-projects each peer's world cursor through *this*
+ *     viewer's camera every frame, so a peer's cursor sticks to the model point
+ *     regardless of your view angle.
  *
- * The collab runtime is lazy-imported so nothing loads until a session
- * exists (the feature ships dark — plan §7.8). When collab is disabled
- * `collabSession` is always null and this renders an inert marker.
- *
- * M1 uses the bridge's 2D-cursor fallback (no `raycastToWorld`), which is
- * accurate when peers share a view. 3D-anchored cursors (re-projected per
- * camera) are a follow-up once a renderer screen→world hook is wired here.
+ * This replaces the earlier 2D-fallback `mountPresenceInViewer` bridge (which
+ * only lined up when peers shared an identical view) with 3D-anchored cursors
+ * built on the renderer's camera callbacks — the house DOM-billboard pattern
+ * (cf. AnnotationLayer). The collab runtime stays code-split: these components
+ * read only plain presence data and call methods on the already-created session.
  */
 
-import { useEffect, useRef } from 'react';
 import { useViewerStore } from '@/store';
+import { PeerPresenceLayer } from './presence/PeerPresenceLayer';
+import { PresenceBroadcaster } from './presence/PresenceBroadcaster';
 
 export function CollabPresenceLayer() {
-  const session = useViewerStore((s) => s.collabSession);
-  const markerRef = useRef<HTMLSpanElement>(null);
-
-  useEffect(() => {
-    if (!session) return;
-    // The viewport wrapper is `position:relative` and tagged `data-viewport`;
-    // the bridge needs it as the overlay container + mousemove source.
-    const container = markerRef.current?.closest('[data-viewport]');
-    if (!(container instanceof HTMLElement)) return;
-
-    let teardown: (() => void) | null = null;
-    let disposed = false;
-    void (async () => {
-      const { mountPresenceInViewer } = await import('@ifc-lite/collab');
-      if (disposed) return;
-      teardown = mountPresenceInViewer({ session, container, viewport: '3d' });
-    })();
-
-    return () => {
-      disposed = true;
-      teardown?.();
-    };
-  }, [session]);
-
-  // Invisible marker — used only to locate the [data-viewport] container.
-  return <span ref={markerRef} className="hidden" aria-hidden="true" />;
+  const sessionActive = useViewerStore((s) => s.collabSession !== null);
+  if (!sessionActive) return null;
+  return (
+    <>
+      <PresenceBroadcaster />
+      <PeerPresenceLayer />
+    </>
+  );
 }
