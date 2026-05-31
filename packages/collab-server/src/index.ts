@@ -105,6 +105,7 @@ export {
 } from './rate-limit.js';
 export {
   InMemoryBlobStorage,
+  FsBlobStorage,
   handleBlobRequest,
   type ServerBlobStorage,
   type ServerBlobMeta,

@@ -2,8 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { startCollabServer } from '../src/server.js';
+import { FsBlobStorage } from '../src/blob-route.js';
 
 /** Mirror of `@ifc-lite/collab/fnv128` so this test doesn't pull in the
  * client package as a devDependency. The actual server route accepts
@@ -86,5 +90,39 @@ describe('blob route', () => {
     });
     expect(res.status).toBe(413);
     await handle.stop();
+  });
+});
+
+describe('FsBlobStorage', () => {
+  let dir: string;
+  afterEach(async () => {
+    if (dir) await fs.promises.rm(dir, { recursive: true, force: true });
+  });
+
+  it('persists blobs to disk + round-trips put/get/has/list/delete', async () => {
+    dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ifclite-blobs-'));
+    const store = new FsBlobStorage(dir);
+    const hash = '0123456789abcdef0123456789abcdef';
+    const bytes = new Uint8Array([1, 2, 3, 4, 5]);
+
+    const meta = await store.put(hash, bytes);
+    expect(meta.byteLength).toBe(5);
+    // Written under <dir>/blobs/<hash>.
+    expect(fs.existsSync(path.join(dir, 'blobs', hash))).toBe(true);
+
+    expect(await store.has(hash)).toBe(true);
+    const got = await store.get(hash);
+    expect(got).not.toBeNull();
+    expect(Array.from(got!.bytes)).toEqual([1, 2, 3, 4, 5]);
+    expect(await store.list()).toEqual([hash]);
+
+    // A fresh instance over the same dir sees the persisted blob (durability).
+    const reopened = new FsBlobStorage(dir);
+    expect(await reopened.has(hash)).toBe(true);
+
+    expect(await store.delete(hash)).toBe(true);
+    expect(await store.has(hash)).toBe(false);
+    expect(await store.get('ffffffffffffffffffffffffffffffff')).toBeNull();
+    expect(await store.delete(hash)).toBe(false);
   });
 });

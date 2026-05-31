@@ -6,6 +6,7 @@
 /** CLI entry point: `ifc-lite-collab-server`. */
 
 import { FilePersistence, startCollabServer, type StartCollabServerOptions } from './server.js';
+import { FsBlobStorage } from './blob-route.js';
 import { createRoomTokenAuthenticator } from './room-token.js';
 import { type Role } from './auth.js';
 
@@ -58,6 +59,10 @@ async function main() {
     port,
     host,
     persistence: new FilePersistence({ dataDir }),
+    // Disk-backed blobs (not the in-RAM default): mesh blobs dominate a room's
+    // size, so keeping them in memory made memory the top hosting cost and lost
+    // them on restart. On a mounted volume this is durable + ~66× cheaper/GB.
+    blobStorage: new FsBlobStorage(dataDir),
     maxRooms,
     ...(tokenSecret ? tokenOptions(tokenSecret) : {}),
   });
