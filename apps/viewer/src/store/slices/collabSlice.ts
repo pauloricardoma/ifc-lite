@@ -49,8 +49,10 @@ import {
   mirrorProperty,
   mirrorPropertyDelete,
   pathForEntity,
+  registerEntityMaps,
   type CollabDocApi,
 } from '@/lib/collab/mutation-bridge';
+import type { IfcDataStore } from '@ifc-lite/parser';
 import {
   buildGeometryResultFromMeshes,
   hydrateGeometryFromRoom,
@@ -82,7 +84,25 @@ export interface StartCollabOptions {
    * recipient joining a populated room hydrates from the doc instead of
    * re-seeding. Recipients (deep-link join) omit this.
    */
-  seed?: () => StepSeedSource | null;
+  seed?: () => CollabSeedInput | null;
+}
+
+/**
+ * Model-share payload the owner hands to `startCollab`. Carries the parsed
+ * store plus enough context to seed both schema families:
+ *   - IFC5/IFCX → seed natively from the store's own IFCX bytes (`store.source`)
+ *     and key geometry by IFCX path (`idToPath`), since an IFCX-origin store has
+ *     no STEP `entityIndex.byId`/GUIDs to drive `buildStepSeedSource`.
+ *   - legacy STEP → seed the pre-built IFCX-shaped `stepSource`, key geometry by
+ *     `pathForEntity` (GUID path).
+ */
+export interface CollabSeedInput {
+  /** The active model's parsed store. For IFC5, `store.source` holds the IFCX bytes. */
+  store: IfcDataStore;
+  /** True when the model is IFC5/IFCX (seed natively from `store.source`). */
+  isIfcx: boolean;
+  /** Pre-built STEP seed source for legacy rooms; `null` for IFC5. */
+  stepSource: StepSeedSource | null;
 }
 
 export interface CollabSlice {
@@ -152,6 +172,13 @@ function remotePeers(peers: Record<number, PresenceState>, selfClientId: number)
     out.push({ ...state, clientId: Number(clientId) } as PresenceState);
   }
   return out;
+}
+
+/** View a `Uint8Array` as an `ArrayBuffer` (copying only when it's a sub-view). */
+function toArrayBuffer(u8: Uint8Array): ArrayBuffer {
+  return u8.byteOffset === 0 && u8.byteLength === u8.buffer.byteLength
+    ? (u8.buffer as ArrayBuffer)
+    : (u8.slice().buffer as ArrayBuffer);
 }
 
 // Collab doc helpers captured from the lazy-loaded runtime (see startCollab),
@@ -262,25 +289,53 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
       try {
         await session.whenSynced;
         if (get().collabRoomId === roomId) {
-          // Seed entities once — never clobber a populated room or a peer's edits.
-          if (session.doc.getMap('entities').size === 0) {
-            const source = seed();
-            if (source) seedFromStep(session.doc, source);
-          }
-          // Seed tessellated geometry as blobs (plan §4.6, §7.9) whenever the room
-          // has none yet — DECOUPLED from the entity-seed guard above. This lets a
-          // room whose entities were seeded by an earlier session/build (before
-          // geometry sync existed) backfill its geometry on the next owner join,
-          // instead of staying stuck with structure-but-no-3D. Blobs are
-          // content-addressed, so re-seeding the same model dedupes.
-          if (session.doc.getMap('geometry').size === 0) {
-            const meshes = get().geometryResult?.meshes;
-            const store = get().ifcDataStore;
-            if (meshes && meshes.length > 0 && store) {
+          const seedData = seed();
+          if (seedData) {
+            const { store } = seedData;
+            // Structure seed — once; never clobber a populated room or peer edits.
+            if (session.doc.getMap('entities').size === 0) {
+              if (seedData.isIfcx) {
+                // IFC5: seed natively from the model's own IFCX bytes. The STEP
+                // path (buildStepSeedSource) can't read an IFCX-origin store (no
+                // entityIndex.byId / GUIDs) and would seed zero entities.
+                const bytes = store.source;
+                if (bytes && bytes.length > 0) collabMod.seedFromIfcx(session.doc, bytes);
+              } else if (seedData.stepSource) {
+                seedFromStep(session.doc, seedData.stepSource);
+              }
+            }
+            // Geometry seed — whenever the room has none yet (DECOUPLED from the
+            // entity guard, so a partially-seeded room backfills). Blobs are
+            // content-addressed, so re-seeding the same model dedupes.
+            if (session.doc.getMap('geometry').size === 0) {
               const blobStore = await createSharedBlobStore(collabMod, collabServerUrl(), token);
-              await seedGeometryToRoom(geomApi, session, blobStore, meshes, (id) =>
-                pathForEntity(store, id),
-              );
+              if (seedData.isIfcx && store.source && store.source.length > 0) {
+                // IFCX geometry is explicit in the file: re-parse the source for
+                // COMPLETE meshes + the id→path map to key them. (The owner's
+                // render buffers may be memory-released for large models, so we
+                // never read those for seeding — plan Fix 2.)
+                const { parseIfcxViewerModel } = await import('@/hooks/ingest/viewerModelIngest');
+                const parsed = await parseIfcxViewerModel(toArrayBuffer(store.source), undefined, {
+                  allowEmptyGeometry: true,
+                });
+                if (parsed.idToPath && parsed.pathToId) {
+                  // Let the owner's outbound mirror resolve paths on this IFCX store.
+                  registerEntityMaps(store, parsed.idToPath, parsed.pathToId);
+                }
+                const meshes = parsed.geometryResult.meshes;
+                if (meshes.length > 0) {
+                  await seedGeometryToRoom(geomApi, session, blobStore, meshes, (id) =>
+                    parsed.idToPath?.get(id) ?? null,
+                  );
+                }
+              } else {
+                const meshes = get().geometryResult?.meshes;
+                if (meshes && meshes.length > 0) {
+                  await seedGeometryToRoom(geomApi, session, blobStore, meshes, (id) =>
+                    pathForEntity(store, id),
+                  );
+                }
+              }
             }
           }
         }
@@ -318,6 +373,12 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
             const buffer = new TextEncoder().encode(JSON.stringify(ifcxFile)).buffer as ArrayBuffer;
             const payload = await parseIfcxViewerModel(buffer, undefined, { allowEmptyGeometry: true });
             if (get().collabRoomId !== roomId) return;
+            // Register the IFCX path maps so the recipient's outbound mirror and
+            // inbound apply can resolve entity↔path (the reconstructed store has
+            // no STEP `entityIndex.byId`). Without this, recipient edits don't sync.
+            if (payload.idToPath && payload.pathToId) {
+              registerEntityMaps(payload.dataStore, payload.idToPath, payload.pathToId);
+            }
             get().setIfcDataStore(payload.dataStore);
             const geomCount = session.doc.getMap('geometry').size;
             if (geomCount !== lastGeomCount) {

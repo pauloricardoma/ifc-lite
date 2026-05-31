@@ -72,6 +72,23 @@ export function entityForPath(store: IfcDataStore, path: string): number | null 
   return entityMaps(store).toExpressId.get(path) ?? null;
 }
 
+/**
+ * Pre-register expressId↔path maps for a store whose `entityIndex.byId` isn't
+ * STEP-populated — i.e. an IFCX-origin store or a recipient's reconstructed
+ * store. Without this, `entityMaps` derives an empty map from `byId`, so the
+ * outbound mirror (`pathForEntity`) and inbound apply (`entityForPath`) both
+ * resolve `null` and edits silently don't sync. Pass the `idToPath`/`pathToId`
+ * maps that `parseIfcxViewerModel` returns. STEP stores need no registration —
+ * their lazy `byId`-derived maps work.
+ */
+export function registerEntityMaps(
+  store: IfcDataStore,
+  idToPath: Map<number, string>,
+  pathToId: Map<string, number>,
+): void {
+  mapCache.set(store, { toPath: idToPath, toExpressId: pathToId });
+}
+
 // ── value conversion ─────────────────────────────────────────────────────────
 
 function toScalar(value: unknown): string | number | boolean | null {

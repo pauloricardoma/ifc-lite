@@ -82,7 +82,20 @@ export function ShareDialog({ open, onOpenChange }: ShareDialogProps) {
             role: 'admin',
             token: adminToken,
             // Owner seeds the model so recipients hydrate from the room.
-            seed: () => (ifcDataStore ? buildStepSeedSource(ifcDataStore, modelName) : null),
+            // IFC5/IFCX seeds natively from the model's own bytes; legacy STEP
+            // seeds the IFCX-shaped StepSeedSource. (Seeding IFCX via the STEP
+            // path produces an empty room — it can't read an IFCX-origin store.)
+            seed: () => {
+              const store = ifcDataStore;
+              if (!store) return null;
+              const model = activeModelId ? models.get(activeModelId) : undefined;
+              const isIfcx = (model?.schemaVersion ?? store.schemaVersion) === 'IFC5';
+              return {
+                store,
+                isIfcx,
+                stepSource: isIfcx ? null : buildStepSeedSource(store, modelName),
+              };
+            },
           });
         }
         // Mint the role-scoped share link (server requires the owner's admin
