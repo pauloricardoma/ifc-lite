@@ -138,6 +138,14 @@ responses carry it inline as `symbolic_data` (in the `complete` event for the
 streaming variants); the binary Parquet transports expose it by cache key via
 `/api/v1/parse/symbolic/{key}` (see below).
 
+Every geometry endpoint's `ModelMetadata` carries `length_unit_scale` (factor to
+convert model length values to metres, e.g. `0.001` for millimetres) and, when
+the model has an `IfcMapConversion` / `IfcProjectedCRS`, a `georeferencing`
+object (CRS name, datum, false eastings/northings, orthogonal height, grid-north
+rotation, and a local→map 4×4 matrix) — matching `@ifc-lite/parse`. For the
+JSON/SSE endpoints it's on `metadata`; for the Parquet endpoints it's in the
+`X-IFC-Metadata` header.
+
 ### Cache Endpoints
 
 | Endpoint | Method | Description |
