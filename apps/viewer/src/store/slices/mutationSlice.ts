@@ -867,6 +867,7 @@ function runInStoreElementBuilder(
   build: (editor: StoreEditor, anchor: ReturnType<typeof resolveSpatialAnchor>) => number,
   meshPayload?: ElementMeshPayload,
 ): { expressId: number } | { error: string } {
+  if (!get().canCollabEdit()) return { error: 'Editing is disabled for your role in this shared session' };
   const state = get();
   const model = state.models.get(modelId);
   const dataStore = model?.ifcDataStore;
@@ -898,6 +899,7 @@ function runInStoreElementBuilder(
   // Build a renderer-frame mesh for the new element so it appears in
   // 3D the moment the action commits — the ImportError-only behaviour
   // before this would only surface the change after an export+reparse.
+  let createdMesh: MeshData | null = null;
   if (meshPayload) {
     const storeyElevation =
       dataStore.spatialHierarchy?.storeyElevations?.get(storeyExpressId) ?? 0;
@@ -909,6 +911,7 @@ function runInStoreElementBuilder(
       payload: meshPayload,
     });
     if (mesh) {
+      createdMesh = mesh;
       const cross = get() as unknown as {
         appendGeometryBatch?: (batch: MeshData[]) => void;
       };
@@ -943,7 +946,17 @@ function runInStoreElementBuilder(
     };
   });
 
+  // Mirror the new element to peers (entity + mesh blob). No-op outside collab.
+  const newGuid = readNewEntityGuid(editor, entityId);
+  get().mirrorEntityCreate(modelId, entityId, ifcType, newGuid, createdMesh);
+
   return { expressId: entityId };
+}
+
+/** Read a freshly-created overlay entity's IFC GlobalId (attribute 0 on IfcRoot). */
+function readNewEntityGuid(editor: StoreEditor, expressId: number): string | null {
+  const raw = editor.getNewEntity(expressId)?.attributes?.[0];
+  return typeof raw === 'string' && raw.length > 0 ? raw : null;
 }
 
 /**
@@ -2134,6 +2147,7 @@ export const createMutationSlice: StateCreator<
   },
 
   addColumn: (modelId, storeyExpressId, params) => {
+    if (!get().canCollabEdit()) return { error: 'Editing is disabled for your role in this shared session' };
     const state = get();
     const model = state.models.get(modelId);
     const dataStore = model?.ifcDataStore;
@@ -2207,6 +2221,9 @@ export const createMutationSlice: StateCreator<
         mutationVersion: s.mutationVersion + 1,
       };
     });
+
+    // Mirror the new column to peers (entity + mesh blob). No-op outside collab.
+    get().mirrorEntityCreate(modelId, columnId, 'IFCCOLUMN', readNewEntityGuid(editor, columnId), columnMesh ?? null);
 
     return { expressId: columnId };
   },

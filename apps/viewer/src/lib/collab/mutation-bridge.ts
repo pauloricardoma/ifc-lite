@@ -39,6 +39,12 @@ export interface CollabDocApi {
   setEntityPlacement(doc: CollabSession['doc'], path: string, placement: LocalPlacement): void;
   /** Tombstone an entity (Yjs preserves it as a delete; observers see a `delete`). */
   deleteEntity(doc: CollabSession['doc'], path: string): boolean;
+  /** Create an entity node (idempotent). Used to mirror a local addElement. */
+  createEntity(
+    doc: CollabSession['doc'],
+    path: string,
+    options?: { ifcClass?: string; attributes?: Record<string, unknown> },
+  ): void;
   /** The `usd::xformop` attribute key, so the inbound observer can route it to `onPlacement`. */
   XFORMOP_KEY: string;
   /** Decode a `usd::xformop` attribute value back to a normalized placement (null if malformed). */
@@ -108,6 +114,19 @@ export function registerEntityMaps(
   pathToId: Map<string, number>,
 ): void {
   mapCache.set(store, { toPath: idToPath, toExpressId: pathToId });
+}
+
+/**
+ * Add a single expressId↔path mapping to a store's cache. Needed for entities
+ * created at runtime (StoreEditor overlay entities), which are intentionally
+ * absent from `entityIndex.byId` and the entity table — so `pathForEntity`
+ * can't derive their path. Without this, a created entity (and any later edit
+ * to it) wouldn't resolve a path and wouldn't sync.
+ */
+export function registerEntityPath(store: IfcDataStore, expressId: number, path: string): void {
+  const maps = entityMaps(store);
+  maps.toPath.set(expressId, path);
+  maps.toExpressId.set(path, expressId);
 }
 
 // ── value conversion ─────────────────────────────────────────────────────────

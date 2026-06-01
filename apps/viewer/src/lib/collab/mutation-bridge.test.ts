@@ -32,6 +32,7 @@ const api: CollabDocApi = {
   setAttribute: (doc, path, name, value) => setAttribute(doc, path, name, value),
   setEntityPlacement: (doc, path, placement) => setEntityPlacement(doc, path, placement),
   deleteEntity: (doc, path) => deleteEntity(doc, path),
+  createEntity: (doc, path, options) => { createEntity(doc, path, options); },
   XFORMOP_KEY: USD_XFORMOP,
   placementFromXformOp: (value) => {
     const xform = value as { transform?: number[][] } | undefined;

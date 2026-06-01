@@ -53,6 +53,7 @@ import {
   mirrorPropertyDelete,
   pathForEntity,
   registerEntityMaps,
+  registerEntityPath,
   type CollabDocApi,
 } from '@/lib/collab/mutation-bridge';
 import type { IfcDataStore } from '@ifc-lite/parser';
@@ -205,6 +206,22 @@ export interface CollabSlice {
    * or edit rights.
    */
   mirrorEntityRemove: (modelId: string, entityId: number) => void;
+  /**
+   * Mirror a local element creation (addElement) to the room: creates the
+   * entity node + records an identity placement baseline (the mesh blob is
+   * baked at the element's world position), and pushes the new mesh as a room
+   * blob so peers hydrate + render it. `ifcType` is the builder's STEP-upper
+   * type (e.g. 'IFCWALL'); `guid` is the new entity's IFC GlobalId (used to key
+   * its room path, since overlay entities aren't in the store's GUID maps);
+   * `mesh` is the renderer-frame mesh (or null). No-op without a session/rights.
+   */
+  mirrorEntityCreate: (
+    modelId: string,
+    entityId: number,
+    ifcType: string,
+    guid: string | null,
+    mesh: MeshData | null,
+  ) => void;
 
   // ── Annotation mirror (collab markup) — called by annotationsSlice after a
   //    local create/edit/delete. No-ops without a session or comment permission.
@@ -247,6 +264,11 @@ interface PlacementApi {
   setPlacementBaseline: (doc: CollabSession['doc'], path: string, p: LocalPlacement) => void;
 }
 let placementApi: PlacementApi | null = null;
+// Geometry API + a blob-store factory captured at startCollab, so a local
+// create (addElement) can push the new entity's mesh blob into the room.
+let geomApiRef: CollabGeomApi | null = null;
+let makeBlobStore: (() => Promise<Awaited<ReturnType<typeof createSharedBlobStore>>>) | null = null;
+let cachedBlobStore: Awaited<ReturnType<typeof createSharedBlobStore>> | null = null;
 // Per-session render reconciliation: renderer-frame translation (Y-up) currently
 // baked into each entity's live mesh, RELATIVE to its baked baseline. Keyed by
 // entity expressId in the active model's id space. Lets inbound placement edits
@@ -263,6 +285,13 @@ const YAW_EPS = 1e-4;
 function yawOf(placement: LocalPlacement | null): number {
   const ref = placement?.refDirection ?? [1, 0, 0];
   return Math.atan2(ref[1], ref[0]);
+}
+
+/** Normalize a builder's STEP-uppercase type ('IFCWALL') to IFC case ('IfcWall'). */
+function normalizeIfcClass(stepType: string): string {
+  if (!stepType.toUpperCase().startsWith('IFC')) return stepType;
+  const rest = stepType.slice(3);
+  return `Ifc${rest.charAt(0).toUpperCase()}${rest.slice(1).toLowerCase()}`;
 }
 
 /**
@@ -437,6 +466,9 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
         setAttribute: collab.setAttribute,
         setEntityPlacement: collab.setEntityPlacement,
         deleteEntity: collab.deleteEntity,
+        createEntity: (doc, path, options) => {
+          collab.createEntity(doc, path, options);
+        },
         XFORMOP_KEY: collab.USD_XFORMOP,
         placementFromXformOp: (value) => {
           const xform = value as { transform?: number[][] } | undefined;
@@ -502,6 +534,11 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
       getGeometry: (doc, geomId) => collabMod.getGeometry(doc, geomId),
       iterEntities: (doc) => collabMod.iterEntities(doc),
     };
+    // Expose the geometry API + a blob-store factory so a local create can push
+    // the new mesh blob into the room later (not just at seed).
+    geomApiRef = geomApi;
+    makeBlobStore = () => createSharedBlobStore(collabMod, collabServerUrl(), token);
+    cachedBlobStore = null;
 
     // Owner seeds the model into the Y.Doc (plan §4.6 seed-into-room) once the
     // room has synced — but only if it's still empty, so we don't re-seed a
@@ -835,6 +872,9 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
     placementApi = null;
     placementAppliedLoc = null;
     placementAppliedYaw = null;
+    geomApiRef = null;
+    makeBlobStore = null;
+    cachedBlobStore = null;
     const session = get().collabSession;
     if (session) {
       try {
@@ -1008,6 +1048,47 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
     // Drop any placement tracking for the removed entity.
     placementAppliedLoc?.delete(entityId);
     placementAppliedYaw?.delete(entityId);
+  },
+
+  mirrorEntityCreate: (modelId, entityId, ifcType, guid, mesh) => {
+    const session = get().collabSession;
+    const store = get().models.get(modelId)?.ifcDataStore ?? get().ifcDataStore;
+    if (!session || !store || !docApi || !placementApi || !geomApiRef) return;
+    if (!get().canCollabEdit()) return;
+    // Overlay (runtime-created) entities aren't in the store's GUID maps, so
+    // derive the path from the new entity's GlobalId and register it so this
+    // (and later edits to it) resolve.
+    let path = pathForEntity(store, entityId);
+    if (!path && guid) {
+      path = `/${guid}`;
+      registerEntityPath(store, entityId, path);
+    }
+    if (!path) return;
+    const ifcClass = normalizeIfcClass(ifcType);
+    const api = docApi;
+    session.transact(() => {
+      api.createEntity(session.doc, path, {
+        ifcClass,
+        attributes: { 'bsi::ifc::class': { code: ifcClass } },
+      });
+    });
+    // The mesh blob is baked at the element's world position → identity baseline
+    // (so a later move composes correctly; see reconcilePlacementMesh).
+    placementApi.setPlacementBaseline(session.doc, path, { location: [0, 0, 0] });
+    // Push the new mesh as a room blob so peers hydrate + render it. Async,
+    // fire-and-forget — the local element already rendered.
+    if (mesh && makeBlobStore) {
+      const geom = geomApiRef;
+      void (async () => {
+        try {
+          cachedBlobStore = cachedBlobStore ?? (await makeBlobStore!());
+          await seedGeometryToRoom(geom, session, cachedBlobStore, [mesh], () => path);
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.error('[collab] mirror create geometry failed:', err);
+        }
+      })();
+    }
   },
 
   mirrorAnnotationUpsert: (annotation) => {
