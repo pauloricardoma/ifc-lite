@@ -1620,6 +1620,9 @@ export const createMutationSlice: StateCreator<
   },
 
   resizeWall: (modelId, expressId, newStart, newEnd) => {
+    if (!get().canCollabEdit()) {
+      return { ok: false, reason: 'Editing is disabled for your role in this shared session' };
+    }
     const view = get().mutationViews.get(modelId);
     if (!view) return { ok: false, reason: 'Model has no editable mutation view yet' };
     const editor = getOrCreateStoreEditor(get, set, modelId);
@@ -1656,6 +1659,29 @@ export const createMutationSlice: StateCreator<
       { entityId: chain.profileId, index: 3, value: length },
       { entityId: chain.profileOriginPointId, index: 0, value: [length / 2, 0] },
     ]);
+
+    // Mirror the resize to peers as a geometry replace: regenerate the wall mesh
+    // at the new dimensions (built at its current world position) and swap the
+    // entity's room blob. The owner's own mesh is unchanged here (resize is
+    // data-only locally today); peers re-hydrate the new blob. No-op off-collab.
+    if (Number.isFinite(chain.height) && chain.height > 0) {
+      const globalId = toGlobalIdFromModels(get().models, modelId, expressId);
+      const meshes =
+        get().models.get(modelId)?.geometryResult?.meshes ?? get().geometryResult?.meshes ?? null;
+      const bounds = getEntityBounds(meshes, globalId);
+      const newMesh = buildElementMesh({
+        type: 'wall',
+        globalId,
+        storeyElevation: bounds?.min.y ?? 0, // renderer Y base = IFC Z storey elevation
+        payload: {
+          type: 'wall',
+          params: { Thickness: chain.thickness, Height: chain.height },
+          start: newStart,
+          end: newEnd,
+        },
+      });
+      if (newMesh) get().mirrorEntityGeometry(modelId, expressId, newMesh);
+    }
 
     return { ok: true, newLength: length };
   },

@@ -222,6 +222,14 @@ export interface CollabSlice {
     guid: string | null,
     mesh: MeshData | null,
   ) => void;
+  /**
+   * Mirror a geometry-shape change (resize) by replacing the entity's room
+   * geometry with a freshly-tessellated `mesh` blob (built at the new world
+   * position, so it carries the new size + placement). Resets the entity's
+   * placement baseline to identity for the new blob. No-op without a session
+   * or edit rights.
+   */
+  mirrorEntityGeometry: (modelId: string, entityId: number, mesh: MeshData) => void;
 
   // ── Annotation mirror (collab markup) — called by annotationsSlice after a
   //    local create/edit/delete. No-ops without a session or comment permission.
@@ -530,6 +538,7 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
       createGeometry: (doc, geomId, opts) => collabMod.createGeometry(doc, geomId, opts),
       hasEntity: (doc, path) => collabMod.hasEntity(doc, path),
       addGeometryRef: (doc, path, geomId) => collabMod.addGeometryRef(doc, path, geomId),
+      setGeometryRef: (doc, path, ref) => collabMod.setGeometryRef(doc, path, ref),
       getGeometryRef: (doc, path) => collabMod.getGeometryRef(doc, path),
       getGeometry: (doc, geomId) => collabMod.getGeometry(doc, geomId),
       iterEntities: (doc) => collabMod.iterEntities(doc),
@@ -1089,6 +1098,31 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
         }
       })();
     }
+  },
+
+  mirrorEntityGeometry: (modelId, entityId, mesh) => {
+    const session = get().collabSession;
+    const store = get().models.get(modelId)?.ifcDataStore ?? get().ifcDataStore;
+    if (!session || !store || !geomApiRef || !makeBlobStore) return;
+    if (!get().canCollabEdit()) return;
+    const path = pathForEntity(store, entityId);
+    if (!path) return;
+    // The new mesh is baked at the entity's current world position (identity
+    // baseline, set at create/seed). Reset applied tracking so the fresh blob
+    // is treated as the new zero (resize-after-move on a peer is an accepted v1
+    // limitation — the peer's stale applied delta isn't reset remotely).
+    placementAppliedLoc?.delete(entityId);
+    placementAppliedYaw?.delete(entityId);
+    const geom = geomApiRef;
+    void (async () => {
+      try {
+        cachedBlobStore = cachedBlobStore ?? (await makeBlobStore!());
+        await seedGeometryToRoom(geom, session, cachedBlobStore, [mesh], () => path, { replace: true });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('[collab] mirror resize geometry failed:', err);
+      }
+    })();
   },
 
   mirrorAnnotationUpsert: (annotation) => {

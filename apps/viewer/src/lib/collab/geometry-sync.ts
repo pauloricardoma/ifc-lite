@@ -38,6 +38,8 @@ export interface CollabGeomApi {
   hasEntity(doc: CollabSession['doc'], path: string): boolean;
   /** Append a geomId to an entity's geometry refs (entities can own several meshes). */
   addGeometryRef(doc: CollabSession['doc'], path: string, geomId: string): void;
+  /** Replace an entity's geometry refs outright (used by resize — swaps the mesh). */
+  setGeometryRef(doc: CollabSession['doc'], path: string, ref: { geomIds: string[] }): void;
   getGeometryRef(doc: CollabSession['doc'], path: string): { geomIds: string[] } | undefined;
   getGeometry(doc: CollabSession['doc'], geomId: string): { get(key: string): unknown } | undefined;
   iterEntities(doc: CollabSession['doc']): IterableIterator<[string, unknown]>;
@@ -55,6 +57,13 @@ export interface SeedGeometryOptions {
   concurrency?: number;
   /** Upload progress (every ~50 blobs + once at the end), for a share UI. */
   onProgress?: (uploaded: number, total: number) => void;
+  /**
+   * Replace each entity's geometry refs with the seeded geomIds (via
+   * `setGeometryRef`) instead of appending. Used by resize, which swaps a
+   * wall's mesh for a freshly-tessellated one — the old blob is left orphaned
+   * (no entity refs it) and so isn't hydrated.
+   */
+  replace?: boolean;
 }
 
 export async function seedGeometryToRoom(
@@ -121,7 +130,18 @@ export async function seedGeometryToRoom(
   session.transact(() => {
     for (const { path, hash } of refs) {
       api.createGeometry(session.doc, hash, { type: 'mesh', source: 'mesh-blob', blobHash: hash });
-      api.addGeometryRef(session.doc, path, hash);
+    }
+    if (opts.replace) {
+      // Group hashes per path, then replace each entity's refs in one write.
+      const byPath = new Map<string, string[]>();
+      for (const { path, hash } of refs) {
+        const list = byPath.get(path) ?? [];
+        list.push(hash);
+        byPath.set(path, list);
+      }
+      for (const [path, geomIds] of byPath) api.setGeometryRef(session.doc, path, { geomIds });
+    } else {
+      for (const { path, hash } of refs) api.addGeometryRef(session.doc, path, hash);
     }
   });
   opts.onProgress?.(jobs.length, jobs.length);
