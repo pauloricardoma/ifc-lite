@@ -1803,9 +1803,10 @@ export const createMutationSlice: StateCreator<
 
     // Tombstone the source. `removeEntity` returns false if the
     // entity wasn't known — shouldn't happen here (we just
-    // resolved its chain), but defend anyway. `mirror: false` — split
-    // create+delete isn't collab-synced yet (Phase 3).
-    const removed = state.removeEntity(modelId, expressId, { mirror: false });
+    // resolved its chain), but defend anyway. The two halves were
+    // created via `addWall` (which mirrors the create), so mirroring
+    // the source-delete here completes the split across the room.
+    const removed = state.removeEntity(modelId, expressId);
     if (!removed) {
       return {
         ok: false,
@@ -2053,8 +2054,9 @@ export const createMutationSlice: StateCreator<
 
     cloneElementMetadata(dataStore, view, editor, expressId, [left.expressId, right.expressId]);
 
-    // `mirror: false` — split create+delete isn't collab-synced yet (Phase 3).
-    const removed = state.removeEntity(modelId, expressId, { mirror: false });
+    // Halves were created via `addColumn`/`addBeam` (which mirror the create);
+    // mirroring the source-delete completes the split across the room.
+    const removed = state.removeEntity(modelId, expressId);
     if (!removed) {
       return {
         ok: false,
