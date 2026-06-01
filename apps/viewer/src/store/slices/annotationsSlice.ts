@@ -295,9 +295,11 @@ export const createAnnotationsSlice: StateCreator<AnnotationsSlice, [], [], Anno
   upsertRemoteAnnotation: (annotation) => {
     set((state) => {
       const next = new Map(state.annotations);
-      next.set(annotation.id, { ...annotation, remote: true });
-      // No saveToStorage: remote pins are session-only (and would be filtered out
-      // anyway). Avoids a localStorage write per inbound sync event.
+      // Trust the caller's `remote` flag (set by authorship in the sync bridge):
+      // peers' pins are session-only; a peer's edit to one of OUR pins arrives
+      // as non-remote, so persist it to localStorage like any local edit.
+      next.set(annotation.id, annotation);
+      if (!annotation.remote) saveToStorage(next);
       return { annotations: next };
     });
   },

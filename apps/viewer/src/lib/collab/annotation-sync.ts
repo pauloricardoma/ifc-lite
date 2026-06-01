@@ -63,7 +63,7 @@ export function annotationToCrdtFields(a: Annotation): CrdtAnnotationFields {
   };
 }
 
-function recordToAnnotation(r: CrdtAnnotationRecord): Annotation {
+function recordToAnnotation(r: CrdtAnnotationRecord, myId: string): Annotation {
   return {
     id: r.id,
     position: { x: r.position.x, y: r.position.y, z: r.position.z },
@@ -75,12 +75,17 @@ function recordToAnnotation(r: CrdtAnnotationRecord): Annotation {
     authorId: r.authorId || undefined,
     authorName: r.authorName || undefined,
     authorColor: r.authorColor || undefined,
-    remote: true,
+    // Ownership is by author, not by where the change arrived from: a pin I
+    // authored stays "mine" (persisted to localStorage) even when a peer's edit
+    // to it flows back through here; everyone else's pins are session-only.
+    remote: r.authorId !== myId,
   };
 }
 
 export interface AnnotationInboundCtx {
-  /** Current local annotation map (to avoid clobbering our own authored pins). */
+  /** This client's collab identity id, to decide which pins are ours. */
+  myId(): string;
+  /** Current local annotation map. */
   getLocal(): Map<string, Annotation>;
   upsertRemote(a: Annotation): void;
   removeRemote(id: string): void;
@@ -101,18 +106,25 @@ export function attachAnnotationInbound(
   const map = api.annotationsMap(doc);
 
   const apply = (isLocalTxn: boolean) => {
-    if (isLocalTxn) return; // our own mirror writes — ignore
+    if (isLocalTxn) return; // our own mirror writes — ignore (no echo)
+    const myId = ctx.myId();
     const remote = new Map<string, CrdtAnnotationRecord>();
     for (const r of api.iterAnnotations(doc)) remote.set(r.id, r);
     const local = ctx.getLocal();
     for (const r of remote.values()) {
+      const incoming = recordToAnnotation(r, myId);
       const existing = local.get(r.id);
-      // A locally-authored pin (not `remote`) is the source of truth for its own
-      // id — don't reflect its echo back as a remote copy.
-      if (existing && !existing.remote) continue;
-      ctx.upsertRemote(recordToAnnotation(r));
+      // Apply the room's version (the source of truth) whenever it differs —
+      // including a peer's edit to a pin we authored. Skip only true no-ops so
+      // we don't churn the map every awareness/doc tick.
+      if (existing && existing.note === incoming.note && existing.updatedAt === incoming.updatedAt) {
+        continue;
+      }
+      ctx.upsertRemote(incoming);
     }
     for (const [id, a] of local) {
+      // Remove a pin that's gone from the room — but only peer-authored ones, so
+      // a brief CRDT lag can't wipe your own just-created pin before it round-trips.
       if (a.remote && !remote.has(id)) ctx.removeRemote(id);
     }
   };

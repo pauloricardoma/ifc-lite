@@ -556,6 +556,7 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
     if (annotationDocApi) {
       try {
         annotationInboundTeardown = attachAnnotationInbound(session, annotationDocApi, {
+          myId: () => get().collabIdentity.id,
           getLocal: () => get().annotations,
           upsertRemote: (a) => get().upsertRemoteAnnotation(a),
           removeRemote: (id) => get().removeRemoteAnnotation(id),

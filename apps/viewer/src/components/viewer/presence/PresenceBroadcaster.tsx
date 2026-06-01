@@ -42,17 +42,17 @@ export function PresenceBroadcaster() {
       const { collabSession, cameraCallbacks } = useViewerStore.getState();
       if (!collabSession || !cameraCallbacks.unprojectToFloor) return;
       const world = cameraCallbacks.unprojectToFloor(e.clientX, e.clientY, CURSOR_PLANE_Y);
-      collabSession.presence.setCursor3d(world ?? null);
-    };
-    const onLeave = () => {
-      useViewerStore.getState().collabSession?.presence.setCursor3d(null);
+      // Only update on a successful ground-plane hit; keep the last position
+      // otherwise. We deliberately do NOT clear on mouseleave — a peer's cursor
+      // should persist at its last spot (it fades when idle, like Figma) so you
+      // can see where collaborators are even when their mouse is still or has
+      // moved to a panel/another window. It's cleared on leave (teardown below).
+      if (world) collabSession.presence.setCursor3d(world);
     };
 
     canvas.addEventListener('mousemove', onMove);
-    canvas.addEventListener('mouseleave', onLeave);
     return () => {
       canvas.removeEventListener('mousemove', onMove);
-      canvas.removeEventListener('mouseleave', onLeave);
       useViewerStore.getState().collabSession?.presence.setCursor3d(null);
     };
   }, [sessionActive]);
