@@ -60,6 +60,10 @@ export default defineConfig({
       '@tauri-apps/api/core': path.resolve(__dirname, '../viewer/src/services/tauri-core-stub.ts'),
       '@tauri-apps/plugin-dialog': path.resolve(__dirname, '../viewer/src/services/tauri-dialog-stub.ts'),
       '@tauri-apps/plugin-fs': path.resolve(__dirname, '../viewer/src/services/tauri-fs-stub.ts'),
+      // `@ifc-lite/collab` lazily `import('y-webrtc')` for its optional WebRTC
+      // transport, which the desktop shell never uses. y-webrtc isn't installed,
+      // so alias it to the viewer's stub (mirrors the viewer/embed configs).
+      'y-webrtc': path.resolve(__dirname, '../viewer/src/services/y-webrtc-stub.ts'),
     },
   },
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
@@ -86,6 +90,9 @@ export default defineConfig({
     sourcemap: !!process.env.TAURI_ENV_DEBUG,
     chunkSizeWarningLimit: 6000,
     rollupOptions: {
+      // Optional collab WebRTC transport — not installed, never used here
+      // (lazy `import('y-webrtc')` with a runtime fallback).
+      external: ['y-webrtc'],
       output: {
         manualChunks(id) {
           if (id.includes('/packages/sandbox/')) return 'sandbox';
@@ -111,6 +118,7 @@ export default defineConfig({
       'quickjs-emscripten',
       '@jitl/quickjs-wasmfile-release-asyncify',
       'esbuild-wasm',
+      'y-webrtc',
     ],
   },
   assetsInclude: ['**/*.wasm'],

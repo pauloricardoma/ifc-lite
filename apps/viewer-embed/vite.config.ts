@@ -48,6 +48,12 @@ export default defineConfig({
       '@ifc-lite/lists': path.resolve(__dirname, '../../packages/lists/src'),
       '@ifc-lite/create': path.resolve(__dirname, '../../packages/create/src'),
       '@ifc-lite/wasm': path.resolve(__dirname, '../../packages/wasm/pkg/ifc-lite.js'),
+      // `@ifc-lite/collab` lazily `import('y-webrtc')` for its optional WebRTC
+      // transport, which the embed never uses (it runs indexeddb+websocket).
+      // y-webrtc isn't installed, so alias it to the viewer's stub — otherwise
+      // Vite/Rollup fails resolving the never-executed import. (Mirrors the
+      // viewer's config; also marked external in rollupOptions below.)
+      'y-webrtc': path.resolve(__dirname, '../viewer/src/services/y-webrtc-stub.ts'),
     },
   },
   server: {
@@ -73,11 +79,14 @@ export default defineConfig({
         '@tauri-apps/plugin-dialog',
         '@tauri-apps/plugin-fs',
         '@tauri-apps/plugin-shell',
+        // Optional collab WebRTC transport — not installed, never used in the
+        // embed (lazy `import('y-webrtc')` with a runtime fallback).
+        'y-webrtc',
       ],
     },
   },
   optimizeDeps: {
-    exclude: ['@duckdb/duckdb-wasm', '@ifc-lite/wasm', 'parquet-wasm'],
+    exclude: ['@duckdb/duckdb-wasm', '@ifc-lite/wasm', 'parquet-wasm', 'y-webrtc'],
   },
   worker: {
     format: 'es',
