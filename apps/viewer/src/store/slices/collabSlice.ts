@@ -29,6 +29,7 @@ import type { StateCreator } from 'zustand';
 // `startCollab` and code-split into its own chunk.
 import type {
   CollabSession,
+  LocalPlacement,
   PresenceState,
   ProviderKind,
   StepSeedSource,
@@ -46,6 +47,7 @@ import {
 import {
   attachRemoteApply,
   mirrorAttribute,
+  mirrorPlacement,
   mirrorProperty,
   mirrorPropertyDelete,
   pathForEntity,
@@ -67,6 +69,7 @@ import {
   type AnnotationDocApi,
 } from '@/lib/collab/annotation-sync';
 import type { Annotation } from '@/store/slices/annotationsSlice';
+import { toGlobalIdFromModels } from '../globalId.js';
 
 /**
  * Access roles, mirrored from `@ifc-lite/collab-server`'s `Role`. Kept as a
@@ -162,6 +165,27 @@ export interface CollabSlice {
   ) => void;
   mirrorPropertyDelete: (entityId: number, psetName: string, propName: string) => void;
   mirrorAttributeEdit: (entityId: number, attrName: string, value: unknown) => void;
+  /**
+   * Mirror a geometry move to the CRDT after a local STEP edit. Composes the
+   * IFC-frame delta onto the entity's current `usd::xformop` (= baseline ∘
+   * cumulative), and records the resulting baked offset so a later *remote*
+   * edit computes the right incremental delta rather than re-applying our move
+   * (the local mesh was already moved by the STEP edit path).
+   */
+  mirrorPlacementEdit: (modelId: string, entityId: number, deltaIfc: [number, number, number]) => void;
+  /**
+   * Read an entity's current local placement from the CRDT (`usd::xformop`),
+   * for stores with no STEP placement chain (a recipient's reconstructed IFCX
+   * model). Returns null outside a session or when the entity has no placement.
+   */
+  readCollabPlacement: (entityId: number) => LocalPlacement | null;
+  /**
+   * Collab-native placement edit for a store with no STEP chain (recipient).
+   * Composes `deltaIfc` (IFC Z-up storey-local) onto the entity's current
+   * placement, writes `usd::xformop`, mirrors to peers, and moves the local
+   * mesh. Returns true when the edit was applied. No-op outside a session.
+   */
+  collabTranslateEntity: (entityId: number, deltaIfc: [number, number, number]) => boolean;
 
   // ── Annotation mirror (collab markup) — called by annotationsSlice after a
   //    local create/edit/delete. No-ops without a session or comment permission.
@@ -196,6 +220,86 @@ function toArrayBuffer(u8: Uint8Array): ArrayBuffer {
 // Collab doc helpers captured from the lazy-loaded runtime (see startCollab),
 // so the synchronous mutation mirror can write to the doc without re-importing.
 let docApi: CollabDocApi | null = null;
+// Placement (move/rotate) helpers captured from the lazy-loaded runtime.
+interface PlacementApi {
+  getEntityPlacement: (doc: CollabSession['doc'], path: string) => LocalPlacement | null;
+  setEntityPlacement: (doc: CollabSession['doc'], path: string, p: LocalPlacement) => void;
+  getPlacementBaseline: (doc: CollabSession['doc'], path: string) => LocalPlacement | null;
+  setPlacementBaseline: (doc: CollabSession['doc'], path: string, p: LocalPlacement) => void;
+}
+let placementApi: PlacementApi | null = null;
+// Per-session render reconciliation: renderer-frame translation (Y-up) currently
+// baked into each entity's live mesh, RELATIVE to its baked baseline. Keyed by
+// entity expressId in the active model's id space. Lets inbound placement edits
+// push only the *incremental* delta (and avoids re-applying our own edits).
+let placementAppliedLoc: Map<number, [number, number, number]> | null = null;
+
+const PLACEMENT_EPS = 1e-6;
+
+/**
+ * Renderer-frame (Y-up) translation that positions an entity's mesh per
+ * `placement`, measured from its baked `baseline`. The mesh is baked at the
+ * baseline, so only the difference is applied. IFC is Z-up storey-local; the
+ * renderer is Y-up: (x, y, z) → (x, z, -y). (This matches the owner's existing
+ * `translateEntity` mapping, and shares its "parent placement is unrotated"
+ * simplification — fine for storey-local edits.)
+ */
+function rendererDeltaForPlacement(
+  baseline: LocalPlacement | null,
+  placement: LocalPlacement,
+): [number, number, number] {
+  const bx = baseline?.location[0] ?? 0;
+  const by = baseline?.location[1] ?? 0;
+  const bz = baseline?.location[2] ?? 0;
+  const dx = placement.location[0] - bx;
+  const dy = placement.location[1] - by;
+  const dz = placement.location[2] - bz;
+  return [dx, dz, -dy];
+}
+
+/**
+ * Move an entity's rendered mesh to reflect `placement`, pushing only the
+ * *incremental* renderer-frame translation since this client last reconciled
+ * it. Shared by inbound remote apply, the recipient's own collab edit, and the
+ * owner's track bookkeeping — so own-edits and remote-edits never double-apply.
+ */
+function reconcilePlacementMesh(
+  get: () => ViewerState,
+  store: IfcDataStore,
+  doc: CollabSession['doc'],
+  entityId: number,
+  placement: LocalPlacement,
+): void {
+  if (!placementApi || !placementAppliedLoc) return;
+  const path = pathForEntity(store, entityId);
+  if (!path) return;
+  let baseline = placementApi.getPlacementBaseline(doc, path);
+  if (!baseline) {
+    // No baseline recorded (un-stamped/legacy room) — establish it at the
+    // current placement so this edit's delta is measured from where the mesh
+    // actually sits. Idempotent; first writer wins.
+    baseline = placement;
+    placementApi.setPlacementBaseline(doc, path, baseline);
+  }
+  const target = rendererDeltaForPlacement(baseline, placement);
+  const applied = placementAppliedLoc.get(entityId) ?? [0, 0, 0];
+  const inc: [number, number, number] = [
+    target[0] - applied[0],
+    target[1] - applied[1],
+    target[2] - applied[2],
+  ];
+  if (
+    Math.abs(inc[0]) < PLACEMENT_EPS &&
+    Math.abs(inc[1]) < PLACEMENT_EPS &&
+    Math.abs(inc[2]) < PLACEMENT_EPS
+  ) {
+    return;
+  }
+  const modelId = get().activeModelId ?? '';
+  const globalId = toGlobalIdFromModels(get().models, modelId, entityId);
+  get().setPendingMeshTranslations(new Map([[globalId, inc]]));
+  placementAppliedLoc.set(entityId, target);
+}
 // Annotation CRDT helpers + inbound-observer teardown (collab markup sync).
 let annotationDocApi: AnnotationDocApi | null = null;
 let annotationInboundTeardown: (() => void) | null = null;
@@ -236,6 +340,14 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
     // role-scoped share link, which needs our admin bearer to be available.
     set({ collabConnecting: true, collabRoomId: roomId, collabRole: role, collabSelfToken: token ?? null });
 
+    // Role gate: joining as viewer/commenter must drop any edit mode the
+    // user had on locally — otherwise the gizmo/geometry card would stay
+    // visible (and now also rejected at the action level) in a session
+    // where they have no edit rights. setEditEnabled re-checks the role.
+    if (!get().canCollabEdit()) {
+      get().setEditEnabled(false);
+    }
+
     const identity = get().collabIdentity;
     const user: UserIdentity = { id: identity.id, name: identity.name, color: identity.color };
 
@@ -253,8 +365,23 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
         setPropertyValue: collab.setPropertyValue,
         deletePropertyValue: collab.deletePropertyValue,
         setAttribute: collab.setAttribute,
+        setEntityPlacement: collab.setEntityPlacement,
+        XFORMOP_KEY: collab.USD_XFORMOP,
+        placementFromXformOp: (value) => {
+          const xform = value as { transform?: number[][] } | undefined;
+          if (!xform || !Array.isArray(xform.transform)) return null;
+          return collab.matrixToPlacement(xform.transform);
+        },
         PROPERTY_TYPE_NAMES: collab.PROPERTY_TYPE_NAMES,
       };
+      // Placement (move/rotate) helpers + a fresh per-session render-track map.
+      placementApi = {
+        getEntityPlacement: collab.getEntityPlacement,
+        setEntityPlacement: collab.setEntityPlacement,
+        getPlacementBaseline: collab.getPlacementBaseline,
+        setPlacementBaseline: collab.setPlacementBaseline,
+      };
+      placementAppliedLoc = new Map();
       // Capture the annotation (markup) CRDT helpers for the sync bridge.
       annotationDocApi = {
         annotationsMap: (doc) => collab.annotationsMap(doc),
@@ -332,6 +459,18 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
             // content-addressed, so re-seeding the same model dedupes.
             if (session.doc.getMap('geometry').size === 0) {
               const blobStore = await createSharedBlobStore(collabMod, collabServerUrl(), token);
+              // Record the placement each entity's blob is baked at, so every
+              // client (incl. late joiners) can render `blob + (current
+              // usd::xformop − baseline)`. The blob is baked at whatever
+              // placement the doc holds now: the seeded `usd::xformop` for IFCX
+              // models, identity for legacy STEP (geometry baked world-absolute).
+              const stampBaseline = (path: string | null): string | null => {
+                if (path && placementApi) {
+                  const current = placementApi.getEntityPlacement(session.doc, path);
+                  placementApi.setPlacementBaseline(session.doc, path, current ?? { location: [0, 0, 0] });
+                }
+                return path;
+              };
               if (seedData.isIfcx && store.source && store.source.length > 0) {
                 // IFCX geometry is explicit in the file: re-parse the source for
                 // COMPLETE meshes + the id→path map to key them. (The owner's
@@ -348,14 +487,14 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
                 const meshes = parsed.geometryResult.meshes;
                 if (meshes.length > 0) {
                   await seedGeometryToRoom(geomApi, session, blobStore, meshes, (id) =>
-                    parsed.idToPath?.get(id) ?? null,
+                    stampBaseline(parsed.idToPath?.get(id) ?? null),
                   );
                 }
               } else {
                 const meshes = get().geometryResult?.meshes;
                 if (meshes && meshes.length > 0) {
                   await seedGeometryToRoom(geomApi, session, blobStore, meshes, (id) =>
-                    pathForEntity(store, id),
+                    stampBaseline(pathForEntity(store, id)),
                   );
                 }
               }
@@ -529,7 +668,7 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
         const modelId = get().activeModelId;
         return modelId ? get().mutationViews.get(modelId) : undefined;
       };
-      remoteApplyTeardown = attachRemoteApply(session, applyStore, {
+      remoteApplyTeardown = attachRemoteApply(docApi!, session, applyStore, {
         onProperty: (entityId, pset, prop, value, type) => {
           const view = activeView();
           if (!view) return;
@@ -546,6 +685,12 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
           const view = activeView();
           if (!view) return;
           view.setAttribute(entityId, attrName, value === null ? '' : String(value));
+          set((s) => ({ mutationVersion: s.mutationVersion + 1 }));
+        },
+        // A peer moved/rotated an entity: reflect it on the local mesh by
+        // pushing the incremental renderer-frame delta (no undo, no echo).
+        onPlacement: (entityId, placement) => {
+          reconcilePlacementMesh(get, applyStore, session.doc, entityId, placement);
           set((s) => ({ mutationVersion: s.mutationVersion + 1 }));
         },
       });
@@ -607,6 +752,8 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
     }
     docApi = null;
     annotationDocApi = null;
+    placementApi = null;
+    placementAppliedLoc = null;
     const session = get().collabSession;
     if (session) {
       try {
@@ -691,6 +838,68 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
     const store = get().ifcDataStore;
     if (!session || !store || !docApi) return;
     mirrorAttribute(docApi, session, store, entityId, attrName, value);
+  },
+
+  mirrorPlacementEdit: (modelId, entityId, deltaIfc) => {
+    const session = get().collabSession;
+    const store = get().models.get(modelId)?.ifcDataStore ?? get().ifcDataStore;
+    if (!session || !store || !docApi || !placementApi || !placementAppliedLoc) return;
+    if (!get().canCollabEdit()) return;
+    const path = pathForEntity(store, entityId);
+    if (!path) return;
+    const baseline = placementApi.getPlacementBaseline(session.doc, path);
+    const prev =
+      placementApi.getEntityPlacement(session.doc, path) ?? baseline ?? { location: [0, 0, 0] };
+    const next: LocalPlacement = {
+      location: [
+        prev.location[0] + deltaIfc[0],
+        prev.location[1] + deltaIfc[1],
+        prev.location[2] + deltaIfc[2],
+      ],
+      axis: prev.axis,
+      refDirection: prev.refDirection,
+    };
+    mirrorPlacement(docApi, session, store, entityId, next);
+    // The local mesh was already moved by the STEP edit path; record the
+    // resulting baked offset so we don't double-apply on a later remote edit.
+    placementAppliedLoc.set(entityId, rendererDeltaForPlacement(baseline, next));
+  },
+
+  readCollabPlacement: (entityId) => {
+    const session = get().collabSession;
+    const store = get().ifcDataStore;
+    if (!session || !store || !placementApi) return null;
+    const path = pathForEntity(store, entityId);
+    if (!path) return null;
+    return (
+      placementApi.getEntityPlacement(session.doc, path) ??
+      placementApi.getPlacementBaseline(session.doc, path)
+    );
+  },
+
+  collabTranslateEntity: (entityId, deltaIfc) => {
+    const session = get().collabSession;
+    const store = get().ifcDataStore;
+    if (!session || !store || !docApi || !placementApi) return false;
+    if (!get().canCollabEdit()) return false;
+    const path = pathForEntity(store, entityId);
+    if (!path) return false;
+    const prev =
+      placementApi.getEntityPlacement(session.doc, path) ??
+      placementApi.getPlacementBaseline(session.doc, path) ?? { location: [0, 0, 0] };
+    const next: LocalPlacement = {
+      location: [
+        prev.location[0] + deltaIfc[0],
+        prev.location[1] + deltaIfc[1],
+        prev.location[2] + deltaIfc[2],
+      ],
+      axis: prev.axis,
+      refDirection: prev.refDirection,
+    };
+    mirrorPlacement(docApi, session, store, entityId, next);
+    // No STEP chain on this store — move our own mesh via the shared reconciler.
+    reconcilePlacementMesh(get, store, session.doc, entityId, next);
+    return true;
   },
 
   mirrorAnnotationUpsert: (annotation) => {

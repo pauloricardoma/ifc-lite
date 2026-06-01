@@ -1375,6 +1375,11 @@ export const createMutationSlice: StateCreator<
   },
 
   translateEntity: (modelId, expressId, delta, batchId) => {
+    // Collab role gate: in a shared session only editor/admin may move geometry
+    // (single-user sessions have role === null → allowed).
+    if (!get().canCollabEdit()) {
+      return { ok: false, reason: 'Editing is disabled for your role in this shared session' };
+    }
     // Read the existing placement chain WITHOUT committing the edit
     // yet — we'll route the actual write through `setPositionalAttribute`
     // below so undo/redo + dirty-tracking come for free.
@@ -1387,6 +1392,12 @@ export const createMutationSlice: StateCreator<
 
     const chain = resolvePlacementChain(dataStore, view, editor, expressId);
     if (!chain) {
+      // No STEP placement chain — e.g. a recipient's IFCX-reconstructed store.
+      // Route the move through the collab doc (`usd::xformop`) instead, which
+      // syncs to peers and moves the local mesh. Returns false outside a room.
+      if (get().collabTranslateEntity(expressId, delta)) {
+        return { ok: true, newCoordinates: delta };
+      }
       return {
         ok: false,
         reason:
@@ -1425,10 +1436,17 @@ export const createMutationSlice: StateCreator<
       }
     }
 
+    // Mirror the move to peers as the entity's canonical placement
+    // (`usd::xformop`). No-op outside a collab session.
+    get().mirrorPlacementEdit(modelId, expressId, delta);
+
     return { ok: true, newCoordinates: next };
   },
 
   setEntityPosition: (modelId, expressId, position) => {
+    if (!get().canCollabEdit()) {
+      return { ok: false, reason: 'Editing is disabled for your role in this shared session' };
+    }
     const view = get().mutationViews.get(modelId);
     if (!view) return { ok: false, reason: 'Model has no editable mutation view yet' };
     const editor = getOrCreateStoreEditor(get, set, modelId);
@@ -1438,6 +1456,19 @@ export const createMutationSlice: StateCreator<
 
     const chain = resolvePlacementChain(dataStore, view, editor, expressId);
     if (!chain) {
+      // No STEP chain (recipient/IFCX store): translate by the delta from the
+      // current collab placement to the requested absolute position.
+      const current = get().readCollabPlacement(expressId);
+      if (current) {
+        const delta: [number, number, number] = [
+          position[0] - current.location[0],
+          position[1] - current.location[1],
+          position[2] - current.location[2],
+        ];
+        if (get().collabTranslateEntity(expressId, delta)) {
+          return { ok: true, newCoordinates: position };
+        }
+      }
       return {
         ok: false,
         reason:
@@ -1462,11 +1493,16 @@ export const createMutationSlice: StateCreator<
         tags.set(mutation.id, { globalId, rendererDelta });
         set({ mutationMeshTranslations: tags });
       }
+      // Mirror the move to peers as the entity's placement (`usd::xformop`).
+      get().mirrorPlacementEdit(modelId, expressId, [dx, dy, dz]);
     }
     return { ok: true, newCoordinates: position };
   },
 
   rotateEntity: (modelId, expressId, deltaYaw) => {
+    if (!get().canCollabEdit()) {
+      return { ok: false, reason: 'Editing is disabled for your role in this shared session' };
+    }
     const view = get().mutationViews.get(modelId);
     if (!view) return { ok: false, reason: 'Model has no editable mutation view yet' };
     const editor = getOrCreateStoreEditor(get, set, modelId);
@@ -1543,7 +1579,12 @@ export const createMutationSlice: StateCreator<
     const dataStore = get().models.get(modelId)?.ifcDataStore;
     if (!dataStore) return null;
     const chain = resolvePlacementChain(dataStore, view, editor, expressId);
-    return chain ? chain.coordinates : null;
+    if (chain) return chain.coordinates;
+    // No STEP chain (recipient's IFCX-reconstructed store): fall back to the
+    // collab placement so the move gizmo + geometry card still surface. The
+    // gizmo's origin comes from the mesh bbox, so a [0,0,0] here is fine — this
+    // is purely the "is this entity movable?" gate.
+    return get().readCollabPlacement(expressId)?.location ?? null;
   },
 
   resizeWall: (modelId, expressId, newStart, newEnd) => {

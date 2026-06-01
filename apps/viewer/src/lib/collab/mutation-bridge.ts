@@ -21,7 +21,7 @@
 
 import { PropertyValueType } from '@ifc-lite/data';
 import type { IfcDataStore } from '@ifc-lite/parser';
-import type { CollabSession } from '@ifc-lite/collab';
+import type { CollabSession, LocalPlacement } from '@ifc-lite/collab';
 
 /** The slice of the collab runtime this bridge needs (injected, never eager-imported). */
 export interface CollabDocApi {
@@ -35,6 +35,12 @@ export interface CollabDocApi {
   ): void;
   deletePropertyValue(doc: CollabSession['doc'], path: string, pset: string, prop: string): boolean;
   setAttribute(doc: CollabSession['doc'], path: string, name: string, value: unknown): void;
+  /** Write an entity's local placement (the IFCX-native `usd::xformop` attribute). */
+  setEntityPlacement(doc: CollabSession['doc'], path: string, placement: LocalPlacement): void;
+  /** The `usd::xformop` attribute key, so the inbound observer can route it to `onPlacement`. */
+  XFORMOP_KEY: string;
+  /** Decode a `usd::xformop` attribute value back to a normalized placement (null if malformed). */
+  placementFromXformOp(value: unknown): LocalPlacement | null;
   PROPERTY_TYPE_NAMES: Record<number, string>;
 }
 
@@ -182,6 +188,26 @@ export function mirrorAttribute(
   });
 }
 
+/**
+ * Mirror a geometry placement edit (move / rotate) to the CRDT as the entity's
+ * canonical `usd::xformop` attribute. Unlike property/attribute edits this is
+ * the IFCX-native transform, so it round-trips through `snapshotToIfcx` and is
+ * read back by `parseIfcxViewerModel` with no writer/parser change.
+ */
+export function mirrorPlacement(
+  api: CollabDocApi,
+  session: CollabSession,
+  store: IfcDataStore,
+  entityId: number,
+  placement: LocalPlacement,
+): void {
+  const path = pathForEntity(store, entityId);
+  if (!path || !api.hasEntity(session.doc, path)) return;
+  session.transact(() => {
+    api.setEntityPlacement(session.doc, path, placement);
+  });
+}
+
 // ── inbound: remote CRDT change → local model ────────────────────────────────
 
 export type ScalarValue = string | number | boolean | null;
@@ -193,6 +219,13 @@ export interface RemoteApplyHandlers {
   onPropertyDelete(entityId: number, pset: string, prop: string): void;
   /** Apply a remote attribute write. */
   onAttribute(entityId: number, attrName: string, value: ScalarValue): void;
+  /**
+   * Apply a remote placement (move / rotate) write. Receives the entity's full
+   * new local placement decoded from `usd::xformop`; the handler reconciles it
+   * against the entity's baseline to move the rendered mesh. Optional so older
+   * callers keep working.
+   */
+  onPlacement?(entityId: number, placement: LocalPlacement): void;
 }
 
 /**
@@ -202,6 +235,7 @@ export interface RemoteApplyHandlers {
  * `[entityPath, 'psets', psetName]` for property sets.
  */
 export function attachRemoteApply(
+  api: CollabDocApi,
   session: CollabSession,
   store: IfcDataStore,
   handlers: RemoteApplyHandlers,
@@ -224,6 +258,14 @@ export function attachRemoteApply(
       if (path[1] === 'attributes' && path.length === 2) {
         for (const [attrName, change] of ev.changes.keys) {
           if (change.action === 'delete') continue;
+          // Placement (`usd::xformop`) is a structured matrix, not a scalar
+          // attribute — route it to the dedicated placement handler so the
+          // mesh moves, and skip the generic stringifying attribute path.
+          if (attrName === api.XFORMOP_KEY) {
+            const placement = api.placementFromXformOp(target.get(attrName));
+            if (placement && handlers.onPlacement) handlers.onPlacement(entityId, placement);
+            continue;
+          }
           handlers.onAttribute(entityId, attrName, toScalar(target.get(attrName)));
         }
       } else if (path[1] === 'psets' && path.length === 3 && typeof path[2] === 'string') {

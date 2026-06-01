@@ -540,6 +540,13 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
   const setActiveTool = useViewerStore((state) => state.setActiveTool);
   const editEnabled = useViewerStore((state) => state.editEnabled);
   const toggleEditEnabled = useViewerStore((state) => state.toggleEditEnabled);
+  // Collab role: editing (gizmo, geometry card, add-element, inline property
+  // editors) is reserved for editor/admin. Derive from the reactive role so
+  // the Edit pill enables/disables live when a peer's role changes. null role
+  // = single-user, always editable.
+  const collabEditRole = useViewerStore((state) => state.collabRole);
+  const canEditInSession =
+    collabEditRole === null || collabEditRole === 'editor' || collabEditRole === 'admin';
   const selectedEntityId = useViewerStore((state) => state.selectedEntityId);
   const selectedEntityIds = useViewerStore((state) => state.selectedEntityIds);
   const hideEntities = useViewerStore((state) => state.hideEntities);
@@ -1386,6 +1393,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
           <Button
             variant={editEnabled ? 'default' : 'ghost'}
             size="icon-sm"
+            disabled={!canEditInSession}
             aria-label={editEnabled ? 'Exit edit mode' : 'Enter edit mode'}
             aria-pressed={editEnabled}
             onClick={(e) => {
@@ -1398,7 +1406,13 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
           </Button>
         </TooltipTrigger>
         <TooltipContent>
-          {editEnabled ? 'Exit Edit Mode' : 'Edit Mode'} <span className="opacity-50">E</span>
+          {canEditInSession ? (
+            <>
+              {editEnabled ? 'Exit Edit Mode' : 'Edit Mode'} <span className="opacity-50">E</span>
+            </>
+          ) : (
+            'Editing requires editor access in this shared session'
+          )}
         </TooltipContent>
       </Tooltip>
 

@@ -11,6 +11,7 @@
 // Doc model
 export * from './doc/schema.js';
 export * from './doc/entity.js';
+export * from './doc/placement.js';
 export * from './doc/relationship.js';
 export * from './doc/geometry.js';
 export * from './doc/annotation.js';
