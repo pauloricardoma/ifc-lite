@@ -46,6 +46,10 @@ export interface UseGeometryStreamingParams {
   geometryContentVersion?: number;
   coordinateInfo?: CoordinateInfo;
   isStreaming: boolean;
+  /** Number of loaded models. When this increases (a model was added to the
+   *  federation) the camera must refit to the new combined bounds — otherwise
+   *  it stays framed on the first model and the newly-added one is off-screen. */
+  modelCount?: number;
   geometryBoundsRef: MutableRefObject<{ min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } }>;
   pendingMeshColorUpdates: Map<number, [number, number, number, number]> | null;
   pendingColorUpdates: Map<number, [number, number, number, number]> | null;
@@ -97,6 +101,7 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
     geometryContentVersion,
     coordinateInfo,
     isStreaming,
+    modelCount = 0,
     geometryBoundsRef,
     pendingMeshColorUpdates,
     pendingColorUpdates,
@@ -126,6 +131,7 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
   const lastFitPolicyKindRef = useRef<'compact' | 'linear' | null>(null);
   const prevIsStreamingRef = useRef(isStreaming);
   const lastContentVersionRef = useRef(geometryContentVersion ?? 0);
+  const prevModelCountRef = useRef(modelCount);
   const queuePumpTimerRef = useRef<ReturnType<typeof globalThis.setTimeout> | null>(null);
 
   // Only activate the timer-based queue pump when the tab is background-throttled
@@ -203,6 +209,20 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
         lastGeometryRef.current = null;
       }
     }
+
+    // A model was added to the federation — refit the camera to the new
+    // combined bounds. Without this, `cameraFittedRef` stays true from the
+    // first model's fit, so the newly-added model renders off-screen and only
+    // its 2D grid overlay shows. Refit only on an INCREASE (a model added),
+    // and never mid-stream (the streaming first-fit + finalize refit handle
+    // the active model). The combined bounds come from the merged
+    // coordinateInfo (union of all visible models).
+    if (modelCount > prevModelCountRef.current && !isStreaming) {
+      traceGeometrySync(`model added (${prevModelCountRef.current}→${modelCount}) — refitting camera to combined bounds`);
+      cameraFittedRef.current = false;
+      finalBoundsRefittedRef.current = false;
+    }
+    prevModelCountRef.current = modelCount;
 
     // Read AFTER the optional reset above so the classification below reflects
     // the post-reset state (otherwise an in-place update gets misclassified as
@@ -404,7 +424,7 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
     }
 
     renderer.requestRender();
-  }, [geometry, geometryVersion, geometryContentVersion, coordinateInfo, isInitialized, isStreaming]);
+  }, [geometry, geometryVersion, geometryContentVersion, coordinateInfo, isInitialized, isStreaming, modelCount]);
 
   useEffect(() => {
     return () => {

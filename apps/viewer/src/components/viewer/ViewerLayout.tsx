@@ -30,6 +30,7 @@ import { HoverTooltip } from './HoverTooltip';
 import { BCFPanel } from './BCFPanel';
 import { IDSPanel } from './IDSPanel';
 import { LensPanel } from './LensPanel';
+import { ClashPanel } from './ClashPanel';
 import { ListPanel } from './lists/ListPanel';
 import { ScriptPanel } from './ScriptPanel';
 import { GanttPanel } from './schedule/GanttPanel';
@@ -150,6 +151,8 @@ export function ViewerLayout() {
   const setListPanelVisible = useViewerStore((s) => s.setListPanelVisible);
   const lensPanelVisible = useViewerStore((s) => s.lensPanelVisible);
   const setLensPanelVisible = useViewerStore((s) => s.setLensPanelVisible);
+  const clashPanelVisible = useViewerStore((s) => s.clashPanelVisible);
+  const setClashPanelVisible = useViewerStore((s) => s.setClashPanelVisible);
   const scriptPanelVisible = useViewerStore((s) => s.scriptPanelVisible);
   const setScriptPanelVisible = useViewerStore((s) => s.setScriptPanelVisible);
   const ganttPanelVisible = useViewerStore((s) => s.ganttPanelVisible);
@@ -360,6 +363,8 @@ export function ViewerLayout() {
                       <AddElementPanel onClose={() => setActiveTool('select')} />
                     ) : lensPanelVisible ? (
                       <LensPanel onClose={() => setLensPanelVisible(false)} />
+                    ) : clashPanelVisible ? (
+                      <ClashPanel onClose={() => setClashPanelVisible(false)} />
                     ) : idsPanelVisible ? (
                       <IDSPanel onClose={() => setIdsPanelVisible(false)} />
                     ) : bcfPanelVisible ? (

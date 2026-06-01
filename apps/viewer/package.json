@@ -1,6 +1,6 @@
 {
   "name": "@ifc-lite/viewer",
-  "version": "1.25.2",
+  "version": "1.26.0",
   "description": "IFC-Lite viewer application",
   "type": "module",
   "repository": {
@@ -27,6 +27,7 @@
     "@codemirror/view": "^6.43.0",
     "@ifc-lite/bcf": "workspace:^",
     "@ifc-lite/cache": "workspace:^",
+    "@ifc-lite/clash": "workspace:^",
     "@ifc-lite/collab": "workspace:^",
     "@ifc-lite/create": "workspace:^",
     "@ifc-lite/data": "workspace:^",

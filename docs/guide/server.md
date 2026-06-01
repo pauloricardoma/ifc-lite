@@ -132,6 +132,20 @@ console.log(`From cache: ${result.stats.from_cache}`);
 | `/api/v1/parse/parquet-stream` | POST | Streaming Parquet (SSE) |
 | `/api/v1/parse/metadata` | POST | Quick metadata only (no geometry) |
 
+All parse endpoints that return geometry also surface the 2D symbol stream
+(`IfcAnnotation` + `IfcGrid`), matching `@ifc-lite/parse`. The JSON and SSE
+responses carry it inline as `symbolic_data` (in the `complete` event for the
+streaming variants); the binary Parquet transports expose it by cache key via
+`/api/v1/parse/symbolic/{key}` (see below).
+
+Every geometry endpoint's `ModelMetadata` carries `length_unit_scale` (factor to
+convert model length values to metres, e.g. `0.001` for millimetres) and, when
+the model has an `IfcMapConversion` / `IfcProjectedCRS`, a `georeferencing`
+object (CRS name, datum, false eastings/northings, orthogonal height, grid-north
+rotation, and a local→map 4×4 matrix) — matching `@ifc-lite/parse`. For the
+JSON/SSE endpoints it's on `metadata`; for the Parquet endpoints it's in the
+`X-IFC-Metadata` header.
+
 ### Cache Endpoints
 
 | Endpoint | Method | Description |
@@ -140,6 +154,7 @@ console.log(`From cache: ${result.stats.from_cache}`);
 | `/api/v1/cache/geometry/{hash}` | GET | Fetch cached geometry (no upload) |
 | `/api/v1/cache/{key}` | GET | Retrieve cached JSON result |
 | `/api/v1/parse/data-model/{key}` | GET | Fetch cached data model |
+| `/api/v1/parse/symbolic/{key}` | GET | Fetch 2D symbol data (`IfcAnnotation` + `IfcGrid`) as JSON |
 
 ### Utility Endpoints
 
@@ -274,6 +289,23 @@ if (dataModel) {
 }
 ```
 
+#### Fetching Symbolic Data
+
+The JSON (`parse`) and streaming endpoints return the 2D symbol stream
+(`IfcAnnotation` + `IfcGrid`) inline as `symbolic_data`. The binary Parquet
+endpoints (`parseParquet`, `parseParquetOptimized`) can't carry it inline —
+fetch it by cache key instead:
+
+```typescript
+const result = await client.parseParquet(file);
+
+const symbols = await client.fetchSymbolic(result.cache_key);
+if (symbols) {
+  console.log(`Grid axes: ${symbols.grid_axes.length}`);
+  console.log(`Annotations: ${symbols.polylines.length} polylines, ${symbols.texts.length} labels`);
+}
+```
+
 ### Utility Methods
 
 ```typescript
@@ -289,7 +321,13 @@ const available = await client.isParquetSupported();
 
 ## Data Model
 
-The server computes a complete data model including:
+The server computes a complete data model including entities, property sets,
+quantity sets, relationships, spatial hierarchy, and — matching `@ifc-lite/parse`
+— per-element **classifications** (`IfcClassificationReference`), **materials**
+(`IfcMaterialLayerSet` layers with metre thicknesses), and **documents**
+(`IfcDocumentReference`). The latter three are exposed as flat, element-keyed
+arrays on the decoded `DataModel` (`classifications`, `materials`, `documents`)
+and decode to empty arrays when served by an older server/cache.
 
 ### Entities
 

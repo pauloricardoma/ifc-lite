@@ -9,6 +9,7 @@ import { loadGLBToMeshData } from '@ifc-lite/cache';
 import type { SchemaVersion } from '../../store/types.js';
 import { calculateMeshBounds, calculateStoreyHeights, createCoordinateInfo, normalizeColor } from '../../utils/localParsingUtils.js';
 import { resolveDataStoreOrAbort } from './resolveDataStoreOrAbort.js';
+import { watchedGeometryStream } from './watchedGeometryStream.js';
 
 type RgbaColor = [number, number, number, number];
 
@@ -292,7 +293,7 @@ export async function parseStepBufferViewerModel(options: StepBufferIngestOption
       });
 
   const geometryView = sharedSource ? new Uint8Array(sharedSource) : new Uint8Array(options.buffer);
-  for await (const event of geometryProcessor.processAdaptive(geometryView, {
+  const geometryStream = geometryProcessor.processAdaptive(geometryView, {
     sizeThreshold: 2 * 1024 * 1024,
     batchSize: options.getDynamicBatchSize(options.fileSizeMB),
     sharedRtcOffset: options.sharedRtcOffset,
@@ -300,48 +301,69 @@ export async function parseStepBufferViewerModel(options: StepBufferIngestOption
     onEntityIndex: (ids, starts, lengths) => {
       workerParser?.setEntityIndex(ids, starts, lengths);
     },
-  })) {
-    if (options.shouldAbort?.()) {
-      break;
+  });
+  let lastTotalMeshes = 0;
+  // The federated/added-model path was missing the size-aware stream watchdog
+  // the single-model loader has, so a geometry worker that failed to spawn would
+  // hang the load forever on "Processing geometry (N meshes)" instead of
+  // surfacing a recoverable error. watchedGeometryStream re-yields each event
+  // under that watchdog and bounds iterator teardown on every exit path.
+  try {
+    for await (const event of watchedGeometryStream(geometryStream, {
+      fileName: options.fileName,
+      fileSizeMB: options.fileSizeMB,
+      shouldAbort: options.shouldAbort,
+      getBatchCount: () => batchIndex,
+      getLastTotalMeshes: () => lastTotalMeshes,
+    })) {
+      switch (event.type) {
+        case 'start':
+          estimatedTotal = event.totalEstimate;
+          break;
+        case 'colorUpdate':
+          for (const [expressId, color] of event.updates) {
+            cumulativeColorUpdates.set(expressId, color);
+          }
+          options.onColorUpdate?.(event.updates);
+          break;
+        case 'rtcOffset':
+          if (event.hasRtc) {
+            capturedRtcOffset = event.rtcOffset;
+            options.onRtcOffset?.({ rtcOffset: event.rtcOffset });
+          }
+          break;
+        case 'batch':
+          batchIndex += 1;
+          for (let i = 0; i < event.meshes.length; i++) {
+            allMeshes.push(event.meshes[i]);
+          }
+          finalCoordinateInfo = event.coordinateInfo ?? null;
+          lastTotalMeshes = event.totalSoFar;
+          options.onBatch?.({
+            batchIndex,
+            estimatedTotal,
+            totalSoFar: event.totalSoFar,
+            meshes: event.meshes,
+            coordinateInfo: event.coordinateInfo ?? null,
+          });
+          options.onProgress?.({
+            phase: `Processing geometry (${event.totalSoFar} meshes)`,
+            percent: 10 + Math.min(80, (allMeshes.length / 1000) * 0.8),
+          });
+          break;
+        case 'complete':
+          finalCoordinateInfo = event.coordinateInfo ?? null;
+          break;
+      }
     }
-    switch (event.type) {
-      case 'start':
-        estimatedTotal = event.totalEstimate;
-        break;
-      case 'colorUpdate':
-        for (const [expressId, color] of event.updates) {
-          cumulativeColorUpdates.set(expressId, color);
-        }
-        options.onColorUpdate?.(event.updates);
-        break;
-      case 'rtcOffset':
-        if (event.hasRtc) {
-          capturedRtcOffset = event.rtcOffset;
-          options.onRtcOffset?.({ rtcOffset: event.rtcOffset });
-        }
-        break;
-      case 'batch':
-        batchIndex += 1;
-        for (let i = 0; i < event.meshes.length; i++) {
-          allMeshes.push(event.meshes[i]);
-        }
-        finalCoordinateInfo = event.coordinateInfo ?? null;
-        options.onBatch?.({
-          batchIndex,
-          estimatedTotal,
-          totalSoFar: event.totalSoFar,
-          meshes: event.meshes,
-          coordinateInfo: event.coordinateInfo ?? null,
-        });
-        options.onProgress?.({
-          phase: `Processing geometry (${event.totalSoFar} meshes)`,
-          percent: 10 + Math.min(80, (allMeshes.length / 1000) * 0.8),
-        });
-        break;
-      case 'complete':
-        finalCoordinateInfo = event.coordinateInfo ?? null;
-        break;
-    }
+  } catch (err) {
+    // Watchdog stall (or other stream error): the parser worker may be
+    // blocked in `waitForEntityIndex`, which only the geometry pre-pass would
+    // unblock. Terminate it here so it doesn't leak — the normal path below
+    // still awaits it via resolveDataStoreOrAbort. watchedGeometryStream's
+    // finally has already bounded teardown of the geometry iterator itself.
+    workerParser?.terminate();
+    throw err;
   }
 
   // If the load was cancelled, don't await dataStorePromise: a worker parse

@@ -2422,6 +2422,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ifc-lite-clash"
+version = "3.0.0"
+
+[[package]]
 name = "ifc-lite-core"
 version = "3.0.0"
 dependencies = [
@@ -2528,6 +2532,7 @@ version = "3.0.0"
 dependencies = [
  "console_error_panic_hook",
  "futures-util",
+ "ifc-lite-clash",
  "ifc-lite-core",
  "ifc-lite-geometry",
  "ifc-lite-processing",
@@ -2990,9 +2995,9 @@ dependencies = [
 
 [[package]]
 name = "memchr"
-version = "2.8.0"
+version = "2.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
+checksum = "6b947ae49db0d222b1dbc6b113ce7248a3fc3a6ca21b696717bfc000ba4484d8"
 
 [[package]]
 name = "memmap2"

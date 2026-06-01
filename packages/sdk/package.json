@@ -1,6 +1,6 @@
 {
   "name": "@ifc-lite/sdk",
-  "version": "1.16.1",
+  "version": "1.17.0",
   "description": "Scripting SDK for ifc-lite — the bim.* API for BIM automation",
   "type": "module",
   "main": "./dist/index.js",
@@ -17,18 +17,19 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@ifc-lite/bcf": "workspace:^",
+    "@ifc-lite/clash": "workspace:^",
     "@ifc-lite/create": "workspace:^",
     "@ifc-lite/data": "workspace:^",
-    "@ifc-lite/parser": "workspace:^",
-    "@ifc-lite/query": "workspace:^",
-    "@ifc-lite/lens": "workspace:^",
-    "@ifc-lite/ids": "workspace:^",
-    "@ifc-lite/bcf": "workspace:^",
-    "@ifc-lite/lists": "workspace:^",
-    "@ifc-lite/mutations": "workspace:^",
-    "@ifc-lite/export": "workspace:^",
     "@ifc-lite/drawing-2d": "workspace:^",
     "@ifc-lite/encoding": "workspace:^",
+    "@ifc-lite/export": "workspace:^",
+    "@ifc-lite/ids": "workspace:^",
+    "@ifc-lite/lens": "workspace:^",
+    "@ifc-lite/lists": "workspace:^",
+    "@ifc-lite/mutations": "workspace:^",
+    "@ifc-lite/parser": "workspace:^",
+    "@ifc-lite/query": "workspace:^",
     "@ifc-lite/spatial": "workspace:^"
   },
   "devDependencies": {
