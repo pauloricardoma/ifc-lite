@@ -95,7 +95,8 @@ export function pathForEntity(store: IfcDataStore, entityId: number): string | n
   const guid = store.entities?.getGlobalId?.(entityId);
   return guid ? guidPath(guid) : null;
 }
-export function entityForPath(store: IfcDataStore, path: string): number | null {
+/** Inbound counterpart to `pathForEntity` — internal to the apply observer. */
+function entityForPath(store: IfcDataStore, path: string): number | null {
   return entityMaps(store).toExpressId.get(path) ?? null;
 }
 

@@ -79,16 +79,6 @@ function cross(a: Vec3, b: Vec3): Vec3 {
   ];
 }
 
-/** Identity transform. */
-export function identityMat4(): Mat4 {
-  return [
-    [1, 0, 0, 0],
-    [0, 1, 0, 0],
-    [0, 0, 1, 0],
-    [0, 0, 0, 1],
-  ];
-}
-
 /**
  * Build a 4×4 (row-vector) matrix from a normalized local placement.
  * Rows 0/1/2 carry the orthonormal local X/Y/Z basis; row 3 the origin.
@@ -121,50 +111,6 @@ export function matrixToPlacement(m: number[][]): LocalPlacement {
     axis: [m[2]?.[0] ?? 0, m[2]?.[1] ?? 0, m[2]?.[2] ?? 1],
     refDirection: [m[0]?.[0] ?? 1, m[0]?.[1] ?? 0, m[0]?.[2] ?? 0],
   };
-}
-
-/**
- * Standard row-major product `A·B`. In the row-vector convention this is the
- * transform that applies A **first**, then B: `p·(A·B) = (p·A)·B`.
- */
-export function multiplyMat4(a: number[][], b: number[][]): Mat4 {
-  const out = identityMat4();
-  for (let i = 0; i < 4; i++) {
-    for (let j = 0; j < 4; j++) {
-      let s = 0;
-      for (let k = 0; k < 4; k++) s += (a[i]?.[k] ?? 0) * (b[k]?.[j] ?? 0);
-      out[i][j] = s;
-    }
-  }
-  return out;
-}
-
-/**
- * Inverse of a rigid transform (orthonormal basis + translation), which is all
- * a local placement ever is. For row-vector `p' = [p 1]·M` with rotation rows
- * R and translation t: the inverse rotation is Rᵀ (as rows) and the inverse
- * translation is `-t·Rᵀ`. Cheaper and more stable than a general 4×4 invert.
- */
-export function invertRigidMat4(m: number[][]): Mat4 {
-  // Rotation basis rows.
-  const r0: Vec3 = [m[0]?.[0] ?? 1, m[0]?.[1] ?? 0, m[0]?.[2] ?? 0];
-  const r1: Vec3 = [m[1]?.[0] ?? 0, m[1]?.[1] ?? 1, m[1]?.[2] ?? 0];
-  const r2: Vec3 = [m[2]?.[0] ?? 0, m[2]?.[1] ?? 0, m[2]?.[2] ?? 1];
-  const t: Vec3 = [m[3]?.[0] ?? 0, m[3]?.[1] ?? 0, m[3]?.[2] ?? 0];
-  // Transposed rotation as rows of the inverse.
-  const i0: Vec3 = [r0[0], r1[0], r2[0]];
-  const i1: Vec3 = [r0[1], r1[1], r2[1]];
-  const i2: Vec3 = [r0[2], r1[2], r2[2]];
-  // Inverse translation: -t · Rᵀ.
-  const tx = -(t[0] * i0[0] + t[1] * i1[0] + t[2] * i2[0]);
-  const ty = -(t[0] * i0[1] + t[1] * i1[1] + t[2] * i2[1]);
-  const tz = -(t[0] * i0[2] + t[1] * i1[2] + t[2] * i2[2]);
-  return [
-    [i0[0], i0[1], i0[2], 0],
-    [i1[0], i1[1], i1[2], 0],
-    [i2[0], i2[1], i2[2], 0],
-    [tx, ty, tz, 1],
-  ];
 }
 
 /* ------------------------------------------------------------------ */

@@ -8,10 +8,7 @@ import { createEntity } from '../src/doc/entity.js';
 import { snapshotToIfcx } from '../src/snapshot/to-ifcx.js';
 import {
   USD_XFORMOP,
-  identityMat4,
-  invertRigidMat4,
   matrixToPlacement,
-  multiplyMat4,
   placementToMatrix,
   setEntityPlacement,
   getEntityPlacement,
@@ -69,28 +66,6 @@ describe('placement math', () => {
     const back = matrixToPlacement(m);
     near(back.refDirection![2], 0); // Z component removed
     near(Math.hypot(...back.refDirection!), 1); // unit length
-  });
-
-  it('invertRigidMat4 ∘ M = identity', () => {
-    const m = placementToMatrix({ location: [7, -2, 3], axis: [0, 0, 1], refDirection: [0, 1, 0] });
-    const inv = invertRigidMat4(m);
-    const id = multiplyMat4(m, inv);
-    const expected = identityMat4();
-    for (let i = 0; i < 4; i++) nearVec(id[i], expected[i]);
-  });
-
-  it('a point placed by M returns to local space under M⁻¹', () => {
-    const m = placementToMatrix({ location: [5, 6, 7], axis: [0, 0, 1], refDirection: [0, 1, 0] });
-    const inv = invertRigidMat4(m);
-    const world = applyRowVec(m, [2, 0, 0]);
-    nearVec(applyRowVec(inv, world), [2, 0, 0]);
-  });
-
-  it('multiplyMat4 composes A-then-B in row-vector order', () => {
-    const tA = placementToMatrix({ location: [1, 0, 0] });
-    const tB = placementToMatrix({ location: [0, 2, 0] });
-    const ab = multiplyMat4(tA, tB);
-    nearVec(applyRowVec(ab, [0, 0, 0]), [1, 2, 0]); // both translations accumulate
   });
 });
 
