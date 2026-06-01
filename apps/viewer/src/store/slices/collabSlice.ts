@@ -868,12 +868,17 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
   readCollabPlacement: (entityId) => {
     const session = get().collabSession;
     const store = get().ifcDataStore;
-    if (!session || !store || !placementApi) return null;
+    if (!session || !store || !placementApi || !docApi) return null;
     const path = pathForEntity(store, entityId);
-    if (!path) return null;
+    if (!path || !docApi.hasEntity(session.doc, path)) return null;
+    // Any entity that exists in the room is movable: prefer its live placement,
+    // then its baked baseline, then identity. Returning identity (not null) for
+    // an un-edited / un-stamped entity is what lets the gizmo render on a
+    // recipient — the gizmo's origin comes from the mesh bbox, and a later edit
+    // establishes the baseline lazily (see `reconcilePlacementMesh`).
     return (
       placementApi.getEntityPlacement(session.doc, path) ??
-      placementApi.getPlacementBaseline(session.doc, path)
+      placementApi.getPlacementBaseline(session.doc, path) ?? { location: [0, 0, 0] }
     );
   },
 

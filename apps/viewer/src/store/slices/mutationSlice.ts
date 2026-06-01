@@ -1572,14 +1572,24 @@ export const createMutationSlice: StateCreator<
     // `GeometryEditCard` to seed its inputs AND by `GizmoOverlay`
     // as its "is this entity movable?" gate — one code path means
     // the controls and the visual gizmo agree on availability.
+    //
+    // The STEP chain needs the mutation view + editor; but the collab
+    // fallback (recipient's IFCX-reconstructed store) reads placement
+    // straight from the doc, so it must NOT be gated on the view. A
+    // freshly-joined recipient creates its MutablePropertyView lazily
+    // *after* first selection, so gating the whole read on the view would
+    // hide the gizmo on the first selection (and the gizmo memo wouldn't
+    // re-run when the view later appears). Try the STEP chain when we can,
+    // then always offer the collab fallback.
     const view = get().mutationViews.get(modelId);
-    if (!view) return null;
-    const editor = getOrCreateStoreEditor(get, set, modelId);
-    if (!editor) return null;
     const dataStore = get().models.get(modelId)?.ifcDataStore;
-    if (!dataStore) return null;
-    const chain = resolvePlacementChain(dataStore, view, editor, expressId);
-    if (chain) return chain.coordinates;
+    if (view && dataStore) {
+      const editor = getOrCreateStoreEditor(get, set, modelId);
+      if (editor) {
+        const chain = resolvePlacementChain(dataStore, view, editor, expressId);
+        if (chain) return chain.coordinates;
+      }
+    }
     // No STEP chain (recipient's IFCX-reconstructed store): fall back to the
     // collab placement so the move gizmo + geometry card still surface. The
     // gizmo's origin comes from the mesh bbox, so a [0,0,0] here is fine — this
