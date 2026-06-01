@@ -14,9 +14,11 @@ healthcheckPath = "/healthz"
 healthcheckTimeout = 10
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
-# Scale to zero when idle to eliminate 24/7 cost. GATED on a mounted volume:
-# a slept instance restarts with a fresh ephemeral disk, so without a volume at
-# COLLAB_DATA_DIR (/data) sleeping would wipe rooms + blobs on every wake. Attach
-# the volume (Railway dashboard → Volumes → mount at /data), then flip this to
-# true. The disk-backed FsBlobStorage already cuts the memory bill on its own.
-sleepApplication = false
+# Scale to zero when idle to eliminate 24/7 cost. Safe now that a persistent
+# volume is mounted at COLLAB_DATA_DIR (/data): a slept instance wakes with the
+# same disk, so rooms + blobs + the revocation deny-list survive across sleeps.
+# (Without the volume this would wipe state on every wake — keep them together.)
+# First connection after idle pays a short cold-start; the room rehydrates from
+# the volume via FilePersistence. The disk-backed FsBlobStorage also keeps the
+# memory bill low while awake.
+sleepApplication = true
