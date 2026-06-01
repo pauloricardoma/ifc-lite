@@ -346,7 +346,7 @@ export interface MutationSlice {
    * Tombstone an entity (existing source entity) or forget it (overlay-only).
    * Returns true if the entity was known to the store or overlay.
    */
-  removeEntity: (modelId: string, expressId: number) => boolean;
+  removeEntity: (modelId: string, expressId: number, opts?: { mirror?: boolean }) => boolean;
   /**
    * Translate an IfcProduct by a storey-local delta (IFC Z-up). Walks
    * the placement chain to the terminal `IfcCartesianPoint` and writes
@@ -1790,8 +1790,9 @@ export const createMutationSlice: StateCreator<
 
     // Tombstone the source. `removeEntity` returns false if the
     // entity wasn't known — shouldn't happen here (we just
-    // resolved its chain), but defend anyway.
-    const removed = state.removeEntity(modelId, expressId);
+    // resolved its chain), but defend anyway. `mirror: false` — split
+    // create+delete isn't collab-synced yet (Phase 3).
+    const removed = state.removeEntity(modelId, expressId, { mirror: false });
     if (!removed) {
       return {
         ok: false,
@@ -2039,7 +2040,8 @@ export const createMutationSlice: StateCreator<
 
     cloneElementMetadata(dataStore, view, editor, expressId, [left.expressId, right.expressId]);
 
-    const removed = state.removeEntity(modelId, expressId);
+    // `mirror: false` — split create+delete isn't collab-synced yet (Phase 3).
+    const removed = state.removeEntity(modelId, expressId, { mirror: false });
     if (!removed) {
       return {
         ok: false,
@@ -2064,7 +2066,8 @@ export const createMutationSlice: StateCreator<
     };
   },
 
-  removeEntity: (modelId, expressId) => {
+  removeEntity: (modelId, expressId, opts) => {
+    if (!get().canCollabEdit()) return false;
     const view = get().mutationViews.get(modelId);
     if (!view) return false;
     const editor = getOrCreateStoreEditor(get, set, modelId);
@@ -2121,6 +2124,11 @@ export const createMutationSlice: StateCreator<
         mutationVersion: state.mutationVersion + 1,
       };
     });
+
+    // Mirror the tombstone to peers (no-op outside a collab session). Split
+    // paths pass `{ mirror: false }` — their create+delete isn't synced yet, so
+    // mirroring only the source-delete would make the wall vanish for peers.
+    if (opts?.mirror !== false) get().mirrorEntityRemove(modelId, expressId);
 
     return true;
   },

@@ -47,6 +47,7 @@ import {
 import {
   attachRemoteApply,
   mirrorAttribute,
+  mirrorEntityDelete,
   mirrorPlacement,
   mirrorProperty,
   mirrorPropertyDelete,
@@ -198,6 +199,12 @@ export interface CollabSlice {
    * mesh about its bbox centre. Returns true when applied.
    */
   collabRotateEntity: (entityId: number, deltaYaw: number) => boolean;
+  /**
+   * Mirror an entity deletion (tombstone) to the CRDT so peers remove it.
+   * Called by mutationSlice after a local removeEntity. No-op without a session
+   * or edit rights.
+   */
+  mirrorEntityRemove: (modelId: string, entityId: number) => void;
 
   // ── Annotation mirror (collab markup) — called by annotationsSlice after a
   //    local create/edit/delete. No-ops without a session or comment permission.
@@ -429,6 +436,7 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
         deletePropertyValue: collab.deletePropertyValue,
         setAttribute: collab.setAttribute,
         setEntityPlacement: collab.setEntityPlacement,
+        deleteEntity: collab.deleteEntity,
         XFORMOP_KEY: collab.USD_XFORMOP,
         placementFromXformOp: (value) => {
           const xform = value as { transform?: number[][] } | undefined;
@@ -757,6 +765,14 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
           reconcilePlacementMesh(get, applyStore, session.doc, entityId, placement);
           set((s) => ({ mutationVersion: s.mutationVersion + 1 }));
         },
+        // A peer deleted an entity: hide its mesh (matches the owner's local
+        // removeEntity, which hides rather than destroying GPU buffers).
+        onEntityDelete: (entityId) => {
+          const modelId = get().activeModelId ?? '';
+          const globalId = toGlobalIdFromModels(get().models, modelId, entityId);
+          get().hideEntities([globalId]);
+          set((s) => ({ mutationVersion: s.mutationVersion + 1 }));
+        },
       });
     }
 
@@ -981,6 +997,17 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
     // Live-rotate our own mesh via the shared reconciler (rotation branch).
     reconcilePlacementMesh(get, store, session.doc, entityId, next);
     return true;
+  },
+
+  mirrorEntityRemove: (modelId, entityId) => {
+    const session = get().collabSession;
+    const store = get().models.get(modelId)?.ifcDataStore ?? get().ifcDataStore;
+    if (!session || !store || !docApi) return;
+    if (!get().canCollabEdit()) return;
+    mirrorEntityDelete(docApi, session, store, entityId);
+    // Drop any placement tracking for the removed entity.
+    placementAppliedLoc?.delete(entityId);
+    placementAppliedYaw?.delete(entityId);
   },
 
   mirrorAnnotationUpsert: (annotation) => {

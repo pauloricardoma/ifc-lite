@@ -11,6 +11,7 @@ import {
   setAttribute,
   setEntityPlacement,
   getEntityPlacement,
+  deleteEntity,
   setPropertyValue,
   deletePropertyValue,
   matrixToPlacement,
@@ -30,6 +31,7 @@ const api: CollabDocApi = {
   deletePropertyValue: (doc, path, pset, prop) => deletePropertyValue(doc, path, pset, prop),
   setAttribute: (doc, path, name, value) => setAttribute(doc, path, name, value),
   setEntityPlacement: (doc, path, placement) => setEntityPlacement(doc, path, placement),
+  deleteEntity: (doc, path) => deleteEntity(doc, path),
   XFORMOP_KEY: USD_XFORMOP,
   placementFromXformOp: (value) => {
     const xform = value as { transform?: number[][] } | undefined;

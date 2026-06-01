@@ -37,6 +37,8 @@ export interface CollabDocApi {
   setAttribute(doc: CollabSession['doc'], path: string, name: string, value: unknown): void;
   /** Write an entity's local placement (the IFCX-native `usd::xformop` attribute). */
   setEntityPlacement(doc: CollabSession['doc'], path: string, placement: LocalPlacement): void;
+  /** Tombstone an entity (Yjs preserves it as a delete; observers see a `delete`). */
+  deleteEntity(doc: CollabSession['doc'], path: string): boolean;
   /** The `usd::xformop` attribute key, so the inbound observer can route it to `onPlacement`. */
   XFORMOP_KEY: string;
   /** Decode a `usd::xformop` attribute value back to a normalized placement (null if malformed). */
@@ -208,6 +210,20 @@ export function mirrorPlacement(
   });
 }
 
+/** Mirror an entity deletion (tombstone) to the CRDT. */
+export function mirrorEntityDelete(
+  api: CollabDocApi,
+  session: CollabSession,
+  store: IfcDataStore,
+  entityId: number,
+): void {
+  const path = pathForEntity(store, entityId);
+  if (!path || !api.hasEntity(session.doc, path)) return;
+  session.transact(() => {
+    api.deleteEntity(session.doc, path);
+  });
+}
+
 // ── inbound: remote CRDT change → local model ────────────────────────────────
 
 export type ScalarValue = string | number | boolean | null;
@@ -226,6 +242,8 @@ export interface RemoteApplyHandlers {
    * callers keep working.
    */
   onPlacement?(entityId: number, placement: LocalPlacement): void;
+  /** A peer tombstoned an entity — hide/remove its rendered mesh locally. */
+  onEntityDelete?(entityId: number): void;
 }
 
 /**
@@ -249,6 +267,18 @@ export function attachRemoteApply(
     if (txn.local) return; // ignore our own writes (seed + outbound mirror)
     for (const ev of events) {
       const path = ev.path;
+      // Top-level entity add/remove on the `entities` map root (path === []).
+      // We only act on deletes here; additions are picked up by the recipient's
+      // full reconstruct. `entityForPath` resolves the removed path's expressId.
+      if (path.length === 0) {
+        if (!handlers.onEntityDelete) continue;
+        for (const [entityPath, change] of ev.changes.keys) {
+          if (change.action !== 'delete') continue;
+          const id = entityForPath(store, entityPath);
+          if (id !== null) handlers.onEntityDelete(id);
+        }
+        continue;
+      }
       const entityPath = typeof path[0] === 'string' ? path[0] : undefined;
       if (!entityPath) continue;
       const entityId = entityForPath(store, entityPath);
