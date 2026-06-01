@@ -43,7 +43,7 @@ import {
 } from '@ifc-lite/create';
 import { EntityExtractor, type MapConversion, type ProjectedCRS } from '@ifc-lite/parser';
 import type { MeshData } from '@ifc-lite/geometry';
-import { getEntityBounds } from '@/utils/viewportUtils';
+import { getEntityBounds, getEntityCenter } from '@/utils/viewportUtils';
 import { toGlobalIdFromModels } from '../globalId.js';
 import { buildElementMesh, type ElementMeshPayload } from './addElementMeshes.js';
 import type { AddElementType } from './addElementSlice.js';
@@ -1504,67 +1504,76 @@ export const createMutationSlice: StateCreator<
       return { ok: false, reason: 'Editing is disabled for your role in this shared session' };
     }
     const view = get().mutationViews.get(modelId);
-    if (!view) return { ok: false, reason: 'Model has no editable mutation view yet' };
-    const editor = getOrCreateStoreEditor(get, set, modelId);
-    if (!editor) return { ok: false, reason: 'Failed to resolve store editor' };
     const dataStore = get().models.get(modelId)?.ifcDataStore;
-    if (!dataStore) return { ok: false, reason: `No model loaded for id "${modelId}"` };
-
-    // resolveRotationState gives us both the current angle and
-    // whether RefDirection is explicit. When it's null we refuse
-    // — see the interface comment above for why; materialising
-    // would require multi-mutation atomic undo to avoid orphans.
-    // Every in-store builder emits an explicit RefDirection, so
-    // this only trips on hand-rolled source-buffer entities.
-    const state = resolveRotationState(dataStore, view, editor, expressId);
-    if (!state) {
-      return {
-        ok: false,
-        reason:
-          'Entity placement is not a simple IfcLocalPlacement → IfcAxis2Placement3D chain',
-      };
+    if (view && dataStore) {
+      const editor = getOrCreateStoreEditor(get, set, modelId);
+      // resolveRotationState gives the current angle + whether RefDirection is
+      // explicit. When implicit we refuse (materialising a fresh IfcDirection
+      // needs multi-mutation atomic undo). Every in-store builder emits an
+      // explicit RefDirection, so that only trips on hand-rolled entities.
+      const state = editor ? resolveRotationState(dataStore, view, editor, expressId) : null;
+      if (state && state.refDirectionId === null) {
+        return {
+          ok: false,
+          reason:
+            'Entity has an implicit reference direction (no IfcDirection on its axis placement). Rotation would require materialising a new IfcDirection, which isn\'t undoable yet.',
+        };
+      }
+      if (state && state.refDirectionId !== null) {
+        const newYaw = state.yawZ + deltaYaw;
+        const newRatios: [number, number, number] = [
+          Math.cos(newYaw),
+          Math.sin(newYaw),
+          state.refDirection[2],
+        ];
+        get().setPositionalAttribute(modelId, state.refDirectionId, 0, newRatios);
+        // Live-rotate the rendered mesh about its bbox centre (IFC yaw about Z
+        // = renderer yaw about +Y, same angle). The owner previously had no
+        // live rotation visual at all.
+        const globalId = toGlobalIdFromModels(get().models, modelId, expressId);
+        const meshes =
+          get().models.get(modelId)?.geometryResult?.meshes ?? get().geometryResult?.meshes ?? null;
+        const c = getEntityCenter(meshes, globalId);
+        if (c) {
+          get().setPendingMeshRotations(
+            new Map([[globalId, { angle: deltaYaw, pivot: [c.x, c.y, c.z] as [number, number, number] }]]),
+          );
+        }
+        // Mirror to peers as the entity's placement (`usd::xformop` refDirection).
+        get().mirrorPlacementEdit(modelId, expressId, [0, 0, 0], deltaYaw);
+        return { ok: true, newYawZ: newYaw };
+      }
     }
-    if (state.refDirectionId === null) {
-      // Implicit RefDirection means the axis placement points at no
-      // IfcDirection — STEP `$` slot. Materialising a fresh
-      // IfcDirection here would require a multi-mutation atomic undo
-      // entry to avoid orphans; we don't have that primitive yet.
-      // In practice every entity our in-store builders emit
-      // (addColumn / addWall / addSlab / …) carries an explicit
-      // RefDirection, so this branch only trips on hand-rolled
-      // source-buffer entities. Surface a clear refusal so the UI
-      // can show "rotate not supported for this entity" rather than
-      // silently leaking entities.
-      return {
-        ok: false,
-        reason:
-          'Entity has an implicit reference direction (no IfcDirection on its axis placement). Rotation would require materialising a new IfcDirection, which isn\'t undoable yet.',
-      };
+    // No STEP rotation chain (recipient's IFCX-reconstructed store): rotate via
+    // the collab doc, which syncs + live-rotates the local mesh.
+    if (get().collabRotateEntity(expressId, deltaYaw)) {
+      return { ok: true, newYawZ: deltaYaw };
     }
-    const newYaw = state.yawZ + deltaYaw;
-    const newRatios: [number, number, number] = [
-      Math.cos(newYaw),
-      Math.sin(newYaw),
-      state.refDirection[2],
-    ];
-    get().setPositionalAttribute(modelId, state.refDirectionId, 0, newRatios);
-    return { ok: true, newYawZ: newYaw };
+    return {
+      ok: false,
+      reason: 'Entity placement is not a simple IfcLocalPlacement → IfcAxis2Placement3D chain',
+    };
   },
 
   readEntityRotation: (modelId, expressId) => {
-    // Lazy editor creation — see the note on `readEntityPosition`
-    // below. A freshly-loaded model has a mutation view but no
-    // cached editor; building one on read so the rotation UI lights
-    // up on first selection, not after the first unrelated edit.
+    // Try the STEP chain only when the view+editor exist; otherwise fall back
+    // to the collab placement (recipient's IFCX store) so the rotate card lights
+    // up there too — mirrors `readEntityPosition`'s view-independent fallback.
     const view = get().mutationViews.get(modelId);
-    if (!view) return null;
-    const editor = getOrCreateStoreEditor(get, set, modelId);
-    if (!editor) return null;
     const dataStore = get().models.get(modelId)?.ifcDataStore;
-    if (!dataStore) return null;
-    const state = resolveRotationState(dataStore, view, editor, expressId);
-    if (!state) return null;
-    return { yawZ: state.yawZ, refDirection: state.refDirection };
+    if (view && dataStore) {
+      const editor = getOrCreateStoreEditor(get, set, modelId);
+      if (editor) {
+        const state = resolveRotationState(dataStore, view, editor, expressId);
+        if (state) return { yawZ: state.yawZ, refDirection: state.refDirection };
+      }
+    }
+    const placement = get().readCollabPlacement(expressId);
+    if (placement) {
+      const ref = (placement.refDirection ?? [1, 0, 0]) as [number, number, number];
+      return { yawZ: Math.atan2(ref[1], ref[0]), refDirection: ref };
+    }
+    return null;
   },
 
   readEntityPosition: (modelId, expressId) => {

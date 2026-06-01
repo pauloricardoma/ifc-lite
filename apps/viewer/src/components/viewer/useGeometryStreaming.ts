@@ -64,10 +64,12 @@ export interface UseGeometryStreamingParams {
    * follows the IFC coordinate mutation on the next frame.
    */
   pendingMeshTranslations: Map<number, [number, number, number]> | null;
+  pendingMeshRotations: Map<number, { angle: number; pivot: [number, number, number] }> | null;
   clearPendingMeshColorUpdates: () => void;
   clearPendingColorUpdates: () => void;
   clearPendingMeshRemovals: () => void;
   clearPendingMeshTranslations: () => void;
+  clearPendingMeshRotations: () => void;
   clearColorRef: MutableRefObject<[number, number, number, number]>;
   releaseGeometryAfterFinalize?: boolean;
   onGeometryReleased?: () => void;
@@ -100,10 +102,12 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
     pendingColorUpdates,
     pendingMeshRemovals,
     pendingMeshTranslations,
+    pendingMeshRotations,
     clearPendingMeshColorUpdates,
     clearPendingColorUpdates,
     clearPendingMeshRemovals,
     clearPendingMeshTranslations,
+    clearPendingMeshRotations,
     clearColorRef,
     releaseGeometryAfterFinalize = false,
     onGeometryReleased,
@@ -587,6 +591,28 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
     }
     clearPendingMeshTranslations();
   }, [pendingMeshTranslations, isInitialized, clearPendingMeshTranslations]);
+
+  // ─── Mesh rotations (yaw / numeric rotate / collab apply) ────────────
+  // Same drain pattern as translations: rotate vertices+normals in place
+  // about the renderer +Y axis through each entity's pivot.
+  useEffect(() => {
+    if (pendingMeshRotations === null || !isInitialized) return;
+    const renderer = rendererRef.current;
+    if (!renderer) return;
+    const device = renderer.getGPUDevice();
+    const pipeline = renderer.getPipeline();
+    const scene = renderer.getScene();
+    if (!device || !pipeline) return;
+
+    if (pendingMeshRotations.size > 0) {
+      scene.rotateMeshesForEntities(pendingMeshRotations);
+      if (scene.hasPendingBatches()) {
+        scene.rebuildPendingBatches(device, pipeline);
+      }
+      renderer.requestRender();
+    }
+    clearPendingMeshRotations();
+  }, [pendingMeshRotations, isInitialized, clearPendingMeshRotations]);
 
   // ─── Lens color overlays ─────────────────────────────────────────────
   useEffect(() => {

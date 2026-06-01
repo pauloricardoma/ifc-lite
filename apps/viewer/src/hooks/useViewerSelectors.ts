@@ -214,20 +214,24 @@ export function useColorUpdateState() {
   const pendingMeshColorUpdates = useViewerStore((state) => state.pendingMeshColorUpdates);
   const pendingMeshRemovals = useViewerStore((state) => state.pendingMeshRemovals);
   const pendingMeshTranslations = useViewerStore((state) => state.pendingMeshTranslations);
+  const pendingMeshRotations = useViewerStore((state) => state.pendingMeshRotations);
   const clearPendingColorUpdates = useViewerStore((state) => state.clearPendingColorUpdates);
   const clearPendingMeshColorUpdates = useViewerStore((state) => state.clearPendingMeshColorUpdates);
   const clearPendingMeshRemovals = useViewerStore((state) => state.clearPendingMeshRemovals);
   const clearPendingMeshTranslations = useViewerStore((state) => state.clearPendingMeshTranslations);
+  const clearPendingMeshRotations = useViewerStore((state) => state.clearPendingMeshRotations);
 
   return {
     pendingColorUpdates,
     pendingMeshColorUpdates,
     pendingMeshRemovals,
     pendingMeshTranslations,
+    pendingMeshRotations,
     clearPendingColorUpdates,
     clearPendingMeshColorUpdates,
     clearPendingMeshRemovals,
     clearPendingMeshTranslations,
+    clearPendingMeshRotations,
   };
 }
 

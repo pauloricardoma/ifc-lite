@@ -661,6 +661,65 @@ export class Scene {
     return count;
   }
 
+  /**
+   * Rotate every mesh for `expressId` by `angleRad` about the renderer-frame
+   * vertical (+Y) axis through `pivot` (renderer world, Y-up). This is the
+   * Y-up image of an IFC yaw about the storey-up Z axis. Modifies `positions`
+   * and `normals` in place and marks the affected bucket(s) for re-batch.
+   *
+   * Same colour-merge caveat as `translateMeshesForEntity` (skips shared
+   * per-vertex `entityIds` meshes). Returns true when a mesh was modified.
+   */
+  rotateMeshesForEntity(expressId: number, angleRad: number, pivot: [number, number, number]): boolean {
+    const meshDataList = this.meshDataMap.get(expressId);
+    if (!meshDataList || meshDataList.length === 0) return false;
+    if (angleRad === 0) return false;
+    const cos = Math.cos(angleRad);
+    const sin = Math.sin(angleRad);
+    const [px, , pz] = pivot;
+
+    const affectedKeys = new Set<string>();
+    let anyMoved = false;
+    for (const meshData of meshDataList) {
+      if (meshData.entityIds && meshData.entityIds.length > 0) continue;
+      const pos = meshData.positions;
+      for (let i = 0; i < pos.length; i += 3) {
+        const dx = pos[i] - px;
+        const dz = pos[i + 2] - pz;
+        pos[i] = px + dx * cos + dz * sin;
+        pos[i + 2] = pz - dx * sin + dz * cos;
+      }
+      const nrm = meshData.normals;
+      if (nrm) {
+        for (let i = 0; i < nrm.length; i += 3) {
+          const nx = nrm[i];
+          const nz = nrm[i + 2];
+          nrm[i] = nx * cos + nz * sin;
+          nrm[i + 2] = -nx * sin + nz * cos;
+        }
+      }
+      const bucket = this.meshDataBucket.get(meshData);
+      if (bucket) affectedKeys.add(bucket.key);
+      anyMoved = true;
+    }
+    if (!anyMoved) return false;
+
+    this.boundingBoxes.delete(expressId);
+    for (const key of affectedKeys) {
+      this.pendingBatchKeys.add(key);
+    }
+    return true;
+  }
+
+  /** Bulk variant of `rotateMeshesForEntity`. */
+  rotateMeshesForEntities(updates: Map<number, { angle: number; pivot: [number, number, number] }>): number {
+    let count = 0;
+    for (const [id, { angle, pivot }] of updates) {
+      if (this.rotateMeshesForEntity(id, angle, pivot)) count++;
+    }
+    return count;
+  }
+
   // ─── Mesh command queue ──────────────────────────────────────────────
 
   /**

@@ -70,6 +70,7 @@ import {
 } from '@/lib/collab/annotation-sync';
 import type { Annotation } from '@/store/slices/annotationsSlice';
 import { toGlobalIdFromModels } from '../globalId.js';
+import { getEntityCenter } from '@/utils/viewportUtils';
 
 /**
  * Access roles, mirrored from `@ifc-lite/collab-server`'s `Role`. Kept as a
@@ -166,13 +167,19 @@ export interface CollabSlice {
   mirrorPropertyDelete: (entityId: number, psetName: string, propName: string) => void;
   mirrorAttributeEdit: (entityId: number, attrName: string, value: unknown) => void;
   /**
-   * Mirror a geometry move to the CRDT after a local STEP edit. Composes the
-   * IFC-frame delta onto the entity's current `usd::xformop` (= baseline ∘
-   * cumulative), and records the resulting baked offset so a later *remote*
-   * edit computes the right incremental delta rather than re-applying our move
-   * (the local mesh was already moved by the STEP edit path).
+   * Mirror a geometry move/rotate to the CRDT after a local STEP edit. Composes
+   * the IFC-frame translation `deltaIfc` and yaw `deltaYaw` (radians, about Z)
+   * onto the entity's current `usd::xformop` (= baseline ∘ cumulative), and
+   * records the resulting baked offset so a later *remote* edit computes the
+   * right incremental translation rather than re-applying our move (the local
+   * mesh was already moved by the STEP edit path).
    */
-  mirrorPlacementEdit: (modelId: string, entityId: number, deltaIfc: [number, number, number]) => void;
+  mirrorPlacementEdit: (
+    modelId: string,
+    entityId: number,
+    deltaIfc: [number, number, number],
+    deltaYaw?: number,
+  ) => void;
   /**
    * Read an entity's current local placement from the CRDT (`usd::xformop`),
    * for stores with no STEP placement chain (a recipient's reconstructed IFCX
@@ -180,12 +187,17 @@ export interface CollabSlice {
    */
   readCollabPlacement: (entityId: number) => LocalPlacement | null;
   /**
-   * Collab-native placement edit for a store with no STEP chain (recipient).
-   * Composes `deltaIfc` (IFC Z-up storey-local) onto the entity's current
-   * placement, writes `usd::xformop`, mirrors to peers, and moves the local
-   * mesh. Returns true when the edit was applied. No-op outside a session.
+   * Collab-native MOVE for a store with no STEP chain (recipient): composes
+   * `deltaIfc` onto the entity's current placement, writes `usd::xformop`,
+   * mirrors to peers, and moves the local mesh. Returns true when applied.
    */
   collabTranslateEntity: (entityId: number, deltaIfc: [number, number, number]) => boolean;
+  /**
+   * Collab-native ROTATE (yaw about Z) for a store with no STEP chain. Composes
+   * the yaw onto `usd::xformop`, mirrors to peers, and live-rotates the local
+   * mesh about its bbox centre. Returns true when applied.
+   */
+  collabRotateEntity: (entityId: number, deltaYaw: number) => boolean;
 
   // ── Annotation mirror (collab markup) — called by annotationsSlice after a
   //    local create/edit/delete. No-ops without a session or comment permission.
@@ -233,8 +245,18 @@ let placementApi: PlacementApi | null = null;
 // entity expressId in the active model's id space. Lets inbound placement edits
 // push only the *incremental* delta (and avoids re-applying our own edits).
 let placementAppliedLoc: Map<number, [number, number, number]> | null = null;
+// Companion to placementAppliedLoc: renderer-frame yaw (radians) currently
+// baked into each entity's live mesh, relative to its baked baseline.
+let placementAppliedYaw: Map<number, number> | null = null;
 
 const PLACEMENT_EPS = 1e-6;
+const YAW_EPS = 1e-4;
+
+/** Yaw (radians, about Z) encoded by a placement's refDirection (local +X). */
+function yawOf(placement: LocalPlacement | null): number {
+  const ref = placement?.refDirection ?? [1, 0, 0];
+  return Math.atan2(ref[1], ref[0]);
+}
 
 /**
  * Renderer-frame (Y-up) translation that positions an entity's mesh per
@@ -258,6 +280,29 @@ function rendererDeltaForPlacement(
 }
 
 /**
+ * Compose a placement edit — IFC translation `deltaIfc` + yaw `deltaYaw`
+ * (radians about Z) — onto a base placement. Translation accumulates; yaw
+ * rotates the refDirection (local +X) in the XY plane.
+ */
+function composePlacement(
+  prev: LocalPlacement,
+  deltaIfc: [number, number, number],
+  deltaYaw: number,
+): LocalPlacement {
+  const location: [number, number, number] = [
+    prev.location[0] + deltaIfc[0],
+    prev.location[1] + deltaIfc[1],
+    prev.location[2] + deltaIfc[2],
+  ];
+  let refDirection = prev.refDirection ?? [1, 0, 0];
+  if (deltaYaw !== 0) {
+    const yaw = Math.atan2(refDirection[1], refDirection[0]) + deltaYaw;
+    refDirection = [Math.cos(yaw), Math.sin(yaw), refDirection[2] ?? 0];
+  }
+  return { location, axis: prev.axis, refDirection };
+}
+
+/**
  * Move an entity's rendered mesh to reflect `placement`, pushing only the
  * *incremental* renderer-frame translation since this client last reconciled
  * it. Shared by inbound remote apply, the recipient's own collab edit, and the
@@ -270,7 +315,7 @@ function reconcilePlacementMesh(
   entityId: number,
   placement: LocalPlacement,
 ): void {
-  if (!placementApi || !placementAppliedLoc) return;
+  if (!placementApi || !placementAppliedLoc || !placementAppliedYaw) return;
   const path = pathForEntity(store, entityId);
   if (!path) return;
   let baseline = placementApi.getPlacementBaseline(doc, path);
@@ -281,6 +326,10 @@ function reconcilePlacementMesh(
     baseline = placement;
     placementApi.setPlacementBaseline(doc, path, baseline);
   }
+  const modelId = get().activeModelId ?? '';
+  const globalId = toGlobalIdFromModels(get().models, modelId, entityId);
+
+  // ── Translation ──
   const target = rendererDeltaForPlacement(baseline, placement);
   const applied = placementAppliedLoc.get(entityId) ?? [0, 0, 0];
   const inc: [number, number, number] = [
@@ -289,16 +338,30 @@ function reconcilePlacementMesh(
     target[2] - applied[2],
   ];
   if (
-    Math.abs(inc[0]) < PLACEMENT_EPS &&
-    Math.abs(inc[1]) < PLACEMENT_EPS &&
-    Math.abs(inc[2]) < PLACEMENT_EPS
+    Math.abs(inc[0]) >= PLACEMENT_EPS ||
+    Math.abs(inc[1]) >= PLACEMENT_EPS ||
+    Math.abs(inc[2]) >= PLACEMENT_EPS
   ) {
-    return;
+    get().setPendingMeshTranslations(new Map([[globalId, inc]]));
+    placementAppliedLoc.set(entityId, target);
   }
-  const modelId = get().activeModelId ?? '';
-  const globalId = toGlobalIdFromModels(get().models, modelId, entityId);
-  get().setPendingMeshTranslations(new Map([[globalId, inc]]));
-  placementAppliedLoc.set(entityId, target);
+
+  // ── Rotation (yaw about Z = renderer rotation about +Y, same angle) ──
+  // Pivot is the entity's bbox centre in renderer world — identical on every
+  // client (same geometry), so the live rotation stays consistent across peers.
+  const targetYaw = yawOf(placement) - yawOf(baseline);
+  const appliedYaw = placementAppliedYaw.get(entityId) ?? 0;
+  const incYaw = targetYaw - appliedYaw;
+  if (Math.abs(incYaw) >= YAW_EPS) {
+    const meshes = get().geometryResult?.meshes ?? null;
+    const c = getEntityCenter(meshes, globalId);
+    if (c) {
+      get().setPendingMeshRotations(
+        new Map([[globalId, { angle: incYaw, pivot: [c.x, c.y, c.z] as [number, number, number] }]]),
+      );
+      placementAppliedYaw.set(entityId, targetYaw);
+    }
+  }
 }
 // Annotation CRDT helpers + inbound-observer teardown (collab markup sync).
 let annotationDocApi: AnnotationDocApi | null = null;
@@ -382,6 +445,7 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
         setPlacementBaseline: collab.setPlacementBaseline,
       };
       placementAppliedLoc = new Map();
+      placementAppliedYaw = new Map();
       // Capture the annotation (markup) CRDT helpers for the sync bridge.
       annotationDocApi = {
         annotationsMap: (doc) => collab.annotationsMap(doc),
@@ -754,6 +818,7 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
     annotationDocApi = null;
     placementApi = null;
     placementAppliedLoc = null;
+    placementAppliedYaw = null;
     const session = get().collabSession;
     if (session) {
       try {
@@ -840,7 +905,7 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
     mirrorAttribute(docApi, session, store, entityId, attrName, value);
   },
 
-  mirrorPlacementEdit: (modelId, entityId, deltaIfc) => {
+  mirrorPlacementEdit: (modelId, entityId, deltaIfc, deltaYaw = 0) => {
     const session = get().collabSession;
     const store = get().models.get(modelId)?.ifcDataStore ?? get().ifcDataStore;
     if (!session || !store || !docApi || !placementApi || !placementAppliedLoc) return;
@@ -850,19 +915,13 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
     const baseline = placementApi.getPlacementBaseline(session.doc, path);
     const prev =
       placementApi.getEntityPlacement(session.doc, path) ?? baseline ?? { location: [0, 0, 0] };
-    const next: LocalPlacement = {
-      location: [
-        prev.location[0] + deltaIfc[0],
-        prev.location[1] + deltaIfc[1],
-        prev.location[2] + deltaIfc[2],
-      ],
-      axis: prev.axis,
-      refDirection: prev.refDirection,
-    };
+    const next = composePlacement(prev, deltaIfc, deltaYaw);
     mirrorPlacement(docApi, session, store, entityId, next);
-    // The local mesh was already moved by the STEP edit path; record the
-    // resulting baked offset so we don't double-apply on a later remote edit.
+    // The local mesh was already moved/rotated by the edit path; record the
+    // resulting baked offset + yaw so we don't double-apply on a later remote
+    // edit (and so a remote edit computes the correct incremental).
     placementAppliedLoc.set(entityId, rendererDeltaForPlacement(baseline, next));
+    if (placementAppliedYaw) placementAppliedYaw.set(entityId, yawOf(next) - yawOf(baseline));
   },
 
   readCollabPlacement: (entityId) => {
@@ -903,6 +962,23 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
     };
     mirrorPlacement(docApi, session, store, entityId, next);
     // No STEP chain on this store — move our own mesh via the shared reconciler.
+    reconcilePlacementMesh(get, store, session.doc, entityId, next);
+    return true;
+  },
+
+  collabRotateEntity: (entityId, deltaYaw) => {
+    const session = get().collabSession;
+    const store = get().ifcDataStore;
+    if (!session || !store || !docApi || !placementApi) return false;
+    if (!get().canCollabEdit()) return false;
+    const path = pathForEntity(store, entityId);
+    if (!path) return false;
+    const prev =
+      placementApi.getEntityPlacement(session.doc, path) ??
+      placementApi.getPlacementBaseline(session.doc, path) ?? { location: [0, 0, 0] };
+    const next = composePlacement(prev, [0, 0, 0], deltaYaw);
+    mirrorPlacement(docApi, session, store, entityId, next);
+    // Live-rotate our own mesh via the shared reconciler (rotation branch).
     reconcilePlacementMesh(get, store, session.doc, entityId, next);
     return true;
   },
