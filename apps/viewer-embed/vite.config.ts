@@ -34,6 +34,10 @@ export default defineConfig({
       '@ifc-lite/data': path.resolve(__dirname, '../../packages/data/src'),
       '@ifc-lite/bcf': path.resolve(__dirname, '../../packages/bcf/src'),
       '@ifc-lite/cache': path.resolve(__dirname, '../../packages/cache/src'),
+      // Resolve collab from source: the embed pulls it via the viewer's source
+      // (not its own package.json), so it's outside Vercel's scoped build and
+      // its dist isn't produced — aliasing to src avoids the missing-entry fail.
+      '@ifc-lite/collab': path.resolve(__dirname, '../../packages/collab/src'),
       '@ifc-lite/drawing-2d': path.resolve(__dirname, '../../packages/drawing-2d/src'),
       '@ifc-lite/export': path.resolve(__dirname, '../../packages/export/src'),
       '@ifc-lite/ids': path.resolve(__dirname, '../../packages/ids/src'),

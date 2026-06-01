@@ -35,6 +35,9 @@ export default defineConfig({
       '@ifc-lite/lens': path.resolve(__dirname, '../../packages/lens/src'),
       '@ifc-lite/mutations': path.resolve(__dirname, '../../packages/mutations/src'),
       '@ifc-lite/bcf': path.resolve(__dirname, '../../packages/bcf/src'),
+      // Resolve collab from source (pulled via the viewer's `@` source), so a
+      // scoped build that doesn't produce collab's dist still resolves it.
+      '@ifc-lite/collab': path.resolve(__dirname, '../../packages/collab/src'),
       '@ifc-lite/drawing-2d': path.resolve(__dirname, '../../packages/drawing-2d/src'),
       '@ifc-lite/encoding': path.resolve(__dirname, '../../packages/encoding/src'),
       '@ifc-lite/ids': path.resolve(__dirname, '../../packages/ids/src'),
