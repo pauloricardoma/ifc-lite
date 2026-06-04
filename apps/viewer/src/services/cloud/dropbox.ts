@@ -19,6 +19,13 @@ const LIST_FOLDER_URL = 'https://api.dropboxapi.com/2/files/list_folder';
 const LIST_FOLDER_CONTINUE_URL = 'https://api.dropboxapi.com/2/files/list_folder/continue';
 const DOWNLOAD_URL = 'https://content.dropboxapi.com/2/files/download';
 
+/** Serialize a Dropbox-API-Arg value, escaping any non-ASCII to `\uXXXX`. */
+function dropboxApiArg(arg: Record<string, unknown>): string {
+  return JSON.stringify(arg).replace(/[\u007f-\uffff]/g, (c) =>
+    `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`,
+  );
+}
+
 interface DropboxMetadata {
   '.tag': 'file' | 'folder' | 'deleted';
   id: string;
@@ -94,8 +101,11 @@ export class DropboxProvider extends OAuthCloudProvider {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${accessToken}`,
-        // Dropbox content API takes its args as a header on download.
-        'Dropbox-API-Arg': JSON.stringify({ path: entry.path }),
+        // Dropbox content API takes its args as an HTTP header, which must be
+        // ASCII. Address the file by its id (always ASCII) rather than its path
+        // — a path with non-ASCII characters would make fetch reject the header
+        // before sending. `dropboxApiArg` also \u-escapes as a belt-and-braces.
+        'Dropbox-API-Arg': dropboxApiArg({ path: entry.id }),
       },
     });
     if (res.status === 401) throw this.notConnected();

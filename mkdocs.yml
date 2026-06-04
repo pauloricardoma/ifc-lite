@@ -125,7 +125,7 @@ nav:
     - Querying Data: guide/querying.md
     - Exporting Data: guide/exporting.md
     - Multi-Model Federation: guide/federation.md
-    - Cloud Import (Dropbox): guide/cloud-import.md
+    - Cloud Import: guide/cloud-import.md
     - BCF Collaboration: guide/bcf.md
     - IDS Validation: guide/ids.md
     - 2D Drawings: guide/drawing-2d.md

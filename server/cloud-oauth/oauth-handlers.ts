@@ -59,6 +59,37 @@ function json(body: unknown, status = 200, extraHeaders: HeadersInit = {}): Resp
   });
 }
 
+const HTML_ESCAPES: Record<string, string> = {
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  '"': '&quot;',
+  "'": '&#39;',
+};
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (c) => HTML_ESCAPES[c]);
+}
+
+/**
+ * Reduce a status message to a short, safe code. Provider error values are
+ * attacker-controlled (e.g. `?error=…` on the callback), so we whitelist to a
+ * harmless character set before it ever reaches the HTML/JS below — defence in
+ * depth on top of the escaping.
+ */
+function sanitizeMessage(message: string): string {
+  return message.replace(/[^a-zA-Z0-9 ._:-]/g, '').slice(0, 200);
+}
+
+/**
+ * Embed a JSON string as a `<script>`-safe JS string literal. Escaping
+ * `<`/`>` prevents a `</script>` break-out; line/paragraph separators cannot
+ * reach here because `sanitizeMessage` already strips them.
+ */
+function scriptSafeJson(json: string): string {
+  return JSON.stringify(json).replace(/</g, '\\u003c').replace(/>/g, '\\u003e');
+}
+
 /**
  * HTML returned to the popup after the consent round-trip. It signals the opener
  * via a same-origin `localStorage` write (the `storage` event fires in the main
@@ -66,14 +97,20 @@ function json(body: unknown, status = 200, extraHeaders: HeadersInit = {}): Resp
  * `window.opener.postMessage` because the app sets
  * `Cross-Origin-Opener-Policy: same-origin`, which severs the opener handle once
  * the popup has visited the provider's domain.
+ *
+ * `message` can carry attacker-supplied provider error codes, so it is
+ * sanitized and HTML/JS-escaped before being embedded in either the visible
+ * text or the script payload.
  */
 function popupResultHtml(spec: OAuthProviderSpec, ok: boolean, message: string): string {
-  const payload = JSON.stringify({ provider: spec.id, ok, message, ts: Date.now() });
-  return `<!doctype html><html><head><meta charset="utf-8"><title>${spec.id}</title></head>
+  const safeMessage = sanitizeMessage(message);
+  const payload = JSON.stringify({ provider: spec.id, ok, message: safeMessage, ts: Date.now() });
+  const visible = ok ? 'Connected. You can close this window.' : `Connection failed: ${escapeHtml(safeMessage)}`;
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(spec.id)}</title></head>
 <body style="font-family:system-ui;background:#0b0b0f;color:#e5e7eb;display:grid;place-items:center;height:100vh;margin:0">
-<p>${ok ? 'Connected. You can close this window.' : `Connection failed: ${message}`}</p>
+<p>${visible}</p>
 <script>
-  try { localStorage.setItem(${JSON.stringify(AUTH_RESULT_STORAGE_KEY)}, ${JSON.stringify(payload)}); } catch (e) { console.error(e); }
+  try { localStorage.setItem(${scriptSafeJson(AUTH_RESULT_STORAGE_KEY)}, ${scriptSafeJson(payload)}); } catch (e) { console.error(e); }
   setTimeout(function () { try { window.close(); } catch (e) { /* user closes manually */ } }, ${ok ? 300 : 2500});
 </script>
 </body></html>`;

@@ -1,8 +1,8 @@
-# Cloud Import (Dropbox, Google Drive)
+# Cloud Import (Dropbox, Google Drive, OneDrive)
 
 Load IFC files straight from a cloud storage account instead of downloading
 them to disk first. Providers ship behind one provider-agnostic abstraction;
-today that's **Dropbox** and **Google Drive**, with OneDrive/SharePoint next.
+today that's **Dropbox**, **Google Drive**, and **OneDrive** (Microsoft Graph).
 
 ## How it works
 
@@ -41,12 +41,11 @@ each provider is just a small **spec** (endpoints, scopes, env var names):
 | --- | --- |
 | Generic OAuth core (URLs, token exchange, cookies) | `server/cloud-oauth/oauth-core.ts` |
 | Generic route handlers (testable) | `server/cloud-oauth/oauth-handlers.ts` |
-| Dropbox spec | `server/dropbox/dropbox.ts` |
-| Google Drive spec | `server/google/google.ts` |
-| Vercel edge endpoints | `api/{dropbox,google}/{auth-start,auth-callback,token,disconnect}.ts` |
+| Dropbox / Google / OneDrive specs | `server/{dropbox/dropbox,google/google,onedrive/onedrive}.ts` |
+| Vercel edge endpoints | `api/{dropbox,google,onedrive}/{auth-start,auth-callback,token,disconnect}.ts` |
 | Provider abstraction | `apps/viewer/src/services/cloud/types.ts` |
 | Shared browser OAuth base | `apps/viewer/src/services/cloud/oauth-provider-base.ts` |
-| Dropbox / Google browser clients | `apps/viewer/src/services/cloud/{dropbox,google-drive}.ts` |
+| Browser clients | `apps/viewer/src/services/cloud/{dropbox,google-drive,onedrive}.ts` |
 | Provider registry (what the UI lists) | `apps/viewer/src/services/cloud/providers.ts` |
 | Importer UI | `apps/viewer/src/components/viewer/cloud/CloudImportDialog.tsx` |
 | Tests | `tests/api/cloud-oauth.test.ts` |
@@ -89,6 +88,27 @@ secrets are absent, and the UI surfaces a clear connect error.
    OAuth consent screen.
 5. Set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`.
 
+### OneDrive (Microsoft Graph)
+
+1. Register an app in the [Microsoft Entra admin center](https://entra.microsoft.com/)
+   (App registrations → New registration). Choose the account types you want to
+   support (the code uses the `common` tenant, which accepts work/school **and**
+   personal Microsoft accounts).
+2. Under **Authentication**, add a **Web** platform redirect URI, e.g.
+   `https://ifclite.com/api/onedrive/auth-callback`.
+3. Under **Certificates & secrets**, create a client secret.
+4. The app requests the delegated scopes `offline_access`, `Files.Read.All`,
+   and `User.Read`. `Files.Read.All` lets the user browse their OneDrive and any
+   files/SharePoint items shared with them; enterprise tenants may require admin
+   consent.
+5. Set `MICROSOFT_CLIENT_ID` and `MICROSOFT_CLIENT_SECRET`.
+
+> **SharePoint scope.** The current client browses the user's OneDrive
+> (`/me/drive`), which surfaces shared items. Browsing SharePoint *sites*
+> directly (`/sites/…` → document libraries) is a planned follow-up — it reuses
+> the same Microsoft auth and only extends `listFolder` (plus a `Sites.Read.All`
+> scope).
+
 No client-side env vars are needed — the browser only talks to
 `/api/<provider>/*`, then to the provider's API with the short-lived token.
 
@@ -105,9 +125,9 @@ revocation, and disconnect — without contacting any provider.
 
 ## Roadmap
 
-- **OneDrive / SharePoint** — Microsoft Graph + MSAL (Azure AD app
-  registration; enterprise tenants may require admin consent). Slots into the
-  same spec + `OAuthCloudProvider` pattern.
+- **SharePoint sites** — extend the OneDrive client's `listFolder` to browse
+  `/sites/…` document libraries (adds a `Sites.Read.All` scope); the auth and
+  download paths are already in place.
 - **Proton Drive** — blocked on Proton shipping third-party auth for their
   Drive SDK (targeted late 2026 / early 2027). Until then the practical path is
   reading a Proton Drive *desktop-sync folder* via the Tauri desktop build.

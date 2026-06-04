@@ -11,5 +11,10 @@
 import type { CloudProvider } from './types.js';
 import { dropboxProvider } from './dropbox.js';
 import { googleDriveProvider } from './google-drive.js';
+import { onedriveProvider } from './onedrive.js';
 
-export const cloudProviders: readonly CloudProvider[] = [dropboxProvider, googleDriveProvider];
+export const cloudProviders: readonly CloudProvider[] = [
+  dropboxProvider,
+  googleDriveProvider,
+  onedriveProvider,
+];

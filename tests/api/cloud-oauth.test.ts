@@ -20,6 +20,7 @@ import {
 import { createOAuthHandlers } from '../../server/cloud-oauth/oauth-handlers.js';
 import { DROPBOX_SPEC, loadDropboxConfig } from '../../server/dropbox/dropbox.js';
 import { GOOGLE_SPEC, loadGoogleConfig } from '../../server/google/google.js';
+import { ONEDRIVE_SPEC, loadOneDriveConfig } from '../../server/onedrive/onedrive.js';
 
 const CONFIG = { clientId: 'client-id', clientSecret: 'client-secret' };
 
@@ -57,11 +58,20 @@ test('Google spec forces consent + offline access (so a refresh token is issued)
   assert.match(url.searchParams.get('scope') ?? '', /drive\.readonly/);
 });
 
+test('Microsoft spec requests offline_access for a refresh token', () => {
+  const url = new URL(buildAuthorizeUrl(ONEDRIVE_SPEC, { clientId: 'k', redirectUri: 'https://app/cb', state: 'st' }));
+  assert.match(url.origin + url.pathname, /login\.microsoftonline\.com\/common\/oauth2\/v2\.0\/authorize/);
+  assert.match(url.searchParams.get('scope') ?? '', /offline_access/);
+  assert.match(url.searchParams.get('scope') ?? '', /Files\.Read\.All/);
+});
+
 test('config loaders read provider-specific env vars and tolerate absence', () => {
   assert.equal(loadDropboxConfig({}), null);
   assert.deepEqual(loadDropboxConfig({ DROPBOX_APP_KEY: 'k', DROPBOX_APP_SECRET: 's' }), { clientId: 'k', clientSecret: 's' });
   assert.equal(loadGoogleConfig({ GOOGLE_CLIENT_ID: 'k' }), null);
   assert.deepEqual(loadGoogleConfig({ GOOGLE_CLIENT_ID: 'k', GOOGLE_CLIENT_SECRET: 's' }), { clientId: 'k', clientSecret: 's' });
+  assert.equal(loadOneDriveConfig({ MICROSOFT_CLIENT_ID: 'k' }), null);
+  assert.deepEqual(loadOneDriveConfig({ MICROSOFT_CLIENT_ID: 'k', MICROSOFT_CLIENT_SECRET: 's' }), { clientId: 'k', clientSecret: 's' });
 });
 
 test('cookie names and redirect URIs are namespaced per provider', () => {
@@ -110,7 +120,7 @@ test('refreshAccessToken throws OAuthTokenError on failure', async () => {
 
 // ── Handlers (parametrised over both providers) ──────────────────────────────
 
-for (const spec of [DROPBOX_SPEC, GOOGLE_SPEC] as OAuthProviderSpec[]) {
+for (const spec of [DROPBOX_SPEC, GOOGLE_SPEC, ONEDRIVE_SPEC] as OAuthProviderSpec[]) {
   const STATE = stateCookieName(spec);
   const REFRESH = refreshCookieName(spec);
   const base = `https://ifclite.com/api/${spec.id}`;
