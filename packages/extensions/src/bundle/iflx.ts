@@ -76,7 +76,10 @@ export function packBundle(bundle: Bundle, signature?: SignatureBlock): Uint8Arr
     ...(signature ? { signature } : {}),
   };
   const json = JSON.stringify(envelope);
-  return gzipSync(new TextEncoder().encode(json));
+  // mtime: 0 — fflate embeds the current time in the gzip header by default,
+  // which would make the output non-deterministic (breaking the documented
+  // contract above and the determinism test). Pin it for reproducible bundles.
+  return gzipSync(new TextEncoder().encode(json), { mtime: 0 });
 }
 
 /**
