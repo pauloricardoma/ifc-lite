@@ -48,6 +48,14 @@ export interface CloudProvider {
   download(entry: CloudFileEntry, onProgress?: CloudDownloadProgress): Promise<File>;
 }
 
+/** Raised when the user has no live connection to a provider (re-connect required). */
+export class CloudNotConnectedError extends Error {
+  constructor(readonly providerId: string) {
+    super(`Not connected to ${providerId}`);
+    this.name = 'CloudNotConnectedError';
+  }
+}
+
 /** Extensions the cloud importer surfaces. Mirrors the IFC subset of the toolbar. */
 export const CLOUD_IMPORT_EXTENSIONS = ['.ifc', '.ifcx'] as const;
 

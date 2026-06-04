@@ -77,6 +77,8 @@ import { cn } from '@/lib/utils';
 import { CSVExporter } from '@ifc-lite/export';
 import { FileSpreadsheet, FileJson, FileText, Filter, Upload, Pencil } from 'lucide-react';
 import { CloudImportDialog } from './cloud/CloudImportDialog';
+import { cloudProviders } from '@/services/cloud/providers';
+import type { CloudProvider } from '@/services/cloud/types';
 import { ExportDialog } from './ExportDialog';
 import { GLBExportDialog } from './GLBExportDialog';
 import { BulkPropertyEditor } from './BulkPropertyEditor';
@@ -421,6 +423,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
   const fileInputRef = useRef<HTMLInputElement>(null);
   const addModelInputRef = useRef<HTMLInputElement>(null);
   const [cloudImportOpen, setCloudImportOpen] = useState(false);
+  const [cloudProvider, setCloudProvider] = useState<CloudProvider | null>(null);
   const {
     loadFile,
     loading,
@@ -1081,32 +1084,41 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
         </Tooltip>
       )}
 
-      {/* Import from cloud storage (Dropbox, …) */}
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            onClick={(e) => {
-              (e.currentTarget as HTMLButtonElement).blur();
-              setCloudImportOpen(true);
-            }}
-            disabled={loading}
-          >
+      {/* Import from cloud storage (Dropbox, Google Drive, …) */}
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button variant="ghost" size="icon-sm" disabled={loading} title="Import from cloud">
             <Cloud className="h-4 w-4" />
           </Button>
-        </TooltipTrigger>
-        <TooltipContent>Import from cloud (Dropbox)</TooltipContent>
-      </Tooltip>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start">
+          <DropdownMenuLabel>Import from cloud</DropdownMenuLabel>
+          {cloudProviders.map((p) => (
+            <DropdownMenuItem
+              key={p.id}
+              onClick={() => {
+                setCloudProvider(p);
+                setCloudImportOpen(true);
+              }}
+            >
+              <Cloud className="h-4 w-4 mr-2" />
+              {p.label}
+            </DropdownMenuItem>
+          ))}
+        </DropdownMenuContent>
+      </DropdownMenu>
 
-      <CloudImportDialog
-        open={cloudImportOpen}
-        onClose={() => setCloudImportOpen(false)}
-        onPick={(file) => {
-          recordRecentFiles([{ name: file.name, size: file.size }]);
-          void addModel(file);
-        }}
-      />
+      {cloudProvider && (
+        <CloudImportDialog
+          open={cloudImportOpen}
+          provider={cloudProvider}
+          onClose={() => setCloudImportOpen(false)}
+          onPick={(file) => {
+            recordRecentFiles([{ name: file.name, size: file.size }]);
+            void addModel(file);
+          }}
+        />
+      )}
 
       <DropdownMenu>
         <DropdownMenuTrigger asChild>

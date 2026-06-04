@@ -3,10 +3,10 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * Cloud import dialog — connect a cloud provider (Dropbox today) and pick an
- * IFC file to load. Selecting a file downloads it directly from the provider to
- * the browser and hands the resulting `File` to the caller via `onPick`, which
- * wires into the existing `loadFile`/`addModel` pipeline.
+ * Cloud import dialog — connect a cloud provider (Dropbox, Google Drive, …) and
+ * pick an IFC file to load. Selecting a file downloads it directly from the
+ * provider to the browser and hands the resulting `File` to the caller via
+ * `onPick`, which wires into the existing `loadFile`/`addModel` pipeline.
  */
 
 import { useCallback, useEffect, useState } from 'react';
@@ -29,15 +29,25 @@ import {
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { toast } from '@/components/ui/toast';
-import { dropboxProvider, DropboxNotConnectedError } from '@/services/cloud/dropbox';
-import type { CloudFileEntry } from '@/services/cloud/types';
+import { CloudNotConnectedError } from '@/services/cloud/types';
+import type { CloudFileEntry, CloudProvider } from '@/services/cloud/types';
 
 interface CloudImportDialogProps {
   open: boolean;
   onClose: () => void;
+  /** Which cloud provider to browse (Dropbox, Google Drive, …). */
+  provider: CloudProvider;
   /** Hand the downloaded file to the loader (e.g. `addModel` or `loadFile`). */
   onPick: (file: File) => void;
 }
+
+/** A readable breadcrumb step: a display name + the provider path/id to list. */
+interface Crumb {
+  name: string;
+  path: string;
+}
+
+const ROOT_CRUMB: Crumb = { name: 'Home', path: '' };
 
 function formatSize(bytes: number): string {
   if (!bytes) return '';
@@ -51,17 +61,17 @@ function formatSize(bytes: number): string {
   return `${n.toFixed(n >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
-export function CloudImportDialog({ open, onClose, onPick }: CloudImportDialogProps) {
-  const provider = dropboxProvider;
+export function CloudImportDialog({ open, onClose, provider, onPick }: CloudImportDialogProps) {
   const [connected, setConnected] = useState(provider.isConnected());
   const [connecting, setConnecting] = useState(false);
-  const [path, setPath] = useState('');
-  const [pathStack, setPathStack] = useState<string[]>([]);
+  const [trail, setTrail] = useState<Crumb[]>([ROOT_CRUMB]);
   const [entries, setEntries] = useState<CloudFileEntry[]>([]);
   const [listing, setListing] = useState(false);
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
   const [downloadPct, setDownloadPct] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  const currentPath = trail[trail.length - 1]?.path ?? '';
 
   const load = useCallback(
     async (targetPath: string) => {
@@ -70,14 +80,12 @@ export function CloudImportDialog({ open, onClose, onPick }: CloudImportDialogPr
       try {
         const items = await provider.listFolder(targetPath);
         setEntries(items);
-        setPath(targetPath);
         setConnected(true);
       } catch (err) {
-        if (err instanceof DropboxNotConnectedError) {
+        if (err instanceof CloudNotConnectedError) {
           setConnected(false);
         } else {
-          const message = err instanceof Error ? err.message : 'Failed to list folder';
-          setError(message);
+          setError(err instanceof Error ? err.message : 'Failed to list folder');
         }
       } finally {
         setListing(false);
@@ -86,13 +94,21 @@ export function CloudImportDialog({ open, onClose, onPick }: CloudImportDialogPr
     [provider],
   );
 
+  // Reset to the root whenever the provider changes (e.g. switching tabs).
+  useEffect(() => {
+    setTrail([ROOT_CRUMB]);
+    setEntries([]);
+    setError(null);
+    setConnected(provider.isConnected());
+  }, [provider]);
+
   // Load the root folder when the dialog opens while already connected.
   useEffect(() => {
     if (open && connected && entries.length === 0 && !listing) {
       void load('');
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, connected]);
+  }, [open, connected, provider]);
 
   const handleConnect = useCallback(async () => {
     setConnecting(true);
@@ -100,10 +116,10 @@ export function CloudImportDialog({ open, onClose, onPick }: CloudImportDialogPr
     try {
       await provider.connect();
       setConnected(true);
+      setTrail([ROOT_CRUMB]);
       await load('');
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Connection failed';
-      setError(message);
+      setError(err instanceof Error ? err.message : 'Connection failed');
     } finally {
       setConnecting(false);
     }
@@ -113,23 +129,22 @@ export function CloudImportDialog({ open, onClose, onPick }: CloudImportDialogPr
     await provider.disconnect();
     setConnected(false);
     setEntries([]);
-    setPath('');
-    setPathStack([]);
+    setTrail([ROOT_CRUMB]);
   }, [provider]);
 
   const enterFolder = useCallback(
     (entry: CloudFileEntry) => {
-      setPathStack((s) => [...s, path]);
+      setTrail((t) => [...t, { name: entry.name, path: entry.path }]);
       void load(entry.path);
     },
-    [path, load],
+    [load],
   );
 
   const goUp = useCallback(() => {
-    setPathStack((s) => {
-      const next = [...s];
-      const parent = next.pop() ?? '';
-      void load(parent);
+    setTrail((t) => {
+      if (t.length <= 1) return t;
+      const next = t.slice(0, -1);
+      void load(next[next.length - 1].path);
       return next;
     });
   }, [load]);
@@ -146,7 +161,7 @@ export function CloudImportDialog({ open, onClose, onPick }: CloudImportDialogPr
         toast.success(`Loaded ${entry.name} from ${provider.label}`);
         onClose();
       } catch (err) {
-        if (err instanceof DropboxNotConnectedError) {
+        if (err instanceof CloudNotConnectedError) {
           setConnected(false);
         } else {
           const message = err instanceof Error ? err.message : 'Download failed';
@@ -194,15 +209,17 @@ export function CloudImportDialog({ open, onClose, onPick }: CloudImportDialogPr
                   variant="ghost"
                   size="icon-sm"
                   onClick={goUp}
-                  disabled={pathStack.length === 0 || listing}
+                  disabled={trail.length <= 1 || listing}
                   title="Up one folder"
                 >
                   <ChevronLeft className="h-4 w-4" />
                 </Button>
-                <span className="text-xs text-zinc-500 truncate">{path || '/'}</span>
+                <span className="text-xs text-zinc-500 truncate">
+                  {trail.map((c) => c.name).join(' / ')}
+                </span>
               </div>
               <div className="flex items-center gap-1">
-                <Button variant="ghost" size="icon-sm" onClick={() => void load(path)} disabled={listing} title="Refresh">
+                <Button variant="ghost" size="icon-sm" onClick={() => void load(currentPath)} disabled={listing} title="Refresh">
                   <RefreshCw className={`h-4 w-4 ${listing ? 'animate-spin' : ''}`} />
                 </Button>
                 <Button variant="ghost" size="icon-sm" onClick={handleDisconnect} title="Disconnect">
