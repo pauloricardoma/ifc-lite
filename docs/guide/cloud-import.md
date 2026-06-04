@@ -2,7 +2,8 @@
 
 Load IFC files straight from a cloud storage account instead of downloading
 them to disk first. Providers ship behind one provider-agnostic abstraction;
-today that's **Dropbox**, **Google Drive**, and **OneDrive** (Microsoft Graph).
+today that's **Dropbox**, **Google Drive**, and **OneDrive / SharePoint**
+(Microsoft Graph).
 
 ## How it works
 
@@ -98,16 +99,16 @@ secrets are absent, and the UI surfaces a clear connect error.
    `https://ifclite.com/api/onedrive/auth-callback`.
 3. Under **Certificates & secrets**, create a client secret.
 4. The app requests the delegated scopes `offline_access`, `Files.Read.All`,
-   and `User.Read`. `Files.Read.All` lets the user browse their OneDrive and any
-   files/SharePoint items shared with them; enterprise tenants may require admin
-   consent.
+   `Sites.Read.All`, and `User.Read`. `Files.Read.All` covers the user's
+   OneDrive; `Sites.Read.All` lets them browse their followed SharePoint sites'
+   document libraries. Enterprise tenants may require admin consent for these.
 5. Set `MICROSOFT_CLIENT_ID` and `MICROSOFT_CLIENT_SECRET`.
 
-> **SharePoint scope.** The current client browses the user's OneDrive
-> (`/me/drive`), which surfaces shared items. Browsing SharePoint *sites*
-> directly (`/sites/…` → document libraries) is a planned follow-up — it reuses
-> the same Microsoft auth and only extends `listFolder` (plus a `Sites.Read.All`
-> scope).
+> **OneDrive + SharePoint.** The importer's root offers **My OneDrive** plus
+> each **followed SharePoint site** (its default document library). If
+> `Sites.Read.All` isn't consented, the site list is simply empty and OneDrive
+> still works. Browsing a site's *non-default* libraries is a possible
+> follow-up.
 
 No client-side env vars are needed — the browser only talks to
 `/api/<provider>/*`, then to the provider's API with the short-lived token.
@@ -125,9 +126,9 @@ revocation, and disconnect — without contacting any provider.
 
 ## Roadmap
 
-- **SharePoint sites** — extend the OneDrive client's `listFolder` to browse
-  `/sites/…` document libraries (adds a `Sites.Read.All` scope); the auth and
-  download paths are already in place.
+- **SharePoint non-default libraries** — the importer browses each followed
+  site's *default* document library; listing a site's other libraries
+  (`/sites/<id>/drives`) would add one more navigation level.
 - **Proton Drive** — blocked on Proton shipping third-party auth for their
   Drive SDK (targeted late 2026 / early 2027). Until then the practical path is
   reading a Proton Drive *desktop-sync folder* via the Tauri desktop build.

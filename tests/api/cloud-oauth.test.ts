@@ -63,6 +63,7 @@ test('Microsoft spec requests offline_access for a refresh token', () => {
   assert.match(url.origin + url.pathname, /login\.microsoftonline\.com\/common\/oauth2\/v2\.0\/authorize/);
   assert.match(url.searchParams.get('scope') ?? '', /offline_access/);
   assert.match(url.searchParams.get('scope') ?? '', /Files\.Read\.All/);
+  assert.match(url.searchParams.get('scope') ?? '', /Sites\.Read\.All/);
 });
 
 test('config loaders read provider-specific env vars and tolerate absence', () => {

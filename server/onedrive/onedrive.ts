@@ -30,8 +30,9 @@ export const ONEDRIVE_SPEC: OAuthProviderSpec = {
   authorizeUrl: `https://login.microsoftonline.com/${TENANT}/oauth2/v2.0/authorize`,
   tokenUrl: `https://login.microsoftonline.com/${TENANT}/oauth2/v2.0/token`,
   // offline_access → refresh token; Files.Read.All covers the user's OneDrive
-  // plus files/SharePoint libraries shared with them.
-  scopes: ['offline_access', 'Files.Read.All', 'User.Read'],
+  // plus files shared with them; Sites.Read.All enables browsing followed
+  // SharePoint sites' document libraries.
+  scopes: ['offline_access', 'Files.Read.All', 'Sites.Read.All', 'User.Read'],
   authorizeParams: {},
   envKeys: { id: 'MICROSOFT_CLIENT_ID', secret: 'MICROSOFT_CLIENT_SECRET' },
 };
