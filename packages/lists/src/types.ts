@@ -71,6 +71,13 @@ export interface ListDataProvider {
   getClassifications?(expressId: number): ListClassificationRef[];
   /** Building-storey name the element belongs to, or '' when unplaced. */
   getStoreyName?(expressId: number): string;
+  /**
+   * Discover EVERY property set / property and quantity set / quantity in
+   * the model — complete and independent of entity-type selection — so the
+   * column picker can offer all data even with no type chosen. Optional:
+   * when absent, callers fall back to the type-sampled `discoverColumns()`.
+   */
+  discoverAllColumns?(): DiscoveredColumns;
 }
 
 /** A classification reference exposed to the list engine (code + name). */
@@ -102,6 +109,16 @@ export interface ListDefinition {
 
   /** Current sort state */
   sortBy?: { columnId: string; direction: 'asc' | 'desc' };
+
+  /** Optional grouping + summation for the summary view */
+  grouping?: ListGrouping;
+}
+
+export interface ListGrouping {
+  /** Column id to group rows by (e.g. a Type / Material / Storey column). */
+  columnId: string;
+  /** Column ids whose numeric values are summed per group and overall. */
+  sumColumnIds: string[];
 }
 
 // ============================================================================
@@ -166,6 +183,29 @@ export interface ListResult {
   totalCount: number;
   /** Execution time in ms */
   executionTime: number;
+  /** Per-group breakdown — present only when `grouping` is configured. */
+  groups?: ListGroup[];
+  /** Whole-result aggregates (count + per-column sums). Present when
+   *  `grouping` is configured. */
+  summary?: ListSummary;
+}
+
+/** One group in a grouped list result. */
+export interface ListGroup {
+  /** Group-by value, stringified. Empty values group under `label`. */
+  key: string;
+  /** Display label for the group header. */
+  label: string;
+  /** Number of rows in the group. */
+  count: number;
+  /** columnId → summed numeric value, for the configured sum columns. */
+  sums: Record<string, number>;
+}
+
+/** Whole-result aggregates. */
+export interface ListSummary {
+  count: number;
+  sums: Record<string, number>;
 }
 
 export interface ListRow {
