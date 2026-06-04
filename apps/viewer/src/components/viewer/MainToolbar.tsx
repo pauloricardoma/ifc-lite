@@ -2,9 +2,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-import React, { useRef, useCallback, useEffect, useMemo, useSyncExternalStore } from 'react';
+import React, { useRef, useState, useCallback, useEffect, useMemo, useSyncExternalStore } from 'react';
 import {
   FolderOpen,
+  Cloud,
   Download,
   MousePointer2,
   PersonStanding,
@@ -75,6 +76,7 @@ import { useIfc } from '@/hooks/useIfc';
 import { cn } from '@/lib/utils';
 import { CSVExporter } from '@ifc-lite/export';
 import { FileSpreadsheet, FileJson, FileText, Filter, Upload, Pencil } from 'lucide-react';
+import { CloudImportDialog } from './cloud/CloudImportDialog';
 import { ExportDialog } from './ExportDialog';
 import { GLBExportDialog } from './GLBExportDialog';
 import { BulkPropertyEditor } from './BulkPropertyEditor';
@@ -418,6 +420,7 @@ interface MainToolbarProps {
 export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainToolbarProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const addModelInputRef = useRef<HTMLInputElement>(null);
+  const [cloudImportOpen, setCloudImportOpen] = useState(false);
   const {
     loadFile,
     loading,
@@ -1077,6 +1080,33 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
           <TooltipContent>Add Model to Scene (Multi-select supported)</TooltipContent>
         </Tooltip>
       )}
+
+      {/* Import from cloud storage (Dropbox, …) */}
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            onClick={(e) => {
+              (e.currentTarget as HTMLButtonElement).blur();
+              setCloudImportOpen(true);
+            }}
+            disabled={loading}
+          >
+            <Cloud className="h-4 w-4" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>Import from cloud (Dropbox)</TooltipContent>
+      </Tooltip>
+
+      <CloudImportDialog
+        open={cloudImportOpen}
+        onClose={() => setCloudImportOpen(false)}
+        onPick={(file) => {
+          recordRecentFiles([{ name: file.name, size: file.size }]);
+          void addModel(file);
+        }}
+      />
 
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
