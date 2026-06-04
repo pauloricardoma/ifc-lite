@@ -16,6 +16,8 @@ import type {
   ListDefinition,
   ListResult,
   ListRow,
+  ListGroup,
+  ListSummary,
   CellValue,
   PropertyCondition,
   ColumnDefinition,
@@ -33,7 +35,7 @@ export function executeList(
   const startTime = performance.now();
 
   // Step 1: Resolve source set (which entities match)
-  const matchedIds = resolveSourceSet(definition, provider);
+  const matchedIds = resolveSourceSet(definition, provider, modelId);
 
   // Step 2: Extract column values for matched entities
   const rows: ListRow[] = new Array(matchedIds.length);
@@ -53,28 +55,114 @@ export function executeList(
     }
   }
 
+  // Step 4: Group + summarise if configured
+  const { groups, summary } = summariseListRows(definition, rows);
+
   return {
     columns: definition.columns,
     rows,
     totalCount: rows.length,
     executionTime: performance.now() - startTime,
+    groups,
+    summary,
   };
+}
+
+// ============================================================================
+// Grouping & Aggregation
+// ============================================================================
+
+/**
+ * Build the grouped breakdown + whole-result summary for a definition over a
+ * row set. Returns `{}` when no grouping is configured, so the result shape is
+ * unchanged for plain flat lists. Exported so federated callers can re-derive
+ * groups/summary after merging rows from several models.
+ */
+export function summariseListRows(
+  definition: ListDefinition,
+  rows: ListRow[],
+): { groups?: ListGroup[]; summary?: ListSummary } {
+  const grouping = definition.grouping;
+  if (!grouping) return {};
+
+  const columns = definition.columns;
+  const groupIdx = columns.findIndex(c => c.id === grouping.columnId);
+  const sumIndices = grouping.sumColumnIds
+    .map(id => ({ id, idx: columns.findIndex(c => c.id === id) }))
+    .filter(s => s.idx >= 0);
+
+  const zeroSums = (): Record<string, number> => {
+    const out: Record<string, number> = {};
+    for (const s of sumIndices) out[s.id] = 0;
+    return out;
+  };
+
+  // Whole-result summary.
+  const summary: ListSummary = { count: rows.length, sums: zeroSums() };
+
+  // Group accumulation, preserving first-seen order.
+  const byKey = new Map<string, ListGroup>();
+  for (const row of rows) {
+    const raw = groupIdx >= 0 ? row.values[groupIdx] : null;
+    const label = raw === null || raw === undefined || raw === '' ? '(none)' : String(raw);
+    const key = label;
+
+    let group = byKey.get(key);
+    if (!group) {
+      group = { key, label, count: 0, sums: zeroSums() };
+      byKey.set(key, group);
+    }
+    group.count++;
+
+    for (const s of sumIndices) {
+      const v = row.values[s.idx];
+      if (typeof v === 'number' && Number.isFinite(v)) {
+        group.sums[s.id] += v;
+        summary.sums[s.id] += v;
+      }
+    }
+  }
+
+  const groups = Array.from(byKey.values());
+  // Stable, useful default: largest groups first.
+  groups.sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+
+  return { groups, summary };
 }
 
 // ============================================================================
 // Source Set Resolution
 // ============================================================================
 
-function resolveSourceSet(definition: ListDefinition, provider: ListDataProvider): number[] {
-  const { entityTypes, conditions } = definition;
+function resolveSourceSet(
+  definition: ListDefinition,
+  provider: ListDataProvider,
+  modelId: string,
+): number[] {
+  const { entityTypes, conditions, expressIdsByModel } = definition;
 
-  // Collect entity IDs by type - gather arrays first, then flatten once
-  const chunks: number[][] = [];
-  for (const type of entityTypes) {
-    const ids = provider.getEntitiesByType(type);
-    if (ids.length > 0) chunks.push(ids);
+  let entityIds: number[];
+  if (expressIdsByModel) {
+    // Explicit snapshot scope (e.g. from a filter result) — target exactly
+    // the ids captured FOR THIS model. Keyed by model so a federated list
+    // never picks up a foreign model's element that happens to share a
+    // local express ID. Still intersect with this model for safety.
+    const snapshot = expressIdsByModel[modelId] ?? [];
+    entityIds = snapshot.filter((id) => provider.getEntityTypeName(id) !== '');
+  } else if (entityTypes.length === 0) {
+    // No class constraint — target every element in the model. Requires
+    // the provider to enumerate all ids; older providers without it
+    // resolve to an empty set rather than throwing.
+    entityIds = provider.getAllEntityIds?.() ?? [];
+  } else {
+    // Collect entity IDs by type - gather arrays first, then flatten once
+    const chunks: number[][] = [];
+    for (const type of entityTypes) {
+      const ids = provider.getEntitiesByType(type);
+      if (ids.length > 0) chunks.push(ids);
+    }
+    entityIds = chunks.length === 1 ? chunks[0] : chunks.flat();
   }
-  const entityIds = chunks.length === 1 ? chunks[0] : chunks.flat();
 
   // Apply conditions as filters
   if (conditions.length === 0) {
@@ -102,6 +190,13 @@ function matchesCondition(
   condition: PropertyCondition,
   provider: ListDataProvider,
 ): boolean {
+  // Material and classification are multi-valued (an element can have many
+  // material layers or classification refs) so they use any/none semantics
+  // rather than the scalar comparison below.
+  if (condition.source === 'material' || condition.source === 'classification') {
+    return matchesMultiValuedCondition(entityId, condition, provider);
+  }
+
   const actualValue = getConditionValue(entityId, condition, provider);
 
   if (condition.operator === 'exists') {
@@ -144,9 +239,56 @@ function getConditionValue(
       return getPropertyValue(entityId, condition.psetName ?? '', condition.propertyName, provider);
     case 'quantity':
       return getQuantityValue(entityId, condition.psetName ?? '', condition.propertyName, provider);
+    case 'spatial':
+      return provider.getStoreyName?.(entityId) || null;
     default:
       return null;
   }
+}
+
+/**
+ * Match a multi-valued condition (material / classification). Positive
+ * operators match if ANY candidate value satisfies them; `notEquals`
+ * matches only if NO candidate equals the value. An element with no
+ * materials / classifications never matches (including `notEquals`),
+ * except `exists` which is a pure presence check.
+ */
+function matchesMultiValuedCondition(
+  entityId: number,
+  condition: PropertyCondition,
+  provider: ListDataProvider,
+): boolean {
+  const candidates = condition.source === 'material'
+    ? (provider.getMaterialNames?.(entityId) ?? [])
+    : classificationCandidates(provider.getClassifications?.(entityId) ?? []);
+
+  if (condition.operator === 'exists') return candidates.length > 0;
+  if (candidates.length === 0) return false;
+
+  const target = String(condition.value).toLowerCase();
+  switch (condition.operator) {
+    case 'equals':
+      return candidates.some(c => c.toLowerCase() === target);
+    case 'contains':
+      return candidates.some(c => c.toLowerCase().includes(target));
+    case 'notEquals':
+      return candidates.every(c => c.toLowerCase() !== target);
+    default:
+      // gt/lt/gte/lte have no meaning for material/classification strings.
+      return false;
+  }
+}
+
+/** Flatten classification refs into a candidate string list (code + name). */
+function classificationCandidates(
+  refs: ReadonlyArray<{ code?: string; name?: string }>,
+): string[] {
+  const out: string[] = [];
+  for (const ref of refs) {
+    if (ref.code) out.push(ref.code);
+    if (ref.name) out.push(ref.name);
+  }
+  return out;
 }
 
 // ============================================================================
@@ -185,11 +327,31 @@ function extractColumnValues(
       case 'quantity':
         values[i] = findQuantityInSets(qsets ?? [], col.psetName ?? '', col.propertyName);
         break;
+      case 'material': {
+        const names = provider.getMaterialNames?.(entityId) ?? [];
+        values[i] = names.length > 0 ? uniqueJoin(names) : null;
+        break;
+      }
+      case 'classification': {
+        const refs = provider.getClassifications?.(entityId) ?? [];
+        const codes = refs.map(r => r.code || r.name || '').filter(s => s.length > 0);
+        values[i] = codes.length > 0 ? uniqueJoin(codes) : null;
+        break;
+      }
+      case 'spatial':
+        values[i] = provider.getStoreyName?.(entityId) || null;
+        break;
       default:
         values[i] = null;
     }
   }
   return values;
+}
+
+/** Join a list of strings into a single cell value, de-duplicated and
+ *  order-preserving (an element can repeat a material across layers). */
+function uniqueJoin(values: string[]): string {
+  return Array.from(new Set(values)).join(', ');
 }
 
 // ============================================================================

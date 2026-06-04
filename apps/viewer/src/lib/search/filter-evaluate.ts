@@ -37,20 +37,35 @@
 import {
   extractPropertiesOnDemand,
   extractQuantitiesOnDemand,
+  extractMaterialsOnDemand,
+  extractClassificationsOnDemand,
   type IfcDataStore,
+  type ClassificationInfo,
 } from '@ifc-lite/parser';
 
 import {
   combineRuleResults,
   setOpMatches,
   stringOpMatches,
+  matchStringAnyNone,
   numericOpMatches,
-  valueOpMatches,
   type Combinator,
   type FilterRule,
-  type PropertyRule,
-  type QuantityRule,
 } from './filter-rules.js';
+
+import {
+  flattenPsets,
+  flattenQtys,
+  stringifyValue,
+  matchPropertyRule,
+  matchQuantityRule,
+  defaultStoreyName,
+  materialNamesOf,
+  matchClassificationRule,
+  elevationOf,
+  type PsetRows,
+  type QtyRows,
+} from './filter-match.js';
 
 /** A single matched element. Mirrors the Rust `FilteredElement` shape. */
 export interface FilteredElement {
@@ -108,6 +123,8 @@ export function evaluateFilterRules(
     options,
     hasPropertyRule: orderedRules.some((r) => r.kind === 'property'),
     hasQuantityRule: orderedRules.some((r) => r.kind === 'quantity'),
+    hasMaterialRule: orderedRules.some((r) => r.kind === 'material'),
+    hasClassificationRule: orderedRules.some((r) => r.kind === 'classification'),
   };
 
   for (const expressId of iterIds) {
@@ -210,6 +227,8 @@ export async function evaluateFilterRulesFederated(
       options,
       hasPropertyRule: orderedRules.some((r) => r.kind === 'property'),
       hasQuantityRule: orderedRules.some((r) => r.kind === 'quantity'),
+      hasMaterialRule: orderedRules.some((r) => r.kind === 'material'),
+      hasClassificationRule: orderedRules.some((r) => r.kind === 'classification'),
     };
 
     // Walk the per-model iter in chunkSize-sized strides, yielding the
@@ -340,12 +359,17 @@ const RULE_COST: Record<FilterRule['kind'], number> = {
   ifcType:        0,
   // Pre-built reverse-map lookup.
   storey:         1,
+  // Pre-built reverse-map lookup (elementToStorey → storeyElevations).
+  elevation:      1,
   // String-table indirection.
   name:           2,
   predefinedType: 2,
   // Source-buffer parse (the AGENTS.md §2 hot path).
   property:       10,
   quantity:       10,
+  // Relationship-graph walk + on-demand resolve — as costly as a pset parse.
+  material:       10,
+  classification: 10,
 };
 
 export function orderRulesByCost(rules: readonly FilterRule[]): FilterRule[] {
@@ -365,6 +389,8 @@ interface EvalContext {
   options: EvaluateOptions;
   hasPropertyRule: boolean;
   hasQuantityRule: boolean;
+  hasMaterialRule: boolean;
+  hasClassificationRule: boolean;
 }
 
 function evaluateOneEntity(
@@ -379,6 +405,8 @@ function evaluateOneEntity(
   // parse entirely.
   let psetCache: PsetRows | null = null;
   let qtyCache: QtyRows | null = null;
+  let matCache: string[] | null = null;
+  let classCache: readonly ClassificationInfo[] | null = null;
   const psetsFor = (): PsetRows => {
     if (!psetCache) psetCache = flattenPsets(extractPropertiesOnDemand(ctx.store, expressId));
     return psetCache;
@@ -386,6 +414,14 @@ function evaluateOneEntity(
   const qtysFor = (): QtyRows => {
     if (!qtyCache) qtyCache = flattenQtys(extractQuantitiesOnDemand(ctx.store, expressId));
     return qtyCache;
+  };
+  const matNamesFor = (): string[] => {
+    if (!matCache) matCache = materialNamesOf(extractMaterialsOnDemand(ctx.store, expressId));
+    return matCache;
+  };
+  const classFor = (): readonly ClassificationInfo[] => {
+    if (!classCache) classCache = extractClassificationsOnDemand(ctx.store, expressId);
+    return classCache;
   };
 
   const ruleResults: boolean[] = [];
@@ -396,6 +432,8 @@ function evaluateOneEntity(
       expressId,
       ctx.hasPropertyRule ? psetsFor : null,
       ctx.hasQuantityRule ? qtysFor : null,
+      ctx.hasMaterialRule ? matNamesFor : null,
+      ctx.hasClassificationRule ? classFor : null,
     );
     ruleResults.push(result);
     if (combinator === 'AND' && !result) return false;
@@ -410,6 +448,8 @@ function evaluateRule(
   expressId: number,
   psetsFor: (() => PsetRows) | null,
   qtysFor: (() => QtyRows) | null,
+  matNamesFor: (() => string[]) | null,
+  classFor: (() => readonly ClassificationInfo[]) | null,
 ): boolean {
   switch (rule.kind) {
     case 'storey': {
@@ -434,6 +474,19 @@ function evaluateRule(
     case 'quantity': {
       if (!qtysFor) return false;
       return matchQuantityRule(rule, qtysFor());
+    }
+    case 'material': {
+      if (!matNamesFor) return false;
+      return matchStringAnyNone(rule.op, matNamesFor(), rule.value);
+    }
+    case 'classification': {
+      if (!classFor) return false;
+      return matchClassificationRule(rule, classFor());
+    }
+    case 'elevation': {
+      const elev = elevationOf(ctx.store, expressId);
+      if (elev === null) return false;
+      return numericOpMatches(rule.op, elev, rule.value);
     }
   }
 }
@@ -513,90 +566,6 @@ function yieldToEventLoop(): Promise<void> {
   });
 }
 
-// ── Pset / Qto matching ──────────────────────────────────────────────────────
-
-interface PsetRow { setName: string; propertyName: string; value: string }
-type PsetRows = ReadonlyArray<PsetRow>;
-
-interface QtyRow { setName: string; quantityName: string; value: number }
-type QtyRows = ReadonlyArray<QtyRow>;
-
-function flattenPsets(
-  psets: ReturnType<typeof extractPropertiesOnDemand>,
-): PsetRows {
-  const out: PsetRow[] = [];
-  for (const set of psets) {
-    for (const p of set.properties) {
-      out.push({
-        setName: set.name,
-        propertyName: p.name,
-        // Stringify everything — `valueOpMatches` re-parses numeric ops
-        // from this representation. Booleans render as "true"/"false"
-        // which matches the chip UI's lowercased input convention.
-        value: stringifyValue(p.value),
-      });
-    }
-  }
-  return out;
-}
-
-function flattenQtys(
-  qtos: ReturnType<typeof extractQuantitiesOnDemand>,
-): QtyRows {
-  const out: QtyRow[] = [];
-  for (const set of qtos) {
-    for (const q of set.quantities) {
-      out.push({ setName: set.name, quantityName: q.name, value: q.value });
-    }
-  }
-  return out;
-}
-
-function stringifyValue(value: unknown): string {
-  if (value === null || value === undefined) return '';
-  if (typeof value === 'boolean') return value ? 'true' : 'false';
-  if (typeof value === 'number') return String(value);
-  return String(value);
-}
-
-function matchPropertyRule(rule: PropertyRule, rows: PsetRows): boolean {
-  // isSet / isNotSet are presence checks against (setName, propertyName).
-  if (rule.op === 'isSet' || rule.op === 'isNotSet') {
-    const present = rows.some(
-      (r) =>
-        r.setName.toLowerCase() === rule.setName.toLowerCase() &&
-        r.propertyName.toLowerCase() === rule.propertyName.toLowerCase(),
-    );
-    return rule.op === 'isSet' ? present : !present;
-  }
-
-  return rows.some(
-    (r) =>
-      r.setName.toLowerCase() === rule.setName.toLowerCase() &&
-      r.propertyName.toLowerCase() === rule.propertyName.toLowerCase() &&
-      valueOpMatches(rule.op, r.value, rule.value),
-  );
-}
-
-function matchQuantityRule(rule: QuantityRule, rows: QtyRows): boolean {
-  return rows.some(
-    (r) =>
-      r.setName.toLowerCase() === rule.setName.toLowerCase() &&
-      r.quantityName.toLowerCase() === rule.quantityName.toLowerCase() &&
-      numericOpMatches(rule.op, r.value, rule.value),
-  );
-}
-
-// ── Storey lookup fallback ────────────────────────────────────────────────────
-
-function defaultStoreyName(store: IfcDataStore, expressId: number): string {
-  const hierarchy = store.spatialHierarchy;
-  if (!hierarchy) return '';
-  const storeyId = hierarchy.elementToStorey.get(expressId);
-  if (!storeyId) return '';
-  return store.entities.getName(storeyId);
-}
-
 // ── Exposed for tests ────────────────────────────────────────────────────────
 
 export const __internal = {
@@ -605,6 +574,9 @@ export const __internal = {
   stringifyValue,
   matchPropertyRule,
   matchQuantityRule,
+  materialNamesOf,
+  matchClassificationRule,
+  elevationOf,
   orderRulesByCost,
   selectIterationSource,
 };

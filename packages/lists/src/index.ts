@@ -12,13 +12,17 @@ export type {
   ColumnDefinition,
   PropertyCondition,
   ConditionOperator,
+  ListClassificationRef,
+  ListGrouping,
+  ListGroup,
+  ListSummary,
   DiscoveredColumns,
   EntityAttribute,
 } from './types.js';
 export { ENTITY_ATTRIBUTES } from './types.js';
 
 // Engine
-export { executeList, listResultToCSV } from './engine.js';
+export { executeList, listResultToCSV, summariseListRows } from './engine.js';
 
 // Column discovery
 export { discoverColumns } from './discovery.js';

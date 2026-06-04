@@ -53,6 +53,38 @@ export interface ListDataProvider {
   getPropertySets(expressId: number): PropertySet[];
   /** Get all quantity sets for an entity (handles on-demand extraction) */
   getQuantitySets(expressId: number): QuantitySet[];
+
+  // ── Optional accessors (added for richer list targeting / columns) ──
+  // Implementers built before these existed keep working: the engine
+  // degrades gracefully when a method is absent (no-class lists resolve
+  // to no rows; material/classification/storey conditions never match).
+
+  /**
+   * All entity express IDs in the model. Used to target a list at every
+   * element regardless of IFC class (when `entityTypes` is empty).
+   */
+  getAllEntityIds?(): number[];
+  /** Material name(s) for the element — top-level material plus any
+   *  layer / constituent / profile / list-member names. */
+  getMaterialNames?(expressId: number): string[];
+  /** Classification references associated with the element. */
+  getClassifications?(expressId: number): ListClassificationRef[];
+  /** Building-storey name the element belongs to, or '' when unplaced. */
+  getStoreyName?(expressId: number): string;
+  /**
+   * Discover EVERY property set / property and quantity set / quantity in
+   * the model — complete and independent of entity-type selection — so the
+   * column picker can offer all data even with no type chosen. Optional:
+   * when absent, callers fall back to the type-sampled `discoverColumns()`.
+   */
+  discoverAllColumns?(): DiscoveredColumns;
+}
+
+/** A classification reference exposed to the list engine (code + name). */
+export interface ListClassificationRef {
+  system?: string;
+  code?: string;
+  name?: string;
 }
 
 // ============================================================================
@@ -69,6 +101,15 @@ export interface ListDefinition {
   /** Which entity types to include */
   entityTypes: IfcTypeEnum[];
 
+  /**
+   * Optional explicit element scope — a snapshot of express IDs per model
+   * (e.g. from a search/filter result), keyed by modelId. When present, the
+   * list targets exactly these elements per model and `entityTypes` is
+   * ignored; `conditions` still apply on top. Keyed by model so federated
+   * snapshots don't over-select when local express IDs collide across files.
+   */
+  expressIdsByModel?: Record<string, number[]>;
+
   /** Optional property-based filter conditions */
   conditions: PropertyCondition[];
 
@@ -77,6 +118,16 @@ export interface ListDefinition {
 
   /** Current sort state */
   sortBy?: { columnId: string; direction: 'asc' | 'desc' };
+
+  /** Optional grouping + summation for the summary view */
+  grouping?: ListGrouping;
+}
+
+export interface ListGrouping {
+  /** Column id to group rows by (e.g. a Type / Material / Storey column). */
+  columnId: string;
+  /** Column ids whose numeric values are summed per group and overall. */
+  sumColumnIds: string[];
 }
 
 // ============================================================================
@@ -84,10 +135,18 @@ export interface ListDefinition {
 // ============================================================================
 
 export interface PropertyCondition {
-  source: 'attribute' | 'property' | 'quantity';
+  /**
+   * Where the compared value comes from:
+   * - `attribute` — a built-in attribute (Name, Class, Description, …)
+   * - `property` / `quantity` — a pset / qto value (uses `psetName`)
+   * - `material` — any of the element's material names (multi-valued)
+   * - `classification` — any classification code or name (multi-valued)
+   * - `spatial` — the element's building-storey name
+   */
+  source: 'attribute' | 'property' | 'quantity' | 'material' | 'classification' | 'spatial';
   /** Property set name (for property/quantity sources) */
   psetName?: string;
-  /** Property name within the set */
+  /** Property name within the set. Ignored for material/classification/spatial. */
   propertyName: string;
   operator: ConditionOperator;
   value: string | number | boolean;
@@ -109,10 +168,14 @@ export type ConditionOperator =
 
 export interface ColumnDefinition {
   id: string;
-  source: 'attribute' | 'property' | 'quantity';
+  /**
+   * Where the column value comes from. `material` / `classification` are
+   * multi-valued (joined with ", "); `spatial` is the element's storey name.
+   */
+  source: 'attribute' | 'property' | 'quantity' | 'material' | 'classification' | 'spatial';
   /** For property: pset name. For quantity: qset name. */
   psetName?: string;
-  /** Attribute name or property/quantity name */
+  /** Attribute name or property/quantity name. Ignored for material/classification/spatial. */
   propertyName: string;
   /** Display label override */
   label?: string;
@@ -129,6 +192,29 @@ export interface ListResult {
   totalCount: number;
   /** Execution time in ms */
   executionTime: number;
+  /** Per-group breakdown — present only when `grouping` is configured. */
+  groups?: ListGroup[];
+  /** Whole-result aggregates (count + per-column sums). Present when
+   *  `grouping` is configured. */
+  summary?: ListSummary;
+}
+
+/** One group in a grouped list result. */
+export interface ListGroup {
+  /** Group-by value, stringified. Empty values group under `label`. */
+  key: string;
+  /** Display label for the group header. */
+  label: string;
+  /** Number of rows in the group. */
+  count: number;
+  /** columnId → summed numeric value, for the configured sum columns. */
+  sums: Record<string, number>;
+}
+
+/** Whole-result aggregates. */
+export interface ListSummary {
+  count: number;
+  sums: Record<string, number>;
 }
 
 export interface ListRow {

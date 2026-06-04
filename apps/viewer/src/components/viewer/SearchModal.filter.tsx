@@ -21,7 +21,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { Play, AlertCircle, Download } from 'lucide-react';
+import { Play, AlertCircle, Download, ListPlus } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { useViewerStore } from '@/store';
 import { toGlobalIdFromModels } from '@/store/globalId';
@@ -37,6 +37,7 @@ import { evaluateFilterRulesFederated } from '@/lib/search/filter-evaluate';
 import { runTier0Scan, type ScanModel } from '@/lib/search/tier0-scan';
 import { queryTier1Indexes, type Tier1Index } from '@/lib/search/tier1-index';
 import { downloadResult } from '@/lib/search/result-export';
+import type { ListDefinition } from '@/lib/lists';
 import { SearchModalFilterBuilder } from './SearchModal.filter.builder';
 
 /** Rows per virtualizer page — tuned for the result table row height. */
@@ -65,6 +66,9 @@ export function SearchModalFilter() {
     setSelectedEntity,
     setSelectedEntityId,
     cameraCallbacks,
+    setPendingListDraft,
+    setListPanelVisible,
+    setSearchModalOpen,
   } = useViewerStore(
     useShallow((s) => ({
       searchFilter: s.searchFilter,
@@ -81,6 +85,9 @@ export function SearchModalFilter() {
       setSelectedEntity: s.setSelectedEntity,
       setSelectedEntityId: s.setSelectedEntityId,
       cameraCallbacks: s.cameraCallbacks,
+      setPendingListDraft: s.setPendingListDraft,
+      setListPanelVisible: s.setListPanelVisible,
+      setSearchModalOpen: s.setSearchModalOpen,
     })),
   );
 
@@ -257,6 +264,52 @@ export function SearchModalFilter() {
     downloadResult(searchFilterResult, format);
   }, [searchFilterResult]);
 
+  /** Freeze the current filter result into a new list — a per-model snapshot
+   *  of the matched express IDs — and open the list builder to configure
+   *  columns. Keyed by model so federated results don't over-select when
+   *  local express IDs collide across files. */
+  const handleCreateList = useCallback(() => {
+    const result = searchFilterResult;
+    if (!result || result.rows.length === 0) return;
+    const idIdx = result.columns.indexOf('express_id');
+    if (idIdx < 0) return;
+    const modelIdx = result.columns.indexOf('model_id'); // only present for multi-model runs
+
+    const byModel: Record<string, number[]> = {};
+    const seen = new Set<string>();
+    for (const row of result.rows) {
+      const id = Number(row[idIdx]);
+      if (!Number.isFinite(id) || id <= 0) continue;
+      const modelId = modelIdx >= 0 && typeof row[modelIdx] === 'string'
+        ? (row[modelIdx] as string)
+        : (activeModelId ?? 'default');
+      const key = `${modelId}:${id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      (byModel[modelId] ??= []).push(id);
+    }
+    const total = Object.values(byModel).reduce((n, ids) => n + ids.length, 0);
+    if (total === 0) return;
+
+    const now = Date.now();
+    const draft: ListDefinition = {
+      id: crypto.randomUUID(),
+      name: 'Filter result',
+      createdAt: now,
+      updatedAt: now,
+      entityTypes: [],
+      expressIdsByModel: byModel,
+      conditions: [],
+      columns: [
+        { id: 'attr-name', source: 'attribute', propertyName: 'Name', label: 'Name' },
+        { id: 'attr-class', source: 'attribute', propertyName: 'Class', label: 'Class' },
+      ],
+    };
+    setPendingListDraft(draft);
+    setListPanelVisible(true);
+    setSearchModalOpen(false);
+  }, [searchFilterResult, activeModelId, setPendingListDraft, setListPanelVisible, setSearchModalOpen]);
+
   if (!activeStore) {
     return (
       <div className="flex flex-1 items-center justify-center p-8 text-center text-sm text-muted-foreground">
@@ -319,6 +372,16 @@ export function SearchModalFilter() {
         )}
 
         <div className="ml-auto flex items-center gap-1.5">
+          <Button
+            variant="ghost"
+            size="sm"
+            disabled={!searchFilterResult || searchFilterResult.rows.length === 0}
+            onClick={handleCreateList}
+            className="h-7 gap-1 text-xs"
+            title="Freeze these results into a new list"
+          >
+            <ListPlus className="h-3 w-3" /> Create list
+          </Button>
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button

@@ -34,12 +34,14 @@ import { useViewerStore } from '@/store';
 import { useIfc } from '@/hooks/useIfc';
 import {
   executeList,
+  summariseListRows,
   LIST_PRESETS,
   importListDefinition,
   exportListDefinition,
   createListDataProvider,
 } from '@/lib/lists';
 import type { ListDefinition, ListResult, ListDataProvider } from '@/lib/lists';
+import type { IfcDataStore } from '@ifc-lite/parser';
 import { ListBuilder } from './ListBuilder';
 import { ListResultsTable } from './ListResultsTable';
 
@@ -64,6 +66,17 @@ export function ListPanel({ onClose }: ListPanelProps) {
   const setActiveListId = useViewerStore((s) => s.setActiveListId);
   const setListResult = useViewerStore((s) => s.setListResult);
   const setListExecuting = useViewerStore((s) => s.setListExecuting);
+  const pendingListDraft = useViewerStore((s) => s.pendingListDraft);
+  const setPendingListDraft = useViewerStore((s) => s.setPendingListDraft);
+
+  // A draft handed off from "Create list" (search filter) opens straight into
+  // the builder for column configuration, then is cleared so it fires once.
+  React.useEffect(() => {
+    if (!pendingListDraft) return;
+    setEditingList(pendingListDraft);
+    setView('builder');
+    setPendingListDraft(null);
+  }, [pendingListDraft, setPendingListDraft]);
 
   const importInputRef = React.useRef<HTMLInputElement>(null);
 
@@ -71,21 +84,22 @@ export function ListPanel({ onClose }: ListPanelProps) {
   // arrays can never drift out of alignment (skipping a model without
   // an ifcDataStore must not shift every later model's provider index).
   const modelProviderPairs = useMemo(() => {
-    const pairs: Array<{ modelId: string; provider: ListDataProvider }> = [];
+    const pairs: Array<{ modelId: string; provider: ListDataProvider; store: IfcDataStore }> = [];
     if (models.size > 0) {
       for (const [modelId, model] of models) {
         // Skip native-metadata models — they don't have a parsed
         // IfcDataStore, so the list provider can't query them.
         if (!model.ifcDataStore) continue;
-        pairs.push({ modelId, provider: createListDataProvider(model.ifcDataStore) });
+        pairs.push({ modelId, provider: createListDataProvider(model.ifcDataStore), store: model.ifcDataStore });
       }
     } else if (ifcDataStore) {
-      pairs.push({ modelId: 'default', provider: createListDataProvider(ifcDataStore) });
+      pairs.push({ modelId: 'default', provider: createListDataProvider(ifcDataStore), store: ifcDataStore });
     }
     return pairs;
   }, [models, ifcDataStore]);
 
   const allProviders = useMemo(() => modelProviderPairs.map((p) => p.provider), [modelProviderPairs]);
+  const allStores = useMemo(() => modelProviderPairs.map((p) => p.store), [modelProviderPairs]);
 
   const hasData = allProviders.length > 0;
 
@@ -107,11 +121,17 @@ export function ListPanel({ onClose }: ListPanelProps) {
         const allRows = resultParts.flatMap(r => r.rows);
         const totalTime = resultParts.reduce((sum, r) => sum + r.executionTime, 0);
 
+        // Re-derive groups/summary over the merged rows so grouping works
+        // across federated models (and isn't dropped on the merge).
+        const { groups, summary } = summariseListRows(definition, allRows);
+
         setListResult({
           columns: definition.columns,
           rows: allRows,
           totalCount: allRows.length,
           executionTime: totalTime,
+          groups,
+          summary,
         });
         setView('results');
       } catch (err) {
@@ -251,6 +271,7 @@ export function ListPanel({ onClose }: ListPanelProps) {
       {view === 'builder' && hasData && (
         <ListBuilder
           providers={allProviders}
+          stores={allStores}
           initial={editingList}
           onSave={handleSaveList}
           onCancel={() => setView('library')}
