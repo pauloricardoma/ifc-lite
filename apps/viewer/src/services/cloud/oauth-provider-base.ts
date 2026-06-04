@@ -49,7 +49,8 @@ export abstract class OAuthCloudProvider implements CloudProvider {
   isConnected(): boolean {
     try {
       return localStorage.getItem(this.connectedFlag) === '1';
-    } catch {
+    } catch (err) {
+      console.warn(`[${this.id}] could not read connection flag:`, err);
       return false;
     }
   }
@@ -156,6 +157,20 @@ export abstract class OAuthCloudProvider implements CloudProvider {
     this.invalidateToken();
     this.setConnected(false);
     return new CloudNotConnectedError(this.id);
+  }
+}
+
+/**
+ * Read a response body for error diagnostics. Unlike a bare `.catch(() => '')`,
+ * this logs (rather than silently swallows) a body-read failure before falling
+ * back to an empty string, per the repo's catch-must-log rule.
+ */
+export async function readErrorBody(res: Response, providerId: string): Promise<string> {
+  try {
+    return await res.text();
+  } catch (err) {
+    console.warn(`[${providerId}] failed to read error response body:`, err);
+    return '';
   }
 }
 

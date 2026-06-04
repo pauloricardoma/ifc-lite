@@ -174,8 +174,16 @@ export function parseCookies(header: string | null): Record<string, string> {
     const eq = part.indexOf('=');
     if (eq === -1) continue;
     const name = part.slice(0, eq).trim();
-    const value = part.slice(eq + 1).trim();
-    if (name) out[name] = decodeURIComponent(value);
+    if (!name) continue;
+    const raw = part.slice(eq + 1).trim();
+    // Untrusted client input: a malformed percent-encoding (e.g. `%zz`) makes
+    // decodeURIComponent throw, which must not crash the whole request — fall
+    // back to the raw value for that one cookie.
+    try {
+      out[name] = decodeURIComponent(raw);
+    } catch {
+      out[name] = raw;
+    }
   }
   return out;
 }

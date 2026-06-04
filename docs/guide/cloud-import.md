@@ -6,7 +6,7 @@ today that's **Dropbox**, **Google Drive**, and **OneDrive** (Microsoft Graph).
 
 ## How it works
 
-```
+```text
 Browser ──"Connect"──▶ /api/<provider>/auth-start ──▶ provider consent (popup)
        ◀── refresh-token cookie (httpOnly) ── /api/<provider>/auth-callback
 Browser ──POST──▶ /api/<provider>/token ──▶ short-lived access token (in memory)

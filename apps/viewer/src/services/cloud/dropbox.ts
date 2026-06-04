@@ -13,7 +13,7 @@ import {
   type CloudFileEntry,
   isSupportedCloudFile,
 } from './types.js';
-import { OAuthCloudProvider, readBodyWithProgress } from './oauth-provider-base.js';
+import { OAuthCloudProvider, readBodyWithProgress, readErrorBody } from './oauth-provider-base.js';
 
 const LIST_FOLDER_URL = 'https://api.dropboxapi.com/2/files/list_folder';
 const LIST_FOLDER_CONTINUE_URL = 'https://api.dropboxapi.com/2/files/list_folder/continue';
@@ -77,7 +77,7 @@ export class DropboxProvider extends OAuthCloudProvider {
   ): Promise<{ entries: DropboxMetadata[]; has_more: boolean; cursor?: string }> {
     if (res.status === 401) throw this.notConnected();
     if (!res.ok) {
-      const detail = await res.text().catch(() => '');
+      const detail = await readErrorBody(res, this.id);
       throw new Error(`Dropbox list_folder failed (${res.status}): ${detail}`);
     }
     const data = (await res.json()) as { entries: DropboxMetadata[]; has_more: boolean; cursor: string };
@@ -110,7 +110,7 @@ export class DropboxProvider extends OAuthCloudProvider {
     });
     if (res.status === 401) throw this.notConnected();
     if (!res.ok) {
-      const detail = await res.text().catch(() => '');
+      const detail = await readErrorBody(res, this.id);
       throw new Error(`Dropbox download failed (${res.status}): ${detail}`);
     }
 

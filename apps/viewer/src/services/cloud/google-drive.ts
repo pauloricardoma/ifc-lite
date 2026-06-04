@@ -17,7 +17,7 @@ import {
   type CloudFileEntry,
   isSupportedCloudFile,
 } from './types.js';
-import { OAuthCloudProvider, readBodyWithProgress } from './oauth-provider-base.js';
+import { OAuthCloudProvider, readBodyWithProgress, readErrorBody } from './oauth-provider-base.js';
 
 const FILES_URL = 'https://www.googleapis.com/drive/v3/files';
 const FOLDER_MIME = 'application/vnd.google-apps.folder';
@@ -54,7 +54,7 @@ export class GoogleDriveProvider extends OAuthCloudProvider {
       const res = await fetch(url.toString(), { headers: { Authorization: `Bearer ${accessToken}` } });
       if (res.status === 401) throw this.notConnected();
       if (!res.ok) {
-        const detail = await res.text().catch(() => '');
+        const detail = await readErrorBody(res, this.id);
         throw new Error(`Google Drive list failed (${res.status}): ${detail}`);
       }
       const data = (await res.json()) as { files?: DriveFile[]; nextPageToken?: string };
@@ -93,7 +93,7 @@ export class GoogleDriveProvider extends OAuthCloudProvider {
     const res = await fetch(url.toString(), { headers: { Authorization: `Bearer ${accessToken}` } });
     if (res.status === 401) throw this.notConnected();
     if (!res.ok) {
-      const detail = await res.text().catch(() => '');
+      const detail = await readErrorBody(res, this.id);
       throw new Error(`Google Drive download failed (${res.status}): ${detail}`);
     }
 

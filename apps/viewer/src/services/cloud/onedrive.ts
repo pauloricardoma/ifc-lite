@@ -22,7 +22,7 @@ import {
   type CloudFileEntry,
   isSupportedCloudFile,
 } from './types.js';
-import { OAuthCloudProvider, readBodyWithProgress } from './oauth-provider-base.js';
+import { OAuthCloudProvider, readBodyWithProgress, readErrorBody } from './oauth-provider-base.js';
 
 const GRAPH = 'https://graph.microsoft.com/v1.0';
 const SELECT = '$select=id,name,size,folder,file,lastModifiedDateTime';
@@ -56,7 +56,7 @@ export class OneDriveProvider extends OAuthCloudProvider {
       const res: Response = await fetch(next, { headers: { Authorization: `Bearer ${accessToken}` } });
       if (res.status === 401) throw this.notConnected();
       if (!res.ok) {
-        const detail = await res.text().catch(() => '');
+        const detail = await readErrorBody(res, this.id);
         throw new Error(`OneDrive list failed (${res.status}): ${detail}`);
       }
       const data = (await res.json()) as GraphChildren;
@@ -95,7 +95,7 @@ export class OneDriveProvider extends OAuthCloudProvider {
     });
     if (res.status === 401) throw this.notConnected();
     if (!res.ok) {
-      const detail = await res.text().catch(() => '');
+      const detail = await readErrorBody(res, this.id);
       throw new Error(`OneDrive download failed (${res.status}): ${detail}`);
     }
 
