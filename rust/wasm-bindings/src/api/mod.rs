@@ -67,6 +67,22 @@ pub struct IfcAPI {
     /// flag value).
     cached_parts_to_skip: std::sync::Mutex<Option<std::sync::Arc<rustc_hash::FxHashSet<u32>>>>,
 
+    /// Lazily-built set of `IfcRepresentationMap` ids that an `IfcMappedItem`
+    /// instantiates (issue #957). `processGeometryBatch` uses it to decide which
+    /// of a type's RepresentationMaps are orphan and should be rendered directly
+    /// (the rest are drawn through their occurrence). Built once per worker on
+    /// the first type-product job and cleared by `clearPrePassCache`.
+    cached_referenced_repmaps:
+        std::sync::Mutex<Option<std::sync::Arc<rustc_hash::FxHashSet<u32>>>>,
+
+    /// Lazily-built surface-texture index keyed by face-set id (issue #961):
+    /// decoded RGBA images + per-triangle UV maps from
+    /// `IfcIndexedTriangleTextureMap`. Built once per worker (cheap substring
+    /// bail-out for untextured files) and cleared by `clearPrePassCache`.
+    cached_texture_index: std::sync::Mutex<
+        Option<std::sync::Arc<rustc_hash::FxHashMap<u32, ifc_lite_geometry::ResolvedTextureMap>>>,
+    >,
+
     /// Lazily-built `IfcIndexedColourMap` index keyed by target geometry id,
     /// used by `processGeometryBatch` to split a tessellated face set into one
     /// sub-mesh per palette group (issue #858). The browser geometry path lost
@@ -91,6 +107,8 @@ impl IfcAPI {
             cached_entity_index: std::sync::Mutex::new(None),
             merge_layers: std::sync::atomic::AtomicBool::new(false),
             cached_parts_to_skip: std::sync::Mutex::new(None),
+            cached_referenced_repmaps: std::sync::Mutex::new(None),
+            cached_texture_index: std::sync::Mutex::new(None),
             cached_indexed_colour_maps: std::sync::Mutex::new(None),
         }
     }
@@ -124,6 +142,19 @@ impl IfcAPI {
             .lock()
             .expect("ifc-lite cached_parts_to_skip Mutex poisoned");
         parts_slot.take();
+        // The referenced-RepresentationMap set is keyed off the previous load's
+        // content; drop it so the next file rebuilds against fresh content.
+        let mut repmap_slot = self
+            .cached_referenced_repmaps
+            .lock()
+            .expect("ifc-lite cached_referenced_repmaps Mutex poisoned");
+        repmap_slot.take();
+        // The texture index is keyed off the previous load's content; drop it.
+        let mut texture_slot = self
+            .cached_texture_index
+            .lock()
+            .expect("ifc-lite cached_texture_index Mutex poisoned");
+        texture_slot.take();
         // The indexed-colour-map index is also keyed off the previous load's
         // content; drop it so the next file rebuilds against fresh content.
         let mut icm_slot = self
@@ -171,6 +202,29 @@ impl IfcAPI {
             .lock()
             .expect("ifc-lite cached_entity_index Mutex poisoned");
         *slot = Some(std::sync::Arc::new(index));
+        drop(slot);
+
+        // Swapping the entity index means a different file. The other caches are
+        // content-scoped (keyed off the previous load) — carrying them into the
+        // next file would wrongly suppress/keep orphan type geometry, reuse a
+        // stale texture index, or skip the wrong parts. Drop them so they
+        // rebuild against the new content (#962 review). Mirrors clearPrePassCache.
+        self.cached_parts_to_skip
+            .lock()
+            .expect("ifc-lite cached_parts_to_skip Mutex poisoned")
+            .take();
+        self.cached_referenced_repmaps
+            .lock()
+            .expect("ifc-lite cached_referenced_repmaps Mutex poisoned")
+            .take();
+        self.cached_texture_index
+            .lock()
+            .expect("ifc-lite cached_texture_index Mutex poisoned")
+            .take();
+        self.cached_indexed_colour_maps
+            .lock()
+            .expect("ifc-lite cached_indexed_colour_maps Mutex poisoned")
+            .take();
     }
 
     /// Get WASM memory for zero-copy access
@@ -253,6 +307,65 @@ impl IfcAPI {
             .cached_parts_to_skip
             .lock()
             .expect("ifc-lite cached_parts_to_skip Mutex poisoned");
+        *slot = Some(std::sync::Arc::clone(&arc));
+        arc
+    }
+
+    /// Get or lazily build the set of `IfcRepresentationMap` ids instantiated by
+    /// an `IfcMappedItem` (issue #957). `processGeometryBatch` uses it to render
+    /// only the ORPHAN RepresentationMaps of a type-product (the rest are drawn
+    /// through their occurrence). Cached per worker so the scan is paid once.
+    pub(crate) fn get_or_build_referenced_repmaps(
+        &self,
+        content: &str,
+        decoder: &mut ifc_lite_core::EntityDecoder,
+    ) -> std::sync::Arc<rustc_hash::FxHashSet<u32>> {
+        {
+            let slot = self
+                .cached_referenced_repmaps
+                .lock()
+                .expect("ifc-lite cached_referenced_repmaps Mutex poisoned");
+            if let Some(existing) = slot.as_ref() {
+                return std::sync::Arc::clone(existing);
+            }
+        }
+
+        let referenced = styling::build_referenced_representation_maps(content, decoder);
+
+        let arc = std::sync::Arc::new(referenced);
+        let mut slot = self
+            .cached_referenced_repmaps
+            .lock()
+            .expect("ifc-lite cached_referenced_repmaps Mutex poisoned");
+        *slot = Some(std::sync::Arc::clone(&arc));
+        arc
+    }
+
+    /// Get or lazily build the surface-texture index keyed by face-set id
+    /// (issue #961): decoded RGBA images + per-triangle UV maps. Cached per
+    /// worker; `build_texture_index` bails out cheaply on untextured files.
+    pub(crate) fn get_or_build_texture_index(
+        &self,
+        content: &str,
+        decoder: &mut ifc_lite_core::EntityDecoder,
+    ) -> std::sync::Arc<rustc_hash::FxHashMap<u32, ifc_lite_geometry::ResolvedTextureMap>> {
+        {
+            let slot = self
+                .cached_texture_index
+                .lock()
+                .expect("ifc-lite cached_texture_index Mutex poisoned");
+            if let Some(existing) = slot.as_ref() {
+                return std::sync::Arc::clone(existing);
+            }
+        }
+
+        let index = ifc_lite_geometry::build_texture_index(content, decoder);
+
+        let arc = std::sync::Arc::new(index);
+        let mut slot = self
+            .cached_texture_index
+            .lock()
+            .expect("ifc-lite cached_texture_index Mutex poisoned");
         *slot = Some(std::sync::Arc::clone(&arc));
         arc
     }

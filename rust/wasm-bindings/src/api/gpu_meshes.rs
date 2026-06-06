@@ -278,6 +278,16 @@ impl IfcAPI {
         drop(slot);
         let mut decoder = EntityDecoder::with_arc_index(content, entity_index);
 
+        // #957: orphan IfcTypeProduct geometry (type RepresentationMaps, no
+        // occurrence) — keep the fast prepass consistent with the once/streaming
+        // paths so type-only models (annex-E) also render on the worker fast
+        // path. The helper is guarded by a cheap `IFCREPRESENTATIONMAP`
+        // substring check, so files without type geometry pay almost nothing.
+        complex_jobs.extend(super::styling::collect_orphan_type_geometry_jobs(
+            content,
+            &mut decoder,
+        ));
+
         let unit_scale = project_id
             .and_then(|pid| ifc_lite_core::extract_length_unit_scale(&mut decoder, pid).ok())
             .unwrap_or(1.0);
@@ -864,6 +874,25 @@ impl IfcAPI {
         super::set_js_prop(&index_event, "lengths", &lengths_arr);
         on_event.call1(&JsValue::NULL, &index_event.into())?;
 
+        // #957: emit orphan IfcTypeProduct geometry as a final jobs chunk so the
+        // browser renders annex-E type-only "tessellated shape with style" files
+        // (geometry on the type via RepresentationMaps, no occurrence). The
+        // entity index is complete here, so this resolves cleanly.
+        //
+        // PERF (flagged, #962 review): for files WITH representation maps this is
+        // a second linear EntityScanner pass over `content` on top of the
+        // streaming scan above. A `IFCREPRESENTATIONMAP` substring guard inside
+        // the helper makes the ~all-files-without-type-geometry case free (just a
+        // SIMD memmem). The remaining instanced-file cost is a tracked follow-up:
+        // fold the mapped-item-source + type-candidate collection into the
+        // streaming scan loop so orphans resolve with no extra pass. Kept as a
+        // separate pass for now to avoid destabilising the streaming hot path.
+        let type_jobs = super::styling::collect_orphan_type_geometry_jobs(content, &mut decoder);
+        if !type_jobs.is_empty() {
+            total_jobs += type_jobs.len() as u32;
+            emit_jobs_chunk(on_event, &type_jobs)?;
+        }
+
         // Complete event.
         let done = js_sys::Object::new();
         super::set_js_prop(&done, "type", &"complete".into());
@@ -1038,6 +1067,79 @@ impl IfcAPI {
                 }
 
                 let ifc_type = entity.ifc_type;
+
+                // #957: orphan type-product geometry — an IfcXxxType carrying its
+                // own RepresentationMaps with no occurrence to instantiate them
+                // (buildingSMART annex-E "tessellated shape with style" files).
+                // Render each RepresentationMap NOT referenced by an IfcMappedItem
+                // (the referenced ones draw through their occurrence — no double
+                // render).
+                if ifc_type.is_subtype_of(ifc_lite_core::IfcType::IfcTypeProduct) {
+                    let rep_map_ids: Vec<u32> = entity
+                        .get(6)
+                        .and_then(|a| a.as_list())
+                        .map(|list| list.iter().filter_map(|v| v.as_entity_ref()).collect())
+                        .unwrap_or_default();
+                    if !rep_map_ids.is_empty() {
+                        let referenced =
+                            self.get_or_build_referenced_repmaps(content, &mut decoder);
+                        // Surface textures + UV maps (#961), built once per worker.
+                        let texture_index = self.get_or_build_texture_index(content, &mut decoder);
+                        for rm_id in rep_map_ids {
+                            if referenced.contains(&rm_id) {
+                                continue;
+                            }
+                            let Ok(rep_map) = decoder.decode_by_id(rm_id) else {
+                                continue;
+                            };
+                            // One part per output mesh: each textured face set
+                            // carries its own image; untextured items merge (#961).
+                            let Ok(parts) = router.process_representation_map_with_texture(
+                                &rep_map,
+                                &mut decoder,
+                                &texture_index,
+                            ) else {
+                                continue;
+                            };
+                            if parts.is_empty() {
+                                continue;
+                            }
+                            let color = super::styling::color_for_representation_map(
+                                rm_id,
+                                &geometry_styles,
+                                &mut decoder,
+                            )
+                            .unwrap_or_else(|| default_color_for_type(ifc_type).to_array());
+                            let ifc_type_name = type_name_cache
+                                .entry(ifc_type)
+                                .or_insert_with(|| ifc_type.name().to_string())
+                                .clone();
+                            for (mut mesh, uvs, texture) in parts {
+                                if mesh.is_empty() {
+                                    continue;
+                                }
+                                if mesh.normals.len() != mesh.positions.len() {
+                                    calculate_normals(&mut mesh);
+                                }
+                                let mut mesh_js =
+                                    MeshDataJs::new(id, ifc_type_name.clone(), mesh, color);
+                                if let Some(tex) = texture {
+                                    mesh_js.set_texture(
+                                        uvs,
+                                        tex.rgba,
+                                        tex.width,
+                                        tex.height,
+                                        tex.repeat_s,
+                                        tex.repeat_t,
+                                    );
+                                }
+                                mesh_collection.add(mesh_js);
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 let has_openings = void_index.contains_key(&id);
 
                 if has_openings {
