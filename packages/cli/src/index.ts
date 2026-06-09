@@ -34,6 +34,8 @@ import { analyzeCommand } from './commands/analyze.js';
 import { lodCommand } from './commands/lod.js';
 import { mcpCommand } from './commands/mcp.js';
 import { extCommand } from './commands/ext.js';
+import { layerCommand } from './commands/layer.js';
+import { refCommand } from './commands/ref.js';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -84,6 +86,8 @@ const HELP = `
     lod       <file.ifc> --level 0|1            Generate lightweight LOD artifacts
     mcp       <file.ifc> [--transport stdio|http] Start an MCP server bound to one or more IFC files
     ext       validate <path>|init <dir>          Manage IFClite extensions (Phase 0 — validate, init)
+    layer     <publish|diff|merge|log|bake|...>    Layered change tracking over a local store (.ifc-lite/)
+    ref       <list|create|move|protect>           Manage named refs in the layer store
 
   Options:
     --help, -h       Show help
@@ -147,6 +151,11 @@ const HELP = `
     ifc-lite mcp model.ifc --read-only
     ifc-lite mcp arch.ifc struct.ifc --federate
     ifc-lite mcp model.ifc --transport http --port 8765 --token abc
+    ifc-lite ref create main
+    ifc-lite layer publish delta.ifcx --base main --intent "Set fire ratings" --scope "model.mutate:Pset_FireSafety*@IfcWall"
+    ifc-lite layer merge blake3:abc123 --into main --preview
+    ifc-lite layer log main
+    ifc-lite layer bake main -o flat.ifcx
 
   Pipe-friendly:
     ifc-lite query model.ifc --type IfcWall --json | jq '.[].name'
@@ -251,6 +260,12 @@ async function main(): Promise<void> {
       break;
     case 'ext':
       await extCommand(commandArgs);
+      break;
+    case 'layer':
+      await layerCommand(commandArgs);
+      break;
+    case 'ref':
+      await refCommand(commandArgs);
       break;
     default:
       process.stderr.write(`Unknown command: ${command}\n`);
