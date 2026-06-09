@@ -1,7 +1,7 @@
 {
-  "name": "@ifc-lite/ifcx",
-  "version": "2.1.3",
-  "description": "IFC5 (IFCX) parser for IFC-Lite",
+  "name": "@ifc-lite/merge",
+  "version": "0.1.0",
+  "description": "Three-way merge engine for IFCX layers — MergePlan with auto-merged ops and explicit conflict records, merge-layer emission, rebase, and revert.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -12,34 +12,34 @@
     }
   },
   "scripts": {
-    "build": "pnpm exec tsc && node ./scripts/verify-dist-hello-wall.mjs",
+    "build": "pnpm exec tsc",
     "dev": "pnpm exec tsc --watch",
-    "test": "tsx --test src/*.test.ts"
+    "test": "vitest run"
   },
   "dependencies": {
-    "@ifc-lite/data": "workspace:^",
-    "@ifc-lite/mutations": "workspace:^",
-    "@ifc-lite/pointcloud": "workspace:^",
-    "@noble/hashes": "^2.2.0"
+    "@ifc-lite/diff": "workspace:^",
+    "@ifc-lite/ifcx": "workspace:^"
   },
   "devDependencies": {
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.0"
   },
   "license": "MPL-2.0",
   "author": "Louis True",
   "repository": {
     "type": "git",
     "url": "https://github.com/LTplus-AG/ifc-lite.git",
-    "directory": "packages/ifcx"
+    "directory": "packages/merge"
   },
   "homepage": "https://ltplus-ag.github.io/ifc-lite/",
   "bugs": "https://github.com/LTplus-AG/ifc-lite/issues",
   "keywords": [
     "ifc",
-    "ifc5",
     "ifcx",
     "bim",
-    "parser",
+    "merge",
+    "three-way",
+    "layers",
     "aec"
   ],
   "publishConfig": {

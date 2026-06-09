@@ -28,6 +28,21 @@ function geometryEqual(a: GeometryHash | undefined, b: GeometryHash | undefined)
   return String(a) === String(b);
 }
 
+/** Union of component keys whose sub-hash differs (one-sided keys count). */
+function changedComponentKeys(
+  base: Record<string, string>,
+  head: Record<string, string>,
+): string[] {
+  const changed: string[] = [];
+  for (const key of Object.keys(base)) {
+    if (base[key] !== head[key]) changed.push(key);
+  }
+  for (const key of Object.keys(head)) {
+    if (!(key in base)) changed.push(key);
+  }
+  return changed.sort();
+}
+
 function indexByKey<TRef>(
   entities: Iterable<EntityFingerprint<TRef>>,
 ): Map<string, EntityFingerprint<TRef>> {
@@ -97,13 +112,17 @@ export function diffModels<TRef = unknown>(
       changeKinds.push('geometry');
     }
 
-    push({
+    const entry: DiffEntry<TRef> = {
       key,
       state: changeKinds.length > 0 ? 'modified' : 'unchanged',
       changeKinds,
       base: baseEntity,
       head: headEntity,
-    });
+    };
+    if (baseEntity.components && headEntity.components) {
+      entry.changedComponents = changedComponentKeys(baseEntity.components, headEntity.components);
+    }
+    push(entry);
   }
 
   // Added: keys only in head.

@@ -38,6 +38,33 @@ import {
 // Re-export types
 export * from './types.js';
 export { composeIfcx, findRoots, getDescendants } from './composition.js';
+export { applyTombstones, isTombstoned } from './tombstones.js';
+export { bakeLayers, type BakeOptions } from './bake.js';
+export {
+  canonicalStringify,
+  canonicalizeLayer,
+  computeLayerId,
+  computeStackHash,
+  blake3Digest,
+} from './canonical.js';
+export {
+  PROVENANCE_VERSION,
+  createProvenanceManifest,
+  getProvenance,
+  setProvenance,
+  validateProvenance,
+  type AuthorKind,
+  type ProvenanceAuthor,
+  type ProvenanceBase,
+  type ProvenanceCheck,
+  type ProvenanceInit,
+  type ProvenanceManifest,
+  type ProvenanceSignature,
+  type IdentityMapEntry,
+  type MergeRecord,
+  type MergeResolution,
+  type WaivedCheck,
+} from './provenance.js';
 export { extractEntities } from './entity-extractor.js';
 export { extractProperties, isQuantityProperty } from './property-extractor.js';
 export { extractGeometry, type MeshData } from './geometry-extractor.js';

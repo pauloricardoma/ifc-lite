@@ -18,6 +18,7 @@ import type { IfcxFile, IfcxNode, ComposedNode } from './types.js';
 import type { IfcxLayer } from './layer-stack.js';
 import { LayerStack } from './layer-stack.js';
 import { PathIndex, parsePath } from './path-resolver.js';
+import { applyTombstones } from './tombstones.js';
 
 /**
  * Options for federated composition.
@@ -167,6 +168,12 @@ export function composeFederated(
   }
 
   onProgress?.('tree', 100);
+
+  // Phase 4: Apply deletion overlays. Attribute merging already resolved
+  // the strongest `ifclite::deleted` opinion per path; here tombstoned
+  // nodes and their subtrees are removed (stronger layers can resurrect
+  // with `ifclite::deleted: false`).
+  applyTombstones(composed);
 
   // Find roots
   const roots = findRoots(composed);

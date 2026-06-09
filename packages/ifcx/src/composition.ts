@@ -8,6 +8,7 @@
  */
 
 import type { IfcxFile, IfcxNode, ComposedNode } from './types.js';
+import { applyTombstones } from './tombstones.js';
 
 interface PreComposedNode {
   path: string;
@@ -24,6 +25,8 @@ interface PreComposedNode {
  * 2. Merge attributes (later wins - layer semantics)
  * 3. Resolve inherits references (type-level data)
  * 4. Build parent-child tree from children references
+ * 5. Apply tombstones: nodes whose strongest `ifclite::deleted` opinion is
+ *    true are removed together with their subtrees (see tombstones.ts)
  */
 export function composeIfcx(file: IfcxFile): Map<string, ComposedNode> {
   // Phase 1: Group nodes by path
@@ -48,7 +51,8 @@ export function composeIfcx(file: IfcxFile): Map<string, ComposedNode> {
     }
   }
 
-  return composed;
+  // Phase 4: Apply deletion overlays
+  return applyTombstones(composed);
 }
 
 /**

@@ -125,6 +125,29 @@ export const ATTR = {
 } as const;
 
 // ============================================================================
+// IFClite Layer Extension Namespace (`ifclite::`)
+// ============================================================================
+
+/**
+ * IFClite extension attributes for layered change tracking
+ * (docs/architecture/layer-prs/). Tools unaware of the namespace ignore
+ * these and still get valid IFCX composition (modulo deletion overlays,
+ * which `bakeLayers` can materialize away for foreign tools).
+ */
+export const IFCLITE_ATTR = {
+  /**
+   * Tombstone opinion: `true` deletes the entity (and shadows all weaker
+   * opinions for the path, including child paths); `false` resurrects it.
+   */
+  DELETED: 'ifclite::deleted',
+  /** Marks derived (cache) content excluded from canonical hashing. */
+  DERIVED: 'ifclite::derived',
+} as const;
+
+/** Header key carrying the provenance manifest (see provenance.ts). */
+export const PROVENANCE_KEY = 'ifclite::provenance';
+
+// ============================================================================
 // USD Geometry Types
 // ============================================================================
 
