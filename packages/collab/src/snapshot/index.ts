@@ -19,6 +19,11 @@ export {
   type ExtractMinimalLayerOptions,
 } from './minimal-layer.js';
 export {
+  publishLayer,
+  type PublishLayerOptions,
+  type PublishedLayer,
+} from './publish-layer.js';
+export {
   runSnapshotWorker,
   type WorkerRequest,
   type WorkerResponse,

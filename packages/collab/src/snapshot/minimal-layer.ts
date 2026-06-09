@@ -18,12 +18,20 @@
  *
  * Strategy: reconstruct a "before" Y.Doc from the baseline state,
  * compare entity-by-entity with the live doc, and emit IFCX nodes
- * containing only the diff. We deliberately don't try to express
- * deletions in the layer — IFCX overlay semantics are additive in
- * v0.x, and deletion overlays are spec'd for a future version.
+ * containing only the diff.
+ *
+ * Deletions are expressed as overlays (layer-prs spec 02 §2.3):
+ *   - a deleted entity emits a tombstone opinion
+ *     `{ "ifclite::deleted": true }` which shadows weaker opinions for
+ *     the path (and its children) during composition;
+ *   - removed children / inherits emit `null` values (standard IFCX
+ *     removal semantics);
+ *   - removed attributes emit `null` values (the convention the merge
+ *     engine and `bakeLayers` resolve).
  */
 
 import type { IfcxFile, IfcxNode } from '@ifc-lite/ifcx';
+import { IFCLITE_ATTR } from '@ifc-lite/ifcx';
 import * as Y from 'yjs';
 import { createCollabDoc, entitiesMap } from '../doc/schema.js';
 import { entityToJSON } from '../doc/entity.js';
@@ -38,6 +46,12 @@ export interface ExtractMinimalLayerOptions {
    * that didn't exist in the baseline at all.
    */
   includeUpdatedValues?: boolean;
+  /**
+   * If true (default), express deletions since the baseline as
+   * tombstone opinions (`ifclite::deleted`) and `null` removals. Set to
+   * false for the legacy additive-only layer shape.
+   */
+  includeDeletions?: boolean;
 }
 
 /**
@@ -51,6 +65,7 @@ export function extractMinimalLayer(
   options: ExtractMinimalLayerOptions = {},
 ): IfcxFile {
   const includeUpdatedValues = options.includeUpdatedValues ?? true;
+  const includeDeletions = options.includeDeletions ?? true;
   // Reconstruct the "before" state by replaying the baseline update on
   // a fresh doc.
   const before = createCollabDoc({ gc: false });
@@ -83,7 +98,7 @@ export function extractMinimalLayer(
     let dirty = false;
 
     // Attributes: include keys that are new OR (when configured)
-    // whose value changed.
+    // whose value changed; removed keys emit null.
     const addedAttrs: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(liveJson.attributes)) {
       const wasInBaseline = key in beforeJson.attributes;
@@ -95,17 +110,27 @@ export function extractMinimalLayer(
         addedAttrs[key] = value;
       }
     }
+    if (includeDeletions) {
+      for (const key of Object.keys(beforeJson.attributes)) {
+        if (!(key in liveJson.attributes)) addedAttrs[key] = null;
+      }
+    }
     if (Object.keys(addedAttrs).length > 0) {
       node.attributes = addedAttrs;
       dirty = true;
     }
 
-    // Children: same rule.
-    const addedChildren: Record<string, string> = {};
+    // Children: same rule; removed roles emit null (IFCX removal).
+    const addedChildren: Record<string, string | null> = {};
     for (const [role, child] of Object.entries(liveJson.children)) {
       const wasInBaseline = role in beforeJson.children;
       if (!wasInBaseline || (includeUpdatedValues && beforeJson.children[role] !== child)) {
         addedChildren[role] = child;
+      }
+    }
+    if (includeDeletions) {
+      for (const role of Object.keys(beforeJson.children)) {
+        if (!(role in liveJson.children)) addedChildren[role] = null;
       }
     }
     if (Object.keys(addedChildren).length > 0) {
@@ -114,11 +139,16 @@ export function extractMinimalLayer(
     }
 
     // Inherits: same rule.
-    const addedInherits: Record<string, string> = {};
+    const addedInherits: Record<string, string | null> = {};
     for (const [role, inh] of Object.entries(liveJson.inherits)) {
       const wasInBaseline = role in beforeJson.inherits;
       if (!wasInBaseline || (includeUpdatedValues && beforeJson.inherits[role] !== inh)) {
         addedInherits[role] = inh;
+      }
+    }
+    if (includeDeletions) {
+      for (const role of Object.keys(beforeJson.inherits)) {
+        if (!(role in liveJson.inherits)) addedInherits[role] = null;
       }
     }
     if (Object.keys(addedInherits).length > 0) {
@@ -128,6 +158,16 @@ export function extractMinimalLayer(
 
     if (dirty) diffNodes.push(node);
   });
+
+  // Entities deleted since the baseline: tombstone opinions that shadow
+  // the entity (and its subtree) when the stack composes.
+  if (includeDeletions) {
+    beforeEnts.forEach((_entUntyped, path) => {
+      if (!liveEnts.has(path)) {
+        diffNodes.push({ path, attributes: { [IFCLITE_ATTR.DELETED]: true } });
+      }
+    });
+  }
 
   before.destroy();
 
