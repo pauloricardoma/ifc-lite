@@ -41,6 +41,7 @@ import {
   type LayerStore,
 } from './layer-store.js';
 import { resolveAncestor } from './layer-merge.js';
+import { deriveScopeOps, verifyScopeClaims, type DerivedScopeOp } from './layer-publish.js';
 
 // ---------------------------------------------------------------------------
 // log
@@ -256,7 +257,14 @@ export async function layerRevertCommand(args: string[]): Promise<void> {
 
 export type RebaseOutcome =
   | { status: 'conflicts'; conflicts: MergeConflict[] }
-  | { status: 'rebased'; layerId: string; file: IfcxFile };
+  | {
+      status: 'rebased';
+      layerId: string;
+      file: IfcxFile;
+      /** Carried claims re-verified against the rebased writes (07 §7.2). */
+      scopeVerified: boolean;
+      violations: DerivedScopeOp[];
+    };
 
 /** Re-plan a candidate onto a ref's current stack and publish the result. */
 export function rebaseLayerOnto(
@@ -302,11 +310,18 @@ export function rebaseLayerOnto(
     schemas: {},
     data: opsToNodes([...plan.autoOps, ...applied.ops]),
   };
+  // Carried claims must be re-verified against the rebased writes and the
+  // new base — rebasing can change which entities the ops touch, so a
+  // claim that covered the original delta may no longer cover this one.
+  // Mismatch is flagged, never silently accepted (07 §7.2).
+  const scopeOps = deriveScopeOps(bare, newBase);
+  const { verified, violations } = verifyScopeClaims(manifestOut.scope_claim, scopeOps);
+
   const withManifest = setProvenance(bare, manifestOut);
   const newId = computeLayerId(withManifest);
   const file: IfcxFile = { ...withManifest, header: { ...withManifest.header, id: newId } };
   storeLayer(store, file);
-  return { status: 'rebased', layerId: newId, file };
+  return { status: 'rebased', layerId: newId, file, scopeVerified: verified, violations };
 }
 
 export async function layerRebaseCommand(args: string[]): Promise<void> {
@@ -333,8 +348,16 @@ export async function layerRebaseCommand(args: string[]): Promise<void> {
     process.exit(2);
     return;
   }
-  if (json) printJson({ status: 'rebased', id: outcome.layerId });
-  else {
+  if (!outcome.scopeVerified) {
+    process.stderr.write('Warning: scope claim mismatch — rebased ops outside the declared claims:\n');
+    for (const op of outcome.violations) {
+      const type = op.ifcType ? ` (${op.ifcType})` : '';
+      process.stderr.write(`  ${op.path}: ${op.capability}${type}\n`);
+    }
+  }
+  if (json) {
+    printJson({ status: 'rebased', id: outcome.layerId, scope_verified: outcome.scopeVerified });
+  } else {
     process.stdout.write(`${outcome.layerId}\n`);
     process.stderr.write(`Rebased ${shortId(layerId)} onto ${ontoRef}\n`);
   }

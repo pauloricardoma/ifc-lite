@@ -81,11 +81,12 @@ export function createLayerWorkspace(): LayerWorkspace {
   };
 }
 
+// TODO(remove-by: registry phase L5 / first multi-client transport, louistrue): #1030
 // Single workspace per server process: this is the registry-less local
 // mode (10-registry.md). The stdio transport is one client per process;
 // multi-client deployments (Streamable HTTP) need the registry's
 // session-scoped storage and per-principal ownership checks before
-// exposing these tools — tracked for phase L5, not patched in here.
+// exposing these tools — tracked in issue #1030, not patched in here.
 let active = createLayerWorkspace();
 
 export function getLayerWorkspace(): LayerWorkspace {
@@ -137,7 +138,14 @@ export function resolveBase(ws: LayerWorkspace, ref?: string): ResolvedBase {
     };
   }
   const layer = ws.layers.get(ref);
-  if (layer) return { base: { kind: 'layer', id: ref }, files: [layer] };
+  if (layer) {
+    // Seed from the full ancestor stack when the layer sits inside a ref
+    // history — a lone delta would lose all earlier state and put drafts
+    // on the wrong baseline for previews and merge planning.
+    const base: ProvenanceBase = { kind: 'layer', id: ref };
+    const files = resolveAncestorFilesAnyRef(ws, base);
+    return { base, files: files.length > 0 ? files : [layer] };
+  }
   throw new ToolExecutionError({
     code: ToolErrorCode.ENTITY_NOT_FOUND,
     message: `Unknown base '${ref}' — not a ref name or published layer id.`,
