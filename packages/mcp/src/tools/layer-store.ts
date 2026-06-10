@@ -6,9 +6,12 @@
  * In-memory draft / layer / review workspace backing the agent draft-layer
  * tool family (docs/architecture/layer-prs/06-agents.md).
  *
- * One workspace per process by default; tests call `resetLayerWorkspace()`
- * for isolation. A draft is a CRDT session (Y.Doc seeded with the resolved
- * base stack) plus the baseline snapshot `publishLayer` diffs against.
+ * Drafts are keyed by transport session id (#1030) and disposed with the
+ * session; published layers, refs, and reviews are process-shared so
+ * other principals' sessions can build on and review them. Tests call
+ * `resetLayerWorkspace()` for isolation. A draft is a CRDT session (Y.Doc
+ * seeded with the resolved base stack) plus the baseline snapshot
+ * `publishLayer` diffs against.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -42,6 +45,8 @@ export interface DraftLayer {
   claims: ScopeClaim[];
   rawClaims: string[];
   session: string;
+  /** Creating principal; undefined = unauthenticated/local → accessible to anyone in the workspace. */
+  owner?: string;
   createdAt: string;
 }
 
@@ -63,6 +68,8 @@ export interface LayerReview {
   feedback: ReviewDecision[];
   /** Follow-up draft ids opened via `respond_to_review`. */
   responses: string[];
+  /** Requesting principal; undefined = unauthenticated/local → accessible to anyone in the workspace. */
+  owner?: string;
 }
 
 export interface LayerWorkspace {
@@ -81,22 +88,64 @@ export function createLayerWorkspace(): LayerWorkspace {
   };
 }
 
-// TODO(remove-by: registry phase L5 / first multi-client transport, louistrue): #1030
-// Single workspace per server process: this is the registry-less local
-// mode (10-registry.md). The stdio transport is one client per process;
-// multi-client deployments (Streamable HTTP) need the registry's
-// session-scoped storage and per-principal ownership checks before
-// exposing these tools — tracked in issue #1030, not patched in here.
-let active = createLayerWorkspace();
+// Storage model (#1030). Drafts are private CRDT sessions, so they are
+// the per-transport-session state: keyed by session id, disposed with the
+// session. Published layers, refs, and reviews are the collaboration
+// surface — content-addressed immutable layers, shared branch heads, and
+// reviews that *other* principals must be able to act on from their own
+// HTTP sessions (each principal necessarily holds a different session,
+// since the transport rejects scope mismatches) — so they live in one
+// process-wide store, gated by the visibility checks below. stdio /
+// in-process transports carry no session id and use the local draft
+// space — registry-less local mode (10-registry.md); durable,
+// registry-backed persistence stays future work.
+const shared = {
+  layers: new Map<string, IfcxFile>(),
+  refs: new Map<string, string[]>([['main', []]]),
+  reviews: new Map<string, LayerReview>(),
+};
 
-export function getLayerWorkspace(): LayerWorkspace {
-  return active;
+const draftSpaces = new Map<string, Map<string, DraftLayer>>();
+
+/** Draft-space key for transports without a session id (stdio, in-process, tests). */
+const LOCAL_WORKSPACE_KEY = 'local';
+
+export function getLayerWorkspace(sessionId?: string): LayerWorkspace {
+  const key = sessionId ?? LOCAL_WORKSPACE_KEY;
+  let drafts = draftSpaces.get(key);
+  if (!drafts) {
+    drafts = new Map();
+    draftSpaces.set(key, drafts);
+  }
+  return { drafts, layers: shared.layers, refs: shared.refs, reviews: shared.reviews };
 }
 
-/** Test hook: swap in a fresh workspace and return it. */
+/** Drafts hold live Y.Docs — destroy them or the CRDT state lingers. */
+function destroyDrafts(drafts: Map<string, DraftLayer>): void {
+  for (const draft of drafts.values()) draft.doc.destroy();
+}
+
+/**
+ * Drop a session's draft space when the transport session ends. Layers,
+ * refs, and reviews deliberately survive — they are the published shared
+ * record other sessions keep building on.
+ */
+export function disposeLayerWorkspace(sessionId: string): void {
+  const drafts = draftSpaces.get(sessionId);
+  if (!drafts) return;
+  destroyDrafts(drafts);
+  draftSpaces.delete(sessionId);
+}
+
+/** Test hook: drop all draft spaces and shared state; return a fresh local workspace. */
 export function resetLayerWorkspace(): LayerWorkspace {
-  active = createLayerWorkspace();
-  return active;
+  for (const drafts of draftSpaces.values()) destroyDrafts(drafts);
+  draftSpaces.clear();
+  shared.layers.clear();
+  shared.reviews.clear();
+  shared.refs.clear();
+  shared.refs.set('main', []);
+  return getLayerWorkspace();
 }
 
 /** Files for a ref, erroring on dangling layer ids (corrupt workspace). */
@@ -278,6 +327,7 @@ export interface CreateDraftInit {
   claims: ScopeClaim[];
   rawClaims: string[];
   session?: string;
+  owner?: string;
 }
 
 /** Build, seed, baseline, and register a new draft. */
@@ -294,32 +344,9 @@ export function createDraft(ws: LayerWorkspace, init: CreateDraftInit): DraftLay
     claims: init.claims,
     rawClaims: init.rawClaims,
     session: init.session ?? randomUUID(),
+    owner: init.owner,
     createdAt: new Date().toISOString(),
   };
   ws.drafts.set(draft.id, draft);
   return draft;
-}
-
-export function requireDraft(ws: LayerWorkspace, id: string): DraftLayer {
-  const draft = ws.drafts.get(id);
-  if (!draft) {
-    throw new ToolExecutionError({
-      code: ToolErrorCode.ENTITY_NOT_FOUND,
-      message: `Unknown draft '${id}'. Call create_draft_layer first.`,
-      details: { drafts: Array.from(ws.drafts.keys()) },
-    });
-  }
-  return draft;
-}
-
-export function requireReview(ws: LayerWorkspace, id: string): LayerReview {
-  const review = ws.reviews.get(id);
-  if (!review) {
-    throw new ToolExecutionError({
-      code: ToolErrorCode.ENTITY_NOT_FOUND,
-      message: `Unknown review '${id}'.`,
-      details: { reviews: Array.from(ws.reviews.keys()) },
-    });
-  }
-  return review;
 }
