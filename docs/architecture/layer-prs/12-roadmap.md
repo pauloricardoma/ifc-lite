@@ -30,9 +30,9 @@ Feature flag: `layers.enabled`. Every phase lands on `main` only with green exit
 - ☑ Per-componentKey sub-hash mode in `packages/diff/src/fingerprint.ts` (opt-in; existing whole-blob tests untouched)
 - ☑ `packages/merge`: three-way engine on `EntityFingerprint`, decision matrix 05 §5.3, relation triples, MergePlan + conflict records (taxonomy from `collab/conflicts`)
 - ☑ Merge-layer emission (resolution ops + `manifest.merge`); rebase = re-run plan
-- ◐ Golden-file suite: the conflict table as fixtures via `pnpm fixtures` infra; fuzz: random op partitions over a real model must never lose ops
+- ☑ Golden-file suite: the conflict table as fixtures; synthetic partition fuzz + real-model partition fuzz (hello-wall + WekaHills via `pnpm fixtures`, disjoint and overlapping partitions, op-loss accounting) + fast-path differential fuzz
 - ☑ CLI: `ifc layer create|status|publish|diff|merge --preview|log|revert|rebase` with stable exit codes
-- ☐ Benchmarks: three-way plan < 1s on 1M-entity fixture; publish to perf docs
+- ☑ Benchmarks: three-way plan 635 ms on the 1M-entity / 2×50k-op fixture (< 1s budget met via prefix projection; numbers in 05 §5.7; `pnpm --filter @ifc-lite/merge bench`)
 
 **Exit:** two divergent layers over a real model merge with correct auto/conflict split in CI; demo recording of CLI flow.
 
@@ -57,8 +57,8 @@ Feature flag: `layers.enabled`. Every phase lands on `main` only with green exit
 
 ## Phase L5: Registry (ongoing)
 
-- ☐ Push/pull by id + ref DB + PR objects on `collab-server`/`apps/server`; webhooks
-- ☐ Ref policies (required checks, reviewers, author-kind, risk-tier, auto-merge) enforced server-side
+- ◐ Push/pull by id + ref DB + PR objects on `collab-server`/`apps/server`; webhooks — DONE on `collab-server` (`/api/v1/layers|refs|reviews`, server-side blake3 integrity gate on push, in-memory store behind a pluggable `LayerRegistryStore`); webhooks, durable backends, and the `apps/server` surface pending. The merge flow itself moved to `@ifc-lite/merge` (`ref-flow.ts`) so CLI and registry run one decision procedure
+- ◐ Ref policies (required checks, reviewers, author-kind, risk-tier, auto-merge) enforced server-side — required checks + human-approval + protected-move-only-via-merge enforced on the registry route; reviewers/risk-tier/auto-merge pending
 - ☐ Registry attestation; optional ed25519 signing; provenance/audit search
 - ☐ Team tier pricing alongside Tauri track; public reference registry for teaching
 - ☐ Nightly model-gardener agent on auto-merge policy (first fully autonomous loop)
@@ -67,7 +67,7 @@ Feature flag: `layers.enabled`. Every phase lands on `main` only with green exit
 
 ## Cross-cutting
 
-- ☐ One diff/MergePlan JSON schema consumed identically by CLI, MCP, UI (contract tests)
+- ◐ One diff/MergePlan JSON schema consumed identically by CLI, MCP, UI (contract tests) — the diff JSON is now ONE implementation (`@ifc-lite/merge` `state-diff.ts`, deterministic ordering) consumed by `ifc layer diff --json` and the MCP `diff_layer` tool, with a byte-exact contract test; MergePlan is emitted from the shared type (CLI full, MCP trimmed conflicts). UI consumption lands with L4
 - ☐ Perf budgets in CI (02 §2.5, 05 §5.7)
 - ☐ Spec-set versioning: manifest SemVer; composition behavior behind `layers.enabled`
 - ⚠ Open problems parked deliberately: heuristic identity (04 §4.5), cross-schema identity, deletion-overlay upstream standardization (tracked with panel)
