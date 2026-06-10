@@ -8,10 +8,13 @@
  * (07-security.md §7.2), plus the draft descriptor workflow.
  */
 
-import type { AuthorKind, IfcxFile, ProvenanceBase } from '@ifc-lite/ifcx';
+import { readFileSync } from 'node:fs';
+import { basename } from 'node:path';
+import type { AuthorKind, IfcxFile, ProvenanceBase, ProvenanceCheck } from '@ifc-lite/ifcx';
 import {
   ATTR,
   IFCLITE_ATTR,
+  blake3Digest,
   computeLayerId,
   computeStackHash,
   createProvenanceManifest,
@@ -152,6 +155,8 @@ export interface PublishInit {
   created?: string;
   /** Abort (throw ScopeViolationError) instead of storing a flagged layer. */
   strictScope?: boolean;
+  /** Verified check evidence to stamp into the manifest (see parseCheckEvidence). */
+  checks?: ProvenanceCheck[];
 }
 
 /** Thrown under `strictScope` before any side effect; CLI maps it to exit 4. */
@@ -187,6 +192,7 @@ export function publishLayer(store: LayerStore, init: PublishInit): PublishResul
     base,
     created: init.created,
     scope_claim: scope,
+    checks: init.checks ?? [],
   });
   // Verify before any side effect: a strict-scope failure must leave the
   // store (and the draft) untouched and never print success output.
@@ -204,6 +210,60 @@ export function publishLayer(store: LayerStore, init: PublishInit): PublishResul
 }
 
 // ---------------------------------------------------------------------------
+// check evidence
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse `--check <spec.ids>=<report.json>` flags into manifest evidence.
+ *
+ * The report must be the JSON written by `ifc-lite ids <model> <rules.ids>
+ * --json`; pass/fail is derived from its summary — never asserted by the
+ * caller — and both files are content-addressed so a registry (or a merge
+ * reviewer) can verify the evidence byte-for-byte. In-process IDS
+ * execution over the composed IFCX state is L3 roadmap work; until then
+ * this is the one honest producer of `manifest.checks`.
+ */
+export function parseCheckEvidence(flags: readonly string[]): ProvenanceCheck[] {
+  return flags.map((raw) => {
+    const eq = raw.indexOf('=');
+    if (eq <= 0 || eq === raw.length - 1) {
+      throw new Error(`--check expects <spec.ids>=<report.json>, got "${raw}"`);
+    }
+    const specPath = raw.slice(0, eq);
+    const reportPath = raw.slice(eq + 1);
+    const specContent = readFileSync(specPath, 'utf-8');
+    const reportContent = readFileSync(reportPath, 'utf-8');
+    return {
+      tool: '@ifc-lite/ids',
+      spec: basename(specPath),
+      specDigest: blake3Digest(specContent),
+      result: checkResultOf(reportContent, reportPath),
+      report: blake3Digest(reportContent),
+    };
+  });
+}
+
+/** Derive pass/fail from an `ifc-lite ids --json` report's summary. */
+function checkResultOf(reportContent: string, label: string): 'pass' | 'fail' {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(reportContent);
+  } catch (err) {
+    throw new Error(
+      `Check report ${label} is not valid JSON: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  const summary = (parsed as { summary?: { failedSpecifications?: unknown } }).summary;
+  const failed = summary?.failedSpecifications;
+  if (typeof failed !== 'number') {
+    throw new Error(
+      `Check report ${label} has no summary.failedSpecifications — expected the JSON written by \`ifc-lite ids <model> <rules.ids> --json\``
+    );
+  }
+  return failed === 0 ? 'pass' : 'fail';
+}
+
+// ---------------------------------------------------------------------------
 // commands
 // ---------------------------------------------------------------------------
 
@@ -218,7 +278,7 @@ export async function layerPublishCommand(args: string[]): Promise<void> {
   const deltaPath = args[0];
   if (!deltaPath || deltaPath.startsWith('-')) {
     throw new Error(
-      'Usage: ifc-lite layer publish <delta.ifcx> --base <ref|-> --intent "<text>" [--scope <claim>]... [--principal <id>] [--kind human|agent|hybrid] [--strict-scope] [--json]'
+      'Usage: ifc-lite layer publish <delta.ifcx> --base <ref|-> --intent "<text>" [--scope <claim>]... [--check <spec.ids>=<report.json>]... [--principal <id>] [--kind human|agent|hybrid] [--strict-scope] [--json]'
     );
   }
 
@@ -244,6 +304,7 @@ export async function layerPublishCommand(args: string[]): Promise<void> {
       principal: getFlag(args, '--principal'),
       kind: parseKind(getFlag(args, '--kind')),
       strictScope: hasFlag(args, '--strict-scope'),
+      checks: parseCheckEvidence(getAllFlags(args, '--check')),
     });
   } catch (error) {
     if (error instanceof ScopeViolationError) {

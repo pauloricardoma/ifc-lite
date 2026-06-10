@@ -3,14 +3,20 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import { describe, expect, it } from 'vitest';
-import { readdirSync } from 'node:fs';
+import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { IFCLITE_ATTR, computeStackHash, getProvenance } from '@ifc-lite/ifcx';
+import { IFCLITE_ATTR, blake3Digest, computeStackHash, getProvenance } from '@ifc-lite/ifcx';
 import { extractStackState } from '@ifc-lite/merge';
 import { getRef, loadLayer, loadRefLayers, type LayerStore } from './layer-store.js';
-import { ScopeViolationError, deriveScopeOps, publishLayer, verifyScopeClaims } from './layer-publish.js';
+import {
+  ScopeViolationError,
+  deriveScopeOps,
+  parseCheckEvidence,
+  publishLayer,
+  verifyScopeClaims,
+} from './layer-publish.js';
 import { mergeIntoRef } from './layer-merge.js';
-import { protectRef } from './ref.js';
+import { createRef, moveRef, protectRef } from './ref.js';
 import { CLASS, FIRE, makeDelta, setupMain, tmpStore } from './layer-test-helpers.js';
 
 describe('publish → ref create → merge fast path', () => {
@@ -219,5 +225,131 @@ describe('scope verification', () => {
     ).toThrow(ScopeViolationError);
     // Nothing was stored.
     expect(readdirSync(join(store.dir, 'layers'))).toEqual(layersBefore);
+  });
+});
+
+describe('store integrity', () => {
+  it('refuses to load a layer file that was modified after publishing', () => {
+    const store = tmpStore();
+    const baseId = setupMain(store);
+
+    const path = join(store.dir, 'layers', `${baseId.slice('blake3:'.length)}.ifcx`);
+    const file = JSON.parse(readFileSync(path, 'utf-8')) as {
+      data: Array<{ path: string; attributes?: Record<string, unknown> }>;
+    };
+    const wall = file.data.find((n) => n.path === 'wall-1');
+    if (!wall?.attributes) throw new Error('fixture layer lost wall-1');
+    wall.attributes[FIRE] = 'REI30'; // tampered on disk
+    writeFileSync(path, JSON.stringify(file), 'utf-8');
+
+    expect(() => loadLayer(store, baseId)).toThrow(/integrity/);
+  });
+});
+
+describe('check evidence (--check spec.ids=report.json)', () => {
+  function writeEvidence(store: LayerStore, failedSpecifications: number): string {
+    const specPath = join(store.dir, 'fire-safety.ids');
+    const reportPath = join(store.dir, 'report.json');
+    writeFileSync(specPath, '<ids/>', 'utf-8');
+    writeFileSync(reportPath, JSON.stringify({ summary: { failedSpecifications } }), 'utf-8');
+    return `${specPath}=${reportPath}`;
+  }
+
+  it('derives pass/fail from the ids --json report and content-addresses both files', () => {
+    const store = tmpStore();
+    const [check] = parseCheckEvidence([writeEvidence(store, 0)]);
+    expect(check).toEqual({
+      tool: '@ifc-lite/ids',
+      spec: 'fire-safety.ids',
+      specDigest: blake3Digest('<ids/>'),
+      result: 'pass',
+      report: blake3Digest(JSON.stringify({ summary: { failedSpecifications: 0 } })),
+    });
+    expect(parseCheckEvidence([writeEvidence(store, 2)])[0].result).toBe('fail');
+  });
+
+  it('rejects reports that are not ids --json output', () => {
+    const store = tmpStore();
+    const reportPath = join(store.dir, 'report.json');
+    writeFileSync(reportPath, '{"not":"a report"}', 'utf-8');
+    const specPath = join(store.dir, 'fire-safety.ids');
+    writeFileSync(specPath, '<ids/>', 'utf-8');
+    expect(() => parseCheckEvidence([`${specPath}=${reportPath}`])).toThrow(
+      /summary\.failedSpecifications/
+    );
+    expect(() => parseCheckEvidence(['no-equals-sign'])).toThrow(/--check expects/);
+  });
+
+  it('satisfies a requiredChecks ref policy end to end', () => {
+    const store = tmpStore();
+    setupMain(store);
+    protectRef(store, 'main', { requiredChecks: ['fire-safety.ids'] });
+
+    const candidate = publishLayer(store, {
+      delta: makeDelta([{ path: 'wall-1', attributes: { [FIRE]: 'REI90' } }]),
+      baseRef: 'main',
+      intent: 'Bump fire rating with evidence',
+      principal: 'bob',
+      checks: parseCheckEvidence([writeEvidence(store, 0)]),
+    });
+    const manifest = getProvenance(loadLayer(store, candidate.layerId));
+    expect(manifest?.checks).toHaveLength(1);
+    expect(manifest?.checks[0]).toMatchObject({ spec: 'fire-safety.ids', result: 'pass' });
+
+    expect(mergeIntoRef(store, { candidateId: candidate.layerId, into: 'main' }).status).toBe(
+      'fast-forward'
+    );
+
+    // A failing report is recorded honestly and still blocks the merge.
+    const failing = publishLayer(store, {
+      delta: makeDelta([{ path: 'wall-1', attributes: { [FIRE]: 'REI120' } }]),
+      baseRef: 'main',
+      intent: 'Bump again, checks red',
+      principal: 'bob',
+      checks: parseCheckEvidence([writeEvidence(store, 3)]),
+    });
+    const blocked = mergeIntoRef(store, { candidateId: failing.layerId, into: 'main' });
+    expect(blocked.status).toBe('policy-failure');
+  });
+});
+
+describe('unrelated declared base', () => {
+  function unrelatedCandidate(store: LayerStore): string {
+    setupMain(store);
+    // A second, unrelated history: its stack hash matches no prefix of main.
+    const otherBase = publishLayer(store, {
+      delta: makeDelta([{ path: 'slab-1', attributes: { [CLASS]: { code: 'IfcSlab', uri: 'u' } } }]),
+      baseRef: null,
+      intent: 'Import other model',
+      principal: 'erin',
+    });
+    createRef(store, 'other');
+    moveRef(store, 'other', otherBase.layerId);
+    return publishLayer(store, {
+      delta: makeDelta([{ path: 'slab-1', attributes: { 'bsi::ifc::v5a::Pset_Common::Status': 'NEW' } }]),
+      baseRef: 'other',
+      intent: 'Edit the other model',
+      principal: 'erin',
+    }).layerId;
+  }
+
+  it('refuses to merge a candidate authored against a different history', () => {
+    const store = tmpStore();
+    const candidateId = unrelatedCandidate(store);
+    const outcome = mergeIntoRef(store, { candidateId, into: 'main' });
+    expect(outcome.status).toBe('unrelated-base');
+    if (outcome.status !== 'unrelated-base') throw new Error('expected unrelated-base');
+    expect(outcome.declaredBase.kind).toBe('stack');
+    // The ref is untouched.
+    expect(getRef(store, 'main')?.layers).toHaveLength(1);
+  });
+
+  it('merges against an empty ancestor only with allowUnrelated', () => {
+    const store = tmpStore();
+    const candidateId = unrelatedCandidate(store);
+    const outcome = mergeIntoRef(store, { candidateId, into: 'main', allowUnrelated: true });
+    expect(outcome.status).toBe('merged');
+    if (outcome.status !== 'merged') throw new Error('expected merged');
+    expect(outcome.ancestorMatched).toBe(false);
   });
 });

@@ -19,7 +19,7 @@ Feature flag: `layers.enabled`. Every phase lands on `main` only with green exit
 
 - ☑ Canonical serialization + blake3 ids (`packages/ifcx`: `canonical.ts`; rule set 02 §2.4) with cross-adapter byte-identity tests
 - ☑ Provenance manifest types + validation (`packages/ifcx`: `provenance.ts`, manifest SemVer v1)
-- ☑ `publishLayer(session, {intent, scope_claim})` in `packages/collab/src/snapshot/` (freeze, canonicalize, hash, manifest, run declared checks via `@ifc-lite/ids`)
+- ☑ `publishLayer(session, {intent, scope_claim})` in `packages/collab/src/snapshot/` (freeze, canonicalize, hash, manifest). Checks are *evidence-attached*, not executed in-process: `ifc layer publish --check <spec.ids>=<report.json>` derives pass/fail from the `ifc ids --json` report and content-addresses both files into `manifest.checks`. In-process IDS execution over the composed IFCX state needs an IFCX→IDS accessor bridge — that lands with the L3 launch demo
 - ☑ expressId→GlobalId bridge: `packages/mutations/src/change-set-to-ops.ts` (+ identity fallback per 04 §4.1(3))
 - ☑ Ref file format + `ifc ref` basics (local mode)
 

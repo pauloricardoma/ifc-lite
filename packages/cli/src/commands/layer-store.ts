@@ -19,13 +19,26 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { IfcxFile } from '@ifc-lite/ifcx';
-import { computeStackHash } from '@ifc-lite/ifcx';
+import { computeLayerId, computeStackHash } from '@ifc-lite/ifcx';
 import { getFlag } from '../output.js';
+
+let atomicWriteSeq = 0;
+
+/**
+ * Write via temp file + rename so a crash or a concurrent CLI process
+ * never leaves a torn refs.json or layer file behind.
+ */
+function writeFileAtomic(path: string, text: string): void {
+  const tmp = `${path}.${process.pid}.${atomicWriteSeq++}.tmp`;
+  writeFileSync(tmp, text, 'utf-8');
+  renameSync(tmp, path);
+}
 
 export interface RefPolicy {
   requireHumanApproval?: boolean;
@@ -122,7 +135,7 @@ export function readRefs(store: LayerStore): RefsFile {
 
 export function writeRefs(store: LayerStore, refs: RefsFile): void {
   mkdirSync(store.dir, { recursive: true });
-  writeFileSync(refsPath(store), `${JSON.stringify(refs, null, 2)}\n`, 'utf-8');
+  writeFileAtomic(refsPath(store), `${JSON.stringify(refs, null, 2)}\n`);
 }
 
 export function getRef(store: LayerStore, name: string): RefEntry | undefined {
@@ -161,7 +174,7 @@ export function storeLayer(store: LayerStore, file: IfcxFile): string {
     throw new Error(`Layer header.id must be a blake3 content address, got "${id}"`);
   }
   mkdirSync(layersDir(store), { recursive: true });
-  writeFileSync(join(layersDir(store), `${hexOf(id)}.ifcx`), `${JSON.stringify(file, null, 2)}\n`, 'utf-8');
+  writeFileAtomic(join(layersDir(store), `${hexOf(id)}.ifcx`), `${JSON.stringify(file, null, 2)}\n`);
   return id;
 }
 
@@ -186,10 +199,21 @@ export function resolveLayerId(store: LayerStore, idOrPrefix: string): string {
 
 export function loadLayer(store: LayerStore, layerId: string): IfcxFile {
   const id = resolveLayerId(store, layerId);
-  return parseIfcxJson(
+  const file = parseIfcxJson(
     readFileSync(join(layersDir(store), `${hexOf(id)}.ifcx`), 'utf-8'),
     `layer ${id}`
   );
+  // Content addressing is only protection if it is checked: a layer file
+  // edited or bit-rotted on disk must fail loudly here, not compose
+  // silently into refs and merges.
+  const actual = computeLayerId(file);
+  if (actual !== id) {
+    throw new Error(
+      `Layer ${id} failed integrity verification — its content hashes to ${actual}. ` +
+        `The file in ${layersDir(store)} was modified or corrupted after publishing.`
+    );
+  }
+  return file;
 }
 
 /** Load a ref's layer documents, ordered weakest first. */
@@ -212,7 +236,7 @@ export function readDraft(store: LayerStore): DraftDescriptor | undefined {
 
 export function writeDraft(store: LayerStore, draft: DraftDescriptor): void {
   mkdirSync(store.dir, { recursive: true });
-  writeFileSync(draftPath(store), `${JSON.stringify(draft, null, 2)}\n`, 'utf-8');
+  writeFileAtomic(draftPath(store), `${JSON.stringify(draft, null, 2)}\n`);
 }
 
 export function deleteDraft(store: LayerStore): void {

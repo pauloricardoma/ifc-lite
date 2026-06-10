@@ -214,7 +214,7 @@ describe('dry_run_merge / list_conflicts', () => {
     });
 
     const preview = await call('dry_run_merge', { layer_or_draft: cId, into: 'main' });
-    expect(preview.would_fail_checks).toEqual([]);
+    expect(preview.base_resolved).toBe(true);
     const conflicts = preview.conflicts as Array<{ kind: string; path: string; componentKey?: string }>;
     expect(conflicts).toEqual([
       { kind: 'concurrent-edit', path: WALL, componentKey: 'pset:Pset_FireSafety' },

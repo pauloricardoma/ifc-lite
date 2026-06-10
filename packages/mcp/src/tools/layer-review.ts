@@ -11,7 +11,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { getProvenance } from '@ifc-lite/ifcx';
+import { computeStackHash, getProvenance } from '@ifc-lite/ifcx';
 import type { IfcxFile } from '@ifc-lite/ifcx';
 import { parseScopeClaims } from '@ifc-lite/extensions';
 import {
@@ -43,6 +43,13 @@ interface ResolvedCandidate {
   baseFiles: IfcxFile[];
   /** The single delta layer (publish preview for drafts). */
   candidateFile: IfcxFile;
+  /**
+   * False when the candidate DECLARES a base that could not be
+   * reconstructed — previews then run against an empty ancestor and
+   * misreport every candidate op as new. Surfaced so agents never act on
+   * such a preview as if it were exact.
+   */
+  baseResolved: boolean;
 }
 
 /** Resolve a draft id or layer id into state/base/delta files. */
@@ -51,7 +58,12 @@ function resolveCandidate(ws: LayerWorkspace, id: string, ctx: ToolContext, into
   if (draft) {
     // Publish preview: `publishLayer` is pure w.r.t. the draft.
     const preview = publishDraftFile(draft, ctx).file;
-    return { stateFiles: [...draft.baseFiles, preview], baseFiles: draft.baseFiles, candidateFile: preview };
+    return {
+      stateFiles: [...draft.baseFiles, preview],
+      baseFiles: draft.baseFiles,
+      candidateFile: preview,
+      baseResolved: true,
+    };
   }
   const layer = ws.layers.get(id);
   if (layer) {
@@ -63,7 +75,11 @@ function resolveCandidate(ws: LayerWorkspace, id: string, ctx: ToolContext, into
       into !== undefined
         ? resolveAncestorFiles(ws, base, ws.refs.get(into) ?? [])
         : resolveAncestorFilesAnyRef(ws, base);
-    return { stateFiles: [...baseFiles, layer], baseFiles, candidateFile: layer };
+    const baseResolved =
+      base === null ||
+      baseFiles.length > 0 ||
+      (base.kind === 'stack' && base.id === computeStackHash([]));
+    return { stateFiles: [...baseFiles, layer], baseFiles, candidateFile: layer, baseResolved };
   }
   // Published layers carry no owner (immutable, workspace-shared); drafts
   // do, so only the caller's own / unowned draft ids may be enumerated.
@@ -123,7 +139,11 @@ function diffStates(left: StackState, right: StackState): {
   return { added: added.sort(), deleted: deleted.sort(), modified };
 }
 
-function planMerge(ws: LayerWorkspace, input: Record<string, unknown>, ctx: ToolContext): MergePlan {
+function planMerge(
+  ws: LayerWorkspace,
+  input: Record<string, unknown>,
+  ctx: ToolContext,
+): { plan: MergePlan; baseResolved: boolean } {
   const into = input.into as string;
   if (!ws.refs.has(into)) {
     throw new ToolExecutionError({
@@ -134,11 +154,12 @@ function planMerge(ws: LayerWorkspace, input: Record<string, unknown>, ctx: Tool
   }
   const ours = refLayerFiles(ws, into);
   const candidate = resolveCandidate(ws, input.layer_or_draft as string, ctx, into);
-  return planThreeWayMerge({
+  const plan = planThreeWayMerge({
     ancestor: candidate.baseFiles,
     ours,
     theirs: [...candidate.baseFiles, candidate.candidateFile],
   });
+  return { plan, baseResolved: candidate.baseResolved };
 }
 
 function conflictsJson(plan: MergePlan): Array<{ kind: string; path: string; componentKey?: string }> {
@@ -173,7 +194,12 @@ const diffLayer: Tool = {
     const diff = diffStates(extractStackState(leftFiles), extractStackState(candidate.stateFiles));
     return okResult(
       `Diff: +${diff.added.length} / -${diff.deleted.length} / ~${diff.modified.length} entities.`,
-      { added: diff.added, deleted: diff.deleted, modified: diff.modified },
+      {
+        added: diff.added,
+        deleted: diff.deleted,
+        modified: diff.modified,
+        base_resolved: candidate.baseResolved,
+      },
     );
   },
 };
@@ -193,10 +219,10 @@ const dryRunMerge: Tool = {
     additionalProperties: false,
   },
   handler(input, ctx) {
-    const plan = planMerge(getLayerWorkspace(ctx.session?.id), input, ctx);
+    const { plan, baseResolved } = planMerge(getLayerWorkspace(ctx.session?.id), input, ctx);
     return okResult(
       `Merge preview into '${input.into as string}': ${fmtCount(plan.conflicts.length, 'conflict')}, ${plan.autoOps.length} auto op(s).`,
-      { conflicts: conflictsJson(plan), auto_op_count: plan.autoOps.length, would_fail_checks: [] },
+      { conflicts: conflictsJson(plan), auto_op_count: plan.autoOps.length, base_resolved: baseResolved },
     );
   },
 };
@@ -215,8 +241,11 @@ const listConflicts: Tool = {
     additionalProperties: false,
   },
   handler(input, ctx) {
-    const plan = planMerge(getLayerWorkspace(ctx.session?.id), input, ctx);
-    return okResult(`${fmtCount(plan.conflicts.length, 'conflict')}.`, { conflicts: conflictsJson(plan) });
+    const { plan, baseResolved } = planMerge(getLayerWorkspace(ctx.session?.id), input, ctx);
+    return okResult(`${fmtCount(plan.conflicts.length, 'conflict')}.`, {
+      conflicts: conflictsJson(plan),
+      base_resolved: baseResolved,
+    });
   },
 };
 

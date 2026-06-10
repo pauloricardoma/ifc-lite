@@ -1457,11 +1457,11 @@ checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
 
 [[package]]
 name = "ifc-lite-clash"
-version = "3.1.0"
+version = "3.1.1"
 
 [[package]]
 name = "ifc-lite-core"
-version = "3.1.0"
+version = "3.1.1"
 dependencies = [
  "fast-float2",
  "futures-core",
@@ -1478,7 +1478,7 @@ dependencies = [
 
 [[package]]
 name = "ifc-lite-geometry"
-version = "3.1.0"
+version = "3.1.1"
 dependencies = [
  "approx",
  "earcutr",
@@ -1499,7 +1499,7 @@ dependencies = [
 
 [[package]]
 name = "ifc-lite-processing"
-version = "3.1.0"
+version = "3.1.1"
 dependencies = [
  "ifc-lite-core",
  "ifc-lite-geometry",
@@ -1512,7 +1512,7 @@ dependencies = [
 
 [[package]]
 name = "ifc-lite-server"
-version = "3.1.0"
+version = "3.1.1"
 dependencies = [
  "anyhow",
  "arrow",
@@ -1546,7 +1546,7 @@ dependencies = [
 
 [[package]]
 name = "ifc-lite-wasm"
-version = "3.1.0"
+version = "3.1.1"
 dependencies = [
  "console_error_panic_hook",
  "futures-util",

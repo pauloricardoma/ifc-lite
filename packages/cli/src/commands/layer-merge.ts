@@ -115,6 +115,8 @@ export interface MergeInit {
   approvedBy?: string;
   principal?: string;
   created?: string;
+  /** Merge a candidate whose declared base matches nothing on the ref. */
+  allowUnrelated?: boolean;
 }
 
 export type MergeOutcome =
@@ -122,6 +124,7 @@ export type MergeOutcome =
   | { status: 'preview'; plan: MergePlan; ancestorMatched: boolean }
   | { status: 'conflicts'; conflicts: MergeConflict[]; ancestorMatched: boolean }
   | { status: 'policy-failure'; reason: string }
+  | { status: 'unrelated-base'; declaredBase: ProvenanceBase }
   | {
       status: 'merged';
       mergeLayerId: string;
@@ -158,6 +161,15 @@ export function mergeIntoRef(store: LayerStore, init: MergeInit): MergeOutcome {
   }
 
   const ancestor = resolveAncestor(store, oursIds, manifest?.base ?? null);
+  // A candidate that DECLARES a base which matches nothing on the ref was
+  // authored against a different history: three-way planning against an
+  // empty ancestor would read its every op as "new" and steamroll the
+  // ref. Refuse unless explicitly overridden. (Baseless candidates keep
+  // the documented warn-and-proceed semantics — null base is a legitimate
+  // publish mode, not a mismatch.)
+  if (manifest?.base != null && !ancestor.matched && !init.preview && !init.allowUnrelated) {
+    return { status: 'unrelated-base', declaredBase: manifest.base };
+  }
   const ours = oursIds.map((id) => loadLayer(store, id));
   const plan = planThreeWayMerge({
     ancestor: ancestor.layers,
@@ -244,7 +256,7 @@ export async function layerMergeCommand(args: string[]): Promise<void> {
   const into = getFlag(args, '--into');
   if (!candidateId || candidateId.startsWith('-') || !into) {
     throw new Error(
-      'Usage: ifc-lite layer merge <layer-id> --into <ref> [--preview] [--resolve ours|theirs] [--waive <spec> --reason "<text>"]... [--approved-by <principal>] [--json]'
+      'Usage: ifc-lite layer merge <layer-id> --into <ref> [--preview] [--resolve ours|theirs] [--waive <spec> --reason "<text>"]... [--approved-by <principal>] [--allow-unrelated] [--json]'
     );
   }
   const resolveFlag = getFlag(args, '--resolve');
@@ -258,6 +270,7 @@ export async function layerMergeCommand(args: string[]): Promise<void> {
     into,
     preview: hasFlag(args, '--preview'),
     waivers: parseWaivers(args),
+    allowUnrelated: hasFlag(args, '--allow-unrelated'),
   };
   if (resolveFlag !== undefined) init.resolve = resolveFlag;
   const approvedBy = getFlag(args, '--approved-by');
@@ -268,7 +281,12 @@ export async function layerMergeCommand(args: string[]): Promise<void> {
   const outcome = mergeIntoRef(store, init);
   const json = hasFlag(args, '--json');
 
-  if (outcome.status !== 'policy-failure' && outcome.status !== 'fast-forward' && !outcome.ancestorMatched) {
+  if (
+    outcome.status !== 'policy-failure' &&
+    outcome.status !== 'unrelated-base' &&
+    outcome.status !== 'fast-forward' &&
+    !outcome.ancestorMatched
+  ) {
     process.stderr.write(
       'Warning: candidate base is unknown or not a prefix of the target ref — using an empty ancestor\n'
     );
@@ -298,6 +316,16 @@ export async function layerMergeCommand(args: string[]): Promise<void> {
       if (json) printJson({ status: outcome.status, reason: outcome.reason });
       else process.stderr.write(`Policy failure: ${outcome.reason}\n`);
       process.exit(3);
+      return;
+    case 'unrelated-base':
+      if (json) printJson({ status: outcome.status, declaredBase: outcome.declaredBase });
+      else {
+        process.stderr.write(
+          `Candidate declares base ${outcome.declaredBase.kind} ${outcome.declaredBase.id} which matches nothing on ${into} — ` +
+            'it was authored against a different history. Re-run with --allow-unrelated to merge against an empty ancestor (every candidate op will read as new).\n'
+        );
+      }
+      process.exit(5);
       return;
     case 'merged':
       if (json) {
