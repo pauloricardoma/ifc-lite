@@ -93,6 +93,30 @@ export function readRefs(store: LayerStore): RefsFile {
   if (typeof refs !== 'object' || refs === null || Array.isArray(refs)) {
     throw new Error(`Corrupt refs.json at ${refsPath(store)}: missing "refs" object`);
   }
+  for (const [name, entry] of Object.entries(refs)) {
+    const candidate = entry as Partial<RefEntry> | null;
+    if (
+      typeof candidate !== 'object' ||
+      candidate === null ||
+      !Array.isArray(candidate.layers) ||
+      !candidate.layers.every((id) => typeof id === 'string')
+    ) {
+      throw new Error(
+        `Corrupt refs.json at ${refsPath(store)}: ref "${name}" must have layers: string[]`
+      );
+    }
+    const policy = candidate.policy;
+    if (policy !== undefined) {
+      const okApproval =
+        policy.requireHumanApproval === undefined || typeof policy.requireHumanApproval === 'boolean';
+      const okChecks =
+        policy.requiredChecks === undefined ||
+        (Array.isArray(policy.requiredChecks) && policy.requiredChecks.every((c) => typeof c === 'string'));
+      if (typeof policy !== 'object' || policy === null || !okApproval || !okChecks) {
+        throw new Error(`Corrupt refs.json at ${refsPath(store)}: ref "${name}" has an invalid policy`);
+      }
+    }
+  }
   return { refs: refs as Record<string, RefEntry> };
 }
 

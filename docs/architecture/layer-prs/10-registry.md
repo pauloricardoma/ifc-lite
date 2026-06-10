@@ -13,7 +13,7 @@ The merge engine being open is what makes the standard adoptable (11); coordinat
 
 ## 10.3 Federation and grouping
 
-Multi-model sessions (04 §4.2) render as one logical PR. Cross-org federation (architect's registry ↔ engineer's registry) via signed layer exchange: the long-game version is registries syncing like Git remotes, with the DBL/DPP world (manufacturer layers, §03) as external principals.
+Multi-model sessions (04 §4.2) render as one logical PR. Cross-org federation (architect's registry ↔ engineer's registry) via signed layer exchange: the long-game version is registries syncing like Git remotes, with the DBL/DPP world (manufacturer layers, 03 §3.2) as external principals.
 
 ## 10.4 Ref policies (branch protection for buildings)
 

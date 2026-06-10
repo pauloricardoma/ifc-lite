@@ -224,6 +224,24 @@ export function removeChild(doc: Y.Doc, path: string, role: string): boolean {
   return true;
 }
 
+/** Set or update a `role → inherited path` entry on an entity. */
+export function setInherit(doc: Y.Doc, path: string, role: string, targetPath: string): void {
+  const entity = getEntity(doc, path);
+  if (!entity) throw new Error(`@ifc-lite/collab: entity "${path}" not found`);
+  const inherits = entity.get(ENTITY_KEY.INHERITS) as Y.Map<string> | undefined;
+  if (!inherits) throw new Error(`@ifc-lite/collab: entity "${path}" missing inherits map`);
+  inherits.set(role, targetPath);
+}
+
+export function removeInherit(doc: Y.Doc, path: string, role: string): boolean {
+  const entity = getEntity(doc, path);
+  if (!entity) return false;
+  const inherits = entity.get(ENTITY_KEY.INHERITS) as Y.Map<string> | undefined;
+  if (!inherits || !inherits.has(role)) return false;
+  inherits.delete(role);
+  return true;
+}
+
 /** Move an entity's containment by updating both endpoints atomically. */
 export function moveEntity(
   doc: Y.Doc,

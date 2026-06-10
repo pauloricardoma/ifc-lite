@@ -6,7 +6,7 @@ There is no write API that targets a published layer or a ref. Every mutation, f
 
 ## 6.2 Draft lifecycle
 
-```
+```text
 create_draft_layer(base, intent, scope)   draft is a CollabSession bound to base
   └─ n × write tools (existing 47, re-targeted to the draft)
   └─ dry_run_merge(draft, into)           optional, any time

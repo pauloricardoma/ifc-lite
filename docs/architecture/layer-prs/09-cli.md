@@ -2,7 +2,7 @@
 
 ## 9.1 Command reference (`packages/cli`, new `layer` namespace)
 
-```
+```shell
 ifc layer create   --base <ref|stack|file.ifcx> --intent "..." [--scope "<capability>"]
 ifc layer status                                   current draft: op count, scope usage
 ifc layer publish  [--sign <key>]                  freeze + hash + checks; prints layer id

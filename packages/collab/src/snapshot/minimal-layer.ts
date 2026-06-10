@@ -69,112 +69,115 @@ export function extractMinimalLayer(
   // Reconstruct the "before" state by replaying the baseline update on
   // a fresh doc.
   const before = createCollabDoc({ gc: false });
-  if (baseline.byteLength > 0) Y.applyUpdate(before, baseline);
+  try {
+    if (baseline.byteLength > 0) Y.applyUpdate(before, baseline);
 
-  // Snapshot the live doc through the standard writer so we get a
-  // header + imports + schemas template, then trim the data array down
-  // to the diff.
-  const live = snapshotToIfcx(doc, options.snapshot);
-  const beforeEnts = entitiesMap(before);
-  const liveEnts = entitiesMap(doc);
+    // Snapshot the live doc through the standard writer so we get a
+    // header + imports + schemas template, then trim the data array down
+    // to the diff.
+    const live = snapshotToIfcx(doc, options.snapshot);
+    const beforeEnts = entitiesMap(before);
+    const liveEnts = entitiesMap(doc);
 
-  const diffNodes: IfcxNode[] = [];
+    const diffNodes: IfcxNode[] = [];
 
-  liveEnts.forEach((entUntyped, path) => {
-    const liveJson = entityToJSON(entUntyped as Y.Map<unknown>);
-    const beforeUntyped = beforeEnts.get(path);
-    if (!beforeUntyped) {
-      // Entity is new — emit it whole (sans empty branches).
+    liveEnts.forEach((entUntyped, path) => {
+      const liveJson = entityToJSON(entUntyped as Y.Map<unknown>);
+      const beforeUntyped = beforeEnts.get(path);
+      if (!beforeUntyped) {
+        // Entity is new — emit it whole (sans empty branches).
+        const node: IfcxNode = { path };
+        if (Object.keys(liveJson.attributes).length > 0) node.attributes = { ...liveJson.attributes };
+        if (Object.keys(liveJson.children).length > 0) node.children = { ...liveJson.children };
+        if (Object.keys(liveJson.inherits).length > 0) node.inherits = { ...liveJson.inherits };
+        diffNodes.push(node);
+        return;
+      }
+
+      const beforeJson = entityToJSON(beforeUntyped as Y.Map<unknown>);
       const node: IfcxNode = { path };
-      if (Object.keys(liveJson.attributes).length > 0) node.attributes = { ...liveJson.attributes };
-      if (Object.keys(liveJson.children).length > 0) node.children = { ...liveJson.children };
-      if (Object.keys(liveJson.inherits).length > 0) node.inherits = { ...liveJson.inherits };
-      diffNodes.push(node);
-      return;
-    }
+      let dirty = false;
 
-    const beforeJson = entityToJSON(beforeUntyped as Y.Map<unknown>);
-    const node: IfcxNode = { path };
-    let dirty = false;
+      // Attributes: include keys that are new OR (when configured)
+      // whose value changed; removed keys emit null.
+      const addedAttrs: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(liveJson.attributes)) {
+        const wasInBaseline = key in beforeJson.attributes;
+        if (!wasInBaseline) {
+          addedAttrs[key] = value;
+          continue;
+        }
+        if (includeUpdatedValues && !deepEqual(value, beforeJson.attributes[key])) {
+          addedAttrs[key] = value;
+        }
+      }
+      if (includeDeletions) {
+        for (const key of Object.keys(beforeJson.attributes)) {
+          if (!(key in liveJson.attributes)) addedAttrs[key] = null;
+        }
+      }
+      if (Object.keys(addedAttrs).length > 0) {
+        node.attributes = addedAttrs;
+        dirty = true;
+      }
 
-    // Attributes: include keys that are new OR (when configured)
-    // whose value changed; removed keys emit null.
-    const addedAttrs: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(liveJson.attributes)) {
-      const wasInBaseline = key in beforeJson.attributes;
-      if (!wasInBaseline) {
-        addedAttrs[key] = value;
-        continue;
+      // Children: same rule; removed roles emit null (IFCX removal).
+      const addedChildren: Record<string, string | null> = {};
+      for (const [role, child] of Object.entries(liveJson.children)) {
+        const wasInBaseline = role in beforeJson.children;
+        if (!wasInBaseline || (includeUpdatedValues && beforeJson.children[role] !== child)) {
+          addedChildren[role] = child;
+        }
       }
-      if (includeUpdatedValues && !deepEqual(value, beforeJson.attributes[key])) {
-        addedAttrs[key] = value;
+      if (includeDeletions) {
+        for (const role of Object.keys(beforeJson.children)) {
+          if (!(role in liveJson.children)) addedChildren[role] = null;
+        }
       }
-    }
-    if (includeDeletions) {
-      for (const key of Object.keys(beforeJson.attributes)) {
-        if (!(key in liveJson.attributes)) addedAttrs[key] = null;
+      if (Object.keys(addedChildren).length > 0) {
+        node.children = addedChildren;
+        dirty = true;
       }
-    }
-    if (Object.keys(addedAttrs).length > 0) {
-      node.attributes = addedAttrs;
-      dirty = true;
-    }
 
-    // Children: same rule; removed roles emit null (IFCX removal).
-    const addedChildren: Record<string, string | null> = {};
-    for (const [role, child] of Object.entries(liveJson.children)) {
-      const wasInBaseline = role in beforeJson.children;
-      if (!wasInBaseline || (includeUpdatedValues && beforeJson.children[role] !== child)) {
-        addedChildren[role] = child;
+      // Inherits: same rule.
+      const addedInherits: Record<string, string | null> = {};
+      for (const [role, inh] of Object.entries(liveJson.inherits)) {
+        const wasInBaseline = role in beforeJson.inherits;
+        if (!wasInBaseline || (includeUpdatedValues && beforeJson.inherits[role] !== inh)) {
+          addedInherits[role] = inh;
+        }
       }
-    }
-    if (includeDeletions) {
-      for (const role of Object.keys(beforeJson.children)) {
-        if (!(role in liveJson.children)) addedChildren[role] = null;
+      if (includeDeletions) {
+        for (const role of Object.keys(beforeJson.inherits)) {
+          if (!(role in liveJson.inherits)) addedInherits[role] = null;
+        }
       }
-    }
-    if (Object.keys(addedChildren).length > 0) {
-      node.children = addedChildren;
-      dirty = true;
-    }
+      if (Object.keys(addedInherits).length > 0) {
+        node.inherits = addedInherits;
+        dirty = true;
+      }
 
-    // Inherits: same rule.
-    const addedInherits: Record<string, string | null> = {};
-    for (const [role, inh] of Object.entries(liveJson.inherits)) {
-      const wasInBaseline = role in beforeJson.inherits;
-      if (!wasInBaseline || (includeUpdatedValues && beforeJson.inherits[role] !== inh)) {
-        addedInherits[role] = inh;
-      }
-    }
-    if (includeDeletions) {
-      for (const role of Object.keys(beforeJson.inherits)) {
-        if (!(role in liveJson.inherits)) addedInherits[role] = null;
-      }
-    }
-    if (Object.keys(addedInherits).length > 0) {
-      node.inherits = addedInherits;
-      dirty = true;
-    }
-
-    if (dirty) diffNodes.push(node);
-  });
-
-  // Entities deleted since the baseline: tombstone opinions that shadow
-  // the entity (and its subtree) when the stack composes.
-  if (includeDeletions) {
-    beforeEnts.forEach((_entUntyped, path) => {
-      if (!liveEnts.has(path)) {
-        diffNodes.push({ path, attributes: { [IFCLITE_ATTR.DELETED]: true } });
-      }
+      if (dirty) diffNodes.push(node);
     });
+
+    // Entities deleted since the baseline: tombstone opinions that shadow
+    // the entity (and its subtree) when the stack composes.
+    if (includeDeletions) {
+      beforeEnts.forEach((_entUntyped, path) => {
+        if (!liveEnts.has(path)) {
+          diffNodes.push({ path, attributes: { [IFCLITE_ATTR.DELETED]: true } });
+        }
+      });
+    }
+
+    return {
+      ...live,
+      data: diffNodes,
+    };
+  } finally {
+    // Deterministic cleanup even when extraction throws.
+    before.destroy();
   }
-
-  before.destroy();
-
-  return {
-    ...live,
-    data: diffNodes,
-  };
 }
 
 /**

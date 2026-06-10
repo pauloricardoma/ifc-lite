@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import { describe, expect, it } from 'vitest';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { IfcxFile, IfcxNode } from '@ifc-lite/ifcx';
@@ -16,7 +16,7 @@ import {
   openStore,
   type LayerStore,
 } from './layer-store.js';
-import { deriveScopeOps, publishLayer, verifyScopeClaims } from './layer-publish.js';
+import { ScopeViolationError, deriveScopeOps, publishLayer, verifyScopeClaims } from './layer-publish.js';
 import { diffLayerStacks } from './layer-diff.js';
 import { mergeIntoRef } from './layer-merge.js';
 import { bakeRef, logRef, revertInRef } from './layer-history.js';
@@ -229,10 +229,48 @@ describe('scope verification', () => {
     expect(ops).toEqual([
       { path: 'wall-1', capability: 'model.delete', ifcType: 'IfcWall' },
       { path: 'wall-2', capability: 'model.create', ifcType: 'IfcWall' },
+      { path: 'storey-eg', capability: 'model.mutate:children' },
     ]);
     const verification = verifyScopeClaims(['model.delete@IfcWall'], ops);
     expect(verification.verified).toBe(false);
-    expect(verification.violations.map((op) => op.capability)).toEqual(['model.create']);
+    expect(verification.violations.map((op) => op.capability)).toEqual([
+      'model.create',
+      'model.mutate:children',
+    ]);
+  });
+
+  it('hierarchy-only mutations do not bypass scope enforcement', () => {
+    const store = tmpStore();
+    setupMain(store);
+    const base = loadRefLayers(store, 'main');
+    // Reparent only — no attribute edits at all.
+    const ops = deriveScopeOps(
+      makeDelta([{ path: 'storey-eg', children: { Wall: 'wall-2' } }]),
+      base
+    );
+    expect(ops).toEqual([{ path: 'storey-eg', capability: 'model.mutate:children' }]);
+    expect(verifyScopeClaims(['model.mutate:Pset_FireSafety*'], ops).verified).toBe(false);
+    // Unchanged children echoes are not ops.
+    expect(
+      deriveScopeOps(makeDelta([{ path: 'storey-eg', children: { Wall: 'wall-1' } }]), base)
+    ).toEqual([]);
+  });
+
+  it('strict scope aborts before any side effect', () => {
+    const store = tmpStore();
+    setupMain(store);
+    const layersBefore = readdirSync(join(store.dir, 'layers'));
+    expect(() =>
+      publishLayer(store, {
+        delta: makeDelta([{ path: 'wall-1', attributes: { [FIRE]: 'REI90' } }]),
+        baseRef: 'main',
+        intent: 'Out of scope',
+        scope: ['model.mutate:Pset_Acoustics*@IfcWall'],
+        strictScope: true,
+      })
+    ).toThrow(ScopeViolationError);
+    // Nothing was stored.
+    expect(readdirSync(join(store.dir, 'layers'))).toEqual(layersBefore);
   });
 });
 

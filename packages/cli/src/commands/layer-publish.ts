@@ -90,8 +90,32 @@ export function deriveScopeOps(delta: IfcxFile, baseLayers: readonly IfcxFile[])
       const target = setMatch ? setMatch[1] : key.split('::').pop() ?? key;
       push(`model.mutate:${target}`);
     }
+    // Structural edits are write capabilities too: a delta that only
+    // touches children/inherits must not bypass scope verification.
+    if (hierarchyChanged(node.children, baseEntity.children)) {
+      push('model.mutate:children');
+    }
+    if (hierarchyChanged(node.inherits, baseEntity.inherits)) {
+      push('model.mutate:inherits');
+    }
   }
   return ops;
+}
+
+/** True when a children/inherits delta differs from the base slots. */
+function hierarchyChanged(
+  delta: Record<string, string | null> | undefined,
+  base: Map<string, string>
+): boolean {
+  if (!delta) return false;
+  for (const [role, target] of Object.entries(delta)) {
+    if (target === null) {
+      if (base.has(role)) return true;
+    } else if (base.get(role) !== target) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export interface ScopeVerification {
@@ -126,6 +150,18 @@ export interface PublishInit {
   principal?: string;
   kind?: AuthorKind;
   created?: string;
+  /** Abort (throw ScopeViolationError) instead of storing a flagged layer. */
+  strictScope?: boolean;
+}
+
+/** Thrown under `strictScope` before any side effect; CLI maps it to exit 4. */
+export class ScopeViolationError extends Error {
+  readonly violations: DerivedScopeOp[];
+  constructor(violations: DerivedScopeOp[]) {
+    super(`scope claim mismatch: ${violations.length} op(s) outside the declared claims`);
+    this.name = 'ScopeViolationError';
+    this.violations = violations;
+  }
 }
 
 export interface PublishResult {
@@ -152,13 +188,17 @@ export function publishLayer(store: LayerStore, init: PublishInit): PublishResul
     created: init.created,
     scope_claim: scope,
   });
+  // Verify before any side effect: a strict-scope failure must leave the
+  // store (and the draft) untouched and never print success output.
+  const ops = deriveScopeOps(init.delta, baseLayers);
+  const { verified, violations } = verifyScopeClaims(scope, ops);
+  if (!verified && init.strictScope) {
+    throw new ScopeViolationError(violations);
+  }
+
   const withManifest = setProvenance(init.delta, manifest);
   const layerId = computeLayerId(withManifest);
   const file: IfcxFile = { ...withManifest, header: { ...withManifest.header, id: layerId } };
-
-  const ops = deriveScopeOps(init.delta, baseLayers);
-  const { verified, violations } = verifyScopeClaims(scope, ops);
-
   storeLayer(store, file);
   return { layerId, file, opCount: ops.length, scopeVerified: verified, violations };
 }
@@ -194,14 +234,29 @@ export async function layerPublishCommand(args: string[]): Promise<void> {
   const scopeFlags = getAllFlags(args, '--scope');
   const scope = scopeFlags.length > 0 ? scopeFlags : draft?.scope ?? [];
 
-  const result = publishLayer(store, {
-    delta: readIfcxFile(deltaPath),
-    baseRef: baseFlag === '-' ? null : baseFlag,
-    intent,
-    scope,
-    principal: getFlag(args, '--principal'),
-    kind: parseKind(getFlag(args, '--kind')),
-  });
+  let result;
+  try {
+    result = publishLayer(store, {
+      delta: readIfcxFile(deltaPath),
+      baseRef: baseFlag === '-' ? null : baseFlag,
+      intent,
+      scope,
+      principal: getFlag(args, '--principal'),
+      kind: parseKind(getFlag(args, '--kind')),
+      strictScope: hasFlag(args, '--strict-scope'),
+    });
+  } catch (error) {
+    if (error instanceof ScopeViolationError) {
+      // Nothing was stored and the draft is kept for retry.
+      process.stderr.write('Scope claim mismatch — ops outside the declared claims:\n');
+      for (const op of error.violations) {
+        const type = op.ifcType ? ` (${op.ifcType})` : '';
+        process.stderr.write(`  ${op.path}: ${op.capability}${type}\n`);
+      }
+      process.exit(4);
+    }
+    throw error;
+  }
 
   if (!result.scopeVerified) {
     process.stderr.write('Warning: scope claim mismatch — ops outside the declared claims:\n');
@@ -218,10 +273,6 @@ export async function layerPublishCommand(args: string[]): Promise<void> {
   } else {
     process.stdout.write(`${result.layerId}\n`);
     process.stderr.write(`Published ${result.opCount} op(s) to ${store.dir}\n`);
-  }
-
-  if (!result.scopeVerified && hasFlag(args, '--strict-scope')) {
-    process.exit(4);
   }
 }
 

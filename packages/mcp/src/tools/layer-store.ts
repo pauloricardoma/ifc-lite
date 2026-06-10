@@ -20,8 +20,10 @@ import {
   deleteEntity,
   hasEntity,
   removeChild,
+  removeInherit,
   setAttribute,
   setChild,
+  setInherit,
 } from '@ifc-lite/collab';
 import type { ScopeClaim } from '@ifc-lite/extensions';
 import { IFCLITE_ATTR, ATTR, computeStackHash } from '@ifc-lite/ifcx';
@@ -79,6 +81,11 @@ export function createLayerWorkspace(): LayerWorkspace {
   };
 }
 
+// Single workspace per server process: this is the registry-less local
+// mode (10-registry.md). The stdio transport is one client per process;
+// multi-client deployments (Streamable HTTP) need the registry's
+// session-scoped storage and per-principal ownership checks before
+// exposing these tools — tracked for phase L5, not patched in here.
 let active = createLayerWorkspace();
 
 export function getLayerWorkspace(): LayerWorkspace {
@@ -165,6 +172,24 @@ export function resolveAncestorFiles(
   return single ? [single] : [];
 }
 
+/**
+ * Resolve a manifest base by searching every ref's layer list — used when
+ * a tool gets a published layer without an explicit `into` ref, where an
+ * empty ref list could never reconstruct a stack-hash base.
+ */
+export function resolveAncestorFilesAnyRef(
+  ws: LayerWorkspace,
+  base: ProvenanceBase | null,
+): IfcxFile[] {
+  if (!base) return [];
+  for (const refIds of ws.refs.values()) {
+    const files = resolveAncestorFiles(ws, base, refIds);
+    if (files.length > 0) return files;
+  }
+  // Fall back to the lone-layer case resolveAncestorFiles also covers.
+  return resolveAncestorFiles(ws, base, []);
+}
+
 /** Read the IfcClass code off the well-known class attribute, if present. */
 export function ifcClassOfAttributes(attributes: Record<string, unknown> | undefined): string | undefined {
   const cls = attributes?.[ATTR.CLASS];
@@ -221,6 +246,13 @@ function applyNode(doc: Y.Doc, file: IfcxFile, node: IfcxNodeLike): void {
   for (const [role, child] of Object.entries(node.children ?? {})) {
     if (child === null) removeChild(doc, node.path, role);
     else setChild(doc, node.path, role, child);
+  }
+  // Inherits deltas must replay on existing entities too — `createEntity`
+  // only applies them on first creation, but later base layers may add,
+  // retarget, or null out inheritance opinions.
+  for (const [role, target] of Object.entries(node.inherits ?? {})) {
+    if (target === null) removeInherit(doc, node.path, role);
+    else if (typeof target === 'string') setInherit(doc, node.path, role, target);
   }
 }
 

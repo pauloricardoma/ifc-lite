@@ -60,7 +60,7 @@ function ifcClassOfEntity(doc: Y.Doc, path: string): string | undefined {
   return typeof ifcClass === 'string' ? ifcClass : undefined;
 }
 
-function requireField(op: DraftOpInput, index: number, field: 'name' | 'pset' | 'prop'): string {
+function requireField(op: DraftOpInput, index: number, field: 'name' | 'pset' | 'prop' | 'ifc_type'): string {
   const value = op[field];
   if (typeof value !== 'string' || value.length === 0) {
     throw new ToolExecutionError({
@@ -147,7 +147,7 @@ const draftApplyOps: Tool = {
           properties: {
             op: { type: 'string', enum: ['create_entity', 'set_attribute', 'set_property', 'delete_entity'] },
             path: { type: 'string', description: 'Entity path, e.g. "site/wall-1".' },
-            ifc_type: { type: 'string', description: 'IFC class for create_entity, e.g. "IfcWall".' },
+            ifc_type: { type: 'string', minLength: 1, description: 'IFC class — required for create_entity, e.g. "IfcWall".' },
             name: { type: 'string', description: 'Attribute name for set_attribute.' },
             pset: { type: 'string', description: 'Property-set name for set_property.' },
             prop: { type: 'string', description: 'Property name for set_property.' },
@@ -179,6 +179,9 @@ const draftApplyOps: Tool = {
       }
       let ifcType: string | undefined;
       if (op.op === 'create_entity') {
+        // A typeless entity would publish without bsi::ifc::class, losing
+        // the only stable signal type-scoped claims and merge rely on.
+        requireField(op, index, 'ifc_type');
         ifcType = op.ifc_type;
         pendingTypes.set(op.path, op.ifc_type);
       } else {
@@ -193,7 +196,7 @@ const draftApplyOps: Tool = {
           case 'create_entity':
             createEntity(draft.doc, op.path, {
               ifcClass: op.ifc_type,
-              attributes: op.ifc_type ? { [ATTR.CLASS]: { code: op.ifc_type } } : {},
+              attributes: { [ATTR.CLASS]: { code: op.ifc_type } },
             });
             break;
           case 'set_attribute':

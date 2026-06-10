@@ -6,7 +6,7 @@
 
 Scope expressions in manifests and grants use the same grammar, extended with entity selectors:
 
-```
+```text
 model.mutate : Pset_FireSafety* @ IfcWall & storey=EG
 model.create : IfcPropertySet
 model.delete : @ IfcAnnotation            [red tier: registry policy may forbid for agent principals]

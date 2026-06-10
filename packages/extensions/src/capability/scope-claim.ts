@@ -53,7 +53,9 @@ export interface ScopeOpDescriptor {
   tags?: Record<string, string>;
 }
 
-const IDENTIFIER_GLOB_RE = /^[A-Za-z_][A-Za-z0-9_-]*\*?$/;
+// Selector types must be IFC EXPRESS class names (PascalCase, `Ifc`
+// prefix), optionally with a trailing `*` glob — never invented aliases.
+const IFC_TYPE_GLOB_RE = /^Ifc[A-Z][A-Za-z0-9]*\*?$/;
 const CONSTRAINT_KEY_RE = /^[A-Za-z_][A-Za-z0-9_-]*$/;
 
 function fail(message: string, hint?: string): ValidationResult<never> {
@@ -86,8 +88,11 @@ export function parseScopeClaim(raw: string): ValidationResult<ScopeClaim> {
 
   const pieces = selectorPart.split('&').map((piece) => piece.trim());
   const ifcType = pieces[0];
-  if (!IDENTIFIER_GLOB_RE.test(ifcType)) {
-    return fail(`Selector type "${ifcType}" is not a valid IFC type pattern.`);
+  if (!IFC_TYPE_GLOB_RE.test(ifcType)) {
+    return fail(
+      `Selector type "${ifcType}" is not a valid IFC type pattern.`,
+      'Use the exact IFC EXPRESS class name (e.g. "IfcWall"), optionally with a trailing "*".'
+    );
   }
 
   const constraints: Record<string, string> = {};

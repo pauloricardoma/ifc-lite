@@ -31,6 +31,7 @@ import {
   refLayerFiles,
   requireReview,
   resolveAncestorFiles,
+  resolveAncestorFilesAnyRef,
 } from './layer-store.js';
 import type { LayerReview, LayerWorkspace, ReviewDecision, ReviewStatus } from './layer-store.js';
 import { publishDraftFile } from './layer.js';
@@ -54,8 +55,14 @@ function resolveCandidate(ws: LayerWorkspace, id: string, ctx: ToolContext, into
   }
   const layer = ws.layers.get(id);
   if (layer) {
-    const refIds = into !== undefined ? ws.refs.get(into) ?? [] : [];
-    const baseFiles = resolveAncestorFiles(ws, getProvenance(layer)?.base ?? null, refIds);
+    const base = getProvenance(layer)?.base ?? null;
+    // With an explicit ref, resolve against it; otherwise search every
+    // ref — an empty ref list could never reconstruct a stack-hash base
+    // and the diff would misreport the whole layer as newly added.
+    const baseFiles =
+      into !== undefined
+        ? resolveAncestorFiles(ws, base, ws.refs.get(into) ?? [])
+        : resolveAncestorFilesAnyRef(ws, base);
     return { stateFiles: [...baseFiles, layer], baseFiles, candidateFile: layer };
   }
   throw new ToolExecutionError({
@@ -234,10 +241,18 @@ const requestReview: Tool = {
         message: `Unknown layer '${layerId}'. Publish the draft first.`,
       });
     }
+    const into = input.into as string;
+    if (!ws.refs.has(into)) {
+      throw new ToolExecutionError({
+        code: ToolErrorCode.ENTITY_NOT_FOUND,
+        message: `Unknown ref '${into}' — a review must target an existing ref.`,
+        details: { refs: Array.from(ws.refs.keys()) },
+      });
+    }
     const review: LayerReview = {
       id: randomUUID(),
       layerId,
-      into: input.into as string,
+      into,
       reviewers: (input.reviewers as string[] | undefined) ?? [],
       status: 'open',
       feedback: [],

@@ -10,7 +10,7 @@ Optional binary sidecar: cached derived geometry (meshes, BVH) keyed by the laye
 
 Conceptually, a layer is a set of ops at (entity, component) granularity, aligned with the columnar store and `diff`'s fingerprint scopes:
 
-```
+```text
 Op =
   | AddEntity        (id, ifcType, components)
   | TombstoneEntity  (id)                          [§2.3]
