@@ -161,14 +161,18 @@ export class MCPServer {
     this.sink = null;
     this.active.forEach((c) => c.abort());
     this.active.clear();
-    // The viewer holds an HTTP server + SSE listener; closing it stops
-    // dangling sockets when the transport disconnects.
-    if (this.viewer.isOpen()) this.viewer.close();
-    // Per-session layer drafts hold live Y.Docs — free them with the
-    // session. detach() only fires on true termination (HTTP DELETE /
-    // transport close), never on SSE client drops, so a reconnecting
-    // client keeps its workspace until the session actually ends.
-    if (this.sessionId !== undefined) disposeLayerWorkspace(this.sessionId);
+    try {
+      // The viewer holds an HTTP server + SSE listener; closing it stops
+      // dangling sockets when the transport disconnects.
+      if (this.viewer.isOpen()) this.viewer.close();
+    } finally {
+      // Per-session layer drafts hold live Y.Docs — free them with the
+      // session even if the viewer close throws. detach() only fires on
+      // true termination (HTTP DELETE / transport close), never on SSE
+      // client drops, so a reconnecting client keeps its workspace until
+      // the session actually ends.
+      if (this.sessionId !== undefined) disposeLayerWorkspace(this.sessionId);
+    }
   }
 
   /** Update the auth scope mid-session (e.g. token refresh). */

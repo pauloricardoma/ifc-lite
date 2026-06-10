@@ -50,12 +50,14 @@ const INITIALIZE = JSON.stringify({
 async function request(
   port: number,
   token: string,
-  init: RequestInit & { sessionId?: string } = {},
+  init: RequestInit & { sessionId?: string; headers?: Record<string, string> } = {},
 ): Promise<Response> {
+  // Caller headers merge over the defaults so tests can add e.g. Accept.
   const headers: Record<string, string> = {
     Authorization: `Bearer ${token}`,
     'Content-Type': 'application/json',
     ...(init.sessionId !== undefined ? { 'Mcp-Session-Id': init.sessionId } : {}),
+    ...init.headers,
   };
   return fetch(`http://127.0.0.1:${port}/`, { ...init, headers });
 }
@@ -106,7 +108,7 @@ describe('HttpTransport session identity', () => {
     const denied = await request(port, 'mallory-token', {
       method: 'GET',
       sessionId: sid,
-      headers: { Authorization: 'Bearer mallory-token', Accept: 'text/event-stream' },
+      headers: { Accept: 'text/event-stream' },
     });
     expect(denied.status).toBe(403);
   });
