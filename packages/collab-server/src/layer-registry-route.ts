@@ -43,7 +43,6 @@ import {
   type LayerRegistryStore,
   type RegistryReview,
   type RegistryReviewDecision,
-  type RegistryReviewStatus,
 } from './layer-registry.js';
 
 /** Resolve the acting principal, or null to reject with 401. */
@@ -97,11 +96,12 @@ async function readBody(req: http.IncomingMessage, maxBytes: number): Promise<st
   return Buffer.concat(chunks).toString('utf-8');
 }
 
-function parseJson(text: string): unknown | undefined {
+/** Parse JSON, surfacing the failure reason instead of swallowing it. */
+function parseJson(text: string): { value?: unknown; error?: string } {
   try {
-    return JSON.parse(text);
-  } catch {
-    return undefined;
+    return { value: JSON.parse(text) };
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
   }
 }
 
@@ -123,6 +123,25 @@ function parseRefPolicy(value: unknown): RefPolicy | undefined {
   return policy;
 }
 
+/** Runtime shape validation for review decisions; undefined = invalid. */
+function parseReviewDecision(value: unknown): RegistryReviewDecision | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  if (typeof raw.entity !== 'string' || (raw.decision !== 'accept' && raw.decision !== 'reject')) {
+    return undefined;
+  }
+  const decision: RegistryReviewDecision = { entity: raw.entity, decision: raw.decision };
+  if (raw.componentKey !== undefined) {
+    if (typeof raw.componentKey !== 'string') return undefined;
+    decision.componentKey = raw.componentKey;
+  }
+  if (raw.comment !== undefined) {
+    if (typeof raw.comment !== 'string') return undefined;
+    decision.comment = raw.comment;
+  }
+  return decision;
+}
+
 /**
  * Handle a registry request. Returns false (untouched response) when the
  * path is not a registry path, true when a response was written.
@@ -134,9 +153,18 @@ export async function handleLayerRegistryRequest(
 ): Promise<boolean> {
   const url = new URL(req.url ?? '/', 'http://localhost');
   if (!url.pathname.startsWith(BASE)) return false;
-  const segments = url.pathname.slice(BASE.length).split('/').filter(Boolean).map(decodeURIComponent);
-  const [head] = segments;
+  const rawSegments = url.pathname.slice(BASE.length).split('/').filter(Boolean);
+  const [head] = rawSegments;
   if (head !== 'layers' && head !== 'refs' && head !== 'reviews') return false;
+  let segments: string[];
+  try {
+    segments = rawSegments.map(decodeURIComponent);
+  } catch (err) {
+    // Malformed percent-escapes are a client error, not a server fault.
+    return json(res, 400, {
+      error: `malformed percent-encoding in path: ${err instanceof Error ? err.message : String(err)}`,
+    });
+  }
 
   const method = req.method ?? 'GET';
   let principal: Principal | null = null;
@@ -160,7 +188,9 @@ export async function handleLayerRegistryRequest(
     if (method === 'POST' && segments.length === 1) {
       const text = await readBody(req, maxBytes);
       if (text === null) return json(res, 413, { error: `body exceeds ${maxBytes} bytes` });
-      const file = parseJson(text) as IfcxFile | undefined;
+      const parsed = parseJson(text);
+      if (parsed.error !== undefined) return json(res, 400, { error: `invalid JSON body: ${parsed.error}` });
+      const file = parsed.value as IfcxFile | undefined;
       if (!file || typeof file.header !== 'object' || !Array.isArray(file.data)) {
         return json(res, 400, { error: 'body must be an IFCX layer document' });
       }
@@ -187,7 +217,9 @@ export async function handleLayerRegistryRequest(
     if (method === 'PUT' && segments.length === 2) {
       const text = await readBody(req, maxBytes);
       if (text === null) return json(res, 413, { error: `body exceeds ${maxBytes} bytes` });
-      const body = parseJson(text ?? '') as { layers?: unknown; policy?: unknown } | undefined;
+      const parsed = parseJson(text);
+      if (parsed.error !== undefined) return json(res, 400, { error: `invalid JSON body: ${parsed.error}` });
+      const body = parsed.value as { layers?: unknown; policy?: unknown } | undefined;
       if (
         !body ||
         (body.layers !== undefined &&
@@ -230,7 +262,9 @@ export async function handleLayerRegistryRequest(
     if (method === 'POST' && segments.length === 3 && segments[2] === 'merge') {
       const text = await readBody(req, maxBytes);
       if (text === null) return json(res, 413, { error: `body exceeds ${maxBytes} bytes` });
-      const body = parseJson(text ?? '') as
+      const parsed = parseJson(text);
+      if (parsed.error !== undefined) return json(res, 400, { error: `invalid JSON body: ${parsed.error}` });
+      const body = parsed.value as
         | {
             candidate?: string;
             preview?: boolean;
@@ -254,11 +288,19 @@ export async function handleLayerRegistryRequest(
       // feedback endpoint with the approver's authenticated identity. A
       // caller-asserted approved_by body field would let any write-capable
       // agent bypass the branch protection (unlike the CLI, where the
-      // local store's operator IS the approver).
-      const approval = registry
+      // local store's operator IS the approver). Only the LATEST review
+      // for the pair is authoritative: a stale approval must not outlive
+      // a newer review that was reopened or marked changes-requested.
+      const latestReview = registry
         .listReviews()
-        .find((r) => r.layerId === body.candidate && r.into === segments[1] && r.status === 'approved');
-      if (approval?.approvedBy !== undefined) init.approvedBy = approval.approvedBy;
+        .filter((r) => r.layerId === body.candidate && r.into === segments[1])
+        .reduce<RegistryReview | undefined>(
+          (acc, r) => (acc === undefined || r.openedAt >= acc.openedAt ? r : acc),
+          undefined
+        );
+      if (latestReview?.status === 'approved' && latestReview.approvedBy !== undefined) {
+        init.approvedBy = latestReview.approvedBy;
+      }
 
       const outcome = mergeIntoRef(registry, init);
       switch (outcome.status) {
@@ -296,7 +338,9 @@ export async function handleLayerRegistryRequest(
   if (method === 'POST' && segments.length === 1) {
     const text = await readBody(req, maxBytes);
     if (text === null) return json(res, 413, { error: `body exceeds ${maxBytes} bytes` });
-    const body = parseJson(text ?? '') as
+    const parsed = parseJson(text);
+    if (parsed.error !== undefined) return json(res, 400, { error: `invalid JSON body: ${parsed.error}` });
+    const body = parsed.value as
       | { layer_id?: string; into?: string; reviewers?: string[] }
       | undefined;
     if (!body?.layer_id || !body.into) {
@@ -327,11 +371,27 @@ export async function handleLayerRegistryRequest(
     }
     const text = await readBody(req, maxBytes);
     if (text === null) return json(res, 413, { error: `body exceeds ${maxBytes} bytes` });
-    const body = parseJson(text ?? '') as
-      | { decisions?: RegistryReviewDecision[]; status?: RegistryReviewStatus }
-      | undefined;
+    const parsed = parseJson(text);
+    if (parsed.error !== undefined) return json(res, 400, { error: `invalid JSON body: ${parsed.error}` });
+    const body = parsed.value as { decisions?: unknown[]; status?: unknown } | undefined;
     if (!body || !Array.isArray(body.decisions)) {
       return json(res, 400, { error: 'body must include { decisions: [...] }' });
+    }
+    // Stored reviews are a contract for downstream tooling: reject unknown
+    // decision shapes and status values instead of persisting them verbatim.
+    const decisions: RegistryReviewDecision[] = [];
+    for (const item of body.decisions) {
+      const decision = parseReviewDecision(item);
+      if (!decision) {
+        return json(res, 400, {
+          error:
+            'each decision must be { entity: string, decision: "accept" | "reject", componentKey?: string, comment?: string }',
+        });
+      }
+      decisions.push(decision);
+    }
+    if (body.status !== undefined && body.status !== 'approved' && body.status !== 'changes-requested') {
+      return json(res, 400, { error: 'status must be "approved" or "changes-requested"' });
     }
     if (body.status === 'approved') {
       // No self-approval: the layer's manifest author cannot satisfy the
@@ -344,7 +404,7 @@ export async function handleLayerRegistryRequest(
         return json(res, 403, { error: `layer author ${author} cannot approve their own review` });
       }
     }
-    review.feedback.push(...body.decisions);
+    review.feedback.push(...decisions);
     if (body.status === 'approved' || body.status === 'changes-requested') {
       review.status = body.status;
       // Approval identity is server-recorded, never caller-asserted: the

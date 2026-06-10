@@ -18,6 +18,7 @@ import {
 } from '@ifc-lite/ifcx';
 import type { IfcxFile, IfcxNode, ProvenanceBase } from '@ifc-lite/ifcx';
 import { startCollabServer, type CollabServerHandle } from '../src/index.js';
+import { MemoryLayerRegistry } from '../src/layer-registry.js';
 
 const FIRE = 'bsi::ifc::v5a::Pset_FireSafety::FireRating';
 const CLASS = 'bsi::ifc::class';
@@ -227,6 +228,28 @@ describe('layer registry route', () => {
     expect(review.status).toBe('changes-requested');
     expect(review.feedback).toHaveLength(1);
     expect(review.openedBy).toBe('anonymous');
+
+    // Stored reviews are a contract: malformed decisions and unknown
+    // status values are rejected, not persisted verbatim.
+    const badDecision = await fetch(`${api}/reviews/${id}/feedback`, {
+      method: 'POST',
+      body: JSON.stringify({ decisions: [{ entity: 'wall-1', decision: 'maybe' }] }),
+    });
+    expect(badDecision.status).toBe(400);
+    const badStatus = await fetch(`${api}/reviews/${id}/feedback`, {
+      method: 'POST',
+      body: JSON.stringify({ decisions: [], status: 'sideways' }),
+    });
+    expect(badStatus.status).toBe(400);
+    const after = (await (await fetch(`${api}/reviews/${id}`)).json()) as { feedback: unknown[] };
+    expect(after.feedback).toHaveLength(1);
+  });
+
+  it('rejects malformed percent-encoding in paths as 400, not 500', async () => {
+    const res = await fetch(`${api}/layers/%zz`);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain('percent-encoding');
   });
 
   it('enforces named reviewers and blocks self-approval', async () => {
@@ -335,10 +358,25 @@ describe('layer registry route', () => {
       });
       expect(asserted.status).toBe(403);
 
-      // An approved review object — server-recorded approval — does.
+      // An approved review object — server-recorded approval — does, but
+      // only while it is the LATEST review for the (candidate, ref) pair:
+      // a newer review with changes requested supersedes a stale approval.
       const opened = await post('/reviews', { layer_id: agentLayer.header.id, into: 'agents' });
       const { id } = (await opened.json()) as { id: string };
       await post(`/reviews/${id}/feedback`, {
+        decisions: [{ entity: 'wall-1', decision: 'accept' }],
+        status: 'approved',
+      });
+      const reopened = await post('/reviews', { layer_id: agentLayer.header.id, into: 'agents' });
+      const reopenedId = ((await reopened.json()) as { id: string }).id;
+      await post(`/reviews/${reopenedId}/feedback`, {
+        decisions: [{ entity: 'wall-1', decision: 'reject', comment: 'needs rework' }],
+        status: 'changes-requested',
+      });
+      const superseded = await post('/refs/agents/merge', { candidate: agentLayer.header.id });
+      expect(superseded.status).toBe(403);
+
+      await post(`/reviews/${reopenedId}/feedback`, {
         decisions: [{ entity: 'wall-1', decision: 'accept' }],
         status: 'approved',
       });
@@ -347,6 +385,29 @@ describe('layer registry route', () => {
     } finally {
       await server.stop();
     }
+  });
+
+  it('owns its state: mutating pushed or pulled objects never alters the registry', () => {
+    const registry = new MemoryLayerRegistry();
+    const layer = publishable(
+      [{ path: 'wall-1', attributes: { [CLASS]: { code: 'IfcWall', uri: 'u' } } }],
+      'Copy semantics',
+      null
+    );
+    const id = registry.push(layer);
+    layer.data.push({ path: 'intruder' }); // ingress: pushed object is not aliased
+    expect(registry.loadLayer(id).data.some((n) => n.path === 'intruder')).toBe(false);
+    registry.loadLayer(id).data.push({ path: 'intruder' }); // egress: pulled copy is not live
+    expect(registry.loadLayer(id).data.some((n) => n.path === 'intruder')).toBe(false);
+
+    registry.setRef('main', { layers: [id], policy: { requireHumanApproval: true } });
+    const ref = registry.getRef('main');
+    ref?.layers.push('blake3:bogus');
+    delete ref?.policy;
+    expect(registry.getRef('main')).toEqual({
+      layers: [id],
+      policy: { requireHumanApproval: true },
+    });
   });
 
   it('rejects all access when authentication denies', async () => {

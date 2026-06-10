@@ -70,6 +70,11 @@ export class MemoryLayerRegistry implements LayerRegistryStore {
   private readonly refs = new Map<string, RefEntry>();
   private readonly reviews = new Map<string, RegistryReview>();
 
+  // The registry owns its state: objects are cloned on ingress and egress
+  // so callers cannot mutate content-addressed layers, refs, or reviews
+  // out-of-band — every change goes back through the integrity and policy
+  // gates.
+
   push(file: IfcxFile): string {
     const computed = computeLayerId(file);
     if (file.header.id !== computed) {
@@ -88,7 +93,7 @@ export class MemoryLayerRegistry implements LayerRegistryStore {
         );
       }
     }
-    this.layers.set(computed, file);
+    this.layers.set(computed, structuredClone(file));
     return computed;
   }
 
@@ -104,7 +109,7 @@ export class MemoryLayerRegistry implements LayerRegistryStore {
   loadLayer(layerId: string): IfcxFile {
     const file = this.layers.get(layerId);
     if (!file) throw new Error(`No layer ${layerId} in registry`);
-    return file;
+    return structuredClone(file);
   }
 
   storeLayer(file: IfcxFile): string {
@@ -114,26 +119,33 @@ export class MemoryLayerRegistry implements LayerRegistryStore {
   }
 
   getRef(name: string): RefEntry | undefined {
-    return this.refs.get(name);
+    const entry = this.refs.get(name);
+    return entry === undefined ? undefined : structuredClone(entry);
   }
 
   setRef(name: string, entry: RefEntry): void {
-    this.refs.set(name, { layers: [...entry.layers], ...(entry.policy ? { policy: entry.policy } : {}) });
+    this.refs.set(
+      name,
+      structuredClone({ layers: entry.layers, ...(entry.policy ? { policy: entry.policy } : {}) })
+    );
   }
 
   listRefs(): Record<string, RefEntry> {
-    return Object.fromEntries(this.refs.entries());
+    return Object.fromEntries(
+      [...this.refs.entries()].map(([name, entry]) => [name, structuredClone(entry)])
+    );
   }
 
   getReview(id: string): RegistryReview | undefined {
-    return this.reviews.get(id);
+    const review = this.reviews.get(id);
+    return review === undefined ? undefined : structuredClone(review);
   }
 
   listReviews(): RegistryReview[] {
-    return [...this.reviews.values()];
+    return [...this.reviews.values()].map((review) => structuredClone(review));
   }
 
   putReview(review: RegistryReview): void {
-    this.reviews.set(review.id, review);
+    this.reviews.set(review.id, structuredClone(review));
   }
 }

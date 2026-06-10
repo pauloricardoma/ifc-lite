@@ -250,12 +250,15 @@ export function mergeIntoRef(store: LayerRefStore, init: MergeInit): MergeOutcom
     },
     created: init.created,
   });
-  store.storeLayer(merged.file);
-  const refLayers = [...oursIds, merged.layerId];
+  // The store owns the persisted identity: a backend that canonicalizes
+  // or re-materializes content may return a different id than the one
+  // precomputed on the merge layer.
+  const mergeLayerId = store.storeLayer(merged.file);
+  const refLayers = [...oursIds, mergeLayerId];
   store.setRef(init.into, { ...entry, layers: refLayers });
   return {
     status: 'merged',
-    mergeLayerId: merged.layerId,
+    mergeLayerId,
     refLayers,
     plan,
     ancestorMatched: ancestor.matched,
