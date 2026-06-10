@@ -204,7 +204,7 @@ function mergeEntity(
 
     // Both changed, different values.
     conflicts.push({
-      kind: key.startsWith('child:') ? 'hierarchy' : 'concurrent-edit',
+      kind: key.startsWith('child:') || key.startsWith('inherit:') ? 'hierarchy' : 'concurrent-edit',
       path,
       componentKey: key,
       ...(aAttrs ? { base: snapshotOf(aAttrs) } : {}),
@@ -239,6 +239,11 @@ export function opsForComponentChange(
     const name = componentKey.slice('child:'.length);
     if (next === undefined) return [{ op: 'remove-child', path, name }];
     return [{ op: 'set-child', path, name, child: String(next.child) }];
+  }
+  if (componentKey.startsWith('inherit:')) {
+    const name = componentKey.slice('inherit:'.length);
+    if (next === undefined) return [{ op: 'remove-inherit', path, name }];
+    return [{ op: 'set-inherit', path, name, target: String(next.inherit) }];
   }
   if (next === undefined) {
     const nulled: ComponentAttributes = {};

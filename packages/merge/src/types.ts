@@ -48,7 +48,14 @@ export type MergeOp =
       readonly name: string;
       readonly child: string;
     }
-  | { readonly op: 'remove-child'; readonly path: string; readonly name: string };
+  | { readonly op: 'remove-child'; readonly path: string; readonly name: string }
+  | {
+      readonly op: 'set-inherit';
+      readonly path: string;
+      readonly name: string;
+      readonly target: string;
+    }
+  | { readonly op: 'remove-inherit'; readonly path: string; readonly name: string };
 
 /**
  * Conflict taxonomy, lifted from `collab/conflicts/detector.ts` kinds from

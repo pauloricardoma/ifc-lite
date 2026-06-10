@@ -9,7 +9,7 @@
  * by:
  *  1. stripping derived (`ifclite::derived`) cache content,
  *  2. sorting all object keys lexicographically and node arrays by path
- *     (then by canonical node text for stable multi-opinion ordering),
+ *     (stable: same-path opinion order is semantic and preserved),
  *  3. normalizing strings to NFC and numbers to their shortest round-trip
  *     representation, with no insignificant whitespace,
  *  4. including the provenance manifest *except* its `signatures` field
@@ -75,10 +75,12 @@ export function canonicalizeLayer(file: IfcxFile): Uint8Array {
     .map((node) => stripDerivedAttributes(node))
     .map((node) => ({ node, text: canonicalStringify(node) }));
 
-  data.sort((a, b) => {
-    if (a.node.path !== b.node.path) return a.node.path < b.node.path ? -1 : 1;
-    return a.text < b.text ? -1 : a.text > b.text ? 1 : 0;
-  });
+  // Stable sort by path only. The relative order of same-path nodes is
+  // semantic (composition applies them in array order, later opinions
+  // win), so it must survive into the canonical bytes — two layers whose
+  // same-path opinions are ordered differently compose to different
+  // states and must hash to different ids.
+  data.sort((a, b) => (a.node.path < b.node.path ? -1 : a.node.path > b.node.path ? 1 : 0));
 
   const header: Record<string, unknown> = { ...file.header };
   // header.id is where tools record the content address itself — it is

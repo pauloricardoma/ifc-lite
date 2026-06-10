@@ -20,10 +20,12 @@ import {
   setProvenance,
 } from '@ifc-lite/ifcx';
 import {
-  buildRevertLayer,
+  applyResolutions,
   opsToNodes,
   planRebase,
+  planThreeWayMerge,
   type MergeConflict,
+  type ResolutionInput,
 } from '@ifc-lite/merge';
 import { getFlag, hasFlag, printJson } from '../output.js';
 import {
@@ -131,52 +133,117 @@ export async function layerBakeCommand(args: string[]): Promise<void> {
 // revert
 // ---------------------------------------------------------------------------
 
-export interface RevertResult {
-  revertLayerId: string;
-  refLayers: string[];
-}
+export type RevertOutcome =
+  | { status: 'conflicts'; conflicts: MergeConflict[] }
+  | { status: 'reverted'; revertLayerId: string; refLayers: string[] };
 
-/** Publish an inverse-op layer for `layerId` and append it to the ref. */
+/**
+ * Publish an inverse-op layer for `layerId` and append it to the ref.
+ *
+ * Reverting a non-tip layer is a three-way plan, not a blind inverse:
+ * ancestor = the stack through the target layer, theirs = the stack with
+ * the target undone, ours = the ref's current state. Components later
+ * layers also touched surface as conflicts instead of being silently
+ * restored to their pre-target values (`--resolve ours|theirs` decides
+ * them in bulk).
+ */
 export function revertInRef(
   store: LayerStore,
   layerId: string,
   refName: string,
-  options: { principal?: string; created?: string } = {}
-): RevertResult {
+  options: { principal?: string; created?: string; resolve?: 'ours' | 'theirs' } = {}
+): RevertOutcome {
   const id = resolveLayerId(store, layerId);
   const entry = requireRef(store, refName);
   const idx = entry.layers.indexOf(id);
   if (idx === -1) {
     throw new Error(`Layer ${id} is not part of ref ${refName}`);
   }
-  const base = entry.layers.slice(0, idx).map((lid) => loadLayer(store, lid));
-  const init: Parameters<typeof buildRevertLayer>[0] = {
-    layer: loadLayer(store, id),
-    base,
+  const before = entry.layers.slice(0, idx).map((lid) => loadLayer(store, lid));
+  const through = entry.layers.slice(0, idx + 1).map((lid) => loadLayer(store, lid));
+  const current = loadRefLayers(store, refName);
+
+  // A→T is the inverse of the target layer; A→O is everything later
+  // layers changed. The matrix folds disjoint edits and flags overlaps.
+  const plan = planThreeWayMerge({ ancestor: through, ours: current, theirs: before });
+  const resolutions = options.resolve
+    ? plan.conflicts.map((conflict) => {
+        const resolution: ResolutionInput = { path: conflict.path, choice: options.resolve as 'ours' | 'theirs' };
+        if (conflict.componentKey !== undefined) resolution.componentKey = conflict.componentKey;
+        return resolution;
+      })
+    : [];
+  const applied = applyResolutions(plan, resolutions);
+  if (applied.unresolved.length > 0) {
+    return { status: 'conflicts', conflicts: applied.unresolved };
+  }
+
+  const manifest = createProvenanceManifest({
     author: { kind: 'human', principal: options.principal ?? defaultPrincipal() },
-    layerId: id,
+    intent: `Revert layer ${id}`,
+    base: { kind: 'stack', id: computeStackHash(entry.layers) },
+    created: options.created,
+    parents: [id],
+  });
+  const target = loadLayer(store, id);
+  const bare: IfcxFile = {
+    header: {
+      id: '',
+      ifcxVersion: target.header.ifcxVersion,
+      dataVersion: target.header.dataVersion,
+      author: manifest.author.principal,
+      timestamp: manifest.created,
+    },
+    imports: [],
+    schemas: {},
+    data: opsToNodes([...plan.autoOps, ...applied.ops]),
   };
-  if (options.created !== undefined) init.created = options.created;
-  const revert = buildRevertLayer(init);
-  storeLayer(store, revert.file);
-  const refLayers = [...entry.layers, revert.layerId];
+  const withManifest = setProvenance(bare, manifest);
+  const revertLayerId = computeLayerId(withManifest);
+  storeLayer(store, { ...withManifest, header: { ...withManifest.header, id: revertLayerId } });
+  const refLayers = [...entry.layers, revertLayerId];
   setRef(store, refName, { ...entry, layers: refLayers });
-  return { revertLayerId: revert.layerId, refLayers };
+  return { status: 'reverted', revertLayerId, refLayers };
 }
 
 export async function layerRevertCommand(args: string[]): Promise<void> {
   const layerId = args[0];
   const refName = getFlag(args, '--in');
   if (!layerId || layerId.startsWith('-') || !refName) {
-    throw new Error('Usage: ifc-lite layer revert <layer-id> --in <ref> [--json]');
+    throw new Error(
+      'Usage: ifc-lite layer revert <layer-id> --in <ref> [--resolve ours|theirs] [--json]'
+    );
   }
   const store = storeFromArgs(args);
-  const options: { principal?: string } = {};
+  const options: { principal?: string; resolve?: 'ours' | 'theirs' } = {};
   const principal = getFlag(args, '--principal');
   if (principal !== undefined) options.principal = principal;
+  const resolve = getFlag(args, '--resolve');
+  if (resolve !== undefined) {
+    if (resolve !== 'ours' && resolve !== 'theirs') {
+      throw new Error('--resolve must be ours or theirs');
+    }
+    options.resolve = resolve;
+  }
   const result = revertInRef(store, layerId, refName, options);
-  if (hasFlag(args, '--json')) {
-    printJson({ revertLayer: result.revertLayerId, ref: refName, layers: result.refLayers });
+  const json = hasFlag(args, '--json');
+  if (result.status === 'conflicts') {
+    if (json) printJson({ status: 'conflicts', conflicts: result.conflicts });
+    else {
+      process.stderr.write(
+        `${result.conflicts.length} conflict(s): later layers touched components this revert would restore.\n`
+      );
+      for (const c of result.conflicts) {
+        const component = c.componentKey ? ` ${c.componentKey}` : '';
+        process.stderr.write(`  [${c.kind}] ${c.path}${component}\n`);
+      }
+      process.stderr.write('Re-run with --resolve ours|theirs to decide them in bulk.\n');
+    }
+    process.exit(2);
+    return;
+  }
+  if (json) {
+    printJson({ status: 'reverted', revertLayer: result.revertLayerId, ref: refName, layers: result.refLayers });
   } else {
     process.stdout.write(`${result.revertLayerId}\n`);
     process.stderr.write(`Reverted ${shortId(layerId)} in ${refName}\n`);

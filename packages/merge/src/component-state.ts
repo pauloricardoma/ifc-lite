@@ -22,7 +22,13 @@ export interface EntityState {
   components: Map<ComponentKey, ComponentAttributes>;
   /** Child slots: role name → child path. */
   children: Map<string, string>;
-  /** Final tombstone opinion for the path. */
+  /** Inheritance slots: role name → inherited path. */
+  inherits: Map<string, string>;
+  /**
+   * Final tombstone state for the path — explicit `ifclite::deleted`
+   * opinions plus subtree shadowing (a tombstoned parent deletes its
+   * descendants, exactly as composition does).
+   */
   deleted: boolean;
 }
 
@@ -63,7 +69,13 @@ export function extractStackState(layers: readonly IfcxFile[]): StackState {
   const entityFor = (path: string): EntityState => {
     let entity = state.get(path);
     if (!entity) {
-      entity = { path, components: new Map(), children: new Map(), deleted: false };
+      entity = {
+        path,
+        components: new Map(),
+        children: new Map(),
+        inherits: new Map(),
+        deleted: false,
+      };
       state.set(path, entity);
     }
     return entity;
@@ -77,10 +89,38 @@ export function extractStackState(layers: readonly IfcxFile[]): StackState {
 
   // Drop empty shells created purely by child references.
   for (const [path, entity] of state) {
-    if (entity.components.size === 0 && entity.children.size === 0 && !entity.deleted) {
+    if (
+      entity.components.size === 0 &&
+      entity.children.size === 0 &&
+      entity.inherits.size === 0 &&
+      !entity.deleted
+    ) {
       state.delete(path);
     }
   }
+
+  // Entity tombstones shadow child paths: composition removes the whole
+  // subtree, so the merge state must see descendants as deleted too —
+  // otherwise a candidate deleting a parent while the target edits a
+  // descendant would silently miss the delete-vs-modify conflict.
+  const queue: string[] = [];
+  for (const entity of state.values()) {
+    if (entity.deleted) queue.push(entity.path);
+  }
+  while (queue.length > 0) {
+    const path = queue.pop();
+    if (path === undefined) break;
+    const entity = state.get(path);
+    if (!entity) continue;
+    for (const childPath of entity.children.values()) {
+      const child = state.get(childPath);
+      if (child && !child.deleted) {
+        child.deleted = true;
+        queue.push(childPath);
+      }
+    }
+  }
+
   return state;
 }
 
@@ -89,6 +129,12 @@ function applyNode(entity: EntityState, node: IfcxNode): void {
     for (const [name, child] of Object.entries(node.children)) {
       if (child === null) entity.children.delete(name);
       else entity.children.set(name, child);
+    }
+  }
+  if (node.inherits) {
+    for (const [role, target] of Object.entries(node.inherits)) {
+      if (target === null) entity.inherits.delete(role);
+      else entity.inherits.set(role, target);
     }
   }
   if (!node.attributes) return;
@@ -119,13 +165,18 @@ export function snapshotOf(attributes: ComponentAttributes): ComponentSnapshot {
 }
 
 /**
- * Unified view used by the matrix: real components plus `child:<name>`
- * pseudo-components whose single attribute is the child path.
+ * Unified view used by the matrix: real components plus `child:<name>` /
+ * `inherit:<role>` pseudo-components whose single attribute is the
+ * referenced path. Both are relation edges, so divergent edits surface
+ * as `hierarchy` conflicts.
  */
 export function componentEntries(entity: EntityState): Map<ComponentKey, ComponentAttributes> {
   const entries = new Map<ComponentKey, ComponentAttributes>(entity.components);
   for (const [name, child] of entity.children) {
     entries.set(`child:${name}`, { child });
+  }
+  for (const [role, target] of entity.inherits) {
+    entries.set(`inherit:${role}`, { inherit: target });
   }
   return entries;
 }

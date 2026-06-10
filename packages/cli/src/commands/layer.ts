@@ -97,7 +97,9 @@ Commands:
   log <ref>                Provenance log, newest first.       Flags: --json
   bake <ref> -o <out>      Materialize a tombstone-free flat document.
   revert <layer-id>        Publish an inverse layer and append it to a ref.
-                           Flags: --in <ref>, --json
+                           Conflicts (exit 2) when later layers touched the
+                           same components.
+                           Flags: --in <ref>, --resolve ours|theirs, --json
   rebase <layer-id>        Re-plan a candidate onto a ref's current stack
                            and publish the rebased layer.
                            Flags: --onto <ref>, --json

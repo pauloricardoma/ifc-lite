@@ -61,6 +61,22 @@ describe('computeLayerId', () => {
     assert.ok(computeLayerId(a).startsWith('blake3:'));
   });
 
+  it('preserves same-path opinion order: opposite orders hash differently', () => {
+    // Composition applies same-path nodes in array order (later wins), so
+    // [REI60, REI90] and [REI90, REI60] are different states.
+    const a = makeFile([
+      { path: 'wall-1', attributes: { FireRating: 'REI60' } },
+      { path: 'wall-1', attributes: { FireRating: 'REI90' } },
+    ]);
+    const b = makeFile([
+      { path: 'wall-1', attributes: { FireRating: 'REI90' } },
+      { path: 'wall-1', attributes: { FireRating: 'REI60' } },
+    ]);
+    assert.notStrictEqual(computeLayerId(a), computeLayerId(b));
+    // Still deterministic for identical input.
+    assert.strictEqual(computeLayerId(a), computeLayerId(makeFile(a.data)));
+  });
+
   it('changes when an opinion changes', () => {
     const a = makeFile([{ path: 'wall-1', attributes: { Name: 'W1' } }]);
     const b = makeFile([{ path: 'wall-1', attributes: { Name: 'W2' } }]);

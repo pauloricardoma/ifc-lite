@@ -45,7 +45,7 @@ Conformance note: tools unaware of `ifclite::deleted` will compose the entity as
 `layerId = blake3(canonical_bytes)` where canonical bytes are produced by:
 
 1. Strip the sidecar and any `derived: true` content
-2. Sort all object keys lexicographically; sort node arrays by path, then componentKey
+2. Sort all object keys lexicographically; sort node arrays by path with a **stable** sort — the relative order of same-path opinions is semantic (later wins) and is preserved in the canonical bytes
 3. Normalize numbers (shortest round-trip representation), strings (NFC), no insignificant whitespace
 4. The manifest is included **except** the `signatures` field (signatures sign the id, so they cannot be inside it)
 

@@ -209,6 +209,70 @@ describe('three-way decision matrix', () => {
     expect(plan.conflicts[0].componentKey).toBe('child:Wall');
   });
 
+  it('a parent tombstone shadows descendants: editing a child of a deleted parent conflicts', () => {
+    // Theirs deletes the storey (whose subtree contains wall-1); ours
+    // edits the wall. Composition would remove the wall with its parent,
+    // so this must surface as modify-vs-delete, not merge silently.
+    const plan = planThreeWayMerge({
+      ancestor: [base],
+      ours: [base, layer([{ path: 'wall-1', attributes: { [FIRE]: 'REI90' } }], 'ours')],
+      theirs: [base, layer([{ path: 'storey-eg', attributes: { [IFCLITE_ATTR.DELETED]: true } }], 'theirs')],
+    });
+    const wallConflict = plan.conflicts.find((c) => c.path === 'wall-1');
+    expect(wallConflict?.kind).toBe('modify-vs-delete');
+  });
+
+  it('deleting a parent while the other side leaves the subtree alone folds cleanly', () => {
+    const plan = planThreeWayMerge({
+      ancestor: [base],
+      ours: [base],
+      theirs: [base, layer([{ path: 'storey-eg', attributes: { [IFCLITE_ATTR.DELETED]: true } }], 'theirs')],
+    });
+    expect(plan.conflicts).toEqual([]);
+    expect(plan.autoOps).toContainEqual({ op: 'tombstone-entity', path: 'storey-eg' });
+    expect(plan.autoOps).toContainEqual({ op: 'tombstone-entity', path: 'wall-1' });
+  });
+
+  it('inherits changes flow through the plan as set-inherit ops', () => {
+    const withType = makeLayer(
+      [...base.data, { path: 'wall-type-1', attributes: { 'bsi::ifc::class': { code: 'IfcWallType', uri: 'u' } } }],
+      'base'
+    );
+    const plan = planThreeWayMerge({
+      ancestor: [withType],
+      ours: [withType],
+      theirs: [withType, layer([{ path: 'wall-1', inherits: { Type: 'wall-type-1' } }], 'theirs')],
+    });
+    expect(plan.conflicts).toEqual([]);
+    expect(plan.autoOps).toEqual([
+      { op: 'set-inherit', path: 'wall-1', name: 'Type', target: 'wall-type-1' },
+    ]);
+    // Round trip: serialized as an inherits opinion and re-extracted.
+    const merged = stateAfterMerge([withType], plan.autoOps);
+    expect(merged.get('wall-1')?.inherits.get('Type')).toBe('wall-type-1');
+  });
+
+  it('divergent inherits retargeting is a hierarchy conflict', () => {
+    const withTypes = makeLayer(
+      [
+        ...base.data,
+        { path: 'wall-1b', inherits: { Type: 'type-a' }, attributes: { [FIRE]: 'x' } },
+        { path: 'type-a', attributes: { 'bsi::ifc::class': { code: 'IfcWallType', uri: 'u' } } },
+        { path: 'type-b', attributes: { 'bsi::ifc::class': { code: 'IfcWallType', uri: 'u' } } },
+        { path: 'type-c', attributes: { 'bsi::ifc::class': { code: 'IfcWallType', uri: 'u' } } },
+      ],
+      'base'
+    );
+    const plan = planThreeWayMerge({
+      ancestor: [withTypes],
+      ours: [withTypes, layer([{ path: 'wall-1b', inherits: { Type: 'type-b' } }], 'ours')],
+      theirs: [withTypes, layer([{ path: 'wall-1b', inherits: { Type: 'type-c' } }], 'theirs')],
+    });
+    expect(plan.conflicts).toHaveLength(1);
+    expect(plan.conflicts[0].kind).toBe('hierarchy');
+    expect(plan.conflicts[0].componentKey).toBe('inherit:Type');
+  });
+
   it('fast path: candidate based on the ref state merges without conflicts', () => {
     const candidate = layer([{ path: 'wall-1', attributes: { [FIRE]: 'REI90' } }], 'candidate');
     const plan = planThreeWayMerge({ ancestor: [base], ours: [base], theirs: [base, candidate] });

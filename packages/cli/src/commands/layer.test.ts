@@ -272,6 +272,7 @@ describe('revert', () => {
     mergeIntoRef(store, { candidateId: edit.layerId, into: 'main' });
 
     const result = revertInRef(store, edit.layerId, 'main', { principal: 'carol' });
+    if (result.status !== 'reverted') throw new Error('expected clean revert');
     expect(getRef(store, 'main')?.layers).toEqual([baseId, edit.layerId, result.revertLayerId]);
 
     const reverted = extractStackState(loadRefLayers(store, 'main'));
@@ -280,6 +281,37 @@ describe('revert', () => {
       baseline.get('wall-1')?.components.get('pset:Pset_FireSafety')
     );
     expect(() => revertInRef(store, 'blake3:0000', 'main')).toThrow();
+  });
+
+  it('conflicts instead of clobbering later edits to the same component', () => {
+    // A→B (revert target), then a later B→C edit: reverting A→B must not
+    // silently produce A.
+    const store = tmpStore();
+    setupMain(store);
+    const toB = publishLayer(store, {
+      delta: makeDelta([{ path: 'wall-1', attributes: { [FIRE]: 'B' } }]),
+      baseRef: 'main',
+      intent: 'A to B',
+      principal: 'bob',
+    });
+    mergeIntoRef(store, { candidateId: toB.layerId, into: 'main' });
+    const toC = publishLayer(store, {
+      delta: makeDelta([{ path: 'wall-1', attributes: { [FIRE]: 'C' } }]),
+      baseRef: 'main',
+      intent: 'B to C',
+      principal: 'dave',
+    });
+    mergeIntoRef(store, { candidateId: toC.layerId, into: 'main' });
+
+    const outcome = revertInRef(store, toB.layerId, 'main');
+    if (outcome.status !== 'conflicts') throw new Error('expected conflicts');
+    expect(outcome.conflicts.map((c) => c.componentKey)).toEqual(['pset:Pset_FireSafety']);
+
+    // ours keeps the later edit (C); the disjoint parts still revert.
+    const kept = revertInRef(store, toB.layerId, 'main', { resolve: 'ours' });
+    if (kept.status !== 'reverted') throw new Error('expected revert with resolution');
+    const state = extractStackState(loadRefLayers(store, 'main'));
+    expect(state.get('wall-1')?.components.get('pset:Pset_FireSafety')).toEqual({ [FIRE]: 'C' });
   });
 });
 
@@ -315,8 +347,10 @@ describe('diff', () => {
     ]);
     const result = diffLayerStacks(base, [...base, next]);
     expect(result.added).toEqual(['wall-2']);
-    expect(result.deleted).toEqual(['storey-eg']);
-    expect(result.modified).toEqual([{ path: 'wall-1', components: ['pset:Pset_FireSafety'] }]);
+    // Tombstoning the storey shadows its subtree: wall-1 is deleted with
+    // it, so its concurrent pset edit is no longer a "modified" entry.
+    expect(result.deleted).toEqual(['storey-eg', 'wall-1']);
+    expect(result.modified).toEqual([]);
   });
 });
 
