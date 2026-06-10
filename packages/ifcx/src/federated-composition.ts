@@ -238,7 +238,11 @@ function mergeNodesForPath(path: string, layers: IfcxLayer[]): PreComposedNode {
         }
       }
 
-      // Merge attributes
+      // Merge attributes. Null opinions are removal masks that must stay
+      // in pre.attributes: resolveInheritance only copies inherited
+      // values for ABSENT keys, so the mask shadows them; composeNode
+      // drops masks from the final output (#1031). A later non-null
+      // opinion overwrites the mask (resurrect).
       if (node.attributes) {
         for (const [key, value] of Object.entries(node.attributes)) {
           result.attributes[key] = value;
@@ -386,8 +390,9 @@ function composeNode(
   };
 
   if (pre) {
-    // Copy attributes
+    // Copy attributes (null removal masks resolved here — never emitted)
     for (const [key, value] of Object.entries(pre.attributes)) {
+      if (value === null) continue;
       node.attributes.set(key, value);
 
       // Track source

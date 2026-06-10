@@ -10,9 +10,10 @@
  */
 
 import type { IfcxFile, ComposedNode } from './types.js';
+import { isTypedPropertyValue, parseV5aKey } from './types.js';
 import { composeIfcx, findRoots } from './composition.js';
 import { extractEntities } from './entity-extractor.js';
-import { extractProperties, isQuantityProperty } from './property-extractor.js';
+import { extractProperties, routesToQuantityTable } from './property-extractor.js';
 import { extractGeometry, type MeshData } from './geometry-extractor.js';
 import { extractPointClouds, type PointCloudExtraction } from './pointcloud-extractor.js';
 import { buildHierarchy } from './hierarchy-builder.js';
@@ -330,18 +331,25 @@ function buildQuantities(
     const qsetName = ifcClass ? `Qto_${ifcClass.replace('Ifc', '')}BaseQuantities` : 'BaseQuantities';
 
     for (const [key, value] of node.attributes) {
-      // Check if this looks like a quantity
-      const propName = key.split('::').pop() ?? '';
+      // Same routing rule the property extractor uses to skip — the v5a
+      // namespace mirrors the collab inflation dialect, typed records
+      // (#1031) unwrap to their scalar — so neither table drops or
+      // double-claims an attribute.
+      if (!routesToQuantityTable(key, value)) continue;
 
-      if (typeof value === 'number' && isQuantityProperty(propName)) {
-        builder.add({
-          entityId: expressId,
-          qsetName,
-          quantityName: propName,
-          quantityType: getQuantityType(propName),
-          value,
-        });
-      }
+      const v5a = parseV5aKey(key);
+      const propName = v5a?.name ?? key.split('::').pop() ?? '';
+      const effective = isTypedPropertyValue(value) ? value.value : value;
+
+      builder.add({
+        entityId: expressId,
+        // Keep the authored set name (Qto_* or custom) when the key
+        // carries one; only heuristic-routed keys get the synthesized set.
+        qsetName: v5a ? v5a.setName : qsetName,
+        quantityName: propName,
+        quantityType: getQuantityType(propName),
+        value: effective as number,
+      });
     }
   }
 

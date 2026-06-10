@@ -90,6 +90,10 @@ function flattenNodes(path: string, nodes: IfcxNode[]): PreComposedNode {
       }
     }
     if (node.attributes) {
+      // Later wins, INCLUDING null: a null is a removal opinion and must
+      // survive flattening as a mask — composeNode resolves it after
+      // inheritance so removals also shadow inherited values (#1031). A
+      // later non-null opinion overwrites the mask (resurrect).
       Object.assign(result.attributes, node.attributes);
     }
   }
@@ -148,9 +152,15 @@ function composeNode(
     }
   }
 
-  // Apply own attributes (override inherited)
+  // Apply own attributes (override inherited). Null opinions are removal
+  // masks: they delete the (possibly inherited) attribute and never
+  // appear in composed output.
   for (const [key, value] of Object.entries(pre.attributes)) {
-    node.attributes.set(key, value);
+    if (value === null) {
+      node.attributes.delete(key);
+    } else {
+      node.attributes.set(key, value);
+    }
   }
 
   // Resolve children

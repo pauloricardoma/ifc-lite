@@ -24,6 +24,18 @@ export {
   type PublishedLayer,
 } from './publish-layer.js';
 export {
+  V5A_ATTR_PREFIX,
+  structuredAttributeKey,
+  flattenStructuredBranches,
+  inflateStructuredAttributes,
+  isPropertyValueShaped,
+  geometryRecordLookup,
+  type StructuredBranchesJSON,
+  type InflatedAttributes,
+  type GeometryRefCarrier,
+  type FlattenOptions,
+} from './structured-attrs.js';
+export {
   runSnapshotWorker,
   type WorkerRequest,
   type WorkerResponse,
