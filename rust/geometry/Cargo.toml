@@ -11,23 +11,12 @@ categories = ["graphics", "parsing"]
 readme = "../../README.md"
 
 [features]
-# Manifold is on by default for native consumers (server, desktop, CLI,
-# tests). The WASM crate (`ifc-lite-wasm`) opts into the
-# `manifold-csg-wasm-uu` variant of the same kernel, single-threaded at
-# runtime to fit the wasm32-unknown-unknown execution model. See
-# `docs/architecture/geometry-pipeline.md` "WASM status" for build
-# prerequisites and the history of the formerly-blocking
-# `wasm-cxx-shim` issue, resolved in `manifold-csg-sys` 3.5.100.
-default = ["manifold-csg"]
-# Use the Manifold (https://github.com/elalish/manifold) C++ kernel for
-# `subtract_mesh` / `union_mesh` / `intersection_mesh` instead of the
-# legacy in-tree BSP port (`bsp_csg.rs`). Removes the 24-polygon operand
-# cap and gives manifold-by-construction output.
-manifold-csg = ["dep:manifold-csg"]
-# Enable Manifold on `wasm32-unknown-unknown`. Implies `manifold-csg`.
-# Requires the build host to have LLVM 18+ with libc++ headers and
-# `wasm-ld` (see scripts/vercel-install.sh + docs/architecture/geometry-pipeline.md).
-manifold-csg-wasm-uu = ["manifold-csg", "manifold-csg/unstable-wasm-uu"]
+# CSG runs on the in-tree pure-Rust exact mesh-arrangement kernel
+# (`src/kernel/`) on every target — native and wasm32 alike. The former
+# Manifold C++ kernel (`manifold-csg` / `manifold-csg-wasm-uu`) and the
+# legacy BSP port were removed in the kernel consolidation
+# (docs/architecture/geometry-pipeline.md).
+default = []
 debug_geometry = []
 
 [dependencies]
@@ -66,11 +55,17 @@ smallvec = "1.13"
 # Error handling
 thiserror = "2.0"
 
-# Optional Manifold CSG kernel (T1.1). Off by default; see the
-# `manifold-csg` feature above for the activation contract.
-# `default-features = false` drops TBB-backed parallelism, which doesn't
-# work on WASM anyway and isn't required for correctness on native.
-manifold-csg = { version = "0.3", default-features = false, optional = true }
+# Pure-Rust CSG kernel (`kernel/`) — exact geometric predicates.
+# geometry-predicates: Shewchuk adaptive predicates + the public expansion
+# primitives (two_sum/two_product/scale_expansion_zeroelim) for the indirect
+# layer. no_std, no C, wasm-clean, FMA-free (platform-deterministic signs).
+geometry-predicates = "0.3"
+# Exact BigRational oracle + the predicate cascade's exact fallback tier
+# (already transitive; promoted to direct).
+num-rational = { version = "0.4", default-features = false, features = ["num-bigint"] }
+num-bigint = { version = "0.4", default-features = false }
+num-traits = { version = "0.2", default-features = false }
+bnum = { version = "0.14.4", features = ["numtraits"] }
 
 [dev-dependencies]
 approx = "0.5"
@@ -85,7 +80,7 @@ proptest = "1.6"
 # with `cargo insta review`.
 insta = { version = "1.43", default-features = false }
 # Shewchuk adaptive exact geometric predicates (sign-exact, no_std, no C deps).
-# Used by the cross-platform determinism floor test that underpins the planned
+# Used by the cross-platform determinism floor test that underpins the
 # pure-Rust CSG kernel. Dev-only: not linked into the shipping crate.
 robust = "1.2"
 

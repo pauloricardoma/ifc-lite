@@ -9,7 +9,6 @@
 use crate::diagnostics::{BoolFailure, BoolFailureReason, BoolOp};
 use crate::error::Result;
 use crate::mesh::Mesh;
-use crate::triangulation::{calculate_polygon_normal, project_to_2d, triangulate_polygon};
 use nalgebra::{Point3, Vector3};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -111,21 +110,46 @@ impl Triangle {
     }
 }
 
-/// Maximum polygon count for either operand in a csgrs boolean operation.
-///
-/// Rectangular solids are 12 triangles. A 16-segment circular prism — the
-/// downsampled form of a round-window opening (issue #635) — is 60
-/// triangles, and AC20-FZK-Haus packs two such prisms (outer + recessed)
-/// into a single opening element, totalling ~120 triangles for the cut.
-/// This budget accommodates that combined opening and the wall mesh
-/// without letting the BSP tree explode: 128 is the upper bound past
-/// which BSP CSG performance starts to degrade noticeably and the WASM
-/// browser stack is at risk.
-///
-/// Do NOT raise this above 128.
-const MAX_CSG_POLYGONS_PER_MESH: usize = 128;
-/// Maximum combined polygon count for CSG operations.
-const MAX_CSG_POLYGONS: usize = MAX_CSG_POLYGONS_PER_MESH * 2;
+/// One recorded invocation of a CSG kernel op (perf-census diagnostics).
+/// `op`: 0=subtract 1=union 2=intersection
+/// 3=clip. `a_tris`/`b_tris` are the operand triangle counts — the arrangement
+/// cost driver — so the census measures the *real* heavy-path workload reaching
+/// the kernel (analytic AABB box clips never get here).
+#[derive(Clone, Copy, Debug)]
+pub struct CsgOpRecord {
+    pub op: u8,
+    pub a_tris: u32,
+    pub b_tris: u32,
+}
+
+// Global (Mutex) so it captures ops on rayon worker threads, not just the caller.
+static CSG_CENSUS: std::sync::Mutex<Vec<CsgOpRecord>> = std::sync::Mutex::new(Vec::new());
+
+/// Clear the CSG op census (call before a measured run).
+pub fn reset_csg_census() {
+    if let Ok(mut g) = CSG_CENSUS.lock() {
+        g.clear();
+    }
+}
+
+/// Drain the CSG op census (call after a measured run).
+pub fn take_csg_census() -> Vec<CsgOpRecord> {
+    CSG_CENSUS
+        .lock()
+        .map(|mut g| std::mem::take(&mut *g))
+        .unwrap_or_default()
+}
+
+#[inline]
+fn record_csg_op(op: u8, a_tris: usize, b_tris: usize) {
+    if let Ok(mut g) = CSG_CENSUS.lock() {
+        g.push(CsgOpRecord {
+            op,
+            a_tris: a_tris as u32,
+            b_tris: b_tris as u32,
+        });
+    }
+}
 
 /// CSG Clipping Processor
 pub struct ClippingProcessor {
@@ -136,213 +160,40 @@ pub struct ClippingProcessor {
     failures: RefCell<Vec<BoolFailure>>,
 }
 
-/// Coplanar triangle bucket entry used by `mesh_to_polygons` during the
-/// pre-BSP merge pass.
-#[cfg_attr(feature = "manifold-csg", allow(dead_code))]
-struct BucketTri {
-    v: [crate::bsp_csg::Vertex; 3],
-    keys: [(i64, i64, i64); 3],
-    normal: [f64; 3],
-}
-
-/// Merge the triangles in one coplanar bucket into the largest convex
-/// boundary polygons the topology supports. Falls back to emitting each
-/// triangle individually if (a) the bucket's boundary walk hits branching
-/// — a single vertex with two outgoing boundary edges — or (b) any walked
-/// ring turns out to be non-convex (BSP's `split_polygon` only behaves on
-/// convex polygons). For the bath block this collapses each 2-tri face
-/// into a 4-vertex quad and each 22-tri cap fan into a 28-vertex rounded
-/// rect outline.
-#[cfg_attr(feature = "manifold-csg", allow(dead_code))]
-fn merge_coplanar_bucket(
-    tris: &[BucketTri],
-    indices: &[usize],
-) -> Vec<crate::bsp_csg::Polygon> {
-    use crate::bsp_csg::{Polygon, Vertex};
-    use rustc_hash::{FxHashMap, FxHashSet};
-
-    if indices.is_empty() {
-        return Vec::new();
+/// Is `v` a degenerate NEEDLE — its shortest edge a hairline relative to its
+/// longest? Such a triangle is a zero-area-intended sliver: the exact kernel
+/// faithfully spans two near-coincident-but-distinct rim Vids (an f32-import /
+/// shallow-dihedral near-duplicate the interner correctly does NOT weld) out to a
+/// far vertex (issue #1007 / schependomlaan: the diagonal flap over an opening).
+///
+/// The test is `min_edge < floor_pow2(max_edge) · 2⁻¹³` — POWER-OF-TWO and
+/// scale-relative, so it is bit-deterministic AND catches the needle (min 6.6 µm
+/// vs max ~5 m ⇒ threshold ~5·10⁻⁴) while never touching a real thin sliver
+/// (e.g. a 0.2 m × 2 m face, min 0.2 m ≫ 2·10⁻⁴). Dropping a needle cannot open a
+/// real gap — the hole/seam is already framed by the neighbouring non-degenerate
+/// triangles, exactly as Manifold (which welds the near-duplicate) produces.
+pub(crate) fn tri_is_needle(v: &[Point3<f64>; 3]) -> bool {
+    let d = |a: &Point3<f64>, b: &Point3<f64>| (a - b).norm();
+    let (e0, e1, e2) = (d(&v[0], &v[1]), d(&v[1], &v[2]), d(&v[2], &v[0]));
+    let mn = e0.min(e1).min(e2);
+    let mx = e0.max(e1).max(e2);
+    if !mx.is_finite() || mx <= 0.0 {
+        return true; // fully degenerate
     }
-    if indices.len() == 1 {
-        let t = &tris[indices[0]];
-        return vec![Polygon::new(t.v.to_vec())];
-    }
-
-    let fallback_per_triangle = |bucket: &[usize]| -> Vec<Polygon> {
-        bucket
-            .iter()
-            .map(|&i| Polygon::new(tris[i].v.to_vec()))
-            .collect()
-    };
-
-    type Key = (i64, i64, i64);
-
-    // Per-vertex data — first occurrence wins. Within a coplanar bucket the
-    // per-vertex normals are all the face normal anyway, so collisions are
-    // benign.
-    let mut vertex_data: FxHashMap<Key, Vertex> = FxHashMap::default();
-
-    // Directed edge counts. An interior edge appears as both (u,v) and
-    // (v,u); a boundary edge has the forward direction only.
-    let mut edge_count: FxHashMap<(Key, Key), u32> = FxHashMap::default();
-
-    for &i in indices {
-        let t = &tris[i];
-        for k in 0..3 {
-            vertex_data
-                .entry(t.keys[k])
-                .or_insert_with(|| t.v[k].clone());
-        }
-        for (a, b) in [(0, 1), (1, 2), (2, 0)] {
-            *edge_count.entry((t.keys[a], t.keys[b])).or_insert(0) += 1;
-        }
-    }
-
-    // Build the next-edge map across all boundary edges. A vertex with
-    // more than one outgoing boundary edge means the merged shape would
-    // have to fork (think two coplanar faces touching at a single vertex),
-    // which the simple ring walk cannot represent — bail out.
-    let mut next_edge: FxHashMap<Key, Key> = FxHashMap::default();
-    for ((u, v), _) in edge_count
-        .iter()
-        .filter(|((u, v), _)| !edge_count.contains_key(&(*v, *u)))
-    {
-        if next_edge.insert(*u, *v).is_some() {
-            return fallback_per_triangle(indices);
-        }
-    }
-
-    if next_edge.is_empty() {
-        return fallback_per_triangle(indices);
-    }
-
-    let plane_normal = tris[indices[0]].normal;
-    let starts: Vec<Key> = next_edge.keys().copied().collect();
-    let mut visited: FxHashSet<Key> = FxHashSet::default();
-    let mut rings: Vec<Vec<Vertex>> = Vec::new();
-    for start in starts {
-        if visited.contains(&start) {
-            continue;
-        }
-        let mut ring: Vec<Vertex> = Vec::new();
-        let mut current = start;
-        let mut steps = 0;
-        loop {
-            if !visited.insert(current) {
-                break;
-            }
-            if let Some(v) = vertex_data.get(&current) {
-                ring.push(v.clone());
-            } else {
-                return fallback_per_triangle(indices);
-            }
-            let next = match next_edge.get(&current) {
-                Some(&n) => n,
-                None => break,
-            };
-            if next == start {
-                break;
-            }
-            current = next;
-            steps += 1;
-            if steps > vertex_data.len() {
-                // Cycle that did not close on `start` — give up.
-                return fallback_per_triangle(indices);
-            }
-        }
-        if ring.len() >= 3 {
-            if !ring_is_convex(&ring, plane_normal) {
-                return fallback_per_triangle(indices);
-            }
-            rings.push(ring);
-        }
-    }
-
-    if rings.is_empty() {
-        return fallback_per_triangle(indices);
-    }
-    rings
-        .into_iter()
-        .map(|r| simplify_collinear(r))
-        .filter(|r| r.len() >= 3)
-        .map(Polygon::new)
-        .collect()
-}
-
-/// Drop ring vertices that are collinear with both neighbours. BSP
-/// over-fragments host faces by splitting them at every extended cutter
-/// plane, even when the cutter doesn't reach the face in 3D. The
-/// pre/post-merge in `mesh_to_polygons` reassembles those fragments into
-/// a single polygon — but the polygon then carries dozens of collinear
-/// "phantom" vertices along the outer edges (each one introduced when a
-/// cutter wall plane projection crossed the host outline). Without this
-/// pass, earcut emits one sliver triangle per phantom vertex; with it,
-/// the bath bottom face collapses back to the 4 corners it started with
-/// and triangulates as 2 tris (issue #780).
-#[cfg_attr(feature = "manifold-csg", allow(dead_code))]
-fn simplify_collinear(
-    ring: Vec<crate::bsp_csg::Vertex>,
-) -> Vec<crate::bsp_csg::Vertex> {
-    let n = ring.len();
-    if n < 4 {
-        return ring;
-    }
-    let mut keep: Vec<bool> = vec![true; n];
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for i in 0..n {
-            if !keep[i] {
-                continue;
-            }
-            let prev = (1..n)
-                .map(|k| (i + n - k) % n)
-                .find(|&k| keep[k]);
-            let next = (1..n).map(|k| (i + k) % n).find(|&k| keep[k]);
-            let (prev, next) = match (prev, next) {
-                (Some(p), Some(n)) if p != i && n != i && p != n => (p, n),
-                _ => continue,
-            };
-            let a = ring[prev].pos;
-            let b = ring[i].pos;
-            let c = ring[next].pos;
-            let e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-            let e2 = [c[0] - b[0], c[1] - b[1], c[2] - b[2]];
-            let cross = [
-                e1[1] * e2[2] - e1[2] * e2[1],
-                e1[2] * e2[0] - e1[0] * e2[2],
-                e1[0] * e2[1] - e1[1] * e2[0],
-            ];
-            let cross_mag =
-                (cross[0].powi(2) + cross[1].powi(2) + cross[2].powi(2)).sqrt();
-            let e1_len = (e1[0].powi(2) + e1[1].powi(2) + e1[2].powi(2)).sqrt();
-            let e2_len = (e2[0].powi(2) + e2[1].powi(2) + e2[2].powi(2)).sqrt();
-            let denom = e1_len * e2_len;
-            if denom < 1.0e-18 || cross_mag / denom < 1.0e-6 {
-                keep[i] = false;
-                changed = true;
-            }
-        }
-    }
-    let kept: Vec<_> = ring
-        .into_iter()
-        .zip(keep.iter())
-        .filter_map(|(v, k)| if *k { Some(v) } else { None })
-        .collect();
-    if kept.len() >= 3 {
-        kept
-    } else {
-        Vec::new()
-    }
+    mn < floor_pow2(mx) * 2.0_f64.powi(-13)
 }
 
 /// Push a single triangle (with the supplied face normal applied to all
-/// three vertices) onto `mesh`. Used by `consolidate_coplanar` for plane
-/// buckets that have only one input triangle and don't need the 2D-union
-/// round-trip.
-#[cfg_attr(feature = "manifold-csg", allow(dead_code))]
+/// three vertices) onto `mesh`, UNLESS it is a degenerate needle ([`tri_is_needle`]).
+/// Used by `consolidate_coplanar` for plane buckets that don't go through the
+/// 2D-union round-trip (single-triangle buckets and the union-collapse fallback);
+/// the needle drop here is what removes the #1007 diagonal sliver, since each
+/// tilted opening face lands in its own single-triangle plane bucket and would
+/// otherwise pass the raw kernel needle through verbatim.
 fn emit_triangle(mesh: &mut Mesh, v: &[Point3<f64>; 3], normal: &Vector3<f64>) {
+    if tri_is_needle(v) {
+        return;
+    }
     let base = mesh.vertex_count() as u32;
     mesh.add_vertex(v[0], *normal);
     mesh.add_vertex(v[1], *normal);
@@ -354,7 +205,6 @@ fn emit_triangle(mesh: &mut Mesh, v: &[Point3<f64>; 3], normal: &Vector3<f64>) {
 /// i_overlay union of many small fragments often leaves "phantom"
 /// vertices on every fragment boundary that crosses the outer outline;
 /// without this pass earcut would emit one sliver triangle per phantom.
-#[cfg_attr(feature = "manifold-csg", allow(dead_code))]
 fn simplify_2d_collinear(ring: &[nalgebra::Point2<f64>]) -> Vec<nalgebra::Point2<f64>> {
     let n = ring.len();
     if n < 4 {
@@ -401,43 +251,93 @@ fn simplify_2d_collinear(ring: &[nalgebra::Point2<f64>]) -> Vec<nalgebra::Point2
         .collect()
 }
 
-/// Convexity test for a coplanar ring of vertices. All `(edge_i × edge_{i+1})`
-/// products must have the same sign when projected onto the plane normal.
-#[cfg_attr(feature = "manifold-csg", allow(dead_code))]
-fn ring_is_convex(ring: &[crate::bsp_csg::Vertex], normal: [f64; 3]) -> bool {
-    let n = ring.len();
-    if n < 3 {
-        return false;
+/// Largest power of two ≤ `x` (x finite, > 0). The exponent is read straight
+/// off the IEEE-754 bits, so the result is an EXACT f64 with a single set bit —
+/// bit-identical across x86_64/aarch64/wasm (no rounding, no transcendental).
+#[inline]
+fn floor_pow2(x: f64) -> f64 {
+    if !x.is_finite() || x <= 0.0 {
+        return 0.0;
     }
-    let mut sign: i32 = 0;
-    for i in 0..n {
-        let a = ring[i].pos;
-        let b = ring[(i + 1) % n].pos;
-        let c = ring[(i + 2) % n].pos;
-        let e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-        let e2 = [c[0] - b[0], c[1] - b[1], c[2] - b[2]];
-        let cross = [
-            e1[1] * e2[2] - e1[2] * e2[1],
-            e1[2] * e2[0] - e1[0] * e2[2],
-            e1[0] * e2[1] - e1[1] * e2[0],
-        ];
-        let dot = cross[0] * normal[0] + cross[1] * normal[1] + cross[2] * normal[2];
-        let s = if dot > 1.0e-12 {
-            1
-        } else if dot < -1.0e-12 {
-            -1
-        } else {
-            0
-        };
-        if s != 0 {
-            if sign == 0 {
-                sign = s;
-            } else if sign != s {
-                return false;
-            }
+    // 2^floor(log2(x)) via the unbiased exponent of the f64 representation.
+    let exp = x.to_bits() >> 52 & 0x7ff; // biased exponent
+    let unbiased = exp as i64 - 1023;
+    // f64::powi keeps a power-of-two base exact; 2.0_f64.powi is exact for the
+    // representable exponent range we hit (|coords| ≲ 1e7 ⇒ exponent ≲ 24).
+    2.0_f64.powi(unbiased as i32)
+}
+
+/// Merge consecutive near-coincident 2D contour vertices BEFORE the union/earcut.
+///
+/// The exact mesh-arrangement kernel correctly preserves two distinct rim points
+/// that the modeller intended as one but f32 import / a shallow-dihedral LPI
+/// crossing split a few µm apart (issue #1007 / schependomlaan: the diagonal
+/// sliver "flap" over an opening). They reach `consolidate_coplanar` as a hairline
+/// notch on the hole/outer ring; `simplify_2d_collinear` (a TURN-ANGLE test) does
+/// not remove them, so earcut frames the notch out to a far vertex → a degenerate
+/// needle (aspect ≫ 10⁵) that renders as a flap across the opening.
+///
+/// This collapses any vertex within `eps` of its kept predecessor onto that
+/// predecessor. `eps` is a POWER OF TWO scaled to the ring's bounding-box extent
+/// (`floor_pow2(extent) · 2⁻¹³` ≈ extent/8192) and CAPPED at an absolute
+/// 2⁻¹² m (244 µm) — bit-deterministic. On the #1007 fixture the rim
+/// duplicates span 6–72 µm on ~2 m faces (~3·10⁻⁶ … 4·10⁻⁵ of the extent)
+/// while the smallest REAL feature edge is 0.2 m (~0.1 of the extent), so eps
+/// (~10⁻⁴ of the extent) sits three orders of magnitude above the duplicate
+/// spread and three below any real edge — no over-weld. The absolute cap is
+/// what protects mm-scale features on LARGE rings: the duplicate spread comes
+/// from f32 import noise / shallow-dihedral LPI crossings whose magnitude does
+/// NOT grow with ring extent (operands are snapped about their AABB centre),
+/// but an uncapped extent-relative eps reaches 1 mm at 8 m and would swallow a
+/// genuine 1 mm chamfer on a long steel member. This runs in the already-
+/// non-exact consolidation post-pass; it does NOT touch the exact kernel's
+/// interner/predicates (no float weld in the determinism path).
+fn weld_near_coincident_2d(ring: &[nalgebra::Point2<f64>]) -> Vec<nalgebra::Point2<f64>> {
+    let n = ring.len();
+    if n < 4 {
+        return ring.to_vec();
+    }
+    let (mut minx, mut miny, mut maxx, mut maxy) =
+        (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for p in ring {
+        minx = minx.min(p.x);
+        miny = miny.min(p.y);
+        maxx = maxx.max(p.x);
+        maxy = maxy.max(p.y);
+    }
+    let extent = (maxx - minx).max(maxy - miny);
+    if !extent.is_finite() || extent <= 0.0 {
+        return ring.to_vec();
+    }
+    // extent · 2⁻¹³ rounded DOWN to a power of two, capped at an absolute
+    // 2⁻¹² m so big rings can't swallow mm-scale features ⇒ exact, deterministic.
+    let eps = (floor_pow2(extent) * 2.0_f64.powi(-13)).min(2.0_f64.powi(-12));
+    let eps2 = eps * eps;
+    let mut kept: Vec<nalgebra::Point2<f64>> = Vec::with_capacity(n);
+    for &p in ring {
+        let dup = kept.last().is_some_and(|q| {
+            let dx = p.x - q.x;
+            let dy = p.y - q.y;
+            dx * dx + dy * dy < eps2
+        });
+        if !dup {
+            kept.push(p);
         }
     }
-    true
+    // close-the-loop check: last vs first.
+    if kept.len() >= 2 {
+        let (first, last) = (kept[0], *kept.last().unwrap());
+        let dx = last.x - first.x;
+        let dy = last.y - first.y;
+        if dx * dx + dy * dy < eps2 {
+            kept.pop();
+        }
+    }
+    if kept.len() >= 3 {
+        kept
+    } else {
+        ring.to_vec()
+    }
 }
 
 /// Create a box mesh from AABB min/max bounds
@@ -484,20 +384,6 @@ fn aabb_to_mesh(min: Point3<f64>, max: Point3<f64>) -> Mesh {
 }
 
 impl ClippingProcessor {
-    #[cfg_attr(feature = "manifold-csg", allow(dead_code))]
-    #[inline]
-    fn can_run_csg_operation(polygons_a: usize, polygons_b: usize) -> bool {
-        if polygons_a < 4 || polygons_b < 4 {
-            return false;
-        }
-
-        if polygons_a > MAX_CSG_POLYGONS_PER_MESH || polygons_b > MAX_CSG_POLYGONS_PER_MESH {
-            return false;
-        }
-
-        polygons_a + polygons_b <= MAX_CSG_POLYGONS
-    }
-
     /// Create a new clipping processor
     pub fn new() -> Self {
         Self {
@@ -520,11 +406,11 @@ impl ClippingProcessor {
 
     /// Whether any failure recorded since index `since` (a prior
     /// [`failure_count`](Self::failure_count)) was an `OperandTooLarge`
-    /// rejection — i.e. the BSP polygon cap returned the host unchanged for a
-    /// genuinely complex cutter (issue #635), as opposed to a kernel error /
-    /// no-overlap / no real intersection. Lets the void router tell "too complex
-    /// to cut, fall back to the AABB box" apart from "the cutter doesn't really
-    /// intersect, keep the host".
+    /// rejection. HISTORICAL: only the deleted BSP polygon cap ever
+    /// emitted this from the boolean ops — the exact kernel has no operand
+    /// cap, so this is now always `false` on the boolean path. Kept because
+    /// the void router still keys its AABB-fallback decision on it
+    /// (issue #635 / #947), which is conservative and correct either way.
     pub(crate) fn has_operand_too_large_since(&self, since: usize) -> bool {
         let failures = self.failures.borrow();
         let since = since.min(failures.len());
@@ -673,199 +559,6 @@ impl ClippingProcessor {
         self.subtract_mesh(mesh, &box_mesh)
     }
 
-    /// Convert our Mesh format to BSP polygon list. Used only by the
-    /// legacy BSP path; under `manifold-csg` this is dead code.
-    ///
-    /// **Coplanar merge pass.** A naive triangle→polygon conversion forces
-    /// BSP to split every cutter plane against the host's interior diagonal
-    /// edges, producing sliver fans on subtraction (issue #780 bath: each
-    /// of the cutter's 28 wall planes sliced the bath top face along the
-    /// (0,0)→(2,0.8) diagonal, leaving thin "spike" triangles radiating to
-    /// the bath outer edge). The fix is to recover the original N-gon
-    /// faces by bucketing input triangles by plane and walking each
-    /// bucket's boundary edges. BSP then operates on the actual face
-    /// quads / cap polygons and the artifact disappears. Non-convex merge
-    /// results fall back to per-triangle emission (BSP's `split_polygon`
-    /// only behaves on convex input).
-    #[cfg_attr(feature = "manifold-csg", allow(dead_code))]
-    fn mesh_to_polygons(mesh: &Mesh) -> Vec<crate::bsp_csg::Polygon> {
-        use crate::bsp_csg::{Polygon, Vertex};
-        use rustc_hash::FxHashMap;
-
-        if mesh.is_empty() || mesh.indices.len() < 3 {
-            return Vec::new();
-        }
-
-        let vertex_count = mesh.positions.len() / 3;
-
-        // Quantization: 1 µm. With BSP running in file units (mm for the
-        // bath, m for most other models) this is far finer than the
-        // BSP EPSILON (1e-5) and far coarser than f64 noise.
-        const QUANT: f64 = 1.0e6;
-        let quantize = |p: [f64; 3]| -> (i64, i64, i64) {
-            (
-                (p[0] * QUANT).round() as i64,
-                (p[1] * QUANT).round() as i64,
-                (p[2] * QUANT).round() as i64,
-            )
-        };
-
-        // Step 1 — collect valid triangles with plane keys.
-        let mut tris: Vec<BucketTri> = Vec::with_capacity(mesh.indices.len() / 3);
-        for chunk in mesh.indices.chunks_exact(3) {
-            let i0 = chunk[0] as usize;
-            let i1 = chunk[1] as usize;
-            let i2 = chunk[2] as usize;
-            if i0 >= vertex_count || i1 >= vertex_count || i2 >= vertex_count {
-                continue;
-            }
-            let p0 = i0 * 3;
-            let p1 = i1 * 3;
-            let p2 = i2 * 3;
-            let v0 = [
-                mesh.positions[p0] as f64,
-                mesh.positions[p0 + 1] as f64,
-                mesh.positions[p0 + 2] as f64,
-            ];
-            let v1 = [
-                mesh.positions[p1] as f64,
-                mesh.positions[p1 + 1] as f64,
-                mesh.positions[p1 + 2] as f64,
-            ];
-            let v2 = [
-                mesh.positions[p2] as f64,
-                mesh.positions[p2 + 1] as f64,
-                mesh.positions[p2 + 2] as f64,
-            ];
-            if !v0.iter().chain(&v1).chain(&v2).all(|x| x.is_finite()) {
-                continue;
-            }
-            let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
-            let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
-            let cross = [
-                e1[1] * e2[2] - e1[2] * e2[1],
-                e1[2] * e2[0] - e1[0] * e2[2],
-                e1[0] * e2[1] - e1[1] * e2[0],
-            ];
-            let len =
-                (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt();
-            if len < 1e-10 {
-                continue;
-            }
-            let n = [cross[0] / len, cross[1] / len, cross[2] / len];
-            tris.push(BucketTri {
-                v: [
-                    Vertex::new(v0, n),
-                    Vertex::new(v1, n),
-                    Vertex::new(v2, n),
-                ],
-                keys: [quantize(v0), quantize(v1), quantize(v2)],
-                normal: n,
-            });
-        }
-
-        // Step 2 — bucket triangles by plane. Plane key = quantized normal
-        // and quantized offset along that normal. Same-plane same-direction
-        // triangles bucket together; opposite-facing coplanar triangles
-        // stay in separate buckets (they are NOT the same surface — merging
-        // would collapse a back-to-back fold into a degenerate polygon).
-        let plane_key = |n: [f64; 3], anchor: [f64; 3]| -> (i64, i64, i64, i64) {
-            let off = n[0] * anchor[0] + n[1] * anchor[1] + n[2] * anchor[2];
-            let (a, b, c) = quantize(n);
-            (a, b, c, (off * QUANT).round() as i64)
-        };
-        let mut buckets: FxHashMap<(i64, i64, i64, i64), Vec<usize>> = FxHashMap::default();
-        for (i, t) in tris.iter().enumerate() {
-            let key = plane_key(t.normal, t.v[0].pos);
-            buckets.entry(key).or_default().push(i);
-        }
-
-        // Step 3 — for each bucket, walk boundary edges into rings; if any
-        // resulting ring is non-convex or the topology is non-manifold,
-        // fall back to emitting that bucket as individual triangles.
-        let mut polygons: Vec<Polygon> = Vec::with_capacity(tris.len());
-        for indices in buckets.values() {
-            let merged = merge_coplanar_bucket(&tris, indices);
-            polygons.extend(merged);
-        }
-        polygons
-    }
-
-    /// Convert BSP polygon list back to our Mesh format. Legacy-only.
-    #[cfg_attr(feature = "manifold-csg", allow(dead_code))]
-    fn polygons_to_mesh(polygons: &[crate::bsp_csg::Polygon]) -> Result<Mesh> {
-        let mut mesh = Mesh::new();
-
-        for polygon in polygons {
-            let vertices = &polygon.vertices;
-            if vertices.len() < 3 {
-                continue;
-            }
-
-            let points_3d: Vec<Point3<f64>> = vertices
-                .iter()
-                .map(|v| Point3::new(v.pos[0], v.pos[1], v.pos[2]))
-                .collect();
-
-            let raw_normal =
-                Vector3::new(vertices[0].normal[0], vertices[0].normal[1], vertices[0].normal[2]);
-
-            let csg_normal = match raw_normal.try_normalize(1e-10) {
-                Some(n) if n.x.is_finite() && n.y.is_finite() && n.z.is_finite() => n,
-                _ => {
-                    let computed = calculate_polygon_normal(&points_3d);
-                    match computed.try_normalize(1e-10) {
-                        Some(n) => n,
-                        None => continue,
-                    }
-                }
-            };
-
-            if points_3d.len() == 3 {
-                let base_idx = mesh.vertex_count();
-                for v in vertices {
-                    mesh.add_vertex(
-                        Point3::new(v.pos[0], v.pos[1], v.pos[2]),
-                        Vector3::new(v.normal[0], v.normal[1], v.normal[2]),
-                    );
-                }
-                mesh.add_triangle(
-                    base_idx as u32,
-                    (base_idx + 1) as u32,
-                    (base_idx + 2) as u32,
-                );
-                continue;
-            }
-
-            let (points_2d, _, _, _) = project_to_2d(&points_3d, &csg_normal);
-
-            let indices = match triangulate_polygon(&points_2d) {
-                Ok(idx) => idx,
-                Err(_) => continue,
-            };
-
-            let base_idx = mesh.vertex_count();
-            for v in vertices {
-                mesh.add_vertex(
-                    Point3::new(v.pos[0], v.pos[1], v.pos[2]),
-                    Vector3::new(v.normal[0], v.normal[1], v.normal[2]),
-                );
-            }
-
-            for tri in indices.chunks(3) {
-                if tri.len() == 3 {
-                    mesh.add_triangle(
-                        (base_idx + tri[0]) as u32,
-                        (base_idx + tri[1]) as u32,
-                        (base_idx + tri[2]) as u32,
-                    );
-                }
-            }
-        }
-
-        Ok(mesh)
-    }
-
     /// Check if two meshes' bounding boxes overlap
     fn bounds_overlap(host_mesh: &Mesh, opening_mesh: &Mesh) -> bool {
         let (host_min, host_max) = host_mesh.bounds();
@@ -894,19 +587,15 @@ impl ClippingProcessor {
         overlap_x && overlap_y && overlap_z
     }
 
-    /// Subtract opening mesh from host mesh using CSG boolean operations.
-    ///
-    /// With the `manifold-csg` feature enabled, dispatches to Google's
-    /// Manifold kernel — no operand-size cap, manifold-by-construction
-    /// output. Without the feature, uses the legacy BSP port (`bsp_csg`)
-    /// which silently falls back to the un-cut host when its 24-polygon
-    /// cap is exceeded.
+    /// Subtract opening mesh from host mesh using CSG boolean operations
+    /// on the pure-Rust exact mesh-arrangement kernel.
     ///
     /// On any failure path the host is returned un-cut and a [`BoolFailure`]
     /// record is appended to the processor's failure log (drainable via
     /// [`Self::take_failures`]). An empty host returns an empty mesh without
     /// recording a failure (it's a fast path, not a fallback).
     pub fn subtract_mesh(&self, host_mesh: &Mesh, opening_mesh: &Mesh) -> Result<Mesh> {
+        record_csg_op(0, host_mesh.triangle_count(), opening_mesh.triangle_count());
         if host_mesh.is_empty() {
             return Ok(Mesh::new());
         }
@@ -919,126 +608,83 @@ impl ClippingProcessor {
             return Ok(host_mesh.clone());
         }
 
-        #[cfg(feature = "manifold-csg")]
-        {
-            match crate::manifold_kernel::difference(host_mesh, opening_mesh) {
-                Ok(result) => {
-                    // An empty result is a legitimate outcome — the cutter
-                    // can fully contain the host. Only treat non-finite /
-                    // invalid kernel output as a failure.
-                    if !self.validate_mesh(&result) {
-                        self.record_failure(
-                            BoolOp::Difference,
-                            BoolFailureReason::KernelOutputInvalid,
-                        );
-                        return Ok(host_mesh.clone());
-                    }
-                    // Defensive: Manifold has been observed (Linux x86_64 CI,
-                    // AC20-FZK-Haus gable walls #60012/#67828) to return an
-                    // implausibly small result — e.g. 1 triangle from a
-                    // 12-triangle box host clipped by a polygonal-bounded
-                    // half-space prism that does NOT fully contain the host.
-                    // macOS aarch64 produces the expected pentagon on the
-                    // same input, so this is a cross-platform Manifold
-                    // determinism issue. When we detect a clearly-truncated
-                    // result, re-run the same op through the legacy BSP
-                    // path and keep whichever output looks like a real
-                    // clip. See `looks_degenerate` for the heuristic.
-                    if Self::manifold_result_looks_degenerate(host_mesh, &result) {
-                        let host_tris = host_mesh.indices.len() / 3;
-                        let result_tris = result.indices.len() / 3;
-                        eprintln!(
-                            "[manifold-csg] difference result looks degenerate \
-                             (host {} tris -> result {} tris); retrying via BSP fallback",
-                            host_tris, result_tris,
-                        );
-                        if let Some(bsp_result) = self.try_bsp_difference(host_mesh, opening_mesh) {
-                            if !Self::manifold_result_looks_degenerate(host_mesh, &bsp_result) {
-                                self.record_failure(
-                                    BoolOp::Difference,
-                                    BoolFailureReason::ManifoldOutputDegenerate {
-                                        host_tris,
-                                        result_tris,
-                                    },
-                                );
-                                return Ok(bsp_result);
-                            }
-                        }
-                        // BSP also failed or produced suspicious output —
-                        // record but keep Manifold's result (better than
-                        // un-cut, in many cases).
-                        self.record_failure(
-                            BoolOp::Difference,
-                            BoolFailureReason::ManifoldOutputDegenerate {
-                                host_tris,
-                                result_tris,
-                            },
-                        );
-                    }
-                    return Ok(result);
-                }
-                Err(reason) => {
-                    self.record_failure(BoolOp::Difference, reason);
-                    return Ok(host_mesh.clone());
-                }
-            }
+        // Pure-Rust exact mesh-arrangement kernel, with consolidate_coplanar
+        // merging per-face fragments to match Manifold's clean output.
+        //
+        // NB: the kernel output itself is the watertightness bar — the
+        // crack-family fix lives upstream (`promote_cutter_verts_onto_host_faces`'s
+        // exact-plane lift). `consolidate_coplanar` can still re-open a closed
+        // cut along a µm-offset plane pair (each bucket earcuts independently,
+        // breaking the shared boundary chain); a closure-preserving guard here
+        // was tried and REJECTED — on FZK-Haus gable walls the raw kernel
+        // output carries >50:1 needle fragments that consolidation legitimately
+        // merges (the pinned `csg_quality_regression` spike bar). A
+        // seam-preserving consolidation is the remaining follow-up.
+        let raw = crate::kernel::mesh_bridge::subtract(host_mesh, opening_mesh);
+        let result = Self::consolidate_coplanar(raw);
+        if !result.is_empty() && !self.validate_mesh(&result) {
+            self.record_failure(BoolOp::Difference, BoolFailureReason::KernelOutputInvalid);
+            return Ok(host_mesh.clone());
         }
-
-        #[cfg(not(feature = "manifold-csg"))]
-        {
-            let host_polys = Self::mesh_to_polygons(host_mesh);
-            let opening_polys = Self::mesh_to_polygons(opening_mesh);
-
-            if host_polys.is_empty() || opening_polys.is_empty() {
-                self.record_failure(BoolOp::Difference, BoolFailureReason::DegenerateOperand);
-                return Ok(host_mesh.clone());
-            }
-
-            if !Self::can_run_csg_operation(host_polys.len(), opening_polys.len()) {
-                self.record_failure(
-                    BoolOp::Difference,
-                    BoolFailureReason::OperandTooLarge {
-                        polys_a: host_polys.len(),
-                        polys_b: opening_polys.len(),
-                    },
-                );
-                return Ok(host_mesh.clone());
-            }
-
-            let result_polys = crate::bsp_csg::difference(host_polys, opening_polys);
-
-            match Self::polygons_to_mesh(&result_polys) {
-                Ok(result) => Ok(Self::consolidate_coplanar(result)),
-                Err(e) => {
-                    self.record_failure(
-                        BoolOp::Difference,
-                        BoolFailureReason::KernelError(e.to_string()),
-                    );
-                    Ok(host_mesh.clone())
-                }
-            }
-        }
+        Ok(result)
     }
 
-    /// Re-merge BSP's per-plane fragments via 2D polygon union, then earcut
-    /// each result back to triangles. BSP CSG over-fragments any host face
-    /// whose plane is crossed by an extended cutter wall — even when the
-    /// cutter doesn't reach that face in 3D — because `split_polygon` is
-    /// plane-based, not solid-aware. A naive edge-walk merge fails on the
+    /// Subtract a GROUP of pairwise-disjoint opening cutters from the host in
+    /// ONE conforming arrangement (disjoint-cutter batching).
+    ///
+    /// A REJECTED group (the N-ary arrangement could not fully conform, or no
+    /// cutter overlaps the host) returns the host UN-CUT and records NO
+    /// failure: rejection is the expected, handled outcome — the router's
+    /// per-opening sequential loop (with the full #635 fallback machinery and
+    /// its own diagnostics) immediately takes over for the group's members, so
+    /// a failure record here would be pure noise on elements whose voids end
+    /// up perfectly cut (the issue-582/583 zero-CSG-failure bar). Only a
+    /// genuinely invalid kernel OUTPUT records, exactly like
+    /// [`Self::subtract_mesh`].
+    pub fn subtract_mesh_many(&self, host_mesh: &Mesh, cutters: &[&Mesh]) -> Result<Mesh> {
+        let total: usize = cutters.iter().map(|c| c.triangle_count()).sum();
+        record_csg_op(0, host_mesh.triangle_count(), total);
+        if host_mesh.is_empty() {
+            return Ok(Mesh::new());
+        }
+        let live: Vec<&Mesh> = cutters
+            .iter()
+            .copied()
+            .filter(|c| !c.is_empty() && Self::bounds_overlap(host_mesh, c))
+            .collect();
+        if live.is_empty() {
+            return Ok(host_mesh.clone()); // silent: sequential path takes over
+        }
+        let Some(raw) = crate::kernel::mesh_bridge::subtract_many(host_mesh, &live) else {
+            // Unrecovered constraint in the N-ary arrangement — reject the
+            // group (silently, see above) so the sequential per-opening path
+            // (few constraints per arrangement) takes over.
+            return Ok(host_mesh.clone());
+        };
+        let result = Self::consolidate_coplanar(raw);
+        if !result.is_empty() && !self.validate_mesh(&result) {
+            self.record_failure(BoolOp::Difference, BoolFailureReason::KernelOutputInvalid);
+            return Ok(host_mesh.clone());
+        }
+        Ok(result)
+    }
+
+    /// Re-merge the kernel's per-plane fragments via 2D polygon union, then
+    /// earcut each result back to triangles. CSG over-fragments host faces
+    /// along operand cut lines; a naive edge-walk merge fails on the
     /// "X" crossings that appear at cutter-outline corners (four fragments
     /// sharing only a vertex), so we project each plane bucket to 2D, run
     /// the i_overlay union the rest of the codebase already uses for
     /// `bool2d::union_contours`, and earcut the resulting (possibly
-    /// annular) shapes. This is what brings the bath from 189 → ~50
-    /// triangles on the BSP path with the cavity outline intact (issue
-    /// #780).
+    /// annular) shapes. This is what brought the bath from 189 → ~50
+    /// triangles with the cavity outline intact (issue #780); it also hosts
+    /// the needle/weld cleanup passes for #1007.
     ///
     /// Returns the input mesh unchanged if the consolidate fails or yields
-    /// nothing — never worse than the BSP-direct output.
-    #[cfg_attr(feature = "manifold-csg", allow(dead_code))]
-    fn consolidate_coplanar(mesh: Mesh) -> Mesh {
+    /// nothing — never worse than the raw kernel output.
+    pub(crate) fn consolidate_coplanar(mesh: Mesh) -> Mesh {
         use crate::triangulation::{
-            project_to_2d_with_basis, triangulate_polygon_with_holes,
+            project_to_2d_with_basis, triangulate_polygon_with_holes_refined,
         };
         use i_overlay::core::fill_rule::FillRule;
         use i_overlay::core::overlay_rule::OverlayRule;
@@ -1052,6 +698,14 @@ impl ClippingProcessor {
         // positions because cross-product noise on near-coplanar tris can
         // wobble in the 6th decimal; offsets get the same coarsening so
         // bucket keys stay aligned with normal direction.
+        //
+        // NB (issue #1007): the offset key is deliberately FINE (1 µm) and must
+        // NOT be coarsened. The exact-kernel opening cut on a faceted-BREP roof
+        // emits the hole-boundary triangles on planes that jitter ~25–150 µm;
+        // that jitter is what keeps each on its own bucket. Coalescing them (a
+        // coarser offset grid, or projecting the whole roof slope to ONE canonical
+        // plane) lets the i_overlay UNION close the opening hole — a bridging facet
+        // over the footprint, caught by `issue_1007_real_opening_no_bridge`.
         const POS_QUANT: f64 = 1.0e6;
         const NORMAL_QUANT: f64 = 1.0e3;
         let qpos = |p: f64| (p * POS_QUANT).round() as i64;
@@ -1143,10 +797,9 @@ impl ClippingProcessor {
             let mut clip: Vec<Vec<[f64; 2]>> = Vec::with_capacity(tris.len() - 1);
             for (idx, tri) in tris.iter().enumerate() {
                 let pts_2d = project_to_2d_with_basis(&tri.v, &u_axis, &v_axis, &origin);
-                // Force CCW for i_overlay's NonZero fill — BSP output can
-                // carry inconsistent winding (an extra `flip()` during the
-                // a_node/b_node invert dance), and mixed-winding subject +
-                // clip cancel out instead of unioning.
+                // Force CCW for i_overlay's NonZero fill — kernel output
+                // fragments can carry inconsistent winding, and mixed-winding
+                // subject + clip cancel out instead of unioning.
                 let signed_area = (pts_2d[1].x - pts_2d[0].x)
                     * (pts_2d[2].y - pts_2d[0].y)
                     - (pts_2d[2].x - pts_2d[0].x)
@@ -1173,7 +826,7 @@ impl ClippingProcessor {
             }
 
             // Total bucket area — used to filter sub-resolution shapes /
-            // holes (BSP's f64 noise leaves tiny spurious cavities after
+            // holes (f64 noise leaves tiny spurious cavities after the
             // i_overlay union).
             let bucket_area: f64 = tris
                 .iter()
@@ -1209,7 +862,10 @@ impl ClippingProcessor {
                     .iter()
                     .map(|p| nalgebra::Point2::new(p[0], p[1]))
                     .collect();
-                let outer_simplified = simplify_2d_collinear(&outer_2d);
+                // Weld µm-scale near-coincident rim duplicates FIRST (the #1007
+                // diagonal-sliver source), THEN drop collinear phantoms.
+                let outer_welded = weld_near_coincident_2d(&outer_2d);
+                let outer_simplified = simplify_2d_collinear(&outer_welded);
                 if outer_simplified.len() < 3 {
                     continue;
                 }
@@ -1225,7 +881,8 @@ impl ClippingProcessor {
                             .iter()
                             .map(|p| nalgebra::Point2::new(p[0], p[1]))
                             .collect();
-                        let simplified = simplify_2d_collinear(&pts);
+                        let welded = weld_near_coincident_2d(&pts);
+                        let simplified = simplify_2d_collinear(&welded);
                         if simplified.len() < 3 {
                             return None;
                         }
@@ -1237,21 +894,24 @@ impl ClippingProcessor {
                     })
                     .collect();
 
-                let indices = match triangulate_polygon_with_holes(
+                // Quality CDT + bounded Ruppert refinement. Returns the
+                // (possibly Steiner-augmented) 2D vertex list `all_2d` plus
+                // indices into it; the lift below maps EVERY returned vertex
+                // (input + Steiner) back to 3D, so a Steiner point on a shared
+                // edge is split on both sides → watertight, no T-junction.
+                // allow_boundary_split = false: this region's outer/hole rings
+                // are shared with neighbouring plane buckets triangulated
+                // independently; a boundary Steiner point would tear that seam
+                // (open edges / T-junctions). Interior-only refinement keeps the
+                // seam watertight while still removing the rim-corner slivers.
+                let (all_2d, indices) = match triangulate_polygon_with_holes_refined(
                     &outer_simplified,
                     &holes_simplified,
+                    false,
                 ) {
-                    Ok(idx) => idx,
+                    Ok((pts, idx)) => (pts, idx),
                     Err(_) => continue,
                 };
-
-                // Lift 2D points back to 3D.
-                let mut all_2d: Vec<nalgebra::Point2<f64>> =
-                    Vec::with_capacity(outer_simplified.len() + holes_simplified.iter().map(|h| h.len()).sum::<usize>());
-                all_2d.extend(outer_simplified.iter().copied());
-                for h in &holes_simplified {
-                    all_2d.extend(h.iter().copied());
-                }
 
                 let lift = |p: nalgebra::Point2<f64>| -> Point3<f64> {
                     let off = u_axis * p.x + v_axis * p.y;
@@ -1267,6 +927,18 @@ impl ClippingProcessor {
                     output.add_vertex(*vp, normal);
                 }
                 for tri in indices.chunks_exact(3) {
+                    // Needle backstop: drop any residual sub-weld degenerate sliver
+                    // ([`tri_is_needle`], the same scale-relative power-of-two rule
+                    // as the single-triangle path). Cannot open a real gap — the
+                    // hole/seam is framed by its non-degenerate neighbours.
+                    let v = [
+                        verts_3d[tri[0]],
+                        verts_3d[tri[1]],
+                        verts_3d[tri[2]],
+                    ];
+                    if tri_is_needle(&v) {
+                        continue;
+                    }
                     output.add_triangle(
                         base + tri[0] as u32,
                         base + tri[1] as u32,
@@ -1282,15 +954,12 @@ impl ClippingProcessor {
         output
     }
 
-    /// Union two meshes together using CSG boolean operations.
-    ///
-    /// With the `manifold-csg` feature, dispatches to the Manifold kernel
-    /// (no operand cap). Without it, the legacy BSP path is used and
-    /// silently falls back to mesh-merge (no overlap removal) when the
-    /// 24-polygon cap is exceeded — recording a [`BoolFailure`].
+    /// Union two meshes together using CSG boolean operations on the
+    /// pure-Rust exact kernel.
     ///
     /// Empty operands are handled silently — they have a unique correct answer.
     pub fn union_mesh(&self, mesh_a: &Mesh, mesh_b: &Mesh) -> Result<Mesh> {
+        record_csg_op(1, mesh_a.triangle_count(), mesh_b.triangle_count());
         if mesh_a.is_empty() {
             return Ok(mesh_b.clone());
         }
@@ -1298,101 +967,40 @@ impl ClippingProcessor {
             return Ok(mesh_a.clone());
         }
 
-        #[cfg(feature = "manifold-csg")]
-        {
-            match crate::manifold_kernel::union(mesh_a, mesh_b) {
-                Ok(result) if !result.is_empty() => return Ok(result),
-                Ok(_) => {
-                    self.record_failure(BoolOp::Union, BoolFailureReason::KernelOutputInvalid);
-                    let mut merged = mesh_a.clone();
-                    merged.merge(mesh_b);
-                    return Ok(merged);
-                }
-                Err(reason) => {
-                    self.record_failure(BoolOp::Union, reason);
-                    let mut merged = mesh_a.clone();
-                    merged.merge(mesh_b);
-                    return Ok(merged);
-                }
-            }
+        // Pure-Rust exact kernel. On an empty/invalid kernel result
+        // fall back to a plain merge (overlap not removed) + record the failure,
+        // preserving the legacy never-Err contract.
+        let raw_u = crate::kernel::mesh_bridge::union(mesh_a, mesh_b);
+        let result = Self::consolidate_coplanar(raw_u);
+        if result.is_empty() || !self.validate_mesh(&result) {
+            self.record_failure(BoolOp::Union, BoolFailureReason::KernelOutputInvalid);
+            let mut merged = mesh_a.clone();
+            merged.merge(mesh_b);
+            return Ok(merged);
         }
-
-        #[cfg(not(feature = "manifold-csg"))]
-        {
-            let polys_a = Self::mesh_to_polygons(mesh_a);
-            let polys_b = Self::mesh_to_polygons(mesh_b);
-
-            if polys_a.is_empty() || polys_b.is_empty() {
-                self.record_failure(BoolOp::Union, BoolFailureReason::DegenerateOperand);
-                let mut merged = mesh_a.clone();
-                merged.merge(mesh_b);
-                return Ok(merged);
-            }
-
-            if !Self::can_run_csg_operation(polys_a.len(), polys_b.len()) {
-                self.record_failure(
-                    BoolOp::Union,
-                    BoolFailureReason::OperandTooLarge {
-                        polys_a: polys_a.len(),
-                        polys_b: polys_b.len(),
-                    },
-                );
-                let mut merged = mesh_a.clone();
-                merged.merge(mesh_b);
-                return Ok(merged);
-            }
-
-            let result_polys = crate::bsp_csg::union(polys_a, polys_b);
-            Self::polygons_to_mesh(&result_polys)
-        }
+        Ok(result)
     }
 
-    /// Intersect two meshes using CSG boolean operations.
+    /// Intersect two meshes using CSG boolean operations on the pure-Rust
+    /// exact kernel.
     ///
     /// Returns the intersection of two meshes (the volume where both
-    /// overlap). With `manifold-csg`, this is a real CSG intersection.
-    /// Without the feature the legacy BSP path returns an empty mesh
-    /// when its cap is exceeded — recording a [`BoolFailure`].
+    /// overlap).
     pub fn intersection_mesh(&self, mesh_a: &Mesh, mesh_b: &Mesh) -> Result<Mesh> {
+        record_csg_op(2, mesh_a.triangle_count(), mesh_b.triangle_count());
         if mesh_a.is_empty() || mesh_b.is_empty() {
             return Ok(Mesh::new());
         }
 
-        #[cfg(feature = "manifold-csg")]
-        {
-            match crate::manifold_kernel::intersection(mesh_a, mesh_b) {
-                Ok(result) => return Ok(result),
-                Err(reason) => {
-                    self.record_failure(BoolOp::Intersection, reason);
-                    return Ok(Mesh::new());
-                }
-            }
+        // Pure-Rust exact kernel. An empty result is legitimate
+        // (disjoint operands → empty intersection).
+        let result =
+            Self::consolidate_coplanar(crate::kernel::mesh_bridge::intersection(mesh_a, mesh_b));
+        if !result.is_empty() && !self.validate_mesh(&result) {
+            self.record_failure(BoolOp::Intersection, BoolFailureReason::KernelOutputInvalid);
+            return Ok(Mesh::new());
         }
-
-        #[cfg(not(feature = "manifold-csg"))]
-        {
-            let polys_a = Self::mesh_to_polygons(mesh_a);
-            let polys_b = Self::mesh_to_polygons(mesh_b);
-
-            if polys_a.is_empty() || polys_b.is_empty() {
-                self.record_failure(BoolOp::Intersection, BoolFailureReason::DegenerateOperand);
-                return Ok(Mesh::new());
-            }
-
-            if !Self::can_run_csg_operation(polys_a.len(), polys_b.len()) {
-                self.record_failure(
-                    BoolOp::Intersection,
-                    BoolFailureReason::OperandTooLarge {
-                        polys_a: polys_a.len(),
-                        polys_b: polys_b.len(),
-                    },
-                );
-                return Ok(Mesh::new());
-            }
-
-            let result_polys = crate::bsp_csg::intersection(polys_a, polys_b);
-            Self::polygons_to_mesh(&result_polys)
-        }
+        Ok(result)
     }
 
     /// Union multiple meshes together
@@ -1514,11 +1122,13 @@ impl ClippingProcessor {
 
     /// Heuristic: does this look like a botched CSG difference?
     ///
-    /// Detects the Linux-specific Manifold pathology where a wall body
-    /// clipped by an `IfcPolygonalBoundedHalfSpace` prism collapses to a
-    /// near-empty result (e.g. 1 triangle from a 12-triangle host box).
-    /// macOS aarch64 produces the full pentagon on identical input, so
-    /// this is a kernel-determinism issue, not a malformed cutter.
+    /// Kernel-neutral check used by the boolean processor (e.g. the
+    /// polygonal-bounded half-space clip) to fall back to a robust
+    /// unbounded plane clip when a difference result looks collapsed
+    /// relative to its host. Historically this caught a Linux-specific
+    /// Manifold pathology where a wall body clipped by an
+    /// `IfcPolygonalBoundedHalfSpace` prism collapsed to a near-empty
+    /// result (1 triangle from a 12-triangle host box).
     ///
     /// Rules:
     ///  * An empty result is a legit outcome (cutter contains host) —
@@ -1528,8 +1138,7 @@ impl ClippingProcessor {
     ///  * For hosts with >= 12 triangles (typical IFC solid input), the
     ///    output should retain at least 25 % of the host's triangle
     ///    count when the cutter is partial.
-    #[cfg_attr(not(feature = "manifold-csg"), allow(dead_code))]
-    fn manifold_result_looks_degenerate(host: &Mesh, result: &Mesh) -> bool {
+    pub(crate) fn difference_result_looks_degenerate(host: &Mesh, result: &Mesh) -> bool {
         let result_tris = result.indices.len() / 3;
         if result_tris == 0 {
             return false;
@@ -1573,49 +1182,6 @@ impl ClippingProcessor {
         false
     }
 
-    /// Kernel-neutral check: does a DIFFERENCE result look collapsed relative
-    /// to its host? Wraps [`Self::manifold_result_looks_degenerate`] under a
-    /// name that reads correctly off the Manifold path too — used by the
-    /// polygonal-bounded half-space clip to fall back to a robust unbounded
-    /// plane clip when either kernel degenerates on coincident faces.
-    pub(crate) fn difference_result_looks_degenerate(host: &Mesh, result: &Mesh) -> bool {
-        Self::manifold_result_looks_degenerate(host, result)
-    }
-
-    /// Run `host - opening` through the legacy in-tree BSP CSG kernel.
-    /// Returns `None` if the BSP path can't accept the inputs (operands
-    /// past the per-mesh polygon cap, degenerate polygon extraction,
-    /// etc.) — caller falls back to keeping the Manifold output.
-    ///
-    /// Used as a safety net under `manifold-csg` when Manifold's output
-    /// looks structurally broken (see [`Self::manifold_result_looks_degenerate`]).
-    /// The BSP path is more deterministic across OS/arch combos at the
-    /// cost of a hard 128-polygon-per-mesh cap.
-    #[cfg_attr(not(feature = "manifold-csg"), allow(dead_code))]
-    fn try_bsp_difference(&self, host_mesh: &Mesh, opening_mesh: &Mesh) -> Option<Mesh> {
-        let host_polys = Self::mesh_to_polygons(host_mesh);
-        let opening_polys = Self::mesh_to_polygons(opening_mesh);
-        if host_polys.is_empty() || opening_polys.is_empty() {
-            return None;
-        }
-        if !Self::can_run_csg_operation(host_polys.len(), opening_polys.len()) {
-            return None;
-        }
-        let result_polys = crate::bsp_csg::difference(host_polys, opening_polys);
-        let _ = host_mesh;
-        match Self::polygons_to_mesh(&result_polys) {
-            Ok(mesh) => {
-                let consolidated = Self::consolidate_coplanar(mesh);
-                if consolidated.is_empty() {
-                    None
-                } else {
-                    Some(consolidated)
-                }
-            }
-            Err(_) => None,
-        }
-    }
-
     /// Validate mesh for common issues
     fn validate_mesh(&self, mesh: &Mesh) -> bool {
         // Check for NaN/Inf in positions
@@ -1641,6 +1207,7 @@ impl ClippingProcessor {
 
     /// Clip an entire mesh against a plane
     pub fn clip_mesh(&self, mesh: &Mesh, plane: &Plane) -> Result<Mesh> {
+        record_csg_op(3, mesh.triangle_count(), 0);
         let mut result = Mesh::new();
 
         // Process each triangle
@@ -2046,189 +1613,115 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bsp_difference_preserves_rounded_rect_cap() {
-        // Reproduce the bath case in isolation. Host: 2×0.8×0.8 m box.
-        // Cutter: 28-vertex rounded-rect prism. After BSP DIFFERENCE the
-        // cutter's bottom cap (becoming the cavity floor) must survive
-        // intact — the actual bug behind issue #780's cap collapsing to 3
-        // triangles is the BSP misclassifying SPANNING edges when many
-        // cap-coplanar wall planes intersect the cap polygon at the cap's
-        // own vertices.
-        use crate::bsp_csg::{Polygon, Vertex};
-
-        let host_polys = ClippingProcessor::mesh_to_polygons(&aabb_to_mesh(
-            Point3::new(0.0, 0.0, 0.0),
-            Point3::new(2.0, 0.8, 0.8),
-        ));
-
-        // Build a 28-vertex rounded rect cap manually (no IFC pipeline) and
-        // its prism by extrusion. Centred at (1.0, 0.4) with half-extents
-        // (0.9, 0.3), corner radius 0.2, depth 0.7, base at z=0.1.
-        const N: usize = 6;
-        let mut outline = Vec::with_capacity((N + 1) * 4);
-        let corners = [
-            (1.7, 0.3, -std::f64::consts::FRAC_PI_2, 0.0),
-            (1.7, 0.5, 0.0, std::f64::consts::FRAC_PI_2),
-            (0.3, 0.5, std::f64::consts::FRAC_PI_2, std::f64::consts::PI),
-            (0.3, 0.3, std::f64::consts::PI, std::f64::consts::PI * 1.5),
-        ];
-        let r = 0.2_f64;
-        for (cx, cy, a0, a1) in corners {
-            for i in 0..=N {
-                let t = i as f64 / N as f64;
-                let a = a0 + (a1 - a0) * t;
-                outline.push((cx + r * a.cos(), cy + r * a.sin()));
-            }
+    fn floor_pow2_is_exact_and_deterministic() {
+        // Exact powers map to themselves; in-between rounds DOWN to the prev power.
+        assert_eq!(floor_pow2(1.0), 1.0);
+        assert_eq!(floor_pow2(2.0), 2.0);
+        assert_eq!(floor_pow2(8.0), 8.0);
+        assert_eq!(floor_pow2(1.9), 1.0);
+        assert_eq!(floor_pow2(5.657), 4.0);
+        assert_eq!(floor_pow2(0.2), 0.125);
+        assert_eq!(floor_pow2(0.0), 0.0);
+        assert_eq!(floor_pow2(-3.0), 0.0);
+        // every result has exactly one set mantissa bit ⇒ bit-deterministic
+        for x in [0.3_f64, 1.7, 3.0, 17.9, 1024.0, 1e-3, 1e6] {
+            let p = floor_pow2(x);
+            assert!(p > 0.0 && p <= x);
+            assert_eq!(p.to_bits() & 0x000f_ffff_ffff_ffff, 0, "floor_pow2({x}) not a clean power of two");
         }
-        let n = outline.len();
-        let z_bot = 0.1_f64;
-        let z_top = 0.8_f64;
-
-        // Build cutter polygons: bottom cap, top cap, side quads.
-        let mut cutter_polys: Vec<Polygon> = Vec::new();
-        // Bottom cap — CCW from below ⇒ vertex order reversed in 2D
-        // (looking from -Z direction); store as outline reversed to face -Z.
-        let bot_verts: Vec<Vertex> = outline
-            .iter()
-            .rev()
-            .map(|(x, y)| Vertex::new([*x, *y, z_bot], [0.0, 0.0, -1.0]))
-            .collect();
-        cutter_polys.push(Polygon::new(bot_verts));
-        // Top cap — CCW from above
-        let top_verts: Vec<Vertex> = outline
-            .iter()
-            .map(|(x, y)| Vertex::new([*x, *y, z_top], [0.0, 0.0, 1.0]))
-            .collect();
-        cutter_polys.push(Polygon::new(top_verts));
-        // Side walls
-        for i in 0..n {
-            let j = (i + 1) % n;
-            let (x0, y0) = outline[i];
-            let (x1, y1) = outline[j];
-            // Outward normal: perpendicular to (x1-x0, y1-y0) in XY plane,
-            // pointing away from cavity centre (1.0, 0.4).
-            let ex = x1 - x0;
-            let ey = y1 - y0;
-            let mut nx = ey;
-            let mut ny = -ex;
-            let nlen = (nx * nx + ny * ny).sqrt();
-            if nlen > 0.0 {
-                nx /= nlen;
-                ny /= nlen;
-            }
-            // Flip if pointing inward
-            let mx = (x0 + x1) * 0.5 - 1.0;
-            let my = (y0 + y1) * 0.5 - 0.4;
-            if nx * mx + ny * my < 0.0 {
-                nx = -nx;
-                ny = -ny;
-            }
-            let wall = vec![
-                Vertex::new([x0, y0, z_bot], [nx, ny, 0.0]),
-                Vertex::new([x1, y1, z_bot], [nx, ny, 0.0]),
-                Vertex::new([x1, y1, z_top], [nx, ny, 0.0]),
-                Vertex::new([x0, y0, z_top], [nx, ny, 0.0]),
-            ];
-            cutter_polys.push(Polygon::new(wall));
-        }
-
-        assert_eq!(
-            cutter_polys.len(),
-            2 + n,
-            "expected 2 caps + {} walls",
-            n
-        );
-
-        let result_polys =
-            crate::bsp_csg::difference(host_polys, cutter_polys);
-
-        // Find the cavity-floor polygon: at z = 0.1, normal +Z.
-        let mut cap_polys: Vec<&Polygon> = result_polys
-            .iter()
-            .filter(|p| {
-                p.vertices
-                    .iter()
-                    .all(|v| (v.pos[2] - z_bot).abs() < 1.0e-4)
-            })
-            .collect();
-        // Sort by vertex count desc to find the largest survivor.
-        cap_polys.sort_by_key(|p| std::cmp::Reverse(p.vertices.len()));
-        let largest_cap_verts = cap_polys.first().map(|p| p.vertices.len()).unwrap_or(0);
-        assert!(
-            largest_cap_verts >= 20,
-            "cavity floor cap collapsed: largest polygon at z={} has {} verts (need ≥20 for the rounded rect outline). All cap polys: {:?}",
-            z_bot,
-            largest_cap_verts,
-            cap_polys.iter().map(|p| p.vertices.len()).collect::<Vec<_>>()
-        );
     }
 
     #[test]
-    fn bsp_difference_preserves_inner_cube_faces() {
-        // Pin BSP behaviour for the "host minus cutter fully inside host" case
-        // (issue #780 bath): the cutter's 6 cap/wall faces should reappear
-        // as the cavity surface after difference. Pre-merge gives BSP one
-        // quad per face on both operands.
-        let host = aabb_to_mesh(Point3::new(0.0, 0.0, 0.0), Point3::new(2.0, 0.8, 0.8));
-        let cutter = aabb_to_mesh(Point3::new(0.1, 0.1, 0.1), Point3::new(1.9, 0.7, 0.8));
+    fn tri_is_needle_flags_hairline_slivers_not_real_thin_faces() {
+        // The #1007 needle: 6.6 µm base, ~5 m apex span → drop.
+        let needle = [
+            Point3::new(4.672253608703613, -1.0, 12.385885238647461),
+            Point3::new(1.047027587890625, -5.0, 14.07635498046875),
+            Point3::new(4.672259330749512, -1.0, 12.385882377624512),
+        ];
+        assert!(tri_is_needle(&needle), "the #1007 diagonal sliver was not flagged");
+        // A REAL thin sliver (0.2 m × 2 m face) must be KEPT.
+        let real_thin = [
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(2.0, 0.0, 0.0),
+            Point3::new(2.0, 0.2, 0.0),
+        ];
+        assert!(!tri_is_needle(&real_thin), "a real 0.2×2 m sliver was wrongly flagged");
+        // A healthy near-equilateral triangle is kept.
+        let healthy = [
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.5, 0.9, 0.0),
+        ];
+        assert!(!tri_is_needle(&healthy));
+        // A fully-collapsed triangle (zero longest edge) is degenerate → drop.
+        let collapsed = [Point3::new(1.0, 1.0, 1.0); 3];
+        assert!(tri_is_needle(&collapsed));
+    }
 
-        let host_polys = ClippingProcessor::mesh_to_polygons(&host);
-        let cutter_polys = ClippingProcessor::mesh_to_polygons(&cutter);
-        assert_eq!(host_polys.len(), 6, "host should pre-merge to 6 face quads");
+    #[test]
+    fn weld_near_coincident_2d_collapses_um_rim_duplicates() {
+        use nalgebra::Point2;
+        // A unit-ish quad whose 4th corner is split into a 6.6 µm near-duplicate
+        // (the rim-notch shape that earcut would otherwise frame as a needle).
+        let ring = vec![
+            Point2::new(0.0, 0.0),
+            Point2::new(1.9, 0.0),
+            Point2::new(1.9, 1.0),
+            Point2::new(0.000_006_6, 1.0),
+            Point2::new(0.0, 1.0),
+        ];
+        let welded = weld_near_coincident_2d(&ring);
+        assert_eq!(welded.len(), 4, "near-coincident rim duplicate not welded: {welded:?}");
+        // A ring with only genuine (≥0.2 m) edges is untouched.
+        let clean = vec![
+            Point2::new(0.0, 0.0),
+            Point2::new(2.0, 0.0),
+            Point2::new(2.0, 0.2),
+            Point2::new(0.0, 0.2),
+        ];
+        assert_eq!(weld_near_coincident_2d(&clean).len(), 4, "a clean ring was over-welded");
+    }
+
+    #[test]
+    fn weld_near_coincident_2d_keeps_mm_features_on_large_rings() {
+        use nalgebra::Point2;
+        // A 12 m × 1 m member face with a 1 mm corner chamfer (two vertices
+        // 1 mm apart). Uncapped extent-relative eps (12/8192 ≈ 1.46 mm) would
+        // weld the chamfer away; the absolute 2⁻¹² m cap must keep it.
+        let chamfered = vec![
+            Point2::new(0.0, 0.0),
+            Point2::new(12.0, 0.0),
+            Point2::new(12.0, 0.999),
+            Point2::new(11.999, 1.0), // 1 mm chamfer edge
+            Point2::new(0.0, 1.0),
+        ];
+        let welded = weld_near_coincident_2d(&chamfered);
         assert_eq!(
-            cutter_polys.len(),
-            6,
-            "cutter should pre-merge to 6 face quads"
+            welded.len(),
+            5,
+            "1 mm chamfer on a 12 m ring was over-welded: {welded:?}"
         );
-
-        let result_polys = crate::bsp_csg::difference(host_polys, cutter_polys);
-        let result = ClippingProcessor::polygons_to_mesh(&result_polys)
-            .expect("polygons_to_mesh ok");
-
-        let tris = result.indices.len() / 3;
-        assert!(
-            tris >= 12,
-            "expected ≥ 12 tris (host bottom + 4 sides + annular top + cavity walls + floor); got {}",
-            tris
-        );
-
-        // Cavity floor at z = 0.1: must exist and cover the cavity footprint.
-        let mut floor_area = 0.0_f64;
-        for tri in result.indices.chunks_exact(3) {
-            let v: Vec<(f32, f32, f32)> = tri
-                .iter()
-                .map(|&i| {
-                    let o = i as usize * 3;
-                    (
-                        result.positions[o],
-                        result.positions[o + 1],
-                        result.positions[o + 2],
-                    )
-                })
-                .collect();
-            if v.iter().all(|p| (p.2 - 0.1).abs() < 1.0e-4) {
-                let ax = v[1].0 - v[0].0;
-                let ay = v[1].1 - v[0].1;
-                let bx = v[2].0 - v[0].0;
-                let by = v[2].1 - v[0].1;
-                floor_area += 0.5 * ((ax * by) - (ay * bx)).abs() as f64;
-            }
-        }
-        let expected_floor_area = 1.8 * 0.6; // cavity footprint
-        assert!(
-            (floor_area - expected_floor_area).abs() < 1.0e-3,
-            "cavity floor area = {:.4} m² (expected {:.4})",
-            floor_area,
-            expected_floor_area
+        // µm-scale rim duplicates must still weld on the SAME large ring.
+        let ring = vec![
+            Point2::new(0.0, 0.0),
+            Point2::new(12.0, 0.0),
+            Point2::new(12.0, 1.0),
+            Point2::new(0.000_02, 1.0), // 20 µm duplicate of the corner
+            Point2::new(0.0, 1.0),
+        ];
+        assert_eq!(
+            weld_near_coincident_2d(&ring).len(),
+            4,
+            "µm rim duplicate on a large ring not welded"
         );
     }
 
     #[test]
     fn merge_coplanar_collapses_subdivided_quad() {
         // Quad on z=0 plane split into 4 triangles via a centroid vertex.
-        // mesh_to_polygons should reassemble it into a single 4-vertex
-        // polygon and polygons_to_mesh should triangulate that into 2
-        // triangles.
+        // consolidate_coplanar should reassemble it into a single quad and
+        // triangulate that into 2 triangles.
         let mut mesh = Mesh::new();
         for p in [
             [0.0, 0.0, 0.0],
@@ -2247,20 +1740,6 @@ mod tests {
         mesh.add_triangle(2, 3, 4);
         mesh.add_triangle(3, 0, 4);
 
-        let polys = ClippingProcessor::mesh_to_polygons(&mesh);
-        assert_eq!(
-            polys.len(),
-            1,
-            "expected single merged polygon, got {}",
-            polys.len()
-        );
-        assert_eq!(
-            polys[0].vertices.len(),
-            4,
-            "expected 4-vertex quad after collinear-vertex cleanup, got {} verts",
-            polys[0].vertices.len()
-        );
-
         let consolidated = ClippingProcessor::consolidate_coplanar(mesh);
         assert_eq!(
             consolidated.indices.len() / 3,
@@ -2274,8 +1753,8 @@ mod tests {
     fn merge_coplanar_collapses_edge_split_quad() {
         // Quad whose boundary edge from (0,0) → (2,0) is split into three
         // segments by inserted collinear vertices (0.5, 0, 0) and
-        // (1.5, 0, 0). Simulates BSP's "extended cutter plane crossed the
-        // host edge here" output. Must collapse back to 2 triangles.
+        // (1.5, 0, 0). Simulates a CSG kernel's "cutter crossed the host
+        // edge here" fragment output. Must collapse back to 2 triangles.
         let mut mesh = Mesh::new();
         for p in [
             [0.0, 0.0, 0.0],
@@ -2406,49 +1885,6 @@ mod tests {
         assert!((area - 0.5).abs() < 1e-6);
     }
 
-    #[test]
-    fn test_csg_operation_guard_allows_simple_boxes() {
-        let box_a = aabb_to_mesh(Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 1.0, 1.0));
-        let box_b = aabb_to_mesh(Point3::new(0.25, 0.25, 0.25), Point3::new(0.75, 0.75, 0.75));
-
-        let polys_a = ClippingProcessor::mesh_to_polygons(&box_a);
-        let polys_b = ClippingProcessor::mesh_to_polygons(&box_b);
-
-        assert!(ClippingProcessor::can_run_csg_operation(polys_a.len(), polys_b.len()));
-    }
-
-    #[test]
-    fn test_csg_operation_guard_rejects_complex_operands() {
-        // Build a mesh with > MAX_CSG_POLYGONS_PER_MESH polygons. Twelve
-        // axis-offset boxes — distinct positions so the coplanar-merge
-        // pass keeps each face as its own polygon. (Stacking boxes at the
-        // same origin used to work but the merge now collapses them.)
-        let mut complex_mesh = Mesh::new();
-        for i in 0..30 {
-            let offset = i as f64 * 2.0;
-            complex_mesh.merge(&aabb_to_mesh(
-                Point3::new(offset, offset, offset),
-                Point3::new(offset + 1.0, offset + 1.0, offset + 1.0),
-            ));
-        }
-        let box_mesh =
-            aabb_to_mesh(Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 1.0, 1.0));
-
-        let polys_complex = ClippingProcessor::mesh_to_polygons(&complex_mesh);
-        let polys_box = ClippingProcessor::mesh_to_polygons(&box_mesh);
-
-        assert!(
-            polys_complex.len() > MAX_CSG_POLYGONS_PER_MESH,
-            "expected > {} polygons, got {} (merge regressed?)",
-            MAX_CSG_POLYGONS_PER_MESH,
-            polys_complex.len()
-        );
-        assert!(!ClippingProcessor::can_run_csg_operation(
-            polys_complex.len(),
-            polys_box.len()
-        ));
-    }
-
     /// Build a unit cube as 8 verts × 12 triangles (each corner vertex
     /// shared by three perpendicular faces). Used by the crease-aware
     /// normal tests below.
@@ -2526,7 +1962,7 @@ mod tests {
     /// faces have identical normals, so crease-aware must keep them in
     /// one smooth group and emit just 4 shared-vertex output verts —
     /// not the worst-case 6 (one per triangle corner). Validates that
-    /// coplanar adjacent strips do shade uniformly post-Manifold.
+    /// coplanar adjacent strips shade uniformly after a CSG cut.
     #[test]
     fn crease_keeps_coplanar_quad_as_4_verts() {
         let mut quad = Mesh::with_capacity(4, 6);

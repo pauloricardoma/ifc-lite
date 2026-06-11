@@ -19,6 +19,7 @@ import { decodeIfcString } from '@ifc-lite/encoding';
 import { useViewerStore } from '@/store';
 import { useShallow } from 'zustand/react/shallow';
 import type { IfcDataStore } from '@ifc-lite/parser';
+import { hasEntityType } from './has-entity-type.js';
 
 /** Lines belonging to a single storey, ready to feed into the section overlay. */
 export interface AnnotationsForStorey {
@@ -238,6 +239,15 @@ async function parseAnnotations(
   const source = store.source;
   if (!source || source.byteLength === 0) {
     if (debugEnabled()) console.log('[annotations] skip: missing/empty source');
+    return result;
+  }
+  // Skip the full-source WASM scan only when the model has neither IfcAnnotation
+  // nor IfcGridAxis — this parse path ALSO feeds the grid buckets (gridByStorey /
+  // gridLoose*), so gating on IfcAnnotation alone would drop grid-only models.
+  // The scan copies the entire IFC source into the WASM heap on the main thread,
+  // so skipping it when there is nothing to find still matters.
+  if (!hasEntityType(store, 'IfcAnnotation', 'IfcGridAxis')) {
+    if (debugEnabled()) console.log('[annotations] skip: no IfcAnnotation/IfcGridAxis entities');
     return result;
   }
 

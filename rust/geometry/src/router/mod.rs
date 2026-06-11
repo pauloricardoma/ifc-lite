@@ -116,7 +116,7 @@ pub struct ClassificationStats {
     /// Openings classified as `DiagonalRectangular` — rotated AABB.
     pub diagonal: usize,
     /// Openings classified as `NonRectangular` — full CSG path
-    /// (cap-limited under the legacy BSP, unlimited under Manifold).
+    /// (no operand cap on the exact kernel).
     pub non_rectangular: usize,
     /// Openings the OLD heuristic would have flagged as floor-opening
     /// (vertical extrusion, dir.z.abs() > 0.95) but the host is a
@@ -153,9 +153,10 @@ pub struct HostOpeningDiagnostic {
     /// classic silent-no-op signature when an opening box doesn't
     /// actually intersect the host mesh.
     pub tris_after: Option<usize>,
-    /// Number of rectangular opening boxes `cut_multiple_rectangular_openings`
-    /// processed for this host. Compare against `tris_before == tris_after`
-    /// to detect the "ran cuts, geometry unchanged" silent-no-op.
+    /// Number of axis-aligned rectangular openings synthesised into penetrating
+    /// box cutters and subtracted (exactly) for this host. Compare against
+    /// `tris_before == tris_after` to detect the "ran cuts, geometry unchanged"
+    /// silent-no-op.
     pub rect_boxes_processed: usize,
     /// Bounding box of the host mesh (min, max) in world coords. Useful
     /// for confirming that an opening box should overlap.
@@ -639,6 +640,9 @@ impl GeometryRouter {
                 }
                 crate::diagnostics::BoolFailureReason::PolygonalBoundedHalfSpaceFallback => {
                     "PolygonalBoundedHalfSpaceFallback"
+                }
+                crate::diagnostics::BoolFailureReason::CutterUnionUnavailable => {
+                    "CutterUnionUnavailable"
                 }
                 crate::diagnostics::BoolFailureReason::UnknownBooleanOperator(_) => {
                     "UnknownBooleanOperator"

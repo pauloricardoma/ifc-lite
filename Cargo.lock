@@ -584,6 +584,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bnum"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1b08cb4ecbb540b940016b0a0f35b7e48ab0cc372ab88150c351de4cc469959"
+dependencies = [
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -719,15 +729,6 @@ name = "clap_lex"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
-
-[[package]]
-name = "cmake"
-version = "0.1.58"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
-dependencies = [
- "cc",
-]
 
 [[package]]
 name = "compression-codecs"
@@ -1178,6 +1179,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "geometry-predicates"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8dba84198cf199c11b83f1cb9243eaeb70dc50b719d2835ebf34bf2481bca010"
+
+[[package]]
 name = "getrandom"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1457,11 +1464,11 @@ checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
 
 [[package]]
 name = "ifc-lite-clash"
-version = "3.1.0"
+version = "3.1.3"
 
 [[package]]
 name = "ifc-lite-core"
-version = "3.1.0"
+version = "3.1.3"
 dependencies = [
  "fast-float2",
  "futures-core",
@@ -1478,16 +1485,20 @@ dependencies = [
 
 [[package]]
 name = "ifc-lite-geometry"
-version = "3.1.0"
+version = "3.1.3"
 dependencies = [
  "approx",
+ "bnum",
  "earcutr",
+ "geometry-predicates",
  "i_overlay",
  "ifc-lite-core",
  "insta",
  "jpeg-decoder",
- "manifold-csg",
  "nalgebra",
+ "num-bigint",
+ "num-rational",
+ "num-traits",
  "png",
  "proptest",
  "rayon",
@@ -1499,7 +1510,7 @@ dependencies = [
 
 [[package]]
 name = "ifc-lite-processing"
-version = "3.1.0"
+version = "3.1.3"
 dependencies = [
  "ifc-lite-core",
  "ifc-lite-geometry",
@@ -1512,7 +1523,7 @@ dependencies = [
 
 [[package]]
 name = "ifc-lite-server"
-version = "3.1.0"
+version = "3.1.3"
 dependencies = [
  "anyhow",
  "arrow",
@@ -1546,7 +1557,7 @@ dependencies = [
 
 [[package]]
 name = "ifc-lite-wasm"
-version = "3.1.0"
+version = "3.1.3"
 dependencies = [
  "console_error_panic_hook",
  "futures-util",
@@ -1767,26 +1778,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ef0d4ed8669f8f8826eb00dc878084aa8f253506c4fd5e8f58f5bce72ddb97e"
 dependencies = [
  "twox-hash",
-]
-
-[[package]]
-name = "manifold-csg"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7c4e4f0f76eadb8ab713b64d0702a32e3f80d8281173b574a337ed309505945"
-dependencies = [
- "log",
- "manifold-csg-sys",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "manifold-csg-sys"
-version = "3.5.101"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c4a9823453e446bbbd356f4a7b3a9bac04d105991cdb4d0a4170ba789cad868"
-dependencies = [
- "cmake",
 ]
 
 [[package]]

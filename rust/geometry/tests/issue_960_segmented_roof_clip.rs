@@ -24,9 +24,13 @@
 //! both the full model and this extract. Coordinates are millimetres; the test
 //! processes each wall at unit scale 1.0.
 //!
-//! The fix is gated on the Manifold CSG kernel (a true cutter union), so this
-//! test is too — the BSP build keeps the legacy sequential behaviour.
-#![cfg(feature = "manifold-csg")]
+//! The chain-union fix subtracts ONE watertight union of the cutter prisms.
+//! `build_cutter_union` produces that union with the pure-Rust kernel's N-ary
+//! union (`kernel::mesh_bridge::union_many` → `arrangement::union_all`): all
+//! cutter prisms are conformed in ONE arrangement, so coplanar seams shared by
+//! 3+ roof segments — and exactly-duplicated cutter prisms — dissolve into a
+//! watertight solid. The pure-Rust exact kernel is the only kernel, so
+//! this test runs unconditionally.
 
 use ifc_lite_core::{build_entity_index, EntityDecoder, EntityScanner};
 use ifc_lite_geometry::{propagate_voids_to_parts, GeometryRouter};

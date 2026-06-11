@@ -83,7 +83,7 @@ jobs:
 
       # exact_predicate_determinism pins exact-predicate signs across
       # platforms; geometry_correctness_harness asserts the committed
-      # x86_64-generated .snap files byte-for-byte. Default features
-      # include `manifold-csg`, which is the kernel the snapshots pin.
+      # x86_64-generated .snap files byte-for-byte against the pure-Rust
+      # exact kernel (the only CSG kernel since M9).
       - name: Determinism tests (exact predicates + snapshot parity)
         run: cargo test -p ifc-lite-geometry --test exact_predicate_determinism --test geometry_correctness_harness
