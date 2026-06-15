@@ -50,6 +50,16 @@ pub struct IfcAPI {
     /// under concurrent `&self` access.
     cached_entity_index: std::sync::Mutex<Option<std::sync::Arc<EntityIndex>>>,
 
+    /// Per-worker shared content-dedup cache (#1109 follow-up). The
+    /// `GeometryRouter` is rebuilt every `processGeometryBatch`, so its item-mesh
+    /// dedup cache would reset each batch. Holding ONE cache here and injecting it
+    /// into every batch router lets byte-identical geometry mesh once across the
+    /// whole worker's workload — e.g. Tekla connection plates/bolts the exporter
+    /// emitted as thousands of separate items instead of one `IfcMappedItem`.
+    /// Built lazily on first batch; one model per `IfcApi` instance, exactly like
+    /// `cached_entity_index`.
+    cached_item_dedup: std::sync::Mutex<Option<ifc_lite_geometry::ItemDedupCache>>,
+
     /// When `true`, `processGeometryBatch` suppresses geometry emission for
     /// every `IfcBuildingElementPart` whose `IfcRelAggregates` parent (a) has
     /// its own `Representation` and (b) is marked `Sliceable` in
@@ -176,6 +186,7 @@ impl IfcAPI {
         Self {
             initialized: true,
             cached_entity_index: std::sync::Mutex::new(None),
+            cached_item_dedup: std::sync::Mutex::new(None),
             merge_layers: std::sync::atomic::AtomicBool::new(false),
             cached_parts_to_skip: std::sync::Mutex::new(None),
             cached_referenced_repmaps: std::sync::Mutex::new(None),
@@ -257,6 +268,14 @@ impl IfcAPI {
             .lock()
             .expect("ifc-lite cached_geometry_styles Mutex poisoned")
             .take();
+        // The content-dedup cache holds the previous model's item meshes, keyed by
+        // a content hash of that model's entities. Drop it so a new file on the
+        // same reused IfcAPI starts with an empty cache (bounds memory across
+        // loads; defensive even though the key is content- not id-based).
+        self.cached_item_dedup
+            .lock()
+            .expect("ifc-lite cached_item_dedup Mutex poisoned")
+            .take();
     }
 
     /// Populate `cached_entity_index` from pre-extracted column arrays.
@@ -333,6 +352,13 @@ impl IfcAPI {
         self.cached_geometry_styles
             .lock()
             .expect("ifc-lite cached_geometry_styles Mutex poisoned")
+            .take();
+        // The content-dedup cache holds the previous model's item meshes — drop it
+        // on content swap so a reused IfcAPI starts the new file with an empty
+        // cache (bounds memory across loads).
+        self.cached_item_dedup
+            .lock()
+            .expect("ifc-lite cached_item_dedup Mutex poisoned")
             .take();
     }
 
