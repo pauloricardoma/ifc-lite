@@ -73,11 +73,22 @@ pub struct InputSegment {
     pub a: [f64; 2],
     pub b: [f64; 2],
     pub source_element: Option<u32>,
+    /// Half the source wall's thickness (metres). Carried onto every half-edge
+    /// derived from this segment so `net_outline` can inset each room edge by
+    /// its own wall's half-thickness — no fuzzy edge↔wall matching, unlike the
+    /// TS `offsetRoomFootprint`. `0.0` = unknown/no thickness (centreline only).
+    pub half_thickness: f64,
 }
 
 impl InputSegment {
     pub fn new(a: [f64; 2], b: [f64; 2], source_element: Option<u32>) -> Self {
-        Self { a, b, source_element }
+        Self { a, b, source_element, half_thickness: 0.0 }
+    }
+
+    /// Builder: set the half-thickness (metres) carried to derived half-edges.
+    pub fn with_half_thickness(mut self, half_thickness: f64) -> Self {
+        self.half_thickness = half_thickness;
+        self
     }
 }
 
@@ -118,6 +129,9 @@ struct HalfEdge {
     /// The IFC element this edge bounds, propagated from the input segment.
     /// `None` for the exterior side of a boundary-less cut or a user split.
     source_element: Option<u32>,
+    /// Half the source wall's thickness (metres); `0.0` for a user-drawn edge.
+    /// Both twins carry the same value (it's the wall, not a side).
+    half_thickness: f64,
     alive: bool,
 }
 
@@ -126,6 +140,13 @@ struct Face {
     /// One boundary half-edge, or `None` once tombstoned.
     half_edge: Option<HalfEdgeId>,
     is_outer: bool,
+    /// Whether this bounded face is surfaced as a ROOM. Classified ONCE at build
+    /// (every bounded face for a centreline plate; only the gaps between wall
+    /// rectangles for a face-based plate) and then carried THROUGH edits — a
+    /// split inherits it, a merge ORs it. Never re-derived from geometry, so
+    /// dragging a vertex or cutting a room can't silently re-classify faces into
+    /// phantom rooms (the wall-rect centroid test was the culprit).
+    is_room: bool,
     floor_z: f64,
     ceiling_z: f64,
     /// Set when the ceiling plane is inferred (e.g. pitched roof underside);
@@ -165,6 +186,13 @@ pub enum EditError {
     /// `merge_faces`: both sides are the same face — the edge is a bridge,
     /// and removing it would change connectivity rather than union two rooms.
     BridgeEdge,
+    /// `dissolve_vertex`: the vertex isn't a simple degree-2 node (a junction
+    /// where 3+ walls meet, or a dangling tip), so there's no unambiguous pair
+    /// of edges to weld into one.
+    VertexNotDissolvable,
+    /// `add_face`: the ring has fewer than 3 points, self-intersects, or
+    /// encloses near-zero area.
+    InvalidPolygon,
 }
 
 /// The persistent floor-plate topology. See the module docs.
@@ -173,9 +201,20 @@ pub struct SpacePlate {
     vertices: Vec<Vertex>,
     half_edges: Vec<HalfEdge>,
     faces: Vec<Face>,
+    /// Wall footprint rectangles (4 corners each), set only by the FACE-BASED
+    /// build (`build_from_wall_rects`). When non-empty, a bounded face is a ROOM
+    /// only if its centroid lies OUTSIDE every wall rectangle (it's a gap between
+    /// walls, not a wall interior). Empty for the centreline build, where every
+    /// non-outer bounded face is a room.
+    wall_rects: Vec<[[f64; 2]; 4]>,
 }
 
 const EPS: f64 = 1e-9;
+/// Perpendicular-distance threshold (metres) for "this degree-2 node is a
+/// redundant collinear point on a straight run" — used by `prune_orphans` to
+/// dissolve derivation cruft. Far below the wall snap tolerance (default 0.1 m)
+/// so genuine corners are never mistaken for collinear and dissolved away.
+const EPS_COLL: f64 = 1e-6;
 
 impl SpacePlate {
     // ───────────────────────── construction ─────────────────────────
@@ -192,7 +231,78 @@ impl SpacePlate {
     /// 7. flag CW cycles as exterior and drop sub-`min_area` rooms.
     pub fn build(segments: &[InputSegment], options: BuildOptions) -> Self {
         let arr = Arrangement::resolve(segments, options.snap_tolerance);
-        Self::from_arrangement(arr, options.min_area)
+        let mut plate = Self::from_arrangement(arr, options.min_area);
+        // The arrangement is non-destructive, so it can carry cruft that bounds
+        // no room — dangling spur walls and the redundant collinear nodes they
+        // leave behind. Clean them so a derived plate starts as just its rooms
+        // (a no-op on already-clean inputs; never changes a room's area).
+        plate.prune_orphans();
+        plate
+    }
+
+    /// FACE-BASED build → an editable CENTRELINE plate sitting on the wall axes.
+    ///
+    /// Two stages. (1) DETECT: arrange the wall footprint rectangle edges and keep
+    /// each bounded face whose centroid lies OUTSIDE every rectangle — i.e. a GAP
+    /// between walls (not a wall interior or a junction overlap). This locates the
+    /// rooms accurately, with the room boundary literally on the rendered wall
+    /// faces (no centroid-derived-centreline drift). (2) LIFT: take each gap room's
+    /// wall-AXIS outline (the net gap offset out by ½ thickness, corners
+    /// re-intersected) and arrange THOSE edges into the returned plate.
+    ///
+    /// The returned plate is therefore a normal centreline plate whose room
+    /// outlines ARE the wall axes and whose vertices ARE the displayed nodes — so
+    /// every editing op (drag / split / merge / dissolve) acts directly on what the
+    /// user sees, with no axis-vs-face offset. Each axis edge carries its wall's
+    /// half-thickness, so `net_outline` recovers the inner (net) and outer (gross)
+    /// faces. Adjacent rooms' shared wall maps to one shared centreline edge.
+    pub fn build_from_wall_rects(rects: &[[[f64; 2]; 4]], options: BuildOptions) -> Self {
+        // --- Stage 1: detect rooms as the gaps between wall rectangles. ---
+        let mut rect_edges: Vec<InputSegment> = Vec::with_capacity(rects.len() * 4);
+        for (wi, r) in rects.iter().enumerate() {
+            // Wall thickness = the rectangle's shorter side (faces are the long pair).
+            let side = |a: [f64; 2], b: [f64; 2]| ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+            let half = side(r[0], r[1]).min(side(r[1], r[2])) / 2.0;
+            let src = Some(wi as u32);
+            for i in 0..4 {
+                rect_edges.push(InputSegment::new(r[i], r[(i + 1) % 4], src).with_half_thickness(half));
+            }
+        }
+        let mut gap = Self::from_arrangement(Arrangement::resolve(&rect_edges, options.snap_tolerance), options.min_area);
+        gap.wall_rects = rects.to_vec();
+
+        // --- Stage 2: lift each gap room to its wall-axis outline and re-arrange. ---
+        let mut axis_edges: Vec<InputSegment> = Vec::new();
+        for i in 0..gap.faces.len() {
+            let f = FaceId(i as u32);
+            if gap.faces[i].is_outer || !gap.is_gap_face(f) {
+                continue;
+            }
+            let axis = gap.gap_boundary(f, 1.0); // net gap → wall axis (½ thickness out)
+            let cycle: Vec<HalfEdgeId> = gap.face_half_edges(f).collect();
+            if axis.len() < 3 || axis.len() != cycle.len() {
+                continue;
+            }
+            for k in 0..axis.len() {
+                let he = &gap.half_edges[cycle[k].0 as usize];
+                axis_edges.push(
+                    InputSegment::new(axis[k], axis[(k + 1) % axis.len()], he.source_element)
+                        .with_half_thickness(he.half_thickness),
+                );
+            }
+        }
+        // Fallback: if the lift produced nothing usable (degenerate input), return
+        // the gap plate as-is so the caller still gets rooms.
+        if axis_edges.is_empty() {
+            for i in 0..gap.faces.len() {
+                let f = FaceId(i as u32);
+                gap.faces[i].is_room = !gap.faces[i].is_outer && gap.is_gap_face(f);
+            }
+            return gap;
+        }
+        // The returned plate has no `wall_rects`, so `is_room` defaults to every
+        // bounded face — exactly the lifted axis rooms.
+        Self::from_arrangement(Arrangement::resolve(&axis_edges, options.snap_tolerance), options.min_area)
     }
 
     fn from_arrangement(arr: Arrangement, min_area: f64) -> Self {
@@ -204,12 +314,13 @@ impl SpacePlate {
                 .collect(),
             half_edges: Vec::with_capacity(arr.edges.len() * 2),
             faces: Vec::new(),
+            wall_rects: Vec::new(),
         };
 
         // Two half-edges per undirected edge, twinned. Record outgoing fans.
         let mut fans: Vec<Vec<(HalfEdgeId, f64)>> = vec![Vec::new(); arr.vertices.len()];
         for e in &arr.edges {
-            let (a, b, src) = (e.a, e.b, e.source);
+            let (a, b, src, ht) = (e.a, e.b, e.source, e.half_thickness);
             let pa = arr.vertices[a];
             let pb = arr.vertices[b];
             let fwd = HalfEdgeId(plate.half_edges.len() as u32);
@@ -222,6 +333,7 @@ impl SpacePlate {
                 prev: fwd,
                 face: FaceId(0),
                 source_element: src,
+                half_thickness: ht,
                 alive: true,
             });
             plate.half_edges.push(HalfEdge {
@@ -231,6 +343,7 @@ impl SpacePlate {
                 prev: bwd,
                 face: FaceId(0),
                 source_element: src,
+                half_thickness: ht,
                 alive: true,
             });
             fans[a].push((fwd, (pb[1] - pa[1]).atan2(pb[0] - pa[0])));
@@ -290,6 +403,9 @@ impl SpacePlate {
             plate.faces.push(Face {
                 half_edge: cycle.first().copied(),
                 is_outer: is_outer || too_small,
+                // Centreline default: every bounded, non-tiny face is a room.
+                // `build_from_wall_rects` re-classifies to gaps-only afterwards.
+                is_room: !(is_outer || too_small),
                 floor_z: 0.0,
                 ceiling_z: 0.0,
                 non_planar_ceiling: false,
@@ -383,6 +499,7 @@ impl SpacePlate {
             prev: pa_prev,
             face,
             source_element,
+            half_thickness: 0.0, // a user-drawn partition has no wall thickness yet
             alive: true,
         });
         self.half_edges.push(HalfEdge {
@@ -392,6 +509,7 @@ impl SpacePlate {
             prev: pb_prev,
             face: new_face,
             source_element,
+            half_thickness: 0.0,
             alive: true,
         });
 
@@ -407,6 +525,7 @@ impl SpacePlate {
         self.faces.push(Face {
             half_edge: Some(e_ba),
             is_outer: false,
+            is_room: parent.is_room, // both halves of a split stay rooms
             floor_z: parent.floor_z,
             ceiling_z: parent.ceiling_z,
             non_planar_ceiling: parent.non_planar_ceiling,
@@ -442,6 +561,9 @@ impl SpacePlate {
         let t_next = self.half_edges[t.0 as usize].next;
         let h_src = self.half_edges[h.0 as usize].source_element;
         let t_src = self.half_edges[t.0 as usize].source_element;
+        // The two new halves continue the same wall → inherit its thickness.
+        let h_ht = self.half_edges[h.0 as usize].half_thickness;
+        let t_ht = self.half_edges[t.0 as usize].half_thickness;
 
         let n = VertexId(self.vertices.len() as u32);
         let e1 = HalfEdgeId(self.half_edges.len() as u32); // N → B (was dest of h)
@@ -449,10 +571,10 @@ impl SpacePlate {
 
         self.vertices.push(Vertex { pos: [x, y], outgoing: Some(e1), alive: true });
         self.half_edges.push(HalfEdge {
-            origin: n, twin: t, next: h_next, prev: h, face: f1, source_element: h_src, alive: true,
+            origin: n, twin: t, next: h_next, prev: h, face: f1, source_element: h_src, half_thickness: h_ht, alive: true,
         });
         self.half_edges.push(HalfEdge {
-            origin: n, twin: h, next: t_next, prev: t, face: f2, source_element: t_src, alive: true,
+            origin: n, twin: h, next: t_next, prev: t, face: f2, source_element: t_src, half_thickness: t_ht, alive: true,
         });
 
         // h becomes A→N; t becomes B→N. Their twins/nexts re-point through N.
@@ -498,6 +620,8 @@ impl SpacePlate {
         self.half_edges[tp.0 as usize].next = hn;
         self.half_edges[hn.0 as usize].prev = tp;
 
+        // The merged face is a room if either side was.
+        self.faces[f_keep.0 as usize].is_room |= self.faces[f_drop.0 as usize].is_room;
         // Re-home f_drop's loop onto f_keep, then tombstone f_drop + the edge.
         self.faces[f_keep.0 as usize].half_edge = Some(hp);
         let merged_cycle: Vec<HalfEdgeId> = self.face_half_edges(f_keep).collect();
@@ -517,6 +641,395 @@ impl SpacePlate {
         Ok(vec![self.face_patch(f_keep)])
     }
 
+    /// Dissolve a **degree-2** vertex `v`, welding its two incident edges into
+    /// one straight edge between its neighbours — the inverse of `split_edge`,
+    /// and the "delete this corner / errant node" affordance. Both incident
+    /// faces lose a boundary vertex; if `v` was a real corner the faces change
+    /// shape (the edge becomes the straight chord A→B), which is the intended
+    /// edit. Returns a patch per incident *room* face.
+    ///
+    /// Rejects:
+    /// - a vertex whose degree isn't exactly 2 — a wall junction or dangling
+    ///   tip has no unambiguous edge pair to merge (`VertexNotDissolvable`);
+    /// - a weld whose two neighbours are already directly joined, which would
+    ///   make a parallel edge / collapse a triangle to a digon (`DegenerateCut`).
+    pub fn dissolve_vertex(&mut self, v: VertexId) -> Result<Vec<FacePatch>, EditError> {
+        let vi = v.0 as usize;
+        if vi >= self.vertices.len() || !self.vertices[vi].alive {
+            return Err(EditError::StaleHandle);
+        }
+        // Degree must be exactly 2 (two live outgoing half-edges).
+        let outs: Vec<HalfEdgeId> = self.outgoing_half_edges(v).collect();
+        if outs.len() != 2 {
+            return Err(EditError::VertexNotDissolvable);
+        }
+        let (o1, o2) = (outs[0], outs[1]); // v→X, v→Y
+        let t1 = self.half_edges[o1.0 as usize].twin; // X→v — kept, becomes X→Y
+        let t2 = self.half_edges[o2.0 as usize].twin; // Y→v — kept, becomes Y→X
+        let x = self.dest(o1);
+        let y = self.dest(o2);
+        if x == y {
+            return Err(EditError::DegenerateCut); // both edges to one neighbour (digon)
+        }
+        // Welding X and Y when they already share an edge would duplicate it.
+        if self.outgoing_half_edges(x).any(|h| self.dest(h) == y) {
+            return Err(EditError::DegenerateCut);
+        }
+        // Degree-2 invariant: the edge arriving at v before o1 (in o1's face) is
+        // t2, and symmetrically prev(o2)==t1. If this doesn't hold one edge is a
+        // dangling antenna — bail rather than corrupt the rotation.
+        if self.half_edges[o1.0 as usize].prev != t2 || self.half_edges[o2.0 as usize].prev != t1 {
+            return Err(EditError::VertexNotDissolvable);
+        }
+        let fa = self.half_edges[t2.0 as usize].face; // face that saw Y→v→X
+        let fb = self.half_edges[t1.0 as usize].face; // face that saw X→v→Y
+        let qa = self.half_edges[o1.0 as usize].next; // what followed o1 in fa
+        let qb = self.half_edges[o2.0 as usize].next; // what followed o2 in fb
+
+        // The welded X↔Y edge only carries a wall provenance when BOTH survivors
+        // agreed on one — otherwise it spans two different source walls and must
+        // drop to `None`, so we don't emit a stale IfcRelSpaceBoundary link.
+        let welded_source = if self.half_edges[t1.0 as usize].source_element
+            == self.half_edges[t2.0 as usize].source_element
+        {
+            self.half_edges[t1.0 as usize].source_element
+        } else {
+            None
+        };
+
+        // Re-twin the survivors into one undirected edge X↔Y, splicing out v.
+        self.half_edges[t1.0 as usize].twin = t2; // t1 now X→Y
+        self.half_edges[t1.0 as usize].source_element = welded_source;
+        self.half_edges[t1.0 as usize].next = qb;
+        self.half_edges[qb.0 as usize].prev = t1;
+        self.half_edges[t2.0 as usize].twin = t1; // t2 now Y→X
+        self.half_edges[t2.0 as usize].source_element = welded_source;
+        self.half_edges[t2.0 as usize].next = qa;
+        self.half_edges[qa.0 as usize].prev = t2;
+
+        // Tombstone the two v-originating half-edges and v itself.
+        self.half_edges[o1.0 as usize].alive = false;
+        self.half_edges[o2.0 as usize].alive = false;
+        self.vertices[vi].outgoing = None;
+        self.vertices[vi].alive = false;
+
+        // A face anchor may have pointed at a now-dead half-edge.
+        for (face, keep) in [(fa, t2), (fb, t1)] {
+            let anchor = self.faces[face.0 as usize].half_edge;
+            if anchor == Some(o1) || anchor == Some(o2) {
+                self.faces[face.0 as usize].half_edge = Some(keep);
+            }
+        }
+        // X keeps its survivor t1 (origin X) and Y keeps t2 (origin Y); their
+        // outgoing slots could only have referenced o1/o2 via v, now gone.
+
+        let mut faces = vec![fa, fb];
+        faces.sort();
+        faces.dedup();
+        Ok(faces
+            .into_iter()
+            .filter(|f| !self.faces[f.0 as usize].is_outer)
+            .map(|f| self.face_patch(f))
+            .collect())
+    }
+
+    /// Live degree of a vertex (its number of live outgoing half-edges).
+    fn vertex_degree(&self, v: VertexId) -> usize {
+        let vi = v.0 as usize;
+        if vi >= self.vertices.len() || !self.vertices[vi].alive {
+            return 0;
+        }
+        self.outgoing_half_edges(v).count()
+    }
+
+    /// Remove the undirected edge of a **degree-1 spur tip** — a dangling wall
+    /// poking into a face — splicing the face cycle closed and tombstoning the
+    /// tip. `spur_he` may be either half-edge of the spur. Internal; driven by
+    /// `prune_orphans` / `remove_edge`. Area-neutral: the tip's out-and-back
+    /// boundary contributes cancelling shoelace terms, so no face area changes.
+    fn remove_spur_edge(&mut self, spur_he: HalfEdgeId) -> Result<(), EditError> {
+        let hi = spur_he.0 as usize;
+        if hi >= self.half_edges.len() || !self.half_edges[hi].alive {
+            return Err(EditError::StaleHandle);
+        }
+        let t = self.half_edges[hi].twin;
+        // Orient so `s = T→J` (origin is the degree-1 tip) and `s_t = J→T`.
+        let (s, s_t) = if self.vertex_degree(self.half_edges[hi].origin) == 1 {
+            (spur_he, t)
+        } else if self.vertex_degree(self.half_edges[t.0 as usize].origin) == 1 {
+            (t, spur_he)
+        } else {
+            return Err(EditError::VertexNotDissolvable); // neither end is a tip
+        };
+        let tip = self.half_edges[s.0 as usize].origin;
+        let j = self.half_edges[s_t.0 as usize].origin;
+        let f = self.half_edges[s.0 as usize].face;
+        // A genuine tip is a peninsula: both half-edges share one face and the
+        // rotation at the tip is the out-and-back pattern. Else it's corrupt.
+        if self.half_edges[s_t.0 as usize].face != f
+            || self.half_edges[s_t.0 as usize].next != s
+            || self.half_edges[s.0 as usize].prev != s_t
+        {
+            return Err(EditError::StaleHandle);
+        }
+        let a = self.half_edges[s_t.0 as usize].prev; // ends at J
+        let b = self.half_edges[s.0 as usize].next; // starts at J
+
+        if a == s {
+            // Lone stick: J is degree-1 too — the whole 2-vertex component is just
+            // this edge bounding one outer face. Tombstone the lot.
+            if !self.faces[f.0 as usize].is_outer {
+                return Err(EditError::StaleHandle); // a lone stick can't bound a room
+            }
+            self.half_edges[s.0 as usize].alive = false;
+            self.half_edges[s_t.0 as usize].alive = false;
+            self.vertices[tip.0 as usize].outgoing = None;
+            self.vertices[tip.0 as usize].alive = false;
+            self.vertices[j.0 as usize].outgoing = None;
+            self.vertices[j.0 as usize].alive = false;
+            self.faces[f.0 as usize].alive = false;
+            self.faces[f.0 as usize].half_edge = None;
+            return Ok(());
+        }
+
+        // Splice the spur out of F's cycle: A → B directly.
+        self.half_edges[a.0 as usize].next = b;
+        self.half_edges[b.0 as usize].prev = a;
+        self.half_edges[s.0 as usize].alive = false;
+        self.half_edges[s_t.0 as usize].alive = false;
+        self.vertices[tip.0 as usize].outgoing = None;
+        self.vertices[tip.0 as usize].alive = false;
+        self.repair_vertex_outgoing(j, s_t);
+        if matches!(self.faces[f.0 as usize].half_edge, Some(h) if h == s || h == s_t) {
+            self.faces[f.0 as usize].half_edge = Some(a);
+        }
+        Ok(())
+    }
+
+    /// Remove all orphaned cruft the wall arrangement leaves behind: dangling
+    /// spur walls (degree-1 chains), isolated vertices, and redundant collinear
+    /// degree-2 nodes. Idempotent, and never changes a room's area (spurs bound
+    /// no room; collinear dissolve only straightens a node already on its chord).
+    /// Returns how many topology elements were pruned.
+    pub fn prune_orphans(&mut self) -> usize {
+        let mut removed = 0usize;
+        // Phase A — spur sweep to a fixpoint (chews whole chains).
+        loop {
+            let tips: Vec<VertexId> = (0..self.vertices.len())
+                .map(|i| VertexId(i as u32))
+                .filter(|&v| self.vertex_degree(v) == 1)
+                .collect();
+            if tips.is_empty() {
+                break;
+            }
+            for tip in tips {
+                if self.vertex_degree(tip) != 1 {
+                    continue; // a sibling removal already changed it
+                }
+                let s = self.outgoing_half_edges(tip).next();
+                if let Some(s) = s {
+                    if self.remove_spur_edge(s).is_ok() {
+                        removed += 1;
+                    }
+                }
+            }
+        }
+        // Phase B — drop leftover degree-0 (isolated) vertices.
+        for i in 0..self.vertices.len() {
+            let v = VertexId(i as u32);
+            if self.vertices[i].alive && self.vertex_degree(v) == 0 {
+                self.vertices[i].alive = false;
+                self.vertices[i].outgoing = None;
+                removed += 1;
+            }
+        }
+        // Phase C — dissolve redundant collinear degree-2 nodes (fixpoint).
+        loop {
+            let mut progress = false;
+            let cands: Vec<VertexId> = (0..self.vertices.len())
+                .map(|i| VertexId(i as u32))
+                .filter(|&v| self.vertex_degree(v) == 2)
+                .collect();
+            for v in cands {
+                if self.vertex_degree(v) != 2 {
+                    continue;
+                }
+                let outs: Vec<HalfEdgeId> = self.outgoing_half_edges(v).collect();
+                let p = self.vertices[v.0 as usize].pos;
+                let x = self.vertices[self.dest(outs[0]).0 as usize].pos;
+                let y = self.vertices[self.dest(outs[1]).0 as usize].pos;
+                if perp_distance(p, x, y) >= EPS_COLL {
+                    continue; // a genuine corner — keep it
+                }
+                if self.dissolve_vertex(v).is_ok() {
+                    removed += 1;
+                    progress = true;
+                }
+            }
+            if !progress {
+                break;
+            }
+        }
+        removed
+    }
+
+    /// Remove the wall `edge`, choosing the right semantics from its two
+    /// incident faces, and auto-clean the orphans it leaves:
+    /// - room ↔ room → union the two rooms (`merge_faces`);
+    /// - bridge (same face both sides) or outer ↔ outer → delete it + `prune_orphans`;
+    /// - room ↔ outer (a real enclosing wall) → `BordersExterior` (don't open a room).
+    pub fn remove_edge(&mut self, edge: HalfEdgeId) -> Result<Vec<FacePatch>, EditError> {
+        let hi = edge.0 as usize;
+        if hi >= self.half_edges.len() || !self.half_edges[hi].alive {
+            return Err(EditError::StaleHandle);
+        }
+        let t = self.half_edges[hi].twin;
+        let f_keep = self.half_edges[hi].face;
+        let f_drop = self.half_edges[t.0 as usize].face;
+        let keep_outer = self.faces[f_keep.0 as usize].is_outer;
+        let drop_outer = self.faces[f_drop.0 as usize].is_outer;
+
+        if f_keep != f_drop && !keep_outer && !drop_outer {
+            return self.merge_faces(edge); // two real rooms → union
+        }
+        if f_keep != f_drop && keep_outer != drop_outer {
+            return Err(EditError::BordersExterior); // would open a room
+        }
+
+        // Bridge (f_keep == f_drop) or outer ↔ outer → delete + clean.
+        let hn = self.half_edges[hi].next;
+        let hp = self.half_edges[hi].prev;
+        let tn = self.half_edges[t.0 as usize].next;
+        let tp = self.half_edges[t.0 as usize].prev;
+        let oh = self.half_edges[hi].origin;
+        let ot = self.half_edges[t.0 as usize].origin;
+
+        self.half_edges[hp.0 as usize].next = tn;
+        self.half_edges[tn.0 as usize].prev = hp;
+        self.half_edges[tp.0 as usize].next = hn;
+        self.half_edges[hn.0 as usize].prev = tp;
+
+        if f_drop != f_keep {
+            // outer ↔ outer: fold f_drop's loop into f_keep.
+            self.faces[f_keep.0 as usize].half_edge = Some(hp);
+            let merged: Vec<HalfEdgeId> = self.face_half_edges(f_keep).collect();
+            for he in merged {
+                self.half_edges[he.0 as usize].face = f_keep;
+            }
+            self.faces[f_drop.0 as usize].alive = false;
+            self.faces[f_drop.0 as usize].half_edge = None;
+        }
+        self.half_edges[hi].alive = false;
+        self.half_edges[t.0 as usize].alive = false;
+        self.repair_vertex_outgoing(oh, edge);
+        self.repair_vertex_outgoing(ot, t);
+        // The face's anchor may have been one of the removed half-edges (esp. a
+        // bridge / spur in the outer face) — re-point it at a survivor.
+        self.reanchor_face_if_dead(f_keep);
+
+        self.prune_orphans();
+
+        let mut out = Vec::new();
+        if self.faces[f_keep.0 as usize].alive && !self.faces[f_keep.0 as usize].is_outer {
+            out.push(self.face_patch(f_keep));
+        }
+        Ok(out)
+    }
+
+    /// Author a brand-new room from a closed ring of points — the "draw a
+    /// room" affordance. The polygon becomes its **own** connected component:
+    /// a CCW interior room face plus the CW exterior face bounding it. It does
+    /// NOT merge into existing topology (there's no arrangement overlay), so
+    /// drawing over an existing room leaves two independent components — the
+    /// documented prototype limitation.
+    ///
+    /// `points` is the ring with no repeated closing vertex; winding is
+    /// normalised to CCW. Rejects a ring that is too short, self-intersecting,
+    /// or near-zero area (`InvalidPolygon`). Returns the new room's patch.
+    pub fn add_face(&mut self, points: &[[f64; 2]], source_element: Option<u32>) -> Result<FacePatch, EditError> {
+        if points.len() < 3 || !is_simple_polygon(points) {
+            return Err(EditError::InvalidPolygon);
+        }
+        // Reject consecutive coincident points, including the closing wrap. A
+        // zero-length edge slips past `is_simple_polygon` (its segment-cross test
+        // treats a degenerate segment as parallel), so a ring like [A, A, B, C]
+        // has non-zero area yet would persist a duplicate vertex + zero-length
+        // half-edge — malformed for later editing/offsetting/baking. Reachable
+        // from the draw UI (e.g. a double-click landing the final corner twice).
+        let n = points.len();
+        for i in 0..n {
+            let a = points[i];
+            let b = points[(i + 1) % n];
+            if (a[0] - b[0]).abs() < EPS && (a[1] - b[1]).abs() < EPS {
+                return Err(EditError::InvalidPolygon);
+            }
+        }
+        let signed = polygon_area(points);
+        if signed.abs() < EPS {
+            return Err(EditError::InvalidPolygon);
+        }
+        // Normalise to CCW so the interior winds positive (room on the left).
+        let ring: Vec<[f64; 2]> =
+            if signed > 0.0 { points.to_vec() } else { points.iter().rev().copied().collect() };
+        let nn = ring.len() as u32;
+
+        let v0 = self.vertices.len() as u32; // first new vertex id
+        let h0 = self.half_edges.len() as u32; // first interior half-edge id
+        let g0 = h0 + nn; // first exterior (twin) half-edge id
+        let room = FaceId(self.faces.len() as u32);
+        let outer = FaceId(self.faces.len() as u32 + 1);
+
+        for (i, &p) in ring.iter().enumerate() {
+            self.vertices.push(Vertex { pos: p, outgoing: Some(HalfEdgeId(h0 + i as u32)), alive: true });
+        }
+        // Interior half-edges h_i: v_i → v_{i+1}, CCW, room on the left.
+        for i in 0..nn {
+            self.half_edges.push(HalfEdge {
+                origin: VertexId(v0 + i),
+                twin: HalfEdgeId(g0 + i),
+                next: HalfEdgeId(h0 + (i + 1) % nn),
+                prev: HalfEdgeId(h0 + (i + nn - 1) % nn),
+                face: room,
+                source_element,
+                half_thickness: 0.0, // a drawn room has no source wall thickness
+                alive: true,
+            });
+        }
+        // Exterior twins g_i: v_{i+1} → v_i, winding CW around the room.
+        for i in 0..nn {
+            self.half_edges.push(HalfEdge {
+                origin: VertexId(v0 + (i + 1) % nn),
+                twin: HalfEdgeId(h0 + i),
+                next: HalfEdgeId(g0 + (i + nn - 1) % nn),
+                prev: HalfEdgeId(g0 + (i + 1) % nn),
+                face: outer,
+                source_element,
+                half_thickness: 0.0,
+                alive: true,
+            });
+        }
+        self.faces.push(Face {
+            half_edge: Some(HalfEdgeId(h0)),
+            is_outer: false,
+            is_room: true, // a user-drawn partition is a room
+            floor_z: 0.0,
+            ceiling_z: 0.0,
+            non_planar_ceiling: false,
+            alive: true,
+        });
+        self.faces.push(Face {
+            half_edge: Some(HalfEdgeId(g0)),
+            is_outer: true,
+            is_room: false,
+            floor_z: 0.0,
+            ceiling_z: 0.0,
+            non_planar_ceiling: false,
+            alive: true,
+        });
+
+        Ok(self.face_patch(room))
+    }
+
     // ─────────────────────────── queries ────────────────────────────
 
     /// The face on the far side of `edge` — its twin's face. O(1). This is
@@ -529,14 +1042,38 @@ impl SpacePlate {
         Some(self.half_edges[he.twin.0 as usize].face)
     }
 
-    /// Every live interior (room) face.
+    /// Every live interior (room) face. In the FACE-BASED build (`wall_rects`
+    /// non-empty) a bounded face is a room only if it's a gap between walls — its
+    /// centroid lies outside every wall rectangle, so wall interiors and junction
+    /// overlaps are excluded.
     pub fn rooms(&self) -> impl Iterator<Item = FaceId> + '_ {
         (0..self.faces.len())
             .map(|i| FaceId(i as u32))
             .filter(move |f| {
                 let face = &self.faces[f.0 as usize];
-                face.alive && !face.is_outer
+                face.alive && face.is_room
             })
+    }
+
+    /// Geometric gap test used ONCE at build to classify face-based rooms: a
+    /// bounded face is a gap (room) when its centroid is not inside any wall
+    /// rectangle. True for the centreline build (no `wall_rects`). Not used after
+    /// build — `Face::is_room` is the carried-through source of truth.
+    fn is_gap_face(&self, face: FaceId) -> bool {
+        if self.wall_rects.is_empty() {
+            return true;
+        }
+        let outline = self.face_outline(face);
+        if outline.len() < 3 {
+            return false;
+        }
+        let (mut cx, mut cy) = (0.0, 0.0);
+        for p in &outline {
+            cx += p[0];
+            cy += p[1];
+        }
+        let c = [cx / outline.len() as f64, cy / outline.len() as f64];
+        !self.wall_rects.iter().any(|r| point_in_quad(c, r))
     }
 
     /// CCW outline of a face (no repeated closing vertex).
@@ -549,6 +1086,158 @@ impl SpacePlate {
     /// Absolute area of a face.
     pub fn face_area(&self, face: FaceId) -> f64 {
         self.signed_area_of_cycle(&self.face_half_edges(face).collect::<Vec<_>>()).abs()
+    }
+
+    /// The room's outline offset to a wall **boundary face** rather than the
+    /// centreline: each boundary edge is moved perpendicular by its own wall's
+    /// half-thickness — inward for the net (inner) face, outward for the gross
+    /// (outer) face — then adjacent offset lines are re-intersected for the
+    /// corners. Because every half-edge carries its source wall's thickness,
+    /// this needs no fuzzy edge↔wall matching (unlike the TS `offsetRoomFootprint`).
+    ///
+    /// An edge shared with another room (its twin bounds a room, not the
+    /// exterior) is pinned to the centreline in **outward** mode so it can't
+    /// push into the neighbour. Falls back to the unchanged centreline outline
+    /// when no offset applies, a corner is degenerate, or an inset would invert
+    /// the polygon — so the result is always a sane ring.
+    pub fn net_outline(&self, face: FaceId, inset: bool) -> Vec<[f64; 2]> {
+        let centre = self.face_outline(face);
+        let n = centre.len();
+        if n < 3 {
+            return centre;
+        }
+        let cycle: Vec<HalfEdgeId> = self.face_half_edges(face).collect();
+        if cycle.len() != n {
+            return centre; // outline / cycle mismatch (e.g. a hole) — don't guess
+        }
+        let sign = if inset { 1.0 } else { -1.0 };
+        // Per edge: a point on its offset line + the edge's unit direction.
+        let mut lines: Vec<([f64; 2], [f64; 2])> = Vec::with_capacity(n);
+        for i in 0..n {
+            let a = centre[i];
+            let b = centre[(i + 1) % n];
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let l = (dx * dx + dy * dy).sqrt();
+            if l < EPS {
+                return centre;
+            }
+            let (ux, uy) = (dx / l, dy / l);
+            let mut half = self.half_edges[cycle[i].0 as usize].half_thickness;
+            // Outward: a shared (room↔room) edge would overlap the neighbour, so pin it.
+            if !inset {
+                if let Some(nbr) = self.neighbor_across(cycle[i]) {
+                    if !self.faces[nbr.0 as usize].is_outer {
+                        half = 0.0;
+                    }
+                }
+            }
+            let off = sign * half;
+            // Inward normal of a CCW outline is to the left of a→b: (-uy, ux).
+            lines.push(([a[0] - uy * off, a[1] + ux * off], [ux, uy]));
+        }
+        let mut verts: Vec<[f64; 2]> = Vec::with_capacity(n);
+        for i in 0..n {
+            let (pp, pd) = lines[(i + n - 1) % n];
+            let (cp, cd) = lines[i];
+            let hit = line_intersection(pp, [pp[0] + pd[0], pp[1] + pd[1]], cp, [cp[0] + cd[0], cp[1] + cd[1]]);
+            // Parallel offset lines (a collinear node, e.g. a mid-wall split, or
+            // two edges of equal thickness in a straight run) don't intersect —
+            // drop the corner onto the current offset line so it sits flush on
+            // the inset boundary instead of poking back to the centreline.
+            verts.push(hit.unwrap_or_else(|| {
+                let t = (centre[i][0] - cp[0]) * cd[0] + (centre[i][1] - cp[1]) * cd[1];
+                [cp[0] + t * cd[0], cp[1] + t * cd[1]]
+            }));
+        }
+        if verts.iter().any(|v| !v[0].is_finite() || !v[1].is_finite()) {
+            return centre;
+        }
+        let got = polygon_area(&verts).abs();
+        if got <= EPS {
+            return centre;
+        }
+        if inset && got > polygon_area(&centre).abs() + 1e-6 {
+            return centre; // the inset inverted the polygon — keep the centreline
+        }
+        verts
+    }
+
+    /// FACE-BASED boundary of a gap room: the gap outline IS the net (inner-face)
+    /// area, so this pushes every edge OUTWARD (into the wall, away from the room)
+    /// by `factor × the source wall's half-thickness`, then re-intersects corners.
+    /// `factor = 0` → net (the gap itself); `1` → the wall **axis / centre line**
+    /// (½ thickness — where the editable node sits, on the wall mid); `2` → the
+    /// gross outer face (full thickness). No shared-edge pinning: two rooms across
+    /// a wall correctly meet at the mid axis and overlap into it for gross.
+    pub fn gap_boundary(&self, face: FaceId, factor: f64) -> Vec<[f64; 2]> {
+        let centre = self.face_outline(face);
+        let n = centre.len();
+        if n < 3 || factor.abs() < EPS {
+            return centre;
+        }
+        let cycle: Vec<HalfEdgeId> = self.face_half_edges(face).collect();
+        if cycle.len() != n {
+            return centre;
+        }
+        // Per edge: the offset line (anchor + dir), the outward displacement
+        // vector applied, and |offset| (for the corner miter clamp below).
+        let mut lines: Vec<([f64; 2], [f64; 2])> = Vec::with_capacity(n);
+        let mut disp: Vec<[f64; 2]> = Vec::with_capacity(n);
+        let mut off_mag: Vec<f64> = Vec::with_capacity(n);
+        for i in 0..n {
+            let a = centre[i];
+            let b = centre[(i + 1) % n];
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let l = (dx * dx + dy * dy).sqrt();
+            if l < EPS {
+                return centre;
+            }
+            let (ux, uy) = (dx / l, dy / l);
+            let half = self.half_edges[cycle[i].0 as usize].half_thickness;
+            // Outward (right of a→b on a CCW ring) = (uy, -ux), i.e. negate the
+            // inward normal (-uy, ux). Push the edge out by factor × half.
+            let off = factor * half;
+            let d = [uy * off, -ux * off];
+            lines.push(([a[0] + d[0], a[1] + d[1]], [ux, uy]));
+            disp.push(d);
+            off_mag.push(off.abs());
+        }
+        // Re-intersect adjacent offset lines at each corner. At a concave / very
+        // acute corner the two near-parallel lines meet far away (an unbounded
+        // miter), which would blow the polygon up; clamp any corner that moves
+        // more than MITER_LIMIT × the local offset to a bevel (the original
+        // corner displaced by the mean of its two edges' offsets).
+        const MITER_LIMIT: f64 = 4.0;
+        let mut verts: Vec<[f64; 2]> = Vec::with_capacity(n);
+        for i in 0..n {
+            let pj = (i + n - 1) % n;
+            let (pp, pd) = lines[pj];
+            let (cp, cd) = lines[i];
+            let bevel = [
+                centre[i][0] + 0.5 * (disp[pj][0] + disp[i][0]),
+                centre[i][1] + 0.5 * (disp[pj][1] + disp[i][1]),
+            ];
+            let limit = MITER_LIMIT * off_mag[i].max(off_mag[pj]) + EPS;
+            let pt = match line_intersection(pp, [pp[0] + pd[0], pp[1] + pd[1]], cp, [cp[0] + cd[0], cp[1] + cd[1]]) {
+                Some(m) => {
+                    let (ddx, ddy) = (m[0] - centre[i][0], m[1] - centre[i][1]);
+                    if (ddx * ddx + ddy * ddy).sqrt() <= limit { m } else { bevel }
+                }
+                None => bevel,
+            };
+            verts.push(pt);
+        }
+        // Final guards: any non-finite / degenerate / runaway (a still-exploded
+        // offset polygon should never dwarf the net area) → fall back to the net.
+        let net_area = polygon_area(&centre).abs();
+        let off_area = polygon_area(&verts).abs();
+        if verts.iter().any(|v| !v[0].is_finite() || !v[1].is_finite())
+            || off_area <= EPS
+            || off_area > 4.0 * net_area + 25.0
+        {
+            return centre;
+        }
+        verts
     }
 
     /// The bounding half-edges of a face paired with the IFC element each
@@ -666,6 +1355,31 @@ impl SpacePlate {
         }
     }
 
+    /// Ensure `f`'s anchor half-edge is a live half-edge that still belongs to
+    /// `f`; if the anchor was tombstoned (or re-homed), re-point it at any
+    /// surviving member, and tombstone the face if none remain.
+    fn reanchor_face_if_dead(&mut self, f: FaceId) {
+        let fi = f.0 as usize;
+        if fi >= self.faces.len() || !self.faces[fi].alive {
+            return;
+        }
+        let ok = matches!(self.faces[fi].half_edge, Some(h)
+            if self.half_edges[h.0 as usize].alive && self.half_edges[h.0 as usize].face == f);
+        if ok {
+            return;
+        }
+        let replacement = (0..self.half_edges.len())
+            .map(|i| HalfEdgeId(i as u32))
+            .find(|h| {
+                let he = &self.half_edges[h.0 as usize];
+                he.alive && he.face == f
+            });
+        self.faces[fi].half_edge = replacement;
+        if replacement.is_none() {
+            self.faces[fi].alive = false;
+        }
+    }
+
     fn face_patch(&self, face: FaceId) -> FacePatch {
         let outline = self.face_outline(face);
         let area = polygon_area(&outline).abs();
@@ -742,6 +1456,7 @@ struct ArrEdge {
     a: usize,
     b: usize,
     source: Option<u32>,
+    half_thickness: f64,
 }
 
 /// The planar arrangement: snapped vertices + split, deduped edges. This is
@@ -795,7 +1510,7 @@ impl Arrangement {
             let ai = lookup(s.a, &mut vertices);
             let bi = lookup(s.b, &mut vertices);
             if ai != bi {
-                segs.push(Seg { a: ai, b: bi, source: s.source_element });
+                segs.push(Seg { a: ai, b: bi, source: s.source_element, half_thickness: s.half_thickness });
             }
         }
 
@@ -814,7 +1529,7 @@ impl Arrangement {
             'outer: for vid in endpoints {
                 let p = vertices[vid];
                 for si in 0..segs.len() {
-                    let Seg { a, b, source } = segs[si];
+                    let Seg { a, b, source, half_thickness } = segs[si];
                     if a == vid || b == vid {
                         continue;
                     }
@@ -827,8 +1542,8 @@ impl Arrangement {
                         if !(1e-6..=1.0 - 1e-6).contains(&t) {
                             continue; // endpoint, not interior
                         }
-                        segs[si] = Seg { a, b: vid, source };
-                        segs.push(Seg { a: vid, b, source });
+                        segs[si] = Seg { a, b: vid, source, half_thickness };
+                        segs.push(Seg { a: vid, b, source, half_thickness });
                         applied = true;
                         break 'outer;
                     }
@@ -881,13 +1596,14 @@ impl Arrangement {
         let mut seen: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
         for (i, mut cuts) in splits.into_iter().enumerate() {
             let source = seeds[i].source;
+            let ht = seeds[i].half_thickness;
             if cuts.len() <= 2 {
-                push_edge(&mut edges, &mut seen, cuts[0].1, cuts[1].1, source);
+                push_edge(&mut edges, &mut seen, cuts[0].1, cuts[1].1, source, ht);
                 continue;
             }
             cuts.sort_by(|p, q| p.0.partial_cmp(&q.0).unwrap_or(std::cmp::Ordering::Equal));
             for w in cuts.windows(2) {
-                push_edge(&mut edges, &mut seen, w[0].1, w[1].1, source);
+                push_edge(&mut edges, &mut seen, w[0].1, w[1].1, source, ht);
             }
         }
 
@@ -900,21 +1616,24 @@ struct Seg {
     a: usize,
     b: usize,
     source: Option<u32>,
+    half_thickness: f64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_edge(
     edges: &mut Vec<ArrEdge>,
     seen: &mut std::collections::HashSet<(usize, usize)>,
     a: usize,
     b: usize,
     source: Option<u32>,
+    half_thickness: f64,
 ) {
     if a == b {
         return;
     }
     let key = if a < b { (a, b) } else { (b, a) };
     if seen.insert(key) {
-        edges.push(ArrEdge { a, b, source });
+        edges.push(ArrEdge { a, b, source, half_thickness });
     }
 }
 
@@ -1025,6 +1744,35 @@ fn polygon_area(pts: &[[f64; 2]]) -> f64 {
     acc * 0.5
 }
 
+/// Ray-cast point-in-polygon for a wall rectangle (4 corners). A face centroid
+/// inside any wall rect = a wall interior / junction overlap, not a room gap.
+fn point_in_quad(p: [f64; 2], quad: &[[f64; 2]; 4]) -> bool {
+    let mut inside = false;
+    let mut j = 3;
+    for i in 0..4 {
+        let (xi, yi) = (quad[i][0], quad[i][1]);
+        let (xj, yj) = (quad[j][0], quad[j][1]);
+        if ((yi > p[1]) != (yj > p[1])) && (p[0] < (xj - xi) * (p[1] - yi) / (yj - yi) + xi) {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// Perpendicular distance of point `p` to the infinite line through `a` and `b`
+/// (degenerates to the point distance when `a == b`). Used to judge whether a
+/// degree-2 node is a redundant collinear point on its neighbours' chord.
+fn perp_distance(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
+    let dx = b[0] - a[0];
+    let dy = b[1] - a[1];
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < EPS {
+        return ((p[0] - a[0]).powi(2) + (p[1] - a[1]).powi(2)).sqrt();
+    }
+    ((p[0] - a[0]) * dy - (p[1] - a[1]) * dx).abs() / len
+}
+
 /// Cheap self-intersection screen for edit feedback: O(n²) edge-pair test on a
 /// single face boundary (faces are small). Not a robustness guarantee.
 fn is_simple_polygon(pts: &[[f64; 2]]) -> bool {
@@ -1074,6 +1822,58 @@ mod tests {
         assert_eq!(plate.room_count(), 1);
         let room = plate.rooms().next().unwrap();
         assert!((plate.face_area(room) - 12.0).abs() < 1e-6, "area {}", plate.face_area(room));
+    }
+
+    #[test]
+    fn face_based_room_is_the_gap_between_wall_rects() {
+        // A 4×3 room boxed by four 0.2 m-thick wall rectangles (they overlap at
+        // the corners, as real walls do). The room is the GAP between them: net
+        // (inner faces) = 3.8×2.8 = 10.64; axis (+½t) = 4×3 = 12; gross (+t) =
+        // 4.2×3.2 = 13.44. Nodes sit on the axis = the true wall mid.
+        let rects = vec![
+            [[-0.1, -0.1], [4.1, -0.1], [4.1, 0.1], [-0.1, 0.1]], // bottom
+            [[-0.1, 2.9], [4.1, 2.9], [4.1, 3.1], [-0.1, 3.1]],   // top
+            [[-0.1, -0.1], [0.1, -0.1], [0.1, 3.1], [-0.1, 3.1]], // left
+            [[3.9, -0.1], [4.1, -0.1], [4.1, 3.1], [3.9, 3.1]],   // right
+        ];
+        let plate = SpacePlate::build_from_wall_rects(&rects, BuildOptions::default());
+        assert_eq!(plate.room_count(), 1, "the gap between the four walls is the one room");
+        let room = plate.rooms().next().unwrap();
+        // The editable plate sits on the wall AXIS: the room outline IS the axis
+        // (4×3 = 12), and net_outline recovers the inner (net) / outer (gross) faces.
+        let axis = polygon_area(&plate.face_outline(room)).abs();
+        assert!((axis - 12.0).abs() < 1e-6, "room outline is the wall axis (4×3=12), got {axis}");
+        let net = polygon_area(&plate.net_outline(room, true)).abs();
+        assert!((net - 10.64).abs() < 1e-3, "net (inner faces) = 10.64, got {net}");
+        let gross = polygon_area(&plate.net_outline(room, false)).abs();
+        assert!((gross - 13.44).abs() < 1e-3, "gross (outer faces) = 13.44, got {gross}");
+    }
+
+    #[test]
+    fn face_based_edits_preserve_room_classification() {
+        // The 4-wall box → one gap room. `is_room` is set once at build and
+        // carried through edits, so neither a drag nor a split can re-classify
+        // wall-interior faces into phantom rooms — and a split yields TWO rooms.
+        let rects = vec![
+            [[-0.1, -0.1], [4.1, -0.1], [4.1, 0.1], [-0.1, 0.1]],
+            [[-0.1, 2.9], [4.1, 2.9], [4.1, 3.1], [-0.1, 3.1]],
+            [[-0.1, -0.1], [0.1, -0.1], [0.1, 3.1], [-0.1, 3.1]],
+            [[3.9, -0.1], [4.1, -0.1], [4.1, 3.1], [3.9, 3.1]],
+        ];
+        let mut plate = SpacePlate::build_from_wall_rects(&rects, BuildOptions::default());
+        assert_eq!(plate.room_count(), 1);
+        // The plate sits on the wall axis, so the room corners are the axis corners
+        // (0,0)…(4,3). Drag one inward — must NOT spawn a phantom room.
+        let corner = plate.find_vertex([4.0, 3.0]);
+        plate.drag_vertex(corner, 3.7, 2.7).expect("drag");
+        assert_eq!(plate.room_count(), 1, "a drag must not spawn phantom rooms");
+        // Cut the room across → two rooms (both halves inherit is_room; this was
+        // the "can't cut a space in half" bug).
+        let room = plate.rooms().next().unwrap();
+        let a = plate.find_vertex([0.0, 0.0]);
+        let b = plate.find_vertex([3.7, 2.7]);
+        plate.split_face(room, a, b, None).expect("split");
+        assert_eq!(plate.room_count(), 2, "a split produces two rooms");
     }
 
     /// Two rooms sharing a central wall — the canonical "shared edge"
@@ -1368,6 +2168,378 @@ mod tests {
             .filter(|(_, s)| s.is_none())
             .count();
         assert!(unsourced >= 1, "the user-drawn partition has no source element");
+    }
+
+    #[test]
+    fn dissolve_is_the_inverse_of_split_edge() {
+        let mut plate = two_room_plate();
+        let rooms: Vec<FaceId> = plate.rooms().collect();
+        let areas_before: Vec<f64> = rooms.iter().map(|f| plate.face_area(*f)).collect();
+        let verts_before: Vec<usize> = rooms.iter().map(|f| plate.face_outline(*f).len()).collect();
+        // Add a node mid-shared-wall, then dissolve it back out.
+        let shared = plate
+            .face_half_edges(rooms[0])
+            .find(|h| {
+                plate
+                    .neighbor_across(*h)
+                    .map(|n| n != rooms[0] && !plate.faces[n.0 as usize].is_outer)
+                    .unwrap_or(false)
+            })
+            .expect("shared edge");
+        let a = plate.vertices[plate.half_edges[shared.0 as usize].origin.0 as usize].pos;
+        let bvid = plate.half_edges[plate.half_edges[shared.0 as usize].twin.0 as usize].origin;
+        let b = plate.vertices[bvid.0 as usize].pos;
+        let mid = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
+        let n = plate.split_edge(shared, mid[0], mid[1]).expect("split_edge");
+        assert_eq!(plate.face_outline(rooms[0]).len(), verts_before[0] + 1, "node added");
+
+        let patches = plate.dissolve_vertex(n).expect("dissolve the node");
+        assert_eq!(patches.len(), 2, "both rooms touching the welded wall come back");
+        assert_eq!(plate.vertex_position(n), None, "the node is tombstoned");
+        assert_eq!(plate.room_count(), 2, "no room added or lost");
+        for (f, (a0, v0)) in rooms.iter().zip(areas_before.iter().zip(&verts_before)) {
+            assert!((plate.face_area(*f) - a0).abs() < 1e-6, "area restored");
+            assert_eq!(plate.face_outline(*f).len(), *v0, "vertex count restored");
+        }
+    }
+
+    #[test]
+    fn dissolve_corner_straightens_the_room() {
+        // A 4×3 rectangle; dropping corner (0,0) leaves the triangle
+        // (4,0)-(4,3)-(0,3) = 12 − 6 = 6 m².
+        let segs = loop_segments(&rect(0.0, 0.0, 4.0, 3.0), 400);
+        let mut plate = SpacePlate::build(&segs, BuildOptions::default());
+        let v00 = plate.find_vertex([0.0, 0.0]);
+        let patches = plate.dissolve_vertex(v00).expect("dissolve a convex corner");
+        assert_eq!(plate.room_count(), 1);
+        assert_eq!(patches.len(), 1, "one incident room (the other side is exterior)");
+        assert!((patches[0].area - 6.0).abs() < 1e-6, "area = 6 m²: {}", patches[0].area);
+        assert!(patches[0].simple, "the triangle stays simple");
+        assert_eq!(plate.face_outline(patches[0].face).len(), 3, "now a triangle");
+    }
+
+    #[test]
+    fn dissolve_rejects_a_wall_junction() {
+        // (4,0) is where the central wall meets the bottom wall: degree 3.
+        let mut plate = two_room_plate();
+        let junction = plate.find_vertex([4.0, 0.0]);
+        assert_eq!(plate.dissolve_vertex(junction), Err(EditError::VertexNotDissolvable));
+    }
+
+    #[test]
+    fn dissolve_rejects_triangle_collapse() {
+        // A triangle room: dropping any corner welds two already-adjacent
+        // neighbours into a parallel edge → a digon. Reject.
+        let segs = loop_segments(&[[0.0, 0.0], [4.0, 0.0], [0.0, 3.0]], 500);
+        let mut plate = SpacePlate::build(&segs, BuildOptions::default());
+        assert_eq!(plate.room_count(), 1, "triangle is one room");
+        let corner = plate.find_vertex([0.0, 0.0]);
+        assert_eq!(plate.dissolve_vertex(corner), Err(EditError::DegenerateCut));
+    }
+
+    #[test]
+    fn dissolve_rejects_a_stale_handle() {
+        let mut plate = two_room_plate();
+        assert_eq!(plate.dissolve_vertex(VertexId(9999)), Err(EditError::StaleHandle));
+    }
+
+    #[test]
+    fn add_face_creates_a_room_on_an_empty_plate() {
+        let mut plate = SpacePlate::build(&[], BuildOptions::default());
+        assert_eq!(plate.room_count(), 0, "no walls → no rooms");
+        let patch = plate.add_face(&rect(0.0, 0.0, 5.0, 4.0), None).expect("draw a room");
+        assert_eq!(plate.room_count(), 1, "the drawn room exists");
+        assert!((patch.area - 20.0).abs() < 1e-6, "area = 20 m²: {}", patch.area);
+        assert!(patch.simple);
+        assert!((plate.face_area(patch.face) - 20.0).abs() < 1e-6, "queryable like any room");
+    }
+
+    #[test]
+    fn add_face_normalises_clockwise_winding() {
+        let mut plate = SpacePlate::build(&[], BuildOptions::default());
+        // CW ring (reverse of a rect): area must still come out correct.
+        let cw = vec![[0.0, 0.0], [0.0, 4.0], [5.0, 4.0], [5.0, 0.0]];
+        let patch = plate.add_face(&cw, Some(7)).expect("draw a CW room");
+        assert!((patch.area - 20.0).abs() < 1e-6, "winding normalised: {}", patch.area);
+        assert!(polygon_area(&patch.outline) > 0.0, "interior face winds CCW");
+    }
+
+    #[test]
+    fn add_face_into_an_existing_plate_keeps_the_old_rooms() {
+        let mut plate = two_room_plate();
+        let before: f64 = plate.rooms().map(|f| plate.face_area(f)).sum();
+        plate.add_face(&rect(20.0, 20.0, 23.0, 22.0), None).expect("draw a third room"); // 3×2 = 6 m²
+        assert_eq!(plate.room_count(), 3, "two original + one drawn");
+        let total: f64 = plate.rooms().map(|f| plate.face_area(f)).sum();
+        assert!((total - (before + 6.0)).abs() < 1e-6, "old rooms intact: {total} vs {}", before + 6.0);
+    }
+
+    #[test]
+    fn add_face_rejects_bad_rings() {
+        let mut plate = SpacePlate::build(&[], BuildOptions::default());
+        // Too few points.
+        assert_eq!(plate.add_face(&[[0.0, 0.0], [1.0, 0.0]], None), Err(EditError::InvalidPolygon));
+        // Self-intersecting bow-tie.
+        let bowtie = vec![[0.0, 0.0], [4.0, 4.0], [4.0, 0.0], [0.0, 4.0]];
+        assert_eq!(plate.add_face(&bowtie, None), Err(EditError::InvalidPolygon));
+        // Collinear (zero area).
+        let line = vec![[0.0, 0.0], [2.0, 0.0], [4.0, 0.0]];
+        assert_eq!(plate.add_face(&line, None), Err(EditError::InvalidPolygon));
+        // Consecutive duplicate point (zero-length edge) — non-zero area, but a
+        // degenerate edge that is_simple_polygon misses. Reachable via a
+        // double-click that lands the final corner twice.
+        let dup = vec![[0.0, 0.0], [0.0, 0.0], [4.0, 0.0], [4.0, 4.0]];
+        assert_eq!(plate.add_face(&dup, None), Err(EditError::InvalidPolygon));
+        // Repeated closing point (first == last) — the wrap-around case.
+        let closed = vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 0.0]];
+        assert_eq!(plate.add_face(&closed, None), Err(EditError::InvalidPolygon));
+    }
+
+    // ───────────────── orphan removal + auto-cleanup ─────────────────
+
+    /// rect(0,0,4,3) plus a spur wall poking out of the right wall's midpoint
+    /// to (6, 1.5). The T-junction snap splits the right wall at (4,1.5), so
+    /// the arrangement carries a degree-1 tip at (6,1.5) and a redundant
+    /// collinear node at (4,1.5).
+    fn spur_segs() -> Vec<InputSegment> {
+        let mut s = loop_segments(&rect(0.0, 0.0, 4.0, 3.0), 100);
+        s.push(InputSegment::new([4.0, 1.5], [6.0, 1.5], Some(200)));
+        s
+    }
+
+    /// Build the spur plate WITHOUT the `build` auto-prune (via the raw
+    /// `from_arrangement`) so the spur survives for the removal/prune tests.
+    fn spur_plate_unpruned() -> SpacePlate {
+        let arr = Arrangement::resolve(&spur_segs(), 0.1);
+        SpacePlate::from_arrangement(arr, 0.5)
+    }
+
+    fn live_vertex_count(plate: &SpacePlate) -> usize {
+        (0..plate.vertices.len()).filter(|&i| plate.vertices[i].alive).count()
+    }
+
+    #[test]
+    fn spur_fixture_actually_has_a_spur() {
+        let plate = spur_plate_unpruned();
+        assert_eq!(plate.room_count(), 1, "the rectangle is still one room");
+        let tip = plate.find_vertex([6.0, 1.5]);
+        assert_eq!(plate.vertex_degree(tip), 1, "the spur end is a degree-1 tip");
+        let junction = plate.find_vertex([4.0, 1.5]);
+        assert_eq!(plate.vertex_degree(junction), 3, "the spur base is a T-junction");
+    }
+
+    #[test]
+    fn remove_spur_edge_drops_the_tip_and_keeps_area() {
+        let mut plate = spur_plate_unpruned();
+        let area_before: f64 = plate.rooms().map(|f| plate.face_area(f)).sum();
+        let tip = plate.find_vertex([6.0, 1.5]);
+        let spur_he = plate.outgoing_half_edges(tip).next().expect("tip has an outgoing he");
+        plate.remove_spur_edge(spur_he).expect("remove the spur");
+        assert_eq!(plate.vertex_position(tip), None, "the tip is tombstoned");
+        assert_eq!(plate.room_count(), 1, "no room gained or lost");
+        let area_after: f64 = plate.rooms().map(|f| plate.face_area(f)).sum();
+        assert!(
+            (area_before - area_after).abs() < 1e-6,
+            "spur removal is area-neutral: {area_before} vs {area_after}",
+        );
+    }
+
+    #[test]
+    fn remove_spur_edge_rejects_a_non_tip_and_a_stale_handle() {
+        let mut plate = spur_plate_unpruned();
+        // Any room boundary edge has both ends at degree ≥ 2 → not a spur.
+        let room = plate.rooms().next().unwrap();
+        let non_spur = plate.face_half_edges(room).next().expect("a room edge");
+        assert_eq!(plate.remove_spur_edge(non_spur), Err(EditError::VertexNotDissolvable));
+        assert_eq!(plate.remove_spur_edge(HalfEdgeId(99_999)), Err(EditError::StaleHandle));
+    }
+
+    #[test]
+    fn prune_orphans_removes_the_spur_and_dissolves_the_exposed_node() {
+        let mut plate = spur_plate_unpruned();
+        let room = plate.rooms().next().unwrap();
+        assert!(
+            plate.face_outline(room).len() >= 5,
+            "unpruned room boundary carries the T-junction node",
+        );
+        let removed = plate.prune_orphans();
+        assert!(removed >= 2, "pruned the spur edge + the now-collinear node: {removed}");
+        let room = plate.rooms().next().unwrap();
+        assert_eq!(plate.face_outline(room).len(), 4, "back to a clean 4-corner rectangle");
+        assert!((plate.face_area(room) - 12.0).abs() < 1e-6, "area unchanged: {}", plate.face_area(room));
+        assert_eq!(live_vertex_count(&plate), 4, "only the four corners survive");
+    }
+
+    #[test]
+    fn prune_orphans_is_idempotent_and_a_noop_on_clean_plates() {
+        // Clean by construction (build auto-prunes) → nothing to do.
+        let mut clean = two_room_plate();
+        assert_eq!(clean.prune_orphans(), 0, "a clean two-room plate prunes nothing");
+        assert_eq!(clean.room_count(), 2);
+        let total: f64 = clean.rooms().map(|f| clean.face_area(f)).sum();
+        assert!((total - 24.0).abs() < 1e-6, "areas intact: {total}");
+        // A second prune right after a real one finds nothing.
+        let mut messy = spur_plate_unpruned();
+        messy.prune_orphans();
+        assert_eq!(messy.prune_orphans(), 0, "prune is idempotent");
+    }
+
+    #[test]
+    fn prune_keeps_genuine_corners() {
+        let segs = loop_segments(&rect(0.0, 0.0, 4.0, 3.0), 100);
+        let mut plate = SpacePlate::build(&segs, BuildOptions::default());
+        assert_eq!(plate.prune_orphans(), 0, "a clean rectangle has nothing to prune");
+        assert_eq!(
+            plate.face_outline(plate.rooms().next().unwrap()).len(),
+            4,
+            "all four real corners are kept (not mistaken for collinear)",
+        );
+    }
+
+    #[test]
+    fn build_auto_prunes_spur_walls() {
+        let plate = SpacePlate::build(&spur_segs(), BuildOptions::default());
+        assert_eq!(plate.room_count(), 1, "the spur doesn't create a phantom room");
+        let room = plate.rooms().next().unwrap();
+        assert_eq!(plate.face_outline(room).len(), 4, "derived room is a clean rectangle, no spur stub");
+        assert!((plate.face_area(room) - 12.0).abs() < 1e-6, "area is the rectangle: {}", plate.face_area(room));
+    }
+
+    #[test]
+    fn remove_edge_merges_two_real_rooms() {
+        let mut plate = two_room_plate();
+        let rooms: Vec<FaceId> = plate.rooms().collect();
+        let shared = plate
+            .face_half_edges(rooms[0])
+            .find(|h| {
+                plate
+                    .neighbor_across(*h)
+                    .map(|n| n != rooms[0] && !plate.faces[n.0 as usize].is_outer)
+                    .unwrap_or(false)
+            })
+            .expect("shared edge");
+        let patches = plate.remove_edge(shared).expect("remove the shared wall");
+        assert_eq!(plate.room_count(), 1, "two rooms merged into one");
+        let total: f64 = patches.iter().map(|p| p.area).sum();
+        assert!((total - 24.0).abs() < 1e-6, "merged area = full box: {total}");
+    }
+
+    #[test]
+    fn remove_edge_refuses_an_enclosing_wall() {
+        let mut plate = two_room_plate();
+        let rooms: Vec<FaceId> = plate.rooms().collect();
+        let exterior_edge = plate
+            .face_half_edges(rooms[0])
+            .find(|h| {
+                plate
+                    .neighbor_across(*h)
+                    .map(|n| plate.faces[n.0 as usize].is_outer)
+                    .unwrap_or(false)
+            })
+            .expect("an outer wall");
+        assert_eq!(plate.remove_edge(exterior_edge), Err(EditError::BordersExterior));
+    }
+
+    #[test]
+    fn remove_edge_deletes_a_bridge_and_cleans_orphans() {
+        let mut plate = spur_plate_unpruned();
+        let tip = plate.find_vertex([6.0, 1.5]);
+        let spur = plate.outgoing_half_edges(tip).next().expect("spur he");
+        // Both of the spur's half-edges sit in the same (exterior) face → bridge.
+        let t = plate.half_edges[spur.0 as usize].twin;
+        assert_eq!(
+            plate.half_edges[spur.0 as usize].face,
+            plate.half_edges[t.0 as usize].face,
+            "the spur is a bridge (same face both sides)",
+        );
+        let patches = plate.remove_edge(spur).expect("remove the bridge/spur wall");
+        assert!(patches.is_empty(), "a bridge in the exterior bounds no room");
+        assert_eq!(plate.room_count(), 1, "the rectangle room survives");
+        let room = plate.rooms().next().unwrap();
+        assert_eq!(plate.face_outline(room).len(), 4, "room cleaned back to a rectangle");
+        assert!((plate.face_area(room) - 12.0).abs() < 1e-6, "area unchanged: {}", plate.face_area(room));
+    }
+
+    #[test]
+    fn remove_edge_rejects_a_stale_handle() {
+        let mut plate = two_room_plate();
+        assert_eq!(plate.remove_edge(HalfEdgeId(99_999)), Err(EditError::StaleHandle));
+    }
+
+    // ───────────────── net-area (wall-thickness offset) ─────────────────
+
+    /// A closed loop with a uniform wall half-thickness on every edge.
+    fn thick_loop(corners: &[[f64; 2]], base: u32, half: f64) -> Vec<InputSegment> {
+        loop_segments(corners, base).into_iter().map(|s| s.with_half_thickness(half)).collect()
+    }
+
+    fn thick_two_room_plate(half: f64) -> SpacePlate {
+        let segs = vec![
+            InputSegment::new([0.0, 0.0], [8.0, 0.0], Some(1)).with_half_thickness(half),
+            InputSegment::new([8.0, 0.0], [8.0, 3.0], Some(2)).with_half_thickness(half),
+            InputSegment::new([8.0, 3.0], [0.0, 3.0], Some(3)).with_half_thickness(half),
+            InputSegment::new([0.0, 3.0], [0.0, 0.0], Some(4)).with_half_thickness(half),
+            InputSegment::new([4.0, 0.0], [4.0, 3.0], Some(99)).with_half_thickness(half),
+        ];
+        SpacePlate::build(&segs, BuildOptions::default())
+    }
+
+    #[test]
+    fn net_outline_insets_and_outsets_by_the_wall_half_thickness() {
+        let plate = SpacePlate::build(&thick_loop(&rect(0.0, 0.0, 4.0, 3.0), 100, 0.25), BuildOptions::default());
+        let room = plate.rooms().next().unwrap();
+        // Inner: 0.25 in on every side → 3.5 × 2.5 = 8.75 m².
+        let inner = polygon_area(&plate.net_outline(room, true)).abs();
+        assert!((inner - 8.75).abs() < 1e-6, "inset 0.25 all round = 8.75, got {inner}");
+        // Outer: 0.25 out on every side → 4.5 × 3.5 = 15.75 m².
+        let outer = polygon_area(&plate.net_outline(room, false)).abs();
+        assert!((outer - 15.75).abs() < 1e-6, "outset 0.25 all round = 15.75, got {outer}");
+    }
+
+    #[test]
+    fn net_outline_is_the_centreline_without_thickness() {
+        // loop_segments leaves half_thickness at 0 → nothing to offset.
+        let plate = SpacePlate::build(&loop_segments(&rect(0.0, 0.0, 4.0, 3.0), 100), BuildOptions::default());
+        let room = plate.rooms().next().unwrap();
+        assert_eq!(plate.net_outline(room, true), plate.face_outline(room), "no thickness → unchanged");
+        assert_eq!(plate.net_outline(room, false), plate.face_outline(room));
+    }
+
+    #[test]
+    fn net_outline_pins_a_shared_wall_when_pushing_outward() {
+        let plate = thick_two_room_plate(0.25);
+        assert_eq!(plate.room_count(), 2);
+        // The left room (centroid x < 4) shares the central wall at x = 4.
+        let left = plate
+            .rooms()
+            .find(|f| {
+                let o = plate.face_outline(*f);
+                (o.iter().map(|p| p[0]).sum::<f64>() / o.len() as f64) < 4.0
+            })
+            .expect("a left room");
+        let outer = plate.net_outline(left, false);
+        let max_x = outer.iter().map(|p| p[0]).fold(f64::MIN, f64::max);
+        let min_x = outer.iter().map(|p| p[0]).fold(f64::MAX, f64::min);
+        assert!((max_x - 4.0).abs() < 1e-6, "shared wall (x=4) is pinned outward, got {max_x}");
+        assert!((min_x + 0.25).abs() < 1e-6, "the exterior wall pushes out to -0.25, got {min_x}");
+    }
+
+    #[test]
+    fn net_outline_thickness_survives_an_edge_split() {
+        let mut plate = SpacePlate::build(&thick_loop(&rect(0.0, 0.0, 4.0, 3.0), 100, 0.25), BuildOptions::default());
+        let room = plate.rooms().next().unwrap();
+        // Split the bottom edge (y = 0) at its midpoint; both halves keep 0.25.
+        let bottom = plate
+            .face_half_edges(room)
+            .find(|h| {
+                let a = plate.vertices[plate.half_edges[h.0 as usize].origin.0 as usize].pos;
+                let b = plate.vertices[plate.dest(*h).0 as usize].pos;
+                a[1].abs() < 1e-9 && b[1].abs() < 1e-9
+            })
+            .expect("the bottom edge");
+        plate.split_edge(bottom, 2.0, 0.0).expect("split");
+        let inner = polygon_area(&plate.net_outline(room, true)).abs();
+        assert!((inner - 8.75).abs() < 1e-6, "the split edge keeps its wall thickness: {inner}");
     }
 
     // Test-only helper.

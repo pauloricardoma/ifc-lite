@@ -555,9 +555,52 @@ export class SpacePlateHandle {
    */
   mergeFaces(edge: number): any;
   /**
+   * The face outline offset to a wall boundary, as flat `[x0, y0, …]`: each
+   * edge is moved by its own wall's half-thickness — inward when `inset`
+   * (the net / inner face), outward otherwise (the gross / outer face).
+   * Shared room↔room edges are pinned when pushing outward. Falls back to the
+   * centreline outline when no offset applies — so it's always a sane ring.
+   * (For a `center` boundary just use `faceOutline`.)
+   */
+  netOutline(face: number, inset: boolean): Float64Array;
+  /**
+   * Remove a wall edge, choosing the right semantics from its two faces:
+   * two real rooms → union them; a bridge / spur / outer-only wall → delete
+   * it and auto-clean the orphaned inner lines and nodes it leaves; a real
+   * enclosing wall (room ↔ exterior) → rejected (`BordersExterior`). This is
+   * the "remove this wall and tidy up" affordance for the orphan cruft the
+   * non-destructive wall arrangement leaves behind. Returns the rooms it
+   * changed (empty if the edge bounded no room).
+   */
+  removeEdge(edge: number): any;
+  /**
    * Flat outline `[x0, y0, x1, y1, …]` of a face (no repeated closing vertex).
    */
   faceOutline(face: number): Float64Array;
+  /**
+   * Face-based gap-room boundary as flat `[x0, y0, …]`: each edge pushed
+   * OUTWARD (into the wall) by `factor × the source wall's half-thickness`.
+   * `0` → net (the gap / inner faces); `1` → centre axis (½ thickness, the
+   * editable node line on the wall mid); `2` → gross outer face.
+   */
+  gapBoundary(face: number, factor: number): Float64Array;
+  /**
+   * Dissolve a degree-2 vertex, welding its two edges into one straight
+   * edge between the neighbours — the inverse of `splitEdge`, and the
+   * "delete this corner / node" affordance. Returns the rooms it changed.
+   * Rejects a wall junction (degree ≥ 3) or a weld that would duplicate an
+   * edge.
+   */
+  dissolveVertex(v: number): any;
+  /**
+   * FACE-BASED build: rooms are the gaps between wall footprint rectangles.
+   * `rectCoords` is flat `[x0, y0, x1, y1, x2, y2, x3, y3, …]` — 8 f64 per wall
+   * (its 4 plan-rectangle corners, CCW). A bounded arrangement face is a room
+   * only if its centroid is outside every rectangle (a gap, not a wall
+   * interior). The room outline IS the net (inner-face) area; `gapBoundary`
+   * gives the centre axis (½ thickness) and the gross outer face.
+   */
+  static fromWallRects(rect_coords: Float64Array, snap_tolerance: number, min_area: number): SpacePlateHandle;
   /**
    * The room on the far side of a half-edge (its twin's face), or
    * `undefined`. O(1) — the "who's across this wall" query.
@@ -582,9 +625,27 @@ export class SpacePlateHandle {
    *
    * `segCoords`: `[ax, ay, bx, by, …]` (length a multiple of 4).
    * `segSources`: one `i32` per segment, `-1` for none.
+   * `segHalfThickness`: one `f64` per segment — half the wall's thickness in
+   * metres, carried onto the derived edges for `netOutline`. Pass an empty
+   * array (or all zeros) when thickness is unknown (centreline only).
    * `snapTolerance` / `minArea`: pass `<= 0` to take the defaults.
    */
-  constructor(seg_coords: Float64Array, seg_sources: Int32Array, snap_tolerance: number, min_area: number);
+  constructor(seg_coords: Float64Array, seg_sources: Int32Array, seg_half_thickness: Float64Array, snap_tolerance: number, min_area: number);
+  /**
+   * Sweep the whole plate clean: remove dangling spur walls, isolated nodes,
+   * and redundant collinear nodes — the "clean up orphans" / eraser action.
+   * Area-neutral and idempotent. Returns how many topology elements were
+   * pruned (0 = the plate was already clean); the caller re-renders via
+   * `snapshot` like any other edit.
+   */
+  prune(): number;
+  /**
+   * Author a new room from a flat ring `[x0, y0, x1, y1, …]` (no repeated
+   * closing vertex). `source` `-1` marks a user-drawn room. Winding is
+   * normalised to CCW; returns the new room patch. The room is its own
+   * connected component — it does not merge into existing topology.
+   */
+  addFace(coords: Float64Array, source: number): any;
   /**
    * Face ids of every live room.
    */
@@ -916,15 +977,22 @@ export interface InitOutput {
   readonly profileentryjs_modelIndex: (a: number) => number;
   readonly profileentryjs_outerPoints: (a: number) => number;
   readonly profileentryjs_transform: (a: number) => number;
+  readonly spaceplatehandle_addFace: (a: number, b: number, c: number, d: number, e: number) => void;
   readonly spaceplatehandle_boundingElements: (a: number, b: number, c: number) => void;
+  readonly spaceplatehandle_dissolveVertex: (a: number, b: number, c: number) => void;
   readonly spaceplatehandle_dragVertex: (a: number, b: number, c: number, d: number, e: number) => void;
   readonly spaceplatehandle_duplicate: (a: number) => number;
   readonly spaceplatehandle_faceArea: (a: number, b: number) => number;
   readonly spaceplatehandle_faceOutline: (a: number, b: number, c: number) => void;
   readonly spaceplatehandle_findVertexNear: (a: number, b: number, c: number, d: number) => number;
+  readonly spaceplatehandle_fromWallRects: (a: number, b: number, c: number, d: number, e: number) => void;
+  readonly spaceplatehandle_gapBoundary: (a: number, b: number, c: number, d: number) => void;
   readonly spaceplatehandle_mergeFaces: (a: number, b: number, c: number) => void;
   readonly spaceplatehandle_neighborAcross: (a: number, b: number) => number;
-  readonly spaceplatehandle_new: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+  readonly spaceplatehandle_netOutline: (a: number, b: number, c: number, d: number) => void;
+  readonly spaceplatehandle_new: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
+  readonly spaceplatehandle_prune: (a: number) => number;
+  readonly spaceplatehandle_removeEdge: (a: number, b: number, c: number) => void;
   readonly spaceplatehandle_roomCount: (a: number) => number;
   readonly spaceplatehandle_roomIds: (a: number, b: number) => void;
   readonly spaceplatehandle_setFaceHeight: (a: number, b: number, c: number, d: number, e: number) => void;

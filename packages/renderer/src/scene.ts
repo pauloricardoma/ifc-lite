@@ -648,6 +648,10 @@ export class Scene {
     for (const key of affectedKeys) {
       this.pendingBatchKeys.add(key);
     }
+    // Also drop the entity's standalone selection-highlight meshes — they're not
+    // in the buckets and would otherwise linger after a delete/split (same ghost
+    // class as a move).
+    this.evictHighlightMeshes(expressId);
     // True when at least one dedicated mesh was removed — covers
     // the case where a mesh was queued but not yet bucketed.
     return removedDedicated;
@@ -697,9 +701,20 @@ export class Scene {
     const affectedKeys = new Set<string>();
     let anyMoved = false;
     for (const meshData of meshDataList) {
-      // Skip shared color-merged meshes — translating their
-      // positions would move every entity in the merge.
-      if (meshData.entityIds && meshData.entityIds.length > 0) continue;
+      // Skip a genuinely shared color-merged mesh — one whose vertices belong to
+      // MORE than this entity — because translating it would drag the others too.
+      // An authored single-entity mesh (slab/space/wall added in-session) tags
+      // EVERY vertex with its own id for picking; all-same-id is safe to move, so
+      // only bail when a foreign id is present (was: skip on any entityIds at all,
+      // which froze authored elements under the gizmo even though their placement
+      // and bbox resolved fine).
+      if (meshData.entityIds && meshData.entityIds.length > 0) {
+        let shared = false;
+        for (let i = 0; i < meshData.entityIds.length; i++) {
+          if (meshData.entityIds[i] !== expressId) { shared = true; break; }
+        }
+        if (shared) continue;
+      }
       const pos = meshData.positions;
       for (let i = 0; i < pos.length; i += 3) {
         pos[i] += dx;
@@ -730,10 +745,31 @@ export class Scene {
     }
 
     this.boundingBoxes.delete(expressId);
+    // The per-entity selection-highlight meshes in `this.meshes` are frozen
+    // position copies made at selection time and are otherwise only cleared by
+    // clear() — so a moved-while-selected entity (the gizmo holds the selection
+    // through the drag) keeps drawing its highlight at the OLD position: a ghost.
+    // Evict them so the highlight re-extracts from the moved geometry next frame.
+    this.evictHighlightMeshes(expressId);
     for (const key of affectedKeys) {
       this.pendingBatchKeys.add(key);
     }
     return true;
+  }
+
+  /** Drop the per-entity selection-highlight meshes for `expressId` (frozen
+   *  copies in `this.meshes`) + free their GPU buffers, so the highlight is
+   *  rebuilt from the entity's current geometry on the next render. Used after a
+   *  translate or removal, which mutate the underlying geometry but don't touch
+   *  these standalone highlight meshes. */
+  private evictHighlightMeshes(expressId: number): void {
+    if (this.meshes.length === 0) return;
+    const kept: Mesh[] = [];
+    for (const mesh of this.meshes) {
+      if (mesh.expressId === expressId) destroyGpuResources(mesh);
+      else kept.push(mesh);
+    }
+    this.meshes = kept;
   }
 
   /** Bulk variant of `translateMeshesForEntity`. */
@@ -764,6 +800,22 @@ export class Scene {
   /** True if the mesh queue has pending work. */
   hasQueuedMeshes(): boolean {
     return this.meshQueueReadIndex < this.meshQueue.length;
+  }
+
+  /** True while un-finalised streaming fragments are still being drawn. An
+   *  element appended during streaming (e.g. an authored IfcSpace) renders as
+   *  such a fragment AND accumulates in its colour bucket; once the bucket is
+   *  re-batched (e.g. by a move) the fragment becomes a stale duplicate, so the
+   *  caller should `finalizeStreaming` to merge fragments away. */
+  hasStreamingFragments(): boolean {
+    return this.streamingFragments.length > 0;
+  }
+
+  /** True when streaming runs in ephemeral mode (huge files) — fragments render
+   *  directly from GPU and geometry is NOT retained for re-batch, so callers
+   *  must NOT finalize (there's nothing to rebuild the batches from). */
+  isEphemeralStreaming(): boolean {
+    return this.ephemeralStreamingMode;
   }
 
   setEphemeralStreamingMode(enabled: boolean): void {

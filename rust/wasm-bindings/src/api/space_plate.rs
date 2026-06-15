@@ -72,11 +72,15 @@ impl SpacePlateHandle {
     ///
     /// `segCoords`: `[ax, ay, bx, by, …]` (length a multiple of 4).
     /// `segSources`: one `i32` per segment, `-1` for none.
+    /// `segHalfThickness`: one `f64` per segment — half the wall's thickness in
+    /// metres, carried onto the derived edges for `netOutline`. Pass an empty
+    /// array (or all zeros) when thickness is unknown (centreline only).
     /// `snapTolerance` / `minArea`: pass `<= 0` to take the defaults.
     #[wasm_bindgen(constructor)]
     pub fn new(
         seg_coords: &[f64],
         seg_sources: &[i32],
+        seg_half_thickness: &[f64],
         snap_tolerance: f64,
         min_area: f64,
     ) -> Result<SpacePlateHandle, JsValue> {
@@ -91,15 +95,22 @@ impl SpacePlateHandle {
                 "segSources length must equal the segment count (segCoords.len / 4)",
             ));
         }
+        if !seg_half_thickness.is_empty() && seg_half_thickness.len() != n {
+            return Err(JsValue::from_str(
+                "segHalfThickness must be empty or have one entry per segment",
+            ));
+        }
         let segments: Vec<InputSegment> = (0..n)
             .map(|i| {
                 let o = i * 4;
                 let src = seg_sources[i];
+                let half = seg_half_thickness.get(i).copied().unwrap_or(0.0);
                 InputSegment::new(
                     [seg_coords[o], seg_coords[o + 1]],
                     [seg_coords[o + 2], seg_coords[o + 3]],
                     if src < 0 { None } else { Some(src as u32) },
                 )
+                .with_half_thickness(half.max(0.0))
             })
             .collect();
         let defaults = BuildOptions::default();
@@ -108,6 +119,44 @@ impl SpacePlateHandle {
             min_area: if min_area > 0.0 { min_area } else { defaults.min_area },
         };
         Ok(SpacePlateHandle { inner: SpacePlate::build(&segments, opts) })
+    }
+
+    /// FACE-BASED build: rooms are the gaps between wall footprint rectangles.
+    /// `rectCoords` is flat `[x0, y0, x1, y1, x2, y2, x3, y3, …]` — 8 f64 per wall
+    /// (its 4 plan-rectangle corners, CCW). A bounded arrangement face is a room
+    /// only if its centroid is outside every rectangle (a gap, not a wall
+    /// interior). The room outline IS the net (inner-face) area; `gapBoundary`
+    /// gives the centre axis (½ thickness) and the gross outer face.
+    #[wasm_bindgen(js_name = fromWallRects)]
+    pub fn from_wall_rects(rect_coords: &[f64], snap_tolerance: f64, min_area: f64) -> Result<SpacePlateHandle, JsValue> {
+        if !rect_coords.len().is_multiple_of(8) {
+            return Err(JsValue::from_str(
+                "rectCoords length must be a multiple of 8 (4 corners × x,y per wall)",
+            ));
+        }
+        let rects: Vec<[[f64; 2]; 4]> = rect_coords
+            .chunks_exact(8)
+            .map(|c| [[c[0], c[1]], [c[2], c[3]], [c[4], c[5]], [c[6], c[7]]])
+            .collect();
+        let defaults = BuildOptions::default();
+        let opts = BuildOptions {
+            snap_tolerance: if snap_tolerance > 0.0 { snap_tolerance } else { defaults.snap_tolerance },
+            min_area: if min_area > 0.0 { min_area } else { defaults.min_area },
+        };
+        Ok(SpacePlateHandle { inner: SpacePlate::build_from_wall_rects(&rects, opts) })
+    }
+
+    /// Face-based gap-room boundary as flat `[x0, y0, …]`: each edge pushed
+    /// OUTWARD (into the wall) by `factor × the source wall's half-thickness`.
+    /// `0` → net (the gap / inner faces); `1` → centre axis (½ thickness, the
+    /// editable node line on the wall mid); `2` → gross outer face.
+    #[wasm_bindgen(js_name = gapBoundary)]
+    pub fn gap_boundary(&self, face: u32, factor: f64) -> Vec<f64> {
+        self.inner
+            .gap_boundary(FaceId(face), factor)
+            .into_iter()
+            .flat_map(|p| [p[0], p[1]])
+            .collect()
     }
 
     /// Number of live rooms.
@@ -148,6 +197,21 @@ impl SpacePlateHandle {
     pub fn face_outline(&self, face: u32) -> Vec<f64> {
         self.inner
             .face_outline(FaceId(face))
+            .into_iter()
+            .flat_map(|p| [p[0], p[1]])
+            .collect()
+    }
+
+    /// The face outline offset to a wall boundary, as flat `[x0, y0, …]`: each
+    /// edge is moved by its own wall's half-thickness — inward when `inset`
+    /// (the net / inner face), outward otherwise (the gross / outer face).
+    /// Shared room↔room edges are pinned when pushing outward. Falls back to the
+    /// centreline outline when no offset applies — so it's always a sane ring.
+    /// (For a `center` boundary just use `faceOutline`.)
+    #[wasm_bindgen(js_name = netOutline)]
+    pub fn net_outline(&self, face: u32, inset: bool) -> Vec<f64> {
+        self.inner
+            .net_outline(FaceId(face), inset)
             .into_iter()
             .flat_map(|p| [p[0], p[1]])
             .collect()
@@ -223,6 +287,55 @@ impl SpacePlateHandle {
         let patches = self.inner.merge_faces(HalfEdgeId(edge)).map_err(edit_err)?;
         patches_to_js(patches)
     }
+
+    /// Dissolve a degree-2 vertex, welding its two edges into one straight
+    /// edge between the neighbours — the inverse of `splitEdge`, and the
+    /// "delete this corner / node" affordance. Returns the rooms it changed.
+    /// Rejects a wall junction (degree ≥ 3) or a weld that would duplicate an
+    /// edge.
+    #[wasm_bindgen(js_name = dissolveVertex)]
+    pub fn dissolve_vertex(&mut self, v: u32) -> Result<JsValue, JsValue> {
+        let patches = self.inner.dissolve_vertex(VertexId(v)).map_err(edit_err)?;
+        patches_to_js(patches)
+    }
+
+    /// Author a new room from a flat ring `[x0, y0, x1, y1, …]` (no repeated
+    /// closing vertex). `source` `-1` marks a user-drawn room. Winding is
+    /// normalised to CCW; returns the new room patch. The room is its own
+    /// connected component — it does not merge into existing topology.
+    #[wasm_bindgen(js_name = addFace)]
+    pub fn add_face(&mut self, coords: &[f64], source: i32) -> Result<JsValue, JsValue> {
+        if !coords.len().is_multiple_of(2) {
+            return Err(JsValue::from_str("coords length must be even (x, y per vertex)"));
+        }
+        let pts: Vec<[f64; 2]> = coords.chunks_exact(2).map(|c| [c[0], c[1]]).collect();
+        let src = if source < 0 { None } else { Some(source as u32) };
+        let patch = self.inner.add_face(&pts, src).map_err(edit_err)?;
+        patches_to_js(vec![patch])
+    }
+
+    /// Remove a wall edge, choosing the right semantics from its two faces:
+    /// two real rooms → union them; a bridge / spur / outer-only wall → delete
+    /// it and auto-clean the orphaned inner lines and nodes it leaves; a real
+    /// enclosing wall (room ↔ exterior) → rejected (`BordersExterior`). This is
+    /// the "remove this wall and tidy up" affordance for the orphan cruft the
+    /// non-destructive wall arrangement leaves behind. Returns the rooms it
+    /// changed (empty if the edge bounded no room).
+    #[wasm_bindgen(js_name = removeEdge)]
+    pub fn remove_edge(&mut self, edge: u32) -> Result<JsValue, JsValue> {
+        let patches = self.inner.remove_edge(HalfEdgeId(edge)).map_err(edit_err)?;
+        patches_to_js(patches)
+    }
+
+    /// Sweep the whole plate clean: remove dangling spur walls, isolated nodes,
+    /// and redundant collinear nodes — the "clean up orphans" / eraser action.
+    /// Area-neutral and idempotent. Returns how many topology elements were
+    /// pruned (0 = the plate was already clean); the caller re-renders via
+    /// `snapshot` like any other edit.
+    #[wasm_bindgen(js_name = prune)]
+    pub fn prune(&mut self) -> usize {
+        self.inner.prune_orphans()
+    }
 }
 
 fn patches_to_js(patches: Vec<FacePatch>) -> Result<JsValue, JsValue> {
@@ -234,14 +347,21 @@ fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
     serde_wasm_bindgen::to_value(value).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
-/// Map a topology-edit rejection to a JS `Error` with a stable, readable code.
+/// Map a topology-edit rejection to a JS `Error` whose `name` is a STABLE code
+/// (the `EditError` variant) and whose `message` is human prose. The TS side
+/// switches on `err.name` rather than parsing the message string — see
+/// `space-edit-error.ts`.
 fn edit_err(e: EditError) -> JsValue {
-    let msg = match e {
-        EditError::StaleHandle => "StaleHandle: id is tombstoned or out of range",
-        EditError::VerticesNotOnFace => "VerticesNotOnFace: both split vertices must lie on the face",
-        EditError::DegenerateCut => "DegenerateCut: split endpoints are equal or already adjacent",
-        EditError::BordersExterior => "BordersExterior: edge borders the exterior — nothing to merge",
-        EditError::BridgeEdge => "BridgeEdge: edge is a bridge — removing it would split connectivity",
+    let (code, msg) = match e {
+        EditError::StaleHandle => ("StaleHandle", "this element no longer exists (it was removed or merged)"),
+        EditError::VerticesNotOnFace => ("VerticesNotOnFace", "both split points must lie on the same room"),
+        EditError::DegenerateCut => ("DegenerateCut", "the two points are the same or already share a wall"),
+        EditError::BordersExterior => ("BordersExterior", "this wall is the room's outer edge — removing it would open the room"),
+        EditError::BridgeEdge => ("BridgeEdge", "this wall bridges the room to itself"),
+        EditError::VertexNotDissolvable => ("VertexNotDissolvable", "this node joins three or more walls"),
+        EditError::InvalidPolygon => ("InvalidPolygon", "a room needs a simple ring of 3+ points enclosing real area"),
     };
-    JsValue::from_str(msg)
+    let err = js_sys::Error::new(msg);
+    err.set_name(code);
+    err.into()
 }
