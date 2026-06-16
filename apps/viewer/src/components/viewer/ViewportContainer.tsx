@@ -5,6 +5,12 @@
 import { useMemo, useRef, useState, useCallback, useEffect, useSyncExternalStore } from 'react';
 import { useLevelDisplayEffect } from '@/hooks/useLevelDisplayEffect';
 import { Viewport } from './Viewport';
+import {
+  initialDragOverlayState,
+  reduceDragOverlay,
+  type DragOverlayEvent,
+  type DragOverlayState,
+} from './dragOverlayState';
 import { ViewportOverlays } from './ViewportOverlays';
 import { MergeLayersBanner } from './MergeLayersBanner';
 import { LevelDisplayIndicator } from './LevelDisplayIndicator';
@@ -405,25 +411,38 @@ export function ViewportContainer() {
     setCesiumSourceModelId(georef?.sourceModelId ?? null);
   }, [georef?.sourceModelId, setCesiumSourceModelId]);
 
-  const handleDragOver = useCallback((e: React.DragEvent) => {
+  // Track drag enter/leave depth so the overlay doesn't flicker when the
+  // cursor moves between child elements (each child boundary fires its own
+  // dragenter/dragleave that bubbles to the container). See dragOverlayState.ts.
+  const dragStateRef = useRef<DragOverlayState>(initialDragOverlayState);
+
+  const applyDragEvent = useCallback((event: DragOverlayEvent) => {
+    dragStateRef.current = reduceDragOverlay(dragStateRef.current, event, webgpu.supported);
+    setIsDragging(dragStateRef.current.dragging);
+  }, [webgpu.supported]);
+
+  const handleDragEnter = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    // Only show drag state if WebGPU is supported
-    if (webgpu.supported) {
-      setIsDragging(true);
-    }
-  }, [webgpu.supported]);
+    applyDragEvent('enter');
+  }, [applyDragEvent]);
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    // Needed to allow the drop, but does not toggle drag state (avoids flicker)
+    e.preventDefault();
+    e.stopPropagation();
+  }, []);
 
   const handleDragLeave = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    setIsDragging(false);
-  }, []);
+    applyDragEvent('leave');
+  }, [applyDragEvent]);
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    setIsDragging(false);
+    applyDragEvent('drop');
 
     // Block file loading if WebGPU not supported
     if (!webgpu.supported) {
@@ -753,6 +772,7 @@ export function ViewportContainer() {
       <div
         className="relative h-full w-full bg-white dark:bg-black text-zinc-900 dark:text-zinc-50 overflow-hidden"
         data-viewport
+        onDragEnter={handleDragEnter}
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
@@ -770,7 +790,7 @@ export function ViewportContainer() {
 
         {/* Drop overlay */}
         {isDragging && (
-          <div className="absolute inset-0 z-50 bg-primary/10 backdrop-blur-[2px] flex items-center justify-center p-8">
+          <div className="pointer-events-none absolute inset-0 z-50 bg-primary/10 backdrop-blur-[2px] flex items-center justify-center p-8">
             <div className="border-4 border-dashed border-primary bg-white/90 dark:bg-black/90 p-12 max-w-2xl w-full text-center shadow-[8px_8px_0px_0px_rgba(0,0,0,1)] dark:shadow-[8px_8px_0px_0px_rgba(255,255,255,1)] transition-all">
               <Upload className="h-20 w-20 mx-auto text-primary mb-6" />
               <p className="text-3xl font-black uppercase tracking-tight text-primary">Drop File to Load</p>
@@ -1089,13 +1109,14 @@ export function ViewportContainer() {
     <div
       className="relative h-full w-full bg-zinc-50 dark:bg-black overflow-hidden"
       data-viewport
+      onDragEnter={handleDragEnter}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
       {/* Drop overlay for when a file is already loaded - shows "Add Model" */}
       {isDragging && (
-        <div className="absolute inset-0 z-50 bg-[#9ece6a]/10 backdrop-blur-[2px] flex items-center justify-center">
+        <div className="pointer-events-none absolute inset-0 z-50 bg-[#9ece6a]/10 backdrop-blur-[2px] flex items-center justify-center">
           <div className="bg-white dark:bg-[#1a1b26] border-4 border-dashed border-[#9ece6a] p-8 shadow-2xl">
             <div className="text-center">
               <Plus className="h-12 w-12 mx-auto text-[#9ece6a] mb-4" />
