@@ -303,3 +303,6 @@ pub unsafe extern "C" fn ifc_lite_free(ptr: *mut u8, len: usize) {
         let _ = Box::from_raw(slice::from_raw_parts_mut(ptr, len));
     }
 }
+
+#[cfg(test)]
+mod tests;
