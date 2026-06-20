@@ -42,7 +42,6 @@ import type {
 import type { IfcDataStore } from '@ifc-lite/parser';
 import { MutablePropertyView, StoreEditor } from '@ifc-lite/mutations';
 import { GeometryProcessor } from '@ifc-lite/geometry';
-import { ensureWasmForNode } from './wasm-node-init.js';
 import {
   addBeamToStore,
   addColumnToStore,
@@ -643,7 +642,6 @@ export class HeadlessBackend implements BimBackend {
         if (!bytes || bytes.length === 0) {
           throw new Error('HBJSON export needs the source IFC bytes, which this store did not retain.');
         }
-        await ensureWasmForNode();
         const processor = new GeometryProcessor();
         await processor.init();
         const baseName = (name ?? modelName).replace(/\.[^.]+$/, '');

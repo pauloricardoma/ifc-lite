@@ -9,13 +9,41 @@
 
 mod adjacency;
 mod constructions;
+mod csv;
 mod geom;
+mod gltf;
 mod hbjson;
+mod ifc5;
+mod json;
+mod jsonld;
+mod merged;
+mod model;
+mod obj;
 mod openings;
+#[cfg(feature = "parquet-bos")]
+mod parquet_bos;
 mod rooms;
+mod schema_convert;
 mod shades;
+mod step;
 
+pub use csv::{export_csv, CsvMode, CsvOptions};
+pub use gltf::{export_glb, export_glb_from_meshes, export_glb_with_stats, GltfOptions, GltfStats};
 pub use hbjson::Model;
+pub use ifc5::{export_ifc5, Ifc5Options};
+pub use json::{export_json, JsonOptions};
+pub use jsonld::{export_jsonld, JsonLdOptions};
+pub use merged::{export_merged, export_merged_with_stats, MergedOptions, MergedStats};
+pub use model::{
+    build_export_model, EntityRow, ExportModel, PropValue, PropertySet, QuantitySet, QuantityValue,
+};
+pub use obj::{export_obj, export_obj_with_stats, ObjOptions, ObjStats};
+#[cfg(feature = "parquet-bos")]
+pub use parquet_bos::{export_bos, ParquetBosOptions};
+pub use step::{
+    export_step, export_step_json, export_step_with_stats, AttrMutation, PropMutation, StepOptions,
+    StepStats,
+};
 
 use ifc_lite_geometry::extract_profiles;
 
