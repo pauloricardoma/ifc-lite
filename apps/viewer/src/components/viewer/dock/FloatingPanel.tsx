@@ -12,7 +12,7 @@
  * `setFloatingPanelRect` / `snapFloatingPanel` calls.
  */
 
-import { useEffect, useRef, type CSSProperties, type ReactNode } from 'react';
+import { useEffect, useRef, type ReactNode } from 'react';
 import {
   PanelLeft,
   PanelRight,
@@ -24,6 +24,9 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { FloatingPanelState, SnapZone } from '@/store';
+import { computeFloatingPanelStyle, type SnapBounds } from './floating-panel-geometry';
+
+export type { SnapBounds };
 
 const MIN_W = 260;
 const MIN_H = 180;
@@ -36,6 +39,8 @@ interface FloatingPanelProps {
   panel: FloatingPanelState;
   title: string;
   zIndex: number;
+  /** The viewport region edge snaps confine to; null until measured. */
+  bounds: SnapBounds | null;
   children: ReactNode;
   onRect: (rect: Partial<Pick<FloatingPanelState, 'x' | 'y' | 'w' | 'h'>>) => void;
   onSnap: (snap: SnapZone) => void;
@@ -45,23 +50,11 @@ interface FloatingPanelProps {
   onClose: () => void;
 }
 
-function styleFor(p: FloatingPanelState): CSSProperties {
-  switch (p.snap) {
-    case 'left':
-      return { left: 0, top: 0, bottom: 0, width: p.w };
-    case 'right':
-      return { right: 0, top: 0, bottom: 0, width: p.w };
-    case 'bottom':
-      return { left: 0, right: 0, bottom: 0, height: p.h };
-    default:
-      return { left: p.x, top: p.y, width: p.w, height: p.h };
-  }
-}
-
 export function FloatingPanel({
   panel,
   title,
   zIndex,
+  bounds,
   children,
   onRect,
   onSnap,
@@ -127,10 +120,15 @@ export function FloatingPanel({
     const px = e.clientX;
     const py = e.clientY;
     const snap = panel.snap;
-    // Clamp growth to the viewport so a snapped panel can't be dragged past the
-    // edge (header / inner edge becoming unreachable) (#1208).
-    const maxW = Math.max(MIN_W, window.innerWidth - RESIZE_EDGE_MARGIN);
-    const maxH = Math.max(MIN_H, window.innerHeight - RESIZE_EDGE_MARGIN);
+    // Clamp growth so a snapped panel can't be dragged past its dock region
+    // (header / inner edge becoming unreachable). Free panels clamp to the
+    // window; edge-snapped panels clamp to the viewport region (#1208 / #1245).
+    const maxW = snap === 'free'
+      ? Math.max(MIN_W, window.innerWidth - RESIZE_EDGE_MARGIN)
+      : Math.max(MIN_W, bounds?.width ?? window.innerWidth);
+    const maxH = snap === 'free'
+      ? Math.max(MIN_H, window.innerHeight - RESIZE_EDGE_MARGIN)
+      : Math.max(MIN_H, bounds?.height ?? window.innerHeight);
 
     const move = (ev: MouseEvent) => {
       const dx = ev.clientX - px;
@@ -173,7 +171,7 @@ export function FloatingPanel({
   return (
     <div
       ref={ref}
-      style={{ ...styleFor(panel), zIndex }}
+      style={{ ...computeFloatingPanelStyle(panel, bounds), zIndex }}
       onMouseDown={onFocus}
       className="absolute pointer-events-auto flex flex-col rounded-lg border border-border bg-background shadow-2xl overflow-hidden"
     >
