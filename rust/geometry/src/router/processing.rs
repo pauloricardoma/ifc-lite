@@ -730,7 +730,7 @@ impl GeometryRouter {
     /// Apply the element's `ObjectPlacement` (scaled to metres) to every sub-mesh.
     /// Placement is a rigid per-instance transform, kept OUT of the dedup cache so
     /// instances of one shared geometry land at their own positions.
-    fn apply_submesh_placement(
+    pub(crate) fn apply_submesh_placement(
         &self,
         sub_meshes: &mut SubMeshCollection,
         element: &DecodedEntity,
