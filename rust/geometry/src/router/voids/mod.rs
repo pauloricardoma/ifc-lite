@@ -1876,6 +1876,140 @@ impl GeometryRouter {
         Ok(Some((voided, translation)))
     }
 
+    /// Void-inclusive definition signature for the element-level void-cut cache
+    /// (#1286 Phase 5): the host representation signature folded with an
+    /// ORDER-INVARIANT fold over each opening's (representation signature,
+    /// host-relative placement). Two elements share a signature iff their host
+    /// geometry, opening geometries AND opening placements relative to the host
+    /// all match — so they produce the identical definition-frame cut. `None`
+    /// (no shared key) when ineligible (layered / rotated host / unresolved
+    /// opening), so the caller falls back to the per-occurrence path.
+    pub fn definition_signature(
+        &self,
+        element: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+        void_index: &FxHashMap<u32, Vec<u32>>,
+    ) -> Result<Option<u128>> {
+        if self.is_material_layer_sliceable(element.id) {
+            return Ok(None);
+        }
+        let opening_ids = match void_index.get(&element.id) {
+            Some(ids) if !ids.is_empty() => ids.clone(),
+            _ => return Ok(None),
+        };
+        // Same eligibility as the unplaced cut: pure-translation host.
+        let host_w = self.get_placement_transform_from_element(element, decoder)?;
+        let rot = host_w.fixed_view::<3, 3>(0, 0);
+        let identity_rot = (0..3).all(|i| {
+            (0..3).all(|j| (rot[(i, j)] - if i == j { 1.0 } else { 0.0 }).abs() < 1e-9)
+        });
+        if !identity_rot {
+            return Ok(None);
+        }
+        let host_inv = match host_w.try_inverse() {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        let host_rep = match self.geometry_routing_key(element, decoder) {
+            Some(h) => h,
+            None => return Ok(None),
+        };
+        let mut parts: Vec<u128> = Vec::with_capacity(opening_ids.len());
+        for oid in opening_ids {
+            let opening = match decoder.decode_by_id(oid) {
+                Ok(o) => o,
+                Err(_) => return Ok(None),
+            };
+            if opening.ifc_type != IfcType::IfcOpeningElement {
+                continue;
+            }
+            let op_rep = match opening.get(6).and_then(|a| a.as_entity_ref()) {
+                Some(r) => {
+                    let mut memo = self.content_sig_memo.borrow_mut();
+                    super::content_hash::item_signature(decoder, r, &mut memo)
+                }
+                None => return Ok(None),
+            };
+            let op_w = self.get_placement_transform_from_element(&opening, decoder)?;
+            // M_rel = host^-1 * opening: the opening relative to the host. Quantise
+            // its 12 affine components so float-noise-free identical placements key
+            // the same, and 1e-6-distinct placements key apart (never false-merge).
+            let m_rel = host_inv * op_w;
+            let mut rel_bits: u128 = 0xcbf29ce484222325;
+            for r in 0..3 {
+                for c in 0..4 {
+                    let q = (m_rel[(r, c)] / 1.0e-6).round() as i64;
+                    rel_bits = rel_bits.wrapping_mul(0x100000001b3).wrapping_add(q as u128);
+                }
+            }
+            parts.push(op_rep ^ rel_bits.wrapping_mul(0x9e3779b97f4a7c15));
+        }
+        if parts.is_empty() {
+            return Ok(None);
+        }
+        parts.sort_unstable(); // ORDER-INVARIANT: opening declaration order is irrelevant
+        let mut structural = host_rep;
+        for p in parts {
+            structural = structural.wrapping_mul(0x100000001b3).wrapping_add(p);
+        }
+        Ok(Some(super::content_hash::key_with_params(
+            structural,
+            self.tessellation_quality.to_index(),
+            self.unit_scale,
+            self.rtc_offset,
+        )))
+    }
+
+    /// Element-level DEDUPED voided sub-meshes (#1286 Phase 5): on a
+    /// definition-cache HIT, clone the cached definition-frame template and apply
+    /// THIS occurrence's placement (no re-cut); on a MISS, run the definition-frame
+    /// cut once and cache it. Returns the PLACED voided sub-meshes, or `None` when
+    /// the flag is off / the element is ineligible / nothing was cut, so the caller
+    /// uses the per-occurrence [`Self::process_element_with_submeshes_and_voids`].
+    pub fn process_element_with_submeshes_and_voids_deduped(
+        &self,
+        element: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+        void_index: &FxHashMap<u32, Vec<u32>>,
+    ) -> Result<Option<SubMeshCollection>> {
+        if !Self::definition_dedup_enabled() {
+            return Ok(None);
+        }
+        let cache = match self.definition_cache.as_ref() {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        let sig = match self.definition_signature(element, decoder, void_index)? {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let hit = cache
+            .lock()
+            .expect("definition cache poisoned")
+            .get(&sig)
+            .cloned();
+        let template = match hit {
+            Some(t) => (*t).clone(),
+            None => {
+                let built =
+                    self.process_element_with_submeshes_and_voids_unplaced(element, decoder, void_index)?;
+                let (tpl, _t) = match built {
+                    Some(v) => v,
+                    None => return Ok(None),
+                };
+                cache
+                    .lock()
+                    .expect("definition cache poisoned")
+                    .insert(sig, std::sync::Arc::new(tpl.clone()));
+                tpl
+            }
+        };
+        // Apply THIS occurrence's placement to the shared definition-frame template.
+        let mut placed = template;
+        self.apply_submesh_placement(&mut placed, element, decoder)?;
+        Ok(Some(placed))
+    }
+
     pub fn process_element_with_submeshes_and_voids(
         &self,
         element: &DecodedEntity,

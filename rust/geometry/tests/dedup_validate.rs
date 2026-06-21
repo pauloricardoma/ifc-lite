@@ -928,3 +928,55 @@ fn void_unplaced_cut_matches_placed_geometry() {
         );
     }
 }
+
+/// Phase 5 (#1286): the element-level void-cut cache must produce geometry
+/// IDENTICAL to the current per-occurrence placed path (a cache HIT reuses an
+/// identical voided element's definition-frame template + this occurrence's
+/// placement; vertex order may differ since the placed path cuts independently,
+/// but the GEOMETRY must not), collapse identical voided walls to one template,
+/// and keep a distinct void distinct.
+#[test]
+fn definition_cache_dedups_and_matches_placed_geometry() {
+    let content = synthetic_voided_duplicates_ifc();
+    let void_idx = build_void_index(&content);
+    let wall_ids = [50u32, 250, 450];
+
+    GeometryRouter::set_definition_dedup_override(Some(true));
+    // Shared cache: wall #250 (identical to #50, translated +10m) HITS #50's
+    // cached definition-frame template; #450 (distinct void) misses.
+    let shared = GeometryRouter::new_definition_cache();
+    let mut d = EntityDecoder::with_index(&content, build_entity_index(&content));
+    let mut router = GeometryRouter::with_units(&content, &mut d);
+    router.enable_definition_dedup_shared(shared.clone());
+
+    let mut placed_fps = Vec::new();
+    for &id in &wall_ids {
+        let e = d.decode_by_id(id).unwrap();
+        let deduped = router
+            .process_element_with_submeshes_and_voids_deduped(&e, &mut d, &void_idx)
+            .unwrap()
+            .expect("translation-only voided host should be eligible");
+        // GEOMETRIC correctness: the deduped (cache) output must match the current
+        // per-occurrence placed path. Order may differ; geometry must not.
+        let placed = router
+            .process_element_with_submeshes_and_voids(&e, &mut d, &void_idx)
+            .unwrap();
+        assert_eq!(
+            sorted_coord_set(&deduped),
+            sorted_coord_set(&placed),
+            "deduped void geometry != placed path for #{id}"
+        );
+        placed_fps.push(sorted_coord_set(&placed));
+    }
+    let entries = shared.lock().unwrap().len();
+    GeometryRouter::set_definition_dedup_override(None);
+
+    assert_eq!(
+        entries, 2,
+        "identical voided walls #50/#250 must share one template (+ #450 distinct = 2)"
+    );
+    // #50 and #250 are the same geometry at different positions => different world
+    // coord-sets (placement preserved); #450 is a distinct void.
+    assert_ne!(placed_fps[0], placed_fps[1], "per-instance placement lost on the deduped void path");
+    assert_ne!(placed_fps[0], placed_fps[2], "a distinct void wrongly shared a template");
+}
