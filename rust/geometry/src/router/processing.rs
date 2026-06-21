@@ -729,6 +729,23 @@ impl GeometryRouter {
                 if let Some(placement) = decoder.resolve_ref(placement_attr)? {
                     let mut transform = self.get_placement_transform(&placement, decoder)?;
                     self.scale_transform(&mut transform);
+                    // Instancing: record the per-element world placement on EACH sub-mesh's
+                    // instance metadata BEFORE it is baked into the vertices, mirroring
+                    // `apply_placement` for the single-mesh path. Without this, the sub-mesh
+                    // path (every multi-item element — all the Tekla steel: beams, plates,
+                    // assemblies) leaves `instance_meta.transform` at the IDENTITY placeholder,
+                    // so `collate_refs` computes rel_k = m_k · m_ref⁻¹ = identity for every
+                    // occurrence and they all stack on the first one. The flat path was
+                    // always correct (placement IS baked into the vertices below), so the
+                    // dedup made it look like repeated geometry was "missing".
+                    if instancing_enabled() {
+                        let row_major = mat4_to_row_major(&transform);
+                        for sub in &mut sub_meshes.sub_meshes {
+                            if let Some(im) = sub.mesh.instance_meta.as_mut() {
+                                im.transform = row_major;
+                            }
+                        }
+                    }
                     for sub in &mut sub_meshes.sub_meshes {
                         self.transform_mesh_world(&mut sub.mesh, &transform);
                     }
@@ -830,8 +847,31 @@ impl GeometryRouter {
                     // Apply MappedItem transform to newly added sub-meshes
                     if let Some(mut transform) = mapping_transform.clone() {
                         self.scale_transform(&mut transform);
+                        // The MappingTarget is baked into the vertices here, but
+                        // `rep_identity` was hashed from the canonical (pre-target)
+                        // geometry during the recursion. Two occurrences sharing a map
+                        // with DIFFERENT targets would therefore collate under one
+                        // template and reuse the reference's target offset/orientation.
+                        // When the target actually changes the geometry, re-hash the
+                        // post-target local geometry so rep_identity matches what is
+                        // baked. Identity targets (the common Revit case) leave the
+                        // geometry unchanged, so the canonical hash already matches —
+                        // skip the re-hash there to avoid the O(verts) cost.
+                        let nontrivial_target = !transform.is_identity(1e-9);
                         for sub in &mut sub_meshes.sub_meshes[count_before..] {
                             self.transform_mesh_local(&mut sub.mesh, &transform);
+                            if nontrivial_target
+                                && sub
+                                    .mesh
+                                    .instance_meta
+                                    .as_ref()
+                                    .is_some_and(|im| im.instanceable)
+                            {
+                                let h = Self::compute_mesh_hash_full(&sub.mesh) | DIRECT_SOLID_TAG;
+                                if let Some(im) = sub.mesh.instance_meta.as_mut() {
+                                    im.rep_identity = h;
+                                }
+                            }
                         }
                     }
                 }
