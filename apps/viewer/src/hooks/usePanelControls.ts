@@ -18,6 +18,7 @@ import { useViewerStore } from '@/store';
 import {
   isAnalysisPanel,
   isBottomPanel,
+  isLeftPanel,
   type WorkspacePanelId,
   type AnalysisPanelId,
 } from '@/lib/panels/registry';
@@ -69,6 +70,10 @@ export function usePanelControls(): PanelControls {
   const scriptVisible = useViewerStore((s) => s.scriptPanelVisible);
   const ganttVisible = useViewerStore((s) => s.ganttPanelVisible);
   const listVisible = useViewerStore((s) => s.listPanelVisible);
+  // The Hierarchy panel (left region, #1267) is "docked" while its slot is open.
+  const leftPanelCollapsed = useViewerStore((s) => s.leftPanelCollapsed);
+  // The lower half of a docked split (#1266), also docked/visible.
+  const secondaryPanel = useViewerStore((s) => s.sidebarSecondaryPanel);
 
   const floatingIds = useMemo(
     () => new Set<WorkspacePanelId>(floatingPanels.map((p) => p.id)),
@@ -85,14 +90,25 @@ export function usePanelControls(): PanelControls {
     return null;
   }, [activePanel, floatingIds, poppedIds]);
 
+  // The panel actually rendered in the lower split half, mirroring
+  // SidebarPanelHost's `secondaryActive`: set, inline (not floated / popped), and
+  // distinct from the primary. So the rail reflects it as docked, not closed.
+  const secondaryDocked = useMemo<WorkspacePanelId | null>(() => {
+    if (!secondaryPanel || secondaryPanel === sideDocked) return null;
+    if (floatingIds.has(secondaryPanel) || poppedIds.has(secondaryPanel)) return null;
+    return secondaryPanel;
+  }, [secondaryPanel, sideDocked, floatingIds, poppedIds]);
+
   const isDockedInHome = useCallback(
     (id: WorkspacePanelId): boolean => {
+      if (id === 'hierarchy') return !leftPanelCollapsed; // left slot open
       if (id === 'script') return scriptVisible;
       if (id === 'gantt') return ganttVisible;
       if (id === 'lists') return listVisible;
-      return id === sideDocked; // side panels: the panel actually shown in the pane
+      // A side panel is docked as the right-pane primary OR the split secondary.
+      return id === sideDocked || id === secondaryDocked;
     },
-    [sideDocked, scriptVisible, ganttVisible, listVisible],
+    [sideDocked, secondaryDocked, scriptVisible, ganttVisible, listVisible, leftPanelCollapsed],
   );
 
   const panelLocation = useCallback(
@@ -110,25 +126,60 @@ export function usePanelControls(): PanelControls {
   );
 
   const openInHome = useCallback((id: WorkspacePanelId) => {
+    // Hierarchy's home is the left slot, so reveal it instead of routing through
+    // the right-pane / bottom-strip flags (#1267).
+    if (isLeftPanel(id)) {
+      useViewerStore.getState().setLeftPanelCollapsed(false);
+      return;
+    }
     useViewerStore.getState().openPanelInHome(id);
   }, []);
 
   const toggle = useCallback((id: WorkspacePanelId) => {
+    if (isLeftPanel(id)) {
+      const s = useViewerStore.getState();
+      s.setLeftPanelCollapsed(!s.leftPanelCollapsed);
+      return;
+    }
+    // If the panel is the lower split half it's already docked below, so
+    // toggling its rail icon closes that half (clears the split) rather than
+    // promoting it to primary and collapsing the split out from under it (#1266).
+    if (useViewerStore.getState().sidebarSecondaryPanel === id) {
+      useViewerStore.getState().setSidebarSecondaryPanel(null);
+      return;
+    }
     if (isBottomPanel(id)) useViewerStore.getState().toggleBottomPanel(id);
     else useViewerStore.getState().toggleWorkspacePanel(id);
   }, []);
 
   const floatPanel = useCallback((id: WorkspacePanelId) => {
+    // The left nav panel stays docked on the left; it never floats (#1267).
+    if (isLeftPanel(id)) {
+      useViewerStore.getState().setLeftPanelCollapsed(false);
+      return;
+    }
     closePanelWindow(id);
     useViewerStore.getState().floatPanel(id);
     useViewerStore.getState().setRightPanelCollapsed(false);
   }, []);
 
   const popOutPanel = useCallback((id: WorkspacePanelId) => {
+    if (isLeftPanel(id)) {
+      useViewerStore.getState().setLeftPanelCollapsed(false);
+      return;
+    }
     void openPanelWindow(id);
   }, []);
 
   const closePanel = useCallback((id: WorkspacePanelId) => {
+    if (isLeftPanel(id)) {
+      useViewerStore.getState().setLeftPanelCollapsed(true);
+      return;
+    }
+    // If it was the lower split half, leave the split too (#1266).
+    if (useViewerStore.getState().sidebarSecondaryPanel === id) {
+      useViewerStore.getState().setSidebarSecondaryPanel(null);
+    }
     useViewerStore.getState().closeFloatingPanel(id);
     closePanelWindow(id);
     if (isAnalysisPanel(id)) setDockedVisible(id, false);
