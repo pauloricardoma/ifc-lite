@@ -881,3 +881,50 @@ fn content_dedup_extra_facesets_byte_identical_when_flagged() {
     assert_ne!(on[0], on[1], "per-instance placement lost on the extra-type path");
     assert_eq!(unique_on, 2, "the two identical facesets must collapse to 1 (+1 distinct = 2)");
 }
+
+/// Order-insensitive coord-set hash over a whole SubMeshCollection.
+fn sorted_coord_set(sm: &SubMeshCollection) -> u64 {
+    let mut v: Vec<i64> = Vec::new();
+    for s in &sm.sub_meshes {
+        for p in &s.mesh.positions {
+            v.push((*p as f64 / 1e-4).round() as i64);
+        }
+    }
+    v.sort_unstable();
+    let mut h = DefaultHasher::new();
+    v.hash(&mut h);
+    h.finish()
+}
+
+/// Phase 4 frame correctness: the definition-frame void cut + re-place must be
+/// GEOMETRICALLY identical (sorted-coord-set) to the current per-occurrence
+/// placed path. Order may differ (independent cuts); geometry must not.
+#[test]
+fn void_unplaced_cut_matches_placed_geometry() {
+    let content = synthetic_voided_duplicates_ifc();
+    let void_idx = build_void_index(&content);
+    let mut d = EntityDecoder::with_index(&content, build_entity_index(&content));
+    let router = GeometryRouter::with_units(&content, &mut d);
+    for id in [50u32, 250, 450] {
+        let e = d.decode_by_id(id).unwrap();
+        let placed = router
+            .process_element_with_submeshes_and_voids(&e, &mut d, &void_idx)
+            .unwrap();
+        let (mut unplaced, t) = router
+            .process_element_with_submeshes_and_voids_unplaced(&e, &mut d, &void_idx)
+            .unwrap()
+            .expect("translation-only host should be eligible");
+        for sub in &mut unplaced.sub_meshes {
+            for c in sub.mesh.positions.chunks_mut(3) {
+                c[0] += t[0] as f32;
+                c[1] += t[1] as f32;
+                c[2] += t[2] as f32;
+            }
+        }
+        assert_eq!(
+            sorted_coord_set(&placed),
+            sorted_coord_set(&unplaced),
+            "unplaced def-frame cut + re-place != placed geometry for #{id}"
+        );
+    }
+}

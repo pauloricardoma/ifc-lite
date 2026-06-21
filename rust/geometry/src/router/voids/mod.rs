@@ -1793,6 +1793,89 @@ impl GeometryRouter {
     /// Returns an empty collection when there are no openings (callers should
     /// fall back to [`process_element_with_submeshes`]) or when every
     /// sub-mesh is destroyed by void subtraction.
+    /// The host's `ObjectPlacement` as a PURE TRANSLATION (metres), or `None` if
+    /// it carries any rotation. The v1 definition-frame void cut relativizes
+    /// cutters by a translation only (rotating axis-aligned `Rectangular` cutters
+    /// would break their AABB form), so rotated hosts fall back to the
+    /// per-occurrence world path.
+    fn host_translation_only(
+        &self,
+        element: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+    ) -> Result<Option<[f64; 3]>> {
+        let mut t = self.get_placement_transform_from_element(element, decoder)?;
+        // Rotation must be identity on the UNSCALED transform (the uniform unit
+        // scale would otherwise read the diagonal as non-identity).
+        let rot = t.fixed_view::<3, 3>(0, 0);
+        let identity_rot = (0..3).all(|i| {
+            (0..3).all(|j| {
+                let want = if i == j { 1.0 } else { 0.0 };
+                (rot[(i, j)] - want).abs() < 1e-9
+            })
+        });
+        if !identity_rot {
+            return Ok(None);
+        }
+        self.scale_transform(&mut t);
+        Ok(Some([t[(0, 3)], t[(1, 3)], t[(2, 3)]]))
+    }
+
+    /// Definition-frame voided sub-meshes for a PURE-TRANSLATION, non-layered
+    /// host: cut the UNPLACED base with the void cutters relativized into the
+    /// host's definition frame, so the result is placement-invariant (reusable
+    /// across translated occurrences — the element-level void-cut cache, #1286).
+    /// Returns `(def_frame_submeshes, host_translation)`, or `None` when the host
+    /// is ineligible (layered / rotated / no openings / empty / nothing cut) — the
+    /// caller then uses the per-occurrence [`Self::process_element_with_submeshes_and_voids`].
+    pub fn process_element_with_submeshes_and_voids_unplaced(
+        &self,
+        element: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+        void_index: &FxHashMap<u32, Vec<u32>>,
+    ) -> Result<Option<(SubMeshCollection, [f64; 3])>> {
+        if self.is_material_layer_sliceable(element.id) {
+            return Ok(None); // per-layer slice baking is not in v1
+        }
+        let opening_ids = match void_index.get(&element.id) {
+            Some(ids) if !ids.is_empty() => ids.clone(),
+            _ => return Ok(None),
+        };
+        let translation = match self.host_translation_only(element, decoder)? {
+            Some(t) => t,
+            None => return Ok(None), // rotated host
+        };
+        let base = self.process_element_with_submeshes_unplaced(element, decoder)?;
+        if base.is_empty() {
+            return Ok(None);
+        }
+        let ctx = self.build_void_context(element, &opening_ids, decoder);
+        if ctx.is_noop() {
+            return Ok(None);
+        }
+        // World cutters -> the host definition frame (translation only). The
+        // rect_fast `param` path is intentionally skipped (relativized_by drops
+        // it); apply_void_context_inner is the exact kernel, cutting the def base
+        // against def cutters at small coords.
+        let def_ctx = ctx.relativized_by(translation);
+        let mut voided = SubMeshCollection::new();
+        for sub in base.sub_meshes {
+            let gid = sub.geometry_id;
+            let mut m = self.apply_void_context_inner(sub.mesh, &def_ctx, element.id);
+            // Voided geometry is not GPU-instanced (the cut invalidates the base's
+            // rep_identity), exactly as the placed path clears it — keep the
+            // deduped output identical so collation behaves the same.
+            m.instance_meta = None;
+            m.clean_degenerate();
+            if !m.is_empty() {
+                voided.sub_meshes.push(SubMesh::new(gid, m));
+            }
+        }
+        if voided.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some((voided, translation)))
+    }
+
     pub fn process_element_with_submeshes_and_voids(
         &self,
         element: &DecodedEntity,
