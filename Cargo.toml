@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["rust/python"]
 members = ["rust/core", "rust/geometry", "rust/processing", "rust/clash", "rust/ffi", "rust/export", "rust/wasm-bindings", "apps/server"]
 resolver = "2"
 
