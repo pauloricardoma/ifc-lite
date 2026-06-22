@@ -29,7 +29,10 @@ jobs:
           - { os: ubuntu-latest, target: x86_64 }
           - { os: ubuntu-latest, target: aarch64 }
           - { os: macos-14, target: aarch64 }
-          - { os: macos-13, target: x86_64 }
+          # Cross-compile the Intel-mac wheel on the Apple-silicon runner: the
+          # macos-13 (Intel) runners are being deprecated and queue indefinitely.
+          # abi3 means no Python lib is linked, so a cross target builds cleanly.
+          - { os: macos-14, target: x86_64 }
           - { os: windows-latest, target: x64 }
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v4
