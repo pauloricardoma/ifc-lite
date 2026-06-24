@@ -30,6 +30,7 @@ import { projectToCssScreen } from '../../utils/projectScreen.js';
 import {
   getEntityBounds,
   getThemeClearColor,
+  accumulateBoundsExcludingTypes,
   type ViewportStateRefs,
 } from '../../utils/viewportUtils.js';
 import { setGlobalCanvasRef, setGlobalRendererRef, clearGlobalRefs } from '../../hooks/useBCF.js';
@@ -482,6 +483,11 @@ export function Viewport({
   const ghostExceptEntitiesRef = useLatestRef(ghostExceptEntities);
   const selectedEntityIdRef = useLatestRef(selectedEntityId);
   const selectedEntityIdsRef = useLatestRef(selectedEntityIds);
+  const ifcDataStoreRef = useLatestRef(ifcDataStore);
+  // Express-ids of the Space Sketch draft ghost meshes currently in the scene
+  // (added directly via appendToBatches, outside geometryResult) so they can be
+  // swapped/cleared without touching the streaming geometry pipeline.
+  const spaceOverlayIdsRef = useRef<Set<number>>(new Set());
   const selectedModelIndexRef = useLatestRef(selectedModelIndex);
   const activeToolRef = useRef<string>(activeTool);
   const pendingMeasurePointRef = useLatestRef(pendingMeasurePoint);
@@ -770,6 +776,100 @@ export function Viewport({
           } else {
             console.warn('[Viewport] frameSelection: Could not get bounds for selected element');
           }
+        },
+        frameEntities: (ids: number[]) => {
+          // Frame an explicit express-id set (active model). Same aggregation as
+          // frameSelection: flat-mesh AABB with an instanced-occurrence fallback.
+          const geom = geometryRef.current;
+          if (!geom || ids.length === 0) return;
+          const scene = rendererRef.current?.getScene();
+          let min: { x: number; y: number; z: number } | null = null;
+          let max: { x: number; y: number; z: number } | null = null;
+          for (const id of ids) {
+            const b = getEntityBounds(geom, id) ?? scene?.getInstancedEntityBounds(id) ?? null;
+            if (!b) continue;
+            if (!min || !max) {
+              min = { x: b.min.x, y: b.min.y, z: b.min.z };
+              max = { x: b.max.x, y: b.max.y, z: b.max.z };
+            } else {
+              min.x = Math.min(min.x, b.min.x); min.y = Math.min(min.y, b.min.y); min.z = Math.min(min.z, b.min.z);
+              max.x = Math.max(max.x, b.max.x); max.y = Math.max(max.y, b.max.y); max.z = Math.max(max.z, b.max.z);
+            }
+          }
+          if (min && max) {
+            // Guard against a degenerate / corrupted bound flinging the camera
+            // off-model: every component must be finite and the span sane.
+            const finite = [min.x, min.y, min.z, max.x, max.y, max.z].every(Number.isFinite);
+            const span = Math.max(max.x - min.x, max.y - min.y, max.z - min.z);
+            if (finite && span >= 0 && span < 1e5) {
+              camera.frameBounds(min, max, 300);
+              calculateScale();
+            }
+          }
+        },
+        frameBuildingExtent: () => {
+          // Frame the building shell: bounds of all rendered geometry EXCEPT
+          // IfcSite/terrain and IfcSpace, so a georeferenced model frames the
+          // building rather than the much larger site extent. Combines flat
+          // meshes with instanced occurrences; falls back to the full extent
+          // when nothing else is available.
+          const geom = geometryRef.current;
+          const scene = rendererRef.current?.getScene();
+          const EXCLUDE = new Set(['IfcSite', 'IfcSpace']);
+          let bounds = geom ? accumulateBoundsExcludingTypes(geom, EXCLUDE) : null;
+          // Merge in instanced occurrences (not present in flat meshes), skipping
+          // excluded types via the data store's type lookup.
+          if (scene) {
+            const store = ifcDataStoreRef.current;
+            for (const id of scene.getInstancedEntityIds()) {
+              const type = store?.entities?.getTypeName(id);
+              if (type && EXCLUDE.has(type)) continue;
+              const b = scene.getInstancedEntityBounds(id);
+              if (!b) continue;
+              if (!bounds) {
+                bounds = { min: { x: b.min.x, y: b.min.y, z: b.min.z }, max: { x: b.max.x, y: b.max.y, z: b.max.z } };
+              } else {
+                bounds.min.x = Math.min(bounds.min.x, b.min.x); bounds.min.y = Math.min(bounds.min.y, b.min.y); bounds.min.z = Math.min(bounds.min.z, b.min.z);
+                bounds.max.x = Math.max(bounds.max.x, b.max.x); bounds.max.y = Math.max(bounds.max.y, b.max.y); bounds.max.z = Math.max(bounds.max.z, b.max.z);
+              }
+            }
+          }
+          const target = bounds ?? geometryBoundsRef.current;
+          camera.frameBounds(target.min, target.max, 300);
+          calculateScale();
+        },
+        setSpaceOverlayMeshes: (meshes) => {
+          // Space Sketch draft ghosts go straight to the scene (NOT through
+          // geometryResult), so per-edit churn never trips the streaming
+          // reclassifier (which would reset the camera / un-pick new spaces).
+          const renderer = rendererRef.current;
+          const scene = renderer?.getScene();
+          const device = renderer?.getGPUDevice();
+          const pipeline = renderer?.getPipeline();
+          if (!renderer || !scene || !device || !pipeline) return;
+          if (spaceOverlayIdsRef.current.size > 0) {
+            scene.removeMeshesForEntities(spaceOverlayIdsRef.current);
+            spaceOverlayIdsRef.current = new Set();
+          }
+          if (meshes.length > 0) {
+            scene.appendToBatches(meshes, device, pipeline, false);
+            spaceOverlayIdsRef.current = new Set(meshes.map((m) => m.expressId));
+          }
+          if (scene.hasPendingBatches()) scene.rebuildPendingBatches(device, pipeline);
+          renderer.clearCaches();
+          renderer.requestRender();
+        },
+        clearSpaceOverlayMeshes: () => {
+          const renderer = rendererRef.current;
+          const scene = renderer?.getScene();
+          if (!renderer || !scene || spaceOverlayIdsRef.current.size === 0) return;
+          scene.removeMeshesForEntities(spaceOverlayIdsRef.current);
+          spaceOverlayIdsRef.current = new Set();
+          const device = renderer.getGPUDevice();
+          const pipeline = renderer.getPipeline();
+          if (device && pipeline && scene.hasPendingBatches()) scene.rebuildPendingBatches(device, pipeline);
+          renderer.clearCaches();
+          renderer.requestRender();
         },
         orbit: (deltaX: number, deltaY: number) => {
           // Orbit camera from ViewCube drag

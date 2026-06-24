@@ -79,7 +79,7 @@ import { downloadFile, downloadDataUrl } from '@/lib/export/download';
 import { FileSpreadsheet, FileJson, FileText, Filter, Upload, Pencil, DraftingCompass } from 'lucide-react';
 import { ExportDialog } from './ExportDialog';
 import { GLBExportDialog } from './GLBExportDialog';
-import { HbjsonExportDialog } from './HbjsonExportDialog';
+import { EnergyModelExportDialog } from './EnergyModelExportDialog';
 import { BulkPropertyEditor } from './BulkPropertyEditor';
 import { DataConnector } from './DataConnector';
 import { ExportChangesButton } from './ExportChangesButton';
@@ -848,11 +848,11 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
             }
           />
           <DropdownMenuSeparator />
-          <HbjsonExportDialog
+          <EnergyModelExportDialog
             trigger={
               <DropdownMenuItem onSelect={(e) => e.preventDefault()}>
                 <Download className="h-4 w-4 mr-2" />
-                Export HBJSON (Energy Model)
+                Energy Model (HBJSON / DFJSON)
               </DropdownMenuItem>
             }
           />

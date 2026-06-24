@@ -10,6 +10,7 @@
 mod adjacency;
 mod constructions;
 mod csv;
+mod dfjson;
 mod frame;
 mod geom;
 mod gltf;
@@ -30,6 +31,7 @@ mod shades;
 mod step;
 
 pub use csv::{export_csv, CsvMode, CsvOptions};
+pub use dfjson::DfjsonStats;
 pub use gltf::{export_glb, export_glb_from_meshes, export_glb_with_stats, GltfOptions, GltfStats};
 pub use hbjson::Model;
 pub use ifc5::{export_ifc5, Ifc5Options};
@@ -138,6 +140,35 @@ pub fn export_hbjson_with_stats(content: &[u8], opts: &HbjsonOptions) -> (String
 
     let model = Model::new(&sanitize_identifier(&opts.name), rooms, shade_meshes, cons.energy, opts.tolerance);
     let json = serde_json::to_string(&model).expect("HBJSON model serializes");
+    (json, stats)
+}
+
+/// Options for DFJSON (Dragonfly) export.
+pub struct DfjsonOptions {
+    /// Model identifier / display name.
+    pub name: String,
+    /// Geometry tolerance in metres (Ladybug Tools default 0.01).
+    pub tolerance: f64,
+}
+
+impl Default for DfjsonOptions {
+    fn default() -> Self {
+        Self { name: "ifc_lite_model".to_string(), tolerance: 0.01 }
+    }
+}
+
+/// Export the `IfcSpace` volumes in `content` (raw IFC/STEP bytes) as a Dragonfly DFJSON
+/// string. Each space becomes an extruded `Room2D` (floor polygon + heights) grouped into
+/// stories — the simpler Ladybug target for mostly-vertical-wall models.
+pub fn export_dfjson(content: &[u8], opts: &DfjsonOptions) -> String {
+    export_dfjson_with_stats(content, opts).0
+}
+
+/// Like [`export_dfjson`] but also returns coverage stats.
+pub fn export_dfjson_with_stats(content: &[u8], opts: &DfjsonOptions) -> (String, DfjsonStats) {
+    let profiles = extract_profiles(content, 0);
+    let (model, stats) = dfjson::build_model(&sanitize_identifier(&opts.name), &profiles, opts.tolerance);
+    let json = serde_json::to_string(&model).expect("DFJSON model serializes");
     (json, stats)
 }
 

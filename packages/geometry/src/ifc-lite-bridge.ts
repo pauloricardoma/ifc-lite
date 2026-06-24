@@ -482,6 +482,16 @@ export class IfcLiteBridge {
   }
 
   /**
+   * Export the `IfcSpace` volumes in `content` as a Dragonfly DFJSON string
+   * (Ladybug Tools energy model). Each space becomes an extruded `Room2D`
+   * (floor polygon + height) grouped into stories — the simpler target for
+   * mostly-vertical-wall models.
+   */
+  exportDfjson(content: string, name: string): string {
+    return this.runExport('exportDfjson', content, (api) => api.exportDfjson(content, name));
+  }
+
+  /**
    * Shared wrapper for the domain-format exporters: init guard + structured error
    * logging + fatal-wasm-error marking, mirroring the other bridge entry points.
    */

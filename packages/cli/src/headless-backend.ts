@@ -651,6 +651,22 @@ export class HeadlessBackend implements BimBackend {
         }
         return result;
       },
+      dfjson: async (name?: string): Promise<string> => {
+        // DFJSON is rebuilt analytically from the source IFC bytes (extruded Room2D
+        // plates grouped into stories) via the wasm geometry engine.
+        const bytes = store.source;
+        if (!bytes || bytes.length === 0) {
+          throw new Error('DFJSON export needs the source IFC bytes, which this store did not retain.');
+        }
+        const processor = new GeometryProcessor();
+        await processor.init();
+        const baseName = (name ?? modelName).replace(/\.[^.]+$/, '');
+        const result = processor.exportDfjson(bytes, baseName);
+        if (result === null) {
+          throw new Error('Geometry engine unavailable for DFJSON export.');
+        }
+        return result;
+      },
       download(_content: string, _filename: string, _mimeType: string): void {
         /* no-op — CLI writes to stdout/file directly */
       },

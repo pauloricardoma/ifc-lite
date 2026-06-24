@@ -237,6 +237,41 @@ export function calculateGeometryBounds(meshes: MeshData[]): BoundingBox3D {
   };
 }
 
+/**
+ * Accumulate a world-space AABB over the meshes whose `ifcType` is NOT in
+ * `excludeTypes` (case-sensitive IfcPascalCase). Returns `null` when no valid
+ * vertex contributes, so the caller can merge with other sources (e.g.
+ * instanced-occurrence bounds) and decide a fallback. Used to frame the
+ * building shell while skipping the IfcSite/terrain extent and IfcSpace.
+ */
+export function accumulateBoundsExcludingTypes(
+  meshes: MeshData[],
+  excludeTypes: ReadonlySet<string>,
+): BoundingBox3D | null {
+  let minX = Infinity, minY = Infinity, minZ = Infinity;
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+  let any = false;
+
+  for (const mesh of meshes) {
+    if (mesh.ifcType && excludeTypes.has(mesh.ifcType)) continue;
+    const ox = mesh.origin ? mesh.origin[0] : 0;
+    const oy = mesh.origin ? mesh.origin[1] : 0;
+    const oz = mesh.origin ? mesh.origin[2] : 0;
+    for (let i = 0; i < mesh.positions.length; i += 3) {
+      const x = mesh.positions[i] + ox;
+      const y = mesh.positions[i + 1] + oy;
+      const z = mesh.positions[i + 2] + oz;
+      if (!isValidCoord(x, y, z)) continue;
+      minX = Math.min(minX, x); minY = Math.min(minY, y); minZ = Math.min(minZ, z);
+      maxX = Math.max(maxX, x); maxY = Math.max(maxY, y); maxZ = Math.max(maxZ, z);
+      any = true;
+    }
+  }
+
+  if (!any || !Number.isFinite(minX)) return null;
+  return { min: { x: minX, y: minY, z: minZ }, max: { x: maxX, y: maxY, z: maxZ } };
+}
+
 // ============================================================================
 // Render Options Builder
 // ============================================================================

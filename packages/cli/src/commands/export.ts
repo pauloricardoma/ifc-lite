@@ -165,7 +165,7 @@ export async function exportCommand(args: string[]): Promise<void> {
   const propFilter = getFlag(args, '--where');
   const storeyFilter = getFlag(args, '--storey');
 
-  if (!filePath) fatal('Usage: ifc-lite export <file.ifc> --format csv|json|ifc|obj|gltf|glb|jsonld|step|ifcx|hbjson [--type IfcWall] [--columns Name,Type,GlobalId] [--where PsetName.Prop=Value] [--storey Name] [--name Model] [--out file]');
+  if (!filePath) fatal('Usage: ifc-lite export <file.ifc> --format csv|json|ifc|obj|gltf|glb|jsonld|step|ifcx|hbjson|dfjson [--type IfcWall] [--columns Name,Type,GlobalId] [--where PsetName.Prop=Value] [--storey Name] [--name Model] [--out file]');
 
   // B9/F6: Auto-prefix Ifc
   if (type) {
@@ -326,7 +326,14 @@ export async function exportCommand(args: string[]): Promise<void> {
       await writeOutput(hbjson, outPath);
       break;
     }
+    case 'dfjson': {
+      // Dragonfly/Ladybug energy-model export (extruded Room2D plates) via the SDK.
+      const name = getFlag(args, '--name') ?? basename(filePath).replace(/\.ifc$/i, '');
+      const dfjson = await bim.export.dfjson({ name });
+      await writeOutput(dfjson, outPath);
+      break;
+    }
     default:
-      fatal(`Unknown format: ${format}. Supported: csv, json, ifc, obj, gltf, glb, jsonld, step, ifcx, hbjson`);
+      fatal(`Unknown format: ${format}. Supported: csv, json, ifc, obj, gltf, glb, jsonld, step, ifcx, hbjson, dfjson`);
   }
 }

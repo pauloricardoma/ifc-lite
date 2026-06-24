@@ -79,6 +79,14 @@ export interface UISlice {
    * rather than per-panel toggles.
    */
   editEnabled: boolean;
+  /**
+   * Space Sketch tool minimized to a small reopen pill. Set when the user
+   * clicks into the 3D scene while the tool is open, so the panel gets out of
+   * the way for inspection without discarding the draft (the overlay stays
+   * mounted — only its panel is visually collapsed). Reset to false on any
+   * tool change so reopening the tool always starts expanded.
+   */
+  spaceSketchMinimized: boolean;
   /** Active tab in the Properties panel. Controlled so in-app flows (e.g.
    *  adding a bSDD property) can jump back to "properties" — issue #1107. */
   propertiesActiveTab: 'properties' | 'quantities' | 'bsdd' | 'raw-step';
@@ -112,6 +120,8 @@ export interface UISlice {
   setLeftPanelCollapsed: (collapsed: boolean) => void;
   setRightPanelCollapsed: (collapsed: boolean) => void;
   setActiveTool: (tool: string) => void;
+  /** Collapse the Space Sketch panel to a reopen pill (or restore it). */
+  setSpaceSketchMinimized: (minimized: boolean) => void;
   setEditEnabled: (enabled: boolean) => void;
   toggleEditEnabled: () => void;
   setPropertiesActiveTab: (tab: 'properties' | 'quantities' | 'bsdd' | 'raw-step') => void;
@@ -163,6 +173,7 @@ export const createUISlice: StateCreator<UISlice & UICrossSliceState, [], [], UI
   rightPanelCollapsed: false,
   activeTool: UI_DEFAULTS.ACTIVE_TOOL,
   editEnabled: false,
+  spaceSketchMinimized: false,
   propertiesActiveTab: 'properties',
   pendingPropertyFocus: null,
   theme: UI_DEFAULTS.THEME,
@@ -189,8 +200,14 @@ export const createUISlice: StateCreator<UISlice & UICrossSliceState, [], [], UI
     // the global toggle on so the rest of the UI (Properties panel,
     // future manipulators) stays in sync. Read-only tools leave the
     // flag alone.
-    set(AUTHORING_TOOLS.has(activeTool) ? { activeTool, editEnabled: true } : { activeTool });
+    // Any tool change resets the Space Sketch minimize state, so the panel is
+    // never stranded collapsed after switching tools and a fresh open of the
+    // tool always starts expanded.
+    set(AUTHORING_TOOLS.has(activeTool)
+      ? { activeTool, editEnabled: true, spaceSketchMinimized: false }
+      : { activeTool, spaceSketchMinimized: false });
   },
+  setSpaceSketchMinimized: (spaceSketchMinimized) => set({ spaceSketchMinimized }),
   setEditEnabled: (editEnabled) => {
     if (!editEnabled) {
       // Flipping edit mode off must clear every authoring sub-state
@@ -201,6 +218,7 @@ export const createUISlice: StateCreator<UISlice & UICrossSliceState, [], [], UI
       set((s) => ({
         editEnabled: false,
         activeTool: AUTHORING_TOOLS.has(s.activeTool) ? 'select' : s.activeTool,
+        spaceSketchMinimized: false,
         cesiumPlacementEditMode: false,
         cesiumPlacementDraftModelId: null,
         cesiumPlacementDraft: null,

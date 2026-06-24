@@ -1225,6 +1225,21 @@ export class GeometryProcessor {
   }
 
   /**
+   * Export the `IfcSpace` volumes in `buffer` as a Dragonfly DFJSON string
+   * (Ladybug Tools energy model — extruded `Room2D` plates). Returns null if
+   * not initialized.
+   * @param buffer IFC file buffer
+   * @param name Model identifier / display name
+   */
+  exportDfjson(buffer: Uint8Array, name: string): string | null {
+    if (!this.bridge || !this.bridge.isInitialized()) {
+      return null;
+    }
+    const content = safeUtf8Decode(buffer);
+    return this.bridge.exportDfjson(content, name);
+  }
+
+  /**
    * Cleanup resources
    */
   dispose(): void {
