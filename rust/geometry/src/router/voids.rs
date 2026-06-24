@@ -87,6 +87,50 @@ fn wall_thinnest_axis_dir(wall_min: &Point3<f64>, wall_max: &Point3<f64>) -> Vec
     }
 }
 
+/// Penetration (depth) axis for a box opening that carries no authored
+/// extrusion direction. The cut axis is the one the opening pierces
+/// transversally: it extends PAST the host on at least one side. A deep
+/// FreeCAD-style cutter is far deeper than the wall is thick, so its THINNEST
+/// AABB axis is NOT the depth — picking thinnest there points the through-host
+/// cap-flush extension along an in-plane axis, where it latches onto a
+/// neighbouring void's reveal facet and grows the hole (issue #1337). Falls
+/// back to the thinnest axis (the classic flush wall-thickness cutter that sits
+/// inside the host on every axis), preserving prior behaviour for those.
+fn infer_box_penetration_dir(
+    open_min: &Point3<f64>,
+    open_max: &Point3<f64>,
+    host_min: &Point3<f64>,
+    host_max: &Point3<f64>,
+) -> Vector3<f64> {
+    let o = [
+        (open_min.x, open_max.x),
+        (open_min.y, open_max.y),
+        (open_min.z, open_max.z),
+    ];
+    let h = [
+        (host_min.x, host_max.x),
+        (host_min.y, host_max.y),
+        (host_min.z, host_max.z),
+    ];
+    let mut best_axis = usize::MAX;
+    let mut best_past = 1.0e-6;
+    for a in 0..3 {
+        // How far the opening pokes past the host on either side along axis `a`.
+        let past = (h[a].0 - o[a].0).max(0.0) + (o[a].1 - h[a].1).max(0.0);
+        if past > best_past {
+            best_past = past;
+            best_axis = a;
+        }
+    }
+    match best_axis {
+        0 => Vector3::new(1.0, 0.0, 0.0),
+        1 => Vector3::new(0.0, 1.0, 0.0),
+        2 => Vector3::new(0.0, 0.0, 1.0),
+        // Inside the host on every axis ⇒ flush cutter ⇒ classic thinnest-axis.
+        _ => wall_thinnest_axis_dir(open_min, open_max),
+    }
+}
+
 /// World-axis along the opening MESH's THINNEST AABB extent — the depth direction
 /// used to extend a cutter through the host when the opening carries no explicit
 /// extrusion direction. (A box opening's thinnest axis is its depth.)
@@ -2398,9 +2442,21 @@ impl GeometryRouter {
         for opening in &ctx.merged_openings {
             match opening {
                 OpeningType::Rectangular(open_min, open_max, extrusion_dir) => {
-                    let (final_min, final_max) = if let Some(dir) = extrusion_dir {
+                    // Penetration axis: the authored extrusion dir when present,
+                    // else inferred from how the box pierces the host (issue
+                    // #1337). Carrying a concrete dir downstream keeps the
+                    // through-host cap-flush extension off the opening's thinnest
+                    // (in-plane) axis for deep cutters.
+                    let dir = extrusion_dir.unwrap_or_else(|| {
+                        infer_box_penetration_dir(open_min, open_max, &wall_min, &wall_max)
+                    });
+                    // Only openings with an AUTHORED extrusion dir were extended
+                    // here before; keep the synthesized box identical for the
+                    // dirless case (the inferred dir only steers the later
+                    // through-host extension, not the box bounds).
+                    let (final_min, final_max) = if extrusion_dir.is_some() {
                         self.extend_opening_along_direction(
-                            *open_min, *open_max, wall_min, wall_max, *dir,
+                            *open_min, *open_max, wall_min, wall_max, dir,
                         )
                     } else {
                         (*open_min, *open_max)
@@ -2410,7 +2466,7 @@ impl GeometryRouter {
                         box_mesh,
                         final_min,
                         final_max,
-                        *extrusion_dir,
+                        Some(dir),
                     ));
                 }
                 other => non_rect_openings.push(other),
@@ -3313,6 +3369,26 @@ impl GeometryRouter {
                     let overlaps_z = a_min.z <= b_max.z + MERGE_TOLERANCE
                         && a_max.z >= b_min.z - MERGE_TOLERANCE;
 
+                    // PHANTOM-VOLUME GUARD (issue #1337): collapsing two AABBs into
+                    // their bounding box is only over-cut-free when the boxes already
+                    // coincide on at least two axes — then the merge merely extends the
+                    // third (overlapping) axis and `bbox(A,B) == A ∪ B`. Two boxes that
+                    // overlap on all three axes but coincide on none (a window on one
+                    // wall and a door on the perpendicular wall whose AABBs cross at the
+                    // building corner) expand into a bounding box that punches a hole
+                    // through BOTH walls. This still collapses the O(2^N) case the merge
+                    // exists for — a wall tiled with aligned openings coincides on two
+                    // axes per pair and folds row-by-row, then column-by-column.
+                    let coincides_x = (a_min.x - b_min.x).abs() <= MERGE_TOLERANCE
+                        && (a_max.x - b_max.x).abs() <= MERGE_TOLERANCE;
+                    let coincides_y = (a_min.y - b_min.y).abs() <= MERGE_TOLERANCE
+                        && (a_max.y - b_max.y).abs() <= MERGE_TOLERANCE;
+                    let coincides_z = (a_min.z - b_min.z).abs() <= MERGE_TOLERANCE
+                        && (a_max.z - b_max.z).abs() <= MERGE_TOLERANCE;
+                    let coincident_axes =
+                        coincides_x as u8 + coincides_y as u8 + coincides_z as u8;
+                    let phantom_free = coincident_axes >= 2;
+
                     // Check direction compatibility before merging
                     let dirs_compatible = match (&rects[i].2, &rects[j].2) {
                         (Some(a), Some(b)) => {
@@ -3323,7 +3399,7 @@ impl GeometryRouter {
                         _ => false, // One has direction, other doesn't
                     };
 
-                    if overlaps_x && overlaps_y && overlaps_z && dirs_compatible {
+                    if overlaps_x && overlaps_y && overlaps_z && dirs_compatible && phantom_free {
                         // Merge into box i
                         let dir = rects[i].2;
                         rects[i] = (
@@ -4828,6 +4904,87 @@ mod reveal_tests {
             !frame.is_axis_aligned(),
             "sloped BRep opening should use the diagonal frame path"
         );
+    }
+
+    #[test]
+    fn test_perpendicular_corner_openings_do_not_merge() {
+        // Issue #1337: FreeCAD/brep openings carry no extrusion direction
+        // (dir = None). A window on one wall and a garage-door opening on the
+        // PERPENDICULAR wall have AABBs that cross at the building corner —
+        // overlapping on all three axes but coinciding on NONE. Collapsing them
+        // into one bounding box punches a phantom hole through both walls (the
+        // reported corner over-cut). They must stay separate.
+        let window = OpeningType::Rectangular(
+            Point3::new(1.5, -1.2, 0.9),
+            Point3::new(2.7, 1.2, 2.1),
+            None,
+        );
+        let door = OpeningType::Rectangular(
+            Point3::new(-2.4, 0.55, 0.0),
+            Point3::new(2.4, 2.95, 2.2),
+            None,
+        );
+        let merged = GeometryRouter::merge_rectangular_openings(&[window, door]);
+        assert_eq!(
+            merged.len(),
+            2,
+            "perpendicular corner openings (overlap-all-axes, coincide-none) must not merge"
+        );
+    }
+
+    #[test]
+    fn test_deep_box_opening_penetration_axis_is_transversal() {
+        // Issue #1337 follow-up: a FreeCAD window cutter is a box 1.2 wide (x),
+        // 2.4 DEEP (y, through-wall), 1.2 tall (z). Its thinnest axis is x/z, but
+        // it penetrates along y — it pokes past the host's y-bounds. The depth
+        // axis for the through-host cap-flush extension must be y, else the push
+        // runs vertically and latches onto a neighbouring void's reveal facet
+        // (all windows share z[0.9,2.1]), over-cutting the wall.
+        let dir = infer_box_penetration_dir(
+            &Point3::new(1.5, -1.2, 0.9),
+            &Point3::new(2.7, 1.2, 2.1),
+            &Point3::new(0.0, 0.0, 0.0),
+            &Point3::new(8.4, 6.2, 3.93),
+        );
+        assert!(dir.y.abs() > 0.99, "deep cutter penetrates along y, got {dir:?}");
+    }
+
+    #[test]
+    fn test_flush_box_opening_falls_back_to_thinnest_axis() {
+        // A flush cutter sized to the wall thickness sits inside the host on
+        // every axis -> classic thinnest-axis (the wall normal). Unchanged.
+        let dir = infer_box_penetration_dir(
+            &Point3::new(1.5, 0.0, 0.9),
+            &Point3::new(2.7, 0.4, 2.1),
+            &Point3::new(0.0, 0.0, 0.0),
+            &Point3::new(8.4, 6.2, 3.93),
+        );
+        assert!(dir.y.abs() > 0.99, "flush cutter -> thinnest (y), got {dir:?}");
+    }
+
+    #[test]
+    fn test_aligned_stacked_openings_still_merge() {
+        // The merge still collapses the O(2^N) case it exists for: openings that
+        // tile a wall coincide on two axes per pair (here X and Y) and are
+        // adjacent on the third (Z), so bbox(A,B) == A ∪ B with no phantom volume.
+        let lower = OpeningType::Rectangular(
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(2.0, 0.4, 1.0),
+            None,
+        );
+        let upper = OpeningType::Rectangular(
+            Point3::new(1.0, 0.0, 1.0),
+            Point3::new(2.0, 0.4, 2.0),
+            None,
+        );
+        let merged = GeometryRouter::merge_rectangular_openings(&[lower, upper]);
+        assert_eq!(merged.len(), 1, "aligned stacked openings should still merge");
+        match &merged[0] {
+            OpeningType::Rectangular(mn, mx, _) => {
+                assert!(mn.z.abs() < 1e-9 && (mx.z - 2.0).abs() < 1e-9, "merged Z span");
+            }
+            _ => panic!("expected a merged Rectangular opening"),
+        }
     }
 
     #[test]
