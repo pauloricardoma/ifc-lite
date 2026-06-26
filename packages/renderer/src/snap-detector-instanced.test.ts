@@ -149,3 +149,39 @@ test('flat meshes (no occurrenceKey) still snap, keyed by expressId', () => {
   assert.equal(snap!.type, SnapType.VERTEX);
   assert.ok(Math.abs(snap!.position.x - 10) < 1e-4, `flat-mesh snap x≈10, got ${snap!.position.x}`);
 });
+
+const RAY = { origin: CAMERA.position, direction: { x: 0, y: 0, z: -1 } };
+
+test('snap finds a vertex on EVERY flat sub-piece of one expressId, not just the first', () => {
+  // Mesh fragmentation emits ONE entity as several flat pieces sharing an
+  // expressId with NO occurrenceKey (e.g. an IfcMechanicalFastener "Bolt
+  // assembly" materialized as many pieces). Distinct world positions; here the
+  // sub-pieces differ in their local positions.
+  const pieceA = makeCube(500, 0);
+  const pieceB = makeCube(500, 10);
+  const meshes = [pieceA, pieceB];
+  const detector = new SnapDetector();
+
+  // Fill the cache from A first.
+  detector.detectSnapTarget(RAY, meshes, hitAtCorner(0, 500, [0, 0, 0]), CAMERA, SCREEN_H);
+  // Pre-fix B (same expressId) reused A's cached geometry → no nearby vertex → face fallback.
+  const snapB = detector.detectSnapTarget(RAY, meshes, hitAtCorner(1, 500, [10, 0, 0]), CAMERA, SCREEN_H);
+  assert.equal(snapB!.type, SnapType.VERTEX, 'second flat piece must snap to its own vertex');
+  assert.ok(Math.abs(snapB!.position.x - 10) < 1e-4, `piece B snap x≈10, got ${snapB!.position.x}`);
+});
+
+test('snap distinguishes flat mapped copies that share local positions and differ only by origin', () => {
+  // The IfcMappedItem bolt case: same expressId, identical LOCAL geometry, distinct
+  // `origin` (placement). The cache lifts local+origin to world, so the two copies
+  // hold different world geometry and must not share a cache entry.
+  const local = makeCube(600, 0);
+  const copyA: MeshData = { ...local, origin: [0, 0, 0] };
+  const copyB: MeshData = { ...local, origin: [10, 0, 0] };
+  const meshes = [copyA, copyB];
+  const detector = new SnapDetector();
+
+  detector.detectSnapTarget(RAY, meshes, hitAtCorner(0, 600, [0, 0, 0]), CAMERA, SCREEN_H);
+  const snapB = detector.detectSnapTarget(RAY, meshes, hitAtCorner(1, 600, [10, 0, 0]), CAMERA, SCREEN_H);
+  assert.equal(snapB!.type, SnapType.VERTEX, 'mapped copy B should snap to its own corner, not copy A geometry');
+  assert.ok(Math.abs(snapB!.position.x - 10) < 1e-4, `copy B snap x≈10, got ${snapB!.position.x}`);
+});

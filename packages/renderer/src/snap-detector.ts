@@ -96,13 +96,13 @@ export class SnapDetector {
   // serving the pre-edit geometry. This is identical for flat and instanced
   // meshes; instancing adds no new staleness window.
   //
-  // Keyed by `mesh.occurrenceKey ?? mesh.expressId`: flat meshes (one per
-  // expressId) key on the numeric id, but GPU-instanced occurrences share one
-  // expressId across many world-space placements, so they must key on their
-  // per-occurrence string key (issue #1405) — keying on expressId alone served
-  // the first occurrence's edges/vertices for every later one, so snap lit up
-  // on a single instance.
-  private geometryCache = new Map<string | number, MeshGeometryCache>();
+  // Keyed via cacheKeyFor(): GPU-instanced occurrences use their per-occurrence
+  // `occurrenceKey` (issue #1405); flat meshes use a content signature
+  // (expressId + origin + buffer sizes + sampled vertices), because one entity
+  // is often emitted as several flat sub-pieces sharing an expressId — keying on
+  // expressId alone served the first piece's edges/vertices for every later one,
+  // so snap lit up on a single piece of a multi-piece element.
+  private geometryCache = new Map<string, MeshGeometryCache>();
 
   /**
    * Detect best snap target near cursor
@@ -548,9 +548,7 @@ export class SnapDetector {
    * Get or compute geometry cache for a mesh
    */
   private getGeometryCache(mesh: MeshData): MeshGeometryCache {
-    // Instanced occurrences share an expressId but hold distinct world-space
-    // positions, so key on the per-occurrence key when present (issue #1405).
-    const key = mesh.occurrenceKey ?? mesh.expressId;
+    const key = this.cacheKeyFor(mesh);
     const cached = this.geometryCache.get(key);
     if (cached) {
       return cached;
@@ -559,6 +557,39 @@ export class SnapDetector {
     const cache = buildGeometryCache(mesh);
     this.geometryCache.set(key, cache);
     return cache;
+  }
+
+  /**
+   * Stable cache key for a mesh's snap geometry.
+   *
+   * GPU-instanced occurrences carry an explicit per-occurrence `occurrenceKey`
+   * (issue #1405). Flat meshes do not, and keying them on `expressId` alone is
+   * wrong whenever ONE entity is emitted as several flat sub-pieces — mesh
+   * fragmentation routinely splits an element into many `MeshData` pieces (e.g.
+   * an IfcMechanicalFastener "Bolt assembly" of mapped items materialized as 24
+   * pieces), and mapped copies share both `expressId` and local positions while
+   * differing only in `origin`. Keying on `expressId` served the first piece's
+   * vertices/edges for every other, so snap lit up on a single piece.
+   *
+   * So flat pieces key on a cheap content signature: `expressId` + per-piece
+   * `origin` (distinguishes same-template copies at different placements) +
+   * buffer sizes + sampled vertices (distinguishes distinct sub-pieces of one
+   * element). Pieces whose world geometry is genuinely identical collapse to the
+   * same key, which is correct (their snap geometry is the same).
+   */
+  private cacheKeyFor(mesh: MeshData): string {
+    if (mesh.occurrenceKey !== undefined) return mesh.occurrenceKey;
+    const p = mesh.positions;
+    const n = p.length;
+    const o = mesh.origin;
+    const ox = o ? o[0] : 0, oy = o ? o[1] : 0, oz = o ? o[2] : 0;
+    // middle vertex offset, aligned to a 3-float stride
+    const mid = n >= 3 ? (Math.floor(n / 6) * 3) : 0;
+    return `${mesh.expressId}:${n}:${mesh.indices?.length ?? 0}` +
+      `:${ox},${oy},${oz}` +
+      `:${p[0]},${p[1]},${p[2]}` +
+      `:${p[mid]},${p[mid + 1]},${p[mid + 2]}` +
+      `:${p[n - 3]},${p[n - 2]},${p[n - 1]}`;
   }
 
   /**
