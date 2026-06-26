@@ -195,6 +195,18 @@ describe('schema-converter', () => {
       const line = "#11=IFCSLAB('guid',$,'S',$,$,#1,#2,'tag',.FLOOR.);"; // 9 attrs
       expect(convertStepLine(line, 'IFC2X3', 'IFC4')).toBe(line);
     });
+
+    it('does NOT pad entities whose attrs were reordered, not appended (IfcMaterialProperties)', () => {
+      // IFC2X3 [Material] vs IFC4 [Name, Description, Properties, Material] — NOT a
+      // prefix, so trailing `$` would shove the Material ref into the Name slot.
+      const line = '#5=IFCMATERIALPROPERTIES(#6);';
+      expect(convertStepLine(line, 'IFC2X3', 'IFC4')).toBe(line); // left untouched
+    });
+
+    it('does NOT pad a reordered IfcApproval (7→9, fully reordered)', () => {
+      const line = "#5=IFCAPPROVAL('desc','2020-01-01',$,$,$,'Name','Id');"; // 7 attrs
+      expect(convertStepLine(line, 'IFC2X3', 'IFC4')).toBe(line);
+    });
   });
 
   // ─── needsConversion ────────────────────────────────────────────────────

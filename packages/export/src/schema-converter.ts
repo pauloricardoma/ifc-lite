@@ -256,24 +256,37 @@ function chainMaps(
   return result;
 }
 
-// Lazily-built UPPERCASE entity name → positional attribute count, per target
-// schema, from the generated buildingSMART tables. `IfcEntityInfo.attributes`
-// is the full inherited+direct positional list (verified to match STEP counts:
-// IfcWall 8→9, IfcDoor 10→13, IfcMaterial 1→3, …), so its length is exactly the
-// number of positional attributes the schema requires.
-const ATTR_COUNT_TABLES = new Map<IfcSchemaVersion, Map<string, number>>();
-function attrCountTable(schema: IfcSchemaVersion): Map<string, number> | null {
-  let table = ATTR_COUNT_TABLES.get(schema);
+// Lazily-built UPPERCASE entity name → ordered positional attribute NAMES, per
+// schema, from the generated buildingSMART tables. `IfcEntityInfo.attributes` is
+// the full inherited+direct positional list (verified to match STEP counts:
+// IfcWall 8→9, IfcDoor 10→13, IfcMaterial 1→3, …).
+const ATTR_NAME_TABLES = new Map<IfcSchemaVersion, Map<string, readonly string[]>>();
+function attrNameTable(schema: IfcSchemaVersion): Map<string, readonly string[]> | null {
+  let table = ATTR_NAME_TABLES.get(schema);
   if (table) return table;
   let entities: readonly IfcEntityInfo[] | null = null;
   if (schema === 'IFC2X3') entities = ENTITIES_IFC2X3;
   else if (schema === 'IFC4') entities = ENTITIES_IFC4;
   else if (schema === 'IFC4X3') entities = ENTITIES_IFC4X3;
   else return null; // IFC5 has no generated table — skip count adjustment
-  table = new Map<string, number>();
-  for (const e of entities) table.set(e.name.toUpperCase(), e.attributes.length);
-  ATTR_COUNT_TABLES.set(schema, table);
+  table = new Map<string, readonly string[]>();
+  for (const e of entities) table.set(e.name.toUpperCase(), e.attributes);
+  ATTR_NAME_TABLES.set(schema, table);
   return table;
+}
+
+/**
+ * True when `src` is a STRICT prefix of `tgt` by attribute name — i.e. the
+ * target only *appended* attributes. Trailing-`$` padding is only safe then;
+ * many entities insert/reorder attributes mid-list (e.g. IfcMaterialProperties,
+ * IfcApproval, IfcTask), where padding would shift values into the wrong slots.
+ */
+function isStrictAttrPrefix(src: readonly string[], tgt: readonly string[]): boolean {
+  if (src.length >= tgt.length) return false;
+  for (let i = 0; i < src.length; i++) {
+    if (src[i] !== tgt[i]) return false;
+  }
+  return true;
 }
 
 /** Ordinal rank of a schema version (older → newer) for direction checks. */
@@ -360,18 +373,27 @@ export function convertStepLine(
     }
   }
 
-  // Pad trailing optional attributes when UPGRADING to a newer schema that ADDED
-  // attributes (e.g. IFC2X3 → IFC4 added PredefinedType to IfcWall / IfcBeam /
-  // IfcOpeningElement / …). Without this the upgraded entity is short an attribute
-  // and invalid under the new schema, which strict readers reject. The added
-  // attributes are optional, so `$` is valid. Scoped to upconversion so it never
-  // touches the downconversion trim path above.
+  // Pad trailing optional attributes when UPGRADING to a newer schema that
+  // APPENDED attributes (e.g. IFC2X3 → IFC4 added PredefinedType to IfcWall /
+  // IfcBeam / IfcOpeningElement / …). Without this the upgraded entity is short
+  // an attribute and invalid under the new schema, which strict readers reject.
+  //
+  // CRITICAL: only pad when the source attribute name-list is a strict PREFIX of
+  // the target's. Many entities insert/reorder attributes mid-list (e.g.
+  // IfcMaterialProperties [Material] → [Name, Description, Properties, Material],
+  // IfcApproval, IfcTask); blindly appending `$` there would shift values into the
+  // wrong (and type-invalid) slots. A prefix check distinguishes a safe append
+  // from a corrupting insertion — the headline targets are all prefix-safe. The
+  // appended attributes are optional, so `$` is valid. Scoped to upconversion so
+  // it never touches the downconversion trim path above.
   if (schemaRank(toSchema) > schemaRank(fromSchema)) {
-    const targetCount = attrCountTable(toSchema)?.get(newType);
-    if (targetCount !== undefined) {
+    // Source attrs keyed on the ORIGINAL type; target on the (possibly renamed) type.
+    const srcAttrs = attrNameTable(fromSchema)?.get(entityType);
+    const tgtAttrs = attrNameTable(toSchema)?.get(newType);
+    if (srcAttrs && tgtAttrs && isStrictAttrPrefix(srcAttrs, tgtAttrs)) {
       const currentCount = countTopLevelAttributes(finalAttrs);
-      if (currentCount > 0 && currentCount < targetCount) {
-        finalAttrs = `${finalAttrs}${',$'.repeat(targetCount - currentCount)}`;
+      if (currentCount > 0 && currentCount < tgtAttrs.length) {
+        finalAttrs = `${finalAttrs}${',$'.repeat(tgtAttrs.length - currentCount)}`;
       }
     }
   }

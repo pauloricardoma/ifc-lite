@@ -7,9 +7,16 @@ trailing attributes when downgrading but never **padded** the new trailing attri
 newer schemas added (e.g. `PredefinedType` on `IfcWall` / `IfcBeam` / `IfcOpeningElement` /
 `IfcFastener` / …, the IfcDoor/IfcWindow additions, `IfcMaterial.Category`, etc.). Upgraded
 entities were left a positional attribute short and rejected by strict readers (e.g. BIM
-Vision). Padding is now driven by the generated buildingSMART attribute tables
-(`@ifc-lite/data`), so any added trailing attribute is filled with `$` (valid — the additions
-are optional), scoped to upconversion so the downconversion trim path is untouched.
+Vision). Padding is driven by the generated buildingSMART attribute tables (`@ifc-lite/data`),
+scoped to upconversion so the downconversion trim path is untouched.
+
+Padding is applied **only when the source attribute name-list is a strict prefix of the
+target's** (i.e. the newer schema merely appended attributes). Many entities insert/reorder
+attributes mid-list — e.g. `IfcMaterialProperties` (`[Material]` → `[Name, Description,
+Properties, Material]`), `IfcApproval`, `IfcTask` — where blindly appending `$` would shift
+values into the wrong, type-invalid slots; those are left untouched. All headline targets
+(`IfcWall`/`Beam`/`Column`/`Member`/`Plate`/`OpeningElement`/`Door`/`Window`/`Fastener`/
+`MechanicalFastener`/`Grid`, `IfcMaterial`) are prefix-safe, so the intended fix is preserved.
 
 Also tolerate whitespace after `=` in `convertStepLine` (e.g. Tekla's `#34498= IFCWALL(...)`);
 such lines previously failed the entity-line regex and passed through **unconverted**, so
