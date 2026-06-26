@@ -12,3 +12,9 @@ vertices/edges were served for every other piece, and vertex/edge snap lit up on
 (one bolt of the group) while the rest fell back to a free-point face hit. The cache now keys
 flat pieces on a cheap content signature (`expressId` + `origin` + buffer sizes + sampled
 vertices), so every piece snaps; genuinely identical world geometry still shares one entry.
+
+Also fix the measure-snap radius being ~57× too small. `screenToWorldRadius` applied a
+degrees→radians conversion to `fov`, but its only caller passes `Camera.getFOV()`, which is
+already in radians. The shrunken radius made vertex/edge snap require sub-millimetre cursor
+precision and fall back to a face hit on small features (e.g. bolts). The conversion is
+removed; `fov` is treated as radians.

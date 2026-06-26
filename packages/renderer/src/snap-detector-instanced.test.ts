@@ -65,7 +65,8 @@ function hitAtCorner(meshIndex: number, expressId: number, corner: [number, numb
   };
 }
 
-const CAMERA = { position: { x: 0, y: 0, z: 100 }, fov: 50 };
+// fov in RADIANS, matching Camera.getFOV() (the real snap call site).
+const CAMERA = { position: { x: 0, y: 0, z: 100 }, fov: Math.PI / 4 };
 const SCREEN_H = 800;
 
 test('snap finds a vertex on EVERY instanced occurrence, not just the first (#1405)', () => {
