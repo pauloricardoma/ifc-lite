@@ -91,14 +91,15 @@ only safe handling is the feature-detect + fallback above (zero regression,
 auto-upgrade per engine as each ships). For users today it yields no in-browser
 speedup.
 
-The bigger lever that *does* work in today's browsers is **threads**: the
-`pkg-threaded` bundle (rayon-in-wasm, atomics + shared memory; SharedArrayBuffer
-is widely supported and the viewer already sets COOP/COEP). Native shows
-threading is a far larger win than wide-arith on the heavy models — Tekla 1-core
-14.2s vs 10-core 2.9s (~4.8x) vs wide-arith's 1.7x. In-wasm scaling still needs
-the `rust/csg-thread-bench` (rung-2) browser result to confirm it tracks native,
-but it is the near-term in-browser path; wide-arith is additive on top later
-(a threaded+wide bundle combines both target-features).
+The bigger lever that *does* work in today's browsers is **threads** (in-instance
+rayon), and it is **already measured** — see `docs/architecture/csg-threading-design.md`
++ the `rust/csg-thread-bench` rung-2 result: threaded WASM scales the CSG step
+**2.9-4.2x at 8 threads** (atomics tax ~0%, output byte-identical) and **1.6-1.9x
+end-to-end** on the current exact-CSG kernel. The `pkg-threaded` bundle is built
+(#1255) but not yet wired into runtime selection. It works in today's
+Chrome/Firefox (cross-origin isolated; the viewer already sets COOP/COEP; Safari
+lacks credentialless COI and falls back to the plain bundle). wide-arith is
+additive on top later (a threaded+wide bundle combines both target-features).
 
 **Working around the wasm-bindgen blocker:** split the CSG kernel into a separate
 plain-`cdylib` wasm (no wasm-bindgen) built with `+wide-arithmetic`, exposing the
