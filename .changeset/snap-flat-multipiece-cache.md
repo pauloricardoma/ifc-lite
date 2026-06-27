@@ -4,7 +4,7 @@
 
 Fix measure-snap missing all-but-one piece of a multi-piece flat mesh. The snap geometry cache
 keyed flat meshes on `expressId` alone (instanced occurrences already keyed on `occurrenceKey`,
-#1405), assuming one flat mesh per `expressId`. But mesh fragmentation routinely emits one
+`#1405`), assuming one flat mesh per `expressId`. But mesh fragmentation routinely emits one
 entity as several flat `MeshData` pieces — e.g. an `IfcMechanicalFastener` "Bolt assembly" of
 mapped items materialized as 24 pieces sharing one `expressId` — and mapped copies share both
 `expressId` and local positions, differing only in `origin`. So the first piece's deduped
