@@ -52,10 +52,64 @@ ThatOpen wins today.
 - `wide-arithmetic` is a recognized wasm target feature in our pinned toolchain.
 - LLVM 21 lowers our actual `bnum` I256/I512 `checked_mul` to the wide ops with
   only `-C target-feature=+wide-arithmetic`. No `bnum` changes required.
-- Gating factor for shipping is **browser engine support** (V8 / SpiderMonkey
-  shipping the proposal), which is handled by feature detection below.
+- At the kernel level there is no blocker: the win is real today on a plain
+  `cdylib` (the benches above).
 
-## Delivery plan (how WASM users get it)
+## Delivery status: blocked upstream (verified 2026-06-27)
+
+Shipping it to browser users is blocked on TWO upstream items, both confirmed here:
+
+1. **wasm-bindgen cannot process a wide-arithmetic module.** The production wasm
+   goes through `wasm-bindgen` (pinned `=0.2.106`) for the `IfcAPI` glue. Building
+   `pkg-wide` fails in the bindgen step: `failed to parse code section: wide
+   arithmetic support is not enabled` — its `walrus` parser rejects the new
+   opcodes. We cannot build the production bundle until a wasm-bindgen / `walrus`
+   release enables wide-arith parsing. (The benches sidestep this: plain
+   `cdylib`, no bindgen — which is why they build and run.)
+2. **No shipping browser engine supports it yet.** Node 22's V8 rejects the
+   module (`WebAssembly.validate()` -> false, "invalid numeric opcode 0xfc13");
+   stable Chrome/Safari are not expected to differ today.
+
+Net: the lever is proven and worth tracking, but **not shippable now**. The plan
+below is the design to wire once BOTH clear. The runtime feature-detect makes it
+a safe, zero-cost no-op for every user until then — the wide `.wasm` is never
+fetched while the probe returns false, which it does on every engine today.
+
+## When might it ship, and can we work around it?
+
+**Timeline (researched 2026-06):** wide-arithmetic is **Phase 3** (implementation
+phase, not yet a finished standard = Phase 4). A 2026 runtime survey found only
+**Wasmtime and Wasmer** run a full wide-arith build in stable releases; **no
+stable browser ships it** (V8 has only prototyped it; it is flag/experimental at
+best). Realistically: per-engine shipping through 2026-2027, "Baseline" (all
+three engines, safe to rely on) later still. So this is a track-and-adopt lever,
+not a near-term one.
+
+**Working around the browser blocker:** there is no useful polyfill — emulating
+the instructions in wasm IS the slow `__multi3` path we are trying to escape. The
+only safe handling is the feature-detect + fallback above (zero regression,
+auto-upgrade per engine as each ships). For users today it yields no in-browser
+speedup.
+
+The bigger lever that *does* work in today's browsers is **threads**: the
+`pkg-threaded` bundle (rayon-in-wasm, atomics + shared memory; SharedArrayBuffer
+is widely supported and the viewer already sets COOP/COEP). Native shows
+threading is a far larger win than wide-arith on the heavy models — Tekla 1-core
+14.2s vs 10-core 2.9s (~4.8x) vs wide-arith's 1.7x. In-wasm scaling still needs
+the `rust/csg-thread-bench` (rung-2) browser result to confirm it tracks native,
+but it is the near-term in-browser path; wide-arith is additive on top later
+(a threaded+wide bundle combines both target-features).
+
+**Working around the wasm-bindgen blocker:** split the CSG kernel into a separate
+plain-`cdylib` wasm (no wasm-bindgen) built with `+wide-arithmetic`, exposing the
+boolean over linear memory (the `csgbench` crate is a proof this builds and runs).
+The main bindgen bundle stays non-wide; JS loads the kernel module only when the
+probe passes. This sidesteps wasm-bindgen entirely — but only matters once a
+browser supports the proposal, so it is not worth building ahead of that. The
+alternative is to wait for a wasm-bindgen / `walrus` release that enables
+wide-arith parsing.
+
+## Delivery plan (wire once unblocked)
 
 This reuses the exact pattern already in place for the threaded second bundle
 (`packages/wasm/pkg-threaded`, built off-by-default in `scripts/build-wasm.sh`).
