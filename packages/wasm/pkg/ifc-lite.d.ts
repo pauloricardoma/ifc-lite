@@ -93,13 +93,21 @@ export class IfcAPI {
    * `true` ⇒ lit (the default), `false` ⇒ flat `KHR_materials_unlit` (the
    * historical look — #1321). Optional at the boundary so older 5-arg callers
    * keep lit-by-default behaviour.
+   * `emissive` self-illuminates each material at its base colour (core glTF
+   * `emissiveFactor`) so renderers without ambient/IBL — Google Earth — don't
+   * render the model near-black (#1427); omitted or `false` ⇒ off.
    */
-  exportGlb(content: Uint8Array, include_metadata: boolean, hidden: Uint32Array, isolated: Uint32Array, hidden_types_csv: string, lit?: boolean | null): Uint8Array;
+  exportGlb(content: Uint8Array, include_metadata: boolean, hidden: Uint32Array, isolated: Uint32Array, hidden_types_csv: string, lit?: boolean | null, emissive?: boolean | null): Uint8Array;
   /**
    * Package an already-produced **GLB** + georeference into a **KMZ** (`Uint8Array`)
    * for Google Earth: a ZIP of `doc.kml` (a `<Model>` placed at `latitude`/`longitude`/
    * `altitude`) + `model.glb`. `x_axis_abscissa`/`x_axis_ordinate` are the
    * `IfcMapConversion` grid-north components; pass both as `undefined` for heading 0.
+   *
+   * The model is placed `clampToGround` (rests on the terrain). Google Earth's
+   * terrain already encodes the site elevation, so emitting `altitude` as the
+   * MSL OrthogonalHeight under `relativeToGround` floated the model ~OrthogonalHeight
+   * metres into the sky — clamping pins it to the ground regardless (#1427).
    */
   exportKmz(glb: Uint8Array, latitude: number, longitude: number, altitude: number, x_axis_abscissa: number | null | undefined, x_axis_ordinate: number | null | undefined, name: string): Uint8Array;
   /**
@@ -109,7 +117,7 @@ export class IfcAPI {
    * RGBA per mesh, `origins` xyz per mesh, `express_ids` labels each mesh (indices are
    * per-mesh local). The caller passes exactly the meshes it wants emitted.
    */
-  exportGlbFromMeshes(positions: Float32Array, normals: Float32Array, indices: Uint32Array, vertex_counts: Uint32Array, index_counts: Uint32Array, colors: Float32Array, origins: Float64Array, express_ids: Uint32Array, include_metadata: boolean, lit?: boolean | null): Uint8Array;
+  exportGlbFromMeshes(positions: Float32Array, normals: Float32Array, indices: Uint32Array, vertex_counts: Uint32Array, index_counts: Uint32Array, colors: Float32Array, origins: Float64Array, express_ids: Uint32Array, include_metadata: boolean, lit?: boolean | null, emissive?: boolean | null): Uint8Array;
   /**
    * Export the render geometry in `content` as a Wavefront **OBJ** string.
    *
@@ -1071,8 +1079,8 @@ export interface InitOutput {
   readonly ifcapi_buildPrePassStreaming: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
   readonly ifcapi_clearPrePassCache: (a: number) => void;
   readonly ifcapi_exportCsv: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
-  readonly ifcapi_exportGlb: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => void;
-  readonly ifcapi_exportGlbFromMeshes: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number) => void;
+  readonly ifcapi_exportGlb: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number) => void;
+  readonly ifcapi_exportGlbFromMeshes: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number) => void;
   readonly ifcapi_exportHbjson: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
   readonly ifcapi_exportIfcx: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
   readonly ifcapi_exportJson: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;

@@ -1099,9 +1099,10 @@ export class GeometryProcessor {
     isolated: Uint32Array = new Uint32Array(),
     hiddenTypesCsv = '',
     lit = true,
+    emissive = false,
   ): Uint8Array | null {
     if (!this.bridge?.isInitialized()) return null;
-    return this.bridge.exportGlb(buffer, includeMetadata, hidden, isolated, hiddenTypesCsv, lit);
+    return this.bridge.exportGlb(buffer, includeMetadata, hidden, isolated, hiddenTypesCsv, lit, emissive);
   }
 
   exportCsv(
@@ -1172,9 +1173,11 @@ export class GeometryProcessor {
    * Flattens `MeshData[]` into the wasm binding's parallel arrays. The caller passes
    * exactly the meshes it wants emitted (its own visibility filtering). `lit` emits
    * standard PBR materials that shade from normals; `false` ⇒ flat
-   * `KHR_materials_unlit` (the historical look — #1321).
+   * `KHR_materials_unlit` (the historical look — #1321). `emissive` self-illuminates
+   * each material at its base colour (core glTF `emissiveFactor`) so renderers with
+   * no ambient/IBL — Google Earth — don't render it near-black (#1427).
    */
-  exportGlbFromMeshes(meshes: MeshData[], includeMetadata = false, lit = true): Uint8Array | null {
+  exportGlbFromMeshes(meshes: MeshData[], includeMetadata = false, lit = true, emissive = false): Uint8Array | null {
     if (!this.bridge?.isInitialized()) return null;
     let totalV = 0;
     let totalI = 0;
@@ -1208,7 +1211,7 @@ export class GeometryProcessor {
       io += m.indices.length;
     }
     return this.bridge.exportGlbFromMeshes(
-      positions, normals, indices, vertexCounts, indexCounts, colors, origins, expressIds, includeMetadata, lit,
+      positions, normals, indices, vertexCounts, indexCounts, colors, origins, expressIds, includeMetadata, lit, emissive,
     );
   }
 

@@ -453,7 +453,12 @@ export function LocationMap({
   const handleExportKmz = useCallback(async () => {
     if (!latLon || !geometryResult || !mapConversion) return;
     try {
-      const glb = await exportGlbFromGeometry(geometryResult, { includeMetadata: true });
+      // Self-illuminate materials (emissiveFactor = base colour): Google Earth has no
+      // ambient/IBL and ignores KHR_materials_unlit, so a plain lit GLB rendered
+      // near-black on shadow-side faces (#1427). The KMZ placement clamps the model to
+      // the ground (Rust exporter), so passing the MSL orthogonal height no longer
+      // floats it — Google Earth's terrain already carries the site elevation.
+      const glb = await exportGlbFromGeometry(geometryResult, { includeMetadata: true, emissive: true });
       const kmz = await buildKmz({
         latLon,
         altitude: mapConversion.orthogonalHeight,

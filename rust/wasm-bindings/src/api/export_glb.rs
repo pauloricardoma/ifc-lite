@@ -19,6 +19,9 @@ impl IfcAPI {
     /// `true` ⇒ lit (the default), `false` ⇒ flat `KHR_materials_unlit` (the
     /// historical look — #1321). Optional at the boundary so older 5-arg callers
     /// keep lit-by-default behaviour.
+    /// `emissive` self-illuminates each material at its base colour (core glTF
+    /// `emissiveFactor`) so renderers without ambient/IBL — Google Earth — don't
+    /// render the model near-black (#1427); omitted or `false` ⇒ off.
     #[wasm_bindgen(js_name = exportGlb)]
     #[allow(clippy::too_many_arguments)]
     pub fn export_glb(
@@ -29,6 +32,7 @@ impl IfcAPI {
         isolated: &[u32],
         hidden_types_csv: String,
         lit: Option<bool>,
+        emissive: Option<bool>,
     ) -> Vec<u8> {
         let hidden_types = hidden_types_csv
             .split(',')
@@ -41,6 +45,7 @@ impl IfcAPI {
             isolated: isolated.to_vec(),
             hidden_types,
             lit: lit.unwrap_or(true),
+            emissive: emissive.unwrap_or(false),
         };
         ifc_lite_export::export_glb(content, &opts)
     }
@@ -64,6 +69,7 @@ impl IfcAPI {
         express_ids: &[u32],
         include_metadata: bool,
         lit: Option<bool>,
+        emissive: Option<bool>,
     ) -> Vec<u8> {
         ifc_lite_export::export_glb_from_meshes(
             positions,
@@ -76,6 +82,7 @@ impl IfcAPI {
             express_ids,
             include_metadata,
             lit.unwrap_or(true),
+            emissive.unwrap_or(false),
         )
         .0
     }
@@ -84,7 +91,13 @@ impl IfcAPI {
     /// for Google Earth: a ZIP of `doc.kml` (a `<Model>` placed at `latitude`/`longitude`/
     /// `altitude`) + `model.glb`. `x_axis_abscissa`/`x_axis_ordinate` are the
     /// `IfcMapConversion` grid-north components; pass both as `undefined` for heading 0.
+    ///
+    /// The model is placed `clampToGround` (rests on the terrain). Google Earth's
+    /// terrain already encodes the site elevation, so emitting `altitude` as the
+    /// MSL OrthogonalHeight under `relativeToGround` floated the model ~OrthogonalHeight
+    /// metres into the sky — clamping pins it to the ground regardless (#1427).
     #[wasm_bindgen(js_name = exportKmz)]
+    #[allow(clippy::too_many_arguments)]
     pub fn export_kmz(
         &self,
         glb: &[u8],
@@ -99,6 +112,7 @@ impl IfcAPI {
             latitude,
             longitude,
             altitude,
+            altitude_mode: ifc_lite_export::AltitudeMode::ClampToGround,
             x_axis_abscissa,
             x_axis_ordinate,
             name: if name.is_empty() { None } else { Some(name) },

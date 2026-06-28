@@ -313,7 +313,9 @@ export class IfcLiteBridge {
 
   /**
    * Export the render geometry in `content` as a binary glTF (GLB).
-   * `hiddenTypesCsv` is a comma-separated IFC-type visibility filter.
+   * `hiddenTypesCsv` is a comma-separated IFC-type visibility filter. `emissive`
+   * self-illuminates each material at its base colour for renderers without
+   * ambient/IBL (Google Earth) — see #1427.
    */
   exportGlb(
     content: Uint8Array,
@@ -322,9 +324,10 @@ export class IfcLiteBridge {
     isolated: Uint32Array = new Uint32Array(),
     hiddenTypesCsv = '',
     lit = true,
+    emissive = false,
   ): Uint8Array {
     return this.runExport('exportGlb', content, (api) =>
-      api.exportGlb(content, includeMetadata, hidden, isolated, hiddenTypesCsv, lit),
+      api.exportGlb(content, includeMetadata, hidden, isolated, hiddenTypesCsv, lit, emissive),
     );
   }
 
@@ -427,13 +430,14 @@ export class IfcLiteBridge {
     expressIds: Uint32Array,
     includeMetadata: boolean,
     lit = true,
+    emissive = false,
   ): Uint8Array {
     if (!this.ifcApi) {
       throw new Error('IFC-Lite not initialized. Call init() first.');
     }
     try {
       return this.ifcApi.exportGlbFromMeshes(
-        positions, normals, indices, vertexCounts, indexCounts, colors, origins, expressIds, includeMetadata, lit,
+        positions, normals, indices, vertexCounts, indexCounts, colors, origins, expressIds, includeMetadata, lit, emissive,
       );
     } catch (error) {
       log.error('Failed to exportGlbFromMeshes', error, { operation: 'exportGlbFromMeshes' });

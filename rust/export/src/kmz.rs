@@ -11,14 +11,48 @@
 //! lean). KMZ readers accept stored entries; the trade-off is a larger file than a
 //! deflated archive, acceptable for this infrequent georef export.
 
+/// KML `<altitudeMode>` — how Google Earth interprets the model's `altitude`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum AltitudeMode {
+    /// IGNORE `altitude`; rest the model origin on the terrain, following the
+    /// ground. The robust default for a building that should sit on the ground:
+    /// it can never float and is immune to a wrong / zero / double-counted
+    /// `IfcMapConversion.OrthogonalHeight` (#1427). KML's own default mode.
+    #[default]
+    ClampToGround,
+    /// `altitude` is metres ABOVE the terrain directly below the origin.
+    RelativeToGround,
+    /// `altitude` is metres above mean sea level, independent of terrain.
+    Absolute,
+}
+
+impl AltitudeMode {
+    fn as_kml(self) -> &'static str {
+        match self {
+            AltitudeMode::ClampToGround => "clampToGround",
+            AltitudeMode::RelativeToGround => "relativeToGround",
+            AltitudeMode::Absolute => "absolute",
+        }
+    }
+}
+
 /// Options for KMZ export.
+///
+/// Derives `Default` (matching peer `*Options` structs) so callers can spread
+/// `..Default::default()` and stay source-compatible as fields are added.
+#[derive(Default)]
 pub struct KmzOptions {
     /// WGS84 latitude of the model origin (degrees).
     pub latitude: f64,
     /// WGS84 longitude of the model origin (degrees).
     pub longitude: f64,
-    /// Orthogonal height / elevation in metres.
+    /// Orthogonal height / elevation in metres. Ignored by Google Earth when
+    /// `altitude_mode` is `ClampToGround` (the default).
     pub altitude: f64,
+    /// How Google Earth places the model vertically. Defaults to `ClampToGround`
+    /// so the model rests on the terrain instead of floating at its MSL elevation
+    /// (the `relativeToGround` + OrthogonalHeight bug — #1427).
+    pub altitude_mode: AltitudeMode,
     /// `IfcMapConversion` `XAxisAbscissa` (grid-north X component). When either axis
     /// component is absent the heading is `0` (local north == true north).
     pub x_axis_abscissa: Option<f64>,
@@ -63,7 +97,7 @@ fn build_kml(opts: &KmzOptions, heading: f64) -> String {
     <Placemark>
       <name>{name}</name>
       <Model id="model">
-        <altitudeMode>relativeToGround</altitudeMode>
+        <altitudeMode>{altitude_mode}</altitudeMode>
         <Location>
           <longitude>{lon}</longitude>
           <latitude>{lat}</latitude>
@@ -87,6 +121,7 @@ fn build_kml(opts: &KmzOptions, heading: f64) -> String {
   </Document>
 </kml>"#,
         name = name,
+        altitude_mode = opts.altitude_mode.as_kml(),
         lon = opts.longitude,
         lat = opts.latitude,
         alt = opts.altitude,
@@ -224,6 +259,7 @@ mod tests {
             latitude: 47.5,
             longitude: 8.5,
             altitude: 412.0,
+            altitude_mode: AltitudeMode::Absolute,
             x_axis_abscissa: Some(1.0),
             x_axis_ordinate: Some(0.0),
             name: Some("Bldg <A>".to_string()),
@@ -232,9 +268,31 @@ mod tests {
         assert!(kml.contains("<latitude>47.5</latitude>"));
         assert!(kml.contains("<longitude>8.5</longitude>"));
         assert!(kml.contains("<altitude>412</altitude>"));
+        assert!(kml.contains("<altitudeMode>absolute</altitudeMode>"));
         assert!(kml.contains("<heading>90</heading>"));
         assert!(kml.contains("<href>model.glb</href>"));
         assert!(kml.contains("Bldg &lt;A&gt;"), "name is XML-escaped");
+    }
+
+    #[test]
+    fn default_altitude_mode_clamps_to_ground() {
+        // #1427: the default must rest the model on the terrain, not float it at its
+        // MSL OrthogonalHeight (the relativeToGround bug).
+        let opts = KmzOptions {
+            latitude: 47.5,
+            longitude: 8.5,
+            altitude: 560.0,
+            altitude_mode: AltitudeMode::default(),
+            x_axis_abscissa: None,
+            x_axis_ordinate: None,
+            name: None,
+        };
+        let kml = build_kml(&opts, 0.0);
+        assert!(kml.contains("<altitudeMode>clampToGround</altitudeMode>"));
+        assert!(
+            !kml.contains("relativeToGround"),
+            "must not re-introduce the floating relativeToGround placement"
+        );
     }
 
     #[test]
@@ -244,6 +302,7 @@ mod tests {
             latitude: 0.0,
             longitude: 0.0,
             altitude: 0.0,
+            altitude_mode: AltitudeMode::default(),
             x_axis_abscissa: None,
             x_axis_ordinate: None,
             name: None,
