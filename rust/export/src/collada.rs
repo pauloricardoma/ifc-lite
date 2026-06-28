@@ -171,14 +171,75 @@ pub fn export_collada_from_meshes(
 }
 
 /// Serialise the collected geometry + materials into a COLLADA 1.4.1 document.
+///
+/// The geometry is split into multiple `<geometry>` chunks so that no single
+/// `<float_array>` becomes a huge XML text node. Strict XML parsers (libxml2 and,
+/// in practice, Google Earth) reject a text node larger than ~10 MB, so a big model
+/// emitted as one array fails to parse and renders nothing — the "model loads but is
+/// invisible" failure on large models (#1427). Each chunk is self-contained (its own
+/// POSITION/NORMAL sources, re-indexed chunk-local) so no triangle spans a chunk.
 fn write_dae(
     pos: &[f32],
     nrm: &[f32],
     mat_colors: &[[f32; 4]],
     mat_tris: &[Vec<u32>],
 ) -> Vec<u8> {
-    let vert_count = pos.len() / 3;
-    let mut s = String::with_capacity(pos.len() * 8 + 2048);
+    // Two independent caps per chunk, both of which Google Earth enforces and which a
+    // strict XML parser also implies:
+    //  - MAX_VERTS: keeps a geometry under Google Earth's ~64K-vertex-per-model limit
+    //    AND keeps each <float_array> a small XML text node (strict parsers reject a
+    //    text node over ~10 MB, so one giant array makes the model load-but-invisible).
+    //  - MAX_TRIS: keeps each <triangles> under Google Earth's 16-bit index ceiling of
+    //    21,845 triangles (65535/3); above it the mesh silently fails to draw.
+    const MAX_VERTS: usize = 60_000;
+    const MAX_TRIS: usize = 20_000;
+
+    struct Chunk {
+        pos: Vec<f32>,
+        nrm: Vec<f32>,
+        tris: Vec<Vec<u32>>, // per material → chunk-local triangle indices
+    }
+
+    let mut chunks: Vec<Chunk> = Vec::new();
+    let mut cur = Chunk { pos: Vec::new(), nrm: Vec::new(), tris: vec![Vec::new(); mat_colors.len()] };
+    let mut cur_tris = 0usize;
+    let mut remap: HashMap<u32, u32> = HashMap::new();
+    for (m, tris) in mat_tris.iter().enumerate() {
+        for tri in tris.chunks_exact(3) {
+            let fresh = tri.iter().filter(|&&g| !remap.contains_key(&g)).count();
+            if !cur.pos.is_empty()
+                && (cur.pos.len() / 3 + fresh > MAX_VERTS || cur_tris >= MAX_TRIS)
+            {
+                chunks.push(std::mem::replace(
+                    &mut cur,
+                    Chunk { pos: Vec::new(), nrm: Vec::new(), tris: vec![Vec::new(); mat_colors.len()] },
+                ));
+                cur_tris = 0;
+                remap.clear();
+            }
+            let mut local = [0u32; 3];
+            for (k, &g) in tri.iter().enumerate() {
+                local[k] = match remap.get(&g) {
+                    Some(&l) => l,
+                    None => {
+                        let l = (cur.pos.len() / 3) as u32;
+                        let gi = g as usize * 3;
+                        cur.pos.extend_from_slice(&pos[gi..gi + 3]);
+                        cur.nrm.extend_from_slice(&nrm[gi..gi + 3]);
+                        remap.insert(g, l);
+                        l
+                    }
+                };
+            }
+            cur.tris[m].extend_from_slice(&local);
+            cur_tris += 1;
+        }
+    }
+    if !cur.pos.is_empty() {
+        chunks.push(cur);
+    }
+
+    let mut s = String::with_capacity(pos.len() * 7 + nrm.len() * 7 + 4096);
 
     // `<created>`/`<modified>` are REQUIRED by the COLLADA 1.4.1 schema; a fixed
     // epoch keeps the document deterministic and wasm-safe (no wall clock).
@@ -251,74 +312,53 @@ fn write_dae(
     }
     s.push_str("  </library_materials>\n");
 
-    // ── Geometry: one shared mesh, one <triangles> per material ─────────────────
-    s.push_str("  <library_geometries>\n    <geometry id=\"geo\" name=\"geo\">\n      <mesh>\n");
-
-    // POSITION source.
-    let _ = write!(
-        s,
-        "        <source id=\"geo-pos\">\n          <float_array id=\"geo-pos-arr\" count=\"{}\">",
-        pos.len()
-    );
-    append_floats(&mut s, pos);
-    let _ = write!(
-        s,
-        "</float_array>\n          <technique_common>\n            <accessor source=\"#geo-pos-arr\" count=\"{vc}\" stride=\"3\">\n              <param name=\"X\" type=\"float\"/><param name=\"Y\" type=\"float\"/><param name=\"Z\" type=\"float\"/>\n            </accessor>\n          </technique_common>\n        </source>\n",
-        vc = vert_count
-    );
-
-    // NORMAL source.
-    let _ = write!(
-        s,
-        "        <source id=\"geo-nrm\">\n          <float_array id=\"geo-nrm-arr\" count=\"{}\">",
-        nrm.len()
-    );
-    append_floats(&mut s, nrm);
-    let _ = write!(
-        s,
-        "</float_array>\n          <technique_common>\n            <accessor source=\"#geo-nrm-arr\" count=\"{vc}\" stride=\"3\">\n              <param name=\"X\" type=\"float\"/><param name=\"Y\" type=\"float\"/><param name=\"Z\" type=\"float\"/>\n            </accessor>\n          </technique_common>\n        </source>\n",
-        vc = nrm.len() / 3
-    );
-
-    // Shared vertices referencing POSITION.
-    s.push_str("        <vertices id=\"geo-vtx\">\n          <input semantic=\"POSITION\" source=\"#geo-pos\"/>\n        </vertices>\n");
-
-    // One <triangles> per material; <p> interleaves VERTEX + NORMAL indices (equal).
-    for (k, tris) in mat_tris.iter().enumerate() {
-        if tris.is_empty() {
-            continue;
-        }
-        let _ = write!(
-            s,
-            "        <triangles material=\"sym{k}\" count=\"{c}\">\n          <input semantic=\"VERTEX\" source=\"#geo-vtx\" offset=\"0\"/>\n          <input semantic=\"NORMAL\" source=\"#geo-nrm\" offset=\"1\"/>\n          <p>",
-            k = k,
-            c = tris.len() / 3
-        );
-        for (j, &idx) in tris.iter().enumerate() {
-            if j > 0 {
-                s.push(' ');
+    // ── Geometry: one <geometry> per chunk, each with bounded float_arrays ──────
+    s.push_str("  <library_geometries>\n");
+    for (ci, ch) in chunks.iter().enumerate() {
+        let vc = ch.pos.len() / 3;
+        let _ = write!(s, "    <geometry id=\"geo{ci}\" name=\"geo{ci}\">\n      <mesh>\n");
+        // POSITION source.
+        let _ = write!(s, "        <source id=\"geo{ci}-pos\">\n          <float_array id=\"geo{ci}-pos-arr\" count=\"{}\">", ch.pos.len());
+        append_floats(&mut s, &ch.pos);
+        let _ = write!(s, "</float_array>\n          <technique_common>\n            <accessor source=\"#geo{ci}-pos-arr\" count=\"{vc}\" stride=\"3\">\n              <param name=\"X\" type=\"float\"/><param name=\"Y\" type=\"float\"/><param name=\"Z\" type=\"float\"/>\n            </accessor>\n          </technique_common>\n        </source>\n");
+        // NORMAL source.
+        let _ = write!(s, "        <source id=\"geo{ci}-nrm\">\n          <float_array id=\"geo{ci}-nrm-arr\" count=\"{}\">", ch.nrm.len());
+        append_floats(&mut s, &ch.nrm);
+        let _ = write!(s, "</float_array>\n          <technique_common>\n            <accessor source=\"#geo{ci}-nrm-arr\" count=\"{}\" stride=\"3\">\n              <param name=\"X\" type=\"float\"/><param name=\"Y\" type=\"float\"/><param name=\"Z\" type=\"float\"/>\n            </accessor>\n          </technique_common>\n        </source>\n", ch.nrm.len() / 3);
+        // Shared vertices referencing POSITION.
+        let _ = write!(s, "        <vertices id=\"geo{ci}-vtx\">\n          <input semantic=\"POSITION\" source=\"#geo{ci}-pos\"/>\n        </vertices>\n");
+        // One <triangles> per material present in this chunk; <p> interleaves VERTEX +
+        // NORMAL indices (equal — normals are per-vertex).
+        for (k, t) in ch.tris.iter().enumerate() {
+            if t.is_empty() {
+                continue;
             }
-            // VERTEX and NORMAL share the index.
-            let _ = write!(s, "{idx} {idx}");
+            let _ = write!(s, "        <triangles material=\"sym{k}\" count=\"{}\">\n          <input semantic=\"VERTEX\" source=\"#geo{ci}-vtx\" offset=\"0\"/>\n          <input semantic=\"NORMAL\" source=\"#geo{ci}-nrm\" offset=\"1\"/>\n          <p>", t.len() / 3);
+            for (j, &idx) in t.iter().enumerate() {
+                if j > 0 {
+                    s.push(' ');
+                }
+                let _ = write!(s, "{idx} {idx}");
+            }
+            s.push_str("</p>\n        </triangles>\n");
         }
-        s.push_str("</p>\n        </triangles>\n");
+        s.push_str("      </mesh>\n    </geometry>\n");
     }
+    s.push_str("  </library_geometries>\n");
 
-    s.push_str("      </mesh>\n    </geometry>\n  </library_geometries>\n");
-
-    // ── Visual scene: instance the geometry, bind each material symbol ──────────
-    s.push_str("  <library_visual_scenes>\n    <visual_scene id=\"scene\">\n      <node id=\"model\" name=\"model\">\n        <instance_geometry url=\"#geo\">\n          <bind_material>\n            <technique_common>\n");
-    for (k, tris) in mat_tris.iter().enumerate() {
-        if tris.is_empty() {
-            continue;
+    // ── Visual scene: one node per chunk, each binding the materials it uses ────
+    s.push_str("  <library_visual_scenes>\n    <visual_scene id=\"scene\">\n");
+    for (ci, ch) in chunks.iter().enumerate() {
+        let _ = write!(s, "      <node id=\"n{ci}\" name=\"n{ci}\">\n        <instance_geometry url=\"#geo{ci}\">\n          <bind_material>\n            <technique_common>\n");
+        for (k, t) in ch.tris.iter().enumerate() {
+            if t.is_empty() {
+                continue;
+            }
+            let _ = writeln!(s, "              <instance_material symbol=\"sym{k}\" target=\"#mat{k}\"/>");
         }
-        let _ = writeln!(
-            s,
-            "              <instance_material symbol=\"sym{k}\" target=\"#mat{k}\"/>",
-            k = k
-        );
+        s.push_str("            </technique_common>\n          </bind_material>\n        </instance_geometry>\n      </node>\n");
     }
-    s.push_str("            </technique_common>\n          </bind_material>\n        </instance_geometry>\n      </node>\n    </visual_scene>\n  </library_visual_scenes>\n");
+    s.push_str("    </visual_scene>\n  </library_visual_scenes>\n");
 
     s.push_str("  <scene><instance_visual_scene url=\"#scene\"/></scene>\n</COLLADA>\n");
 
@@ -336,12 +376,14 @@ fn append_floats(s: &mut String, vals: &[f32]) {
     }
 }
 
-/// Format an f32 with up to 6 significant decimals, no trailing zeros.
+/// Format an f32 with up to 4 decimals (0.1 mm at building scale), no trailing
+/// zeros — keeps the document compact (fewer chars per coordinate) while staying
+/// far below any visible tolerance.
 fn fmt_f32(v: f32) -> String {
     if v == 0.0 {
         return "0".to_string();
     }
-    let mut t = format!("{v:.6}");
+    let mut t = format!("{v:.4}");
     if t.contains('.') {
         while t.ends_with('0') {
             t.pop();
@@ -392,19 +434,35 @@ mod tests {
         assert!(xml.contains("profile=\"GOOGLEEARTH\""));
     }
 
-    /// Parse the `<float_array id="geo-pos-arr">` back into vertices.
+    /// Parse every `<float_array id="geoN-pos-arr">` (one per chunk) into vertices.
     fn parse_positions(xml: &str) -> Vec<[f32; 3]> {
-        let start = xml.find("geo-pos-arr").unwrap();
-        let s = &xml[start..];
-        let open = s.find('>').unwrap() + 1;
-        let close = s.find("</float_array>").unwrap();
-        s[open..close]
-            .split_whitespace()
-            .map(|t| t.parse::<f32>().unwrap())
-            .collect::<Vec<_>>()
-            .chunks_exact(3)
-            .map(|c| [c[0], c[1], c[2]])
-            .collect()
+        let mut out: Vec<f32> = Vec::new();
+        let mut rest = xml;
+        while let Some(at) = rest.find("<float_array") {
+            let s = &rest[at..];
+            let tag_end = s.find('>').unwrap();
+            let close = s.find("</float_array>").unwrap();
+            if s[..tag_end].contains("-pos-arr") {
+                out.extend(s[tag_end + 1..close].split_whitespace().map(|t| t.parse::<f32>().unwrap()));
+            }
+            rest = &s[close + "</float_array>".len()..];
+        }
+        out.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect()
+    }
+
+    /// The largest `<float_array>` text node, in bytes — the value strict XML
+    /// parsers cap (libxml2 / Google Earth at ~10 MB).
+    fn max_float_array_bytes(xml: &str) -> usize {
+        let mut max = 0;
+        let mut rest = xml;
+        while let Some(at) = rest.find("<float_array") {
+            let s = &rest[at..];
+            let open = s.find('>').unwrap() + 1;
+            let close = s.find("</float_array>").unwrap();
+            max = max.max(close - open);
+            rest = &s[close..];
+        }
+        max
     }
 
     fn hbounds(verts: &[[f32; 3]]) -> (f32, f32) {
@@ -450,6 +508,49 @@ mod tests {
         let (cx, cy) = hbounds(&parse_positions(&xml));
         assert!(cx.abs() < 1e-3, "X re-centred to ~0 (geometry was ~105 from origin): {cx}");
         assert!(cy.abs() < 1e-3, "Y re-centred to ~0 (geometry was ~210 from origin): {cy}");
+    }
+
+    #[test]
+    fn large_model_is_chunked_into_small_text_nodes() {
+        // >MAX_VERTS unique vertices must split into multiple <geometry> chunks so no
+        // single <float_array> is a huge XML text node. Strict XML parsers (libxml2 and
+        // Google Earth) reject a text node over ~10 MB, which made large models load but
+        // render INVISIBLE (#1427). One 25k-triangle / 75k-vertex mesh exceeds the 60k
+        // per-chunk cap and must produce ≥2 geometries, all parser-safe.
+        let vcount = 75_000usize; // > MAX_VERTS (60k)
+        let mut positions = Vec::with_capacity(vcount * 3);
+        let mut normals = Vec::with_capacity(vcount * 3);
+        let mut indices = Vec::with_capacity(vcount);
+        for i in 0..vcount {
+            let f = i as f32 * 0.01;
+            positions.extend_from_slice(&[f, 1.0, -f]);
+            normals.extend_from_slice(&[0.0, 1.0, 0.0]);
+            indices.push(i as u32);
+        }
+        let xml = String::from_utf8(export_collada_from_meshes(
+            &positions, &normals, &indices, &[vcount as u32], &[vcount as u32],
+            &[0.5, 0.5, 0.5, 1.0], &[0.0, 0.0, 0.0],
+        ))
+        .unwrap();
+        assert!(xml.matches("<geometry ").count() >= 2, "geometry split into ≥2 chunks");
+        // All vertices survive the split (75k in, 75k out across chunks).
+        assert_eq!(parse_positions(&xml).len(), vcount, "no vertices dropped by chunking");
+        assert!(
+            max_float_array_bytes(&xml) < 5_000_000,
+            "largest float_array stays small: {} bytes",
+            max_float_array_bytes(&xml)
+        );
+        // Each <triangles count="N"> stays under Google Earth's 16-bit ceiling (21,845).
+        let max_tri = xml
+            .match_indices("<triangles ")
+            .map(|(i, _)| {
+                let tag = &xml[i..i + xml[i..].find('>').unwrap()];
+                let c = tag.find("count=\"").unwrap() + 7;
+                tag[c..tag[c..].find('"').unwrap() + c].parse::<usize>().unwrap()
+            })
+            .max()
+            .unwrap();
+        assert!(max_tri <= 21_845, "no <triangles> over the 16-bit ceiling: {max_tri}");
     }
 
     #[test]
