@@ -3,21 +3,24 @@
 "@ifc-lite/wasm": patch
 ---
 
-Fix the Google Earth (KMZ) export placing the model floating in the sky and rendering it
-extremely dark (#1427).
+Make the Google Earth (KMZ) export actually load and render correctly, and add it to
+the export menu (#1427).
 
-**Placement.** The `<Model>` was emitted with `altitudeMode = relativeToGround` and
-`altitude = IfcMapConversion.OrthogonalHeight`. Google Earth's terrain already carries the
-site elevation, so adding the MSL orthogonal height on top of it floated the building roughly
-`OrthogonalHeight` metres into the air. The KMZ exporter now clamps the model to the ground
-(`altitudeMode = clampToGround`), which rests it on the terrain and is immune to a wrong /
-zero / double-counted `OrthogonalHeight`. A new `AltitudeMode` option on the Rust exporter
-keeps `absolute`/`relativeToGround` available for callers that trust the source height.
+**It now loads.** Google Earth's KML `<Model>` only accepts **COLLADA** — a glTF/GLB
+model fails with "Unsupported element: Model". The KMZ now embeds a COLLADA `.dae`
+(new `exportKmzFromMeshes` / `export_collada_from_meshes`, schema-validated against the
+COLLADA 1.4.1 XSD) instead of a GLB.
 
-**Colour.** GLB materials were standard lit PBR. Google Earth provides no ambient/IBL and
-lights with a single hard sun, and it ignores `KHR_materials_unlit`, so shadow-side faces went
-near-black. The GLB exporter gains an `emissive` option (`exportGlbFromMeshes(..., emissive)`)
-that sets each material's `emissiveFactor` to its base colour — core glTF 2.0, honoured by any
-compliant renderer — so the model shows its true colour regardless of lighting. The base colour
-is preserved, so a viewer that ignores emissive is never darker than before. The Google Earth
-KMZ export now requests emissive materials.
+**It's no longer dark or floating.** COLLADA materials set `<emission>` to the element
+colour (Google Earth has no ambient/IBL and a single hard sun, so plain diffuse renders
+near-black) and are flagged `double_sided` for IFC's unreliable winding. The model is
+placed `clampToGround` so it rests on the terrain instead of floating at its MSL
+`OrthogonalHeight` (a new `AltitudeMode` keeps `absolute`/`relativeToGround` available).
+Vertices are emitted in the IFC-native Z-up frame so the building stands upright.
+
+**It's in the menu.** A new "Export KMZ (Google Earth)" entry sits alongside Export
+GLB / IFC / HBJSON, using the same model-name file-stem scheme (`<name>.kmz`); it reports
+a clear message when a model isn't georeferenced.
+
+Also adds a general `emissive` option to the GLB exporter (`exportGlb` /
+`exportGlbFromMeshes`) — `emissiveFactor = base colour` for renderers without ambient/IBL.

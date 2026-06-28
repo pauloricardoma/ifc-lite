@@ -50,7 +50,7 @@ describe('exportGlbFromGeometry', () => {
     assert.equal(calls.exportArgs[0].emissive, false, 'emissive defaults to off');
   });
 
-  it('forwards the emissive flag (Google Earth / KMZ path — #1427)', async () => {
+  it('forwards the emissive flag to the assembler (self-illuminated GLB option)', async () => {
     const { gp, calls } = makeStub(new Uint8Array([1]));
 
     await exportGlbFromGeometry(geometry([mesh(1)]), { includeMetadata: true, emissive: true }, () => gp);

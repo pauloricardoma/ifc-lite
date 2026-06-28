@@ -119,4 +119,50 @@ impl IfcAPI {
         };
         ifc_lite_export::export_kmz(glb, &opts)
     }
+
+    /// Build a Google-Earth-ready **KMZ** (`Uint8Array`) straight from the viewer's
+    /// already-produced meshes — the working path (#1427). The model is embedded as
+    /// **COLLADA** (`model.dae`), the only `<Model>` format Google Earth loads (a GLB
+    /// raises "Unsupported element: Model"), with emission-lit double-sided materials
+    /// and `clampToGround` placement. Mesh arrays match `exportGlbFromMeshes`;
+    /// `latitude`/`longitude`/`altitude` + `x_axis_abscissa`/`x_axis_ordinate`
+    /// (grid-north, `undefined` ⇒ heading 0) place + orient the model.
+    #[wasm_bindgen(js_name = exportKmzFromMeshes)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn export_kmz_from_meshes(
+        &self,
+        positions: &[f32],
+        normals: &[f32],
+        indices: &[u32],
+        vertex_counts: &[u32],
+        index_counts: &[u32],
+        colors: &[f32],
+        origins: &[f64],
+        latitude: f64,
+        longitude: f64,
+        altitude: f64,
+        x_axis_abscissa: Option<f64>,
+        x_axis_ordinate: Option<f64>,
+        name: String,
+    ) -> Vec<u8> {
+        let opts = ifc_lite_export::KmzOptions {
+            latitude,
+            longitude,
+            altitude,
+            altitude_mode: ifc_lite_export::AltitudeMode::ClampToGround,
+            x_axis_abscissa,
+            x_axis_ordinate,
+            name: if name.is_empty() { None } else { Some(name) },
+        };
+        ifc_lite_export::export_kmz_collada_from_meshes(
+            positions,
+            normals,
+            indices,
+            vertex_counts,
+            index_counts,
+            colors,
+            origins,
+            &opts,
+        )
+    }
 }

@@ -21,8 +21,7 @@ import {
 } from 'lucide-react';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import type { MapConversion, ProjectedCRS } from '@ifc-lite/parser';
-import type { CoordinateInfo, GeometryResult } from '@ifc-lite/geometry';
-import { exportGlbFromGeometry } from '@/lib/export/glb';
+import type { CoordinateInfo, GeometryResult, MeshData } from '@ifc-lite/geometry';
 import { downloadBlob } from '@/lib/export/download';
 import { reprojectToLatLon, reprojectFromLatLon, queryTerrainElevation, computeFootprintGeoJSON, type LatLon } from '@/lib/geo/reproject';
 import { buildKmz } from '@/lib/geo/kmz-exporter';
@@ -453,18 +452,15 @@ export function LocationMap({
   const handleExportKmz = useCallback(async () => {
     if (!latLon || !geometryResult || !mapConversion) return;
     try {
-      // Self-illuminate materials (emissiveFactor = base colour): Google Earth has no
-      // ambient/IBL and ignores KHR_materials_unlit, so a plain lit GLB rendered
-      // near-black on shadow-side faces (#1427). The KMZ placement clamps the model to
-      // the ground (Rust exporter), so passing the MSL orthogonal height no longer
-      // floats it — Google Earth's terrain already carries the site elevation.
-      const glb = await exportGlbFromGeometry(geometryResult, { includeMetadata: true, emissive: true });
+      // Embed the model as COLLADA (Rust exporter): Google Earth's <Model> only loads
+      // COLLADA, renders it bright via emission, and clampToGround keeps it on the
+      // terrain so the MSL orthogonal height no longer floats it (#1427).
       const kmz = await buildKmz({
         latLon,
         altitude: mapConversion.orthogonalHeight,
         xAxisAbscissa: mapConversion.xAxisAbscissa,
         xAxisOrdinate: mapConversion.xAxisOrdinate,
-        glb,
+        meshes: geometryResult.meshes as MeshData[],
         name: 'IFC Model',
       });
       downloadBlob(new Blob([kmz as BlobPart], { type: 'application/vnd.google-earth.kmz' }), 'model.kmz');

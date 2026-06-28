@@ -1234,6 +1234,60 @@ export class GeometryProcessor {
   }
 
   /**
+   * Build a Google-Earth-ready KMZ from already-produced meshes (no re-meshing) —
+   * the working KMZ path (#1427). The model is embedded as COLLADA (`model.dae`),
+   * the only `<Model>` format Google Earth loads (a GLB raises "Unsupported element:
+   * Model"), with emission-lit double-sided materials and `clampToGround` placement.
+   * Flattens `MeshData[]` into the wasm binding's parallel arrays.
+   * `xAxisAbscissa`/`xAxisOrdinate` are the `IfcMapConversion` grid-north components
+   * (pass `undefined` for heading 0). Returns null if not initialized.
+   */
+  exportKmzFromMeshes(
+    meshes: MeshData[],
+    latitude: number,
+    longitude: number,
+    altitude: number,
+    xAxisAbscissa: number | undefined,
+    xAxisOrdinate: number | undefined,
+    name = 'IFC Model',
+  ): Uint8Array | null {
+    if (!this.bridge?.isInitialized()) return null;
+    let totalV = 0;
+    let totalI = 0;
+    for (const m of meshes) {
+      totalV += m.positions.length;
+      totalI += m.indices.length;
+    }
+    const positions = new Float32Array(totalV);
+    const normals = new Float32Array(totalV);
+    const indices = new Uint32Array(totalI);
+    const vertexCounts = new Uint32Array(meshes.length);
+    const indexCounts = new Uint32Array(meshes.length);
+    const colors = new Float32Array(meshes.length * 4);
+    const origins = new Float64Array(meshes.length * 3);
+    let vo = 0;
+    let io = 0;
+    for (let i = 0; i < meshes.length; i++) {
+      const m = meshes[i];
+      positions.set(m.positions, vo);
+      if (m.normals && m.normals.length === m.positions.length) normals.set(m.normals, vo);
+      indices.set(m.indices, io);
+      vertexCounts[i] = m.positions.length / 3;
+      indexCounts[i] = m.indices.length;
+      const c = m.color ?? [0.8, 0.8, 0.8, 1];
+      colors[i * 4] = c[0]; colors[i * 4 + 1] = c[1]; colors[i * 4 + 2] = c[2]; colors[i * 4 + 3] = c[3];
+      const o = m.origin ?? [0, 0, 0];
+      origins[i * 3] = o[0]; origins[i * 3 + 1] = o[1]; origins[i * 3 + 2] = o[2];
+      vo += m.positions.length;
+      io += m.indices.length;
+    }
+    return this.bridge.exportKmzFromMeshes(
+      positions, normals, indices, vertexCounts, indexCounts, colors, origins,
+      latitude, longitude, altitude, xAxisAbscissa, xAxisOrdinate, name,
+    );
+  }
+
+  /**
    * Export the `IfcSpace` volumes in `buffer` as a Honeybee HBJSON string
    * (Ladybug Tools energy/daylight model). Returns null if not initialized.
    * @param buffer IFC file buffer

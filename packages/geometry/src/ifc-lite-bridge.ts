@@ -477,6 +477,45 @@ export class IfcLiteBridge {
   }
 
   /**
+   * Build a Google-Earth-ready KMZ directly from already-produced meshes (flattened
+   * parallel arrays). The model is embedded as COLLADA (`model.dae`) — the only
+   * `<Model>` format Google Earth loads — with emission-lit, double-sided materials
+   * and `clampToGround` placement (#1427). `xAxisAbscissa`/`xAxisOrdinate` are the
+   * `IfcMapConversion` grid-north components (pass `undefined` for heading 0).
+   */
+  exportKmzFromMeshes(
+    positions: Float32Array,
+    normals: Float32Array,
+    indices: Uint32Array,
+    vertexCounts: Uint32Array,
+    indexCounts: Uint32Array,
+    colors: Float32Array,
+    origins: Float64Array,
+    latitude: number,
+    longitude: number,
+    altitude: number,
+    xAxisAbscissa: number | undefined,
+    xAxisOrdinate: number | undefined,
+    name: string,
+  ): Uint8Array {
+    if (!this.ifcApi) {
+      throw new Error('IFC-Lite not initialized. Call init() first.');
+    }
+    try {
+      return this.ifcApi.exportKmzFromMeshes(
+        positions, normals, indices, vertexCounts, indexCounts, colors, origins,
+        latitude, longitude, altitude, xAxisAbscissa, xAxisOrdinate, name,
+      );
+    } catch (error) {
+      log.error('Failed to exportKmzFromMeshes', error, { operation: 'exportKmzFromMeshes' });
+      if (this.isWasmRuntimeError(error)) {
+        this.markFatalWasmRuntimeError();
+      }
+      throw error;
+    }
+  }
+
+  /**
    * Export the `IfcSpace` volumes in `content` as a Honeybee HBJSON string
    * (Ladybug Tools energy/daylight model). Rooms are built analytically from
    * extruded-area profiles (watertight by construction).

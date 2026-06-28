@@ -119,6 +119,16 @@ export class IfcAPI {
    */
   exportGlbFromMeshes(positions: Float32Array, normals: Float32Array, indices: Uint32Array, vertex_counts: Uint32Array, index_counts: Uint32Array, colors: Float32Array, origins: Float64Array, express_ids: Uint32Array, include_metadata: boolean, lit?: boolean | null, emissive?: boolean | null): Uint8Array;
   /**
+   * Build a Google-Earth-ready **KMZ** (`Uint8Array`) straight from the viewer's
+   * already-produced meshes — the working path (#1427). The model is embedded as
+   * **COLLADA** (`model.dae`), the only `<Model>` format Google Earth loads (a GLB
+   * raises "Unsupported element: Model"), with emission-lit double-sided materials
+   * and `clampToGround` placement. Mesh arrays match `exportGlbFromMeshes`;
+   * `latitude`/`longitude`/`altitude` + `x_axis_abscissa`/`x_axis_ordinate`
+   * (grid-north, `undefined` ⇒ heading 0) place + orient the model.
+   */
+  exportKmzFromMeshes(positions: Float32Array, normals: Float32Array, indices: Uint32Array, vertex_counts: Uint32Array, index_counts: Uint32Array, colors: Float32Array, origins: Float64Array, latitude: number, longitude: number, altitude: number, x_axis_abscissa: number | null | undefined, x_axis_ordinate: number | null | undefined, name: string): Uint8Array;
+  /**
    * Export the render geometry in `content` as a Wavefront **OBJ** string.
    *
    * `hidden` / `isolated` are express-id filters mirroring the viewer's visibility
@@ -1086,6 +1096,7 @@ export interface InitOutput {
   readonly ifcapi_exportJson: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
   readonly ifcapi_exportJsonld: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => void;
   readonly ifcapi_exportKmz: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number) => void;
+  readonly ifcapi_exportKmzFromMeshes: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number, v: number, w: number, x: number, y: number) => void;
   readonly ifcapi_exportMerged: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
   readonly ifcapi_exportObj: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
   readonly ifcapi_exportStep: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => void;
