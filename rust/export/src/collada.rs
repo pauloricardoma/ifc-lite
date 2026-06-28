@@ -140,6 +140,33 @@ pub fn export_collada_from_meshes(
         ibase += ic;
     }
 
+    // Center the model on its horizontal (X,Y) AABB centre so the .dae origin
+    // coincides with the geometry centre. The KMZ <Model> pins the .dae origin to
+    // <Location>, and that lat/lon is computed for the geometry's AABB centre (the
+    // viewer's reproject adds the model centre to the MapConversion eastings/northings).
+    // Without this the model lands offset by however far its geometry sits from the
+    // local/survey origin — e.g. a CH1903+/LV95 model whose structure is 200 m from
+    // the project origin appeared ~250 m away in Google Earth (#1427). Z is left alone
+    // so clampToGround rests project-zero on the terrain (foundations below, frame above).
+    if pos.len() >= 3 {
+        let mut min_x = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        for v in pos.chunks_exact(3) {
+            min_x = min_x.min(v[0]);
+            max_x = max_x.max(v[0]);
+            min_y = min_y.min(v[1]);
+            max_y = max_y.max(v[1]);
+        }
+        let cx = (min_x + max_x) * 0.5;
+        let cy = (min_y + max_y) * 0.5;
+        for v in pos.chunks_exact_mut(3) {
+            v[0] -= cx;
+            v[1] -= cy;
+        }
+    }
+
     write_dae(&pos, &nrm, &mat_colors, &mat_tris)
 }
 
@@ -365,20 +392,64 @@ mod tests {
         assert!(xml.contains("profile=\"GOOGLEEARTH\""));
     }
 
+    /// Parse the `<float_array id="geo-pos-arr">` back into vertices.
+    fn parse_positions(xml: &str) -> Vec<[f32; 3]> {
+        let start = xml.find("geo-pos-arr").unwrap();
+        let s = &xml[start..];
+        let open = s.find('>').unwrap() + 1;
+        let close = s.find("</float_array>").unwrap();
+        s[open..close]
+            .split_whitespace()
+            .map(|t| t.parse::<f32>().unwrap())
+            .collect::<Vec<_>>()
+            .chunks_exact(3)
+            .map(|c| [c[0], c[1], c[2]])
+            .collect()
+    }
+
+    fn hbounds(verts: &[[f32; 3]]) -> (f32, f32) {
+        let (mut mnx, mut mxx, mut mny, mut mxy) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+        for v in verts {
+            mnx = mnx.min(v[0]);
+            mxx = mxx.max(v[0]);
+            mny = mny.min(v[1]);
+            mxy = mxy.max(v[1]);
+        }
+        ((mnx + mxx) / 2.0, (mny + mxy) / 2.0) // (X centre, Y centre)
+    }
+
     #[test]
-    fn converts_yup_to_zup() {
-        // Y-up input vertex (0,1,0) (one unit "up") must land at Z-up (0,0,1).
+    fn converts_yup_to_zup_and_centers() {
+        // Y-up input vertex (0,1,0) ("up") must land at Z-up Z=1 (up preserved), and the
+        // geometry is centred on its horizontal AABB so the .dae origin == geometry centre.
         let positions = vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
         let normals: Vec<f32> = std::iter::repeat_n([0.0f32, 0.0, 1.0], 3).flatten().collect();
-        let indices = vec![0u32, 1, 2];
         let xml = String::from_utf8(export_collada_from_meshes(
-            &positions, &normals, &indices, &[3], &[3], &[0.5, 0.5, 0.5, 1.0], &[0.0, 0.0, 0.0],
+            &positions, &normals, &[0, 1, 2], &[3], &[3], &[0.5, 0.5, 0.5, 1.0], &[0.0, 0.0, 0.0],
         ))
         .unwrap();
-        // The "up" vertex (0,1,0)_yup -> (0,0,1)_zup appears in the position array.
-        let arr_start = xml.find("geo-pos-arr").unwrap();
-        let arr = &xml[arr_start..xml[arr_start..].find("</float_array>").unwrap() + arr_start];
-        assert!(arr.contains("0 0 1"), "Y-up (0,1,0) maps to Z-up (0,0,1); got: {arr}");
+        let verts = parse_positions(&xml);
+        assert!(verts.iter().any(|v| (v[2] - 1.0).abs() < 1e-4), "Y-up (0,1,0) -> Z-up Z=1");
+        let (cx, cy) = hbounds(&verts);
+        assert!(cx.abs() < 1e-4 && cy.abs() < 1e-4, "geometry centred: ({cx}, {cy})");
+    }
+
+    #[test]
+    fn centers_geometry_far_from_origin() {
+        // A model whose geometry sits ~100-200 m from the local/survey origin must be
+        // re-centred so the .dae origin == geometry centre — the point the KMZ <Location>
+        // is computed for. This is the CH1903+/LV95 ~250 m offset fix (#1427).
+        let positions = vec![
+            100.0, 0.0, 200.0, 110.0, 0.0, 200.0, 110.0, 0.0, 220.0, 100.0, 0.0, 220.0,
+        ];
+        let normals: Vec<f32> = std::iter::repeat_n([0.0f32, 1.0, 0.0], 4).flatten().collect();
+        let xml = String::from_utf8(export_collada_from_meshes(
+            &positions, &normals, &[0, 1, 2, 0, 2, 3], &[4], &[6], &[0.6, 0.6, 0.6, 1.0], &[0.0, 0.0, 0.0],
+        ))
+        .unwrap();
+        let (cx, cy) = hbounds(&parse_positions(&xml));
+        assert!(cx.abs() < 1e-3, "X re-centred to ~0 (geometry was ~105 from origin): {cx}");
+        assert!(cy.abs() < 1e-3, "Y re-centred to ~0 (geometry was ~210 from origin): {cy}");
     }
 
     #[test]
