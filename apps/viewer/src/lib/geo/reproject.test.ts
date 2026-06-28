@@ -190,6 +190,34 @@ describe('reproject helpers', () => {
     assert.ok(latLon!.lon > 3 && latLon!.lon < 8, `lon = ${latLon!.lon} (expected ~5°E for NL)`);
   });
 
+  it('resolves legacy IfcSite (geographic EPSG:4326) georeferencing — eastings/northings are lon/lat', async () => {
+    // The legacy-IfcSite path (extractLegacySiteGeoreference) synthesises a geographic
+    // CRS with eastings = longitude and northings = latitude. reprojectToLatLon must
+    // return those degrees directly (no projected-metre maths), so the KMZ / Google
+    // Earth export works for models georeferenced only by IfcSite.RefLatitude /
+    // RefLongitude, not just IfcMapConversion + a projected CRS (#1427).
+    const crs: ProjectedCRS = {
+      id: 1,
+      name: 'EPSG:4326',
+      mapProjection: 'Geographic',
+      geodeticDatum: 'WGS84',
+      mapUnit: 'DEGREE',
+    };
+    const conversion: MapConversion = {
+      id: 2,
+      sourceCRS: 0,
+      targetCRS: 1,
+      eastings: 5.38, // longitude
+      northings: 52.15, // latitude
+      orthogonalHeight: 12,
+      scale: 1,
+    };
+    const latLon = await reprojectToLatLon(conversion, crs);
+    assert.ok(latLon, 'legacy IfcSite geolocation should resolve');
+    assert.ok(Math.abs(latLon!.lat - 52.15) < 1e-9, `lat = ${latLon!.lat} (expected 52.15)`);
+    assert.ok(Math.abs(latLon!.lon - 5.38) < 1e-9, `lon = ${latLon!.lon} (expected 5.38)`);
+  });
+
   it('treats unset MapUnit as METRES, not project length unit (Bonsai/IfcOpenShell convention)', async () => {
     // Regression for the antipode bug: a file with LengthUnit=mm and
     // MapConversion eastings/northings authored in METRES (typical surveyor

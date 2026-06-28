@@ -122,9 +122,17 @@ pub fn export_collada_from_meshes(
             mat_tris.push(Vec::new());
             mat_colors.len() - 1
         });
-        // Re-base local indices into the shared output buffer.
-        for &idx in islice {
-            mat_tris[mi].push(vout + idx);
+        // Re-base local indices into the shared output buffer. Keep only whole
+        // triangles: a trailing partial triangle (index count not a multiple of 3)
+        // would desync `<triangles count>` from the `<p>` list and emit malformed
+        // COLLADA. Also drop indices that fall outside this mesh's vertex range.
+        let tri_len = islice.len() - islice.len() % 3;
+        for tri in islice[..tri_len].chunks_exact(3) {
+            if tri.iter().all(|&idx| (idx as usize) < vc) {
+                for &idx in tri {
+                    mat_tris[mi].push(vout + idx);
+                }
+            }
         }
 
         vout += vc as u32;
@@ -368,6 +376,24 @@ mod tests {
         let arr_start = xml.find("geo-pos-arr").unwrap();
         let arr = &xml[arr_start..xml[arr_start..].find("</float_array>").unwrap() + arr_start];
         assert!(arr.contains("0 0 1"), "Y-up (0,1,0) maps to Z-up (0,0,1); got: {arr}");
+    }
+
+    #[test]
+    fn triangles_count_matches_index_list_on_ragged_input() {
+        // A malformed index count (not a multiple of 3) must not desync the emitted
+        // <triangles count> from the <p> list — keep only whole triangles.
+        let positions = vec![0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.5, 0.0, 0.5];
+        let normals: Vec<f32> = std::iter::repeat_n([0.0f32, 1.0, 0.0], 4).flatten().collect();
+        let indices = vec![0u32, 1, 2, 0, 2]; // 5 indices = one whole triangle + a stray pair
+        let xml = String::from_utf8(export_collada_from_meshes(
+            &positions, &normals, &indices, &[4], &[5], &[0.3, 0.3, 0.3, 1.0], &[0.0, 0.0, 0.0],
+        ))
+        .unwrap();
+        // Exactly one triangle survives; its <p> holds 3 vertex+normal index pairs (6 ints).
+        assert!(xml.contains("<triangles material=\"sym0\" count=\"1\">"));
+        let p_start = xml.find("<p>").unwrap() + 3;
+        let p = &xml[p_start..xml[p_start..].find("</p>").unwrap() + p_start];
+        assert_eq!(p.split_whitespace().count(), 6, "one triangle = 3 pairs = 6 indices: {p}");
     }
 
     #[test]
