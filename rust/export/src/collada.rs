@@ -33,6 +33,15 @@ fn to_zup(x: f32, y: f32, z: f32) -> [f32; 3] {
     [x, -z, y]
 }
 
+/// Vertex dedup key: position quantised to 0.1 mm + normal to ~1e-3 (the emitted
+/// precision), so vertices that serialise identically collapse to one.
+#[inline]
+fn vert_key(p: [f32; 3], n: [f32; 3]) -> [i32; 6] {
+    let qp = |v: f32| (v * 10_000.0).round() as i32;
+    let qn = |v: f32| (v * 1_000.0).round() as i32;
+    [qp(p[0]), qp(p[1]), qp(p[2]), qn(n[0]), qn(n[1]), qn(n[2])]
+}
+
 /// Build a Google-Earth-compatible COLLADA 1.4.1 `.dae` from already-produced
 /// (Y-up) meshes, flattened into parallel arrays exactly like
 /// `export_glb_from_meshes`. Per mesh `i`: `vertex_counts[i]` vertices +
@@ -57,11 +66,14 @@ pub fn export_collada_from_meshes(
     let mut mat_colors: Vec<[f32; 4]> = Vec::new();
     let mut mat_tris: Vec<Vec<u32>> = Vec::new();
     let mut mat_map: HashMap<(i32, i32, i32, i32), usize> = HashMap::new();
+    // Global vertex dedup: quantised (position, normal) → index into pos/nrm. Merges
+    // identical vertices within and across meshes so a non-indexed IFC mesh (per-face
+    // vertices) doesn't blow past Google Earth's render limits.
+    let mut dedup: HashMap<[i32; 6], u32> = HashMap::new();
 
     let n = vertex_counts.len();
     let mut vbase = 0usize; // running vertex offset into the flat input
     let mut ibase = 0usize; // running index offset into the flat input
-    let mut vout = 0u32; // running vertex offset into the output (shared) buffer
     for i in 0..n {
         let vc = vertex_counts[i] as usize;
         let ic = index_counts.get(i).copied().unwrap_or(0) as usize;
@@ -94,48 +106,53 @@ pub fn export_collada_from_meshes(
             continue;
         }
 
-        // Bake world = origin + position, converted to Z-up. RTC-relative render
-        // coords are small, so f32 keeps full precision without re-centring.
-        for v in pslice.chunks_exact(3) {
-            let wx = v[0] as f64 + origin[0];
-            let wy = v[1] as f64 + origin[1];
-            let wz = v[2] as f64 + origin[2];
-            let z = to_zup(wx as f32, wy as f32, wz as f32);
-            pos.extend_from_slice(&z);
-        }
-        if nslice.len() == pslice.len() {
-            for nv in nslice.chunks_exact(3) {
-                let z = to_zup(nv[0], nv[1], nv[2]);
-                nrm.extend_from_slice(&z);
-            }
-        } else {
-            // No usable normals — emit a placeholder up-normal per vertex so the
-            // accessor stays valid (Google Earth tolerates this).
-            for _ in 0..vc {
-                nrm.extend_from_slice(&[0.0, 0.0, 1.0]);
-            }
+        // Bake world = origin + position into Z-up, deduplicating by (position,
+        // normal). RTC-relative render coords are small, so f32 keeps full precision.
+        // `l2g` maps this mesh's local vertex index → the shared deduped index. A hard
+        // edge keeps distinct normals, so its vertices are NOT merged → flat shading
+        // is preserved; only redundant same-position-same-normal vertices collapse.
+        let has_normals = nslice.len() == pslice.len();
+        let mut l2g = vec![0u32; vc];
+        for vi in 0..vc {
+            let p = &pslice[vi * 3..vi * 3 + 3];
+            let zp = to_zup(
+                (p[0] as f64 + origin[0]) as f32,
+                (p[1] as f64 + origin[1]) as f32,
+                (p[2] as f64 + origin[2]) as f32,
+            );
+            let zn = if has_normals {
+                let nv = &nslice[vi * 3..vi * 3 + 3];
+                to_zup(nv[0], nv[1], nv[2])
+            } else {
+                [0.0, 0.0, 1.0]
+            };
+            l2g[vi] = *dedup.entry(vert_key(zp, zn)).or_insert_with(|| {
+                let g = (pos.len() / 3) as u32;
+                pos.extend_from_slice(&zp);
+                nrm.extend_from_slice(&zn);
+                g
+            });
         }
 
-        let key = color_key(color);
-        let mi = *mat_map.entry(key).or_insert_with(|| {
+        let mi = *mat_map.entry(color_key(color)).or_insert_with(|| {
             mat_colors.push(color);
             mat_tris.push(Vec::new());
             mat_colors.len() - 1
         });
-        // Re-base local indices into the shared output buffer. Keep only whole
-        // triangles: a trailing partial triangle (index count not a multiple of 3)
-        // would desync `<triangles count>` from the `<p>` list and emit malformed
-        // COLLADA. Also drop indices that fall outside this mesh's vertex range.
+        // Keep only whole triangles (a trailing partial triangle would desync
+        // `<triangles count>` from `<p>`); drop indices outside this mesh's vertex
+        // range; remap each to its deduped global index, dropping any triangle that
+        // dedup collapsed to zero area (two corners merged).
         let tri_len = islice.len() - islice.len() % 3;
         for tri in islice[..tri_len].chunks_exact(3) {
             if tri.iter().all(|&idx| (idx as usize) < vc) {
-                for &idx in tri {
-                    mat_tris[mi].push(vout + idx);
+                let (a, b, c) = (l2g[tri[0] as usize], l2g[tri[1] as usize], l2g[tri[2] as usize]);
+                if a != b && b != c && a != c {
+                    mat_tris[mi].extend_from_slice(&[a, b, c]);
                 }
             }
         }
 
-        vout += vc as u32;
         vbase += vc;
         ibase += ic;
     }
@@ -508,6 +525,26 @@ mod tests {
         let (cx, cy) = hbounds(&parse_positions(&xml));
         assert!(cx.abs() < 1e-3, "X re-centred to ~0 (geometry was ~105 from origin): {cx}");
         assert!(cy.abs() < 1e-3, "Y re-centred to ~0 (geometry was ~210 from origin): {cy}");
+    }
+
+    #[test]
+    fn deduplicates_shared_vertices() {
+        // A quad supplied NON-indexed as two triangles (6 vertices: a,b,c and a,c,d)
+        // collapses to 4 unique — a and c are shared with identical position+normal.
+        // This is the lever that shrinks per-face IFC meshes under Google Earth's
+        // vertex/triangle limits (#1427).
+        let (a, b, c, d) = ([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 1.0], [0.0, 0.0, 1.0]);
+        let mut positions = vec![];
+        for v in [a, b, c, a, c, d] {
+            positions.extend_from_slice(&v);
+        }
+        let normals: Vec<f32> = std::iter::repeat_n([0.0f32, 1.0, 0.0], 6).flatten().collect();
+        let indices: Vec<u32> = (0..6).collect();
+        let xml = String::from_utf8(export_collada_from_meshes(
+            &positions, &normals, &indices, &[6], &[6], &[0.5, 0.5, 0.5, 1.0], &[0.0, 0.0, 0.0],
+        ))
+        .unwrap();
+        assert_eq!(parse_positions(&xml).len(), 4, "6 input verts dedupe to 4 unique");
     }
 
     #[test]
