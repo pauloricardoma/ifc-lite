@@ -330,7 +330,10 @@ fn fmt_f32(v: f32) -> String {
 mod tests {
     use super::*;
 
-    fn one_quad() -> (Vec<f32>, Vec<f32>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<f32>, Vec<f64>) {
+    /// `(positions, normals, indices, vertex_counts, index_counts, colors, origins)`.
+    type MeshArrays = (Vec<f32>, Vec<f32>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<f32>, Vec<f64>);
+
+    fn one_quad() -> MeshArrays {
         // A unit quad in the XY plane (Y-up input), single red mesh.
         let positions = vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0];
         let normals: Vec<f32> = std::iter::repeat_n([0.0f32, 1.0, 0.0], 4).flatten().collect();
