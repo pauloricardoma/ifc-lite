@@ -115,6 +115,13 @@ impl IfcAPI {
         let mut router =
             GeometryRouter::with_scale_and_quality(unit_scale, self.tessellation_quality());
 
+        // Apply the consumer-selected small-cut skip (#1286) for this batch.
+        // Independent of the tessellation tier so the viewer can skip tiny steel
+        // cuts while keeping full-density curves. Scoped to this router (not a
+        // process-wide flag), so an export's router, which never enables it,
+        // keeps every cut regardless of a concurrent display build.
+        router.set_skip_small_cuts(self.skip_small_cuts());
+
         // Arm content-dedup against the per-worker shared cache so byte-identical
         // geometry (e.g. Tekla parts the exporter failed to share via
         // IfcMappedItem) is meshed ONCE across batches, not once per batch.
