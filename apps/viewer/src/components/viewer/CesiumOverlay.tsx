@@ -138,6 +138,7 @@ export function CesiumOverlay({
   const dataSource = useViewerStore((s) => s.cesiumDataSource);
   const ionToken = useViewerStore((s) => s.cesiumIonToken);
   const terrainEnabled = useViewerStore((s) => s.cesiumTerrainEnabled);
+  const heightsAreEllipsoidal = useViewerStore((s) => s.cesiumHeightsAreEllipsoidal);
   const terrainClipY = useViewerStore((s) => s.cesiumTerrainClipY);
   const setCesiumTerrainHeight = useViewerStore((s) => s.setCesiumTerrainHeight);
   const setCesiumTerrainSource = useViewerStore((s) => s.setCesiumTerrainSource);
@@ -361,6 +362,7 @@ export function CesiumOverlay({
       const usesSeparateCameraBridge = cameraConversion !== mapConversion;
       const cameraTentative = await createCesiumBridge(
         cameraConversion, projectedCRS, coordinateInfo, lengthUnitScale,
+        undefined, heightsAreEllipsoidal,
       );
       if (cancelled) return;
       if (!cameraTentative) {
@@ -390,7 +392,10 @@ export function CesiumOverlay({
       if (cancelled) return;
       const terrainH = terrainSample?.height ?? null;
       const modelTentative = usesSeparateCameraBridge
-        ? await createCesiumBridge(mapConversion, projectedCRS, coordinateInfo, lengthUnitScale)
+        ? await createCesiumBridge(
+            mapConversion, projectedCRS, coordinateInfo, lengthUnitScale,
+            undefined, heightsAreEllipsoidal,
+          )
         : cameraTentative;
       if (cancelled) return;
       if (!modelTentative) {
@@ -495,6 +500,7 @@ export function CesiumOverlay({
     coordinateInfo,
     lengthUnitScale,
     terrainEnabled,
+    heightsAreEllipsoidal,
     dataSource,
     storeyElevations,
     setCesiumTerrainHeight,

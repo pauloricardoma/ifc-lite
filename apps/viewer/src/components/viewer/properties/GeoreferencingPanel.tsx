@@ -346,6 +346,8 @@ export function GeoreferencingPanel({ georef, modelId, enableEditing, schemaVers
   const cesiumTerrainHeight = useViewerStore(s => s.cesiumTerrainHeight);
   const cesiumTerrainSource = useViewerStore(s => s.cesiumTerrainSource);
   const cesiumSourceModelId = useViewerStore(s => s.cesiumSourceModelId);
+  const heightsAreEllipsoidal = useViewerStore(s => s.cesiumHeightsAreEllipsoidal);
+  const setHeightsAreEllipsoidal = useViewerStore(s => s.setCesiumHeightsAreEllipsoidal);
   const models = useViewerStore(s => s.models);
   const loading = useViewerStore(s => s.loading);
   const { addModel, clearAllModels } = useIfc();
@@ -790,6 +792,25 @@ export function GeoreferencingPanel({ georef, modelId, enableEditing, schemaVers
               </button>
             </div>
           )}
+          {/* Vertical-datum interpretation: OrthogonalHeight is orthometric by
+              spec, so we add the geoid undulation N to convert it to the
+              ellipsoidal height Cesium expects (default). Allow opting out for
+              the rare file whose heights are already ellipsoidal (#1355). */}
+          <label className="flex items-start gap-1.5 ml-5 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={heightsAreEllipsoidal}
+              onChange={(e) => setHeightsAreEllipsoidal(e.target.checked)}
+              className="mt-0.5 h-3 w-3 accent-teal-500 shrink-0"
+            />
+            <span className="text-[9px] text-zinc-600 dark:text-zinc-400 leading-snug">
+              Heights are ellipsoidal (skip geoid correction)
+              <span className="block text-zinc-400 dark:text-zinc-500">
+                Off by default: OrthogonalHeight is treated as orthometric and the
+                geoid undulation is added so the model is not buried under terrain.
+              </span>
+            </span>
+          </label>
         </div>
       )}
 

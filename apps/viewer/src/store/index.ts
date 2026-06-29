@@ -360,6 +360,10 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
       cesiumEnabled: false,
       cesiumTerrainHeight: null,
       cesiumSourceModelId: null,
+      // A new file is orthometric by default — re-arm the geoid correction
+      // so a previous file's "heights are ellipsoidal" opt-out doesn't carry
+      // over (#1355).
+      cesiumHeightsAreEllipsoidal: false,
       cesiumTerrainClipY: null,
       cesiumGlbLoaded: false,
       cesiumPlacementEditMode: false,

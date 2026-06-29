@@ -15,6 +15,7 @@ import {
   mapUnitsToMeters,
   metersToMapUnits,
   projectedDeltaToViewerDelta,
+  shouldApplyGeoidUndulation,
   shouldPreferOrthometricTerrain,
   viewerDeltaToProjectedDelta,
 } from './cesium-placement.js';
@@ -49,6 +50,19 @@ describe('cesium placement helpers', () => {
     assert.strictEqual(shouldPreferOrthometricTerrain({ verticalDatum: '$' }), false);
     assert.strictEqual(shouldPreferOrthometricTerrain({ verticalDatum: '' }), false);
     assert.strictEqual(shouldPreferOrthometricTerrain(undefined), false);
+  });
+
+  it('applies the geoid correction by DEFAULT, regardless of vertical datum (#1355)', () => {
+    // The bug: the orthometric->ellipsoidal correction used to be gated on a
+    // declared VerticalDatum, but that attribute is optional in IFC4/IFC4X3 and
+    // routinely omitted (e.g. Dutch RD-New / NAP files). The authored altitude
+    // is orthometric per spec, so the correction must be the default. This
+    // predicate is now decoupled from shouldPreferOrthometricTerrain and keys
+    // only off the user's "heights are ellipsoidal" opt-out.
+    assert.strictEqual(shouldApplyGeoidUndulation(undefined), true);
+    assert.strictEqual(shouldApplyGeoidUndulation(false), true);
+    // Opt-out: the rare file whose OrthogonalHeight is already ellipsoidal.
+    assert.strictEqual(shouldApplyGeoidUndulation(true), false);
   });
 
   it('places the model at its authored IFC height — no terrain/storey clamp', () => {

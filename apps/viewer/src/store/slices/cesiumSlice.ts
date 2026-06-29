@@ -46,6 +46,16 @@ export interface CesiumSlice {
   /** Model ID that the Cesium overlay is currently displaying. */
   cesiumSourceModelId: string | null;
   /**
+   * When true, the model's authored `IfcMapConversion.OrthogonalHeight` is
+   * treated as an ELLIPSOIDAL height and the EGM96 geoid correction is skipped.
+   *
+   * Default false: heights are orthometric per the IFC spec, so the geoid
+   * undulation N is added to avoid the model sinking ~N below world terrain
+   * (#1355). Only the rare file whose OrthogonalHeight is genuinely ellipsoidal
+   * needs this turned on.
+   */
+  cesiumHeightsAreEllipsoidal: boolean;
+  /**
    * User-selected federation anchor model.
    *
    * When multiple georeferenced models are loaded, federation alignment rebakes
@@ -86,6 +96,7 @@ export interface CesiumSlice {
   setCesiumTerrainHeight: (height: number | null) => void;
   setCesiumTerrainSource: (source: string | null) => void;
   setCesiumSourceModelId: (modelId: string | null) => void;
+  setCesiumHeightsAreEllipsoidal: (ellipsoidal: boolean) => void;
   setAnchorModelIdOverride: (modelId: string | null) => void;
   setShowModelBasepoints: (show: boolean) => void;
   toggleShowModelBasepoints: () => void;
@@ -162,6 +173,7 @@ export const createCesiumSlice: StateCreator<CesiumSlice & CesiumCrossSliceState
   cesiumTerrainHeight: null,
   cesiumTerrainSource: null,
   cesiumSourceModelId: null,
+  cesiumHeightsAreEllipsoidal: false,
   anchorModelIdOverride: null,
   showModelBasepoints: false,
   cesiumTerrainClipY: null,
@@ -214,6 +226,7 @@ export const createCesiumSlice: StateCreator<CesiumSlice & CesiumCrossSliceState
   setCesiumTerrainHeight: (height) => set({ cesiumTerrainHeight: height }),
   setCesiumTerrainSource: (source) => set({ cesiumTerrainSource: source }),
   setCesiumSourceModelId: (modelId) => set({ cesiumSourceModelId: modelId }),
+  setCesiumHeightsAreEllipsoidal: (ellipsoidal) => set({ cesiumHeightsAreEllipsoidal: ellipsoidal }),
   setAnchorModelIdOverride: (modelId) => set({ anchorModelIdOverride: modelId }),
   setShowModelBasepoints: (show) => set({ showModelBasepoints: show }),
   toggleShowModelBasepoints: () => set((s) => ({ showModelBasepoints: !s.showModelBasepoints })),

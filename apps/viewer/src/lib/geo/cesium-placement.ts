@@ -32,11 +32,44 @@ export function metersToMapUnits(
   return value / getMapUnitScale(projectedCRS, lengthUnitScale);
 }
 
+/**
+ * Whether to REORDER terrain sampling to prefer an orthometric source
+ * (Open-Meteo's bare-earth DEM) over the visible-surface / ellipsoidal ones.
+ *
+ * This is purely a terrain-sampling heuristic: a declared vertical datum is a
+ * strong "this site cares about heights above sea level" signal, so we fetch
+ * the orthometric DEM first. It does NOT decide whether the MODEL height gets
+ * the geoid correction — that is `shouldApplyGeoidUndulation`, which defaults
+ * on for every georeferenced model. (#1355 decoupled the two.)
+ */
 export function shouldPreferOrthometricTerrain(
   projectedCRS: Pick<ProjectedCRS, 'verticalDatum'> | undefined,
 ): boolean {
   const verticalDatum = projectedCRS?.verticalDatum?.trim();
   return Boolean(verticalDatum && verticalDatum !== '$');
+}
+
+/**
+ * Whether to convert the authored (orthometric) IFC altitude into the
+ * ellipsoidal height Cesium expects by adding the EGM96 geoid undulation N.
+ *
+ * `IfcMapConversion.OrthogonalHeight` is orthometric by spec (a height above
+ * the vertical datum / mean sea level), while Cesium positions geometry by
+ * ellipsoidal height (above the WGS84 ellipsoid). The two differ by N
+ * (~+43..49 m in central Europe), so a georeferenced model that skips the
+ * correction sinks ~N below the world terrain (#1355).
+ *
+ * The correction is therefore the DEFAULT for any georeferenced model. It is
+ * NOT gated on a declared `IfcProjectedCRS.VerticalDatum`: that attribute is
+ * optional in IFC4 / IFC4X3 and routinely omitted by exporters (very common
+ * for Dutch RD-New / NAP files), yet the authored altitude is orthometric
+ * regardless. The only opt-out is a file whose OrthogonalHeight is already
+ * ellipsoidal, which the user signals via `heightsAreEllipsoidal`.
+ */
+export function shouldApplyGeoidUndulation(
+  heightsAreEllipsoidal: boolean | undefined,
+): boolean {
+  return !heightsAreEllipsoidal;
 }
 
 export interface CesiumPlacementInput {
