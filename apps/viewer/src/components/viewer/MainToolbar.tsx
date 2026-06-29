@@ -985,7 +985,10 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
 
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <Button variant="ghost" size="icon-sm" disabled={!geometryResult}>
+          {/* Gate on any loaded model, not the legacy single-model geometryResult:
+              federated / multi-model sessions populate `models` but leave
+              geometryResult null, which would hide the whole export menu (incl. KMZ). */}
+          <Button variant="ghost" size="icon-sm" disabled={!hasModelsLoaded && !ifcDataStore}>
             <Download className="h-4 w-4" />
           </Button>
         </DropdownMenuTrigger>

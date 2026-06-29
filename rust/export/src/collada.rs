@@ -29,17 +29,19 @@ fn color_key(c: [f32; 4]) -> (i32, i32, i32, i32) {
 
 /// Convert a Y-up vector back to the IFC-native Z-up frame: `(x, y, z) -> (x, -z, y)`.
 #[inline]
-fn to_zup(x: f32, y: f32, z: f32) -> [f32; 3] {
+fn to_zup(x: f64, y: f64, z: f64) -> [f64; 3] {
     [x, -z, y]
 }
 
 /// Vertex dedup key: position quantised to 0.1 mm + normal to ~1e-3 (the emitted
 /// precision), so vertices that serialise identically collapse to one. Quantises in
 /// f64→i64 so large world coordinates (e.g. a national-grid model not RTC-shifted,
-/// hundreds of km) can't overflow the key and merge unrelated vertices.
+/// hundreds of km) can't overflow the key and merge unrelated vertices. The position
+/// is kept in f64 end-to-end (only normals, which are unit-scale, are f32) so a
+/// large-georef world coordinate is not quantised by an early f32 downcast.
 #[inline]
-fn vert_key(p: [f32; 3], n: [f32; 3]) -> [i64; 6] {
-    let qp = |v: f32| (v as f64 * 10_000.0).round() as i64;
+fn vert_key(p: [f64; 3], n: [f32; 3]) -> [i64; 6] {
+    let qp = |v: f64| (v * 10_000.0).round() as i64;
     let qn = |v: f32| (v as f64 * 1_000.0).round() as i64;
     [qp(p[0]), qp(p[1]), qp(p[2]), qn(n[0]), qn(n[1]), qn(n[2])]
 }
@@ -62,8 +64,11 @@ pub fn export_collada_from_meshes(
     origins: &[f64],
 ) -> Vec<u8> {
     // Concatenated Z-up vertex buffers (one shared POSITION + NORMAL source) and,
-    // per material, the triangle indices into that shared buffer.
-    let mut pos: Vec<f32> = Vec::new();
+    // per material, the triangle indices into that shared buffer. Positions are
+    // accumulated in f64 so `world = origin + position` and the subsequent AABB
+    // re-centering keep full precision at georef scale; the buffer is downcast to
+    // f32 only once, after centering, just before serialisation.
+    let mut pos: Vec<f64> = Vec::new();
     let mut nrm: Vec<f32> = Vec::new();
     let mut mat_colors: Vec<[f32; 4]> = Vec::new();
     let mut mat_tris: Vec<Vec<u32>> = Vec::new();
@@ -109,8 +114,9 @@ pub fn export_collada_from_meshes(
         }
 
         // Bake world = origin + position into Z-up, deduplicating by (position,
-        // normal). RTC-relative render coords are small, so f32 keeps full precision.
-        // `l2g` maps this mesh's local vertex index → the shared deduped index. A hard
+        // normal). The world position is accumulated in f64 so a large-georef
+        // coordinate is not quantised by an f32 downcast before centering. `l2g`
+        // maps this mesh's local vertex index → the shared deduped index. A hard
         // edge keeps distinct normals, so its vertices are NOT merged → flat shading
         // is preserved; only redundant same-position-same-normal vertices collapse.
         let has_normals = nslice.len() == pslice.len();
@@ -118,13 +124,15 @@ pub fn export_collada_from_meshes(
         for vi in 0..vc {
             let p = &pslice[vi * 3..vi * 3 + 3];
             let zp = to_zup(
-                (p[0] as f64 + origin[0]) as f32,
-                (p[1] as f64 + origin[1]) as f32,
-                (p[2] as f64 + origin[2]) as f32,
+                p[0] as f64 + origin[0],
+                p[1] as f64 + origin[1],
+                p[2] as f64 + origin[2],
             );
+            // Normals are unit-scale direction vectors; f32 carries them losslessly.
             let zn = if has_normals {
                 let nv = &nslice[vi * 3..vi * 3 + 3];
-                to_zup(nv[0], nv[1], nv[2])
+                let z = to_zup(nv[0] as f64, nv[1] as f64, nv[2] as f64);
+                [z[0] as f32, z[1] as f32, z[2] as f32]
             } else {
                 [0.0, 0.0, 1.0]
             };
@@ -168,10 +176,10 @@ pub fn export_collada_from_meshes(
     // the project origin appeared ~250 m away in Google Earth (#1427). Z is left alone
     // so clampToGround rests project-zero on the terrain (foundations below, frame above).
     if pos.len() >= 3 {
-        let mut min_x = f32::INFINITY;
-        let mut max_x = f32::NEG_INFINITY;
-        let mut min_y = f32::INFINITY;
-        let mut max_y = f32::NEG_INFINITY;
+        let mut min_x = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut min_y = f64::INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
         for v in pos.chunks_exact(3) {
             min_x = min_x.min(v[0]);
             max_x = max_x.max(v[0]);
@@ -186,7 +194,10 @@ pub fn export_collada_from_meshes(
         }
     }
 
-    write_dae(&pos, &nrm, &mat_colors, &mat_tris)
+    // Downcast the centered (small, origin-local) coordinates to f32 only now — the
+    // accumulation + AABB centering above ran in f64 to survive georef magnitudes.
+    let pos_f32: Vec<f32> = pos.iter().map(|&c| c as f32).collect();
+    write_dae(&pos_f32, &nrm, &mat_colors, &mat_tris)
 }
 
 /// Serialise the collected geometry + materials into a COLLADA 1.4.1 document.

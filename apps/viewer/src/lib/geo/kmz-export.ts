@@ -41,10 +41,13 @@ export type KmzBuildError = 'not-georeferenced' | 'unprojectable' | 'no-geometry
 export async function buildKmzForModel(input: BuildKmzInput): Promise<Uint8Array | KmzBuildError> {
   if (!input.geometryResult.meshes?.length) return 'no-geometry';
   const info = extractGeoreferencingOnDemand(input.dataStore);
-  if (!info?.hasGeoreference) return 'not-georeferenced';
   const scale = extractLengthUnitScale(input.dataStore.source, input.dataStore.entityIndex) ?? 1;
-  const conversion = mergeMapConversion(info.mapConversion, input.mutations?.mapConversion);
-  const crs = mergeProjectedCRS(info.projectedCRS, input.mutations?.projectedCRS, scale);
+  // Apply pending georef edits BEFORE deciding the model is unreferenced: a model
+  // whose only georeference comes from unsaved edits (mutations) has no extracted
+  // `hasGeoreference`, but the merged conversion/CRS still place it. The merged
+  // result is the source of truth — gate on it, not on the on-disk info (#1427).
+  const conversion = mergeMapConversion(info?.mapConversion, input.mutations?.mapConversion);
+  const crs = mergeProjectedCRS(info?.projectedCRS, input.mutations?.projectedCRS, scale);
   if (!conversion || !crs) return 'not-georeferenced';
   const latLon = await reprojectToLatLon(conversion, crs, input.geometryResult.coordinateInfo, scale);
   if (!latLon) return 'unprojectable';

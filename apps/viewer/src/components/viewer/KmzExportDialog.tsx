@@ -72,8 +72,16 @@ export function KmzExportDialog({ trigger }: KmzExportDialogProps) {
     return list;
   }, [models, legacyGeometryResult, legacyDataStore]);
 
+  // Pick a default AND repair a stale selection: when the loaded models change
+  // (federated add/remove, model swap), an id that no longer matches any model
+  // would otherwise export the fallback (`modelList[0]`) while passing the stale
+  // id's mutations — a mismatch. Reset to the first model whenever the current
+  // id is empty or absent from the list.
   useEffect(() => {
-    if (modelList.length > 0 && !selectedModelId) setSelectedModelId(modelList[0].id);
+    if (modelList.length === 0) return;
+    if (!selectedModelId || !modelList.some((m) => m.id === selectedModelId)) {
+      setSelectedModelId(modelList[0].id);
+    }
   }, [modelList, selectedModelId]);
 
   const selectedModel = useMemo(
