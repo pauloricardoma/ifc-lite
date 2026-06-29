@@ -130,15 +130,26 @@ export function KmzExportDialog({ trigger }: KmzExportDialogProps) {
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Globe2 className="h-5 w-5" />
-            Export KMZ File
+            Export KMZ for Google Earth Pro
           </DialogTitle>
           <DialogDescription>
-            Export the model for Google Earth, placed at its real-world location. The model is
-            embedded as COLLADA (the format Google Earth loads). Requires a georeferenced model.
+            Places the model at its real-world location, embedded as COLLADA. Requires a
+            georeferenced model.
           </DialogDescription>
         </DialogHeader>
 
         <div className="grid gap-4 py-4">
+          {/* Google Earth Web does not support KML <Model>, so it cannot render a KMZ 3D
+              model — only Earth Pro (desktop) can. Web users should export GLB instead. */}
+          <Alert>
+            <AlertCircle className="h-4 w-4" />
+            <AlertTitle>Opens in Google Earth Pro (desktop)</AlertTitle>
+            <AlertDescription>
+              Google Earth on the web cannot show 3D models from a KMZ. For Earth on the web,
+              use Export GLB and import it via the web app&apos;s Import 3D model option.
+            </AlertDescription>
+          </Alert>
+
           {modelList.length > 1 && (
             <div className="flex items-center gap-4">
               <Label className="w-32">Model</Label>

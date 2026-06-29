@@ -1011,7 +1011,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
             trigger={
               <DropdownMenuItem onSelect={(e) => e.preventDefault()}>
                 <Globe2 className="h-4 w-4 mr-2" />
-                Export KMZ (Google Earth)
+                Export KMZ (Google Earth Pro)
               </DropdownMenuItem>
             }
           />

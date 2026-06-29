@@ -710,7 +710,7 @@ export function LocationMap({
                     Google Earth
                   </button>
                 </TooltipTrigger>
-                <TooltipContent>Download KMZ to open in Google Earth with model at correct position</TooltipContent>
+                <TooltipContent>Download KMZ for Google Earth Pro (desktop), placed at the model location. Google Earth on the web cannot show KMZ 3D models — use Export GLB for the web.</TooltipContent>
               </Tooltip>
             )}
             <button
