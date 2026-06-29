@@ -196,7 +196,7 @@ if [ "${BUILD_WIDE:-}" = "1" ]; then
     --out-dir "$WIDE_OUT" \
     --out-name ifc-lite \
     --release \
-    $FEATURES
+    -- $FEATURES
 
   WIDE_REL="$(echo "$WIDE_OUT" | sed 's|^../../||')"
   WIDE_DTS="$WIDE_REL/ifc-lite.d.ts"
@@ -204,13 +204,19 @@ if [ "${BUILD_WIDE:-}" = "1" ]; then
     grep -v '__wasm_bindgen_func_elem_' "$WIDE_DTS" > "$WIDE_DTS.tmp" && mv "$WIDE_DTS.tmp" "$WIDE_DTS"
   fi
   # Litmus test: the bundle must actually contain wide-arithmetic ops.
-  if command -v wasm-tools >/dev/null 2>&1; then
-    if [ "$(wasm-tools print "$WIDE_REL/ifc-lite_bg.wasm" 2>/dev/null | grep -cE 'mul_wide|add128|sub128')" -gt 0 ]; then
-      echo "🔢 ✅ wide-arithmetic bundle emits wide ops"
-    else
-      echo "🔢 ❌ wide-arithmetic bundle has NO wide ops — flags wrong; refusing to ship"
-      exit 1
-    fi
+  # wasm-tools is REQUIRED for BUILD_WIDE=1 — without it we cannot verify the
+  # bundle isn't silently baseline wasm, so refuse to proceed rather than ship
+  # an unverified bundle.
+  if ! command -v wasm-tools >/dev/null 2>&1; then
+    echo "🔢 ❌ wasm-tools not found — required for BUILD_WIDE=1 to verify wide ops; refusing to ship an unverified bundle"
+    echo "      Install it with: cargo install wasm-tools"
+    exit 1
+  fi
+  if [ "$(wasm-tools print "$WIDE_REL/ifc-lite_bg.wasm" 2>/dev/null | grep -cE 'mul_wide|add128|sub128')" -gt 0 ]; then
+    echo "🔢 ✅ wide-arithmetic bundle emits wide ops"
+  else
+    echo "🔢 ❌ wide-arithmetic bundle has NO wide ops — flags wrong; refusing to ship"
+    exit 1
   fi
   ls -lh "$WIDE_REL/ifc-lite_bg.wasm" | awk '{print "   Wide WASM: " $5 " (no budget — not the default bundle)"}'
 fi
