@@ -239,7 +239,12 @@ export const createCesiumSlice: StateCreator<CesiumSlice & CesiumCrossSliceState
   setCesiumTerrainSource: (source) => set({ cesiumTerrainSource: source }),
   setCesiumTerrainSaveHeight: (height) => set({ cesiumTerrainSaveHeight: height }),
   setCesiumSourceModelId: (modelId) => set({ cesiumSourceModelId: modelId }),
-  setCesiumHeightsAreEllipsoidal: (ellipsoidal) => set({ cesiumHeightsAreEllipsoidal: ellipsoidal }),
+  setCesiumHeightsAreEllipsoidal: (ellipsoidal) => set({
+    cesiumHeightsAreEllipsoidal: ellipsoidal,
+    // The snap target is geoid-mode-dependent; drop the stale value so a snap
+    // can't persist the old frame before the overlay recomputes it (#1456).
+    cesiumTerrainSaveHeight: null,
+  }),
   setAnchorModelIdOverride: (modelId) => set({ anchorModelIdOverride: modelId }),
   setShowModelBasepoints: (show) => set({ showModelBasepoints: show }),
   toggleShowModelBasepoints: () => set((s) => ({ showModelBasepoints: !s.showModelBasepoints })),

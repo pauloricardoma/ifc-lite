@@ -784,10 +784,10 @@ export function GeoreferencingPanel({ georef, modelId, enableEditing, schemaVers
               sampled via {cesiumTerrainSource}
             </div>
           )}
-          {cesiumTerrainHeight !== null && editable && modelId && (
+          {cesiumTerrainHeight !== null && cesiumTerrainSaveHeight !== null && editable && modelId && (
             <div className="flex items-center gap-1 ml-5">
               <button
-                onClick={() => handleSave('mapConversion', 'orthogonalHeight', oHeightForBaseAltitude(cesiumTerrainSaveHeight ?? cesiumTerrainHeight))}
+                onClick={() => handleSave('mapConversion', 'orthogonalHeight', oHeightForBaseAltitude(cesiumTerrainSaveHeight))}
                 className="text-[9px] text-teal-500 hover:text-teal-700 dark:hover:text-teal-300 transition-colors flex items-center gap-0.5"
               >
                 <Mountain className="h-2.5 w-2.5" />
@@ -844,8 +844,10 @@ function TerrainHeightButton({ modelId, editable, onApply }: {
   const terrainSource = useViewerStore(s => s.cesiumTerrainSource);
   const sourceModelId = useViewerStore(s => s.cesiumSourceModelId);
 
-  // Only show when this panel's model is the active Cesium model
-  if (!cesiumEnabled || terrainHeight === null || !editable || !modelId || modelId !== sourceModelId) return null;
+  // Only show when this panel's model is the active Cesium model and the
+  // geoid-corrected snap target is ready (#1456): never fall back to the raw
+  // ellipsoidal sample, which would skip the correction.
+  if (!cesiumEnabled || terrainHeight === null || terrainSaveHeight === null || !editable || !modelId || modelId !== sourceModelId) return null;
 
   return (
     <Tooltip>
@@ -853,7 +855,7 @@ function TerrainHeightButton({ modelId, editable, onApply }: {
         <button
           onClick={(e) => {
             e.stopPropagation();
-            onApply(terrainSaveHeight ?? terrainHeight);
+            onApply(terrainSaveHeight);
           }}
           className="flex items-center gap-0.5 text-[9px] text-teal-500 hover:text-teal-700 dark:hover:text-teal-300 transition-colors mt-0.5"
         >
