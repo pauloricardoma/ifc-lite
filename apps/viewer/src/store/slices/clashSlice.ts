@@ -76,6 +76,21 @@ export interface ClashSlice {
    * (#1277)
    */
   clashOverlapBox: { min: [number, number, number]; max: [number, number, number] } | null;
+  /**
+   * The focused clash's CONTACT geometry as a flat world-frame line-list (the
+   * real shared-face polygon outlines / intersection lines). Preferred over the
+   * AABB `clashOverlapBox` when present. `null` when no clash is focused or the
+   * contact could not be computed (then the box is used). (#1402)
+   */
+  clashContactLines: { vertices: number[]; color: [number, number, number, number] } | null;
+  /**
+   * Whether the focused clash's region box is drawn in the 3D view. On by
+   * default (#1402): with the tight contact bounds (#1362 Bug B) the box marks
+   * the actual penetration region instead of the old whole-element AABB that
+   * obscured everything. It draws on the always-visible overlay so it shows
+   * through the (often isolated) clashing solids; toggle it off in clash settings.
+   */
+  showClashRegionBox: boolean;
 
   setClashPanelVisible: (visible: boolean) => void;
   toggleClashPanel: () => void;
@@ -94,6 +109,8 @@ export interface ClashSlice {
   setClashSelectedId: (id: string | null) => void;
   setClashHighlightColors: (colors: Map<number, [number, number, number, number]> | null) => void;
   setClashOverlapBox: (box: { min: [number, number, number]; max: [number, number, number] } | null) => void;
+  setClashContactLines: (lines: { vertices: number[]; color: [number, number, number, number] } | null) => void;
+  setShowClashRegionBox: (show: boolean) => void;
   // Preset CRUD (persisted). create/update/import return a SaveResult so the UI
   // can surface quota / cap failures; the rest are best-effort.
   createClashPreset: (input: NewClashPreset) => SaveResult;
@@ -144,6 +161,8 @@ export const createClashSlice: StateCreator<ClashSlice, [], [], ClashSlice> = (s
     clashSelectedId: null,
     clashHighlightColors: null,
     clashOverlapBox: null,
+    clashContactLines: null,
+    showClashRegionBox: true,
 
     setClashPanelVisible: (clashPanelVisible) => set({ clashPanelVisible }),
     toggleClashPanel: () => set((s) => ({ clashPanelVisible: !s.clashPanelVisible })),
@@ -176,6 +195,7 @@ export const createClashSlice: StateCreator<ClashSlice, [], [], ClashSlice> = (s
         clashClusterEpsilon: DEFAULT_CLASH_SETTINGS.clusterEpsilon,
         clashReportTouch: DEFAULT_CLASH_SETTINGS.reportTouch,
         clashGroupBy: DEFAULT_CLASH_SETTINGS.groupBy,
+        showClashRegionBox: true,
       });
       persistSettings();
     },
@@ -183,6 +203,8 @@ export const createClashSlice: StateCreator<ClashSlice, [], [], ClashSlice> = (s
     setClashSelectedId: (clashSelectedId) => set({ clashSelectedId }),
     setClashHighlightColors: (clashHighlightColors) => set({ clashHighlightColors }),
     setClashOverlapBox: (clashOverlapBox) => set({ clashOverlapBox }),
+    setClashContactLines: (clashContactLines) => set({ clashContactLines }),
+    setShowClashRegionBox: (showClashRegionBox) => set({ showClashRegionBox }),
 
     createClashPreset: (input) => {
       const name = validatePresetName(input.name);
@@ -268,6 +290,7 @@ export const createClashSlice: StateCreator<ClashSlice, [], [], ClashSlice> = (s
         clashSelectedId: null,
         clashHighlightColors: null,
         clashOverlapBox: null,
+    clashContactLines: null,
       }),
   };
 };
