@@ -344,6 +344,9 @@ export function GeoreferencingPanel({ georef, modelId, enableEditing, schemaVers
   const setGeorefFields = useViewerStore(s => s.setGeorefFields);
   const cesiumEnabled = useViewerStore(s => s.cesiumEnabled);
   const cesiumTerrainHeight = useViewerStore(s => s.cesiumTerrainHeight);
+  // Geoid-inverted target for snapping OrthogonalHeight to terrain (#1456); the
+  // raw cesiumTerrainHeight is still shown to the user.
+  const cesiumTerrainSaveHeight = useViewerStore(s => s.cesiumTerrainSaveHeight);
   const cesiumTerrainSource = useViewerStore(s => s.cesiumTerrainSource);
   const cesiumSourceModelId = useViewerStore(s => s.cesiumSourceModelId);
   const heightsAreEllipsoidal = useViewerStore(s => s.cesiumHeightsAreEllipsoidal);
@@ -784,7 +787,7 @@ export function GeoreferencingPanel({ georef, modelId, enableEditing, schemaVers
           {cesiumTerrainHeight !== null && editable && modelId && (
             <div className="flex items-center gap-1 ml-5">
               <button
-                onClick={() => handleSave('mapConversion', 'orthogonalHeight', oHeightForBaseAltitude(cesiumTerrainHeight))}
+                onClick={() => handleSave('mapConversion', 'orthogonalHeight', oHeightForBaseAltitude(cesiumTerrainSaveHeight ?? cesiumTerrainHeight))}
                 className="text-[9px] text-teal-500 hover:text-teal-700 dark:hover:text-teal-300 transition-colors flex items-center gap-0.5"
               >
                 <Mountain className="h-2.5 w-2.5" />
@@ -836,6 +839,8 @@ function TerrainHeightButton({ modelId, editable, onApply }: {
 }) {
   const cesiumEnabled = useViewerStore(s => s.cesiumEnabled);
   const terrainHeight = useViewerStore(s => s.cesiumTerrainHeight);
+  // Geoid-inverted snap target (#1456); display still uses terrainHeight.
+  const terrainSaveHeight = useViewerStore(s => s.cesiumTerrainSaveHeight);
   const terrainSource = useViewerStore(s => s.cesiumTerrainSource);
   const sourceModelId = useViewerStore(s => s.cesiumSourceModelId);
 
@@ -848,7 +853,7 @@ function TerrainHeightButton({ modelId, editable, onApply }: {
         <button
           onClick={(e) => {
             e.stopPropagation();
-            onApply(terrainHeight);
+            onApply(terrainSaveHeight ?? terrainHeight);
           }}
           className="flex items-center gap-0.5 text-[9px] text-teal-500 hover:text-teal-700 dark:hover:text-teal-300 transition-colors mt-0.5"
         >

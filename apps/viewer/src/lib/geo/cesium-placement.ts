@@ -159,6 +159,23 @@ export function computeOrthogonalHeightForBaseAltitude({
   ) / 100;
 }
 
+/**
+ * OrthogonalHeight-frame target for a sampled WORLD terrain altitude.
+ *
+ * The read path places the model base at `OrthogonalHeight + geoid undulation N`
+ * (#1355), so to snap the base onto terrain whose ellipsoidal height is
+ * `ellipsoidalTerrainHeight`, persist `ellipsoidalTerrainHeight - N`. With the
+ * geoid correction off (heights already ellipsoidal) N is 0 and this is the
+ * identity. Pass the result as `targetBaseAltitude` to
+ * {@link computeOrthogonalHeightForBaseAltitude}. (#1456)
+ */
+export function orthometricTargetForTerrain(
+  ellipsoidalTerrainHeight: number,
+  geoidUndulation: number,
+): number {
+  return ellipsoidalTerrainHeight - geoidUndulation;
+}
+
 export function computeIfcOriginHeight(
   mapConversion: Pick<MapConversion, 'orthogonalHeight'>,
   projectedCRS: Pick<ProjectedCRS, 'mapUnitScale'> | undefined,

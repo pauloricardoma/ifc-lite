@@ -14,6 +14,7 @@ import {
   intersectRayWithHorizontalPlane,
   mapUnitsToMeters,
   metersToMapUnits,
+  orthometricTargetForTerrain,
   projectedDeltaToViewerDelta,
   shouldApplyGeoidUndulation,
   shouldPreferOrthometricTerrain,
@@ -270,5 +271,31 @@ describe('cesium placement helpers', () => {
       0,
     );
     assert.strictEqual(y, null);
+  });
+});
+
+describe('snap-to-terrain geoid round-trip (#1456)', () => {
+  it('inverts the read-path geoid add (ellipsoidal terrain - N)', () => {
+    // True orthometric ~515 m, geoid undulation ~45 m -> ellipsoidal terrain 560.
+    assert.ok(Math.abs(orthometricTargetForTerrain(560, 45) - 515) < 1e-9);
+    // Correction off (heights ellipsoidal) -> N = 0 -> identity.
+    assert.strictEqual(orthometricTargetForTerrain(560, 0), 560);
+  });
+
+  it('round-trips: saved OrthogonalHeight + applied N lands back on the terrain', () => {
+    // Without CRS / offsets, OrthogonalHeight == targetBaseAltitude, and the read
+    // path adds N back, so a Cesium-sourced (ellipsoidal) terrain sample saved via
+    // this target reconstructs the original ellipsoidal terrain altitude.
+    const ellipsoidalTerrain = 560.0;
+    const appliedN = 45.3;
+    const target = orthometricTargetForTerrain(ellipsoidalTerrain, appliedN);
+    const orthogonalHeight = computeOrthogonalHeightForBaseAltitude({
+      lengthUnitScale: 1,
+      targetBaseAltitude: target,
+    });
+    assert.ok(
+      Math.abs((orthogonalHeight + appliedN) - ellipsoidalTerrain) < 0.02,
+      `expected round-trip to ${ellipsoidalTerrain}, got ${orthogonalHeight + appliedN}`,
+    );
   });
 });

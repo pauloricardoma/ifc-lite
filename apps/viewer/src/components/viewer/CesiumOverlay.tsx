@@ -28,6 +28,8 @@ import { createCesiumBridge, type CesiumBridge } from '@/lib/geo/cesium-bridge';
 import {
   computeCesiumPlacement,
   shouldPreferOrthometricTerrain,
+  shouldApplyGeoidUndulation,
+  orthometricTargetForTerrain,
 } from '@/lib/geo/cesium-placement';
 import { getEffectiveHorizontalScale, resolveMapUnitToMetreScale } from '@/lib/geo/geo-scale';
 import { egm96Undulation } from '@/lib/geo/egm96-undulation';
@@ -142,6 +144,7 @@ export function CesiumOverlay({
   const terrainClipY = useViewerStore((s) => s.cesiumTerrainClipY);
   const setCesiumTerrainHeight = useViewerStore((s) => s.setCesiumTerrainHeight);
   const setCesiumTerrainSource = useViewerStore((s) => s.setCesiumTerrainSource);
+  const setCesiumTerrainSaveHeight = useViewerStore((s) => s.setCesiumTerrainSaveHeight);
   const setCesiumTerrainClipY = useViewerStore((s) => s.setCesiumTerrainClipY);
   const setCesiumGlbLoaded = useViewerStore((s) => s.setCesiumGlbLoaded);
 
@@ -439,6 +442,20 @@ export function CesiumOverlay({
         setCesiumTerrainSource(
           `${terrainSample.source}${terrainSample.reference === 'orthometric' ? ' (orthometric)' : ''}`,
         );
+        // Snap-to-terrain target in the OrthogonalHeight frame: the read path
+        // places the base at OrthogonalHeight + geoid N, so persist the
+        // ellipsoidal terrain altitude (terrainHForFrame) minus the same N that
+        // was actually applied to this model. N mirrors the bridge: the EGM96
+        // undulation, or 0 when heights are flagged ellipsoidal. Keeps the snap
+        // button round-tripping (#1456).
+        const appliedGeoidN = shouldApplyGeoidUndulation(heightsAreEllipsoidal)
+          ? egm96Undulation(modelTentative.modelOrigin.latitude, modelTentative.modelOrigin.longitude)
+          : 0;
+        setCesiumTerrainSaveHeight(
+          terrainHForFrame !== null
+            ? orthometricTargetForTerrain(terrainHForFrame, appliedGeoidN)
+            : null,
+        );
         // terrainClipY stays in viewer-space; it represents the world terrain
         // altitude expressed in the camera bridge's committed frame. Draft
         // placement edits must not move this floor, or the camera will drift.
@@ -448,6 +465,7 @@ export function CesiumOverlay({
         // the clip plane doesn't drift relative to the new bridge.
         setCesiumTerrainHeight(null);
         setCesiumTerrainSource(null);
+        setCesiumTerrainSaveHeight(null);
         setCesiumTerrainClipY(null);
       }
 
@@ -505,6 +523,7 @@ export function CesiumOverlay({
     storeyElevations,
     setCesiumTerrainHeight,
     setCesiumTerrainSource,
+    setCesiumTerrainSaveHeight,
     setCesiumTerrainClipY,
   ]);
 
