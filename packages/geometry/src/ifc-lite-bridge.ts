@@ -521,7 +521,7 @@ export class IfcLiteBridge {
    * (floor polygon + height) grouped into stories — the simpler target for
    * mostly-vertical-wall models.
    */
-  exportDfjson(content: string, name: string): string {
+  exportDfjson(content: Uint8Array, name: string): string {
     return this.runExport('exportDfjson', content, (api) => api.exportDfjson(content, name));
   }
 

@@ -10,7 +10,7 @@ import { getModelForRef, LEGACY_MODEL_ID } from './model-compat.js';
 import { applyAttributeMutationsToEntityData, getMutationViewForModel } from './mutation-view.js';
 import { serializeScheduleToStep, type ScheduleExtraction, type IfcDataStore } from '@ifc-lite/parser';
 import { spliceScheduleIntoExport } from './export-schedule-splice.js';
-import { downloadFile } from '../../lib/export/download.js';
+import { downloadFile, sanitizeFilename } from '../../lib/export/download.js';
 
 /** Options for CSV export */
 interface CsvOptions {
@@ -395,7 +395,16 @@ export function createExportAdapter(store: StoreApi): ExportBackendMethods {
     },
 
     download(content: string | Uint8Array, filename: string, mimeType?: string) {
-      triggerDownload(content, filename, mimeType ?? 'text/plain');
+      // `filename` is API input (scripts pass arbitrary strings) — sanitize the
+      // stem at this single chokepoint so every SDK download path honors the
+      // repo's filename contract, keeping a real extension intact.
+      const dot = filename.lastIndexOf('.');
+      const stem = dot > 0 ? filename.slice(0, dot) : filename;
+      const ext = dot > 0 ? filename.slice(dot + 1).replace(/[^\w]+/g, '') : '';
+      const safe = ext
+        ? `${sanitizeFilename(stem, { fallback: 'export' })}.${ext}`
+        : sanitizeFilename(filename, { fallback: 'export' });
+      triggerDownload(content, safe, mimeType ?? 'text/plain');
       return undefined;
     },
   };

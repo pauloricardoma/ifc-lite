@@ -142,7 +142,9 @@ export function EnergyModelExportDialog({ trigger }: EnergyModelExportDialogProp
         application: 'ifc-lite',
       });
 
-      const baseName = selectedModel.name.replace(/\.[^.]+$/, '');
+      // Strip only a real IFC source-file extension — a dotted display name
+      // like `Tower.v2` must survive into the exported model name.
+      const baseName = selectedModel.name.replace(/\.(ifc|ifcx|ifczip)$/i, '');
       // A fresh processor is cheap: wasm-bindgen shares one module singleton,
       // so init() no-ops when the viewer already initialised the engine.
       const processor = new GeometryProcessor();

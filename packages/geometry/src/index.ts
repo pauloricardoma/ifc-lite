@@ -1297,8 +1297,7 @@ export class GeometryProcessor {
     if (!this.bridge || !this.bridge.isInitialized()) {
       return null;
     }
-    const content = safeUtf8Decode(buffer);
-    return this.bridge.exportDfjson(content, name);
+    return this.bridge.exportDfjson(buffer, name);
   }
 
   /**

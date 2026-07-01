@@ -255,7 +255,7 @@ export class IfcAPI {
    * const dfjson = api.exportDfjson(ifcContent, "my_model");
    * ```
    */
-  exportDfjson(content: string, name: string): string;
+  exportDfjson(content: Uint8Array, name: string): string;
   /**
    * Export the `IfcSpace` volumes in `content` as a Honeybee **HBJSON** string.
    *

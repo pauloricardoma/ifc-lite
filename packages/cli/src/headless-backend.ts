@@ -644,7 +644,10 @@ export class HeadlessBackend implements BimBackend {
         }
         const processor = new GeometryProcessor();
         await processor.init();
-        const baseName = (name ?? modelName).replace(/\.[^.]+$/, '');
+        // An explicit `name` is a display/model name — keep it verbatim (dotted
+        // identifiers like `Tower.v2` are valid). Only the modelName fallback is a
+        // filename, so only it gets a real IFC extension stripped.
+        const baseName = name ?? modelName.replace(/\.(ifc|ifcx|ifczip)$/i, '');
         const result = processor.exportHbjson(bytes, baseName);
         if (result === null) {
           throw new Error('Geometry engine unavailable for HBJSON export.');
@@ -660,7 +663,10 @@ export class HeadlessBackend implements BimBackend {
         }
         const processor = new GeometryProcessor();
         await processor.init();
-        const baseName = (name ?? modelName).replace(/\.[^.]+$/, '');
+        // An explicit `name` is a display/model name — keep it verbatim (dotted
+        // identifiers like `Tower.v2` are valid). Only the modelName fallback is a
+        // filename, so only it gets a real IFC extension stripped.
+        const baseName = name ?? modelName.replace(/\.(ifc|ifcx|ifczip)$/i, '');
         const result = processor.exportDfjson(bytes, baseName);
         if (result === null) {
           throw new Error('Geometry engine unavailable for DFJSON export.');

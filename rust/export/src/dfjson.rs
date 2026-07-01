@@ -1,4 +1,7 @@
-// SPDX-License-Identifier: MPL-2.0
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Serde structs + builder for the Dragonfly DFJSON model schema.
 //!
 //! Dragonfly (Ladybug Tools) represents a building as extruded 2D floor plates: each
@@ -15,7 +18,6 @@ use serde::Serialize;
 
 use ifc_lite_geometry::ExtractedProfile;
 
-use crate::geom::polygon_area;
 use crate::rooms::floor_profiles;
 
 /// Honeybee/Dragonfly schema version this output targets (advisory; loaders warn but do
@@ -116,7 +118,7 @@ pub struct DfjsonStats {
 /// (floor) ring projected to 2D, its Z as `floor_height`, and the extrusion magnitude as
 /// `floor_to_ceiling_height`. Boundaries are normalised to counterclockwise.
 fn build_plates(profiles: &[ExtractedProfile], tol: f64) -> (Vec<Plate>, usize) {
-    let (fps, _origin, skipped) = floor_profiles(profiles, tol);
+    let (fps, _origin, mut skipped) = floor_profiles(profiles, tol);
     let mut plates = Vec::new();
     for fp in &fps {
         let floor = &fp.floor;
@@ -132,7 +134,11 @@ fn build_plates(profiles: &[ExtractedProfile], tol: f64) -> (Vec<Plate>, usize) 
             (ceil_z, floor_z - ceil_z)
         };
         if ftc <= tol {
-            continue; // zero-height extrusion — not a usable room
+            // Zero-height extrusion — not a usable room. Counted as skipped so
+            // `stats.spaces == stats.rooms + stats.skipped` holds for callers
+            // reporting coverage.
+            skipped += 1;
+            continue;
         }
         // Project to 2D and ensure counterclockwise winding (Dragonfly requirement).
         let mut boundary: Vec<[f64; 2]> = floor.iter().map(|p| [p[0], p[1]]).collect();
@@ -310,6 +316,18 @@ mod tests {
         // Lowest story is ground contact, highest is top exposed.
         assert!(model.buildings[0].unique_stories[0].room_2ds[0].is_ground_contact);
         assert!(model.buildings[0].unique_stories[1].room_2ds[0].is_top_exposed);
+    }
+
+    #[test]
+    fn zero_height_space_counts_as_skipped() {
+        let mut flat = unit_space(9, 0.0);
+        flat.extrusion_depth = 0.0;
+        let profiles = vec![unit_space(8, 0.0), flat];
+        let (_, stats) = build_model("test", &profiles, 0.01);
+        assert_eq!(stats.spaces, 2);
+        assert_eq!(stats.rooms, 1);
+        assert_eq!(stats.skipped, 1, "zero-height extrusion must count as skipped");
+        assert_eq!(stats.spaces, stats.rooms + stats.skipped, "coverage invariant");
     }
 
     /// Guards the shared extractor refactor: the same synthetic space yields a watertight

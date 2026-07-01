@@ -10,8 +10,8 @@
  * Rooms are derived from the active storey's RENDERED wall meshes (min-area
  * footprint rectangles → gap detection → lifted onto the wall axis), then the
  * user can drag a shared vertex (both rooms follow), split a room — between
- * corners OR new nodes added anywhere on a wall — merge two rooms, then Bake to
- * real `IfcSpace` through the viewer's existing `addSpace`.
+ * corners OR new nodes added anywhere on a wall — merge two rooms, then confirm
+ * every storey's draft into real `IfcSpace` through the viewer's `addSpace`.
  *
  * Fluency (RFC §4.2): hover telegraphs the op; drawing/dragging/cutting snap to
  * other vertices + walls, with Shift = ortho (which dominates snap). Undo/redo
@@ -44,7 +44,8 @@ import {
   GENERATED_SPACE_OBJECTTYPE,
   type BoundaryMode,
 } from '@ifc-lite/create';
-import { X, Undo2, Redo2, Layers, Maximize, Magnet, SlidersHorizontal, HelpCircle, Eraser, Square, PenLine, Frame, Check } from 'lucide-react';
+import { X, Undo2, Redo2, Layers, Maximize, Magnet, SlidersHorizontal, HelpCircle, Eraser, Square, PenLine, Frame, Check, Minus, Building2 } from 'lucide-react';
+import { toast } from '@/components/ui/toast';
 import { SpaceSketchCanvas } from './space-sketch/SpaceSketchCanvas';
 import { OptionsPopover, HelpPopover } from './space-sketch/SpaceSketchPopovers';
 import { SpaceSketchReopenPill } from './space-sketch/SpaceSketchReopenPill';
@@ -73,8 +74,17 @@ export function SpaceSketchOverlay() {
   const addSpace = useViewerStore((s) => s.addSpace);
   const removeEntity = useViewerStore((s) => s.removeEntity);
   const activeModelId = useViewerStore((s) => s.activeModelId);
+  const models = useViewerStore((s) => s.models);
+  const toGlobalId = useViewerStore((s) => s.toGlobalId);
   const minimized = useViewerStore((s) => s.spaceSketchMinimized);
   const setMinimized = useViewerStore((s) => s.setSpaceSketchMinimized);
+  // The model this sketch session creates spaces in. `activeModelId` can be
+  // null with a single model loaded (the hierarchy stores the model UUID), so
+  // fall back to the only/first model instead of disabling the whole workflow.
+  const sketchModelId = useMemo(
+    () => activeModelId ?? (models.size > 0 ? models.keys().next().value ?? null : null),
+    [activeModelId, models],
+  );
   // Rooms are derived from the RENDERED wall meshes (the geometry the user sees),
   // so the room lines land on the rendered wall faces — not from STEP source
   // geometry, which has no per-wall thickness here and a centroid-biased axis.
@@ -245,12 +255,12 @@ export function SpaceSketchOverlay() {
   const lastActiveStoreyRef = useRef<string | null>(null);
   useEffect(() => {
     if (!storeys.length) return;
-    const sketchModelId = activeStorey?.modelId ?? activeModelId ?? 'legacy';
+    const storeyModelKey = activeStorey?.modelId ?? activeModelId ?? 'legacy';
     const activeHere =
       activeStorey && storeys.some((s) => s.id === activeStorey.expressId)
         ? activeStorey.expressId
         : null;
-    const activeKey = activeHere == null ? null : `${sketchModelId}:${activeHere}`;
+    const activeKey = activeHere == null ? null : `${storeyModelKey}:${activeHere}`;
     // Follow the shared active storey when it changes to one in this model.
     if (activeKey != null && activeKey !== lastActiveStoreyRef.current) {
       lastActiveStoreyRef.current = activeKey;
@@ -492,17 +502,21 @@ export function SpaceSketchOverlay() {
   }, [storeys]);
 
   // ── 3D coupling ────────────────────────────────────────────────────────────
-  // The tool takes over the 3D view: it isolates to the spaces (existing + every
-  // storey's draft ghosts) so ONLY the rooms show and the building is hidden,
-  // frames them on open, and mirrors the live drafts as semi-transparent ghost
-  // meshes so the 2D plan and the model stay in lockstep. Active whenever a model
-  // is loaded — the overlay only mounts while the tool is active.
-  const sceneEnabled = !!activeModelId && !!ifcDataStore;
-  // The model's existing IfcSpace ids — the isolation base, so the 3D view
-  // isolates to spaces ∪ draft ghosts (hiding the building).
+  // The 2D plan and the model stay in lockstep: every storey's drafts mirror
+  // into the 3D scene as semi-transparent ghost meshes, and while anything is
+  // drafted the rest of the model is X-rayed (`ghostExceptEntities`) so the
+  // rooms read against the building instead of replacing it. The camera frames
+  // the relevant extent once on open; the prior view is restored on close.
+  const sceneEnabled = !!sketchModelId && !!ifcDataStore;
+  // The model's existing IfcSpace ids as federated GLOBAL ids (the renderer's
+  // id space; single-model globalId === expressId) — kept solid alongside the
+  // draft ghosts while the rest of the model is X-rayed, and framed on open.
   const existingSpaceIds = useMemo(
-    () => (ifcDataStore ? ifcDataStore.getEntitiesByType('IfcSpace').map((e) => e.expressId) : []),
-    [ifcDataStore],
+    () =>
+      ifcDataStore
+        ? ifcDataStore.getEntitiesByType('IfcSpace').map((e) => toGlobalId(sketchModelId ?? 'legacy', e.expressId))
+        : [],
+    [ifcDataStore, sketchModelId, toGlobalId],
   );
   // Every draft room across EVERY storey, as ghost specs (outline + that storey's
   // floor elevation + height). Recomputed on any draft change so all floors'
@@ -525,7 +539,7 @@ export function SpaceSketchOverlay() {
   const { clearGhosts } = useSpaceGhostPreview({
     enabled: sceneEnabled,
     ghosts: ghostSpecs,
-    isolationBase: existingSpaceIds,
+    contextIds: existingSpaceIds,
   });
 
   /**
@@ -551,8 +565,8 @@ export function SpaceSketchOverlay() {
     rooms: { outline: Pt[]; boundary: Pt[] }[],
     authored: Pt[][],
   ): { emitted: number; skipped: number; error: string | null } => {
-    if (!activeModelId) return { emitted: 0, skipped: 0, error: null };
-    for (const id of generatedRef.current.get(sid) ?? []) removeEntity(activeModelId, id);
+    if (!sketchModelId) return { emitted: 0, skipped: 0, error: 'no model to create spaces in' };
+    for (const id of generatedRef.current.get(sid) ?? []) removeEntity(sketchModelId, id);
     generatedRef.current.delete(sid);
     const height = floorToFloor(sid);
     const newIds: number[] = [];
@@ -567,7 +581,7 @@ export function SpaceSketchOverlay() {
       if (authored.some((fp) => pointInPoly(cx, cy, fp))) { skipped++; continue; }
       // `boundary` is the engine's net/gross/centre outline; gross area stays on
       // the centreline so the quantity reflects the room, not the wall face.
-      const res = addSpace(activeModelId, sid, {
+      const res = addSpace(sketchModelId, sid, {
         Profile: 'polygon', OuterCurve: room.boundary, Height: height,
         Name: `Space ${newIds.length + 1}`, ObjectType: GENERATED_SPACE_OBJECTTYPE,
         grossFloorArea: polyArea(room.outline),
@@ -577,7 +591,7 @@ export function SpaceSketchOverlay() {
     }
     generatedRef.current.set(sid, newIds);
     return { emitted: newIds.length, skipped, error };
-  }, [activeModelId, removeEntity, addSpace, floorToFloor]);
+  }, [sketchModelId, removeEntity, addSpace, floorToFloor]);
 
   /**
    * Confirm: turn EVERY storey's collected draft into IfcSpace at once — the
@@ -585,7 +599,7 @@ export function SpaceSketchOverlay() {
    * the active boundary mode and dedupes against existing authored spaces.
    */
   const createAllSpaces = useCallback((): { emitted: number; floors: number; error: string | null } => {
-    if (!activeModelId || !ifcDataStore) return { emitted: 0, floors: 0, error: null };
+    if (!sketchModelId || !ifcDataStore) return { emitted: 0, floors: 0, error: null };
     const authoredMap = existingSpaceFootprintsByStorey(ifcDataStore);
     let emitted = 0, floors = 0;
     let firstError: string | null = null;
@@ -602,7 +616,7 @@ export function SpaceSketchOverlay() {
     }
     if (emitted > 0) revealSpaces();
     return { emitted, floors, error: firstError };
-  }, [activeModelId, ifcDataStore, boundaryMode, createSpacesForStorey, revealSpaces]);
+  }, [sketchModelId, ifcDataStore, boundaryMode, createSpacesForStorey, revealSpaces]);
 
   /**
    * Derive rooms on EVERY storey into its own draft session, so the whole
@@ -636,17 +650,6 @@ export function SpaceSketchOverlay() {
     setPendingTick((v) => v + 1);
     setStatus(`Derived rooms across ${floors} storey(s). Confirm on close to create the spaces.`);
   }, [ifcDataStore, geometryResult, storeys, floorToFloor]);
-
-  // On open, populate EVERY storey's draft automatically (once the first storey
-  // has derived, so it isn't double-built) — the user shouldn't have to visit
-  // each floor for it to appear in the pending list. Runs once per tool session.
-  const didDeriveAllRef = useRef(false);
-  useEffect(() => {
-    if (didDeriveAllRef.current) return;
-    if (!sceneEnabled || derivedStorey == null) return; // wait for the first derive
-    didDeriveAllRef.current = true;
-    void deriveAllStoreys();
-  }, [sceneEnabled, derivedStorey, deriveAllStoreys]);
 
   // One space for the whole floor: replace the draft with a single room whose
   // outline is the storey's exterior wall perimeter (convex hull of the wall
@@ -683,20 +686,6 @@ export function SpaceSketchOverlay() {
       sessionRef.current = null;
     };
   }, []);
-
-  // Click into the 3D scene → collapse the panel to its reopen pill so the user
-  // can inspect the model (and the live ghost preview) unobstructed. A passive,
-  // non-capturing listener so it never fights the camera orbit/select handlers.
-  // The overlay stays mounted (the wasm session + draft survive) — only the
-  // panel chrome is swapped for the pill.
-  useEffect(() => {
-    if (minimized) return;
-    const canvas = document.querySelector('[data-viewport="main"]');
-    if (!canvas) return;
-    const onDown = () => setMinimized(true);
-    canvas.addEventListener('pointerdown', onDown, { passive: true });
-    return () => canvas.removeEventListener('pointerdown', onDown);
-  }, [minimized, setMinimized]);
 
   const svgPoint = (e: React.MouseEvent): Pt => {
     const rect = svgRef.current!.getBoundingClientRect();
@@ -892,26 +881,42 @@ export function SpaceSketchOverlay() {
   // There is a draft on at least one storey to create.
   const needsConfirm = pendingRooms > 0;
 
-  // Cancel: drop ghosts, restore the prior isolation/visibility (building back),
-  // and leave the tool WITHOUT creating anything.
+  // Cancel: drop ghosts, restore the prior view (X-ray off, isolation and
+  // spaces visibility as they were), and leave WITHOUT creating anything.
   const closeNow = useCallback(() => {
     clearGhosts();
     restoreScene({ keepSpacesVisible: false });
     setActiveTool('select');
   }, [clearGhosts, restoreScene, setActiveTool]);
 
-  // The single confirm: create EVERY storey's draft as IfcSpace at once, then
-  // leave with ONLY the rooms visible — isolated to all spaces (existing + the
-  // ones just created), building hidden, and not restored.
+  // The single confirm: create EVERY storey's draft as IfcSpace at once. On
+  // success the tool closes with the prior view restored (spaces stay visible)
+  // and the created spaces selected, so the result is highlighted in context
+  // and no modal view state lingers. On any create failure the tool STAYS OPEN
+  // with drafts + ghosts intact so nothing is silently dropped — the status
+  // line reports the error and confirming again retries (replacing whatever
+  // this session already created).
   const confirmCreate = useCallback(() => {
-    createAllSpaces();
+    const res = createAllSpaces();
+    if (res.error) {
+      setPendingTick((v) => v + 1);
+      setStatus(`Created ${res.emitted} space(s), but some failed: ${res.error}. Fix and confirm again.`);
+      return;
+    }
+    if (res.emitted > 0) {
+      const store = useViewerStore.getState();
+      const created: number[] = [];
+      for (const ids of generatedRef.current.values()) created.push(...ids);
+      store.setSelectedEntityIds(created.map((id) => toGlobalId(sketchModelId ?? 'legacy', id)));
+      toast.success(
+        `Created ${res.emitted} ${res.emitted === 1 ? 'space' : 'spaces'}` +
+          (res.floors > 1 ? ` across ${res.floors} storeys` : ''),
+      );
+    }
     clearGhosts();
-    const ids = [...existingSpaceIds];
-    for (const created of generatedRef.current.values()) ids.push(...created);
-    useViewerStore.getState().setIsolatedEntities(ids.length > 0 ? new Set(ids) : null);
-    restoreScene({ keepSpacesVisible: true, keepIsolation: true });
+    restoreScene({ keepSpacesVisible: true });
     setActiveTool('select');
-  }, [createAllSpaces, clearGhosts, existingSpaceIds, restoreScene, setActiveTool]);
+  }, [createAllSpaces, clearGhosts, restoreScene, setActiveTool, sketchModelId, toGlobalId]);
 
   // While the panel is open, Esc belongs to the sketch — NOT the global
   // shortcut (which closes the tool and would lose the sketch). Capture-phase +
@@ -1392,11 +1397,12 @@ export function SpaceSketchOverlay() {
   const leakCount = diagnostics ? diagnostics.filter((s) => !s.bounding).length : 0;
   const badCount = rooms.filter((r) => !r.simple).length;
 
-  // Collapsed: clicking into the 3D scene swaps the panel for the reopen pill so
-  // the model (and the live ghost preview) is unobstructed. The overlay stays
-  // mounted, so the session + all state survive the collapse.
+  // Collapsed (via the header's minimize button): the panel is swapped for a
+  // small reopen pill so the model and the live ghost preview are unobstructed.
+  // The overlay stays mounted, so the sessions + all state survive the collapse;
+  // the pill shows the aggregated pending count across every storey.
   if (minimized) {
-    return <SpaceSketchReopenPill roomCount={rooms.length} onReopen={() => setMinimized(false)} />;
+    return <SpaceSketchReopenPill pendingCount={pendingRooms} onReopen={() => setMinimized(false)} />;
   }
 
   return (
@@ -1420,6 +1426,8 @@ export function SpaceSketchOverlay() {
         <div className="flex items-center gap-0.5">
           <button className={`${iconBtn} ${helpOpen ? 'bg-muted text-foreground' : ''}`} aria-pressed={helpOpen}
             onClick={() => { setHelpOpen((v) => !v); setOptionsOpen(false); }} title="How it works"><HelpCircle className="h-4 w-4" /></button>
+          <button className={iconBtn} onClick={() => setMinimized(true)}
+            title="Minimize — drafts and 3D preview stay live"><Minus className="h-4 w-4" /></button>
           <button className={iconBtn} onClick={closeNow} title="Close without creating (Esc)"><X className="h-4 w-4" /></button>
         </div>
       </div>
@@ -1430,6 +1438,9 @@ export function SpaceSketchOverlay() {
           onChange={(e) => setStoreyId(Number(e.target.value))} disabled={!storeys.length}>
           {storeys.length ? storeys.map((s) => <option key={s.id} value={s.id}>{s.name}</option>) : <option>no model</option>}
         </select>
+        <button className={iconBtn} onClick={() => void deriveAllStoreys()} disabled={!sketchModelId}
+          title="Derive rooms on every storey — drafts only until you confirm; storeys you already edited are kept">
+          <Building2 className="h-4 w-4" /></button>
         <span className="shrink-0 pr-0.5 text-[11px] tabular-nums text-muted-foreground">
           {rooms.length} {rooms.length === 1 ? 'room' : 'rooms'} · {total.toFixed(1)} m²
         </span>
@@ -1444,7 +1455,7 @@ export function SpaceSketchOverlay() {
         <button className={`${iconBtn} ${drawMode === 'rect' ? 'bg-primary/10 text-primary hover:bg-primary/15' : ''}`}
           onClick={() => selectDrawMode('rect')} aria-pressed={drawMode === 'rect'}
           title="Rectangle room: click two opposite corners (Shift = square)"><Square className="h-4 w-4" /></button>
-        <button className={iconBtn} onClick={() => void addFootprint()} disabled={!activeModelId}
+        <button className={iconBtn} onClick={() => void addFootprint()} disabled={!sketchModelId}
           title="Footprint: one room over the whole storey outline (convex outline of its walls)"><Frame className="h-4 w-4" /></button>
         <span className="mx-0.5 h-5 w-px bg-border" />
         <button className={iconBtn} onClick={undo} disabled={!canUndo} title="Undo (Ctrl+Z)"><Undo2 className="h-4 w-4" /></button>
@@ -1489,8 +1500,6 @@ export function SpaceSketchOverlay() {
           onToggleBuilding={() => setShowBuilding((v) => !v)}
           showDiagnostics={showDiagnostics}
           onToggleDiagnostics={() => setShowDiagnostics((v) => !v)}
-          onGenerateAll={() => { setOptionsOpen(false); void deriveAllStoreys(); }}
-          generateDisabled={!activeModelId}
         />
       )}
       {helpOpen && <HelpPopover />}

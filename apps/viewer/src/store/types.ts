@@ -251,9 +251,10 @@ export interface CameraCallbacks {
   zoomOut?: () => void;
   frameSelection?: () => void;
   /**
-   * Frame the camera on the bounds of an explicit set of express-ids
-   * (active model), keeping the current view direction. Used by the Space
-   * Sketch tool to zoom to the existing IfcSpace extent on open.
+   * Frame the camera on the bounds of an explicit id set, keeping the current
+   * view direction. Ids are federated GLOBAL ids — the id space the scene
+   * meshes carry (single model: global === express). Used by the Space Sketch
+   * tool to zoom to the existing IfcSpace extent on open.
    */
   frameEntities?: (ids: number[]) => void;
   /**

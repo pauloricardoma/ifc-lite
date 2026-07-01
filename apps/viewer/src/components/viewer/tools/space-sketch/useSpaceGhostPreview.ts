@@ -6,14 +6,21 @@
  * Live 3D preview of the Space Sketch draft rooms across EVERY storey.
  *
  * Renders each draft room (on any storey, not just the active one) as a
- * semi-transparent ghost mesh in the 3D scene WITHOUT committing an IfcSpace, so
- * the 2D plan and the model stay coupled while editing and the building stays
- * hidden behind the rooms on every floor. Ghosts reuse the exact same outline +
- * floor elevation + height the eventual create feeds `addSpace`, so a ghost
- * lands pixel-identical to the space it previews - only tinted differently.
+ * semi-transparent ghost mesh in the 3D scene WITHOUT committing an IfcSpace,
+ * so the 2D plan and the model stay coupled while editing. Ghosts reuse the
+ * exact same outline + floor elevation + height the eventual create feeds
+ * `addSpace`, so a ghost lands pixel-identical to the space it previews —
+ * only tinted differently.
  *
- * The 3D view is isolated to (existing spaces ∪ all draft ghosts) so ONLY the
- * rooms show; the building is hidden as long as there is any room to show.
+ * The building is NEVER hidden: while there is anything to preview, the view
+ * X-rays the rest of the model through `ghostExceptEntities` (building fades
+ * to the renderer's ghost alpha, rooms stay solid), so the drafts read in the
+ * context of the walls they were derived from. The prior view state is
+ * captured/restored by `useSpaceSceneFraming` on close.
+ *
+ * Ghost meshes ride a dedicated scene-overlay channel (`setSpaceOverlayMeshes`
+ * → `appendToBatches` direct), bypassing the streaming geometry pipeline so
+ * per-edit churn can't reset the camera or break picking.
  */
 
 import { useCallback, useEffect, useRef } from 'react';
@@ -22,8 +29,10 @@ import { buildElementMesh } from '@/store/slices/addElementMeshes';
 import type { AddElementSpaceParams } from '@/store/slices/addElementSlice';
 
 /** Draft ghost tint (RGBA 0..1): a cool blue, clearly distinct from the warm
- *  green of a committed IfcSpace, at a low alpha so the model reads through. */
-const GHOST_COLOR: [number, number, number, number] = [0.25, 0.62, 0.95, 0.16];
+ *  tone of a committed IfcSpace. Alpha sits well above the X-ray ghost alpha
+ *  (0.12) so drafts read as "the thing being authored" against the faded
+ *  building, while the model still shows through. */
+const GHOST_COLOR: [number, number, number, number] = [0.25, 0.62, 0.95, 0.4];
 
 /** Reserved high id band for ghost meshes — far above any real express/global
  *  id, so a ghost can never collide with (or be removed alongside) a real
@@ -46,29 +55,41 @@ interface GhostPreviewArgs {
   enabled: boolean;
   /** Every draft room across every storey (memoised by the overlay). */
   ghosts: GhostSpec[];
-  /** Existing IfcSpace ids — the isolation base the ghosts are added to. */
-  isolationBase: number[];
+  /** Existing IfcSpace ids (federated GLOBAL ids) that should stay solid
+   *  alongside the ghosts while the rest of the model is X-rayed. */
+  contextIds: number[];
 }
 
-export function useSpaceGhostPreview({ enabled, ghosts, isolationBase }: GhostPreviewArgs): {
+export function useSpaceGhostPreview({ enabled, ghosts, contextIds }: GhostPreviewArgs): {
   clearGhosts: () => void;
 } {
   const ghostIdsRef = useRef<number[]>([]);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const baseRef = useRef<number[]>(isolationBase);
-  baseRef.current = isolationBase;
+  const contextRef = useRef<number[]>(contextIds);
+  contextRef.current = contextIds;
+  // Whether THIS hook currently owns the X-ray channel — so an empty preview
+  // never clears state it didn't set (setGhostExceptEntities(null) also drops
+  // isolation as a slice side effect).
+  const ghostViewActiveRef = useRef(false);
 
-  // Isolate the 3D view to the spaces (existing base + current draft ghosts) so
-  // the building is hidden and only the rooms show. With nothing to show at all
-  // (no spaces and no ghosts) isolation is cleared so the view is not blank.
-  const syncIsolation = useCallback(() => {
+  // X-ray the model around the rooms: everything except (existing spaces ∪
+  // current draft ghosts) fades to the renderer's ghost alpha, so the drafts
+  // read against the building instead of replacing it. With nothing to show
+  // the X-ray is cleared so the model renders normally.
+  const syncGhostView = useCallback(() => {
     const store = useViewerStore.getState();
-    const ids = [...baseRef.current, ...ghostIdsRef.current];
-    store.setIsolatedEntities(ids.length > 0 ? new Set(ids) : null);
+    const ids = [...contextRef.current, ...ghostIdsRef.current];
+    if (ids.length > 0) {
+      store.setGhostExceptEntities(new Set(ids));
+      ghostViewActiveRef.current = true;
+    } else if (ghostViewActiveRef.current) {
+      store.setGhostExceptEntities(null);
+      ghostViewActiveRef.current = false;
+    }
   }, []);
 
-  // Drop every ghost from the scene's overlay channel. The close path owns
-  // isolation afterwards, so this leaves isolation alone.
+  // Drop every ghost from the scene's overlay channel. The close path owns the
+  // X-ray/view restore afterwards, so this leaves `ghostExceptEntities` alone.
   const clearGhosts = useCallback(() => {
     if (ghostIdsRef.current.length === 0) return;
     useViewerStore.getState().cameraCallbacks.clearSpaceOverlayMeshes?.();
@@ -80,7 +101,6 @@ export function useSpaceGhostPreview({ enabled, ghosts, isolationBase }: GhostPr
     if (!enabled) {
       store.cameraCallbacks.clearSpaceOverlayMeshes?.();
       ghostIdsRef.current = [];
-      syncIsolation();
       return;
     }
     const meshes: ReturnType<typeof buildElementMesh>[] = [];
@@ -107,8 +127,8 @@ export function useSpaceGhostPreview({ enabled, ghosts, isolationBase }: GhostPr
     // Replace the overlay in ONE scene operation (no geometryResult churn).
     store.cameraCallbacks.setSpaceOverlayMeshes?.(meshes.filter((m): m is NonNullable<typeof m> => m !== null));
     ghostIdsRef.current = newIds;
-    syncIsolation();
-  }, [enabled, ghosts, syncIsolation]);
+    syncGhostView();
+  }, [enabled, ghosts, syncGhostView]);
 
   // Debounced rebuild whenever the draft set changes.
   useEffect(() => {

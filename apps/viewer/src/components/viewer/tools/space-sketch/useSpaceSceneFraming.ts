@@ -3,20 +3,21 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * 3D scene framing + isolation for the Space Sketch tool.
+ * 3D scene framing + view capture/restore for the Space Sketch tool.
  *
- * On open the tool takes over the 3D view so the user actually SEES the spaces
- * they are about to sketch (IfcSpace is class-hidden by default and the
- * building shell obscures it):
+ * On open the tool makes the spaces the user is about to sketch visible
+ * without taking the building away (IfcSpace is class-hidden by default and
+ * the shell obscures it):
  *   - turn IfcSpace visibility on,
- *   - if the model already has spaces: isolate them and frame their extent,
- *   - otherwise: frame the building shell (NOT the much larger site extent),
- *     leaving isolation alone so the walls stay visible to sketch against.
+ *   - frame the existing spaces' extent when the model has any, otherwise
+ *     frame the building shell (NOT the much larger site extent).
+ * The building itself is never hidden — while drafts exist the ghost-preview
+ * hook X-rays it via `ghostExceptEntities` so the rooms read in context.
  *
- * On close it restores the prior isolation + visibility, EXCEPT after a bake
- * (`restore(true)`) where freshly-created spaces should stay visible. `restore`
- * is idempotent so the explicit close paths and the unmount cleanup can both
- * call it without double-applying.
+ * On close `restore` replays the exact prior view (isolation, X-ray, spaces
+ * visibility), EXCEPT after a confirm (`keepSpacesVisible`) where the
+ * freshly-created spaces should stay visible. `restore` is idempotent so the
+ * explicit close paths and the unmount cleanup can both call it safely.
  */
 
 import { useCallback, useEffect, useRef } from 'react';
@@ -25,31 +26,37 @@ import { useViewerStore } from '@/store';
 interface SceneFramingArgs {
   /** Tool open AND a model present. Drives the one-shot open behavior. */
   enabled: boolean;
-  /** The model's existing IfcSpace express-ids (active model). */
+  /** The model's existing IfcSpace ids (federated GLOBAL ids). */
   existingSpaceIds: number[];
 }
 
 export function useSpaceSceneFraming({ enabled, existingSpaceIds }: SceneFramingArgs): {
-  restore: (opts: { keepSpacesVisible: boolean; keepIsolation?: boolean }) => void;
+  restore: (opts: { keepSpacesVisible: boolean }) => void;
 } {
   // Prior 3D view state captured on open, replayed on close.
-  const priorRef = useRef<{ isolated: Set<number> | null; spacesVisible: boolean } | null>(null);
-  // Did THIS hook flip spaces visibility on? Only then do we restore it.
-  const flippedSpacesRef = useRef(false);
+  const priorRef = useRef<{
+    isolated: Set<number> | null;
+    ghostExcept: Set<number> | null;
+    spacesVisible: boolean;
+  } | null>(null);
   const restoredRef = useRef(false);
 
-  // Tear down the open behavior. `keepSpacesVisible` keeps IfcSpace shown;
-  // `keepIsolation` leaves the current isolation in place (used after a confirm,
-  // which isolates to the freshly-created spaces so ONLY rooms stay visible)
-  // instead of restoring the building.
-  const restore = useCallback((opts: { keepSpacesVisible: boolean; keepIsolation?: boolean }) => {
+  // Tear down the open behavior: put isolation / X-ray / spaces visibility
+  // back to what they were before the tool opened. `keepSpacesVisible` keeps
+  // IfcSpace shown (after a confirm, so the user sees what they created).
+  const restore = useCallback((opts: { keepSpacesVisible: boolean }) => {
     if (restoredRef.current) return;
     restoredRef.current = true;
     const prior = priorRef.current;
     if (!prior) return;
     const store = useViewerStore.getState();
-    if (!opts.keepIsolation) store.setIsolatedEntities(prior.isolated);
-    if (!opts.keepSpacesVisible && flippedSpacesRef.current && store.typeVisibility.spaces) {
+    // Isolation and X-ray are mutually exclusive in the slice (each setter
+    // clears the other), so restore isolation first, then any prior X-ray.
+    store.setIsolatedEntities(prior.isolated);
+    if (prior.ghostExcept) store.setGhostExceptEntities(prior.ghostExcept);
+    // Restore against the CAPTURED visibility, not a "did we flip it" flag —
+    // something else may have toggled spaces mid-session.
+    if (!opts.keepSpacesVisible && store.typeVisibility.spaces !== prior.spacesVisible) {
       store.toggleTypeVisibility('spaces');
     }
   }, []);
@@ -60,38 +67,25 @@ export function useSpaceSceneFraming({ enabled, existingSpaceIds }: SceneFraming
     restoredRef.current = false;
     priorRef.current = {
       isolated: store.isolatedEntities ? new Set(store.isolatedEntities) : null,
+      ghostExcept: store.ghostExceptEntities ? new Set(store.ghostExceptEntities) : null,
       spacesVisible: store.typeVisibility.spaces,
     };
 
-    // Reveal spaces so isolation / new ghosts are not class-hidden.
-    if (!store.typeVisibility.spaces) {
-      store.toggleTypeVisibility('spaces');
-      flippedSpacesRef.current = true;
-    } else {
-      flippedSpacesRef.current = false;
-    }
+    // Reveal spaces so the existing rooms and the draft ghosts are not
+    // class-hidden while the tool is open.
+    if (!store.typeVisibility.spaces) store.toggleTypeVisibility('spaces');
 
+    // One gentle camera move per open: to the existing spaces when there are
+    // any, else to the building shell (not the georeferenced site extent).
     if (existingSpaceIds.length > 0) {
-      // Isolate the existing spaces (the ghost hook folds all storeys' draft
-      // ghosts into this set). Only frame the camera when we're NEWLY isolating
-      // them — if they're already the active isolation (e.g. re-opening the tool
-      // right after a confirm left them isolated), keep the user's camera put
-      // instead of jumping it to the extent again.
-      const newSet = new Set(existingSpaceIds);
-      const prior = priorRef.current?.isolated;
-      const alreadyIsolated = !!prior && prior.size === newSet.size && [...newSet].every((id) => prior.has(id));
-      store.setIsolatedEntities(newSet);
-      if (!alreadyIsolated) store.cameraCallbacks.frameEntities?.(existingSpaceIds);
+      store.cameraCallbacks.frameEntities?.(existingSpaceIds);
     } else {
-      // No spaces yet: frame the building shell (not the whole georeferenced
-      // site). The ghost hook isolates to the drafts the moment derive-all
-      // populates them, hiding the building so only the rooms show.
       store.cameraCallbacks.frameBuildingExtent?.();
     }
 
     return () => {
       // Safety net for any unmount the explicit close paths didn't handle
-      // (tool switched away, etc.): restore the building.
+      // (tool switched away, etc.): put the prior view back.
       restore({ keepSpacesVisible: false });
     };
   }, [enabled, existingSpaceIds, restore]);

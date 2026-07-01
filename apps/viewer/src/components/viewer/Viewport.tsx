@@ -812,8 +812,10 @@ export function Viewport({
           }
         },
         frameEntities: (ids: number[]) => {
-          // Frame an explicit express-id set (active model). Same aggregation as
-          // frameSelection: flat-mesh AABB with an instanced-occurrence fallback.
+          // Frame an explicit id set. Ids are federated GLOBAL ids — the same
+          // id space the scene meshes carry (single model: global === express).
+          // Same aggregation as frameSelection: flat-mesh AABB with an
+          // instanced-occurrence fallback.
           const geom = geometryRef.current;
           if (!geom || ids.length === 0) return;
           const scene = rendererRef.current?.getScene();
@@ -852,11 +854,18 @@ export function Viewport({
           const EXCLUDE = new Set(['IfcSite', 'IfcSpace']);
           let bounds = geom ? accumulateBoundsExcludingTypes(geom, EXCLUDE) : null;
           // Merge in instanced occurrences (not present in flat meshes), skipping
-          // excluded types via the data store's type lookup.
+          // excluded types via each id's OWN model store — instanced ids are
+          // federated global ids, so resolve them through the registry instead
+          // of assuming the active model (fromGlobalId is null pre-federation,
+          // where global === express and the active store is the right one).
           if (scene) {
-            const store = ifcDataStoreRef.current;
+            const state = useViewerStore.getState();
             for (const id of scene.getInstancedEntityIds()) {
-              const type = store?.entities?.getTypeName(id);
+              const loc = state.fromGlobalId(id);
+              const store = loc
+                ? state.models.get(loc.modelId)?.ifcDataStore
+                : ifcDataStoreRef.current;
+              const type = store?.entities?.getTypeName(loc ? loc.expressId : id);
               if (type && EXCLUDE.has(type)) continue;
               const b = scene.getInstancedEntityBounds(id);
               if (!b) continue;

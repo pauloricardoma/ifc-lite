@@ -22,16 +22,12 @@ export interface OptionsPopoverProps {
   onToggleBuilding: () => void;
   showDiagnostics: boolean;
   onToggleDiagnostics: () => void;
-  /** Bake a space into every storey at once (auto floor-to-floor height). */
-  onGenerateAll: () => void;
-  generateDisabled: boolean;
 }
 
 export function OptionsPopover(props: OptionsPopoverProps) {
   const {
     boundaryMode, onBoundaryMode, hasWallData, snapDelta, usedTol, snapDisabled,
     onSnap, snapTol, showBuilding, onToggleBuilding, showDiagnostics, onToggleDiagnostics,
-    onGenerateAll, generateDisabled,
   } = props;
   return (
     <div className="absolute right-3 top-12 z-20 w-64 space-y-3 rounded-lg border bg-popover p-3 text-[11px] text-muted-foreground shadow-xl">
@@ -77,14 +73,6 @@ export function OptionsPopover(props: OptionsPopoverProps) {
         <span className="text-foreground">Leak diagnostics</span>
         <input type="checkbox" className="accent-primary" checked={showDiagnostics} disabled={!hasWallData} onChange={onToggleDiagnostics} />
       </label>
-      <div className="border-t pt-2">
-        <button
-          className="w-full rounded-md border px-2 py-1.5 text-center font-medium text-foreground hover:bg-muted disabled:opacity-40"
-          onClick={onGenerateAll} disabled={generateDisabled}
-          title="Derive draft rooms on every storey at once. Nothing is created until you confirm on close; storeys you already edited are kept.">
-          Derive all storeys
-        </button>
-      </div>
     </div>
   );
 }
@@ -97,7 +85,7 @@ const HELP_ROWS: [string, string][] = [
   ['Click empty space', 'draw a room (Enter / dbl-click closes)'],
   ['⌥/Ctrl/right-click a node', 'remove it (cleans up orphans)'],
   ['⌥/Ctrl/right-click a wall', 'merge rooms / remove & clean up'],
-  ['Click in 3D', 'collapse the panel · scroll = zoom · Shift-drag = pan'],
+  ['Shift-drag / middle-drag', 'pan · scroll = zoom'],
 ];
 
 export function HelpPopover() {

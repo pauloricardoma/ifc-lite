@@ -20,8 +20,8 @@ impl IfcAPI {
     /// const dfjson = api.exportDfjson(ifcContent, "my_model");
     /// ```
     #[wasm_bindgen(js_name = exportDfjson)]
-    pub fn export_dfjson(&self, content: String, name: String) -> String {
+    pub fn export_dfjson(&self, content: &[u8], name: String) -> String {
         let opts = ifc_lite_export::DfjsonOptions { name, tolerance: 0.01 };
-        ifc_lite_export::export_dfjson(content.as_bytes(), &opts)
+        ifc_lite_export::export_dfjson(content, &opts)
     }
 }
