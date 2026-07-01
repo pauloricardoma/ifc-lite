@@ -384,12 +384,25 @@ export const mainShaderSource = `
             color = vec3<f32>(0.3, 0.6, 1.0) * shade;
           }
 
+          // flags.x bit 5 (value 32) = EMPHASIZE overlay: render the colour
+          // override FULLY UNLIT and saturated (no lighting attenuation, no
+          // wash-to-white) so the focused clash pair reads as a solid, vivid,
+          // distinct colour that pops against the lit model — like a clash tool.
+          // A faint normal-based shade keeps the silhouette from going flat. (#1277)
+          let emphasizedOverlay = isOverlay && (uniforms.flags.x & 32u) != 0u;
+          if (emphasizedOverlay) {
+            let facet = 0.85 + 0.15 * abs(dot(N, normalize(vec3<f32>(0.3, 1.0, 0.2))));
+            color = baseColor * facet;
+          }
+
           // Beautiful fresnel effect for transparent materials (glass)
           // Skip when selected — the glass shine and desaturation wash out the
           // blue highlight, making it appear white instead of blue.
           // Also force alpha to 1.0 for selected objects so the highlight is
           // fully opaque (the selection pipeline has no alpha blending).
-          var finalAlpha = select(input.color.a, 1.0, isSelected);
+          // Emphasized clash overlay paints a SOLID vivid fill (force opaque) so
+          // it isn't blended down to a pale tint against the geometry beneath.
+          var finalAlpha = select(input.color.a, 1.0, isSelected || emphasizedOverlay);
           if (finalAlpha < 0.99 && !isSelected && !isOverlay) {
             // Calculate view direction for fresnel
             let V = normalize(-input.worldPos);

@@ -191,6 +191,12 @@ export interface RenderOptions {
   selectedId?: number | null;     // Currently selected mesh (for highlighting)
   selectedIds?: Set<number>;      // Multi-selection support
   /**
+   * Render the active colour overrides almost full-bright so they POP like a
+   * highlight rather than reading as normal lit materials. Used while a clash is
+   * focused so the amber/cyan pair stands out. (#1277/#1339)
+   */
+  emphasizeOverrides?: boolean;
+  /**
    * Per-frame alpha overrides — primary use case is X-Ray mode.
    *
    * Map<expressId, alpha 0..1>. Non-selected meshes/batches whose expressId
@@ -235,8 +241,9 @@ export interface RenderOptions {
   // Section plane clipping
   sectionPlane?: SectionPlane;
   // Section / crop box: clip geometry to an axis-aligned world-space box (all six
-  // sides). Independent of `sectionPlane`. Rendering only: the GPU picker does not
-  // clip on the box (same as `sectionPlane`), so consumers filter box picks themselves.
+  // sides). Independent of `sectionPlane`. The GPU picker mirrors the active
+  // section plane + clip box from the last render, so cropped/sectioned-away
+  // geometry is unpickable too with no extra wiring.
   clipBox?: ClipBox;
   // Terrain clipping: discard fragments below this Y value in viewer space.
   // Used by Cesium overlay to prevent model from showing below terrain.
@@ -270,6 +277,20 @@ export interface PickOptions {
   // Visibility filtering - same as RenderOptions for consistency
   hiddenIds?: Set<number>;        // Hidden elements (can't be picked)
   isolatedIds?: Set<number> | null; // Only these elements can be picked (null = all pickable)
+}
+
+/**
+ * Resolved clip state the GPU picker mirrors from the most recent render so that
+ * section/crop-clipped geometry is unpickable, not just invisible. The renderer
+ * stashes this each `render()` and feeds it to the picker; consumers don't build
+ * it. Point clouds are clipped by the section plane only (matching the point
+ * render); the crop box clips triangle meshes only, on render and on pick.
+ */
+export interface PickClipState {
+  // Resolved section plane (world space, already enabled), or null when off.
+  sectionPlane?: { normal: [number, number, number]; distance: number; flipped: boolean } | null;
+  // Active axis-aligned crop box, or null when off.
+  clipBox?: ClipBox | null;
 }
 
 /**

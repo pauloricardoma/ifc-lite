@@ -26,12 +26,25 @@ export {
   type MetadataBootstrapSpatialNode,
 } from './platform-bridge.js';
 
+// Public CSG / opening diagnostics contract (surfaced on the streaming `complete`
+// event and the native ProcessingStats).
+export type { GeometryDiagnostics } from './diagnostics.js';
+export { mergeGeometryDiagnostics } from './diagnostics.js';
+
 // Support components
 export { BufferBuilder } from './buffer-builder.js';
 export { CoordinateHandler } from './coordinate-handler.js';
 export { GeometryQuality } from './progressive-loader.js';
 export { computeWorkerCount, pickWorkerCount, type WorkerCountInputs, type WorkerCountResult } from './worker-count.js';
 export { getGeometryStreamWatchdogMs, type WatchdogInputs } from './watchdog.js';
+// Stale-deployment WASM-asset detection (#1363). The host app subscribes to
+// WASM_ASSET_UNAVAILABLE_EVENT and uses `isWasmAssetUnavailableError` to reload
+// onto the current deployment. `notifyIfWasmAssetUnavailable` stays internal —
+// it is the engine-side dispatcher, imported directly where it fires.
+export {
+  isWasmAssetUnavailableError,
+  WASM_ASSET_UNAVAILABLE_EVENT,
+} from './wasm-asset-error.js';
 export {
   // `isInstancedShard` / `INSTANCED_SHARD_MAGIC` / `INSTANCED_SHARD_VERSION`
   // are intentionally NOT re-exported — they have no consumer outside the
@@ -45,6 +58,7 @@ export {
 export * from './types.js';
 
 import { IfcLiteBridge } from './ifc-lite-bridge.js';
+import { notifyIfWasmAssetUnavailable } from './wasm-asset-error.js';
 import { BufferBuilder } from './buffer-builder.js';
 import { CoordinateHandler } from './coordinate-handler.js';
 import { GeometryQuality } from './progressive-loader.js';
@@ -109,6 +123,16 @@ export interface GeometryProcessorOptions {
    * and worker-pool); the native desktop path does not consume it yet.
    */
   tessellationQuality?: TessellationQuality;
+  /**
+   * Tier-independent small-cut skip (issue #1286). When true, the WASM mesh pass
+   * drops `IfcBooleanResult` differences whose cutter is tiny relative to its
+   * host (steel copes/notches, minor detail recesses) WITHOUT lowering the
+   * tessellation tier — so curves keep full density while the dominant
+   * boolean-heavy load cost is skipped. Default false ⇒ every cut runs
+   * (byte-identical to before). The viewer enables it for the on-screen load;
+   * exporters/drawings leave it off so their geometry stays full fidelity.
+   */
+  skipSmallCuts?: boolean;
 }
 
 let activeWasmStreamingOperation: string | null = null;
@@ -183,7 +207,16 @@ export type StreamingGeometryEvent =
    * is additive.
    */
   | { type: 'progress'; phase: 'prepass' | 'workers' }
-  | { type: 'complete'; totalMeshes: number; coordinateInfo: import('./types.js').CoordinateInfo };
+  | {
+      type: 'complete';
+      totalMeshes: number;
+      coordinateInfo: import('./types.js').CoordinateInfo;
+      /** CSG / opening diagnostics aggregated over the whole load (the
+       *  GeometryDiagnostics contract). Omitted when none were recorded or on
+       *  non-parallel load paths. See ./diagnostics.ts for the field semantics
+       *  and which counts are exact vs batch-summed upper bounds. */
+      diagnostics?: import('./diagnostics.js').GeometryDiagnostics;
+    };
 
 // QueuedNativeStreamingEvent, native stream constants, and yieldToEventLoop
 // have been extracted to ./geometry-native.ts
@@ -200,6 +233,7 @@ export class GeometryProcessor {
   private mergeLayers: boolean;
   private enableInstancing: boolean;
   private tessellationQuality: TessellationQuality | null;
+  private skipSmallCuts: boolean;
 
   constructor(options: GeometryProcessorOptions = {}) {
     this.bufferBuilder = new BufferBuilder();
@@ -208,6 +242,7 @@ export class GeometryProcessor {
     this.mergeLayers = options.mergeLayers === true;
     this.enableInstancing = options.enableInstancing !== false;
     this.tessellationQuality = options.tessellationQuality ?? null;
+    this.skipSmallCuts = options.skipSmallCuts === true;
     // Note: options accepted for API compatibility
     void options.quality;
 
@@ -220,6 +255,8 @@ export class GeometryProcessor {
       this.bridge.setMergeLayers(this.mergeLayers);
       // Same eager cache-and-replay for the tessellation level (#976).
       this.bridge.setTessellationQuality(this.tessellationQuality);
+      // …and the tier-independent small-cut skip (#1286).
+      this.bridge.setSkipSmallCuts(this.skipSmallCuts);
     }
   }
 
@@ -237,7 +274,15 @@ export class GeometryProcessor {
     } else {
       // WASM path
       if (this.bridge) {
-        await this.bridge.init();
+        try {
+          await this.bridge.init();
+        } catch (err) {
+          // A rotated/missing engine binary after a redeploy (#1363) can't be
+          // recovered by retrying the same hashed URL — signal the host to
+          // reload onto the current deployment. No-op for any other failure.
+          notifyIfWasmAssetUnavailable(err);
+          throw err;
+        }
       }
     }
   }
@@ -765,6 +810,10 @@ export class GeometryProcessor {
       // Issue #976: forward the tessellation level so every pool worker's
       // IfcAPI tessellates at the same density as the main-thread paths.
       tessellationQuality: this.tessellationQuality,
+      // Issue #1286: forward the small-cut skip so every pool worker drops the
+      // same tiny detail cuts as the main-thread paths. Forwarded every run, so
+      // an export processor (default false) never inherits a prior load's skip.
+      skipSmallCuts: this.skipSmallCuts,
       wasmUrls,
       workerCountOverride,
     });
@@ -779,6 +828,9 @@ export class GeometryProcessor {
    * @param options.sizeThreshold File size threshold in bytes (default: 2MB)
    * @param options.batchSize Number of meshes per batch for streaming (default: 25)
    * @param options.entityIndex Optional entity index for priority-based loading
+   * @yields StreamingGeometryEvent with 'batch' events containing MeshData[].
+   *   Multiple meshes may share the same expressId (one per material/part).
+   *   Consumers should group by expressId for per-element rendering or picking.
    */
   async *processAdaptive(
     buffer: Uint8Array,
@@ -1069,7 +1121,7 @@ export class GeometryProcessor {
     isolated: Uint32Array = new Uint32Array(),
   ): string | null {
     if (!this.bridge?.isInitialized()) return null;
-    return this.bridge.exportObj(safeUtf8Decode(buffer), includeNormals, hidden, isolated);
+    return this.bridge.exportObj(buffer, includeNormals, hidden, isolated);
   }
 
   exportGlb(
@@ -1081,7 +1133,18 @@ export class GeometryProcessor {
     lit = true,
   ): Uint8Array | null {
     if (!this.bridge?.isInitialized()) return null;
-    return this.bridge.exportGlb(safeUtf8Decode(buffer), includeMetadata, hidden, isolated, hiddenTypesCsv, lit);
+    return this.bridge.exportGlb(buffer, includeMetadata, hidden, isolated, hiddenTypesCsv, lit);
+  }
+
+  /**
+   * Run geometry extraction on `buffer` and return its typed CSG / opening
+   * diagnostics (the `GeometryDiagnostics` contract), or `undefined` when nothing
+   * diagnostic-worthy happened or the bridge is not initialized. The meshes are
+   * discarded - this is the diagnostics-only surface for the CLI / SDK.
+   */
+  diagnoseGeometry(buffer: Uint8Array): import('./diagnostics.js').GeometryDiagnostics | undefined {
+    if (!this.bridge?.isInitialized()) return undefined;
+    return this.bridge.diagnoseGeometry(buffer);
   }
 
   exportCsv(
@@ -1091,7 +1154,7 @@ export class GeometryProcessor {
     includeProperties = false,
   ): string | null {
     if (!this.bridge?.isInitialized()) return null;
-    return this.bridge.exportCsv(safeUtf8Decode(buffer), mode, delimiter, includeProperties);
+    return this.bridge.exportCsv(buffer, mode, delimiter, includeProperties);
   }
 
   exportJson(
@@ -1101,7 +1164,7 @@ export class GeometryProcessor {
     includeQuantities = true,
   ): string | null {
     if (!this.bridge?.isInitialized()) return null;
-    return this.bridge.exportJson(safeUtf8Decode(buffer), pretty, includeProperties, includeQuantities);
+    return this.bridge.exportJson(buffer, pretty, includeProperties, includeQuantities);
   }
 
   exportJsonld(
@@ -1113,7 +1176,7 @@ export class GeometryProcessor {
     included: Uint32Array = new Uint32Array(),
   ): string | null {
     if (!this.bridge?.isInitialized()) return null;
-    return this.bridge.exportJsonld(safeUtf8Decode(buffer), context, includeProperties, includeQuantities, pretty, included);
+    return this.bridge.exportJsonld(buffer, context, includeProperties, includeQuantities, pretty, included);
   }
 
   exportStep(
@@ -1123,12 +1186,12 @@ export class GeometryProcessor {
     mutationsJson = '',
   ): string | null {
     if (!this.bridge?.isInitialized()) return null;
-    return this.bridge.exportStep(safeUtf8Decode(buffer), schema, included, mutationsJson);
+    return this.bridge.exportStep(buffer, schema, included, mutationsJson);
   }
 
   exportIfcx(buffer: Uint8Array, onlyKnownProperties = true, pretty = false): string | null {
     if (!this.bridge?.isInitialized()) return null;
-    return this.bridge.exportIfcx(safeUtf8Decode(buffer), onlyKnownProperties, pretty);
+    return this.bridge.exportIfcx(buffer, onlyKnownProperties, pretty);
   }
 
   /** Merge several IFC models (raw byte buffers) into one STEP/IFC string. */
@@ -1220,8 +1283,7 @@ export class GeometryProcessor {
     if (!this.bridge || !this.bridge.isInitialized()) {
       return null;
     }
-    const content = safeUtf8Decode(buffer);
-    return this.bridge.exportHbjson(content, name);
+    return this.bridge.exportHbjson(buffer, name);
   }
 
   /**

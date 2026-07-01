@@ -9,6 +9,7 @@
 
 import { createLogger } from '@ifc-lite/data';
 import type { TessellationQuality } from './types.js';
+import type { GeometryDiagnostics } from './diagnostics.js';
 import init, {
   IfcAPI,
   SymbolicRepresentationCollection,
@@ -45,6 +46,7 @@ type IfcAPIWithMerge = IfcAPI & {
   setMergeLayers?: (enabled: boolean) => void;
   setComputeGeometryHashes?: (tolerance?: number | null) => void;
   setTessellationQuality?: (level?: string | null) => void;
+  setSkipSmallCuts?: (on: boolean) => void;
 };
 
 export class IfcLiteBridge {
@@ -76,6 +78,14 @@ export class IfcLiteBridge {
    * pattern.
    */
   private tessellationQuality: TessellationQuality | null = null;
+  /**
+   * Tier-independent small-cut skip (#1286). When true, the WASM mesh pass drops
+   * tiny `IfcBooleanResult` detail cuts (steel copes/notches) WITHOUT lowering
+   * the tessellation tier, so curves keep full density. Cached here and forwarded
+   * to the IfcAPI on `init` + every `setSkipSmallCuts` call, mirroring the
+   * `mergeLayers` replay pattern. Default false ⇒ every cut runs.
+   */
+  private skipSmallCuts: boolean = false;
 
   private isWasmRuntimeError(error: unknown): boolean {
     return error instanceof WebAssembly.RuntimeError;
@@ -139,6 +149,8 @@ export class IfcLiteBridge {
       this.applyComputeGeometryHashes();
       // …and for the tessellation-quality level (issue #976).
       this.applyTessellationQuality();
+      // …and for the tier-independent small-cut skip (issue #1286).
+      this.applySkipSmallCuts();
       this.initialized = true;
       log.info('WASM geometry engine initialized');
     } catch (error) {
@@ -301,7 +313,7 @@ export class IfcLiteBridge {
    * `hidden` / `isolated` are express-id visibility filters (empty `isolated` ⇒ all).
    */
   exportObj(
-    content: string,
+    content: Uint8Array,
     includeNormals = true,
     hidden: Uint32Array = new Uint32Array(),
     isolated: Uint32Array = new Uint32Array(),
@@ -312,11 +324,33 @@ export class IfcLiteBridge {
   }
 
   /**
+   * Run geometry extraction on the raw IFC `content` (`Uint8Array`) and return ONLY
+   * its typed CSG / opening diagnostics (the `GeometryDiagnostics` contract), or
+   * `undefined` when nothing diagnostic-worthy happened. The produced meshes are
+   * dropped. Takes bytes (not a string) so there is no input-size cap.
+   */
+  diagnoseGeometry(content: Uint8Array): GeometryDiagnostics | undefined {
+    if (!this.ifcApi) {
+      throw new Error('IFC-Lite not initialized. Call init() first.');
+    }
+    try {
+      const diag = this.ifcApi.diagnoseGeometry(content) as GeometryDiagnostics | undefined;
+      return diag ?? undefined;
+    } catch (error) {
+      log.error('Failed to diagnose geometry', error, { operation: 'diagnoseGeometry' });
+      if (this.isWasmRuntimeError(error)) {
+        this.markFatalWasmRuntimeError();
+      }
+      throw error;
+    }
+  }
+
+  /**
    * Export the render geometry in `content` as a binary glTF (GLB).
    * `hiddenTypesCsv` is a comma-separated IFC-type visibility filter.
    */
   exportGlb(
-    content: string,
+    content: Uint8Array,
     includeMetadata = false,
     hidden: Uint32Array = new Uint32Array(),
     isolated: Uint32Array = new Uint32Array(),
@@ -333,7 +367,7 @@ export class IfcLiteBridge {
    * empty `delimiter` ⇒ `,`; `includeProperties` adds flattened `Pset_Prop` columns.
    */
   exportCsv(
-    content: string,
+    content: Uint8Array,
     mode: 'entities' | 'properties' | 'quantities' | 'spatial' = 'entities',
     delimiter = ',',
     includeProperties = false,
@@ -345,7 +379,7 @@ export class IfcLiteBridge {
 
   /** Export structured JSON (array of entity objects with typed property values). */
   exportJson(
-    content: string,
+    content: Uint8Array,
     pretty = false,
     includeProperties = true,
     includeQuantities = true,
@@ -361,7 +395,7 @@ export class IfcLiteBridge {
    * empty `included` ⇒ whole model.
    */
   exportStep(
-    content: string,
+    content: Uint8Array,
     schema = '',
     included: Uint32Array = new Uint32Array(),
     mutationsJson = '',
@@ -388,7 +422,7 @@ export class IfcLiteBridge {
   }
 
   /** Export IFC5/IFCX (USD-style node graph). */
-  exportIfcx(content: string, onlyKnownProperties = true, pretty = false): string {
+  exportIfcx(content: Uint8Array, onlyKnownProperties = true, pretty = false): string {
     return this.runExport('exportIfcx', content, (api) =>
       api.exportIfcx(content, onlyKnownProperties, pretty),
     );
@@ -400,7 +434,7 @@ export class IfcLiteBridge {
    * OBJ/glTF/STEP exporters so `--type`/`--storey`/`--where`/`--limit` subsets apply.
    */
   exportJsonld(
-    content: string,
+    content: Uint8Array,
     context = '',
     includeProperties = true,
     includeQuantities = false,
@@ -477,7 +511,7 @@ export class IfcLiteBridge {
    * (Ladybug Tools energy/daylight model). Rooms are built analytically from
    * extruded-area profiles (watertight by construction).
    */
-  exportHbjson(content: string, name: string): string {
+  exportHbjson(content: Uint8Array, name: string): string {
     return this.runExport('exportHbjson', content, (api) => api.exportHbjson(content, name));
   }
 
@@ -495,7 +529,7 @@ export class IfcLiteBridge {
    * Shared wrapper for the domain-format exporters: init guard + structured error
    * logging + fatal-wasm-error marking, mirroring the other bridge entry points.
    */
-  private runExport<T>(op: string, content: string, run: (api: IfcAPI) => T): T {
+  private runExport<T>(op: string, content: Uint8Array, run: (api: IfcAPI) => T): T {
     if (!this.ifcApi) {
       throw new Error('IFC-Lite not initialized. Call init() first.');
     }
@@ -652,5 +686,43 @@ export class IfcLiteBridge {
     log.debug(`tessellationQuality=${this.tessellationQuality ?? 'default'}`, {
       operation: 'setTessellationQuality',
     });
+  }
+
+  /**
+   * Toggle the tier-independent small-cut skip (issue #1286). Safe to call
+   * before `init()` — the value is cached and re-applied on the freshly
+   * constructed IfcAPI. Applies to meshes produced AFTER the call.
+   */
+  setSkipSmallCuts(on: boolean): void {
+    this.skipSmallCuts = on;
+    if (!this.ifcApi) return; // init() will apply on the new IfcAPI
+    this.applySkipSmallCuts();
+  }
+
+  /** Read back the active small-cut skip flag. */
+  getSkipSmallCuts(): boolean {
+    return this.skipSmallCuts;
+  }
+
+  /**
+   * Forward the cached small-cut skip flag to the underlying IfcAPI. Guards
+   * against an older WASM build that predates the binding so the flag degrades
+   * to a no-op (every cut runs) rather than throwing — same defensive shape as
+   * `applyTessellationQuality`.
+   */
+  private applySkipSmallCuts(): void {
+    if (!this.ifcApi) return;
+    const api = this.ifcApi as IfcAPIWithMerge;
+    if (typeof api.setSkipSmallCuts !== 'function') {
+      if (this.skipSmallCuts) {
+        log.warn('setSkipSmallCuts not present on WASM API — flag ignored until WASM is rebuilt', {
+          operation: 'setSkipSmallCuts',
+          data: { requested: this.skipSmallCuts },
+        });
+      }
+      return;
+    }
+    api.setSkipSmallCuts(this.skipSmallCuts);
+    log.debug(`skipSmallCuts=${this.skipSmallCuts}`, { operation: 'setSkipSmallCuts' });
   }
 }

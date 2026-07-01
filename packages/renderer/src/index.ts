@@ -17,6 +17,7 @@ export { Picker } from './picker.js';
 export { MathUtils } from './math.js';
 export { SectionPlaneRenderer } from './section-plane.js';
 export { Section2DOverlayRenderer } from './section-2d-overlay.js';
+import { aabbEdgeLineList } from './aabb-edges.js';
 
 // IfcAnnotation overlay pipelines (3D world-space). Self-contained — caller
 // passes a GPUDevice + presentation format and invokes `.render(pass, viewProj)`
@@ -89,6 +90,8 @@ import type {
     RenderOptions,
     PickOptions,
     PickResult,
+    PickClipState,
+    ClipBox,
     Mesh,
     VisualEnhancementOptions,
     ContactShadingQuality,
@@ -175,6 +178,9 @@ export class Renderer {
     private canvas: HTMLCanvasElement;
     private sectionPlaneRenderer: SectionPlaneRenderer | null = null;
     private section2DOverlayRenderer: Section2DOverlayRenderer | null = null;
+    // Overlay/section-cut line colour, kept on the Renderer so it survives a
+    // pre-init call and a section2DOverlayRenderer re-creation (re-applied below).
+    private overlayLineColor: readonly [number, number, number, number] = [0, 0, 0, 1];
     // IfcAnnotation overlay pipelines (issue #653). Created on `init()` once
     // the device exists; nulled until then.
     private symbolicFillPipeline: SymbolicFillPipeline | null = null;
@@ -192,6 +198,9 @@ export class Renderer {
         highQuality: true,
     };
     private pointCloudRenderer: PointCloudRenderer | null = null;
+    /** Set true at the end of `init()`; gates `whenReady()`. */
+    private ready = false;
+    private readyWaiters: Array<() => void> = [];
     private deviationPipeline: DeviationPipeline | null = null;
     /**
      * Cache of which mesh-set the BVH was built from. We rebuild on
@@ -240,6 +249,12 @@ export class Renderer {
     private readonly uniformScratch = new Float32Array(56);
     private readonly uniformScratchU32 = new Uint32Array(this.uniformScratch.buffer, 176, 4);
 
+    // What the last render() actually clipped, so the GPU picker can mirror it and
+    // section/crop-clipped geometry stays unpickable, not just invisible. Updated
+    // every render; read by pick()/pickRect(). null = nothing clipped that frame.
+    private _activePickSection: { normal: [number, number, number]; distance: number; flipped: boolean } | null = null;
+    private _activePickClipBox: ClipBox | null = null;
+
     constructor(canvas: HTMLCanvasElement) {
         this.canvas = canvas;
         this.device = new WebGPUDevice();
@@ -285,6 +300,8 @@ export class Renderer {
             this.device.getFormat(),
             this.pipeline.getSampleCount()
         );
+        // Re-apply any colour set before this (re)creation so it isn't lost.
+        this.section2DOverlayRenderer.setOverlayLineColor(this.overlayLineColor);
         // IfcAnnotation overlay pipelines (issue #653). Share the device +
         // presentation format AND the MSAA sample count + objectId attachment
         // shape with the rest of the renderer so they composite into the same
@@ -344,6 +361,28 @@ export class Renderer {
                 },
             };
         });
+
+        this.markReady();
+    }
+
+    /**
+     * Resolves once `init()` has finished and the GPU device + point-cloud
+     * renderer are usable. Callers that may run before init completes — e.g.
+     * dropping a point cloud immediately after the viewport mounts, before
+     * the async WebGPU init resolves — should `await renderer.whenReady()`
+     * before `beginPointCloudStream`, which otherwise throws
+     * "Renderer not initialized".
+     */
+    whenReady(): Promise<void> {
+        if (this.ready) return Promise.resolve();
+        return new Promise<void>((resolve) => { this.readyWaiters.push(resolve); });
+    }
+
+    private markReady(): void {
+        this.ready = true;
+        const waiters = this.readyWaiters;
+        this.readyWaiters = [];
+        for (const w of waiters) w();
     }
 
     /**
@@ -581,6 +620,8 @@ export class Renderer {
         // Otherwise the caller's "compute done" callback fires before
         // the deviation buffers are actually populated.
         await this.device.getDevice().queue.onSubmittedWorkDone();
+        // The GPU is done reading each chunk's params uniform — free them.
+        this.deviationPipeline.releaseTransientParams();
         this.requestRender();
 
         // Suggest a default half-range = max(0.01m, max-extent / 1000).
@@ -1465,6 +1506,27 @@ export class Renderer {
                 }
             }
 
+            // Stash what we actually clipped this frame so the GPU picker mirrors
+            // it (section/crop-clipped geometry must be unpickable, not just hidden).
+            // `flipped` matches how the mesh flags pack it below. terrainClipY feeds
+            // sectionPlaneData too, so it's covered without special-casing.
+            // Snapshot (don't alias the caller's arrays/object) so an in-place
+            // mutation after render() can't make pick() mirror a different cut.
+            this._activePickSection = sectionPlaneData?.enabled
+                ? {
+                    normal: [...sectionPlaneData.normal] as [number, number, number],
+                    distance: sectionPlaneData.distance,
+                    flipped: !!options.sectionPlane?.flipped,
+                }
+                : null;
+            this._activePickClipBox = options.clipBox?.enabled
+                ? {
+                    enabled: true,
+                    min: [...options.clipBox.min] as [number, number, number],
+                    max: [...options.clipBox.max] as [number, number, number],
+                }
+                : null;
+
             // Reuse pooled scratch buffer for per-mesh uniform writes
             const meshBuf = this.uniformScratch;
             const meshFlags = this.uniformScratchU32;
@@ -1985,7 +2047,8 @@ export class Renderer {
                 const overrideBatches = this.scene.getOverrideBatches();
                 if (overrideBatches.length > 0) {
                     pass.setPipeline(this.pipeline.getOverlayPipeline());
-                    tplFlags[0] = 2;  // set overlay bit for the duration of these draws
+                    // bit 1 = overlay; bit 5 (32) = emphasize (pop) — see shader.
+                    tplFlags[0] = options.emphasizeOverrides ? (2 | 32) : 2;
                     for (const batch of overrideBatches) {
                         renderBatch(batch);
                     }
@@ -2308,6 +2371,9 @@ export class Renderer {
             if (this.section2DOverlayRenderer?.hasGridLines3D()) {
                 this.section2DOverlayRenderer.drawGridLines3D(pass, viewProj);
             }
+            if (this.section2DOverlayRenderer?.hasClashBoxLines3D()) {
+                this.section2DOverlayRenderer.drawClashBoxLines3D(pass, viewProj);
+            }
             if (this.symbolicTextPipeline?.hasGeometry()) {
                 // Pass viewport pixel dimensions so the shader can scale glyphs
                 // to a constant on-screen size (BIMvision-style annotations)
@@ -2443,7 +2509,15 @@ export class Renderer {
      * These are scaled internally to match the actual canvas pixel dimensions.
      */
     async pick(x: number, y: number, options?: PickOptions): Promise<PickResult | null> {
-        return this.pickingManager.pick(x, y, options);
+        return this.pickingManager.pick(x, y, options, this.activePickClip());
+    }
+
+    /**
+     * Section plane + clip box from the last render(), so the picker discards the
+     * same fragments and clipped-away geometry can't be selected.
+     */
+    private activePickClip(): PickClipState {
+        return { sectionPlane: this._activePickSection, clipBox: this._activePickClipBox };
     }
 
     /**
@@ -2462,7 +2536,7 @@ export class Renderer {
         y1: number,
         options?: PickOptions,
     ): Promise<Set<number>> {
-        return this.pickingManager.pickRect(x0, y0, x1, y1, options);
+        return this.pickingManager.pickRect(x0, y0, x1, y1, options, this.activePickClip());
     }
 
     /**
@@ -2645,6 +2719,20 @@ export class Renderer {
     }
 
     /**
+     * Set the colour of the overlay lines (annotation / alignment / grid) and the
+     * section-cut outline (RGBA, 0..1). Defaults to opaque black; theme it to keep
+     * lines legible on a dark canvas. The matching label colour is per-text via
+     * `SymbolicTextInput.color` on `uploadAnnotationTexts3D`.
+     */
+    setOverlayLineColor(color: readonly [number, number, number, number]): void {
+        // Persist on the Renderer so a pre-init call (and any later overlay
+        // re-creation) keeps the colour — init() re-applies this.overlayLineColor.
+        this.overlayLineColor = color;
+        this.section2DOverlayRenderer?.setOverlayLineColor(color);
+        this.requestRender();
+    }
+
+    /**
      * Upload pre-lifted 3D line-list vertices for the standalone annotation
      * overlay. Each segment is `[x1, y1, z1, x2, y2, z2]` in world space.
      * The overlay is drawn regardless of whether a section plane is active.
@@ -2767,6 +2855,47 @@ export class Renderer {
             this.section2DOverlayRenderer.clearGridLines3D();
             this.requestRender();
         }
+    }
+
+    /**
+     * Show (or clear) the clash-overlap box: the wireframe AABB of a focused
+     * clash, drawn in `color` so the overlap region reads as a distinct third
+     * colour next to the two glowing clash elements (#1277). Pass `null` to
+     * clear. `min`/`max` are world-space corners (clash works in world frame).
+     */
+    setClashOverlapBox(
+        box: { min: [number, number, number]; max: [number, number, number]; color: [number, number, number, number] } | null,
+    ): void {
+        if (!this.section2DOverlayRenderer) return;
+        if (!box) {
+            this.section2DOverlayRenderer.clearClashBoxLines3D();
+            this.requestRender();
+            return;
+        }
+        this.section2DOverlayRenderer.setClashBoxLineColor(box.color);
+        this.section2DOverlayRenderer.uploadClashBoxLines3D(aabbEdgeLineList(box.min, box.max));
+        this.requestRender();
+    }
+
+    /**
+     * Draw the focused clash's CONTACT geometry as 3D line segments — the real
+     * shared-face polygon outlines / intersection lines, not the AABB box.
+     * `vertices` is a flat line-list (x,y,z per endpoint, 2 endpoints per
+     * segment) in world frame. Pass `null` to clear. Shares the clash-box line
+     * buffer, so only one of this / setClashOverlapBox is shown at a time.
+     */
+    setClashContactLines(
+        lines: { vertices: Float32Array; color: [number, number, number, number] } | null,
+    ): void {
+        if (!this.section2DOverlayRenderer) return;
+        if (!lines || lines.vertices.length === 0) {
+            this.section2DOverlayRenderer.clearClashBoxLines3D();
+            this.requestRender();
+            return;
+        }
+        this.section2DOverlayRenderer.setClashBoxLineColor(lines.color);
+        this.section2DOverlayRenderer.uploadClashBoxLines3D(lines.vertices);
+        this.requestRender();
     }
 
     /**

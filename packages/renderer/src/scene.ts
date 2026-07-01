@@ -6,7 +6,7 @@
  * Scene graph and mesh management
  */
 
-import type { Mesh, BatchedMesh, Vec3 } from './types.js';
+import type { Mesh, BatchedMesh, Vec3, PickClipState } from './types.js';
 import type { MeshData } from '@ifc-lite/geometry';
 import type { RenderPipeline } from './pipeline.js';
 import { BATCH_CONSTANTS } from './constants.js';
@@ -2220,7 +2220,13 @@ export class Scene {
         }
       }
       const color: [number, number, number, number] = [...o.originalColor];
-      out.push({ expressId, positions, normals, indices: tpl.indices, color });
+      // Per-occurrence key so CPU caches that would otherwise key on `expressId`
+      // alone (measure-snap geometry cache) don't collide across occurrences of
+      // this instanced entity, which share `expressId` but hold distinct
+      // world-space positions (issue #1405). templateIndex+byteOffset uniquely
+      // and stably identifies an occurrence within the instance buffers.
+      const occurrenceKey = `${expressId}:inst:${o.templateIndex}:${o.byteOffset}`;
+      out.push({ expressId, positions, normals, indices: tpl.indices, color, occurrenceKey });
     }
     return out.length > 0 ? out : undefined;
   }
@@ -2683,13 +2689,14 @@ export class Scene {
     rayOrigin: Vec3,
     rayDir: Vec3,
     hiddenIds?: Set<number>,
-    isolatedIds?: Set<number> | null
+    isolatedIds?: Set<number> | null,
+    clip?: PickClipState | null
   ): RaycastHit | null {
     const { rayDirInv, rayDirSign } = prepareRayDirInv(rayDir);
 
     // When geometry data has been released, use bounding-box-only raycast.
     if (this.geometryReleased) {
-      return raycastBoundingBoxes(rayOrigin, rayDirInv, rayDirSign, this.boundingBoxes, hiddenIds, isolatedIds);
+      return raycastBoundingBoxes(rayOrigin, rayDir, rayDirInv, rayDirSign, this.boundingBoxes, hiddenIds, isolatedIds, clip);
     }
 
     // Full triangle-level raycast with bounding-box pre-filter
@@ -2702,6 +2709,7 @@ export class Scene {
       (id) => this.getEntityBoundingBox(id),
       hiddenIds,
       isolatedIds,
+      clip,
     );
 
     // Instanced-only occurrences live in the shard, not meshDataMap, so the CPU
@@ -2729,6 +2737,7 @@ export class Scene {
           (id) => this.getInstancedEntityBounds(id),
           hiddenIds,
           isolatedIds,
+          clip,
         );
       }
     }

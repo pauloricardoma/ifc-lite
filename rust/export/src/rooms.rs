@@ -34,6 +34,9 @@ pub(crate) struct FloorProfile {
 /// Extract every `IfcSpace`'s cleaned floor ring + extrusion, with the model-wide rebase
 /// origin. Skips spaces that are degenerate (< 3 points / self-intersecting) or carry inner
 /// rings (holes are a follow-up); `skipped` counts those so callers can report coverage.
+// The `k` loops iterate the three coordinate components in lockstep; a range
+// loop over 0..3 reads more clearly than zipping the arrays.
+#[allow(clippy::needless_range_loop)]
 pub(crate) fn floor_profiles(profiles: &[ExtractedProfile], tol: f64) -> (Vec<FloorProfile>, [f64; 3], usize) {
     let mut skipped = 0usize;
     let spaces: Vec<&ExtractedProfile> =
@@ -94,6 +97,9 @@ pub(crate) fn floor_profiles(profiles: &[ExtractedProfile], tol: f64) -> (Vec<Fl
 /// Returns the rooms, the model-wide rebase origin (so the openings pass can place window/
 /// door geometry in the same frame), and the count of `IfcSpace` profiles skipped as
 /// degenerate (so callers can report coverage rather than silently truncate).
+// The `k` loops iterate the three coordinate components in lockstep; a range
+// loop over 0..3 reads more clearly than zipping the arrays.
+#[allow(clippy::needless_range_loop)]
 pub fn build_rooms(profiles: &[ExtractedProfile], tol: f64) -> (Vec<Room>, [f64; 3], usize) {
     let (fps, origin, mut skipped) = floor_profiles(profiles, tol);
 
