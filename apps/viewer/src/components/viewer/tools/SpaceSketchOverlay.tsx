@@ -1427,7 +1427,7 @@ export function SpaceSketchOverlay() {
           <button className={`${iconBtn} ${helpOpen ? 'bg-muted text-foreground' : ''}`} aria-pressed={helpOpen}
             onClick={() => { setHelpOpen((v) => !v); setOptionsOpen(false); }} title="How it works"><HelpCircle className="h-4 w-4" /></button>
           <button className={iconBtn} onClick={() => setMinimized(true)}
-            title="Minimize — drafts and 3D preview stay live"><Minus className="h-4 w-4" /></button>
+            title="Minimize (drafts and 3D preview stay live)"><Minus className="h-4 w-4" /></button>
           <button className={iconBtn} onClick={closeNow} title="Close without creating (Esc)"><X className="h-4 w-4" /></button>
         </div>
       </div>
@@ -1439,7 +1439,7 @@ export function SpaceSketchOverlay() {
           {storeys.length ? storeys.map((s) => <option key={s.id} value={s.id}>{s.name}</option>) : <option>no model</option>}
         </select>
         <button className={iconBtn} onClick={() => void deriveAllStoreys()} disabled={!sketchModelId}
-          title="Derive rooms on every storey — drafts only until you confirm; storeys you already edited are kept">
+          title="Derive rooms on every storey. Drafts only until you confirm; storeys you already edited are kept.">
           <Building2 className="h-4 w-4" /></button>
         <span className="shrink-0 pr-0.5 text-[11px] tabular-nums text-muted-foreground">
           {rooms.length} {rooms.length === 1 ? 'room' : 'rooms'} · {total.toFixed(1)} m²
