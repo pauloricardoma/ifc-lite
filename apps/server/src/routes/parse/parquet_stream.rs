@@ -81,6 +81,14 @@ pub async fn parse_parquet_stream(
     use std::sync::{Arc, Mutex};
 
     // Extract file
+    // Admission gate (bounded concurrency + byte budget): acquired BEFORE the
+    // upload is buffered, reserving the max upload size since multipart rarely
+    // declares a length up front. Held for the request's whole lifetime so a
+    // disconnected-but-still-running job keeps its memory slot.
+    let admission_guard = state
+        .admission
+        .acquire(state.config.max_file_size_mb as u64 * 1024 * 1024)
+        .await?;
     let data = extract_file(&mut multipart, state.config.max_file_size_mb).await?;
 
     // Generate cache key before processing (include opening filter + quality)
@@ -150,6 +158,11 @@ pub async fn parse_parquet_stream(
             )),
         ]));
 
+        // Cached replay: no parse work runs, so holding the admission guard
+        // (and its CPU slot) while a slow client drains the SSE would starve
+        // real parses for nothing. The replay blob is already materialized
+        // and is bounded by cache content, far below a parse working set.
+        drop(admission_guard);
         return Ok(Sse::new(fast_stream)
             .keep_alive(KeepAlive::default())
             .into_response());
@@ -180,6 +193,7 @@ pub async fn parse_parquet_stream(
         max_batch_size,
         query.opening_filter,
         tessellation_quality,
+        Some(admission_guard),
     )
     .map(move |event: StreamEvent| {
         let sse_event = match event {
@@ -330,7 +344,22 @@ pub async fn parse_parquet_stream(
     let content_for_cache = content.clone();
     let cache_key_for_dm = cache_key.clone();
     let cache_for_dm = cache.clone();
+    let admission_for_dm = state.admission.clone();
     tokio::spawn(async move {
+        // The data-model extraction re-parses the whole upload, so it must
+        // pass admission like any parse job. It is a cache-fill optimization:
+        // when the server is saturated, skipping it (the next request rebuilds
+        // it inline) beats bypassing the gate.
+        let _dm_admission = match admission_for_dm
+            .acquire(content_for_cache.len() as u64)
+            .await
+        {
+            Ok(guard) => guard,
+            Err(_) => {
+                tracing::debug!("Skipping data-model cache fill: admission saturated");
+                return;
+            }
+        };
         // Run data model extraction in blocking task
         let dm_result =
             tokio::task::spawn_blocking(move || extract_data_model(&content_for_cache)).await;

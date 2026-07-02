@@ -61,6 +61,14 @@ pub async fn parse_parquet(
     mut multipart: Multipart,
 ) -> Result<Response, ApiError> {
     // Extract file from multipart
+    // Admission gate (bounded concurrency + byte budget): acquired BEFORE the
+    // upload is buffered, reserving the max upload size since multipart rarely
+    // declares a length up front. Held for the request's whole lifetime so a
+    // disconnected-but-still-running job keeps its memory slot.
+    let admission_guard = state
+        .admission
+        .acquire(state.config.max_file_size_mb as u64 * 1024 * 1024)
+        .await?;
     let data = extract_file(&mut multipart, state.config.max_file_size_mb).await?;
 
     // Generate cache key (include opening filter so different modes get different cache entries)
@@ -111,10 +119,15 @@ pub async fn parse_parquet(
     // that's independent of tokio's blocking thread pool
     let serialize_start = tokio::time::Instant::now();
     let opening_filter = query.opening_filter;
+    // Guard rides the blocking task (see parse_full): a cancelled handler
+    // future must not release the admission slot while the work runs on.
     let (
-        (geometry_result, geometry_parquet),
-        (data_model_stats, data_model_parquet),
-        symbolic_data,
+        (
+            (geometry_result, geometry_parquet),
+            (data_model_stats, data_model_parquet),
+            symbolic_data,
+        ),
+        _admission,
     ) = tokio::task::spawn_blocking(move || {
             // First: extract geometry, data model, and the 2D symbol stream
             // (IfcAnnotation + IfcGrid) all in parallel. Symbolic extraction is
@@ -145,9 +158,12 @@ pub async fn parse_parquet(
             );
 
             (
-                (geometry_result, geo_parquet),
-                (dm_stats, dm_parquet),
-                symbolic_data,
+                (
+                    (geometry_result, geo_parquet),
+                    (dm_stats, dm_parquet),
+                    symbolic_data,
+                ),
+                admission_guard,
             )
         })
         .await?;
@@ -281,6 +297,14 @@ pub async fn parse_parquet_optimized(
     mut multipart: Multipart,
 ) -> Result<Response, ApiError> {
     // Extract file from multipart
+    // Admission gate (bounded concurrency + byte budget): acquired BEFORE the
+    // upload is buffered, reserving the max upload size since multipart rarely
+    // declares a length up front. Held for the request's whole lifetime so a
+    // disconnected-but-still-running job keeps its memory slot.
+    let admission_guard = state
+        .admission
+        .acquire(state.config.max_file_size_mb as u64 * 1024 * 1024)
+        .await?;
     let data = extract_file(&mut multipart, state.config.max_file_size_mb).await?;
 
     // Generate cache key (include opening filter so different modes get different cache entries)
@@ -300,10 +324,14 @@ pub async fn parse_parquet_optimized(
     // Process on blocking thread pool (CPU-intensive). Extract the 2D symbol
     // stream (IfcAnnotation + IfcGrid) alongside geometry for endpoint parity
     // (issue #900) — it's cached and served via the symbolic fetch endpoint.
-    let (result, symbolic_data) = tokio::task::spawn_blocking(move || {
-        rayon::join(
-            || process_geometry_filtered_with_quality(&content, opening_filter, tessellation_quality),
-            || extract_symbolic_data(&content),
+    // Guard rides the blocking task (see parse_full).
+    let ((result, symbolic_data), _admission) = tokio::task::spawn_blocking(move || {
+        (
+            rayon::join(
+                || process_geometry_filtered_with_quality(&content, opening_filter, tessellation_quality),
+                || extract_symbolic_data(&content),
+            ),
+            admission_guard,
         )
     })
     .await?;
