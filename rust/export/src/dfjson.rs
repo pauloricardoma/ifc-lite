@@ -177,14 +177,28 @@ fn build_stories(mut plates: Vec<Plate>) -> Vec<Story> {
     }
 
     let n_groups = groups.len();
+    // Dragonfly defines `floor_to_floor_height` as the slab-to-slab distance to the NEXT
+    // story, so every group's floor height is needed up front to take the deltas below.
+    let floor_heights: Vec<f64> = groups
+        .iter()
+        .map(|g| g.iter().map(|p| p.floor_height).fold(f64::MAX, f64::min))
+        .collect();
     groups
         .into_iter()
         .enumerate()
         .map(|(si, group)| {
             let is_ground = si == 0;
             let is_top = si + 1 == n_groups;
-            let floor_height = group.iter().map(|p| p.floor_height).fold(f64::MAX, f64::min);
-            let ftf = group.iter().map(|p| p.ftc_height).sum::<f64>() / group.len().max(1) as f64;
+            let floor_height = floor_heights[si];
+            let avg_ftc = group.iter().map(|p| p.ftc_height).sum::<f64>() / group.len().max(1) as f64;
+            // Slab-to-slab: elevation delta to the next story where one exists. The
+            // topmost story has no next slab, so it falls back to the average
+            // floor-to-ceiling height of its rooms (a non-positive delta gets the same
+            // fallback, though the ascending sort makes that unreachable in practice).
+            let ftf = match floor_heights.get(si + 1) {
+                Some(&next) if next - floor_height > 0.0 => next - floor_height,
+                _ => avg_ftc,
+            };
             let room_2ds = group
                 .into_iter()
                 .map(|p| Room2D {
@@ -316,6 +330,27 @@ mod tests {
         // Lowest story is ground contact, highest is top exposed.
         assert!(model.buildings[0].unique_stories[0].room_2ds[0].is_ground_contact);
         assert!(model.buildings[0].unique_stories[1].room_2ds[0].is_top_exposed);
+    }
+
+    #[test]
+    fn floor_to_floor_uses_story_elevation_delta() {
+        // Ground story at Y=0 (3 m floor-to-ceiling rooms), next story at Y=4: the
+        // Dragonfly slab-to-slab distance is 4 m, not the 3 m ceiling height. The
+        // topmost story has no next slab and falls back to floor-to-ceiling.
+        let profiles = vec![unit_space(1, 0.0), unit_space(2, 4.0)];
+        let (model, _stats) = build_model("test", &profiles, 0.01);
+        let stories = &model.buildings[0].unique_stories;
+        assert_eq!(stories.len(), 2);
+        assert!(
+            (stories[0].floor_to_floor_height - 4.0).abs() < 1e-6,
+            "non-terminal story must use the elevation delta to the next story, got {}",
+            stories[0].floor_to_floor_height
+        );
+        assert!(
+            (stories[1].floor_to_floor_height - 3.0).abs() < 1e-6,
+            "topmost story must fall back to average floor-to-ceiling height, got {}",
+            stories[1].floor_to_floor_height
+        );
     }
 
     #[test]

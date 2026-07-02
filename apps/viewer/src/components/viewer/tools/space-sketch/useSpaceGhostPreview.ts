@@ -34,12 +34,27 @@ import type { AddElementSpaceParams } from '@/store/slices/addElementSlice';
  *  building, while the model still shows through. */
 const GHOST_COLOR: [number, number, number, number] = [0.25, 0.62, 0.95, 0.4];
 
-/** Reserved high id band for ghost meshes — far above any real express/global
- *  id, so a ghost can never collide with (or be removed alongside) a real
- *  entity. Always allocate fresh; never reuse. */
-let ghostIdSeq = 0x70000000;
-function nextGhostId(): number {
-  return ghostIdSeq++;
+/** Base of the reserved high id band for ghost meshes, far above any real
+ *  express/global id in practice. Ghost ids only need to be unique among LIVE
+ *  ghosts: every rebuild replaces the whole overlay (the Viewport removes the
+ *  previous overlay ids from the scene before appending the new meshes), so
+ *  allocation restarts at the band base on each rebuild. A module-level
+ *  counter would instead walk upward forever across mounts and long sessions,
+ *  creeping toward real federated ids. */
+const GHOST_ID_BASE = 0x70000000;
+
+/** First id safely above every real entity: the band base, or one past the
+ *  highest federated global id (idOffset + maxExpressId) should offsets ever
+ *  reach past the base. Keeps a ghost id from ever colliding with a real
+ *  entity in the X-ray filter (`ghostExceptEntities`) or the overlay removal
+ *  set (`removeMeshesForEntities`). */
+function ghostIdBase(): number {
+  let maxReal = 0;
+  for (const m of useViewerStore.getState().models.values()) {
+    const top = (m.idOffset ?? 0) + (m.maxExpressId ?? 0);
+    if (top > maxReal) maxReal = top;
+  }
+  return Math.max(GHOST_ID_BASE, maxReal + 1);
 }
 
 /** One draft room to preview: its boundary outline (plan, metres) + the storey
@@ -105,9 +120,10 @@ export function useSpaceGhostPreview({ enabled, ghosts, contextIds }: GhostPrevi
     }
     const meshes: ReturnType<typeof buildElementMesh>[] = [];
     const newIds: number[] = [];
+    let nextGhostId = ghostIdBase();
     for (const g of ghosts) {
       if (g.corners.length < 3) continue;
-      const id = nextGhostId();
+      const id = nextGhostId++;
       const params: AddElementSpaceParams = { Width: 0, Depth: 0, Height: g.height };
       const mesh = buildElementMesh({
         type: 'space',

@@ -155,8 +155,27 @@ export function EnergyModelExportDialog({ trigger }: EnergyModelExportDialogProp
       if (out === null) {
         throw new Error('Geometry engine unavailable');
       }
-      if (out.trim().length === 0) {
-        throw new Error('No IfcSpace volumes found in the model to export');
+      if (format === 'hbjson') {
+        // The HBJSON exporter returns an empty string when the model has no
+        // IfcSpace volumes.
+        if (out.trim().length === 0) {
+          throw new Error('No IfcSpace volumes found in the model to export');
+        }
+      } else {
+        // export_dfjson always returns a complete Model JSON, even with zero
+        // spaces (empty `buildings`), so an emptiness check on the string can
+        // never fire. Count the exported Room2Ds instead so a model without
+        // IfcSpace volumes gets the same friendly error, not a useless file.
+        const dfModel = JSON.parse(out) as {
+          buildings?: { unique_stories?: { room_2ds?: unknown[] }[] }[];
+        };
+        const roomCount = (dfModel.buildings ?? []).reduce(
+          (n, b) => n + (b.unique_stories ?? []).reduce((m, s) => m + (s.room_2ds?.length ?? 0), 0),
+          0,
+        );
+        if (roomCount === 0) {
+          throw new Error('No IfcSpace volumes found in the model to export');
+        }
       }
 
       const blob = new Blob([out], { type: 'application/json' });
