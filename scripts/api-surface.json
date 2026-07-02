@@ -157,6 +157,19 @@
     "createBCFFromClashResult: function",
     "mapBcfToClashes: function"
   ],
+  "@ifc-lite/clash/contact": [
+    "AABB: interface",
+    "ContactOptions: interface",
+    "Mesh: interface",
+    "NarrowPhaseOptions: interface",
+    "SharedFaceCluster: interface",
+    "SharedFaceOptions: interface",
+    "TrianglePair: type",
+    "Vec3: type",
+    "clusterSharedFaces: function",
+    "contactClusters: function",
+    "narrowPhase: function"
+  ],
   "@ifc-lite/clash/ifcx": [
     "IfcxAdapterOptions: interface",
     "IfcxAdapterResult: interface",
@@ -1591,6 +1604,7 @@
     "MetadataBootstrapEntitySummary: interface",
     "MetadataBootstrapPayload: interface",
     "MetadataBootstrapSpatialNode: interface",
+    "NO_RENDER_GEOMETRY: const",
     "PlatformGeometryStats: interface",
     "PointCloudAsset: interface",
     "ProfileCollection: class (type-only)",
@@ -1613,6 +1627,7 @@
     "createPlatformBridge: function",
     "decodeInstancedShard: function",
     "getGeometryStreamWatchdogMs: function",
+    "isNoRenderGeometryError: function",
     "isTauri: function",
     "isWasmAssetUnavailableError: function",
     "mergeGeometryDiagnostics: function",
