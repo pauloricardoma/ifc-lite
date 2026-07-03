@@ -1177,6 +1177,12 @@ pub fn process_geometry_streaming_filtered_with_options(
     // indexed by thread index). Memoizes each worker's resolved placement world
     // transforms across the whole model — see `new_worker_placement_caches`.
     let worker_placement_caches = jobs::new_worker_placement_caches();
+    // Sized identically again. Memoizes each worker's decoded sub-tree entities
+    // (profiles / materials / styles / representation maps) across the whole model
+    // so they are decoded once per worker instead of re-parsed per element;
+    // BOUNDED at write-back (see `jobs::ENTITY_CACHE_CAP`) so persistence never
+    // regresses peak memory — see `new_worker_entity_caches`.
+    let worker_entity_caches = jobs::new_worker_entity_caches();
 
     let geometry_span = tracing::info_span!(
         "geometry",
@@ -1324,6 +1330,21 @@ pub fn process_geometry_streaming_filtered_with_options(
                         Some(cache) => cache,
                         None => &mut fallback_placement_cache,
                     };
+                // Decoded-entity slot: the SAME `try_lock` (not `lock`) discipline
+                // as the point/placement caches above — a faceted-brep nested
+                // `par_iter` can work-steal another job onto this worker's own
+                // thread index and re-enter here, and `lock()` on the non-reentrant
+                // `Mutex` this thread already holds would self-deadlock (#1587). On
+                // that rare re-entrant steal we fall back to a throwaway cache;
+                // output stays byte-identical since the cache is pure memoization
+                // keyed by entity id (a miss just re-decodes the same bytes).
+                let mut fallback_entity_cache = FxHashMap::default();
+                let mut entity_slot_guard = worker_entity_caches[widx].try_lock().ok();
+                let worker_entity_cache: &mut FxHashMap<u32, Arc<DecodedEntity>> =
+                    match entity_slot_guard.as_deref_mut() {
+                        Some(cache) => cache,
+                        None => &mut fallback_entity_cache,
+                    };
                 process_entity_job(
                     job,
                     content,
@@ -1347,6 +1368,7 @@ pub fn process_geometry_streaming_filtered_with_options(
                     &item_dedup_cache,
                     worker_point_cache,
                     worker_placement_cache,
+                    worker_entity_cache,
                     &point_cache_hits_collector,
                     &point_cache_misses_collector,
                     &faceted_brep_ns_collector,

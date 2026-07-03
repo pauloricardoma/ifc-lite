@@ -446,11 +446,32 @@ impl<'a> EntityDecoder<'a> {
         })?))
     }
 
-    /// Drain the populated cache out of this decoder for sharing across
-    /// rayon tasks. After calling this, the decoder is empty (cache
-    /// moved out); callers typically then drop the decoder.
-    pub fn drain_cache(&mut self) -> FxHashMap<u32, Arc<DecodedEntity>> {
+    /// Move the decoded-entity cache OUT of this decoder, leaving it empty.
+    /// Paired with [`Self::set_entity_cache`] to hoist the cache across the
+    /// per-element decoders a single worker builds within one batch, exactly
+    /// like [`Self::take_point_cache`] / [`Self::take_placement_transform_cache`].
+    ///
+    /// The cache maps entity id -> `Arc<DecodedEntity>`; every entry is a pure
+    /// function of `content` + entity id (the same bytes always decode to the
+    /// same entity), so reusing it across the elements one worker meshes is
+    /// byte-identical (speed only): a shared sub-tree entity — a profile,
+    /// material, style, or representation map referenced by thousands of
+    /// elements — is decoded at most once per worker instead of re-decoded per
+    /// element. Cheap: moves the map header (with its `Arc` handles), not the
+    /// entities themselves. The caller is responsible for bounding the returned
+    /// map's size before re-installing it (see `WorkerCacheGuard::drop`), since a
+    /// decoded entity is far heavier than the point/placement caches' `Copy`
+    /// values.
+    pub fn take_entity_cache(&mut self) -> FxHashMap<u32, Arc<DecodedEntity>> {
         std::mem::take(&mut self.cache)
+    }
+
+    /// Install a previously-accumulated decoded-entity cache (see
+    /// [`Self::take_entity_cache`]). The worker's persistent cache is adopted
+    /// into a fresh per-element decoder so a shared sub-tree entity resolves from
+    /// memory instead of re-parsing its bytes. Mirror of [`Self::set_point_cache`].
+    pub fn set_entity_cache(&mut self, cache: FxHashMap<u32, Arc<DecodedEntity>>) {
+        self.cache = cache;
     }
 
     /// Clear all caches to free memory

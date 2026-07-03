@@ -12,7 +12,8 @@
      522 apps/server/src/services/parquet.rs
 # +8: add set_entity_index setter so the processor can install its inline-built index (perf/single-scan).
 # +50: add the per-worker placement-transform memo (field + take/set/get/cache methods), mirroring point_cache (perf/placement-cache).
-    1145 rust/core/src/decoder.rs
+# +21: replace dead drain_cache with take_entity_cache/set_entity_cache (the per-worker decoded-entity cache pair, mirroring point_cache) (worktree-decoder-cache).
+    1166 rust/core/src/decoder.rs
      429 rust/core/src/fast_parse.rs
      793 rust/core/src/georef.rs
      445 rust/core/src/model_bounds.rs
@@ -73,10 +74,16 @@
      812 rust/processing/src/element.rs
      468 rust/processing/src/georeferencing.rs
      772 rust/processing/src/prepass.rs
+# NEW row (was 386, under 400): add the per-worker decoded-entity cache — its type
+# alias, the memory-bound cap + `new_worker_entity_caches` constructor, the guard's
+# bounded write-back, and the job's adopt/write-back — mirroring the point/placement
+# caches (worktree-decoder-cache).
+     462 rust/processing/src/processor/jobs.rs
 # +24: build the entity index INLINE in the scan loop instead of a separate build_entity_index pass (perf/single-scan; one file walk instead of two).
 # +15: try_lock the per-worker point cache to fix the nested-par_iter re-entrancy self-deadlock (#1572 regression).
 # +20: add the per-worker placement-transform cache store + its try_lock slot acquisition, mirroring the point cache (perf/placement-cache).
-    1533 rust/processing/src/processor/mod.rs
+# +22: acquire the per-worker decoded-entity cache slot (try_lock, mirroring the point/placement slots) and pass it into process_entity_job (worktree-decoder-cache).
+    1555 rust/processing/src/processor/mod.rs
      440 rust/processing/src/symbolic/items.rs
 # +6: wire per-batch point-cache hit/miss stats into record_pipeline_batch (perf/brep-point-cache-instrumentation).
      773 rust/wasm-bindings/src/api/gpu_meshes/batch.rs

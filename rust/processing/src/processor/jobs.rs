@@ -22,6 +22,34 @@ pub(super) type WorkerPointCaches = Vec<std::sync::Mutex<FxHashMap<u32, (f64, f6
 /// world transform the geometry router memoizes per IfcObjectPlacement id.
 pub(super) type WorkerPlacementCaches = Vec<std::sync::Mutex<FxHashMap<u32, [f64; 16]>>>;
 
+/// Per-rayon-worker decoded-entity caches: one `FxHashMap` behind a `Mutex` per
+/// worker thread, indexed by `rayon::current_thread_index()`. Mirrors
+/// [`WorkerPointCaches`] / [`WorkerPlacementCaches`]; the value is the
+/// `Arc<DecodedEntity>` the decoder memoizes per entity id, so a sub-tree entity
+/// shared by many elements — a section profile, material, style, or
+/// representation map — is decoded at most once per worker for the whole model
+/// instead of re-parsed per element. Unlike the point/placement caches' small
+/// `Copy` values, a decoded entity is heavy, so this cache is BOUNDED at write-back
+/// by [`ENTITY_CACHE_CAP`] (see [`WorkerCacheGuard::drop`]) to keep peak memory
+/// flat on huge files.
+pub(super) type WorkerEntityCaches =
+    Vec<std::sync::Mutex<FxHashMap<u32, std::sync::Arc<DecodedEntity>>>>;
+
+/// Upper bound (in entries) on a worker's persistent decoded-entity cache; see
+/// the wholesale-clear in [`WorkerCacheGuard::drop`].
+///
+/// The cache accumulates the hot shared set (profiles / materials / styles /
+/// representation maps reused across elements) PLUS each element's own unique
+/// sub-tree (decoded once, never reused). Left unbounded, that per-element dead
+/// weight — times N workers natively, or one worker over a 300 MB+ file on the
+/// single-threaded wasm export path — is a real peak-memory regression (a decoded
+/// entity is hundreds of bytes, vs 24 for a point). 16 K entries hold the hot set
+/// plus ~1 K elements of sub-tree between clears (steady-state ≈ a few MB/worker),
+/// so clears are rare and the re-warm cost is amortized to noise. Byte-identical:
+/// the cache is pure memoization keyed by entity id, so a miss after a clear
+/// re-decodes the same bytes to the same entity.
+pub(super) const ENTITY_CACHE_CAP: usize = 16_384;
+
 /// One persistent CartesianPoint cache per rayon worker thread, indexed by
 /// `rayon::current_thread_index()`.
 ///
@@ -58,6 +86,21 @@ pub(super) fn new_worker_placement_caches() -> WorkerPlacementCaches {
         .collect()
 }
 
+/// One persistent decoded-entity cache per rayon worker thread, sized and indexed
+/// identically to [`new_worker_point_caches`]. A sub-tree entity shared by many
+/// elements (profile / material / style / representation map) is decoded once per
+/// worker for the whole model instead of re-parsed per element, and the whole
+/// per-element decode cache is no longer torn down and rebuilt for each product.
+/// Pure memoization keyed by entity id, so meshes stay byte-identical
+/// (`mesh_determinism` no-diff); bounded at write-back by [`ENTITY_CACHE_CAP`] so
+/// the persistence never regresses peak memory. Each slot is only ever locked by
+/// the one worker that owns that index; see the `try_lock` note at the call site.
+pub(super) fn new_worker_entity_caches() -> WorkerEntityCaches {
+    (0..rayon::current_num_threads().max(1))
+        .map(|_| std::sync::Mutex::new(FxHashMap::default()))
+        .collect()
+}
+
 /// RAII guard that returns a worker's warm CartesianPoint cache to its slot on
 /// EVERY exit path — the normal return, the `decode_at` error early-return, and
 /// a panic. Without it, a decode failure would drop `local_decoder` (holding the
@@ -71,6 +114,10 @@ struct WorkerCacheGuard<'c, 's> {
     // same EVERY-exit-path guarantee as `slot` so a `decode_at` error or panic
     // does not cold-start placement resolution for the worker's next element.
     placement_slot: &'s mut FxHashMap<u32, [f64; 16]>,
+    // The worker's persistent decoded-entity cache, written back (bounded) on the
+    // same EVERY-exit-path guarantee so a `decode_at` error or panic does not
+    // cold-start sub-tree decoding for the worker's next element.
+    entity_slot: &'s mut FxHashMap<u32, std::sync::Arc<DecodedEntity>>,
 }
 
 impl Drop for WorkerCacheGuard<'_, '_> {
@@ -78,6 +125,20 @@ impl Drop for WorkerCacheGuard<'_, '_> {
         // Cheap: moves the map header (now warmer), not its entries.
         *self.slot = self.decoder.take_point_cache();
         *self.placement_slot = self.decoder.take_placement_transform_cache();
+        // Memory bound (the whole reason the entity cache is safe to persist).
+        // Take the worker's now-warmer decoded-entity cache and, if it has grown
+        // past the cap, clear it before handing it to the next element. A total
+        // clear (not an LRU eviction) keeps this O(1) amortized and trivially
+        // correct: the cache is pure memoization keyed by entity id, so a miss
+        // after a clear just re-decodes the same bytes to the same entity —
+        // byte-identical (`mesh_determinism` no-diff). Bounding here, at the
+        // element boundary, caps peak at ≈ cap + one element's sub-tree per
+        // worker; unbounded it would hold the whole file's structural graph.
+        let mut entity_cache = self.decoder.take_entity_cache();
+        if entity_cache.len() > ENTITY_CACHE_CAP {
+            entity_cache.clear();
+        }
+        *self.entity_slot = entity_cache;
     }
 }
 
@@ -144,6 +205,14 @@ pub(super) fn process_entity_job(
     // decoder and moved back out afterwards so a placement chain shared by many
     // elements (storey/building) is composed once per worker, not once per element.
     worker_placement_cache: &mut FxHashMap<u32, [f64; 16]>,
+    // The current rayon worker's PERSISTENT decoded-entity cache, reused across
+    // every element that worker meshes (see the `worker_entity_caches` store at
+    // the call site). Moved into this job's decoder and moved (bounded) back out
+    // afterwards so a shared sub-tree entity — profile, material, style,
+    // representation map — is decoded once per worker instead of re-parsed per
+    // element, and the whole per-element decode cache is no longer rebuilt from
+    // scratch for each product.
+    worker_entity_cache: &mut FxHashMap<u32, std::sync::Arc<DecodedEntity>>,
     // Request-local point-cache hit/miss + faceted-brep-timing sinks (see the
     // collectors declared before the chunk loop).
     point_cache_hits_collector: &std::sync::atomic::AtomicU64,
@@ -162,16 +231,23 @@ pub(super) fn process_entity_job(
     // chain shared across elements (storey/building) is composed once per worker
     // instead of re-resolved per element.
     local_decoder.set_placement_transform_cache(std::mem::take(worker_placement_cache));
+    // Adopt this worker's persistent decoded-entity cache so a sub-tree entity
+    // shared across elements (profile / material / style / representation map) is
+    // decoded once per worker instead of re-parsed per element, and the per-element
+    // decode cache is no longer torn down and rebuilt for each product.
+    local_decoder.set_entity_cache(std::mem::take(worker_entity_cache));
     // Seed the unit-scale caches so curve/arc processing skips the O(file)
     // IFCPROJECT scan that each fresh per-element decoder would otherwise repeat.
     local_decoder.seed_unit_scales(unit_scale, seed_plane_angle_to_radians);
     // From here the decoder is owned by the guard, which writes its (warmer)
-    // point + placement caches back into the worker slots on Drop — so the early
-    // return below, and any panic, still hand the caches to the worker's next element.
+    // point + placement + entity caches back into the worker slots on Drop — so the
+    // early return below, and any panic, still hand the caches to the worker's next
+    // element (the entity cache bounded on the way out; see WorkerCacheGuard::drop).
     let mut decoder = WorkerCacheGuard {
         decoder: local_decoder,
         slot: worker_point_cache,
         placement_slot: worker_placement_cache,
+        entity_slot: worker_entity_cache,
     };
 
     let entity = match decoder.decode_at(job.start, job.end) {
