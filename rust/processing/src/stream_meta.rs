@@ -157,7 +157,7 @@ fn resolve_partial_rtc(
     let mut detection_succeeded = detected_rtc.is_some();
 
     if !coord_is_large(rtc_offset) && (site_position.is_none() || !detection_succeeded) {
-        let full_index = ifc_lite_core::build_entity_index(content);
+        let full_index = crate::build_entity_index_parallel(content);
         let mut full_decoder = EntityDecoder::with_index(content, full_index);
         if let Some(full_rtc) = router.detect_rtc_offset_from_jobs(jobs, &mut full_decoder) {
             // The full index resolved the placement chain — a successful

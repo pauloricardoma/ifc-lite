@@ -19,7 +19,7 @@ use ifc_lite_core::EntityIndex;
 use ifc_lite_geometry::{collate_refs, InstanceMeshRef, InstanceMeta, InstanceTemplate};
 use ifc_lite_processing::{
     process_geometry, process_geometry_streaming_filtered_with_options, process_geometry_with_index,
-    MeshData, OpeningFilterMode, ProcessingResult, StreamingOptions,
+    build_entity_index_parallel, MeshData, OpeningFilterMode, ProcessingResult, StreamingOptions,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -1782,6 +1782,9 @@ fn export_glb_streaming_bounded_impl(
     opts: &GltfOptions,
     index: Option<Arc<EntityIndex>>,
 ) -> (Vec<u8>, GltfStats) {
+    // Build the index ONCE, in parallel on native, so both passes reuse it (no
+    // redundant per-pass inline scan). Byte-identical to the shared-index path (#1516).
+    let index = index.or_else(|| Some(Arc::new(build_entity_index_parallel(content))));
     let plan = plan_bounded_glb(content, opts, index.clone());
     // Back-compat: an oversize model PANICS with the historical messages (the
     // worker's OutputTooLarge classifier matches on them). `try_export_glb*` /
@@ -1828,6 +1831,10 @@ fn try_export_glb_streaming_bounded_impl(
     opts: &GltfOptions,
     index: Option<Arc<EntityIndex>>,
 ) -> Result<(Vec<u8>, GltfStats), ExportError> {
+    // Build the index ONCE in parallel and share it across plan + write. This is
+    // the fail-closed large-model path, exactly where the parallel scan pays off;
+    // with `index=None` it otherwise paid two internal serial scans.
+    let index = index.or_else(|| Some(Arc::new(build_entity_index_parallel(content))));
     let plan = plan_bounded_glb(content, opts, index.clone());
     if plan.bin_total > u32::MAX as u64 || plan.total > u32::MAX as u64 {
         return Err(ExportError::TooLarge { bytes: plan.total });
@@ -1857,6 +1864,7 @@ fn project_glb_size_impl(
     opts: &GltfOptions,
     index: Option<Arc<EntityIndex>>,
 ) -> GlbSizeProjection {
+    let index = index.or_else(|| Some(Arc::new(build_entity_index_parallel(content))));
     let plan = plan_bounded_glb(content, opts, index);
     GlbSizeProjection {
         total_bytes: plan.total,

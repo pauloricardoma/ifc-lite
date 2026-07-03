@@ -19,7 +19,8 @@
      463 rust/core/src/parser/tokenizer.rs
      550 rust/core/src/schema_gen.rs
      990 rust/core/src/units.rs
-    3943 rust/export/src/gltf.rs
+# +4: build the index once in parallel on the fail-closed try_/project_glb_size large-model GLB paths (perf/parallel-scan).
+    3947 rust/export/src/gltf.rs
      655 rust/export/src/model.rs
      611 rust/export/src/step.rs
     1233 rust/geometry/src/alignment.rs
@@ -52,13 +53,11 @@
      596 rust/geometry/src/profiles/shapes.rs
      706 rust/geometry/src/profiles/simplify.rs
      781 rust/geometry/src/rect_fast.rs
-     461 rust/geometry/src/router/clipping.rs
      586 rust/geometry/src/router/diagnostics.rs
      659 rust/geometry/src/router/layers.rs
      572 rust/geometry/src/router/mod.rs
     1072 rust/geometry/src/router/processing.rs
      446 rust/geometry/src/router/rtc_offset.rs
-     497 rust/geometry/src/router/voids_2d.rs
      618 rust/geometry/src/router/voids/aabb_clip.rs
      871 rust/geometry/src/router/voids/geom.rs
 # +10: extract min_opening_volume(quality) tier->floor helper shared by the batch
@@ -70,7 +69,6 @@
     1472 rust/geometry/src/space_dcel/mod.rs
      525 rust/geometry/src/transform.rs
      782 rust/geometry/src/triangulation.rs
-     715 rust/geometry/src/void_analysis.rs
      745 rust/geometry/src/void_index.rs
      499 rust/processing/src/determinism.rs
      812 rust/processing/src/element.rs

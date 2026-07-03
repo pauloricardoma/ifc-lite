@@ -12,8 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ifc_lite_core::{
-    build_entity_index, AttributeValue, DecodedEntity, EntityDecoder, EntityIndex, EntityScanner,
-    IfcType,
+    AttributeValue, DecodedEntity, EntityDecoder, EntityIndex, EntityScanner, IfcType,
 };
 use ifc_lite_processing::element::{plan_type_geometry, TypeGeometryMode};
 use rustc_hash::FxHashSet;
@@ -267,7 +266,8 @@ pub fn build_export_model(content: &[u8]) -> ExportModel {
 /// of entities extracts in a few GB instead of exhausting memory. Output is the
 /// caller's responsibility to stream onwards (e.g. to S3/Parquet) and drop.
 pub fn stream_export_model(content: &[u8], f: impl FnMut(EntityRow)) {
-    let entity_index = Arc::new(build_entity_index(content));
+    // Parallel on native (byte-identical to `build_entity_index`), serial on wasm.
+    let entity_index = Arc::new(ifc_lite_processing::build_entity_index_parallel(content));
     stream_export_model_with_index(content, &entity_index, f);
 }
 
@@ -638,7 +638,7 @@ mod tests {
         let bytes = fixture(rel);
         let mut plain = Vec::new();
         stream_export_model(&bytes, |r| plain.push(r));
-        let idx = Arc::new(build_entity_index(&bytes));
+        let idx = Arc::new(ifc_lite_core::build_entity_index(&bytes));
         let mut shared = Vec::new();
         stream_export_model_with_index(&bytes, &idx, |r| shared.push(r));
         assert!(!plain.is_empty(), "expected products");

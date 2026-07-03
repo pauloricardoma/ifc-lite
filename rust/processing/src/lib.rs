@@ -8,6 +8,8 @@
 //! the HTTP server and the native FFI library.
 
 pub mod determinism;
+pub(crate) mod parallel_scan;
+pub use parallel_scan::build_entity_index_parallel;
 // `determinism::diff_report` unit tests (#1549) live in this sibling
 // `_tests.rs` file, declared from here rather than inside `determinism.rs`,
 // because that module already sits exactly at its frozen
