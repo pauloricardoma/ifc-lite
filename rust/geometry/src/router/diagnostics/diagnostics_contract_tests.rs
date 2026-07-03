@@ -70,12 +70,7 @@ fn aggregate_summarizes_failures_hosts_classification_and_silent_noops() {
         },
     );
 
-    let cls = ClassificationStats {
-        rectangular: 3,
-        diagonal: 1,
-        non_rectangular: 0,
-        floor_opening_guard_saved: 0,
-    };
+    let cls = ClassificationStats { rectangular: 3, diagonal: 1, non_rectangular: 0 };
     let rf = RectFastStats { fired: 2, openings_cut: 4, ..Default::default() };
 
     let d = aggregate_diagnostics(cls, &csg, &hosts, rf, 16);
@@ -191,11 +186,11 @@ fn schema_version_round_trips_and_defaults() {
     let d = GeometryDiagnostics::default();
     assert_eq!(d.schema_version, GEOMETRY_DIAGNOSTICS_SCHEMA_VERSION);
     let json = serde_json::to_string(&d).unwrap();
-    assert!(json.contains("\"schemaVersion\":1"), "serialized unconditionally: {json}");
+    assert!(json.contains("\"schemaVersion\":2"), "serialized unconditionally: {json}");
     let back: GeometryDiagnostics = serde_json::from_str(&json).unwrap();
     assert_eq!(back.schema_version, GEOMETRY_DIAGNOSTICS_SCHEMA_VERSION);
     // A pre-versioned producer (field absent) deserializes to 0, distinguishable.
     let legacy: GeometryDiagnostics =
-        serde_json::from_str(&json.replace("\"schemaVersion\":1,", "")).unwrap();
+        serde_json::from_str(&json.replace("\"schemaVersion\":2,", "")).unwrap();
     assert_eq!(legacy.schema_version, 0);
 }
