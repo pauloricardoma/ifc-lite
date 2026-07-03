@@ -23,14 +23,19 @@ use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 use std::time::Instant;
 
-/// Serialize the tests that mutate the process-wide `IFC_LITE_DEF_DEDUP` override
-/// (`set_definition_dedup_override`) so cargo's parallel runner can't interleave
-/// one test's ON window with another's OFF window. Poison-tolerant: a panic while
-/// held must not cascade into unrelated failures.
-static DEF_DEDUP_SERIAL: Mutex<()> = Mutex::new(());
+/// Serialize every test that mutates a process-wide dedup override
+/// (`set_definition_dedup_override` for `IFC_LITE_DEF_DEDUP`,
+/// `set_build_dedup_extra_override` for `IFC_LITE_DEDUP_EXTRA`) so cargo's
+/// parallel runner can't interleave one test's flipped window with another's.
+/// One mutex covers both overrides: they gate the same meshing pass, so any two
+/// override-flipping tests must be mutually exclusive. Every holder restores its
+/// override to the env default (`None`) before releasing, and the guard makes
+/// that the only live value, so there is no cross-test bleed. Poison-tolerant: a
+/// panic while held must not cascade into unrelated failures.
+static DEDUP_OVERRIDE_SERIAL: Mutex<()> = Mutex::new(());
 
-fn def_dedup_guard() -> std::sync::MutexGuard<'static, ()> {
-    DEF_DEDUP_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+fn dedup_override_guard() -> std::sync::MutexGuard<'static, ()> {
+    DEDUP_OVERRIDE_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Simulate an N-worker partition: greedily pack each key's cost onto the
@@ -663,7 +668,7 @@ fn dedup_byte_identical_and_faster() {
 #[test]
 #[ignore = "manual; needs IFCLT_MODEL"]
 fn def_dedup_csg_time_delta() {
-    let _guard = def_dedup_guard();
+    let _guard = dedup_override_guard();
     let path = match std::env::var("IFCLT_MODEL") {
         Ok(p) => p,
         Err(_) => {
@@ -966,6 +971,10 @@ END-ISO-10303-21;
 
 #[test]
 fn content_dedup_extra_facesets_byte_identical_when_flagged() {
+    // Serialize with the other override-flipping tests: this mutates the
+    // process-wide DEDUP_EXTRA override, so it must not overlap another test's
+    // flipped window (or a reader of that override) under the parallel runner.
+    let _guard = dedup_override_guard();
     let content = synthetic_faceset_duplicates_ifc();
     let ids = [50u32, 80, 110];
 
@@ -1058,7 +1067,7 @@ fn void_unplaced_cut_matches_placed_geometry() {
 /// and keep a distinct void distinct.
 #[test]
 fn definition_cache_dedups_and_matches_placed_geometry() {
-    let _guard = def_dedup_guard();
+    let _guard = dedup_override_guard();
     let content = synthetic_voided_duplicates_ifc();
     let void_idx = build_void_index(&content);
     let wall_ids = [50u32, 250, 450];
@@ -1181,7 +1190,7 @@ fn byte_delta(off: &SubMeshCollection, on: &SubMeshCollection) -> ByteDelta {
 /// Run with `--nocapture` to read the report.
 #[test]
 fn on_vs_off_byte_divergence_report() {
-    let _guard = def_dedup_guard();
+    let _guard = dedup_override_guard();
     let content = synthetic_voided_duplicates_ifc();
     let void_idx = build_void_index(&content);
     let wall_ids = [50u32, 250, 450];
