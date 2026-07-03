@@ -294,7 +294,7 @@ function ActionButton({ icon: Icon, label, onClick, shortcut, disabled }: Action
 /** Extensions the viewer can ingest (IFC / IFCX / GLB / point clouds). */
 function isSupportedModelFile(f: File): boolean {
   const n = f.name.toLowerCase();
-  return n.endsWith('.ifc') || n.endsWith('.ifcx') || n.endsWith('.glb')
+  return n.endsWith('.ifc') || n.endsWith('.ifcx') || n.endsWith('.ifczip') || n.endsWith('.glb')
     || n.endsWith('.las') || n.endsWith('.laz') || n.endsWith('.ply') || n.endsWith('.pcd')
     || n.endsWith('.e57') || n.endsWith('.pts') || n.endsWith('.xyz');
 }
@@ -920,7 +920,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
         id="file-input-open"
         ref={fileInputRef}
         type="file"
-        accept=".ifc,.ifcx,.glb,.las,.laz,.ply,.pcd,.e57,.pts,.xyz"
+        accept=".ifc,.ifcx,.ifczip,.glb,.las,.laz,.ply,.pcd,.e57,.pts,.xyz"
         multiple
         onChange={handleFileSelect}
         className="hidden"
@@ -928,7 +928,7 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
       <input
         ref={addModelInputRef}
         type="file"
-        accept=".ifc,.ifcx,.glb,.las,.laz,.ply,.pcd,.e57,.pts,.xyz"
+        accept=".ifc,.ifcx,.ifczip,.glb,.las,.laz,.ply,.pcd,.e57,.pts,.xyz"
         multiple
         onChange={handleAddModelSelect}
         className="hidden"

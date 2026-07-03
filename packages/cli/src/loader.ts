@@ -9,7 +9,7 @@
 import { readFile } from 'node:fs/promises';
 import { logger } from './logger.js';
 import { basename } from 'node:path';
-import { IfcParser, type IfcDataStore } from '@ifc-lite/parser';
+import { IfcParser, unwrapIfcZipView, type IfcDataStore } from '@ifc-lite/parser';
 import { createBimContext, type BimContext, type ViewerBackendMethods, type VisibilityBackendMethods } from '@ifc-lite/sdk';
 import { HeadlessBackend } from './headless-backend.js';
 import { createStreamingViewerAdapter, createStreamingVisibilityAdapter } from './streaming-viewer.js';
@@ -37,6 +37,17 @@ export async function loadIfcBytes(
   // Validate the file is a STEP/IFC file
   if (bytes.byteLength === 0) {
     process.stderr.write(`Error: ${label} is empty (0 bytes)\n`);
+    process.exit(1);
+  }
+
+  // Transparent .ifcZIP unwrap (issue #1494) — cheap magic-byte no-op for an
+  // ordinary .ifc file. `unwrapIfcZipView` returns an ArrayBuffer over the
+  // model bytes (the input unchanged when it isn't a zip container), so this
+  // covers both the disk-read path and callers that already hold the buffer.
+  try {
+    bytes = new Uint8Array(await unwrapIfcZipView(bytes));
+  } catch (err) {
+    process.stderr.write(`Error: ${label}: ${(err as Error).message}\n`);
     process.exit(1);
   }
 

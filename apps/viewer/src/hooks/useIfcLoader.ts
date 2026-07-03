@@ -15,7 +15,7 @@ import { flushSync } from 'react-dom';
 import { useShallow } from 'zustand/react/shallow';
 import { getViewerStoreApi, useViewerStore, type FederatedModel } from '@/store';
 import { getGeomWorkerOverride, resolveLoadTessellationTier } from '../store/constants.js';
-import { IfcParser, detectFormat, type IfcDataStore } from '@ifc-lite/parser';
+import { IfcParser, detectFormat, unwrapIfcZip, type IfcDataStore } from '@ifc-lite/parser';
 import { WorkerParser } from '@ifc-lite/parser/browser';
 import { memoryAccounting } from '../lib/perf/memoryAccounting.js';
 import {
@@ -424,7 +424,7 @@ export function useIfcLoader() {
       // reads bytes via `new Uint8Array(buffer)` / `new DataView(buffer)`,
       // both of which work on either backing store. The TS cast is purely
       // type-system: the runtime is identical.
-      const buffer = acquired.buffer as ArrayBuffer;
+      let buffer = acquired.buffer as ArrayBuffer;
       const fileReadMs = performance.now() - fileReadStart;
       console.log(
         `[useIfc] File: ${file.name}, size: ${fileSizeMB.toFixed(2)}MB` +
@@ -432,6 +432,17 @@ export function useIfcLoader() {
             ? ` — point cloud, streaming from Blob (no whole-file read)`
             : `, read in ${fileReadMs.toFixed(0)}ms${acquired.isShared ? ' (streamed→SAB)' : ''}`),
       );
+
+      // Transparent .ifcZIP unwrap (issue #1494) — cheap magic-byte no-op for
+      // an ordinary file. Skipped for point clouds: those never reach here
+      // with the full buffer (streamed straight from the Blob). The server
+      // client uploads the original `file` object (still zipped), but the
+      // server unwraps `.ifcZIP` itself (apps/server extract_file), so a zipped
+      // upload can still take the server fast-path; the local WASM path
+      // consumes the now-unwrapped `buffer`.
+      if (!pointCloudFormat) {
+        buffer = await unwrapIfcZip(buffer);
+      }
 
       // IFCX/IFC5 vs IFC4 STEP vs GLB resolved from the full buffer; point
       // cloud format was already resolved from the head slice above.
@@ -690,6 +701,9 @@ export function useIfcLoader() {
       // server fast-path for every primary IFC load (the cause of an "overall
       // slower" regression on server-enabled deploys); fast mode still applies on
       // every local-path load (IFCX, merge-layers, Tauri, or server-off).
+      // A .ifcZIP source is fine on the server path: loadFromServer uploads the
+      // original `file` object (still zipped) and the server unwraps the
+      // container itself (apps/server extract_file, issue #1494) before parsing.
       if (target.kind === 'primary' && format === 'ifc' && !mergeLayersAtLoad && USE_SERVER && SERVER_URL && SERVER_URL !== '') {
         // Pass buffer directly - server uses File object for parsing, buffer is only for size checks
         const serverSuccess = await loadFromServer(file, buffer, () => loadSessionRef.current !== currentSession);

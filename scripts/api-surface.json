@@ -3190,7 +3190,9 @@
     "serializeValue: function",
     "toStepLine: function",
     "transformToLocal: function",
-    "transformToWorld: function"
+    "transformToWorld: function",
+    "unwrapIfcZip: function",
+    "unwrapIfcZipView: function"
   ],
   "@ifc-lite/parser/browser": [
     "WorkerParser: class",
