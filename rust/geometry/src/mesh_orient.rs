@@ -61,12 +61,13 @@ impl EdgeInc {
     }
 }
 
-/// Vertex weld grid (10 µm): fine enough not to merge distinct mm-scale features,
-/// coarse enough to weld the (usually bit-equal) coincident flat-shaded
-/// duplicates so shared edges are found. Under-welding only splits a body into
-/// more components (each still oriented); over-welding would fuse distinct
-/// vertices and is the dangerous direction, so the grid stays fine.
-const WELD: f64 = 1.0e5;
+/// Vertex weld grid scale (reciprocal of a 10 µm grid, i.e. positions are
+/// quantized to `round(v * WELD_SCALE)`): fine enough not to merge distinct
+/// mm-scale features, coarse enough to weld the (usually bit-equal) coincident
+/// flat-shaded duplicates so shared edges are found. Under-welding only splits
+/// a body into more components (each still oriented); over-welding would fuse
+/// distinct vertices and is the dangerous direction, so the grid stays fine.
+const WELD_SCALE: f64 = 1.0e5;
 
 /// Per-worker reusable scratch for [`orient_mesh_outward`], cleared (never freed)
 /// between meshes. The pass runs once per assembled submesh (~109k times on a
@@ -138,7 +139,7 @@ pub fn orient_mesh_outward(mesh: &mut Mesh) -> bool {
     corner.reserve(mesh.indices.len());
 
     // Weld positions -> welded vertex id; record the welded vid of every corner.
-    let q = |v: f32| (v as f64 * WELD).round() as i64;
+    let q = |v: f32| (v as f64 * WELD_SCALE).round() as i64;
     for &idx in &mesh.indices {
         let b = idx as usize * 3;
         let key = (
@@ -148,7 +149,11 @@ pub fn orient_mesh_outward(mesh: &mut Mesh) -> bool {
         );
         let vid = *vid_of.entry(key).or_insert_with(|| {
             let id = vpos.len() as u32;
-            vpos.push([key.0 as f64 / WELD, key.1 as f64 / WELD, key.2 as f64 / WELD]);
+            vpos.push([
+                key.0 as f64 / WELD_SCALE,
+                key.1 as f64 / WELD_SCALE,
+                key.2 as f64 / WELD_SCALE,
+            ]);
             id
         });
         corner.push(vid);
@@ -311,7 +316,7 @@ mod tests {
     }
 
     fn bad_edges(m: &Mesh) -> usize {
-        let q = |v: f32| (v as f64 * WELD).round() as i64;
+        let q = |v: f32| (v as f64 * WELD_SCALE).round() as i64;
         let key = |i: u32| {
             let b = i as usize * 3;
             (q(m.positions[b]), q(m.positions[b + 1]), q(m.positions[b + 2]))

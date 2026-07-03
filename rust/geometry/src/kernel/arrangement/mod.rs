@@ -13,9 +13,13 @@
 //! The result is a single intersection-free complex, ready for L4 winding
 //! classification.
 //!
-//! This increment: all-pairs broadphase (AABB cull) + the proper-crossing
-//! `Segment` case. BVH broadphase, coplanar overlap, and vertex/edge `Touches`
-//! degeneracies are later increments.
+//! Broadphase is a hand-rolled AABB BVH (`super::broadphase`) that filters
+//! candidate triangle pairs before the exact per-pair `tri_tri_intersection`
+//! test; that test itself resolves both the proper-crossing `Segment` case and
+//! the on-plane-vertex/edge `Touches` degeneracies (folded into `Segment`/
+//! `Chord`, see `tritri::PlaneInterval`). Coplanar overlaps are handled
+//! separately via `coplanar_clip` and accumulated alongside the segment
+//! constraints before re-triangulation.
 
 use super::coplanar::coplanar_clip;
 use super::interner::{Interner, Vid};
@@ -250,8 +254,9 @@ pub fn arrange(a: &[Tri], b: &[Tri]) -> Arrangement {
 }
 
 /// The conforming arrangement of `n` operand meshes over one shared interner.
-/// `subtris[k]` is mesh `k`'s conforming sub-triangles; `owner[k][t]` is the index
-/// in mesh `k`'s sub-tri list (unused externally, kept implicit by position).
+/// `subtris[k]` is mesh `k`'s conforming sub-triangles; there is no separate
+/// owner/index table — a sub-triangle's originating mesh is simply its
+/// position `k` in `subtris`.
 pub struct MultiArrangement {
     pub interner: Interner,
     /// `subtris[k]` = mesh `k`'s conforming sub-triangles (interned Vids).

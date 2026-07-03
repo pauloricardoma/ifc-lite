@@ -66,7 +66,8 @@
 # +26: is_rtc_votable_representation predicate + doc — Surface3D is meshable but must NOT cast RTC votes (#1526 pollution via absolute-coord surfaces).
      472 rust/geometry/src/router/rtc_offset.rs
      497 rust/geometry/src/router/voids_2d.rs
-     618 rust/geometry/src/router/voids/aabb_clip.rs
+# +1: reveal-quads comment expanded to 2 lines (dead-symbol reference fix, no code change).
+     619 rust/geometry/src/router/voids/aabb_clip.rs
      871 rust/geometry/src/router/voids/geom.rs
 # +10: extract min_opening_volume(quality) tier->floor helper shared by the batch
 # admission gate and the sequential CSG path so they can't diverge on the

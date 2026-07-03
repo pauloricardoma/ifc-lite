@@ -299,7 +299,7 @@ cascade!(indirect_orient3d(p: &ImplicitPoint, p2: [f64; 3], p3: [f64; 3], p4: [f
 // The re-triangulation tests the SAME interned points in MANY predicates; the
 // LPI/TPI lambda (degree-4/7 cross products) is the dominant per-call cost and is
 // otherwise recomputed every time (interval pass + fixed pass + interner cmp_lex).
-// The interner computes each point's lambda ONCE (via `lambda1024`) and the
+// The interner computes each point's lambda ONCE (via `cached_lambda`) and the
 // Vid-based predicates below evaluate the determinant directly from the cached
 // `Lam`, skipping the interval filter (which can't resolve the degenerate box
 // configs anyway) and all lambda recomputation. Cached at I512 — fits LPI/TPI
@@ -341,7 +341,7 @@ fn bsign(x: &Big) -> Sign {
 /// denominator absorbs the 2^20 scale ratio — `real·2^16 = λ_fine/(d_fine·2^20)`
 /// — so every cached lambda lives in ONE homogeneous convention and any two are
 /// directly comparable in the Vid predicates below.
-pub fn lambda1024(p: &ImplicitPoint) -> Option<Lam> {
+pub fn cached_lambda(p: &ImplicitPoint) -> Option<Lam> {
     use num_traits::{CheckedMul, FromPrimitive, One};
     let (mut lam, mut d) = w512::lambda_of(p).or_else(|| {
         let (lam, d) = f512::lambda_of(p)?;
@@ -516,7 +516,7 @@ pub fn point_to_f64_from_lam(lam: &Lam) -> Option<[f64; 3]> {
 #[cfg(test)]
 mod tests {
     use super::super::{interner::Interner, ImplicitPoint, Lpi, Tpi};
-    use super::lambda1024;
+    use super::cached_lambda;
 
     /// Degenerate LPI: line exactly parallel to its plane ⇒ d = 0. Must return
     /// `None` (fall through to the BigRational cascade), never panic — bnum's
@@ -532,7 +532,7 @@ mod tests {
             s: [1.0, 0.0, 0.0],
             t: [0.0, 1.0, 0.0],
         });
-        assert!(lambda1024(&p).is_none());
+        assert!(cached_lambda(&p).is_none());
     }
 
     /// Degenerate TPI: two parallel planes ⇒ det(n1,n2,n3) = 0 ⇒ d = 0.
@@ -545,7 +545,7 @@ mod tests {
                 [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], // x=0
             ],
         });
-        assert!(lambda1024(&p).is_none());
+        assert!(cached_lambda(&p).is_none());
     }
 
     /// Interning a degenerate point must not panic: the cached-lambda fast path

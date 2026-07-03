@@ -23,9 +23,7 @@ const IDENTITY_ROW_MAJOR: [f64; 16] = [
     0.0, 0.0, 1.0, 0.0, //
     0.0, 0.0, 0.0, 1.0, //
 ];
-use ifc_lite_core::{
-    DecodedEntity, EntityDecoder, GeometryCategory, IfcType,
-};
+use ifc_lite_core::{DecodedEntity, EntityDecoder, IfcType};
 use rustc_hash::FxHashSet;
 use std::sync::Arc;
 
@@ -676,29 +674,16 @@ impl GeometryRouter {
             return Ok(mesh);
         }
 
-        // Check category for fallback handling
-        match self.schema.geometry_category(&item.ifc_type) {
-            Some(GeometryCategory::SweptSolid) => {
-                // For now, return empty mesh - processors will handle this
-                Ok(Mesh::new())
-            }
-            Some(GeometryCategory::ExplicitMesh) => {
-                // For now, return empty mesh - processors will handle this
-                Ok(Mesh::new())
-            }
-            Some(GeometryCategory::Boolean) => {
-                // For now, return empty mesh - processors will handle this
-                Ok(Mesh::new())
-            }
-            Some(GeometryCategory::MappedItem) => {
-                // For now, return empty mesh - processors will handle this
-                Ok(Mesh::new())
-            }
-            _ => Err(Error::geometry(format!(
-                "Unsupported representation type: {}",
-                item.ifc_type
-            ))),
-        }
+        // No processor is registered for this type. Every `GeometryCategory`
+        // that has a real implementation (SweptSolid, ExplicitMesh, Boolean) is
+        // already caught by the processor lookup above; `MappedItem` never
+        // reaches here (`process_representation_item` intercepts it first, see
+        // `process_mapped_item_cached`). So landing here means the type is
+        // genuinely unsupported, not merely "not implemented yet".
+        Err(Error::geometry(format!(
+            "Unsupported representation type: {}",
+            item.ifc_type
+        )))
     }
 
     /// Process MappedItem with caching for repeated geometry

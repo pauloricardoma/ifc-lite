@@ -202,9 +202,10 @@ pub fn parse_cartesian_point_from_id(
     Ok(Point3::new(x, y, z))
 }
 
-/// Parse IfcDirection from entity ID (fast-path variant)
+/// Parse IfcDirection from entity ID.
 ///
-/// Uses fast-path extraction when available.
+/// Plain decode-by-id + parse; unlike [`parse_cartesian_point_from_id`], there
+/// is no fast-path extraction for `IfcDirection`.
 pub fn parse_direction_from_id(dir_id: u32, decoder: &mut EntityDecoder) -> Result<Vector3<f64>> {
     let dir = decoder.decode_by_id(dir_id)?;
     parse_direction(&dir)

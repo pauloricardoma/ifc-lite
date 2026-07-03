@@ -597,7 +597,8 @@ impl Mesh {
     /// Returns a new mesh where vertices at the same position (within
     /// `position_eps`) collapse to one canonical vertex; the welded
     /// vertex's normal is the sum of contributing normals, re-normalized
-    /// (or the first contributing normal if the sum is degenerate).
+    /// (or a neutral up-Z `(0, 0, 1)` default if the sum is degenerate,
+    /// e.g. exactly opposing normals cancelling out).
     /// Triangles that collapse to a degenerate edge or point are dropped.
     ///
     /// **Use this when you need a topologically connected, manifold-

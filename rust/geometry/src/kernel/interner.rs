@@ -24,7 +24,7 @@ pub type Vid = u32;
 pub struct Interner {
     points: Vec<ImplicitPoint>, // indexed by Vid
     sorted: Vec<Vid>,           // Vids in cmp_lex (lexicographic) order
-    // Per-Vid cached I1024 homogeneous lambda (computed once at intern). The hot
+    // Per-Vid cached I512 homogeneous lambda (computed once at intern). The hot
     // re-triangulation predicates evaluate exactly from this instead of
     // recomputing the LPI/TPI cross products every call. `None` = off-grid /
     // overflow ⇒ predicates fall back to the exact BigRational cascade.
@@ -49,11 +49,11 @@ impl Interner {
         // Compute the new point's cached lambda once; the binary-search compares
         // use it (fast exact) and fall back to the ImplicitPoint cmp_lex only on
         // off-grid/overflow.
-        let new_lam = fixed::lambda1024(&p);
+        let new_lam = fixed::cached_lambda(&p);
         let new_lam_iv = interval::ilambda_cached(&p);
         let search = self.sorted.binary_search_by(|&vid| {
             // f64 interval compare from the cached lambdas first (pure f64, no
-            // wide-int) → cached-I1024 compare → ImplicitPoint cascade. Each tier
+            // wide-int) → cached-I512 compare → ImplicitPoint cascade. Each tier
             // gives the SAME exact order; the interval just carries the
             // distinct-coordinate majority off the wasm-emulated I512 path.
             let s = interval::cmp_lex_from_lam_iv(&self.lambdas_iv[vid as usize], &new_lam_iv)
@@ -85,7 +85,7 @@ impl Interner {
         &self.points[v as usize]
     }
 
-    /// The cached I1024 lambda for a Vid (`None` if off-grid/overflow).
+    /// The cached I512 lambda for a Vid (`None` if off-grid/overflow).
     #[inline]
     pub fn lam(&self, v: Vid) -> &Option<fixed::Lam> {
         &self.lambdas[v as usize]

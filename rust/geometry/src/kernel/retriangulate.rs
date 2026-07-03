@@ -30,9 +30,9 @@ fn e(p: [f64; 3]) -> ImplicitPoint {
 /// Vid-based exact orient2d — the dominant re-triangulation predicate. Tiers, all
 /// returning the SAME exact sign (faster ones resolve the easy cases first):
 /// all-explicit Shewchuk (f64) → f64 directed-rounding interval from the cached
-/// lambdas → cached-I1024 determinant → ImplicitPoint cascade (BigRational tail).
+/// lambdas → cached-I512 determinant → ImplicitPoint cascade (BigRational tail).
 /// The interval tier carries the non-degenerate majority of implicit-point
-/// predicates in pure f64, so the wasm-emulated I1024 path is reached only on a
+/// predicates in pure f64, so the wasm-emulated I512 path is reached only on a
 /// genuine zero-straddle — the fix for the dense-opening-wall wasm cost.
 #[inline]
 fn orient2d_v(it: &Interner, a: Vid, b: Vid, c: Vid, axis: DropAxis) -> Sign {
@@ -57,7 +57,7 @@ fn orient2d_v(it: &Interner, a: Vid, b: Vid, c: Vid, axis: DropAxis) -> Sign {
 }
 
 /// Vid-based exact lexicographic compare — f64 interval from the cached lambdas
-/// first, then the cached-I1024 compare, then the ImplicitPoint cascade.
+/// first, then the cached-I512 compare, then the ImplicitPoint cascade.
 #[inline]
 fn cmp_lex_v(it: &Interner, a: Vid, b: Vid) -> Sign {
     if let Some(s) = interval::cmp_lex_from_lam_iv(it.lam_iv(a), it.lam_iv(b)) {
