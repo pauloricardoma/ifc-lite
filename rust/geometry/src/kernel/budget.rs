@@ -38,6 +38,14 @@
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Serialises every test that mutates the process-global `CAP` / `ELEMENT_CAP`
+/// atomics, so cargo's parallel runner can't race them. Shared crate-wide (not
+/// just this module's tests) so cap-mutating tests in OTHER modules — e.g. the
+/// voids-router engulf-suppression regression — take the SAME lock and never
+/// clobber each other's cap while a boolean runs. Test-only.
+#[cfg(test)]
+pub(crate) static GLOBAL_CAP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Default per-boolean exact-evaluation cap for the interactive profile.
 ///
 /// Calibrated against the model corpus: the worst healthy boolean (a dense steel
@@ -285,11 +293,6 @@ pub fn element_count() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Serialises the two tests that mutate the global `CAP` / `ELEMENT_CAP`
-    /// atomics, so cargo's parallel runner can't race them.
-    static GLOBAL_CAP_LOCK: Mutex<()> = Mutex::new(());
 
     /// The cap counts escalations and trips at exactly the configured count,
     /// deterministically; `begin()` resets; unbounded never trips.

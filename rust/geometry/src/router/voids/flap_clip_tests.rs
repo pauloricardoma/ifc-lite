@@ -180,3 +180,178 @@ fn nonzero_origin_host_records_world_space_bbox() {
     assert!(mny > 1900.0 && mxy < 2100.0, "y not world: [{mny}, {mxy}]");
     assert!(mnz > 2900.0 && mxz < 3100.0, "z not world: [{mnz}, {mxz}]");
 }
+
+/// An axis-aligned box mesh centred at `cx` on X (0 on Y/Z) with the given half
+/// extents, via the same `OpeningBox` corner order the router uses.
+fn box_mesh_at(cx: f64, half: [f64; 3]) -> Mesh {
+    OpeningBox {
+        center: Vector3::new(cx, 0.0, 0.0),
+        axes: [Vector3::x(), Vector3::y(), Vector3::z()],
+        half,
+    }
+    .extended_box_mesh([0.0; 3], 0.0)
+}
+
+/// #1109 → #635 engulf-suppression correctness (the decided SKIP fix). When the
+/// per-boolean escalation budget (#1109) trips while cutting a void whose AABB
+/// ENGULFS the host, the router must NOT fall through to the destructive #635
+/// AABB box-cut: that box covers the whole host, so it would DELETE the wall
+/// (silent element loss). It leaves the host UN-CUT instead — a phantom solid is
+/// strictly safer. The companion cut pins the OTHER quadrant: a NON-engulfing
+/// opening under the SAME tripped cap MUST still take the #635 box-cut, proving
+/// the dropped `!capped` term only affects the engulfing case.
+#[test]
+fn budget_tripped_engulfing_cutter_skips_aabb_fallback() {
+    use crate::kernel::budget;
+
+    // We trip via the per-ELEMENT budget, NOT the per-boolean cap. The
+    // per-boolean cap is process-global and read by EVERY boolean on EVERY
+    // thread, so lowering it here would false-trip the CSG that concurrent
+    // (unlocked) sibling tests are running. The per-element cap only bites a
+    // thread that has opened an element scope via `begin_element` — and within
+    // this lib test binary only THIS test and budget.rs's own `per_element`
+    // test (both hold the lock below, and neither runs a sibling's CSG) ever do
+    // — so a per-element cap of 1 is invisible to every other test.
+    //
+    // Serialise against the other cap-mutating tests (they share this lock).
+    let _cap_guard = budget::GLOBAL_CAP_LOCK.lock().unwrap();
+    // Restore BOTH global caps AND reset THIS worker thread's thread-local
+    // element scope to unbounded on the way out (even on panic): thread-locals
+    // persist across tests on a reused worker thread, so a left-armed element
+    // cap would false-trip whatever CSG test cargo schedules next on it.
+    struct RestoreBudget {
+        cap: Option<u64>,
+        ecap: Option<u64>,
+    }
+    impl Drop for RestoreBudget {
+        fn drop(&mut self) {
+            // Re-open an UNBOUNDED element scope on this thread (elem cap 0 ⇒
+            // thread-local ELEM_CAP = u64::MAX, ELEM_COUNT = 0), matching a
+            // thread that never opened a scope, THEN restore the globals.
+            budget::set_element_cap(None);
+            budget::begin_element();
+            budget::set_cap(self.cap);
+            budget::set_element_cap(self.ecap);
+        }
+    }
+    let _restore = RestoreBudget {
+        cap: budget::cap(),
+        ecap: budget::element_cap(),
+    };
+
+    let router = GeometryRouter::new();
+
+    // Box host wall: 2 m (x) × 0.3 m thick (y) × 2 m tall (z), centred at
+    // origin. Every face stays well under the 8:1 sliver-refine threshold, so
+    // the un-cut host passes through the post-loop refine/clip unchanged and its
+    // triangle count is a stable "host present, un-cut" baseline.
+    let host = aabb_box([1.0, 0.15, 1.0]);
+    let host_tris = host.triangle_count();
+
+    // ENGULFING cutter: two disjoint boxes flanking the host in X with a gap
+    // straddling the host centre, merged into ONE cutter mesh. Their COMBINED
+    // AABB covers the host on all three axes (engulf), yet the real solid
+    // EXCLUDES the host centre (the X-gap) — so `opening_engulfs_host_solid` is
+    // false (the host is NOT consumed as a containing void) and the cut reaches
+    // the exact subtract. Each box's Y/Z faces sit a hair (~0.1 mm, off-grid)
+    // beyond the host faces: near-coplanar overlaps that force the exact
+    // predicate cascade off the interval filter, so an element cap of 1 trips.
+    let dy = 1.3e-4;
+    let dz = 1.7e-4;
+    let cutter = {
+        let mut m = box_mesh_at(-0.8, [0.5, 0.15 + dy, 1.0 + dz]); // x ∈ [-1.3, -0.3]
+        m.merge(&box_mesh_at(0.8, [0.5, 0.15 + dy, 1.0 + dz])); //     x ∈ [ 0.3,  1.3]
+        m
+    };
+    // The cutter welds to a closed manifold (two closed boxes), so the
+    // malformed-cutter recut path never claims it and bypasses the target code.
+    assert!(
+        opening_obb_if_malformed(&cutter).is_none(),
+        "engulfing cutter must be well-formed"
+    );
+
+    let (cmn, cmx) = cutter.bounds();
+    let engulf_open = OpeningType::NonRectangular(
+        cutter,
+        Point3::new(cmn.x as f64, cmn.y as f64, cmn.z as f64),
+        Point3::new(cmx.x as f64, cmx.y as f64, cmx.z as f64),
+        None,
+    );
+    let engulf_ctx = VoidContext {
+        merged_openings: vec![engulf_open.clone()],
+        openings: vec![engulf_open],
+        param: None,
+    };
+
+    // Arm a per-element cap of 1 so the FIRST exact escalation trips the
+    // element budget deterministically (the per-boolean cap stays at its
+    // default, untouched, so concurrent tests are unaffected).
+    budget::set_element_cap(Some(1));
+
+    let engulf_id = 91_109_u32;
+    budget::begin_element(); // fresh element scope; element cap 1 is the trip
+    let engulf_result = router.apply_void_context(host.clone(), &engulf_ctx, engulf_id);
+
+    // Host PRESENT and UN-CUT: the engulfing AABB box-cut was suppressed, so the
+    // result is the original host, not an empty (deleted) mesh.
+    assert!(
+        !engulf_result.is_empty(),
+        "engulfing cutter DELETED the host (box-cut fallback not suppressed)"
+    );
+    assert_eq!(
+        engulf_result.triangle_count(),
+        host_tris,
+        "host must be left exactly un-cut (got {} tris, host {host_tris})",
+        engulf_result.triangle_count(),
+    );
+
+    // Exactly ONE failure recorded for this element — the single tripped
+    // boolean — with reason OperandTooLarge (the #1109 budget-trip signature).
+    let failures = router.take_csg_failures();
+    let engulf_fails = failures
+        .get(&engulf_id)
+        .expect("the tripped engulfing cut must record a failure");
+    assert_eq!(
+        engulf_fails.len(),
+        1,
+        "exactly one failure for the single tripped cut (got {engulf_fails:?})"
+    );
+    assert!(
+        matches!(
+            engulf_fails[0].reason,
+            crate::diagnostics::BoolFailureReason::OperandTooLarge { .. }
+        ),
+        "the tripped cut must record OperandTooLarge (got {:?})",
+        engulf_fails[0].reason,
+    );
+
+    // COMPANION (other quadrant): a small NON-engulfing opening centred in the
+    // wall, under the SAME tripped cap, MUST still change the host — the #635
+    // box-cut fires because `engulfs_host` is false, so dropping the `!capped`
+    // term left this case untouched.
+    let small = box_mesh_at(0.0, [0.15, 0.2, 0.15]); // 0.3 × 0.4 × 0.3, through the wall
+    let small_open = OpeningType::NonRectangular(
+        small,
+        Point3::new(-0.15, -0.2, -0.15),
+        Point3::new(0.15, 0.2, 0.15),
+        None,
+    );
+    let small_ctx = VoidContext {
+        merged_openings: vec![small_open.clone()],
+        openings: vec![small_open],
+        param: None,
+    };
+
+    let small_id = 91_635_u32;
+    budget::begin_element();
+    let small_result = router.apply_void_context(host.clone(), &small_ctx, small_id);
+    assert!(
+        !small_result.is_empty(),
+        "a non-engulfing cut must keep the wall"
+    );
+    assert_ne!(
+        small_result.triangle_count(),
+        host_tris,
+        "a non-engulfing opening under the tripped cap must still cut the host (#635 box-cut)"
+    );
+}

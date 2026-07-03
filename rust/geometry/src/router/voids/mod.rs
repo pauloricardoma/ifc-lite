@@ -1691,14 +1691,23 @@ impl GeometryRouter {
                                 && covers(final_min.y, final_max.y, wall_min.y, wall_max.y)
                                 && covers(final_min.z, final_max.z, wall_min.z, wall_max.z)
                         };
-                        // Only suppress the fallback when "unchanged" means the
-                        // kernel found no real cut (a kernel error / no-overlap on
-                        // a grazing engulfing cutter). `capped` keys on the
-                        // historical `OperandTooLarge` rejection (issue #635 /
-                        // #947): the exact kernel has no operand cap so it is
-                        // now always false, but keeping the term costs
-                        // nothing and stays correct if a complexity budget ever
-                        // records it again.
+                        // `capped` keys on the `OperandTooLarge` rejection: the
+                        // #1109 per-boolean/-element escalation budget records it
+                        // when a cut trips mid-arrangement and bails to the un-cut
+                        // host (`csg/mod.rs`), so it is NOT always false — a
+                        // grazing engulfing cutter that would run long trips the
+                        // budget just as it errors on the coincident faces.
+                        // Engulf suppression therefore applies regardless of WHY
+                        // the CSG produced no change (budget trip or kernel error
+                        // on the coincident faces): an engulfing cutter's AABB
+                        // covers the whole host, so the #635 box-cut would delete
+                        // the entire wall — a silent element deletion strictly
+                        // worse than leaving a phantom (un-cut) solid. `capped` is
+                        // now only read by the diagnostic below (it no longer
+                        // gates the suppression), so it is unused in a release
+                        // build that compiles out both the tracing and the
+                        // debug/test `eprintln!` legs of `diag_warn!`.
+                        #[allow(unused_variables)]
                         let capped = clipper.has_operand_too_large_since(failures_before);
                         // Issue #964: suppress the destructive AABB box when the
                         // host already has this void cut into it (a void
@@ -1716,7 +1725,7 @@ impl GeometryRouter {
                         let redundant_void =
                             opening_redundant_with_host(&result, opening_mesh, &probe_axis);
                         let suppress_fallback =
-                            redundant_void || (csg_unchanged && engulfs_host && !capped);
+                            redundant_void || (csg_unchanged && engulfs_host);
                         if !suppress_fallback {
                             // Diagnostic for issue #635: log the opening
                             // triangle count when the AABB fallback actually
@@ -1751,6 +1760,29 @@ impl GeometryRouter {
                                 result = aabb_cut;
                                 host_mutated = true;
                             }
+                        } else {
+                            // The engulfing/redundant-void guard suppressed the
+                            // #635 AABB box-cut. For an engulfing cutter the box
+                            // covers the whole host, so cutting it would DELETE
+                            // the wall; leaving the host un-cut (a phantom solid)
+                            // is the strictly safer degrade. `capped` records
+                            // whether the CSG bailed via the #1109 budget trip
+                            // (`OperandTooLarge`) vs a kernel error on the
+                            // coincident faces.
+                            crate::diag::diag_warn!(
+                                { opening_tris = opening_mesh.triangle_count(),
+                                  capped = capped,
+                                  reason = "engulfing-cutter-fallback-suppressed",
+                                  "voids: AABB fallback suppressed for engulfing cutter (host left un-cut)" }
+                                else {
+                                    #[cfg(any(debug_assertions, test))]
+                                    eprintln!(
+                                        "[issue-635] AABB fallback SUPPRESSED for engulfing cutter: opening={} tris, capped={} (host left un-cut)",
+                                        opening_mesh.triangle_count(),
+                                        capped
+                                    );
+                                }
+                            );
                         }
                     }
                 }
