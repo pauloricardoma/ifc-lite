@@ -159,6 +159,52 @@ impl Mesh {
         }
     }
 
+    /// Build a mesh with FRESH geometry buffers (`positions` / `normals` /
+    /// `indices`) that carries THIS mesh's placement/frame metadata forward:
+    /// `origin` (RTC / local-frame translation), `rtc_applied`, `local_bounds`
+    /// and `local_to_world` (the #1474 placement capture).
+    ///
+    /// This is the correct constructor for an in-place rebuild pass that
+    /// REPLACES the vertex buffers of an already-placed mesh (sliver refine,
+    /// subdivide, weld). Constructing a bare `Mesh` and copying back only a
+    /// field or two silently resets `origin` and the #1474 capture to their
+    /// defaults, which mis-places the rebuilt host at the world origin on
+    /// local-framed (large / georeferenced) models — see facet_weld's
+    /// sliver-refine and this module's `subdivide_once` / `weld_impl`.
+    ///
+    /// `instance_meta` is intentionally NOT carried. Every such rebuild CHANGES
+    /// the vertices, so the mesh no longer reproduces its representation's
+    /// canonical geometry; carrying the (vertex-invariant) `rep_identity`
+    /// forward would let the GPU-instancing collator dedup this changed mesh
+    /// against an *unrefined* sibling that shares the same `rep_identity` and
+    /// draw the wrong geometry. Dropping it mirrors the void-cut path, which
+    /// nulls `instance_meta` for exactly this reason.
+    ///
+    /// # Precondition
+    ///
+    /// The new buffers MUST NOT extend the mesh's spatial extent beyond the
+    /// original: the carried `local_bounds` stays valid only because it remains
+    /// a *superset* of the rebuilt vertices' extent. This holds for every
+    /// current caller — sliver-refine and subdivide insert edge/interior
+    /// midpoints (convex combinations that lie inside the existing hull), and
+    /// weld only merges/moves coincident vertices to a snapped position (a
+    /// subset extent). A future caller that GROWS the extent (adds vertices
+    /// outside the original hull) must NOT use this constructor for
+    /// `local_bounds`: it has to recompute `local_bounds` from the new positions
+    /// or pass through a variant that sets it to `None`.
+    pub fn rebuilt_like(&self, positions: Vec<f32>, normals: Vec<f32>, indices: Vec<u32>) -> Mesh {
+        Mesh {
+            positions,
+            normals,
+            indices,
+            rtc_applied: self.rtc_applied,
+            origin: self.origin,
+            instance_meta: None,
+            local_bounds: self.local_bounds,
+            local_to_world: self.local_to_world,
+        }
+    }
+
     /// Create a mesh from a single triangle
     pub fn from_triangle(
         v0: &Point3<f64>,
@@ -370,13 +416,10 @@ impl Mesh {
             // four sub-triangles, preserving the parent winding
             indices.extend_from_slice(&[a, ab, ca, ab, b, bc, ca, bc, c, ab, bc, ca]);
         }
-        Mesh {
-            positions,
-            normals,
-            indices,
-            rtc_applied: self.rtc_applied,
-            origin: self.origin,
-        instance_meta: None, local_bounds: None, local_to_world: None }
+        // Adding midpoints changes the vertex buffers, so carry the placement /
+        // frame metadata (origin, rtc, #1474 capture) but drop instance_meta
+        // (this mesh no longer matches its canonical rep) via `rebuilt_like`.
+        self.rebuilt_like(positions, normals, indices)
     }
 
     /// Remove triangle indices that reference vertices beyond the positions array.
@@ -865,13 +908,10 @@ fn weld_impl(mesh: &Mesh, position_eps: f32, average_normals: bool) -> Mesh {
         new_indices.push(i2);
     }
 
-    Mesh {
-        positions: new_positions,
-        normals: new_normals,
-        indices: new_indices,
-        rtc_applied: mesh.rtc_applied,
-        origin: mesh.origin,
-    instance_meta: None, local_bounds: None, local_to_world: None }
+    // Welding collapses / moves vertices, so carry the placement / frame
+    // metadata (origin, rtc, #1474 capture) but drop instance_meta (the welded
+    // mesh no longer matches its canonical rep) via `rebuilt_like`.
+    mesh.rebuilt_like(new_positions, new_normals, new_indices)
 }
 
 #[cfg(test)]
@@ -1080,6 +1120,60 @@ mod tests {
                 (len_sq - 1.0).abs() < 1e-4,
                 "welded normal must be unit length, got |n|^2 = {}",
                 len_sq
+            );
+        }
+    }
+
+    /// #1474 / B7 regression guard: a vertex-changing rebuild MUST carry the
+    /// mesh's placement/frame metadata (origin, rtc_applied, local_bounds,
+    /// local_to_world) forward and MUST drop instance_meta (the changed vertices
+    /// no longer match the canonical rep). Directly exercises `rebuilt_like` and
+    /// the two public seams that route through it (`subdivided`,
+    /// `welded_by_position`). Pure unit test — no fixture.
+    #[test]
+    fn rebuild_carries_placement_metadata_and_drops_instancing() {
+        // One triangle, placed: non-default origin/rtc + a set #1474 capture and
+        // an attached instance side-channel.
+        let mut m = mesh_from_tris(&[[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0]]]);
+        m.origin = [100.0, 200.0, 300.0];
+        m.rtc_applied = true;
+        m.local_bounds = Some([0.0, 0.0, 0.0, 1.0, 1.0, 0.0]);
+        let l2w: [f64; 16] = [
+            1.0, 0.0, 0.0, 10.0, //
+            0.0, 1.0, 0.0, 20.0, //
+            0.0, 0.0, 1.0, 30.0, //
+            0.0, 0.0, 0.0, 1.0,
+        ];
+        m.local_to_world = Some(l2w);
+        m.instance_meta = Some(InstanceMeta {
+            transform: l2w,
+            local_transform: None,
+            canonical_transform: None,
+            rep_identity: 0xDEAD_BEEF,
+            instanceable: true,
+        });
+
+        // Metadata carried; instancing dropped. Assert on every seam.
+        let via_ctor = m.rebuilt_like(vec![0.0, 0.0, 0.0], vec![0.0, 0.0, 1.0], vec![]);
+        let via_subdivide = m.subdivided(1);
+        let via_weld = m.welded_by_position(1e-6);
+
+        for (label, out) in [
+            ("rebuilt_like", &via_ctor),
+            ("subdivided", &via_subdivide),
+            ("welded_by_position", &via_weld),
+        ] {
+            assert_eq!(out.origin, [100.0, 200.0, 300.0], "{label}: origin must carry");
+            assert!(out.rtc_applied, "{label}: rtc_applied must carry");
+            assert_eq!(
+                out.local_bounds,
+                Some([0.0, 0.0, 0.0, 1.0, 1.0, 0.0]),
+                "{label}: local_bounds (#1474) must carry"
+            );
+            assert_eq!(out.local_to_world, Some(l2w), "{label}: local_to_world (#1474) must carry");
+            assert!(
+                out.instance_meta.is_none(),
+                "{label}: instance_meta must be dropped (vertices changed -> not the canonical rep)"
             );
         }
     }

@@ -33,7 +33,8 @@
     1061 rust/geometry/src/csg/mod.rs
      436 rust/geometry/src/csg/normals.rs
      998 rust/geometry/src/extrusion.rs
-     759 rust/geometry/src/facet_weld.rs
+# +4: refine_high_aspect_slivers routes its rebuild through Mesh::rebuilt_like so a slivered host keeps its local-frame origin + #1474 placement capture (B7 metadata-loss fix).
+     763 rust/geometry/src/facet_weld.rs
      408 rust/geometry/src/geom_hash.rs
      641 rust/geometry/src/kernel/arrangement/classify.rs
      566 rust/geometry/src/kernel/fixed.rs
