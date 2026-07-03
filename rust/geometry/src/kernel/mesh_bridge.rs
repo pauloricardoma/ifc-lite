@@ -384,9 +384,28 @@ pub fn subtract_many(host: &Mesh, cutters: &[&Mesh]) -> Option<Mesh> {
 
 /// `a ∪ b` as a `Mesh`.
 pub fn union(a: &Mesh, b: &Mesh) -> Mesh {
+    // Enter the #1109 escalation budget exactly like `subtract` does: begin a
+    // fresh PER-BOOLEAN count (this is a distinct operation) while the per-ELEMENT
+    // accumulator is left intact — `begin()` resets only the per-op counter, so a
+    // union inside an over-budget element STILL trips (it is not an element-cap
+    // escape hatch; see `budget::begin` / the `per_element_budget_accumulates_
+    // across_booleans` test). Without this, a union scheduled on a worker thread
+    // after a subtract tripped starts already-tripped and `arrange` bails at its
+    // first pair, silently returning a partial/empty arrangement.
+    super::budget::begin();
     let a = orient_outward(mesh_to_tris(a));
     let b = orient_outward(mesh_to_tris(b));
-    tris_to_mesh(&boolean(&a, &b, BoolOp::Union))
+    let out = boolean(&a, &b, BoolOp::Union);
+    // On a budget trip `arrange` bailed mid-way and `out` is a PARTIAL arrangement.
+    // Discard it and return empty — the graceful-fallback signal the callers already
+    // handle (`csg::union_mesh` degrades to a plain merge; the #960 roof
+    // `build_cutter_union` defers to the sequential path) — never a poisoned mesh.
+    // Deterministic: the trip point is a pure function of the snapped operands, so
+    // native and wasm degrade the SAME union identically (parity).
+    if super::budget::tripped() {
+        return Mesh::new();
+    }
+    tris_to_mesh(&out)
 }
 
 /// `∪ meshes` as one watertight `Mesh` — the N-ary union, computed in a single
@@ -394,17 +413,37 @@ pub fn union(a: &Mesh, b: &Mesh) -> Mesh {
 /// segmented-roof cutters) dissolve without the tearing that left-deep pairwise
 /// accumulation produces. Empty input ⇒ empty mesh.
 pub fn union_many(meshes: &[&Mesh]) -> Mesh {
+    // Participate in the #1109 budget like `subtract` / `union` — fresh per-boolean
+    // count, per-element accumulator preserved (see `union`).
+    super::budget::begin();
     let tri_lists: Vec<Vec<Tri>> =
         meshes.iter().map(|m| orient_outward(mesh_to_tris(m))).collect();
     let refs: Vec<&[Tri]> = tri_lists.iter().map(|t| t.as_slice()).collect();
-    tris_to_mesh(&union_all(&refs))
+    let out = union_all(&refs);
+    // On a budget trip `arrange_many` bailed and `out` is a PARTIAL arrangement.
+    // Return empty so `build_cutter_union` defers to the sequential per-cutter path
+    // instead of feeding a poisoned (non-watertight) cutter union into the subtract.
+    if super::budget::tripped() {
+        return Mesh::new();
+    }
+    tris_to_mesh(&out)
 }
 
 /// `a ∩ b` as a `Mesh`.
 pub fn intersection(a: &Mesh, b: &Mesh) -> Mesh {
+    // Participate in the #1109 budget like `subtract` / `union` — fresh per-boolean
+    // count, per-element accumulator preserved (see `union`).
+    super::budget::begin();
     let a = orient_outward(mesh_to_tris(a));
     let b = orient_outward(mesh_to_tris(b));
-    tris_to_mesh(&boolean(&a, &b, BoolOp::Intersection))
+    let out = boolean(&a, &b, BoolOp::Intersection);
+    // On a budget trip `arrange` bailed and `out` is a PARTIAL arrangement. Return
+    // empty — `csg::intersection_mesh` treats empty as the graceful (disjoint-like)
+    // degrade rather than consuming a poisoned partial intersection.
+    if super::budget::tripped() {
+        return Mesh::new();
+    }
+    tris_to_mesh(&out)
 }
 
 #[cfg(test)]

@@ -236,6 +236,20 @@ pub fn reset_peak() {
 /// Called from the `.or_else(|| fixed::…)` arms of [`crate::kernel::predicates`]
 /// — the point where a predicate leaves the cheap interval filter for the
 /// expensive fixed-width / BigRational path.
+///
+/// DELIBERATE EXEMPTION — the cached-λ I512/I1024 tier is NOT counted. The
+/// escalations tallied here all RE-DERIVE the degree-4/7 LPI/TPI lambda inside the
+/// `fixed::indirect_*` / `orient2d_2i|3i` / `cmp_lex` arms of `predicates.rs`, and
+/// that lambda recompute is the dominant per-escalation cost the caps were
+/// calibrated against. The hot re-triangulation / arrangement predicates that run
+/// straight off lambdas ALREADY interned — `retriangulate::orient2d_v` /
+/// `cmp_lex_v` (their `fixed::orient2d_from_lam` / `cmp_lex_from_lam` determinant
+/// branch, retriangulate.rs:51) and `arrangement::orient2d_end` (its cached
+/// interval-lambda branch, arrangement/mod.rs:107) — skip that recompute, so they
+/// are intentionally left OUT of the counter. Folding them in would inflate the
+/// count on cheap cached evaluations and re-calibrate the effective cap, shifting
+/// which elements trip and thereby perturbing valid mesh output / determinism; the
+/// counter is kept as a proxy for the recompute-heavy work only.
 #[inline]
 pub fn note_escalation() {
     COUNT.with(|c| c.set(c.get().saturating_add(1)));
