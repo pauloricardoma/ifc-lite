@@ -1173,6 +1173,10 @@ pub fn process_geometry_streaming_filtered_with_options(
     let faceted_brep_ns_collector = std::sync::atomic::AtomicU64::new(0);
 
     let worker_point_caches = jobs::new_worker_point_caches();
+    // Sized identically to `worker_point_caches` (one slot per rayon worker,
+    // indexed by thread index). Memoizes each worker's resolved placement world
+    // transforms across the whole model — see `new_worker_placement_caches`.
+    let worker_placement_caches = jobs::new_worker_placement_caches();
 
     let geometry_span = tracing::info_span!(
         "geometry",
@@ -1305,6 +1309,21 @@ pub fn process_geometry_streaming_filtered_with_options(
                         Some(cache) => cache,
                         None => &mut fallback_cache,
                     };
+                // Placement-transform slot: the SAME `try_lock` (not `lock`)
+                // discipline as the point cache above — a faceted-brep nested
+                // `par_iter` can work-steal another job onto this worker's own
+                // thread index and re-enter here, and `lock()` on the
+                // non-reentrant `Mutex` this thread already holds would
+                // self-deadlock (#1587). On that rare re-entrant steal we fall
+                // back to a throwaway cache; output stays byte-identical since
+                // the cache is pure memoization of a deterministic composition.
+                let mut fallback_placement_cache = FxHashMap::default();
+                let mut placement_slot_guard = worker_placement_caches[widx].try_lock().ok();
+                let worker_placement_cache: &mut FxHashMap<u32, [f64; 16]> =
+                    match placement_slot_guard.as_deref_mut() {
+                        Some(cache) => cache,
+                        None => &mut fallback_placement_cache,
+                    };
                 process_entity_job(
                     job,
                     content,
@@ -1327,6 +1346,7 @@ pub fn process_geometry_streaming_filtered_with_options(
                     &backstop_collector,
                     &item_dedup_cache,
                     worker_point_cache,
+                    worker_placement_cache,
                     &point_cache_hits_collector,
                     &point_cache_misses_collector,
                     &faceted_brep_ns_collector,

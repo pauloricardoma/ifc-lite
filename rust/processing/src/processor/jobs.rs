@@ -16,6 +16,12 @@ use super::*;
 /// worker thread, indexed by `rayon::current_thread_index()`.
 pub(super) type WorkerPointCaches = Vec<std::sync::Mutex<FxHashMap<u32, (f64, f64, f64)>>>;
 
+/// Per-rayon-worker placement-transform caches: one `FxHashMap` behind a `Mutex`
+/// per worker thread, indexed by `rayon::current_thread_index()`. Mirrors
+/// [`WorkerPointCaches`] exactly; the value is the opaque column-major `[f64; 16]`
+/// world transform the geometry router memoizes per IfcObjectPlacement id.
+pub(super) type WorkerPlacementCaches = Vec<std::sync::Mutex<FxHashMap<u32, [f64; 16]>>>;
+
 /// One persistent CartesianPoint cache per rayon worker thread, indexed by
 /// `rayon::current_thread_index()`.
 ///
@@ -39,6 +45,19 @@ pub(super) fn new_worker_point_caches() -> WorkerPointCaches {
         .collect()
 }
 
+/// One persistent placement-transform cache per rayon worker thread, sized and
+/// indexed identically to [`new_worker_point_caches`]. Storey/building
+/// placements shared by thousands of elements are composed at most once per
+/// worker thread for the whole model instead of re-resolving the placement chain
+/// per element. Pure memoization of a deterministic composition, so meshes stay
+/// byte-identical (`mesh_determinism` no-diff). Each slot is only ever locked by
+/// the one worker that owns that index; see the `try_lock` note at the call site.
+pub(super) fn new_worker_placement_caches() -> WorkerPlacementCaches {
+    (0..rayon::current_num_threads().max(1))
+        .map(|_| std::sync::Mutex::new(FxHashMap::default()))
+        .collect()
+}
+
 /// RAII guard that returns a worker's warm CartesianPoint cache to its slot on
 /// EVERY exit path — the normal return, the `decode_at` error early-return, and
 /// a panic. Without it, a decode failure would drop `local_decoder` (holding the
@@ -48,12 +67,17 @@ pub(super) fn new_worker_point_caches() -> WorkerPointCaches {
 struct WorkerCacheGuard<'c, 's> {
     decoder: EntityDecoder<'c>,
     slot: &'s mut FxHashMap<u32, (f64, f64, f64)>,
+    // The worker's persistent placement-transform cache, written back on the
+    // same EVERY-exit-path guarantee as `slot` so a `decode_at` error or panic
+    // does not cold-start placement resolution for the worker's next element.
+    placement_slot: &'s mut FxHashMap<u32, [f64; 16]>,
 }
 
 impl Drop for WorkerCacheGuard<'_, '_> {
     fn drop(&mut self) {
         // Cheap: moves the map header (now warmer), not its entries.
         *self.slot = self.decoder.take_point_cache();
+        *self.placement_slot = self.decoder.take_placement_transform_cache();
     }
 }
 
@@ -114,6 +138,12 @@ pub(super) fn process_entity_job(
     // and moved back out afterwards so a shared point list is parsed once per worker
     // for the entire pass, not once per chunk or once per part.
     worker_point_cache: &mut FxHashMap<u32, (f64, f64, f64)>,
+    // The current rayon worker's PERSISTENT placement-transform cache, reused
+    // across every element that worker meshes for the whole model (see the
+    // `worker_placement_caches` store at the call site). Moved into this job's
+    // decoder and moved back out afterwards so a placement chain shared by many
+    // elements (storey/building) is composed once per worker, not once per element.
+    worker_placement_cache: &mut FxHashMap<u32, [f64; 16]>,
     // Request-local point-cache hit/miss + faceted-brep-timing sinks (see the
     // collectors declared before the chunk loop).
     point_cache_hits_collector: &std::sync::atomic::AtomicU64,
@@ -128,15 +158,20 @@ pub(super) fn process_entity_job(
     // Adopt this worker's persistent point cache so faceted-brep polyloop points
     // shared across elements are served from memory instead of re-parsed per element.
     local_decoder.set_point_cache(std::mem::take(worker_point_cache));
+    // Adopt this worker's persistent placement-transform cache so a placement
+    // chain shared across elements (storey/building) is composed once per worker
+    // instead of re-resolved per element.
+    local_decoder.set_placement_transform_cache(std::mem::take(worker_placement_cache));
     // Seed the unit-scale caches so curve/arc processing skips the O(file)
     // IFCPROJECT scan that each fresh per-element decoder would otherwise repeat.
     local_decoder.seed_unit_scales(unit_scale, seed_plane_angle_to_radians);
     // From here the decoder is owned by the guard, which writes its (warmer)
-    // point cache back into `worker_point_cache` on Drop — so the early return
-    // below, and any panic, still hand the cache to the worker's next element.
+    // point + placement caches back into the worker slots on Drop — so the early
+    // return below, and any panic, still hand the caches to the worker's next element.
     let mut decoder = WorkerCacheGuard {
         decoder: local_decoder,
         slot: worker_point_cache,
+        placement_slot: worker_placement_cache,
     };
 
     let entity = match decoder.decode_at(job.start, job.end) {

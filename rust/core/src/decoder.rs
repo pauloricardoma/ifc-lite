@@ -70,6 +70,19 @@ pub struct EntityDecoder<'a> {
     /// files, 0.001 for millimetre files, etc. Used to express absolute
     /// tolerances (e.g. curve-tessellation chord deviation) in file units.
     length_unit_scale_cache: Option<f64>,
+    /// Per-worker memo of resolved placement world transforms, keyed by the
+    /// IfcObjectPlacement entity id and stored as an opaque column-major
+    /// `[f64; 16]` (core must not depend on nalgebra; the geometry crate owns
+    /// the Matrix4 <-> array round-trip). Populated by the geometry router's
+    /// placement resolver, which recursively composes `parent * local` down the
+    /// IfcLocalPlacement chain. For a well-formed acyclic placement DAG the
+    /// resolved transform is a pure function of the placement id, so reusing it
+    /// across the elements a single worker meshes is byte-identical (speed
+    /// only): storey/building placements shared by thousands of elements are
+    /// composed once per worker instead of once per element. Hoisted across a
+    /// worker's parts exactly like `point_cache`; see
+    /// [`Self::take_placement_transform_cache`].
+    placement_transform_cache: FxHashMap<u32, [f64; 16]>,
 }
 
 impl<'a> EntityDecoder<'a> {
@@ -88,6 +101,7 @@ impl<'a> EntityDecoder<'a> {
             point_cache_misses: 0,
             plane_angle_to_radians_cache: None,
             length_unit_scale_cache: None,
+            placement_transform_cache: FxHashMap::default(),
         }
     }
 
@@ -106,6 +120,7 @@ impl<'a> EntityDecoder<'a> {
             point_cache_misses: 0,
             plane_angle_to_radians_cache: None,
             length_unit_scale_cache: None,
+            placement_transform_cache: FxHashMap::default(),
         }
     }
 
@@ -124,6 +139,7 @@ impl<'a> EntityDecoder<'a> {
             point_cache_misses: 0,
             plane_angle_to_radians_cache: None,
             length_unit_scale_cache: None,
+            placement_transform_cache: FxHashMap::default(),
         }
     }
 
@@ -441,6 +457,7 @@ impl<'a> EntityDecoder<'a> {
     pub fn clear_cache(&mut self) {
         self.cache.clear();
         self.point_cache.clear();
+        self.placement_transform_cache.clear();
     }
 
     /// Clear only the point coordinate cache (used after BREP preprocessing).
@@ -472,6 +489,39 @@ impl<'a> EntityDecoder<'a> {
     /// one faceted part with a shared point list prove cross-element memoization.
     pub fn point_cache_stats(&self) -> (u64, u64) {
         (self.point_cache_hits, self.point_cache_misses)
+    }
+
+    /// Move the placement-transform memo OUT of this decoder, leaving it empty.
+    /// Paired with [`Self::set_placement_transform_cache`] to hoist the cache
+    /// across the per-element decoders a single worker builds within one batch,
+    /// exactly like [`Self::take_point_cache`]. The memo is a pure function of
+    /// `content` + placement id (deterministic `parent * local` composition), so
+    /// reusing it across elements is byte-identical (speed only). Cheap: moves
+    /// the map header, not its contents.
+    pub fn take_placement_transform_cache(&mut self) -> FxHashMap<u32, [f64; 16]> {
+        std::mem::take(&mut self.placement_transform_cache)
+    }
+
+    /// Install a previously-accumulated placement-transform memo (see
+    /// [`Self::take_placement_transform_cache`]).
+    pub fn set_placement_transform_cache(&mut self, cache: FxHashMap<u32, [f64; 16]>) {
+        self.placement_transform_cache = cache;
+    }
+
+    /// Read a memoized placement world transform by placement id. Returns a copy
+    /// (`[f64; 16]` is `Copy`) so the caller can drop the borrow before
+    /// reconstructing its `Matrix4`. The array is the opaque column-major layout
+    /// written by [`Self::cache_placement_transform`].
+    pub fn get_placement_transform_cached(&self, id: u32) -> Option<[f64; 16]> {
+        self.placement_transform_cache.get(&id).copied()
+    }
+
+    /// Memoize a resolved placement world transform under its placement id. Only
+    /// the geometry router's real computed transforms (IfcLocalPlacement /
+    /// linear / grid) are stored here; identity/depth-guard fallbacks are not, so
+    /// the memo stays a pure function of the placement id (byte-identical reuse).
+    pub fn cache_placement_transform(&mut self, id: u32, transform: [f64; 16]) {
+        self.placement_transform_cache.insert(id, transform);
     }
 
     /// Get cache size
