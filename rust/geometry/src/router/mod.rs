@@ -350,7 +350,7 @@ impl GeometryRouter {
     pub fn dedup_unique_count(&self) -> usize {
         self.item_dedup_cache
             .as_ref()
-            .map(|c| c.lock().expect("dedup cache poisoned").len())
+            .map(|c| c.lock().unwrap_or_else(|e| e.into_inner()).len())
             .unwrap_or(0)
     }
 

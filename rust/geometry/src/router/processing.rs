@@ -567,7 +567,11 @@ impl GeometryRouter {
         // the cached item mesh; meshing is skipped entirely.
         let dedup_key = self.item_dedup_key(item, decoder);
         if let (Some(key), Some(cache)) = (dedup_key, self.item_dedup_cache.as_ref()) {
-            let hit = cache.lock().expect("dedup cache poisoned").get(&key).cloned();
+            let hit = cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+                .cloned();
             if let Some(mesh) = hit {
                 return Ok(self.tag_direct_instance((*mesh).clone()));
             }
@@ -588,7 +592,7 @@ impl GeometryRouter {
             if !mesh.positions.is_empty() && !crate::kernel::budget::tripped() {
                 cache
                     .lock()
-                    .expect("dedup cache poisoned")
+                    .unwrap_or_else(|e| e.into_inner())
                     .insert(key, Arc::new(mesh.clone()));
             }
         }
@@ -611,17 +615,6 @@ impl GeometryRouter {
             // so a sampled-hash collision (#833 family) would silently group
             // non-identical geometry. The 128-bit content hash makes that ~2^-127.
             let exact_rep = Self::compute_mesh_hash_full(&mesh) | DIRECT_SOLID_TAG;
-            // Stash the PRE-PLACEMENT local mesh (the exact state this hash saw)
-            // for the rigid post-pass (build_rigid_map) — needed by both the
-            // offline analysis and the production rigid emit.
-            if crate::congruence::analysis_enabled() || crate::congruence::rigid_enabled() {
-                crate::congruence::record_local(exact_rep, &mesh);
-            }
-            // NOTE: the rotation-normalized rigid tier (RigidCache) is NOT run here.
-            // Verify-on-insert with a shared cache serialises the parallel geometry
-            // workers and stalls large streams (measured). Production integration is
-            // a rayon POST-PASS on captured local meshes in a collect-all path
-            // (coupled with the instanced wire format); the exact-bit tier ships now.
             mesh.instance_meta = Some(InstanceMeta {
                 transform: IDENTITY_ROW_MAJOR,
                 local_transform: None,

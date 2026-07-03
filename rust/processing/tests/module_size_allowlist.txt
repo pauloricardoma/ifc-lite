@@ -25,7 +25,6 @@
     1233 rust/geometry/src/alignment.rs
      551 rust/geometry/src/bool2d.rs
     1875 rust/geometry/src/cdt.rs
-     535 rust/geometry/src/congruence/engine.rs
      895 rust/geometry/src/csg/consolidate.rs
     1061 rust/geometry/src/csg/mod.rs
      436 rust/geometry/src/csg/normals.rs

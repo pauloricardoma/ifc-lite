@@ -96,7 +96,6 @@ pub mod mesh_weld;
 pub(crate) mod diag;
 pub(crate) mod diagnostics;
 pub(crate) mod error;
-pub(crate) mod congruence;
 pub(crate) mod geom_hash;
 pub(crate) mod extrusion;
 pub(crate) mod instancing;
