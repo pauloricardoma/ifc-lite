@@ -20,15 +20,33 @@ use num_traits::ToPrimitive;
 /// A sub-triangle of mesh `k` is on `∂(∪meshes)` iff its OUTER side (`+n`) lies
 /// outside every other mesh. Identical co-oriented faces shared by several meshes
 /// (e.g. duplicated cutter prisms) are kept once, owned by the LOWEST mesh index.
-pub fn union_all(meshes: &[&[Tri]]) -> Vec<Tri> {
+///
+/// Returns `(union, conforming)`. `conforming == false` ⇒ the N-way arrangement
+/// left an unrecovered constraint ([`MultiArrangement::unrecovered`]): some
+/// sub-triangle STRADDLES another operand's boundary and its centroid
+/// classification is unreliable, so the union may be TORN. This is the SAME
+/// non-conformity condition [`difference_all`] HARD-REJECTS — surfaced here as a
+/// signal a torn union is distinct from an EMPTY one, where before it was
+/// silently discarded (`arrange_many`'s `_unrecovered`) and indistinguishable.
+///
+/// Unlike `difference_all`, the union still RETURNS its best-effort triangles even
+/// when `!conforming`: its sole caller (the #960 segmented-roof cutter-union via
+/// [`crate::kernel::mesh_bridge::union_many`]) verifies the DOWNSTREAM subtract,
+/// and the exact batched union — even a technically torn one — is a strictly
+/// better cutter than the sequential fallback, which reintroduces the seam sliver
+/// #960 eliminated (House.ifc wall #4148: exact union → correct 8984 mm; the
+/// sequential fallback → a 9850 mm full-height sliver). A caller WITHOUT its own
+/// output verification must treat `!conforming` as "do not trust; fall back."
+pub fn union_all(meshes: &[&[Tri]]) -> (Vec<Tri>, bool) {
     if meshes.is_empty() {
-        return Vec::new();
+        return (Vec::new(), true);
     }
     if meshes.len() == 1 {
-        return meshes[0].to_vec();
+        return (meshes[0].to_vec(), true);
     }
     use std::collections::HashMap;
     let arr = arrange_many(meshes);
+    let conforming = arr.unrecovered == 0;
     let exts: Vec<f64> = meshes.iter().map(|m| operand_extent(m)).collect();
     // Owner map: oriented (winding-preserving) Vid key → lowest mesh index that
     // KEEPS that face. A later mesh's identical co-oriented copy is dropped.
@@ -74,7 +92,7 @@ pub fn union_all(meshes: &[&[Tri]]) -> Vec<Tri> {
             }
         }
     }
-    out
+    (out, conforming)
 }
 
 /// Step `step·n̂` off `c` along the unit-normalised `dir`. Deterministic FMA-free

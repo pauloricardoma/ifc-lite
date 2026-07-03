@@ -419,13 +419,20 @@ pub fn union_many(meshes: &[&Mesh]) -> Mesh {
     let tri_lists: Vec<Vec<Tri>> =
         meshes.iter().map(|m| orient_outward(mesh_to_tris(m))).collect();
     let refs: Vec<&[Tri]> = tri_lists.iter().map(|t| t.as_slice()).collect();
-    let out = union_all(&refs);
-    // On a budget trip `arrange_many` bailed and `out` is a PARTIAL arrangement.
-    // Return empty so `build_cutter_union` defers to the sequential per-cutter path
-    // instead of feeding a poisoned (non-watertight) cutter union into the subtract.
+    let (out, conforming) = union_all(&refs);
+    // #1109 budget trip ⇒ `arrange_many` bailed and `out` is PARTIAL; return empty so
+    // `build_cutter_union` defers to the sequential per-cutter path instead of feeding
+    // a poisoned (non-watertight) cutter union into the subtract.
     if super::budget::tripped() {
         return Mesh::new();
     }
+    // `!conforming` ⇒ an unrecovered constraint left the arrangement non-conforming —
+    // `union_all` now SURFACES the condition `difference_all` hard-rejects (vs the old
+    // silent discard). We deliberately trust the union anyway: the sole caller (#960
+    // `build_cutter_union`) verifies the downstream subtract, and the exact batched
+    // union — even a torn one — beats the sequential fallback that reintroduces the
+    // seam sliver #960 removed (wall #4148: exact → 8984 mm; fallback → 9850 mm).
+    let _ = conforming;
     tris_to_mesh(&out)
 }
 

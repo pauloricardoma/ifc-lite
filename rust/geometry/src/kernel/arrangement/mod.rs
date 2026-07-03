@@ -256,6 +256,14 @@ pub struct MultiArrangement {
     pub interner: Interner,
     /// `subtris[k]` = mesh `k`'s conforming sub-triangles (interned Vids).
     pub subtris: Vec<Vec<[Vid; 3]>>,
+    /// Total constraint sub-segments the per-mesh re-triangulations could not
+    /// force as edges (summed over every mesh's `Mesh2d::unrecovered`). Non-zero
+    /// ⇒ the operands do not fully conform along their intersections, so a
+    /// straddling sub-triangle's centroid classification in [`union_all`] is
+    /// unreliable (the union can silently tear). Mirrors [`Arrangement::unrecovered`]
+    /// so [`union_all`] can SIGNAL the same non-conformity condition
+    /// [`difference_all`] hard-rejects (it was previously discarded into a `_`).
+    pub unrecovered: usize,
 }
 
 /// Conforming arrangement of `meshes` (N operands) over ONE interner.
@@ -314,6 +322,11 @@ pub fn arrange_many(meshes: &[&[Tri]]) -> MultiArrangement {
     }
     let mut interner = Interner::new();
     let mut subtris = Vec::with_capacity(n);
+    // Accumulate unrecovered constraints across EVERY mesh's re-triangulation
+    // (mirrors the binary `arrange`, which sums over both operands). `union_all`
+    // surfaces any non-zero total as its non-conformity signal, so it must not be
+    // discarded here (it previously was, into a `_unrecovered`).
+    let mut unrecovered = 0usize;
     for k in 0..n {
         let cop_parent: Vec<bool> = cop[k].iter().map(|c| !c.is_empty()).collect();
         let cons: Vec<Vec<Constraint>> = (0..meshes[k].len())
@@ -325,12 +338,11 @@ pub fn arrange_many(meshes: &[&[Tri]]) -> MultiArrangement {
             .collect();
         // `union_all` classifies every sub-triangle against each other mesh via the
         // off-plane `solid_side` probe, so it needs no per-sub coplanar flag here.
-        let mut _unrecovered = 0usize;
         let (tris, _coplanar) =
-            retriangulate_each(meshes[k], &cons, &pts[k], &cop_parent, &mut interner, &mut _unrecovered);
+            retriangulate_each(meshes[k], &cons, &pts[k], &cop_parent, &mut interner, &mut unrecovered);
         subtris.push(tris);
     }
-    MultiArrangement { interner, subtris }
+    MultiArrangement { interner, subtris, unrecovered }
 }
 
 /// Re-triangulate each original triangle over the shared interner. Returns the
