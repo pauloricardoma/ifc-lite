@@ -253,16 +253,11 @@ pub(super) fn process_entity_job(
     // element's only — summing across jobs mirrors the wasm batch router's
     // accumulate-then-drain, giving the same GeometryDiagnostics counts.
     let cls = local_router.take_classification_stats();
-    if cls.rectangular != 0
-        || cls.diagonal != 0
-        || cls.non_rectangular != 0
-        || cls.floor_opening_guard_saved != 0
-    {
+    if cls.rectangular != 0 || cls.diagonal != 0 || cls.non_rectangular != 0 {
         if let Ok(mut acc) = classification_collector.lock() {
             acc.rectangular += cls.rectangular;
             acc.diagonal += cls.diagonal;
             acc.non_rectangular += cls.non_rectangular;
-            acc.floor_opening_guard_saved += cls.floor_opening_guard_saved;
         }
     }
     let host_diags = local_router.take_host_opening_diagnostics();

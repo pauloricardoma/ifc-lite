@@ -22,11 +22,6 @@ pub struct ClassificationStats {
     /// Openings classified as `NonRectangular` — full CSG path
     /// (no operand cap on the exact kernel).
     pub non_rectangular: usize,
-    /// Openings the OLD heuristic would have flagged as floor-opening
-    /// (vertical extrusion, dir.z.abs() > 0.95) but the host is a
-    /// wall-class element — so the classifier fix kept them on the
-    /// rectangular path. Non-zero here = the fix activated.
-    pub floor_opening_guard_saved: usize,
 }
 
 /// Per-host opening diagnostic captured during void processing.
@@ -78,9 +73,6 @@ pub struct OpeningDiagnostic {
     /// Vertex count of the opening's mesh — high counts (>100) force the
     /// non-rectangular path regardless of extrusion direction.
     pub vertex_count: usize,
-    /// Whether the host-aware floor-opening guard saved this opening
-    /// from being mis-routed onto the CSG path.
-    pub guard_saved: bool,
 }
 
 /// Discriminator for [`OpeningDiagnostic::kind`]. Mirrors `OpeningType`
@@ -227,7 +219,6 @@ impl GeometryRouter {
             ClassificationKind::Rectangular => s.rectangular += 1,
             ClassificationKind::Diagonal => s.diagonal += 1,
             ClassificationKind::NonRectangular => s.non_rectangular += 1,
-            ClassificationKind::FloorOpeningGuardSaved => s.floor_opening_guard_saved += 1,
         }
     }
 
@@ -316,20 +307,12 @@ impl GeometryRouter {
 }
 
 /// Internal classification-branch tag for `bump_classification`. Mirrors
-/// the variants of `OpeningType` plus the "the host-aware guard saved
-/// this opening from the floor-opening path" sentinel.
+/// the variants of `OpeningType`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ClassificationKind {
     Rectangular,
     Diagonal,
     NonRectangular,
-    /// Retained for backwards compatibility. After main's per-item geometry
-    /// classification superseded the host-aware floor-opening heuristic this
-    /// variant is no longer bumped (the per-item path makes the same call
-    /// without the global guard). The field on `Stats` remains so older
-    /// JSON consumers don't see schema breakage.
-    #[allow(dead_code)]
-    FloorOpeningGuardSaved,
 }
 
 // ───────────────────────── Public diagnostics contract ─────────────────────
@@ -414,7 +397,11 @@ pub struct WorstHost {
 /// Changelog:
 /// - 1: initial versioned contract (the #1439 shape; a deserialized 0 means a
 ///   pre-versioned producer).
-pub const GEOMETRY_DIAGNOSTICS_SCHEMA_VERSION: u32 = 1;
+/// - 2: removed the permanently-dead `guard_saved` signal — every producer
+///   passed `false`, so `OpeningDiagnostic.guard_saved` and the
+///   `floor_opening_guard_saved` counter were always 0. Field removal, not
+///   just a rename, hence the bump.
+pub const GEOMETRY_DIAGNOSTICS_SCHEMA_VERSION: u32 = 2;
 
 /// Aggregate CSG / opening diagnostics for one geometry pass — the public
 /// diagnostics contract. Built by [`aggregate_diagnostics`] from drained router
