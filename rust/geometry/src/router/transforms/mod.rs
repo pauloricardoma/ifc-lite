@@ -79,6 +79,19 @@ pub(crate) fn instancing_enabled() -> bool {
     true
 }
 
+/// Flatten a nalgebra `Matrix4<f64>` into a **column-major** `[f64; 16]` for the
+/// [`EntityDecoder`] placement-transform memo. `Matrix4::as_slice` is already
+/// column-major length 16, and [`Matrix4::from_column_slice`] reconstructs it
+/// bit-for-bit (an f64 round-trip is exact), so the memo is byte-identical to
+/// recomputing the transform. Distinct from [`mat4_to_row_major`], which is the
+/// row-major GPU-instancing convention.
+#[inline]
+fn mat4_to_col_array(m: &Matrix4<f64>) -> [f64; 16] {
+    *m.as_slice()
+        .first_chunk::<16>()
+        .expect("Matrix4<f64> as_slice is exactly 16 elements")
+}
+
 /// Flatten a column-major nalgebra `Matrix4<f64>` into a row-major `[f64; 16]`
 /// (the [`crate::mesh::InstanceMeta`] convention; matches a GPU mat4 fed row-by-row).
 pub(crate) fn mat4_to_row_major(m: &Matrix4<f64>) -> [f64; 16] {
@@ -169,6 +182,19 @@ impl GeometryRouter {
             return Ok(Matrix4::identity());
         }
 
+        // Per-worker placement-transform memo. For a well-formed acyclic IFC
+        // placement DAG the composed world transform is a pure function of
+        // `placement.id`, so returning a cached result is byte-identical — and
+        // it collapses the repeated work: storey/building placements shared by
+        // thousands of elements compose once per worker, not once per element.
+        // Only the REAL computed transforms below (local/linear/grid) are
+        // cached, never the depth-guard/identity fallbacks, so a cache hit is
+        // depth-independent (the depth guard only bites on chains deeper than
+        // MAX_PLACEMENT_DEPTH or cycles, which never reach a cache write).
+        if let Some(m) = decoder.get_placement_transform_cached(placement.id) {
+            return Ok(Matrix4::from_column_slice(&m));
+        }
+
         // IfcLinearPlacement is the IFC4x3 placement used by infrastructure
         // models to put products at a station along an alignment / gradient
         // curve. Without dedicated handling, every linearly-placed element
@@ -181,7 +207,9 @@ impl GeometryRouter {
         //   1 RelativePlacement (IfcAxis2PlacementLinear) — required, samples the curve
         //   2 CartesianPosition (IfcAxis2Placement3D, optional) — pre-baked world fallback
         if placement.ifc_type == IfcType::IfcLinearPlacement {
-            return self.resolve_linear_placement_with_depth(placement, decoder, depth);
+            let result = self.resolve_linear_placement_with_depth(placement, decoder, depth)?;
+            decoder.cache_placement_transform(placement.id, mat4_to_col_array(&result));
+            return Ok(result);
         }
 
         // IfcGridPlacement positions a product on a grid-axis intersection
@@ -190,7 +218,9 @@ impl GeometryRouter {
         // falls back to identity here and stacks at the world origin — the
         // exact symptom reported in issue #883 on the `ifcgrid` fixture.
         if placement.ifc_type == IfcType::IfcGridPlacement {
-            return self.resolve_grid_placement_with_depth(placement, decoder, depth);
+            let result = self.resolve_grid_placement_with_depth(placement, decoder, depth)?;
+            decoder.cache_placement_transform(placement.id, mat4_to_col_array(&result));
+            return Ok(result);
         }
 
         if placement.ifc_type != IfcType::IfcLocalPlacement {
@@ -232,6 +262,8 @@ impl GeometryRouter {
         };
 
         // Compose: parent * local
-        Ok(parent_transform * local_transform)
+        let result = parent_transform * local_transform;
+        decoder.cache_placement_transform(placement.id, mat4_to_col_array(&result));
+        Ok(result)
     }
 }
