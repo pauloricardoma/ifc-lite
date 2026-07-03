@@ -1289,7 +1289,22 @@ pub fn process_geometry_streaming_filtered_with_options(
             .par_iter()
             .map(|job| {
                 let widx = rayon::current_thread_index().unwrap_or(0) % worker_point_caches.len();
-                let mut worker_point_cache = worker_point_caches[widx].lock().unwrap();
+                // `try_lock`, not `lock`: faceted-brep triangulation nests a rayon
+                // `par_iter`, so a worker blocked at that nested join can work-steal
+                // another element job onto its OWN thread index and re-enter here.
+                // `lock()` on the non-reentrant `Mutex` this thread already holds
+                // would self-deadlock (regression from the persistent per-worker
+                // cache). Each slot is a thread's own index, so `try_lock` only ever
+                // fails on that re-entrant steal; that rare job uses a throwaway
+                // cache instead. Output is byte-identical: the cache is pure
+                // memoization of deterministic coordinates, so a miss just re-decodes.
+                let mut fallback_cache = FxHashMap::default();
+                let mut slot_guard = worker_point_caches[widx].try_lock().ok();
+                let worker_point_cache: &mut FxHashMap<u32, (f64, f64, f64)> =
+                    match slot_guard.as_deref_mut() {
+                        Some(cache) => cache,
+                        None => &mut fallback_cache,
+                    };
                 process_entity_job(
                     job,
                     content,
@@ -1311,7 +1326,7 @@ pub fn process_geometry_streaming_filtered_with_options(
                     &rect_fast_collector,
                     &backstop_collector,
                     &item_dedup_cache,
-                    &mut worker_point_cache,
+                    worker_point_cache,
                     &point_cache_hits_collector,
                     &point_cache_misses_collector,
                     &faceted_brep_ns_collector,
