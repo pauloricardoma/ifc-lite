@@ -118,7 +118,6 @@ pub(crate) mod tessellation;
 pub mod space_dcel;
 pub(crate) mod transform;
 pub(crate) mod triangulation;
-pub(crate) mod void_analysis;
 pub(crate) mod void_index;
 
 // Re-export nalgebra types for convenience
@@ -176,11 +175,7 @@ pub use transform::{
     rotation_angle_about_z,
 };
 pub use triangulation::triangulate_polygon;
-pub use void_analysis::{
-    classify_voids_batch, extract_coplanar_voids, extract_nonplanar_voids, VoidAnalyzer,
-    VoidClassification,
-};
 pub use void_index::{
     build_aggregate_children_index, compute_parts_to_skip, propagate_voids_to_parts,
-    propagate_voids_via_aggregates, VoidIndex, VoidStatistics,
+    propagate_voids_via_aggregates, VoidIndex,
 };
