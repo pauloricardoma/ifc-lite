@@ -524,6 +524,19 @@ struct ParamRectCut {
 }
 
 impl GeometryRouter {
+    /// Tier-conditional minimum opening volume (m³) floor. Shared by the batch
+    /// admission gate and the sequential CSG path so the two can never diverge
+    /// (B11 / issue #976): the 0.1 L default filters legacy-BSP CSG artefacts,
+    /// but at High/Highest quality it relaxes to ~1e-9 m³ so genuine small
+    /// openings (bolt holes / sleeves in thin plates) still get cut instead of
+    /// being silently skipped.
+    #[inline]
+    fn min_opening_volume(quality: TessellationQuality) -> f64 {
+        match quality {
+            TessellationQuality::High | TessellationQuality::Highest => 1e-9,
+            _ => MIN_OPENING_VOLUME,
+        }
+    }
 
     /// Process element with void subtraction (openings)
     /// Process element with voids using optimized plane clipping
@@ -1329,7 +1342,7 @@ impl GeometryRouter {
                 let open_vol = (omx.x - omn.x) as f64
                     * (omx.y - omn.y) as f64
                     * (omx.z - omn.z) as f64;
-                if open_vol < MIN_OPENING_VOLUME {
+                if open_vol < Self::min_opening_volume(self.tessellation_quality) {
                     continue;
                 }
                 let depth_dir = extrusion_dir
@@ -1549,10 +1562,7 @@ impl GeometryRouter {
                     // thin plates. At the two highest quality levels keep those
                     // holes (the exact kernel is stable on small cutters); only
                     // reject numerically degenerate cutters there. (issue #976)
-                    let min_open_vol = match self.tessellation_quality {
-                        TessellationQuality::High | TessellationQuality::Highest => 1e-9_f32,
-                        _ => MIN_OPENING_VOLUME as f32,
-                    };
+                    let min_open_vol = Self::min_opening_volume(self.tessellation_quality) as f32;
                     if open_vol < min_open_vol {
                         continue;
                     }
