@@ -20,6 +20,7 @@ mod json;
 mod jsonld;
 mod kmz;
 mod merged;
+mod mesh_weld;
 mod model;
 mod obj;
 mod openings;
