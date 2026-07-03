@@ -7,7 +7,6 @@
 //! Routes IFC representation entities to appropriate processors based on type.
 
 mod caching;
-mod clipping;
 mod content_hash;
 mod diagnostics;
 mod layers;
@@ -15,7 +14,6 @@ mod processing;
 mod rtc_offset;
 mod transforms;
 mod voids;
-mod voids_2d;
 
 pub use transforms::local_frame_set_enabled_override;
 pub use voids::RectParam;
