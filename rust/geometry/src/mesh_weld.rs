@@ -40,11 +40,11 @@ use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 
 /// Normal quantization grid: components are multiplied by this and rounded to an
-/// integer before keying. Matches [`crate::facet_weld`]'s `NORMAL_QUANT` and the
-/// `consolidate_coplanar` grid, so the weld merges exactly the f32-jittered
-/// coplanar normals while keeping any real crease (normals that differ by more
-/// than ~1e-3 in a component) split.
-const NORMAL_QUANT: f32 = 1.0e3;
+/// integer before keying. The shared grid also used by [`crate::facet_weld`]'s
+/// `NORMAL_QUANT` and the `consolidate_coplanar` grid, so the weld merges
+/// exactly the f32-jittered coplanar normals while keeping any real crease
+/// (normals that differ by more than ~1e-3 in a component) split.
+use crate::grid::NORMAL_QUANT_F32 as NORMAL_QUANT;
 
 /// UV quantization grid (~0.001 texel-fraction resolution). Coarse enough to
 /// merge f32 UV jitter on a shared corner, far finer than any real texture seam

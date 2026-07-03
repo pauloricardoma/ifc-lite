@@ -70,16 +70,17 @@ use crate::mesh::Mesh;
 use std::collections::BTreeMap;
 
 /// f32-snap / kernel-reconcile grid (metres). Power of two ⇒ `(c/G).round()*G`
-/// is an EXACT f64 op, bit-deterministic across targets. Mirrors
-/// `kernel::mesh_bridge::SNAP_GRID` so welded vertices land exactly where the
-/// kernel would snap them anyway.
-const SNAP_GRID: f64 = 1.0 / 65536.0;
+/// is an EXACT f64 op, bit-deterministic across targets. The kernel's own
+/// canonical grid, so welded vertices land exactly where the kernel would
+/// snap them anyway.
+use crate::kernel::mesh_bridge::SNAP_GRID;
 
 /// Normal-direction quantisation for the plane bucket. 1e3 ⇒ ~0.057° resolution
-/// — matches `consolidate_coplanar`'s `NORMAL_QUANT` so a weld merges exactly
-/// the facets that bucket would otherwise scatter. A real roof pitch / dormer
-/// has a distinct normal bucket and never clusters with the slope.
-const NORMAL_QUANT: f64 = 1.0e3;
+/// — the shared grid also used by `consolidate_coplanar`'s `NORMAL_QUANT`, so
+/// a weld merges exactly the facets that bucket would otherwise scatter. A
+/// real roof pitch / dormer has a distinct normal bucket and never clusters
+/// with the slope.
+use crate::grid::NORMAL_QUANT_F64 as NORMAL_QUANT;
 
 /// Max plane-offset jitter (metres) for two same-normal facets to weld into one
 /// plane cluster. 50 µm comfortably spans the ~15 µm f32 offset jitter but is

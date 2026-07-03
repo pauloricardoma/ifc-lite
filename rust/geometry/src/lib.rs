@@ -97,6 +97,10 @@ pub(crate) mod diag;
 pub(crate) mod diagnostics;
 pub(crate) mod error;
 pub(crate) mod geom_hash;
+/// Shared float-noise-tolerance quantisation constants used by more than one
+/// geometry pass (single-sourced so independently-evolving passes can't drift
+/// apart on the same tolerance).
+pub(crate) mod grid;
 pub(crate) mod extrusion;
 pub(crate) mod instancing;
 /// Pure-Rust exact mesh-arrangement CSG kernel — the only CSG kernel, on

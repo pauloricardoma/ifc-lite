@@ -146,9 +146,9 @@ fn plane_interval(tri: &[[f64; 3]; 3], plane: &[[f64; 3]; 3]) -> PlaneInterval {
     }
 }
 
-/// Snap grid used by `mesh_bridge::mesh_to_tris` (metres, power of two). The
-/// near-coplanar band below is sized to the snap-scatter envelope it produces.
-use super::mesh_bridge::SNAP_GRID;
+/// Near-coplanar band formula, canonical in `mesh_bridge` (sized to the
+/// snap-scatter envelope `mesh_bridge::mesh_to_tris` produces).
+use super::mesh_bridge::near_band_from_extent;
 
 #[inline]
 fn ti_sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
@@ -221,7 +221,7 @@ fn near_coplanar(t1: &[[f64; 3]; 3], t2: &[[f64; 3]; 3]) -> bool {
             extent = extent.max(c.abs());
         }
     }
-    let band = (8.0 * SNAP_GRID).max(extent * (1.0 / 4_194_304.0)); // 2^-22
+    let band = near_band_from_extent(extent); // 2^-22
     let band2 = band * band;
     // All three vertices of `t` within `band` of `plane`'s supporting plane?
     let in_slab = |t: &[[f64; 3]; 3], plane: &[[f64; 3]; 3], n: [f64; 3], nn: f64| {

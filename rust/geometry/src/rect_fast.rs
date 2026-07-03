@@ -30,9 +30,9 @@
 
 use crate::mesh::Mesh;
 
-/// The kernel's reconcile grid (mesh_bridge::SNAP_GRID). Power of two ⇒ the snap
-/// is an exact f64 op ⇒ bit-deterministic native==wasm.
-const SNAP_GRID: f64 = 1.0 / 65536.0;
+/// The kernel's canonical reconcile grid. Power of two ⇒ the snap is an exact
+/// f64 op ⇒ bit-deterministic native==wasm.
+use crate::kernel::mesh_bridge::SNAP_GRID;
 
 #[inline]
 fn snap(c: f64) -> f64 {
