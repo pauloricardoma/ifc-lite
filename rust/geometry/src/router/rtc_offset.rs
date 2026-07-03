@@ -9,6 +9,26 @@ use super::GeometryRouter;
 use crate::LARGE_COORD_THRESHOLD_METERS;
 use ifc_lite_core::{has_geometry_by_name, DecodedEntity, EntityDecoder, IfcType};
 
+/// Whether a near-origin element with this `RepresentationType` may cast a
+/// "no-shift" `(0,0,0)` RTC vote when the vertex probe can't cheaply read a
+/// coordinate. This is [`is_body_representation`](super::is_body_representation)
+/// MINUS `"Surface3D"` — meshable does NOT imply RTC-votable.
+///
+/// A `Surface3D` rep (`IfcBSplineSurfaceWithKnots`, `IfcSectionedSurface`,
+/// trimmed/curve-bounded surfaces) keeps its geometry in absolute model-space
+/// control points that `sample_first_geometry_vertex` cannot navigate, so a
+/// near-origin identity-placed Surface3D element would fall through to voting
+/// its placement `(0,0,0)` even though its real geometry can sit on a national
+/// grid hundreds of km away. On IFC4X3 corridor models with many such surfaces
+/// ahead of a few large-coordinate solids, those origin votes drag the median
+/// to zero and/or exhaust the 50-sample budget, suppressing a legitimate
+/// rebase — the #1526 curve-only pollution rebuilt via Surface3D. So Surface3D
+/// must ABSTAIN here, like a curve/axis rep. Scoped to RTC voting only: the
+/// meshing / void / layer paths still treat Surface3D as body geometry.
+fn is_rtc_votable_representation(rep_type: &str) -> bool {
+    rep_type != "Surface3D" && super::is_body_representation(rep_type)
+}
+
 impl GeometryRouter {
     /// Compute median-based RTC offset from sampled translations.
     /// Returns `(0,0,0)` if empty or coordinates are within 10km of origin.
@@ -112,11 +132,17 @@ impl GeometryRouter {
         Some((tx, ty, tz))
     }
 
-    /// True when the element carries at least one meshable body/surface shape
-    /// representation (as opposed to only curve/axis/footprint representations,
-    /// e.g. an IfcAlignmentSegment). Used to decide whether an origin-placed
-    /// element with no cheaply-samplable vertex may still cast a "no shift"
-    /// (0,0,0) vote during RTC detection.
+    /// True when the element carries at least one RTC-votable body shape
+    /// representation (see [`is_rtc_votable_representation`]), as opposed to
+    /// only curve/axis/footprint reps (e.g. an IfcAlignmentSegment) OR a
+    /// `Surface3D` rep whose coordinates the vertex probe cannot read. Used to
+    /// decide whether an origin-placed element with no cheaply-samplable vertex
+    /// may still cast a "no shift" (0,0,0) vote during RTC detection.
+    ///
+    /// NOTE: this uses [`is_rtc_votable_representation`], NOT
+    /// [`is_body_representation`](super::is_body_representation) — the two
+    /// differ only in `Surface3D`, which is meshable but not RTC-votable (see
+    /// the predicate's doc; #1526).
     fn element_has_body_representation(
         &self,
         entity: &DecodedEntity,
@@ -145,7 +171,7 @@ impl GeometryRouter {
                 && sr
                     .get(2)
                     .and_then(|a| a.as_string())
-                    .map(super::is_body_representation)
+                    .map(is_rtc_votable_representation)
                     .unwrap_or(false)
         })
     }

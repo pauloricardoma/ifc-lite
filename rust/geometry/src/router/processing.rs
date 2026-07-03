@@ -99,31 +99,12 @@ impl GeometryRouter {
         // First pass: check if we have any direct geometry representations
         // This prevents duplication when both direct and MappedRepresentation exist
         let has_direct_geometry = representations.iter().any(|rep| {
-            if rep.ifc_type != IfcType::IfcShapeRepresentation {
-                return false;
-            }
-            if let Some(rep_type_attr) = rep.get(2) {
-                if let Some(rep_type) = rep_type_attr.as_string() {
-                    matches!(
-                        rep_type,
-                        "Body"
-                            | "SweptSolid"
-                            | "SolidModel"
-                            | "Brep"
-                            | "CSG"
-                            | "Clipping"
-                            | "SurfaceModel"
-                            | "Surface3D"
-                            | "Tessellation"
-                            | "AdvancedSweptSolid"
-                            | "AdvancedBrep"
-                    )
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
+            rep.ifc_type == IfcType::IfcShapeRepresentation
+                && rep
+                    .get(2)
+                    .and_then(|a| a.as_string())
+                    .map(super::is_direct_body_representation)
+                    .unwrap_or(false)
         });
 
         for shape_rep in representations {
@@ -141,22 +122,8 @@ impl GeometryRouter {
                         continue;
                     }
 
-                    // Only process solid geometry representations
-                    if !matches!(
-                        rep_type,
-                        "Body"
-                            | "SweptSolid"
-                            | "SolidModel"
-                            | "Brep"
-                            | "CSG"
-                            | "Clipping"
-                            | "SurfaceModel"
-                            | "Surface3D"
-                            | "Tessellation"
-                            | "MappedRepresentation"
-                            | "AdvancedSweptSolid"
-                            | "AdvancedBrep"
-                    ) {
+                    // Only process solid/surface geometry representations
+                    if !super::is_body_representation(rep_type) {
                         continue; // Skip non-solid representations like 'Axis', 'Curve2D', etc.
                     }
                 }
@@ -257,31 +224,12 @@ impl GeometryRouter {
 
         // Check if we have direct geometry
         let has_direct_geometry = representations.iter().any(|rep| {
-            if rep.ifc_type != IfcType::IfcShapeRepresentation {
-                return false;
-            }
-            if let Some(rep_type_attr) = rep.get(2) {
-                if let Some(rep_type) = rep_type_attr.as_string() {
-                    matches!(
-                        rep_type,
-                        "Body"
-                            | "SweptSolid"
-                            | "SolidModel"
-                            | "Brep"
-                            | "CSG"
-                            | "Clipping"
-                            | "SurfaceModel"
-                            | "Surface3D"
-                            | "Tessellation"
-                            | "AdvancedSweptSolid"
-                            | "AdvancedBrep"
-                    )
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
+            rep.ifc_type == IfcType::IfcShapeRepresentation
+                && rep
+                    .get(2)
+                    .and_then(|a| a.as_string())
+                    .map(super::is_direct_body_representation)
+                    .unwrap_or(false)
         });
 
         for shape_rep in representations {
@@ -296,22 +244,8 @@ impl GeometryRouter {
                         continue;
                     }
 
-                    // Only process solid geometry representations
-                    if !matches!(
-                        rep_type,
-                        "Body"
-                            | "SweptSolid"
-                            | "SolidModel"
-                            | "Brep"
-                            | "CSG"
-                            | "Clipping"
-                            | "SurfaceModel"
-                            | "Surface3D"
-                            | "Tessellation"
-                            | "MappedRepresentation"
-                            | "AdvancedSweptSolid"
-                            | "AdvancedBrep"
-                    ) {
+                    // Only process solid/surface geometry representations
+                    if !super::is_body_representation(rep_type) {
                         continue;
                     }
                 }

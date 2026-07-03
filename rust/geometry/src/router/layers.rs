@@ -393,25 +393,14 @@ fn element_is_single_unshifted_item(
             continue;
         }
         // Only inspect body-style representations — axis/curve/footprint
-        // don't contribute to the sliced mesh.
+        // don't contribute to the sliced mesh. Uses the single canonical
+        // body-geometry predicate so this stays in lockstep with the meshing
+        // path (a mapped/surface item disqualifies slicing below regardless,
+        // via item_has_identity_position).
         let is_body = shape_rep
             .get(2)
             .and_then(|a| a.as_string())
-            .map(|s| {
-                matches!(
-                    s,
-                    "Body"
-                        | "SweptSolid"
-                        | "SolidModel"
-                        | "Brep"
-                        | "CSG"
-                        | "Clipping"
-                        | "SurfaceModel"
-                        | "Tessellation"
-                        | "AdvancedSweptSolid"
-                        | "AdvancedBrep"
-                )
-            })
+            .map(super::is_body_representation)
             .unwrap_or(false);
         if !is_body {
             continue;
