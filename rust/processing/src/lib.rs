@@ -24,6 +24,7 @@ mod georeferencing;
 pub mod pipeline_diagnostics;
 pub mod prepass;
 mod processor;
+pub mod stream_meta;
 pub mod style;
 mod symbolic;
 mod types;
