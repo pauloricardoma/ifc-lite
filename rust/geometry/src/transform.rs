@@ -57,6 +57,26 @@ pub fn parse_axis2_placement_3d(
         Vector3::new(1.0, 0.0, 0.0)
     };
 
+    Ok(build_axis2_matrix(location, z_axis, x_axis))
+}
+
+/// Orthonormalize a placement's raw axes + location into a column-major 4×4
+/// transform (columns = world-space local X, Y, Z, then translation).
+///
+/// `z_axis` is the raw Axis (local +Z), `x_axis` the raw RefDirection (local
+/// +X); both are normalized here. This is the single home for the
+/// degenerate-axis fallback: when RefDirection is parallel to Axis the projected
+/// X collapses, so instead of normalizing a zero vector (which yields a NaN
+/// matrix) we pick a deterministic perpendicular direction. The math is the
+/// canonical Gram–Schmidt (normalize Z, project RefDirection onto the plane ⟂ Z,
+/// then Y = Z × X). Every `IfcAxis2Placement3D` parser in the crate keeps its
+/// own attribute extraction / default-axis choices and shares only this
+/// orthonormalization + assembly, so the guard can never drift out of a fork.
+pub(crate) fn build_axis2_matrix(
+    location: Point3<f64>,
+    z_axis: Vector3<f64>,
+    x_axis: Vector3<f64>,
+) -> Matrix4<f64> {
     // Normalize axes
     let z_axis_final = z_axis.normalize();
     let x_axis_normalized = x_axis.normalize();
@@ -94,7 +114,7 @@ pub fn parse_axis2_placement_3d(
     transform[(1, 3)] = location.y;
     transform[(2, 3)] = location.z;
 
-    Ok(transform)
+    transform
 }
 
 /// Parse IfcCartesianPoint from an entity attribute
@@ -240,46 +260,7 @@ pub fn parse_axis2_placement_3d_from_id(
         Vector3::new(1.0, 0.0, 0.0)
     };
 
-    // Normalize axes
-    let z_axis_final = z_axis.normalize();
-    let x_axis_normalized = x_axis.normalize();
-
-    // Ensure X is orthogonal to Z (project X onto plane perpendicular to Z)
-    let dot_product = x_axis_normalized.dot(&z_axis_final);
-    let x_axis_orthogonal = x_axis_normalized - z_axis_final * dot_product;
-    let x_axis_final = if x_axis_orthogonal.norm() > 1e-6 {
-        x_axis_orthogonal.normalize()
-    } else {
-        // X and Z are parallel or nearly parallel - use a default perpendicular direction
-        if z_axis_final.z.abs() < 0.9 {
-            Vector3::new(0.0, 0.0, 1.0).cross(&z_axis_final).normalize()
-        } else {
-            Vector3::new(1.0, 0.0, 0.0).cross(&z_axis_final).normalize()
-        }
-    };
-
-    // Y axis is cross product of Z and X (right-hand rule: Y = Z × X)
-    let y_axis = z_axis_final.cross(&x_axis_final).normalize();
-
-    // Build transformation matrix using Matrix4::new constructor (column-major)
-    Ok(Matrix4::new(
-        x_axis_final.x,
-        y_axis.x,
-        z_axis_final.x,
-        location.x,
-        x_axis_final.y,
-        y_axis.y,
-        z_axis_final.y,
-        location.y,
-        x_axis_final.z,
-        y_axis.z,
-        z_axis_final.z,
-        location.z,
-        0.0,
-        0.0,
-        0.0,
-        1.0,
-    ))
+    Ok(build_axis2_matrix(location, z_axis, x_axis))
 }
 
 /// Parse IfcDirection entity

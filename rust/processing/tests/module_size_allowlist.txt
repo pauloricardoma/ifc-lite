@@ -24,7 +24,8 @@
      611 rust/export/src/step.rs
     1233 rust/geometry/src/alignment.rs
      551 rust/geometry/src/bool2d.rs
-    1875 rust/geometry/src/cdt.rs
+# +19: split_on_edge now sets a failed flag and bails to the ear-clip fallback instead of the lone .expect() panic.
+    1894 rust/geometry/src/cdt.rs
      895 rust/geometry/src/csg/consolidate.rs
     1061 rust/geometry/src/csg/mod.rs
      436 rust/geometry/src/csg/normals.rs

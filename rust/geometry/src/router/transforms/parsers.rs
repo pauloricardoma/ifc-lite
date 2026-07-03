@@ -48,27 +48,10 @@ impl GeometryRouter {
             Vector3::new(1.0, 0.0, 0.0)
         };
 
-        // Y axis is cross product of Z and X
-        let y_axis = z_axis.cross(&x_axis).normalize();
-        let x_axis = y_axis.cross(&z_axis).normalize();
-        let z_axis = z_axis.normalize();
-
-        // Build transformation matrix
-        let mut transform = Matrix4::identity();
-        transform[(0, 0)] = x_axis.x;
-        transform[(1, 0)] = x_axis.y;
-        transform[(2, 0)] = x_axis.z;
-        transform[(0, 1)] = y_axis.x;
-        transform[(1, 1)] = y_axis.y;
-        transform[(2, 1)] = y_axis.z;
-        transform[(0, 2)] = z_axis.x;
-        transform[(1, 2)] = z_axis.y;
-        transform[(2, 2)] = z_axis.z;
-        transform[(0, 3)] = location.x;
-        transform[(1, 3)] = location.y;
-        transform[(2, 3)] = location.z;
-
-        Ok(transform)
+        // Orthonormalize + assemble via the shared builder so the
+        // degenerate-axis (RefDirection ∥ Axis) fallback is applied here too,
+        // instead of normalizing a zero cross-product into a NaN matrix.
+        Ok(crate::transform::build_axis2_matrix(location, z_axis, x_axis))
     }
 
     /// Parse IfcCartesianPoint

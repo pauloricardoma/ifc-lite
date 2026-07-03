@@ -165,6 +165,13 @@ struct Cdt {
     track: bool,
     /// Quality target used by the tracking hooks.
     cos_min_angle: f64,
+    /// Set when an insertion hits a "can't happen" topology invariant (e.g. a
+    /// shared edge whose neighbour has no apex vertex). Rather than panic, the
+    /// insertion bails and every `Option`-returning entry point (`build_from`,
+    /// the incremental refinement driver) treats the CDT as unbuildable and
+    /// returns `None`, so the caller falls back to ear-clipping — matching how
+    /// every other degenerate case in this module degrades.
+    failed: bool,
 }
 
 /// The next refinement step chosen for a triangulation (see `Cdt::next_action`).
@@ -229,6 +236,7 @@ impl Cdt {
             skinny: BTreeSet::new(),
             track: false,
             cos_min_angle: COS_MIN_ANGLE,
+            failed: false,
         };
         cdt.tris.push(Tri {
             v: [super_base, super_base + 1, super_base + 2],
@@ -240,6 +248,9 @@ impl Cdt {
         // Incremental Delaunay insertion in canonical index order.
         for vi in 0..n_input {
             cdt.insert_point(vi);
+        }
+        if cdt.failed {
+            return None; // an insertion tripped a topology invariant — fall back to ear-clipping
         }
         if !cdt.enforce_constraints() {
             return None;
@@ -262,6 +273,9 @@ impl Cdt {
     /// the incremental-refinement entry skips the O(T) `locate` scan (the
     /// caller walked to it via [`Cdt::locate_from`]).
     fn insert_point_at(&mut self, vi: usize, start: usize) {
+        if self.failed {
+            return; // a prior insertion tripped a topology invariant; stop touching topology
+        }
         let p = self.points[vi];
         // Region of the seed = region of every cavity triangle (the cavity BFS
         // never crosses a constraint), inherited by the re-fan below.
@@ -508,12 +522,14 @@ impl Cdt {
         // both parents in lockstep. Each child inherits its OWN parent's
         // region flag — the two regions can differ across a constraint edge.
         let region_nb = self.inside.get(nb).copied().unwrap_or(false);
-        let d = self.tris[nb]
-            .v
-            .iter()
-            .copied()
-            .find(|&x| x != a && x != b)
-            .expect("cdt: neighbour across a shared edge must have an apex vertex");
+        let Some(d) = self.tris[nb].v.iter().copied().find(|&x| x != a && x != b) else {
+            // "Can't happen": the neighbour across a shared edge must have a
+            // third (apex) vertex. Degrade to ear-clipping instead of panicking
+            // — `t` is already retired above, so leave the CDT flagged
+            // unbuildable and let the entry point return `None`.
+            self.failed = true;
+            return;
+        };
         let outer_of = |s: &Self, t: usize, x: usize, y: usize| -> usize {
             s.tris[t].edge_of(x, y).map(|oe| s.tris[t].n[oe]).unwrap_or(NONE)
         };
@@ -1358,6 +1374,9 @@ fn refine_to_fixpoint(
                 break;
             };
             cdt.insert_steiner(p, loc);
+            if cdt.failed {
+                return None; // Steiner insertion tripped a topology invariant — ear-clip fallback
+            }
             steiner += 1;
         }
         return Some(cdt);

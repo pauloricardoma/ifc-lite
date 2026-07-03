@@ -615,32 +615,9 @@ fn parse_axis2_placement_3d(
         Vector3::new(1.0, 0.0, 0.0)
     };
 
-    let z = z_axis.normalize();
-
-    // Gram–Schmidt: ensure X is orthogonal to Z
-    let dot = x_axis_raw.dot(&z);
-    let x_orth = x_axis_raw - z * dot;
-    let x = if x_orth.norm() > 1e-6 {
-        x_orth.normalize()
-    } else {
-        // Fallback if X and Z are nearly parallel
-        if z.z.abs() < 0.9 {
-            Vector3::new(0.0, 0.0, 1.0).cross(&z).normalize()
-        } else {
-            Vector3::new(1.0, 0.0, 0.0).cross(&z).normalize()
-        }
-    };
-    let y = z.cross(&x).normalize();
-
-    // Column-major construction: columns = [x | y | z | loc]
-    #[rustfmt::skip]
-    let m = Matrix4::new(
-        x.x, y.x, z.x, location.x,
-        x.y, y.y, z.y, location.y,
-        x.z, y.z, z.z, location.z,
-        0.0, 0.0, 0.0, 1.0,
-    );
-    Ok(m)
+    // Orthonormalize + assemble via the shared builder (canonical Gram–Schmidt
+    // with the degenerate-axis fallback baked in).
+    Ok(crate::transform::build_axis2_matrix(location, z_axis, x_axis_raw))
 }
 
 /// Parse IfcCartesianPoint from a parent entity at the given attribute index.
