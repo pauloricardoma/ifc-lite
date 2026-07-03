@@ -318,20 +318,6 @@ impl GeometryRouter {
         Arc::new(Mutex::new(FxHashMap::default()))
     }
 
-    /// Whether content-dedup is enabled on the PRODUCTION batch paths (native
-    /// rayon pool + wasm). Re-enabled (was OFF in #1177) now that
-    /// `content_hash::item_signature` has a cached byte-level fast path for
-    /// IfcFacetedBrep — the Tekla-steel hot path. Measured on a 50k-part steel
-    /// model the brep hash dropped from ~8 s (recursive `decode_by_id` per point)
-    /// to ~2 s, below the ~5 s of meshing it skips, flipping dedup from a 0.9x
-    /// loss to a 1.2x win (byte-identical). `item_dedup_key` gates the hash to the
-    /// cheap types, so procedural-geometry models — the ones whose recursive hash
-    /// cost more than it saved — skip dedup entirely and pay nothing. The separate
-    /// `IfcMappedItem` instancing cache is always on regardless.
-    pub fn content_dedup_enabled() -> bool {
-        true
-    }
-
     /// Inject a shared item-dedup cache (see [`Self::new_dedup_cache`]) into this
     /// router. All routers given the SAME `Arc` dedup against one cache, so
     /// byte-identical geometry is meshed once across the whole model regardless of
