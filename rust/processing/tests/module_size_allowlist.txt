@@ -33,13 +33,16 @@
      947 rust/geometry/src/csg/mod.rs
      998 rust/geometry/src/extrusion.rs
 # +4: refine_high_aspect_slivers routes its rebuild through Mesh::rebuilt_like so a slivered host keeps its local-frame origin + #1474 placement capture (B7 metadata-loss fix).
-     763 rust/geometry/src/facet_weld.rs
-     408 rust/geometry/src/geom_hash.rs
-     640 rust/geometry/src/kernel/arrangement/classify.rs
+# +1: SNAP_GRID/NORMAL_QUANT single-homed to kernel::mesh_bridge / crate::grid (import replaces local const; doc rewrap costs a line).
+     764 rust/geometry/src/facet_weld.rs
+# +2: mix64 made pub(crate); doc-comment noting the shared use by router::content_hash.
+     410 rust/geometry/src/geom_hash.rs
+     633 rust/geometry/src/kernel/arrangement/classify.rs
      566 rust/geometry/src/kernel/fixed.rs
 # +39: begin()/tripped() budget-guard added to the union & intersection kernel entries (#1109 parity with subtract).
 # +7: union_many threads/documents union_all's new (union, conforming) signal (B8 arrange-many parity).
-     892 rust/geometry/src/kernel/mesh_bridge.rs
+# +12: near_band_from_extent (the snap-scatter band formula) single-homed here, next to canonical SNAP_GRID; tritri/classify import it instead of mirroring the expression.
+     904 rust/geometry/src/kernel/mesh_bridge.rs
      700 rust/geometry/src/kernel/predicates.rs
     1261 rust/geometry/src/kernel/retriangulate.rs
     1529 rust/geometry/src/mesh.rs
@@ -69,7 +72,8 @@
 # admission gate and the sequential CSG path so they can't diverge on the
 # High/Highest small-opening floor (B11 regression, issue #976).
 # +32: engulf-cutter #635 AABB box-cut suppression on a #1109 budget trip (drop `!capped`) + its rewritten rationale comment and a diag_warn! else-branch (correctness: an engulfing box-cut would DELETE the host).
-    1931 rust/geometry/src/router/voids/mod.rs
+# +5: ENGULF_TOLERANCE / ENGULF_TOLERANCE_F32 single-homed (3 sites shared one literal 0.03 tolerance, now one named const each).
+    1936 rust/geometry/src/router/voids/mod.rs
      621 rust/geometry/src/router/voids/probe.rs
     1002 rust/geometry/src/router/voids/synthesis.rs
     1472 rust/geometry/src/space_dcel/mod.rs

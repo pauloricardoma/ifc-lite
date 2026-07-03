@@ -34,6 +34,11 @@ const CSG_TRIANGLE_RETENTION_DIVISOR: usize = 4;
 const MIN_VALID_TRIANGLES: usize = 4;
 /// Maximum wrapper depth when drilling through mapped/boolean items to find an extrusion.
 const MAX_EXTRUSION_EXTRACT_DEPTH: usize = 32;
+/// Per-axis AABB engulf slack shared by the batched, host-consumed, and
+/// rectangular-fallback engulf checks below, so the three guards can't drift
+/// apart on what counts as "engulfs the host".
+const ENGULF_TOLERANCE: f64 = 0.03;
+const ENGULF_TOLERANCE_F32: f32 = 0.03;
 
 
 
@@ -1361,7 +1366,7 @@ impl GeometryRouter {
                 // near-engulf and redundant-void guards live — batched it can
                 // shave the host's outer shell (the #559171-family residual).
                 let engulfs = {
-                    let tol = 0.03_f64;
+                    let tol = ENGULF_TOLERANCE;
                     let covers = |omin: f64, omax: f64, wmin: f64, wmax: f64| {
                         let slack = (wmax - wmin).abs().max(1.0e-9) * tol;
                         omin <= wmin + slack && omax >= wmax - slack
@@ -1578,7 +1583,7 @@ impl GeometryRouter {
                     // host while its real profile excludes it is not affected.
                     // On a hit the host is fully consumed.
                     let aabb_engulfs = {
-                        let tol = 0.03_f32;
+                        let tol = ENGULF_TOLERANCE_F32;
                         let covers = |omin: f32, omax: f32, hmin: f32, hmax: f32| {
                             let slack = (hmax - hmin).abs().max(1.0e-9) * tol;
                             omin <= hmin + slack && omax >= hmax - slack
@@ -1682,7 +1687,7 @@ impl GeometryRouter {
                         // The 3% per-axis tolerance absorbs an opening that reaches
                         // ~flush with a wall face (its near plane).
                         let engulfs_host = {
-                            let tol = 0.03_f64;
+                            let tol = ENGULF_TOLERANCE;
                             let covers = |omin: f64, omax: f64, wmin: f64, wmax: f64| {
                                 let slack = (wmax - wmin).abs().max(1.0e-9) * tol;
                                 omin <= wmin + slack && omax >= wmax - slack

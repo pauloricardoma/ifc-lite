@@ -269,6 +269,7 @@ impl ClippingProcessor {
     /// Returns the input mesh unchanged if the consolidate fails or yields
     /// nothing — never worse than the raw kernel output.
     pub(crate) fn consolidate_coplanar(mesh: Mesh) -> Mesh {
+        use crate::grid::NORMAL_QUANT_F64 as NORMAL_QUANT;
         use crate::triangulation::{
             project_to_2d_with_basis, triangulate_polygon_with_holes_refined,
         };
@@ -293,7 +294,6 @@ impl ClippingProcessor {
         // plane) lets the i_overlay UNION close the opening hole — a bridging facet
         // over the footprint, caught by `issue_1007_real_opening_no_bridge`.
         const POS_QUANT: f64 = 1.0e6;
-        const NORMAL_QUANT: f64 = 1.0e3;
         let qpos = |p: f64| (p * POS_QUANT).round() as i64;
         let qnorm = |n: f64| (n * NORMAL_QUANT).round() as i64;
 

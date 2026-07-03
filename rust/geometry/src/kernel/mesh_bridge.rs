@@ -27,6 +27,18 @@ fn snap(c: f64) -> f64 {
     (c / SNAP_GRID).round() * SNAP_GRID
 }
 
+/// The near-coplanar perpendicular band (metres) from the operand+point
+/// coordinate magnitude `extent`. `8·SNAP_GRID` is the per-axis-snap scatter
+/// envelope near the origin; the `extent·2⁻²²` term widens it for far-from-
+/// origin operands where f32 import is coarser.
+///
+/// Canonical definition — `tritri`, `classify`, and this module all size their
+/// near-coplanar/scatter bands to this SAME formula, so they call this
+/// function rather than mirroring the expression.
+pub(crate) fn near_band_from_extent(extent: f64) -> f64 {
+    (8.0 * SNAP_GRID).max(extent * (1.0 / 4_194_304.0))
+}
+
 /// `Mesh` → the kernel's triangle list (f32 → f64, snapped to the reconcile
 /// grid). Panic-free: an out-of-range index OR a non-finite (NaN/Inf) coord drops
 /// that triangle rather than indexing past the end or crashing
@@ -203,7 +215,7 @@ fn promote_cutter_verts_onto_host_faces(cutter: &mut [Tri], host: &[Tri]) {
             }
         }
     }
-    let band = (8.0 * SNAP_GRID).max(extent * (1.0 / 4_194_304.0));
+    let band = near_band_from_extent(extent);
     let band2 = band * band;
 
     struct Face {

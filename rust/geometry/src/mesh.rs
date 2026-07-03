@@ -700,10 +700,9 @@ impl Mesh {
     /// extreme scale. NaN/Inf triangles are kept (the comparison is false),
     /// i.e. non-finite geometry is left for upstream to handle, never dropped.
     pub fn clean_degenerate(&mut self) {
-        // 1/65536 m — matches kernel::mesh_bridge::SNAP_GRID (power-of-two for
+        // The kernel's canonical reconcile grid (power-of-two for
         // bit-determinism). Sub-grid triangles are below kernel resolution.
-        const RECONCILE_GRID: f64 = 1.0 / 65536.0;
-        self.drop_thin_triangles(RECONCILE_GRID);
+        self.drop_thin_triangles(crate::kernel::mesh_bridge::SNAP_GRID);
     }
 
     /// Drop triangles with ANY vertex outside `[min - pad, max + pad]`, then
