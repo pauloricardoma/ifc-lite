@@ -20,7 +20,18 @@ use ifc_lite_geometry::{propagate_voids_to_parts, GeometryRouter, SubMeshCollect
 use rustc_hash::FxHashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::Mutex;
 use std::time::Instant;
+
+/// Serialize the tests that mutate the process-wide `IFC_LITE_DEF_DEDUP` override
+/// (`set_definition_dedup_override`) so cargo's parallel runner can't interleave
+/// one test's ON window with another's OFF window. Poison-tolerant: a panic while
+/// held must not cascade into unrelated failures.
+static DEF_DEDUP_SERIAL: Mutex<()> = Mutex::new(());
+
+fn def_dedup_guard() -> std::sync::MutexGuard<'static, ()> {
+    DEF_DEDUP_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Simulate an N-worker partition: greedily pack each key's cost onto the
 /// least-loaded worker (a good static-affinity scheduler), return the wall time =
@@ -639,6 +650,116 @@ fn dedup_byte_identical_and_faster() {
     println!("✓ dedup is byte-identical to the non-deduped path");
 }
 
+/// Real-model CSG-time delta for the element-level void-cut dedup (#1286 Phase 5).
+/// Times the VOIDED hosts through the per-occurrence world cut (OFF) vs the
+/// definition-frame deduped cut (ON, shared cache), and reports the cache hit rate
+/// and speedup. Also verifies ON stays GEOMETRICALLY == OFF (sorted 0.1mm
+/// coord-set) per voided host, so a false-merge surfaces as a divergence count.
+///
+/// ```text
+/// IFCLT_MODEL=/abs/path.ifc cargo test -p ifc-lite-geometry --release \
+///   --test dedup_validate def_dedup_csg_time_delta -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "manual; needs IFCLT_MODEL"]
+fn def_dedup_csg_time_delta() {
+    let _guard = def_dedup_guard();
+    let path = match std::env::var("IFCLT_MODEL") {
+        Ok(p) => p,
+        Err(_) => {
+            println!("set IFCLT_MODEL=/abs/path.ifc");
+            return;
+        }
+    };
+    let content = std::fs::read_to_string(&path).expect("read model");
+    let void_idx = build_void_index(&content);
+    let products = list_products(&content);
+    let voided: Vec<u32> = products
+        .iter()
+        .map(|(id, _)| *id)
+        .filter(|id| void_idx.get(id).map(|v| !v.is_empty()).unwrap_or(false))
+        .collect();
+    println!("\n=== def-dedup void-cut CSG-time delta ===");
+    println!("model: {path}  ({} bytes)", content.len());
+    println!("products: {}  voided hosts: {}\n", products.len(), voided.len());
+
+    // OFF: per-occurrence world cut, ground truth.
+    GeometryRouter::set_definition_dedup_override(Some(false));
+    let mut d = EntityDecoder::with_index(&content, build_entity_index(&content));
+    let off_router = GeometryRouter::with_units(&content, &mut d);
+    let mut off_fps: Vec<u64> = Vec::with_capacity(voided.len());
+    let t = Instant::now();
+    for &id in &voided {
+        let e = match d.decode_by_id(id) {
+            Ok(e) => e,
+            Err(_) => {
+                off_fps.push(u64::MAX);
+                continue;
+            }
+        };
+        match off_router.process_element_with_submeshes_and_voids(&e, &mut d, &void_idx) {
+            Ok(sm) => off_fps.push(sorted_coord_set(&sm)),
+            Err(_) => off_fps.push(u64::MAX - 1),
+        }
+    }
+    let off_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    // ON: definition-frame deduped cut with a shared cache. Falls back to the
+    // per-occurrence path where the deduped path returns None (ineligible host).
+    GeometryRouter::set_definition_dedup_override(Some(true));
+    let shared = GeometryRouter::new_definition_cache();
+    let mut d = EntityDecoder::with_index(&content, build_entity_index(&content));
+    let mut on_router = GeometryRouter::with_units(&content, &mut d);
+    on_router.enable_definition_dedup_shared(shared.clone());
+    let mut on_fps: Vec<u64> = Vec::with_capacity(voided.len());
+    let mut eligible = 0usize;
+    let t = Instant::now();
+    for &id in &voided {
+        let e = match d.decode_by_id(id) {
+            Ok(e) => e,
+            Err(_) => {
+                on_fps.push(u64::MAX);
+                continue;
+            }
+        };
+        let deduped = on_router
+            .process_element_with_submeshes_and_voids_deduped(&e, &mut d, &void_idx)
+            .unwrap_or(None);
+        let sm = match deduped {
+            Some(sm) => {
+                eligible += 1;
+                sm
+            }
+            None => on_router
+                .process_element_with_submeshes_and_voids(&e, &mut d, &void_idx)
+                .unwrap_or_default(),
+        };
+        on_fps.push(sorted_coord_set(&sm));
+    }
+    let on_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let templates = shared.lock().unwrap().len();
+    GeometryRouter::set_definition_dedup_override(None);
+
+    let hits = eligible.saturating_sub(templates);
+    let divergences = off_fps
+        .iter()
+        .zip(&on_fps)
+        .filter(|(a, b)| a != b)
+        .count();
+    let speedup = if on_ms > 0.0 { off_ms / on_ms } else { 0.0 };
+    println!("OFF (per-occurrence world cut): {off_ms:.0}ms");
+    println!("ON  (def-frame deduped cut):    {on_ms:.0}ms");
+    println!(
+        "eligible voided hosts: {eligible}/{}  unique templates: {templates}  cache hits: {hits}",
+        voided.len()
+    );
+    println!("speedup on voided hosts: {speedup:.2}x   ({off_ms:.0}ms -> {on_ms:.0}ms)");
+    println!(
+        "geometric divergences (ON vs OFF, 0.1mm sorted coord-set): {divergences} / {}",
+        voided.len()
+    );
+}
+
 /// Two geometrically-IDENTICAL voided walls (same 2x0.3x3 swept section, same
 /// 0.5x0.5x1 opening at the same wall-relative offset) at DIFFERENT placements,
 /// plus a third wall with a DISTINCT (0.8x0.8) opening. Exercises the VOID path
@@ -937,6 +1058,7 @@ fn void_unplaced_cut_matches_placed_geometry() {
 /// and keep a distinct void distinct.
 #[test]
 fn definition_cache_dedups_and_matches_placed_geometry() {
+    let _guard = def_dedup_guard();
     let content = synthetic_voided_duplicates_ifc();
     let void_idx = build_void_index(&content);
     let wall_ids = [50u32, 250, 450];
@@ -979,4 +1101,143 @@ fn definition_cache_dedups_and_matches_placed_geometry() {
     // coord-sets (placement preserved); #450 is a distinct void.
     assert_ne!(placed_fps[0], placed_fps[1], "per-instance placement lost on the deduped void path");
     assert_ne!(placed_fps[0], placed_fps[2], "a distinct void wrongly shared a template");
+}
+
+/// Exact BYTE-level comparison of two voided sub-mesh collections in ARRAY ORDER
+/// (submesh order, geometry_id, positions/normals/indices bit-for-bit). Reports:
+/// (submesh_count_equal, geometry_id_order_equal, positions_len_equal,
+///  bitwise_equal, max_abs_coord_delta, differing_coord_count, total_coords).
+struct ByteDelta {
+    submesh_count: (usize, usize),
+    geom_id_order_equal: bool,
+    positions_len_equal: bool,
+    bitwise_equal: bool,
+    max_abs_coord_delta: f32,
+    differing_coords: usize,
+    total_coords: usize,
+}
+
+fn byte_delta(off: &SubMeshCollection, on: &SubMeshCollection) -> ByteDelta {
+    let submesh_count = (off.sub_meshes.len(), on.sub_meshes.len());
+    let geom_id_order_equal = off.sub_meshes.len() == on.sub_meshes.len()
+        && off
+            .sub_meshes
+            .iter()
+            .zip(&on.sub_meshes)
+            .all(|(a, b)| a.geometry_id == b.geometry_id);
+    let off_pos: Vec<f32> = off.sub_meshes.iter().flat_map(|s| s.mesh.positions.clone()).collect();
+    let on_pos: Vec<f32> = on.sub_meshes.iter().flat_map(|s| s.mesh.positions.clone()).collect();
+    let positions_len_equal = off_pos.len() == on_pos.len();
+    let mut max_abs = 0.0f32;
+    let mut differing = 0usize;
+    let n = off_pos.len().min(on_pos.len());
+    for i in 0..n {
+        let d = (off_pos[i] - on_pos[i]).abs();
+        if off_pos[i].to_bits() != on_pos[i].to_bits() {
+            differing += 1;
+        }
+        if d > max_abs {
+            max_abs = d;
+        }
+    }
+    // Bitwise equality requires identical submesh count, order, geometry_ids AND
+    // identical positions/normals/indices for every submesh.
+    let bitwise_equal = submesh_count.0 == submesh_count.1
+        && geom_id_order_equal
+        && off.sub_meshes.iter().zip(&on.sub_meshes).all(|(a, b)| {
+            a.mesh.positions.len() == b.mesh.positions.len()
+                && a.mesh
+                    .positions
+                    .iter()
+                    .zip(&b.mesh.positions)
+                    .all(|(x, y)| x.to_bits() == y.to_bits())
+                && a.mesh.indices == b.mesh.indices
+                && a.mesh.normals.len() == b.mesh.normals.len()
+                && a.mesh
+                    .normals
+                    .iter()
+                    .zip(&b.mesh.normals)
+                    .all(|(x, y)| x.to_bits() == y.to_bits())
+        });
+    ByteDelta {
+        submesh_count,
+        geom_id_order_equal,
+        positions_len_equal,
+        bitwise_equal,
+        max_abs_coord_delta: max_abs,
+        differing_coords: differing,
+        total_coords: off_pos.len().max(on_pos.len()),
+    }
+}
+
+/// ON-vs-OFF characterization (#1286 Phase 5 rebase): the definition-frame void
+/// cut (ON) is GEOMETRICALLY identical to the per-occurrence world cut (OFF) —
+/// `sorted_coord_set` matches to 0.1 mm — but is NOT byte-identical, because the
+/// template is cut by the exact kernel in the host DEFINITION frame at small
+/// coords and re-placed, while OFF cuts in the world frame with the `rect_fast`
+/// `param` fast-path available. This test PROVES the geometric invariant (so it
+/// stays green) and PRINTS the exact byte divergence (submesh order, vertex
+/// count, coordinate delta) so the reconciliation gap is quantified in numbers.
+/// Run with `--nocapture` to read the report.
+#[test]
+fn on_vs_off_byte_divergence_report() {
+    let _guard = def_dedup_guard();
+    let content = synthetic_voided_duplicates_ifc();
+    let void_idx = build_void_index(&content);
+    let wall_ids = [50u32, 250, 450];
+
+    GeometryRouter::set_definition_dedup_override(Some(true));
+    let shared = GeometryRouter::new_definition_cache();
+    let mut d = EntityDecoder::with_index(&content, build_entity_index(&content));
+    let mut router = GeometryRouter::with_units(&content, &mut d);
+    router.enable_definition_dedup_shared(shared.clone());
+
+    eprintln!("\n=== ON-vs-OFF void-cut dedup divergence (synthetic voided walls) ===");
+    let mut any_byte_divergence = false;
+    for &id in &wall_ids {
+        let e = d.decode_by_id(id).unwrap();
+        let off = router
+            .process_element_with_submeshes_and_voids(&e, &mut d, &void_idx)
+            .unwrap();
+        let on = router
+            .process_element_with_submeshes_and_voids_deduped(&e, &mut d, &void_idx)
+            .unwrap()
+            .expect("translation-only voided host should be eligible");
+        let delta = byte_delta(&off, &on);
+        let geom_equal = sorted_coord_set(&off) == sorted_coord_set(&on);
+        if !delta.bitwise_equal {
+            any_byte_divergence = true;
+        }
+        eprintln!(
+            "  #{id}: geometric(0.1mm)={} bytewise={} | submeshes OFF={} ON={} order_match={} \
+             pos_len_match={} differing_coords={}/{} max_delta={:.3e}m",
+            geom_equal,
+            delta.bitwise_equal,
+            delta.submesh_count.0,
+            delta.submesh_count.1,
+            delta.geom_id_order_equal,
+            delta.positions_len_equal,
+            delta.differing_coords,
+            delta.total_coords,
+            delta.max_abs_coord_delta,
+        );
+        // The load-bearing INVARIANT: ON must be geometrically identical to OFF.
+        assert!(geom_equal, "ON void geometry diverges from OFF beyond 0.1mm for #{id}");
+    }
+    GeometryRouter::set_definition_dedup_override(None);
+    eprintln!(
+        "  => ON is geometrically == OFF (<=0.1mm) but NOT byte-identical: {}.\n\
+         Divergence 1 (this fixture): a cache-HIT occurrence reuses the TEMPLATE\n\
+         DONOR's per-submesh geometry_id (order_match=false), not its own, so\n\
+         per-item IfcStyledItem colour lookup would resolve the donor's style — the\n\
+         definition_signature keys geometry+placement, NOT style, so two identical\n\
+         shapes with different colours would false-merge.\n\
+         Divergence 2 (real models): the template is cut by the exact kernel in the\n\
+         host DEFINITION frame (small coords) while OFF cuts in the WORLD frame with\n\
+         the rect_fast `param` fast-path available (relativized_by drops `param`), so\n\
+         vertex values/order also differ once a non-trivial cutter is involved.\n\
+         Reconciliation (per-occurrence geometry_id on cache hits + frame/kernel-path\n\
+         unification incl. rect_fast) is required before any default flip.\n",
+        any_byte_divergence
+    );
 }

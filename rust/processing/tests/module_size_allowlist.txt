@@ -53,13 +53,13 @@
      461 rust/geometry/src/router/clipping.rs
      710 rust/geometry/src/router/diagnostics.rs
      659 rust/geometry/src/router/layers.rs
-     572 rust/geometry/src/router/mod.rs
-    1072 rust/geometry/src/router/processing.rs
+     665 rust/geometry/src/router/mod.rs
+    1119 rust/geometry/src/router/processing.rs
      446 rust/geometry/src/router/rtc_offset.rs
      497 rust/geometry/src/router/voids_2d.rs
      618 rust/geometry/src/router/voids/aabb_clip.rs
      871 rust/geometry/src/router/voids/geom.rs
-    1963 rust/geometry/src/router/voids/mod.rs
+    2180 rust/geometry/src/router/voids/mod.rs
      621 rust/geometry/src/router/voids/probe.rs
     1002 rust/geometry/src/router/voids/synthesis.rs
     1472 rust/geometry/src/space_dcel/mod.rs
@@ -68,14 +68,14 @@
      715 rust/geometry/src/void_analysis.rs
      745 rust/geometry/src/void_index.rs
      499 rust/processing/src/determinism.rs
-     877 rust/processing/src/element.rs
+     892 rust/processing/src/element.rs
      468 rust/processing/src/georeferencing.rs
      772 rust/processing/src/prepass.rs
-    1674 rust/processing/src/processor/mod.rs
+    1682 rust/processing/src/processor/mod.rs
      440 rust/processing/src/symbolic/items.rs
-     767 rust/wasm-bindings/src/api/gpu_meshes/batch.rs
+     778 rust/wasm-bindings/src/api/gpu_meshes/batch.rs
      727 rust/wasm-bindings/src/api/gpu_meshes/prepass.rs
      436 rust/wasm-bindings/src/api/grid_lines.rs
-     879 rust/wasm-bindings/src/api/mod.rs
+     884 rust/wasm-bindings/src/api/mod.rs
      692 rust/wasm-bindings/src/zero_copy/mesh.rs
      743 rust/wasm-bindings/src/zero_copy/symbolic.rs
