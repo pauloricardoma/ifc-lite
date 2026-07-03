@@ -139,7 +139,7 @@ pub use instancing::{
     INSTANCED_VERSION,
 };
 pub use material_layer_index::{LayerAxis, LayerBuildup, LayerInfo, MaterialLayerIndex};
-pub use mesh::{CoordinateShift, InstanceMeta, Mesh, SubMesh, SubMeshCollection};
+pub use mesh::{InstanceMeta, Mesh, SubMesh, SubMeshCollection};
 pub use mesh_orient::orient_mesh_outward;
 pub use processors::{
     AdvancedBrepProcessor, BooleanClippingProcessor, ExtrudedAreaSolidProcessor,
@@ -165,13 +165,13 @@ pub use router::{
 /// cast to f32, or the model renders with vertex jitter. Shared by the router's
 /// own coordinate sampling (`router::rtc_offset`) and the streaming pre-pass
 /// meta resolver (`ifc_lite_processing::stream_meta`) so those two make the same
-/// decision. (Other 10 km checks — e.g. `mesh::CoordinateShift::is_significant`
-/// — carry their own local constant of the same value.)
+/// decision. (Other 10 km checks carry their own local constant of the same
+/// value.)
 pub const LARGE_COORD_THRESHOLD_METERS: f64 = 10000.0;
 pub use tessellation::{scale_segments, TessellationQuality};
 pub use transform::{
-    apply_rtc_offset, parse_axis2_placement_3d, parse_axis2_placement_3d_from_id,
-    parse_cartesian_point, parse_cartesian_point_from_id, parse_direction, parse_direction_from_id,
+    parse_axis2_placement_3d, parse_axis2_placement_3d_from_id, parse_cartesian_point,
+    parse_cartesian_point_from_id, parse_direction, parse_direction_from_id,
     rotation_angle_about_z,
 };
 pub use triangulation::triangulate_polygon;

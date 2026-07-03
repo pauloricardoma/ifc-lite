@@ -8,7 +8,6 @@
 //! eliminating code duplication across processors.
 
 use crate::error::{Error, Result};
-use crate::mesh::Mesh;
 use ifc_lite_core::{DecodedEntity, EntityDecoder, IfcType};
 use nalgebra::{Matrix4, Point3, Vector3};
 
@@ -308,19 +307,6 @@ pub fn parse_direction(direction_entity: &DecodedEntity) -> Result<Vector3<f64>>
     let z = ratios.get(2).and_then(|v| v.as_float()).unwrap_or(0.0);
 
     Ok(Vector3::new(x, y, z))
-}
-
-/// Apply RTC offset to mesh vertices
-///
-/// Subtracts the RTC offset from all vertex positions to shift coordinates
-/// from world space to RTC-shifted space.
-pub fn apply_rtc_offset(mesh: &mut Mesh, rtc: (f64, f64, f64)) {
-    let (rtc_x, rtc_y, rtc_z) = rtc;
-    mesh.positions.chunks_exact_mut(3).for_each(|chunk| {
-        chunk[0] = (chunk[0] as f64 - rtc_x) as f32;
-        chunk[1] = (chunk[1] as f64 - rtc_y) as f32;
-        chunk[2] = (chunk[2] as f64 - rtc_z) as f32;
-    });
 }
 
 /// The building/site rotation about the world vertical (Z) axis, derived from a

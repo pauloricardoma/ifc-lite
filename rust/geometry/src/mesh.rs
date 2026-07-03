@@ -6,49 +6,6 @@
 
 use nalgebra::{Point3, Vector3};
 
-/// Coordinate shift for RTC (Relative-to-Center) rendering
-/// Stores the offset subtracted from coordinates to improve Float32 precision
-#[derive(Debug, Clone, Copy, Default)]
-pub struct CoordinateShift {
-    /// X offset (subtracted from all X coordinates)
-    pub x: f64,
-    /// Y offset (subtracted from all Y coordinates)
-    pub y: f64,
-    /// Z offset (subtracted from all Z coordinates)
-    pub z: f64,
-}
-
-impl CoordinateShift {
-    /// Create a new coordinate shift
-    #[inline]
-    pub fn new(x: f64, y: f64, z: f64) -> Self {
-        Self { x, y, z }
-    }
-
-    /// Create shift from a Point3
-    #[inline]
-    pub fn from_point(point: Point3<f64>) -> Self {
-        Self {
-            x: point.x,
-            y: point.y,
-            z: point.z,
-        }
-    }
-
-    /// Check if shift is significant (>10km from origin)
-    #[inline]
-    pub fn is_significant(&self) -> bool {
-        const THRESHOLD: f64 = 10000.0; // 10km
-        self.x.abs() > THRESHOLD || self.y.abs() > THRESHOLD || self.z.abs() > THRESHOLD
-    }
-
-    /// Check if shift is zero (no shifting needed)
-    #[inline]
-    pub fn is_zero(&self) -> bool {
-        self.x == 0.0 && self.y == 0.0 && self.z == 0.0
-    }
-}
-
 /// Side-channel instancing metadata, attached only when GPU instancing is
 /// enabled (the `IFC_LITE_INSTANCING` flag). NEVER read by geometry processing
 /// and excluded from `compute_mesh_hash` / `meshes_equal`, so content-dedup and
@@ -246,22 +203,6 @@ impl Mesh {
         self.normals.push(normal.x as f32);
         self.normals.push(normal.y as f32);
         self.normals.push(normal.z as f32);
-    }
-
-    /// Apply coordinate shift to existing positions in-place
-    /// Uses f64 intermediate for precision when subtracting large offsets
-    #[inline]
-    pub fn apply_shift(&mut self, shift: &CoordinateShift) {
-        if shift.is_zero() {
-            return;
-        }
-        for chunk in self.positions.chunks_exact_mut(3) {
-            // Convert to f64, subtract, convert back to f32
-            chunk[0] = (chunk[0] as f64 - shift.x) as f32;
-            chunk[1] = (chunk[1] as f64 - shift.y) as f32;
-            chunk[2] = (chunk[2] as f64 - shift.z) as f32;
-        }
-        self.rtc_applied = true;
     }
 
     /// Add a triangle
@@ -608,30 +549,6 @@ impl Mesh {
         self.local_to_world = None;
     }
 
-    /// Weld coincident vertices, preserving per-vertex normals.
-    ///
-    /// Returns a new mesh where vertices whose **position AND normal** both
-    /// quantize to the same bucket are merged. Indices are remapped.
-    /// Triangles that collapse to a degenerate edge or point (any two
-    /// corners welded to the same vertex) are dropped.
-    ///
-    /// **Use this when shading must stay crisp.** A box corner shared by
-    /// three faces has the same position but three different normals, so
-    /// it stays as three vertices — flat shading and per-face colours
-    /// survive the weld.
-    ///
-    /// `position_eps` and `normal_eps` are bucket sizes (in metres and
-    /// normal-vector units respectively). 1 µm position / 1 mrad normal is
-    /// usually right for IFC geometry: well below any meaningful BIM
-    /// tolerance and below f32 precision at typical building scales.
-    ///
-    /// For watertight output that lets you compute volumes or run CSG,
-    /// use [`Mesh::welded_by_position`] instead — it merges all vertices
-    /// at the same position regardless of normal.
-    pub fn welded(&self, position_eps: f32, normal_eps: f32) -> Mesh {
-        weld_impl(self, position_eps, Some(normal_eps), /*average_normals=*/ false)
-    }
-
     /// Weld vertices that share a position, regardless of normal.
     ///
     /// Returns a new mesh where vertices at the same position (within
@@ -643,12 +560,12 @@ impl Mesh {
     /// **Use this when you need a topologically connected, manifold-
     /// candidate mesh** — volume queries, CSG operands, watertight
     /// checks, mesh repair pipelines. Shading at sharp corners gets
-    /// averaged; if you need crisp corners use [`Mesh::welded`] instead.
+    /// averaged.
     ///
     /// `position_eps` is the bucket size in metres (1 µm is a safe
     /// default for IFC).
     pub fn welded_by_position(&self, position_eps: f32) -> Mesh {
-        weld_impl(self, position_eps, None, /*average_normals=*/ true)
+        weld_impl(self, position_eps, /*average_normals=*/ true)
     }
 
     /// Drop triangles whose perpendicular height (= 2·area / longest edge) is
@@ -746,82 +663,6 @@ impl Mesh {
         self.drop_thin_triangles(RECONCILE_GRID);
     }
 
-    /// Filter out triangles with edges exceeding the threshold
-    /// This removes "stretched" triangles that span unreasonably large distances,
-    /// which can occur when disconnected geometry is incorrectly merged.
-    ///
-    /// Uses a conservative threshold (500m) to only catch clearly broken geometry,
-    /// not legitimate large elements like long beams or walls.
-    ///
-    /// # Arguments
-    /// * `max_edge_length` - Maximum allowed edge length in meters (default: 500m)
-    ///
-    /// # Returns
-    /// Number of triangles removed
-    pub fn filter_stretched_triangles(&mut self, max_edge_length: f32) -> usize {
-        if self.is_empty() {
-            return 0;
-        }
-
-        let max_edge_sq = max_edge_length * max_edge_length;
-        let mut valid_indices = Vec::new();
-        let mut removed_count = 0;
-
-        // Check each triangle
-        for i in (0..self.indices.len()).step_by(3) {
-            if i + 2 >= self.indices.len() {
-                break;
-            }
-            let i0 = self.indices[i] as usize;
-            let i1 = self.indices[i + 1] as usize;
-            let i2 = self.indices[i + 2] as usize;
-
-            if i0 * 3 + 2 >= self.positions.len()
-                || i1 * 3 + 2 >= self.positions.len()
-                || i2 * 3 + 2 >= self.positions.len()
-            {
-                // Invalid indices - skip
-                removed_count += 1;
-                continue;
-            }
-
-            let p0 = (
-                self.positions[i0 * 3],
-                self.positions[i0 * 3 + 1],
-                self.positions[i0 * 3 + 2],
-            );
-            let p1 = (
-                self.positions[i1 * 3],
-                self.positions[i1 * 3 + 1],
-                self.positions[i1 * 3 + 2],
-            );
-            let p2 = (
-                self.positions[i2 * 3],
-                self.positions[i2 * 3 + 1],
-                self.positions[i2 * 3 + 2],
-            );
-
-            // Calculate squared edge lengths
-            let edge01_sq = (p1.0 - p0.0).powi(2) + (p1.1 - p0.1).powi(2) + (p1.2 - p0.2).powi(2);
-            let edge12_sq = (p2.0 - p1.0).powi(2) + (p2.1 - p1.1).powi(2) + (p2.2 - p1.2).powi(2);
-            let edge20_sq = (p0.0 - p2.0).powi(2) + (p0.1 - p2.1).powi(2) + (p0.2 - p2.2).powi(2);
-
-            // Check if any edge exceeds threshold
-            if edge01_sq <= max_edge_sq && edge12_sq <= max_edge_sq && edge20_sq <= max_edge_sq {
-                // Triangle is valid - keep it
-                valid_indices.push(self.indices[i]);
-                valid_indices.push(self.indices[i + 1]);
-                valid_indices.push(self.indices[i + 2]);
-            } else {
-                // Triangle has stretched edge - remove it
-                removed_count += 1;
-            }
-        }
-
-        self.indices = valid_indices;
-        removed_count
-    }
-
     /// Drop triangles with ANY vertex outside `[min - pad, max + pad]`, then
     /// compact away the now-unreferenced vertices. Returns the count dropped.
     ///
@@ -908,21 +749,12 @@ impl Default for Mesh {
     }
 }
 
-/// Shared welding implementation backing `Mesh::welded` and
-/// `Mesh::welded_by_position`.
+/// Shared welding implementation backing `Mesh::welded_by_position`.
 ///
-/// When `normal_eps` is `Some(eps)`, the dedupe key is
-/// `(quantized_position, quantized_normal)` and `average_normals` is
-/// ignored — the first encountered (position, normal) pair wins. When
-/// `normal_eps` is `None`, the dedupe key is `quantized_position` only;
-/// `average_normals=true` accumulates contributing normals into the
-/// welded vertex and renormalizes at the end.
-fn weld_impl(
-    mesh: &Mesh,
-    position_eps: f32,
-    normal_eps: Option<f32>,
-    average_normals: bool,
-) -> Mesh {
+/// The dedupe key is `quantized_position` only. `average_normals=true`
+/// accumulates contributing normals into the welded vertex and
+/// renormalizes at the end.
+fn weld_impl(mesh: &Mesh, position_eps: f32, average_normals: bool) -> Mesh {
     use rustc_hash::FxHashMap;
 
     let n_verts = mesh.positions.len() / 3;
@@ -934,17 +766,8 @@ fn weld_impl(
     let pos_scale = 1.0 / position_eps.max(f32::MIN_POSITIVE);
     let q_pos = |v: f32| -> i64 { (v * pos_scale).round() as i64 };
 
-    let nrm_scale = normal_eps.map(|e| 1.0 / e.max(f32::MIN_POSITIVE));
-    let q_nrm = |v: f32| -> i64 {
-        nrm_scale
-            .map(|s| (v * s).round() as i64)
-            .unwrap_or(0)
-    };
-
-    // Dedupe key. Pre-allocate to size 6 (pos + normal) — using a tuple
-    // would require two distinct hash types; a small array keeps a single
-    // hash map specialisation.
-    type Key = [i64; 6];
+    // Dedupe key: quantized position only.
+    type Key = [i64; 3];
     let mut canonical: FxHashMap<Key, u32> = FxHashMap::default();
     let mut old_to_new: Vec<u32> = Vec::with_capacity(n_verts);
     let mut new_positions: Vec<f32> = Vec::with_capacity(n_verts * 3);
@@ -970,14 +793,7 @@ fn weld_impl(
         } else {
             (0.0, 0.0, 0.0)
         };
-        let key: Key = [
-            q_pos(px),
-            q_pos(py),
-            q_pos(pz),
-            q_nrm(nx),
-            q_nrm(ny),
-            q_nrm(nz),
-        ];
+        let key: Key = [q_pos(px), q_pos(py), q_pos(pz)];
 
         if let Some(&new_idx) = canonical.get(&key) {
             old_to_new.push(new_idx);
@@ -1148,36 +964,6 @@ mod tests {
     }
 
     #[test]
-    fn test_coordinate_shift_creation() {
-        let shift = CoordinateShift::new(500000.0, 5000000.0, 100.0);
-        assert!(shift.is_significant());
-        assert!(!shift.is_zero());
-
-        let zero_shift = CoordinateShift::default();
-        assert!(!zero_shift.is_significant());
-        assert!(zero_shift.is_zero());
-    }
-
-    #[test]
-    fn test_apply_shift_to_existing_mesh() {
-        let mut mesh = Mesh::new();
-
-        // Add vertices with large coordinates (already converted to f32 - some precision lost)
-        mesh.positions = vec![500000.0, 5000000.0, 0.0, 500010.0, 5000010.0, 10.0];
-        mesh.normals = vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0];
-
-        // Apply shift
-        let shift = CoordinateShift::new(500000.0, 5000000.0, 0.0);
-        mesh.apply_shift(&shift);
-
-        // Verify positions are shifted
-        assert!((mesh.positions[0] - 0.0).abs() < 0.001);
-        assert!((mesh.positions[1] - 0.0).abs() < 0.001);
-        assert!((mesh.positions[3] - 10.0).abs() < 0.001);
-        assert!((mesh.positions[4] - 10.0).abs() < 0.001);
-    }
-
-    #[test]
     fn test_centroid_f64() {
         let mut mesh = Mesh::new();
         mesh.positions = vec![0.0, 0.0, 0.0, 10.0, 10.0, 10.0, 20.0, 20.0, 20.0];
@@ -1273,25 +1059,6 @@ mod tests {
     }
 
     #[test]
-    fn welded_preserves_corner_normals() {
-        let m = make_unwelded_box();
-        assert_eq!(m.vertex_count(), 24);
-        assert_eq!(m.triangle_count(), 12);
-        // With normal-preserving weld, each box corner has 3 incident
-        // faces with 3 different normals, so each corner stays as 3
-        // separate vertices. 6 faces × 4 vertices = 24 → 24 (no merge,
-        // because no two of the 24 input vertices share BOTH position
-        // and normal).
-        let welded = m.welded(1e-6, 1e-3);
-        assert_eq!(
-            welded.vertex_count(),
-            24,
-            "normal-preserving weld must keep all per-face corner vertices"
-        );
-        assert_eq!(welded.triangle_count(), 12);
-    }
-
-    #[test]
     fn welded_by_position_collapses_corner_to_one_vertex() {
         let m = make_unwelded_box();
         // Position-only weld: all 24 input vertices map to the 8 box
@@ -1350,8 +1117,6 @@ mod tests {
     #[test]
     fn welded_handles_empty_mesh() {
         let m = Mesh::new();
-        let welded = m.welded(1e-6, 1e-3);
-        assert!(welded.is_empty());
         let welded_pos = m.welded_by_position(1e-6);
         assert!(welded_pos.is_empty());
     }
