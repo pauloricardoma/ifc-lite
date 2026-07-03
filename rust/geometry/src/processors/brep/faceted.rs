@@ -4,8 +4,9 @@
 
 use crate::{Error, Mesh, Point3, Result, TessellationQuality};
 use ifc_lite_core::{DecodedEntity, EntityDecoder, IfcSchema, IfcType};
+use smallvec::smallvec;
 
-use super::super::helpers::{FaceData, FaceResult};
+use super::super::helpers::{FaceData, FaceIndices, FacePositions, FaceResult, LoopPoints};
 use crate::router::GeometryProcessor;
 
 /// Minimum face count at which parallel (rayon) triangulation pays off. Below
@@ -74,22 +75,21 @@ impl FacetedBrepProcessor {
         }
     }
 
-    /// Extract polygon points using ultra-fast path from loop entity ID
-    /// Uses cached coordinate extraction - points are cached across faces
-    /// This is the fastest path for files with shared cartesian points
+    /// Extract polygon points using ultra-fast path from loop entity ID.
+    /// Cached coordinate extraction - points are cached/shared across faces.
     #[inline]
     fn extract_loop_points_fast(
         &self,
         loop_entity_id: u32,
         decoder: &mut EntityDecoder,
-    ) -> Option<Vec<Point3<f64>>> {
-        // ULTRA-FAST PATH with CACHING: Get coordinates with point cache
-        // Many faces share the same cartesian points, so caching avoids
-        // re-parsing the same point data multiple times
+    ) -> Option<LoopPoints> {
+        // ULTRA-FAST PATH with CACHING: many faces share the same cartesian
+        // points, so caching avoids re-parsing the same point data per face.
         let coords = decoder.get_polyloop_coords_cached(loop_entity_id)?;
 
-        // Convert to Point3 - pre-allocated in get_polyloop_coords_cached
-        let polygon_points: Vec<Point3<f64>> = coords
+        // Convert to Point3 - inline SmallVec keeps the common tri/quad loop off
+        // the heap (byte-identical values/order to the previous Vec).
+        let polygon_points: LoopPoints = coords
             .into_iter()
             .map(|(x, y, z)| Point3::new(x, y, z))
             .collect();
@@ -114,7 +114,7 @@ impl FacetedBrepProcessor {
 
         // FAST PATH: Triangle without holes - no triangulation needed
         if n == 3 && face.hole_points.is_empty() {
-            let mut positions = Vec::with_capacity(9);
+            let mut positions = FacePositions::with_capacity(9);
             for point in &face.outer_points {
                 positions.push((point.x - rtc.0) as f32);
                 positions.push((point.y - rtc.1) as f32);
@@ -122,13 +122,13 @@ impl FacetedBrepProcessor {
             }
             return FaceResult {
                 positions,
-                indices: vec![0, 1, 2],
+                indices: smallvec![0, 1, 2],
             };
         }
 
         // FAST PATH: Quad without holes - simple fan
         if n == 4 && face.hole_points.is_empty() {
-            let mut positions = Vec::with_capacity(12);
+            let mut positions = FacePositions::with_capacity(12);
             for point in &face.outer_points {
                 positions.push((point.x - rtc.0) as f32);
                 positions.push((point.y - rtc.1) as f32);
@@ -136,7 +136,7 @@ impl FacetedBrepProcessor {
             }
             return FaceResult {
                 positions,
-                indices: vec![0, 1, 2, 0, 2, 3],
+                indices: smallvec![0, 1, 2, 0, 2, 3],
             };
         }
 
@@ -172,13 +172,13 @@ impl FacetedBrepProcessor {
             }
 
             if is_convex {
-                let mut positions = Vec::with_capacity(n * 3);
+                let mut positions = FacePositions::with_capacity(n * 3);
                 for point in &face.outer_points {
                     positions.push((point.x - rtc.0) as f32);
                     positions.push((point.y - rtc.1) as f32);
                     positions.push((point.z - rtc.2) as f32);
                 }
-                let mut indices = Vec::with_capacity((n - 2) * 3);
+                let mut indices = FaceIndices::with_capacity((n - 2) * 3);
                 for i in 1..n - 1 {
                     indices.push(0);
                     indices.push(i as u32);
@@ -194,8 +194,8 @@ impl FacetedBrepProcessor {
             triangulate_polygon_with_holes,
         };
 
-        let mut positions = Vec::new();
-        let mut indices = Vec::new();
+        let mut positions = FacePositions::new();
+        let mut indices = FaceIndices::new();
 
         // Calculate face normal from outer boundary
         let normal = calculate_polygon_normal(&face.outer_points);
@@ -286,8 +286,8 @@ impl FacetedBrepProcessor {
                 Some(ids) => ids,
                 None => continue,
             };
-            let mut outer_bound_points: Option<Vec<Point3<f64>>> = None;
-            let mut hole_points: Vec<Vec<Point3<f64>>> = Vec::new();
+            let mut outer_bound_points: Option<LoopPoints> = None;
+            let mut hole_points: Vec<LoopPoints> = Vec::new();
             for bound_id in bound_ids {
                 let (loop_id, orientation, is_outer) = match decoder.get_face_bound_fast(bound_id) {
                     Some(data) => data,
@@ -391,8 +391,8 @@ impl GeometryProcessor for FacetedBrepProcessor {
             };
 
             // Separate outer bound from inner bounds (holes)
-            let mut outer_bound_points: Option<Vec<Point3<f64>>> = None;
-            let mut hole_points: Vec<Vec<Point3<f64>>> = Vec::new();
+            let mut outer_bound_points: Option<LoopPoints> = None;
+            let mut hole_points: Vec<LoopPoints> = Vec::new();
 
             for bound_id in bound_ids {
                 // FAST PATH: Extract loop_id, orientation, is_outer from raw bytes

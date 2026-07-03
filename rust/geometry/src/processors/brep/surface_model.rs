@@ -2,11 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use crate::{Error, Mesh, Point3, Result, TessellationQuality};
+use crate::{Error, Mesh, Result, TessellationQuality};
 use ifc_lite_core::{DecodedEntity, EntityDecoder, IfcSchema, IfcType};
 
 use super::super::advanced_face::process_advanced_face;
-use super::super::helpers::{extract_loop_points_by_id, FaceData};
+use super::super::helpers::{extract_loop_points_by_id, FaceData, LoopPoints};
 use super::faceted::FacetedBrepProcessor;
 use crate::router::GeometryProcessor;
 
@@ -94,8 +94,8 @@ impl GeometryProcessor for FaceBasedSurfaceModelProcessor {
                         None => continue,
                     };
 
-                    let mut outer_points: Option<Vec<Point3<f64>>> = None;
-                    let mut hole_points: Vec<Vec<Point3<f64>>> = Vec::new();
+                    let mut outer_points: Option<LoopPoints> = None;
+                    let mut hole_points: Vec<LoopPoints> = Vec::new();
 
                     for bound_id in bound_ids {
                         // FAST PATH: Extract loop_id, orientation, is_outer from raw bytes
@@ -266,8 +266,8 @@ impl GeometryProcessor for ShellBasedSurfaceModelProcessor {
                         None => continue,
                     };
 
-                    let mut outer_points: Option<Vec<Point3<f64>>> = None;
-                    let mut hole_points: Vec<Vec<Point3<f64>>> = Vec::new();
+                    let mut outer_points: Option<LoopPoints> = None;
+                    let mut hole_points: Vec<LoopPoints> = Vec::new();
 
                     for bound_id in bound_ids {
                         // FAST PATH: Extract loop_id, orientation, is_outer from raw bytes

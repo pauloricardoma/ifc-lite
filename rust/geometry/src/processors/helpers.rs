@@ -10,17 +10,46 @@
 use crate::{Error, Point3, Result, Vector3};
 use ifc_lite_core::{DecodedEntity, EntityDecoder, IfcType};
 use nalgebra::Matrix4;
+use smallvec::SmallVec;
+
+/// Inline-stored vertex loop for a single face boundary.
+///
+/// A census of the faceted-brep corpus (Holter tower, 36.5k faces) shows the
+/// outer boundary is a triangle or quad 95.5% of the time (50.7% tri, 44.8%
+/// quad; 5-vertex and up together are 4.5%). Inline capacity 4 keeps that
+/// dominant tri/quad boundary entirely on the stack (inside the owning
+/// `Vec<FaceData>`/`FaceResult` slot), eliminating one heap alloc+free per loop
+/// without bloating the per-face struct for the rare large n-gon (which spills
+/// to the heap exactly as before). `SmallVec` iterates/indexes/derefs to `&[T]`
+/// bit-identically to `Vec`, so the downstream triangulation and mesh assembly
+/// are byte-for-byte unchanged.
+pub(super) type LoopPoints = SmallVec<[Point3<f64>; 4]>;
+
+/// Inline-stored interleaved f32 positions for one triangulated face.
+///
+/// A quad emits 4*3 = 12 f32, matching the `LoopPoints` tri/quad range so the
+/// 95.5%-common face stays heap-free end to end; larger faces spill.
+pub(super) type FacePositions = SmallVec<[f32; 12]>;
+
+/// Inline-stored triangle indices for one triangulated face.
+///
+/// A quad fan yields 2*3 = 6 indices (a triangle 3), covering the same
+/// dominant tri/quad range inline.
+pub(super) type FaceIndices = SmallVec<[u32; 6]>;
 
 /// Face data extracted from IFC for parallel triangulation
 pub(super) struct FaceData {
-    pub(super) outer_points: Vec<Point3<f64>>,
-    pub(super) hole_points: Vec<Vec<Point3<f64>>>,
+    pub(super) outer_points: LoopPoints,
+    // Holes are rare; an empty `Vec` never allocates, so keep the outer
+    // container as `Vec` (no inline bloat for the common no-hole face) while the
+    // per-hole loops still get inline `LoopPoints` storage.
+    pub(super) hole_points: Vec<LoopPoints>,
 }
 
 /// Triangulated face result
 pub(super) struct FaceResult {
-    pub(super) positions: Vec<f32>,
-    pub(super) indices: Vec<u32>,
+    pub(super) positions: FacePositions,
+    pub(super) indices: FaceIndices,
 }
 
 /// Parse IfcAxis2Placement3D into transformation matrix
@@ -149,10 +178,10 @@ pub(super) fn parse_direction(direction_entity: &DecodedEntity) -> Result<Vector
 pub(super) fn extract_loop_points_by_id(
     loop_id: u32,
     decoder: &mut EntityDecoder,
-) -> Option<Vec<Point3<f64>>> {
+) -> Option<LoopPoints> {
     let point_ids = decoder.get_polyloop_point_ids_fast(loop_id)?;
 
-    let mut points = Vec::with_capacity(point_ids.len());
+    let mut points = LoopPoints::with_capacity(point_ids.len());
     for point_id in point_ids {
         let (x, y, z) = decoder.get_cartesian_point_fast(point_id)?;
         points.push(Point3::new(x, y, z));
