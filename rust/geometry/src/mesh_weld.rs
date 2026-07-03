@@ -37,6 +37,7 @@
 //! a quantized UV), no float comparison, FMA-free.
 
 use rustc_hash::FxHashMap;
+use std::cell::RefCell;
 
 /// Normal quantization grid: components are multiplied by this and rounded to an
 /// integer before keying. Matches [`crate::facet_weld`]'s `NORMAL_QUANT` and the
@@ -65,6 +66,32 @@ fn vkey(p: &[f32], n: &[f32], uv: [f32; 2]) -> VKey {
         (uv[0] * UV_QUANT).round() as i32,
         (uv[1] * UV_QUANT).round() as i32,
     )
+}
+
+/// Per-worker reusable scratch for [`weld_indexed`]'s INTERNAL buffers, cleared
+/// (never freed) between meshes. The output buffers (`out_pos`/`out_nrm`/…) still
+/// allocate (they escape to the caller); only the transient `map`/`remap`/
+/// `first_vert` — allocated and dropped per element by the pre-pool code — are
+/// pooled. BYTE-IDENTICAL: `map` is only `.get()`/`.insert()`-ed, never iterated
+/// (so its bucket count / residual capacity can't reach the output); `remap` is
+/// fully overwritten; `first_vert` is refilled by push in first-seen order and
+/// iterated in push order. A cleared, reused buffer replays the identical fill.
+#[derive(Default)]
+struct WeldScratch {
+    map: FxHashMap<VKey, u32>,
+    remap: Vec<u32>,
+    first_vert: Vec<u32>,
+}
+
+thread_local! {
+    /// One scratch per rayon worker (and the main / wasm single thread): a
+    /// `thread_local!`, not the shared worker-slot pattern, since these LEAF buffers
+    /// never cross a crate boundary, need no lock, and work when
+    /// `rayon::current_thread_index()` is `None`. Re-entrancy is TAKE / put-back (the
+    /// `RefCell` borrow is never held across the hash pass), so a re-entrant call
+    /// mints a fresh scratch rather than panicking — though `weld_indexed` runs no
+    /// rayon and cannot re-enter on the same thread.
+    static WELD_SCRATCH: RefCell<Option<WeldScratch>> = const { RefCell::new(None) };
 }
 
 /// Weld `positions`/`normals` (3 floats per vertex, equal length), optional
@@ -100,14 +127,22 @@ pub fn weld_indexed(
         return None; // malformed: caller keeps the (unvalidated) originals
     }
 
-    // Single hash pass: assign each distinct key a first-seen id, record the
-    // source vertex that minted it, and fill the remap. `first_vert` doubles as
-    // the merge detector — if it ends the same length as `nverts`, no two
-    // vertices collided and the remap is the identity.
-    let mut map: FxHashMap<VKey, u32> = FxHashMap::default();
+    // Take this worker's warm scratch (or mint one). The `.with` borrow is momentary
+    // at both ends, never held across the hash pass (re-entrancy-safe); the scratch
+    // is handed back on the single return path below. Disjoint `&mut` field bindings.
+    let mut scratch = WELD_SCRATCH.with(|c| c.borrow_mut().take()).unwrap_or_default();
+    let WeldScratch { map, remap, first_vert } = &mut scratch;
+
+    // Single hash pass: assign each distinct key a first-seen id, record the source
+    // vertex that minted it, and fill the remap. `first_vert` doubles as the merge
+    // detector — same length as `nverts` ⇒ nothing collided, the remap is identity.
+    // Clear (retain capacity) before use so no stale data leaks in; `remap` is resized
+    // to all-zero (every slot is overwritten by `remap[v] = id` below).
+    map.clear();
     map.reserve(nverts);
-    let mut remap = vec![0u32; nverts];
-    let mut first_vert: Vec<u32> = Vec::new();
+    remap.clear();
+    remap.resize(nverts, 0u32);
+    first_vert.clear();
     for v in 0..nverts {
         let p = &positions[v * 3..v * 3 + 3];
         let n = &normals[v * 3..v * 3 + 3];
@@ -128,26 +163,30 @@ pub fn weld_indexed(
     }
 
     let unique = first_vert.len();
-    if unique == nverts {
+    let out = if unique == nverts {
         // Nothing merged: the identity remap reproduces the input exactly.
-        return None;
-    }
-
-    // Merges happened: gather the first-seen vertex per id (byte-identical to
-    // extending on first insert above) and remap the indices.
-    let mut out_pos: Vec<f32> = Vec::with_capacity(unique * 3);
-    let mut out_nrm: Vec<f32> = Vec::with_capacity(unique * 3);
-    let mut out_uv: Vec<f32> = Vec::with_capacity(if uvs.is_some() { unique * 2 } else { 0 });
-    for &fv in &first_vert {
-        let fv = fv as usize;
-        out_pos.extend_from_slice(&positions[fv * 3..fv * 3 + 3]);
-        out_nrm.extend_from_slice(&normals[fv * 3..fv * 3 + 3]);
-        if let Some(u) = uvs {
-            out_uv.extend_from_slice(&u[fv * 2..fv * 2 + 2]);
+        None
+    } else {
+        // Merges happened: gather the first-seen vertex per id (byte-identical to
+        // extending on first insert above) and remap the indices.
+        let mut out_pos: Vec<f32> = Vec::with_capacity(unique * 3);
+        let mut out_nrm: Vec<f32> = Vec::with_capacity(unique * 3);
+        let mut out_uv: Vec<f32> =
+            Vec::with_capacity(if uvs.is_some() { unique * 2 } else { 0 });
+        for &fv in first_vert.iter() {
+            let fv = fv as usize;
+            out_pos.extend_from_slice(&positions[fv * 3..fv * 3 + 3]);
+            out_nrm.extend_from_slice(&normals[fv * 3..fv * 3 + 3]);
+            if let Some(u) = uvs {
+                out_uv.extend_from_slice(&u[fv * 2..fv * 2 + 2]);
+            }
         }
-    }
-    let out_idx: Vec<u32> = indices.iter().map(|&i| remap[i as usize]).collect();
-    Some((out_pos, out_nrm, uvs.map(|_| out_uv), out_idx))
+        let out_idx: Vec<u32> = indices.iter().map(|&i| remap[i as usize]).collect();
+        Some((out_pos, out_nrm, uvs.map(|_| out_uv), out_idx))
+    };
+    // Field borrows have ended (NLL); hand the now-warm scratch back to this worker.
+    WELD_SCRATCH.with(|c| *c.borrow_mut() = Some(scratch));
+    out
 }
 
 #[cfg(test)]
