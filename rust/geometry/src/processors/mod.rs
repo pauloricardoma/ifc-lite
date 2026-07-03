@@ -12,7 +12,6 @@
 //! - `brep`: FacetedBrep, FaceBasedSurfaceModel, ShellBasedSurfaceModel (boundary representations)
 //! - `surface`: SurfaceOfLinearExtrusion (swept surfaces)
 //! - `boolean`: BooleanClippingResult (CSG operations)
-//! - `mapped`: MappedItem (geometry instancing)
 //! - `swept`: SweptDiskSolid, RevolvedAreaSolid (swept geometry)
 //! - `advanced`: AdvancedBrep (NURBS/B-spline)
 //! - `advanced_face`: Shared IfcAdvancedFace processing (B-spline, planar, cylindrical)
@@ -27,7 +26,6 @@ mod csg_primitive;
 mod extrusion;
 mod extrusion_tapered;
 mod helpers;
-mod mapped;
 mod sectioned;
 mod surface;
 mod swept;
@@ -47,7 +45,6 @@ pub use brep::{
 pub use csg_primitive::{BlockProcessor, CsgSolidProcessor, SphereProcessor};
 pub use extrusion::ExtrudedAreaSolidProcessor;
 pub use extrusion_tapered::ExtrudedAreaSolidTaperedProcessor;
-pub use mapped::MappedItemProcessor;
 pub use sectioned::SectionedSolidHorizontalProcessor;
 pub use surface::SurfaceOfLinearExtrusionProcessor;
 pub use swept::{

@@ -213,7 +213,6 @@ impl ProfileProcessor {
             )));
         }
 
-        let half_overall_width = bottom_width.max(top_width) * 0.5;
         let half_depth = overall_depth * 0.5;
         let half_web = web_thickness * 0.5;
         let half_bottom = bottom_width * 0.5;
@@ -225,7 +224,6 @@ impl ProfileProcessor {
         // + bottom_flange_thickness)` is intentionally placed at the
         // bottom-flange edge (`±half_bottom`) — *not* at the overall width
         // — so a wider bottom flange protrudes correctly.
-        let _ = half_overall_width; // (kept for future fillet/slope work)
         let points = vec![
             Point2::new(-half_bottom, -half_depth),
             Point2::new(half_bottom, -half_depth),

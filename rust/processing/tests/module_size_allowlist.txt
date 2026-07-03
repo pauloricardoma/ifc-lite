@@ -26,24 +26,22 @@
      655 rust/export/src/model.rs
      611 rust/export/src/step.rs
     1125 rust/geometry/src/alignment.rs
-     551 rust/geometry/src/bool2d.rs
+     413 rust/geometry/src/bool2d.rs
 # +19: split_on_edge now sets a failed flag and bails to the ear-clip fallback instead of the lone .expect() panic.
-    1894 rust/geometry/src/cdt.rs
-     895 rust/geometry/src/csg/consolidate.rs
-    1061 rust/geometry/src/csg/mod.rs
-     436 rust/geometry/src/csg/normals.rs
+    1526 rust/geometry/src/cdt.rs
+     894 rust/geometry/src/csg/consolidate.rs
+     947 rust/geometry/src/csg/mod.rs
      998 rust/geometry/src/extrusion.rs
      759 rust/geometry/src/facet_weld.rs
      408 rust/geometry/src/geom_hash.rs
-     641 rust/geometry/src/kernel/arrangement/classify.rs
+     640 rust/geometry/src/kernel/arrangement/classify.rs
      566 rust/geometry/src/kernel/fixed.rs
 # +39: begin()/tripped() budget-guard added to the union & intersection kernel entries (#1109 parity with subtract).
      885 rust/geometry/src/kernel/mesh_bridge.rs
      700 rust/geometry/src/kernel/predicates.rs
-    1383 rust/geometry/src/kernel/retriangulate.rs
-     468 rust/geometry/src/kernel/tritri.rs
+    1261 rust/geometry/src/kernel/retriangulate.rs
     1529 rust/geometry/src/mesh.rs
-     920 rust/geometry/src/processors/boolean/mod.rs
+     919 rust/geometry/src/processors/boolean/mod.rs
      486 rust/geometry/src/processors/brep/faceted.rs
      402 rust/geometry/src/processors/csg_primitive.rs
      608 rust/geometry/src/processors/sectioned.rs
@@ -52,7 +50,7 @@
      598 rust/geometry/src/profiles/curves_2d.rs
      709 rust/geometry/src/profiles/curves_3d.rs
      898 rust/geometry/src/profiles/mod.rs
-     596 rust/geometry/src/profiles/shapes.rs
+     594 rust/geometry/src/profiles/shapes.rs
      706 rust/geometry/src/profiles/simplify.rs
      781 rust/geometry/src/rect_fast.rs
      586 rust/geometry/src/router/diagnostics.rs

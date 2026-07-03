@@ -418,44 +418,6 @@ fn insert_point(mesh: &mut Mesh2d, it: &Interner, p: Vid) {
     }
 }
 
-/// Phases A–C: project, canonicalise, and insert every constraint-endpoint point
-/// into a triangulation of `T`. `None` ⇒ `T` is degenerate. (Phase D — forcing
-/// the constraint segments to be edges — is a later increment.)
-pub fn triangulate_points(input: &RetriInput, interner: &mut Interner) -> Option<Mesh2d> {
-    let (axis, w0) = projection_axis(&input.tri)?;
-    let canon = canonicalize(input, interner);
-    // The initial triangle is T's corners in input order; by Phase A its
-    // orientation is exactly w0.
-    let mut mesh = Mesh2d {
-        tris: vec![canon.corners],
-        axis,
-        w0,
-        unrecovered: 0,
-        audit_needed: false,
-        coords: BTreeMap::new(),
-    };
-    let mut pts: BTreeSet<Vid> = BTreeSet::new();
-    for &(lo, hi) in &canon.segments {
-        pts.insert(lo);
-        pts.insert(hi);
-    }
-    pts.extend(canon.points.iter().copied());
-    for &c in &canon.corners {
-        pts.remove(&c);
-    }
-    // insert in canonical lex order ⇒ order-independent topology
-    let mut ordered: Vec<Vid> = pts.into_iter().collect();
-    ordered.sort_by(|&a, &b| lex_cmp(interner, a, b));
-    for p in ordered {
-        // #1109 overshoot guard — see `triangulate`.
-        if super::budget::tripped() {
-            break;
-        }
-        insert_point(&mut mesh, interner, p);
-    }
-    Some(mesh)
-}
-
 /// Is `p` strictly OUTSIDE the closed triangle `(a,b,c)` (oriented `w0`)? — true
 /// iff some edge has `p` on its far (opposite-`w0`) side. Used by the ear test:
 /// an ear is valid only when every other vertex is strictly outside (a vertex on
@@ -1145,90 +1107,6 @@ mod tests {
         // a duplicate constraint is deduplicated
         let with_dup = materialise(vec![c1.clone(), c1.clone(), c2.clone()]);
         assert_eq!(with_dup.len(), 2, "duplicate constraint not deduped");
-    }
-
-    #[test]
-    fn phase_c_covers_t_exactly_with_correct_orientation() {
-        use super::super::rational::tri_area2;
-        use num_rational::BigRational;
-        use num_traits::Zero;
-        let t = [[0., 0., 0.], [6., 0., 0.], [0., 6., 0.]]; // z=0, CCW
-        let lpi = ImplicitPoint::Lpi(Lpi {
-            p: [2., 2., -1.],
-            q: [2., 2., 1.],
-            r: [0., 0., 0.],
-            s: [1., 0., 0.],
-            t: [0., 1., 0.],
-        }); // (2,2,0), interior
-        let cons = vec![
-            Constraint { a: lpi, b: e([3., 3., 0.]) }, // (3,3,0) on the hypotenuse x+y=6
-            Constraint { a: e([1., 1., 0.]), b: e([4., 1., 0.]) },
-        ];
-        let mut it = Interner::new();
-        let mesh = triangulate_points(&RetriInput { tri: t, constraints: cons, points: Vec::new() }, &mut it).unwrap();
-        // every sub-triangle is oriented w0 (none flipped or degenerate)
-        for &tri in &mesh.tris {
-            assert_eq!(
-                orient2d_v(&it, tri[0], tri[1], tri[2], mesh.axis),
-                mesh.w0,
-                "sub-tri not oriented w0: {tri:?}"
-            );
-        }
-        // exact coverage: Σ sub-triangle area == T's area
-        let area2 = |tri: SubTri| {
-            tri_area2(
-                &point_of(it.get(tri[0])),
-                &point_of(it.get(tri[1])),
-                &point_of(it.get(tri[2])),
-                mesh.axis,
-            )
-        };
-        let sum = mesh.tris.iter().fold(BigRational::zero(), |acc, &tr| acc + area2(tr));
-        let t_area = tri_area2(
-            &point_of(&e(t[0])),
-            &point_of(&e(t[1])),
-            &point_of(&e(t[2])),
-            mesh.axis,
-        );
-        assert_eq!(sum, t_area, "sub-triangles do not exactly cover T");
-    }
-
-    #[test]
-    fn phase_c_topology_is_input_order_independent() {
-        let t = [[0., 0., 0.], [5., 0., 0.], [0., 5., 0.]];
-        let lpi = ImplicitPoint::Lpi(Lpi {
-            p: [1., 1., -1.],
-            q: [1., 1., 1.],
-            r: [0., 0., 0.],
-            s: [1., 0., 0.],
-            t: [0., 1., 0.],
-        });
-        let c1 = Constraint { a: lpi, b: e([2., 2., 0.]) };
-        let c2 = Constraint { a: e([3., 1., 0.]), b: e([1., 3., 0.]) };
-        let topo = |cons: Vec<Constraint>| {
-            let mut it = Interner::new();
-            let mesh = triangulate_points(&RetriInput { tri: t, constraints: cons, points: Vec::new() }, &mut it).unwrap();
-            let mut tris: Vec<_> = mesh
-                .tris
-                .iter()
-                .map(|&tri| {
-                    let mut p = [
-                        point_of(it.get(tri[0])),
-                        point_of(it.get(tri[1])),
-                        point_of(it.get(tri[2])),
-                    ];
-                    p.sort();
-                    p
-                })
-                .collect();
-            tris.sort();
-            tris
-        };
-        assert_eq!(
-            topo(vec![c1.clone(), c2.clone()]),
-            topo(vec![c2, c1]),
-            "Phase C topology depends on input order"
-        );
     }
 
     #[test]

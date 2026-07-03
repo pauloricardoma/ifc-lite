@@ -472,7 +472,6 @@ fn on_interface_keep(
     other: &[Tri],
     ext_other: f64,
     op: BoolOp,
-    _a_side: bool,
 ) -> Option<bool> {
     let n = tri_normal(arr, tri);
     let (op_plus, op_minus) = solid_side(c, n, other, ext_other);
@@ -612,7 +611,7 @@ pub(super) fn boolean_vids_components(
             continue; // coplanar-shared B-copy: dropped (the A-copy is the kept one)
         }
         if cop_parent {
-            if let Some(keep) = on_interface_keep(arr, tri, c, a, ext_a, op, false) {
+            if let Some(keep) = on_interface_keep(arr, tri, c, a, ext_a, op) {
                 // regime 2 for B (coplanar-overlap parent only).
                 if keep {
                     let flip = matches!(op, BoolOp::Difference);

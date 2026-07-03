@@ -175,7 +175,6 @@ struct Seg {
     half_thickness: f64,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_edge(
     edges: &mut Vec<ArrEdge>,
     seen: &mut std::collections::HashSet<(usize, usize)>,

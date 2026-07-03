@@ -260,9 +260,9 @@ impl ClippingProcessor {
     /// along operand cut lines; a naive edge-walk merge fails on the
     /// "X" crossings that appear at cutter-outline corners (four fragments
     /// sharing only a vertex), so we project each plane bucket to 2D, run
-    /// the i_overlay union the rest of the codebase already uses for
-    /// `bool2d::union_contours`, and earcut the resulting (possibly
-    /// annular) shapes. This is what brought the bath from 189 → ~50
+    /// the same `i_overlay` boolean engine `bool2d.rs` already uses elsewhere
+    /// in the crate, and earcut the resulting (possibly annular) shapes.
+    /// This is what brought the bath from 189 → ~50
     /// triangles with the cavity outline intact (issue #780); it also hosts
     /// the needle/weld cleanup passes for #1007.
     ///
@@ -493,7 +493,7 @@ impl ClippingProcessor {
                 // indices into it; the lift below maps EVERY returned vertex
                 // (input + Steiner) back to 3D, so a Steiner point on a shared
                 // edge is split on both sides → watertight, no T-junction.
-                // allow_boundary_split = false: this region's outer/hole rings
+                // Refinement is interior-only: this region's outer/hole rings
                 // are shared with neighbouring plane buckets triangulated
                 // independently; a boundary Steiner point would tear that seam
                 // (open edges / T-junctions). Interior-only refinement keeps the
@@ -501,7 +501,6 @@ impl ClippingProcessor {
                 let (all_2d, indices) = match triangulate_polygon_with_holes_refined(
                     &outer_simplified,
                     &holes_simplified,
-                    false,
                 ) {
                     Ok((pts, idx)) => (pts, idx),
                     Err(_) => continue,

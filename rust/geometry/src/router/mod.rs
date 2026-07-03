@@ -33,7 +33,7 @@ use crate::processors::{
     AdvancedBrepProcessor, BSplineSurfaceProcessor, BlockProcessor, BooleanClippingProcessor,
     CsgSolidProcessor, ExtrudedAreaSolidProcessor, ExtrudedAreaSolidTaperedProcessor,
     FaceBasedSurfaceModelProcessor, FacetedBrepProcessor, IfcAlignmentProcessor,
-    MappedItemProcessor, PolygonalFaceSetProcessor, RevolvedAreaSolidProcessor,
+    PolygonalFaceSetProcessor, RevolvedAreaSolidProcessor,
     SectionedSolidHorizontalProcessor, ShellBasedSurfaceModelProcessor, SphereProcessor,
     SurfaceCurveSweptAreaSolidProcessor, SweptDiskSolidProcessor, TriangulatedFaceSetProcessor,
 };
@@ -236,7 +236,6 @@ impl GeometryRouter {
         )));
         router.register(Box::new(TriangulatedFaceSetProcessor::new()));
         router.register(Box::new(PolygonalFaceSetProcessor::new()));
-        router.register(Box::new(MappedItemProcessor::new()));
         router.register(Box::new(FacetedBrepProcessor::new()));
         router.register(Box::new(BooleanClippingProcessor::new()));
         router.register(Box::new(SweptDiskSolidProcessor::new(schema_clone.clone())));
@@ -458,9 +457,6 @@ impl GeometryRouter {
     /// [`Self::set_skip_small_cuts`] flips the flag; `register` overwrites the
     /// existing map entries keyed by IFC type.
     fn register_skip_dependent_processors(&mut self) {
-        self.register(Box::new(MappedItemProcessor::with_skip_small_cuts(
-            self.skip_small_cuts,
-        )));
         self.register(Box::new(BooleanClippingProcessor::with_skip_small_cuts(
             self.skip_small_cuts,
         )));

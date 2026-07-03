@@ -124,7 +124,7 @@ pub use nalgebra::{Point2, Point3, Vector2, Vector3};
 
 pub use bool2d::{
     compute_signed_area, ensure_ccw, ensure_cw, is_valid_contour, point_in_contour, subtract_2d,
-    subtract_multiple_2d, union_contours,
+    subtract_multiple_2d,
 };
 pub use csg::{calculate_normals, ClippingProcessor, Plane, Triangle};
 pub use diagnostics::{BoolFailure, BoolFailureReason, BoolOp};
@@ -143,7 +143,7 @@ pub use mesh_orient::orient_mesh_outward;
 pub use processors::{
     AdvancedBrepProcessor, BooleanClippingProcessor, ExtrudedAreaSolidProcessor,
     ExtrudedAreaSolidTaperedProcessor, FaceBasedSurfaceModelProcessor, FacetedBrepProcessor,
-    build_texture_index, MappedItemProcessor, MeshTexture, PolygonalFaceSetProcessor,
+    build_texture_index, MeshTexture, PolygonalFaceSetProcessor,
     ResolvedTextureMap, RevolvedAreaSolidProcessor, SurfaceOfLinearExtrusionProcessor,
     SweptDiskSolidProcessor, TriangulatedFaceSetProcessor,
 };
