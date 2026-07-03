@@ -22,7 +22,7 @@
     3943 rust/export/src/gltf.rs
      655 rust/export/src/model.rs
      611 rust/export/src/step.rs
-    1233 rust/geometry/src/alignment.rs
+    1125 rust/geometry/src/alignment.rs
      551 rust/geometry/src/bool2d.rs
     1875 rust/geometry/src/cdt.rs
      895 rust/geometry/src/csg/consolidate.rs
