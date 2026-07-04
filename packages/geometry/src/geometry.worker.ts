@@ -1034,10 +1034,18 @@ async function processBatch(session: ProcessingSession, jobs: Uint32Array): Prom
     }
     if (numJobs === 1) {
       console.warn(`[Worker] Skipping entity #${jobs[0]}: ${msg}`);
+      // Free the abandoned instance NOW rather than waiting for GC: it holds a
+      // file-sized source copy (setSourceBytes), and `ensureInit` immediately
+      // installs a fresh one — so a bare `api = null` would transiently double the
+      // source in this worker's (never-shrinking) wasm heap on exactly the
+      // memory-stressed models that trigger recovery. `free()` returns the block
+      // to the wasm allocator so the re-install reuses it.
+      try { api?.free(); } catch { /* wrapper may already be invalid */ }
       api = null;
       return;
     }
     console.warn(`[Worker] Batch of ${numJobs} entities failed (${msg}), splitting…`);
+    try { api?.free(); } catch { /* see the free() rationale above */ }
     api = null;
     const mid = Math.floor(numJobs / 2) * 3;
     await processBatch(session, jobs.slice(0, mid));
@@ -1194,6 +1202,15 @@ async function handleMessage(e: MessageEvent<GeometryWorkerRequest>): Promise<vo
       // size from a previous dense model).
       batchSizing = resolveBatchSizing(e.data.batchSizing);
       adaptiveBatchJobs = batchSizing.maxJobs;
+      // Fresh load: drop any source held for a PREVIOUS load so this load's bytes
+      // are re-installed on its first batch. The in-repo host spawns a fresh
+      // worker per load so this is belt-and-braces there, but a host that reuses a
+      // worker across loads without a `stream-end` between them would otherwise
+      // mesh the new load against the previous file's held bytes (a similar-size
+      // stale source decodes wrong entities). Resetting here makes that misuse
+      // fail to the byte-identical legacy path instead of silently meshing wrong.
+      sourceBytesApplied = false;
+      cachedSourceBytes = null;
       activeSession = startSession({
         sharedBuffer: e.data.sharedBuffer,
         unitScale: e.data.unitScale,
