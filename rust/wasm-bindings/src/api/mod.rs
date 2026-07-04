@@ -643,8 +643,10 @@ impl IfcAPI {
         // pay the full build; non-layered files behave identically (an absent
         // entry and a `NotSliceable` entry both mean "don't slice").
         const LAYER_SET_KW: &[u8] = b"IFCMATERIALLAYERSET";
-        let has_layer_set = content.len() >= LAYER_SET_KW.len()
-            && content.windows(LAYER_SET_KW.len()).any(|w| w == LAYER_SET_KW);
+        // memmem (SIMD O(n)) not the naive O(n*k) `windows().any()`: this runs on
+        // the whole file on each worker's first batch call, so on a 200-340MB model
+        // the naive scan cost ~100-400ms per worker. Byte-identical boolean.
+        let has_layer_set = memchr::memmem::find(content, LAYER_SET_KW).is_some();
         let index = if has_layer_set {
             ifc_lite_geometry::MaterialLayerIndex::from_content(content, decoder)
         } else {
@@ -795,10 +797,7 @@ impl IfcAPI {
         // IfcIndexedColourMap pay only a single substring search (SIMD memmem),
         // not a full entity scan + decode, on the first batch of every worker.
         // The empty result is still cached so later batches skip even that.
-        if !content
-            .windows(b"IFCINDEXEDCOLOURMAP".len())
-            .any(|window| window == b"IFCINDEXEDCOLOURMAP")
-        {
+        if memchr::memmem::find(content, b"IFCINDEXEDCOLOURMAP").is_none() {
             let arc = std::sync::Arc::new(map);
             let mut slot = self
                 .cached_indexed_colour_maps
