@@ -58,6 +58,21 @@ pub struct IfcAPI {
     /// under concurrent `&self` access.
     cached_entity_index: std::sync::Mutex<Option<std::sync::Arc<EntityIndex>>>,
 
+    /// Session source bytes (the whole IFC file) held ONCE per load, so the
+    /// streaming batch path stops re-copying the file into the wasm heap on
+    /// EVERY `processGeometryBatch*` call. `passArray8ToWasm0` mallocs + memcpys
+    /// the full `data` slice every call (~4 ms/call on 169 MB); a huge CSG-dense
+    /// model adapts down to 64-job batches and makes 600+ calls/worker, so the
+    /// per-call copy alone is 15-25 s/worker of pure memcpy. The bytes are
+    /// IDENTICAL across a worker's calls (one model per `IfcAPI`), so one copy
+    /// suffices: `setSourceBytes` stores it here and the `*FromSource` batch
+    /// variants read it instead of taking `data`. Set once per load (mirrors
+    /// `cached_entity_index`); dropped by `clearPrePassCache`. NOT dropped by
+    /// `setEntityIndex` — it is REPLACED wholesale by the next `setSourceBytes`,
+    /// and the JS worker always calls `setSourceBytes` for the current session
+    /// before any `*FromSource` batch, so the held bytes always match the index.
+    cached_source_bytes: std::sync::Mutex<Option<std::sync::Arc<Vec<u8>>>>,
+
     /// Per-worker shared content-dedup cache (#1109 follow-up). The
     /// `GeometryRouter` is rebuilt every `processGeometryBatch`, so its item-mesh
     /// dedup cache would reset each batch. Holding ONE cache here and injecting it
@@ -222,6 +237,7 @@ impl IfcAPI {
         Self {
             initialized: true,
             cached_entity_index: std::sync::Mutex::new(None),
+            cached_source_bytes: std::sync::Mutex::new(None),
             cached_item_dedup: std::sync::Mutex::new(None),
             merge_layers: std::sync::atomic::AtomicBool::new(false),
             cached_parts_to_skip: std::sync::Mutex::new(None),
@@ -316,6 +332,13 @@ impl IfcAPI {
         // same reused IfcAPI starts with an empty cache (bounds memory across
         // loads; defensive even though the key is content- not id-based).
         self.cached_item_dedup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        // The session source bytes are the previous load's whole file; drop them
+        // at end-of-load cleanup so a reused IfcAPI doesn't retain a ~100s-of-MB
+        // copy between loads (the next load's setSourceBytes re-installs its own).
+        self.cached_source_bytes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();

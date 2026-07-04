@@ -194,6 +194,165 @@ test('issue #1023: raw byte geometry and scans accept non-UTF-8 string bytes', (
   }
 });
 
+// ===== setSourceBytes + *FromSource (cold-load lever 1c) =====
+// The whole file was memcpy'd into the wasm heap on EVERY processGeometryBatch*
+// call (the wasm-bindgen `data: &[u8]` arg). setSourceBytes holds it ONCE and
+// the *FromSource variants read it, so a huge model no longer pays 600+ full
+// file copies/worker. The HARD gate is byte-identical output: the meshing reads
+// the exact same bytes whether copied once or per call. These tests prove that
+// at the real wasm boundary (mocked TS tests can't).
+console.log('\n📋 setSourceBytes + *FromSource batch (byte-identical)');
+
+/**
+ * Byte-identical fingerprint of a MeshCollection: per-mesh identity + full
+ * geometry arrays, in collection order. Copies out of wasm memory and frees
+ * each MeshDataJs handle so the caller can free() the collection right after.
+ */
+function meshFingerprint(collection) {
+  const meshes = [];
+  for (let i = 0; i < collection.length; i++) {
+    const m = collection.get(i);
+    if (!m) continue;
+    try {
+      meshes.push({
+        expressId: m.expressId,
+        ifcType: m.ifcType,
+        geometryClass: m.geometryClass,
+        color: Array.from(m.color),
+        origin: Array.from(m.origin),
+        positions: Array.from(m.positions),
+        normals: Array.from(m.normals),
+        indices: Array.from(m.indices),
+      });
+    } finally {
+      m.free();
+    }
+  }
+  return meshes;
+}
+
+test('processGeometryBatchFromSource is byte-identical to processGeometryBatch', () => {
+  const bytes = new TextEncoder().encode(columnContent);
+
+  // Reference: the legacy per-call `data`-taking path.
+  const preRef = api.buildPrePassOnce(bytes);
+  let ref;
+  try {
+    const col = api.processGeometryBatch(
+      bytes, preRef.jobs, preRef.unitScale,
+      preRef.rtcOffset[0], preRef.rtcOffset[1], preRef.rtcOffset[2], preRef.needsShift,
+      preRef.voidKeys, preRef.voidCounts, preRef.voidValues, preRef.styleIds, preRef.styleColors,
+      preRef.planeAngleToRadians, preRef.materialElementIds, preRef.materialColorCounts, preRef.materialColors,
+    );
+    try { ref = meshFingerprint(col); } finally { col.free(); }
+  } finally {
+    api.clearPrePassCache();
+  }
+  assert.ok(ref.length > 0, 'reference batch must produce meshes');
+
+  // Candidate: hold the source ONCE, run the no-`data` variant.
+  const pre = api.buildPrePassOnce(bytes);
+  let got;
+  try {
+    api.setSourceBytes(bytes);
+    const col = api.processGeometryBatchFromSource(
+      pre.jobs, pre.unitScale,
+      pre.rtcOffset[0], pre.rtcOffset[1], pre.rtcOffset[2], pre.needsShift,
+      pre.voidKeys, pre.voidCounts, pre.voidValues, pre.styleIds, pre.styleColors,
+      pre.planeAngleToRadians, pre.materialElementIds, pre.materialColorCounts, pre.materialColors,
+    );
+    try { got = meshFingerprint(col); } finally { col.free(); }
+  } finally {
+    api.clearPrePassCache();
+  }
+
+  assert.deepEqual(got, ref,
+    'processGeometryBatchFromSource must be byte-for-byte identical to processGeometryBatch');
+});
+
+test('processGeometryBatchPartitionedFromSource matches processGeometryBatchPartitioned', () => {
+  if (typeof api.processGeometryBatchPartitioned !== 'function'
+    || typeof api.processGeometryBatchPartitionedFromSource !== 'function') {
+    throw new Error('partitioned exports missing from the built wasm');
+  }
+  const bytes = new TextEncoder().encode(columnContent);
+
+  // Reference partitioned (legacy per-call data).
+  const preRef = api.buildPrePassOnce(bytes);
+  let refFlat, refShard, refOcc;
+  try {
+    const p = api.processGeometryBatchPartitioned(
+      bytes, preRef.jobs, preRef.unitScale,
+      preRef.rtcOffset[0], preRef.rtcOffset[1], preRef.rtcOffset[2], preRef.needsShift,
+      preRef.voidKeys, preRef.voidCounts, preRef.voidValues, preRef.styleIds, preRef.styleColors,
+      preRef.planeAngleToRadians, preRef.materialElementIds, preRef.materialColorCounts, preRef.materialColors,
+    );
+    try {
+      refOcc = p.instancedOccurrences;
+      refShard = Array.from(p.takeShard());
+      const flat = p.takeMeshes();
+      refFlat = flat ? meshFingerprint(flat) : [];
+      if (flat) flat.free();
+    } finally {
+      p.free?.();
+    }
+  } finally {
+    api.clearPrePassCache();
+  }
+
+  // Candidate partitioned FromSource (source held once).
+  const pre = api.buildPrePassOnce(bytes);
+  let gotFlat, gotShard, gotOcc;
+  try {
+    api.setSourceBytes(bytes);
+    const p = api.processGeometryBatchPartitionedFromSource(
+      pre.jobs, pre.unitScale,
+      pre.rtcOffset[0], pre.rtcOffset[1], pre.rtcOffset[2], pre.needsShift,
+      pre.voidKeys, pre.voidCounts, pre.voidValues, pre.styleIds, pre.styleColors,
+      pre.planeAngleToRadians, pre.materialElementIds, pre.materialColorCounts, pre.materialColors,
+    );
+    try {
+      gotOcc = p.instancedOccurrences;
+      gotShard = Array.from(p.takeShard());
+      const flat = p.takeMeshes();
+      gotFlat = flat ? meshFingerprint(flat) : [];
+      if (flat) flat.free();
+    } finally {
+      p.free?.();
+    }
+  } finally {
+    api.clearPrePassCache();
+  }
+
+  assert.equal(gotOcc, refOcc, 'instanced occurrence count must match');
+  assert.deepEqual(gotShard, refShard, 'IFNS instancing shard bytes must be identical');
+  assert.deepEqual(gotFlat, refFlat, 'flat MeshCollection must be byte-identical');
+});
+
+test('processGeometryBatchFromSource returns empty when no source is installed (defensive)', () => {
+  const freshApi = new IfcAPI();
+  const bytes = new TextEncoder().encode(columnContent);
+  const pre = freshApi.buildPrePassOnce(bytes);
+  try {
+    // No setSourceBytes: the held bytes are empty → zero meshes, and crucially
+    // NO panic (the decoder validates every byte span). The JS worker gates the
+    // *FromSource path on a successful setSourceBytes, so this is unreachable in
+    // production, but it must degrade gracefully rather than corrupt/crash.
+    const col = freshApi.processGeometryBatchFromSource(
+      pre.jobs, pre.unitScale,
+      pre.rtcOffset[0], pre.rtcOffset[1], pre.rtcOffset[2], pre.needsShift,
+      pre.voidKeys, pre.voidCounts, pre.voidValues, pre.styleIds, pre.styleColors,
+    );
+    try {
+      assert.equal(col.length, 0, 'FromSource without setSourceBytes must produce no meshes');
+    } finally {
+      col.free();
+    }
+  } finally {
+    freshApi.clearPrePassCache();
+  }
+});
+
 // ===== Pre-pass contract (viewer boundary) =====
 // The TS GeometryProcessor (packages/geometry) destructures these exact
 // fields off buildPrePassOnce() and forwards them to processGeometryBatch.

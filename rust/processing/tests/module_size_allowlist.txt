@@ -97,6 +97,7 @@
      735 rust/wasm-bindings/src/api/gpu_meshes/prepass.rs
      436 rust/wasm-bindings/src/api/grid_lines.rs
 # +75: add the setReferencedRepmaps / setInstantiatedTypeIds / setMaterialLayerIndex wasm setters that install the pre-pass-computed per-content structures into the worker's IfcAPI (perf/single-scan #957/#563), mirroring setEntityIndex.
-     953 rust/wasm-bindings/src/api/mod.rs
+# +23: add the cached_source_bytes session field (doc + init + clearPrePassCache drop) for cold-load lever 1c (setSourceBytes); the setter + FromSource batch variants live in the new sub-400 gpu_meshes/batch_from_source.rs, not here (perf/coldload-setsourcebytes).
+     976 rust/wasm-bindings/src/api/mod.rs
      692 rust/wasm-bindings/src/zero_copy/mesh.rs
      743 rust/wasm-bindings/src/zero_copy/symbolic.rs

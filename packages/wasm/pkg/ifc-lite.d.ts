@@ -132,6 +132,34 @@ export class IfcAPI {
    */
   exportObj(content: Uint8Array, include_normals: boolean, hidden: Uint32Array, isolated: Uint32Array): Uint8Array;
   /**
+   * Store the whole IFC source file ONCE per load so the `*FromSource` batch
+   * variants can read it from the wasm heap instead of re-copying it per call.
+   *
+   * Mirrors the `setEntityIndex` lifecycle: called once per worker per load,
+   * and REPLACES the previous file wholesale (repeated calls swap the bytes),
+   * so a parser/geometry worker reusing one `IfcAPI` across loads is safe.
+   * The bytes must be the exact source the batch jobs' byte spans index into
+   * (the same buffer passed as `data` to the legacy `processGeometryBatch*`),
+   * or the decoded entities won't match — the JS worker installs its own
+   * session buffer, so this holds by construction.
+   *
+   * Taking `Vec<u8>` (by value) means wasm-bindgen hands us ownership of the
+   * single JS→wasm copy directly; we wrap it in `Arc` with no second copy.
+   */
+  setSourceBytes(data: Uint8Array): void;
+  /**
+   * Like [`IfcAPI::process_geometry_batch`] but reads the source bytes held by
+   * [`IfcAPI::set_source_bytes`] instead of taking `data`. Byte-for-byte
+   * identical output — it delegates to the legacy twin with the held slice.
+   */
+  processGeometryBatchFromSource(jobs_flat: Uint32Array, unit_scale: number, rtc_x: number, rtc_y: number, rtc_z: number, needs_shift: boolean, void_keys: Uint32Array, void_counts: Uint32Array, void_values: Uint32Array, style_ids: Uint32Array, style_colors: Uint8Array, plane_angle_to_radians?: number | null, material_element_ids?: Uint32Array | null, material_color_counts?: Uint32Array | null, material_colors_rgba?: Uint8Array | null): MeshCollection;
+  /**
+   * Like [`IfcAPI::process_geometry_batch_partitioned`] but reads the source
+   * bytes held by [`IfcAPI::set_source_bytes`] instead of taking `data`.
+   * Byte-for-byte identical output — it delegates to the legacy twin.
+   */
+  processGeometryBatchPartitionedFromSource(jobs_flat: Uint32Array, unit_scale: number, rtc_x: number, rtc_y: number, rtc_z: number, needs_shift: boolean, void_keys: Uint32Array, void_counts: Uint32Array, void_values: Uint32Array, style_ids: Uint32Array, style_colors: Uint8Array, plane_angle_to_radians?: number | null, material_element_ids?: Uint32Array | null, material_color_counts?: Uint32Array | null, material_colors_rgba?: Uint8Array | null): PartitionedBatch;
+  /**
    * Process geometry for a subset of pre-scanned entities → flat
    * MeshCollection. Takes raw bytes + pre-pass data from buildPrePassOnce.
    * Thin wrapper over [`IfcAPI::produce_batch`]; converts each produced mesh
@@ -1193,8 +1221,10 @@ export interface InitOutput {
   readonly ifcapi_parseGridLines: (a: number, b: number, c: number) => number;
   readonly ifcapi_parseSymbolicRepresentations: (a: number, b: number, c: number) => number;
   readonly ifcapi_processGeometryBatch: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number, v: number, w: number, x: number, y: number, z: number, a1: number, b1: number) => number;
+  readonly ifcapi_processGeometryBatchFromSource: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number, v: number, w: number, x: number, y: number, z: number) => number;
   readonly ifcapi_processGeometryBatchInstanced: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number, v: number, w: number, x: number, y: number, z: number, a1: number, b1: number, c1: number) => void;
   readonly ifcapi_processGeometryBatchPartitioned: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number, v: number, w: number, x: number, y: number, z: number, a1: number, b1: number) => number;
+  readonly ifcapi_processGeometryBatchPartitionedFromSource: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number, v: number, w: number, x: number, y: number, z: number) => number;
   readonly ifcapi_scanEntitiesFast: (a: number, b: number, c: number) => number;
   readonly ifcapi_scanEntitiesFastBytes: (a: number, b: number, c: number) => number;
   readonly ifcapi_scanGeometryEntitiesFast: (a: number, b: number, c: number) => number;
@@ -1206,6 +1236,7 @@ export interface InitOutput {
   readonly ifcapi_setRectParamFastPath: (a: number, b: number) => void;
   readonly ifcapi_setReferencedRepmaps: (a: number, b: number, c: number) => void;
   readonly ifcapi_setSkipSmallCuts: (a: number, b: number) => void;
+  readonly ifcapi_setSourceBytes: (a: number, b: number, c: number) => void;
   readonly ifcapi_setTessellationQuality: (a: number, b: number, c: number, d: number) => void;
   readonly ifcapi_version: (a: number, b: number) => void;
   readonly meshOutline2d: (a: number, b: number, c: number, d: number, e: number, f: number) => number;

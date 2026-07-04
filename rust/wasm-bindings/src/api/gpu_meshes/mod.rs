@@ -8,4 +8,5 @@
 //! and GPU-ready geometry generation.
 
 mod batch;
+mod batch_from_source;
 mod prepass;
