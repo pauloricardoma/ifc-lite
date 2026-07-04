@@ -191,15 +191,33 @@ pub(crate) fn build_referenced_representation_maps(
     decoder: &mut ifc_lite_core::EntityDecoder,
 ) -> rustc_hash::FxHashSet<u32> {
     use ifc_lite_core::EntityScanner;
-    let mut referenced: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
+    let mut spans: Vec<(u32, usize, usize)> = Vec::new();
     let mut scanner = EntityScanner::new(content);
     while let Some((id, type_name, start, end)) = scanner.next_entity() {
         if type_name == "IFCMAPPEDITEM" {
-            if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
-                // IfcMappedItem.MappingSource = attr 0 (the IfcRepresentationMap).
-                if let Some(source_id) = entity.get_ref(0) {
-                    referenced.insert(source_id);
-                }
+            spans.push((id, start, end));
+        }
+    }
+    build_referenced_representation_maps_from_spans(&spans, decoder)
+}
+
+/// Span-based twin of [`build_referenced_representation_maps`]. The streaming
+/// pre-pass already visits every `IfcMappedItem` during its single scan, so it
+/// stashes their spans and builds this set ONCE here (then ships it to the
+/// workers) instead of every worker re-walking the file on its first
+/// type-product job. Byte-identical to the scanner-based builder: it decodes
+/// the same spans (file order) and inserts the same `MappingSource` refs into a
+/// set, whose membership — the only thing consumers query — is order-invariant.
+pub(crate) fn build_referenced_representation_maps_from_spans(
+    spans: &[(u32, usize, usize)],
+    decoder: &mut ifc_lite_core::EntityDecoder,
+) -> rustc_hash::FxHashSet<u32> {
+    let mut referenced: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
+    for &(id, start, end) in spans {
+        if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
+            // IfcMappedItem.MappingSource = attr 0 (the IfcRepresentationMap).
+            if let Some(source_id) = entity.get_ref(0) {
+                referenced.insert(source_id);
             }
         }
     }
@@ -216,15 +234,30 @@ pub(crate) fn build_instantiated_type_ids(
     decoder: &mut ifc_lite_core::EntityDecoder,
 ) -> rustc_hash::FxHashSet<u32> {
     use ifc_lite_core::EntityScanner;
-    let mut instantiated: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
+    let mut spans: Vec<(u32, usize, usize)> = Vec::new();
     let mut scanner = EntityScanner::new(content);
     while let Some((id, type_name, start, end)) = scanner.next_entity() {
         if type_name == "IFCRELDEFINESBYTYPE" {
-            if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
-                // IfcRelDefinesByType.RelatingType = attr 5 (the typed product).
-                if let Some(type_id) = entity.get_ref(5) {
-                    instantiated.insert(type_id);
-                }
+            spans.push((id, start, end));
+        }
+    }
+    build_instantiated_type_ids_from_spans(&spans, decoder)
+}
+
+/// Span-based twin of [`build_instantiated_type_ids`]. Same hoisting rationale
+/// as [`build_referenced_representation_maps_from_spans`]: the streaming
+/// pre-pass stashes every `IfcRelDefinesByType` span during its single scan and
+/// builds this set once, byte-identically to the per-worker full-file walk.
+pub(crate) fn build_instantiated_type_ids_from_spans(
+    spans: &[(u32, usize, usize)],
+    decoder: &mut ifc_lite_core::EntityDecoder,
+) -> rustc_hash::FxHashSet<u32> {
+    let mut instantiated: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
+    for &(id, start, end) in spans {
+        if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
+            // IfcRelDefinesByType.RelatingType = attr 5 (the typed product).
+            if let Some(type_id) = entity.get_ref(5) {
+                instantiated.insert(type_id);
             }
         }
     }

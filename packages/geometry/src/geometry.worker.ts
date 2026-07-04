@@ -108,6 +108,33 @@ export interface GeometryWorkerSetEntityIndexMessage {
   lengths: Uint32Array;
 }
 
+/**
+ * Install the three per-content structures the streaming pre-pass computed
+ * ONCE, so this worker's first `processGeometryBatch` skips rebuilding them
+ * with its own full-file walk (issue #957 orphan/instanced type geometry +
+ * #563 material-layer slicing). Without this, every worker independently
+ * re-walks the whole 200-340 MB file on its first type-product / layered
+ * batch — N concurrent walks contending for memory bandwidth.
+ *
+ * `referencedRepmaps` and `instantiatedTypeIds` are id sets; the `mli*` arrays
+ * are the flat SoA encoding of the `MaterialLayerIndex` (see Rust
+ * `MaterialLayerFlat`). Applied AFTER `set-entity-index` (which clears these
+ * caches on content swap), so the injected values survive. Absent ⇒ the
+ * worker's lazy per-batch build (the byte-identical fallback) runs instead.
+ */
+export interface GeometryWorkerSetPrepassColumnsMessage {
+  type: 'set-prepass-columns';
+  referencedRepmaps: Uint32Array;
+  instantiatedTypeIds: Uint32Array;
+  mliElementIds: Uint32Array;
+  mliAxis: Uint32Array;
+  mliLayerCounts: Uint32Array;
+  mliDirectionSense: Float64Array;
+  mliOffset: Float64Array;
+  mliLayerMaterialIds: Uint32Array;
+  mliLayerThicknesses: Float64Array;
+}
+
 export interface GeometryWorkerPrePassMessage {
   type: 'prepass-streaming';
   sharedBuffer: SharedArrayBuffer;
@@ -188,6 +215,7 @@ export type GeometryWorkerRequest =
   | GeometryWorkerStreamEndMessage
   | GeometryWorkerSetStylesMessage
   | GeometryWorkerSetEntityIndexMessage
+  | GeometryWorkerSetPrepassColumnsMessage
   | GeometryWorkerSetMergeLayersMessage
   | GeometryWorkerSetInstancingMessage
   | GeometryWorkerSetComputeGeometryHashesMessage
@@ -301,6 +329,8 @@ async function ensureInit(): Promise<IfcAPI> {
   applySkipSmallCutsToApi();
   entityIndexApplied = false;
   applyEntityIndexToApi();
+  prepassColumnsApplied = false;
+  applyPrepassColumnsToApi();
   return api;
 }
 
@@ -329,6 +359,25 @@ type IfcAPIWithMerge = IfcAPI & {
   setComputeGeometryHashes?: (tolerance?: number | null) => void;
   setTessellationQuality?: (level?: string | null) => void;
   setSkipSmallCuts?: (on: boolean) => void;
+};
+
+/**
+ * Narrow wrapper for the pre-pass column setters (issue #957 / #563). Optional
+ * so a staged/older engine binary without them degrades to the byte-identical
+ * lazy per-worker rebuild instead of throwing.
+ */
+type IfcAPIWithPrepassColumns = IfcAPI & {
+  setReferencedRepmaps?: (ids: Uint32Array) => void;
+  setInstantiatedTypeIds?: (ids: Uint32Array) => void;
+  setMaterialLayerIndex?: (
+    elementIds: Uint32Array,
+    axis: Uint32Array,
+    layerCounts: Uint32Array,
+    directionSense: Float64Array,
+    offset: Float64Array,
+    layerMaterialIds: Uint32Array,
+    layerThicknesses: Float64Array,
+  ) => void;
 };
 
 /**
@@ -421,6 +470,46 @@ function applyEntityIndexToApi(): void {
   if (!ifcApi || entityIndexApplied || !cachedEntityIndex) return;
   ifcApi.setEntityIndex(cachedEntityIndex.ids, cachedEntityIndex.starts, cachedEntityIndex.lengths);
   entityIndexApplied = true;
+}
+
+/**
+ * Cached pre-pass columns (issue #957 / #563). Same replay contract as
+ * {@link cachedEntityIndex}: `setEntityIndex` CLEARS these three per-content
+ * caches on the IfcAPI (content-swap semantics), so they must be re-installed
+ * AFTER every entity-index apply — including the binary-split recovery re-init
+ * that rebuilds the IfcAPI. Without replay a recovery would drop the injected
+ * columns and the next batch would pay the O(file) rebuild the hoist removed.
+ */
+let cachedPrepassColumns: GeometryWorkerSetPrepassColumnsMessage | null = null;
+let prepassColumnsApplied: boolean = false;
+
+/**
+ * Push the cached pre-pass columns onto the IfcAPI (once per API). MUST run
+ * AFTER {@link applyEntityIndexToApi} — `setEntityIndex` clears these caches,
+ * so applying columns first would have them wiped by a later index apply.
+ */
+function applyPrepassColumnsToApi(): void {
+  const ifcApi = api as IfcAPIWithPrepassColumns | null;
+  if (!ifcApi || prepassColumnsApplied || !cachedPrepassColumns) return;
+  const c = cachedPrepassColumns;
+  if (typeof ifcApi.setReferencedRepmaps === 'function') {
+    ifcApi.setReferencedRepmaps(c.referencedRepmaps);
+  }
+  if (typeof ifcApi.setInstantiatedTypeIds === 'function') {
+    ifcApi.setInstantiatedTypeIds(c.instantiatedTypeIds);
+  }
+  if (typeof ifcApi.setMaterialLayerIndex === 'function') {
+    ifcApi.setMaterialLayerIndex(
+      c.mliElementIds,
+      c.mliAxis,
+      c.mliLayerCounts,
+      c.mliDirectionSense,
+      c.mliOffset,
+      c.mliLayerMaterialIds,
+      c.mliLayerThicknesses,
+    );
+  }
+  prepassColumnsApplied = true;
 }
 
 /**
@@ -976,6 +1065,8 @@ async function handleMessage(e: MessageEvent<GeometryWorkerRequest>): Promise<vo
         applySkipSmallCutsToApi();
         entityIndexApplied = false;
         applyEntityIndexToApi();
+        prepassColumnsApplied = false;
+        applyPrepassColumnsToApi();
       } else {
         await ensureInit();
       }
@@ -1048,6 +1139,24 @@ async function handleMessage(e: MessageEvent<GeometryWorkerRequest>): Promise<vo
       cachedEntityIndex = { ids: e.data.ids, starts: e.data.starts, lengths: e.data.lengths };
       entityIndexApplied = false;
       applyEntityIndexToApi();
+      // Re-install any already-cached columns: setEntityIndex just cleared them.
+      prepassColumnsApplied = false;
+      applyPrepassColumnsToApi();
+      return;
+    }
+
+    if (e.data.type === 'set-prepass-columns') {
+      // Install the three per-content structures the pre-pass computed once
+      // (issue #957 / #563) so this worker's first batch skips its own
+      // full-file rebuild. Cache-and-replay like set-entity-index so a
+      // recovery re-init re-installs them. Applied AFTER the entity index
+      // (whose setter clears these caches); the pre-pass emits this event
+      // after `entity-index`, and the worker handles messages FIFO, so the
+      // ordering holds. Absent setters (older engine) ⇒ lazy rebuild fallback.
+      await ensureInit();
+      cachedPrepassColumns = e.data;
+      prepassColumnsApplied = false;
+      applyPrepassColumnsToApi();
       return;
     }
 
@@ -1106,6 +1215,11 @@ async function handleMessage(e: MessageEvent<GeometryWorkerRequest>): Promise<vo
       // arrives. The next load re-populates via its own set-entity-index.
       cachedEntityIndex = null;
       entityIndexApplied = false;
+      // Same rationale for the per-content pre-pass columns: drop them so a
+      // reused worker cannot replay a previous load's referenced-repmaps /
+      // material-layer index. The next load re-populates via set-prepass-columns.
+      cachedPrepassColumns = null;
+      prepassColumnsApplied = false;
       return;
     }
   } catch (err) {

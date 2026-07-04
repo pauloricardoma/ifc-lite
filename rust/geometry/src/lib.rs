@@ -141,7 +141,9 @@ pub use instancing::{
     DecodedTemplate, InstanceMeshRef, InstanceOccurrence, InstanceTemplate, INSTANCED_MAGIC,
     INSTANCED_VERSION,
 };
-pub use material_layer_index::{LayerAxis, LayerBuildup, LayerInfo, MaterialLayerIndex};
+pub use material_layer_index::{
+    LayerAxis, LayerBuildup, LayerInfo, MaterialLayerFlat, MaterialLayerIndex,
+};
 pub use mesh::{InstanceMeta, Mesh, SubMesh, SubMeshCollection};
 pub use mesh_orient::orient_mesh_outward;
 pub use processors::{

@@ -45,6 +45,8 @@
      904 rust/geometry/src/kernel/mesh_bridge.rs
      700 rust/geometry/src/kernel/predicates.rs
     1261 rust/geometry/src/kernel/retriangulate.rs
+# new row: adds from_spans (build the index from pre-collected IfcRelAssociatesMaterial spans, no re-walk) + the MaterialLayerFlat wire codec (to_flat/from_flat) + round-trip tests, so the streaming pre-pass ships the index to workers once instead of each worker re-scanning the file (perf/single-scan #563).
+     563 rust/geometry/src/material_layer_index.rs
     1529 rust/geometry/src/mesh.rs
      919 rust/geometry/src/processors/boolean/mod.rs
      486 rust/geometry/src/processors/brep/faceted.rs
@@ -65,7 +67,6 @@
     1072 rust/geometry/src/router/processing.rs
 # +26: is_rtc_votable_representation predicate + doc — Surface3D is meshable but must NOT cast RTC votes (#1526 pollution via absolute-coord surfaces).
      472 rust/geometry/src/router/rtc_offset.rs
-     497 rust/geometry/src/router/voids_2d.rs
 # +1: reveal-quads comment expanded to 2 lines (dead-symbol reference fix, no code change).
      619 rust/geometry/src/router/voids/aabb_clip.rs
      871 rust/geometry/src/router/voids/geom.rs
@@ -92,8 +93,10 @@
      440 rust/processing/src/symbolic/items.rs
 # +6: wire per-batch point-cache hit/miss stats into record_pipeline_batch (perf/brep-point-cache-instrumentation).
      773 rust/wasm-bindings/src/api/gpu_meshes/batch.rs
-     627 rust/wasm-bindings/src/api/gpu_meshes/prepass.rs
+# +108: build the referenced-repmaps + instantiated-type-id sets and the material-layer index ONCE in the streaming pre-pass (from spans this scan already collected) and emit them as a `prepass-columns` event, so every geometry worker skips its own full-file walk on the first batch (perf/single-scan #957/#563).
+     735 rust/wasm-bindings/src/api/gpu_meshes/prepass.rs
      436 rust/wasm-bindings/src/api/grid_lines.rs
-     878 rust/wasm-bindings/src/api/mod.rs
+# +75: add the setReferencedRepmaps / setInstantiatedTypeIds / setMaterialLayerIndex wasm setters that install the pre-pass-computed per-content structures into the worker's IfcAPI (perf/single-scan #957/#563), mirroring setEntityIndex.
+     953 rust/wasm-bindings/src/api/mod.rs
      692 rust/wasm-bindings/src/zero_copy/mesh.rs
      743 rust/wasm-bindings/src/zero_copy/symbolic.rs

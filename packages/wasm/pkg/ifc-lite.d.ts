@@ -379,6 +379,36 @@ export class IfcAPI {
    */
   clearPrePassCache(): void;
   /**
+   * Install the pre-computed set of `IfcRepresentationMap` ids referenced by
+   * an `IfcMappedItem` (issue #957), so the worker's first type-product batch
+   * SKIPS the per-worker [`Self::get_or_build_referenced_repmaps`] full-file
+   * walk. The streaming pre-pass built the same set once from the
+   * `IfcMappedItem` spans it already scanned (see
+   * `styling::build_referenced_representation_maps_from_spans`) and ships the
+   * id list here — bit-identical to what each worker would compute, since a
+   * set's membership is order-invariant and consumers only call `.contains`.
+   *
+   * Installed AFTER `setEntityIndex` (which clears this cache on content
+   * swap), so the injected value survives. When this setter is never called
+   * (native path, non-streaming callers), the lazy build path is unchanged.
+   */
+  setReferencedRepmaps(ids: Uint32Array): void;
+  /**
+   * Install the pre-computed [`ifc_lite_geometry::MaterialLayerIndex`] (#563)
+   * from its flat SoA encoding, so the worker's first batch skips the
+   * per-worker [`Self::get_or_build_material_layer_index`] full-file decode
+   * scan (the dominant first-batch cost on layered architectural models,
+   * which run this on the DEFAULT view). The streaming pre-pass built the
+   * index once from the `IfcRelAssociatesMaterial` spans it already scanned
+   * (`MaterialLayerIndex::from_spans`) and flat-encoded it here; the flat
+   * encoding round-trips bit-for-bit (proven in `material_layer_index` tests),
+   * so the injected index equals each worker's `from_content` result.
+   *
+   * Same injection contract as [`Self::set_referenced_repmaps`]: installed
+   * after `setEntityIndex`, and a no-op absence leaves the lazy build intact.
+   */
+  setMaterialLayerIndex(element_ids: Uint32Array, axis: Uint32Array, layer_counts: Uint32Array, direction_sense: Float64Array, offset: Float64Array, layer_material_ids: Uint32Array, layer_thicknesses: Float64Array): void;
+  /**
    * Enable or disable the PARAMETRIC rectangular-opening fast path (the
    * placement-frame, ground-truth-exact analytic cut) for `processGeometryBatch`.
    *
@@ -407,6 +437,13 @@ export class IfcAPI {
    * silently rendering at the wrong density.
    */
   setTessellationQuality(level?: string | null): void;
+  /**
+   * Install the pre-computed set of type ids that an `IfcRelDefinesByType`
+   * instantiates (#957 follow-up), so the worker's first type-product batch
+   * skips the per-worker [`Self::get_or_build_instantiated_type_ids`]
+   * full-file walk. Same injection contract as [`Self::set_referenced_repmaps`].
+   */
+  setInstantiatedTypeIds(ids: Uint32Array): void;
   /**
    * Enable or disable per-entity geometry fingerprinting in
    * `processGeometryBatch`, used by the viewer's revision-diff feature.
@@ -1163,8 +1200,11 @@ export interface InitOutput {
   readonly ifcapi_scanGeometryEntitiesFast: (a: number, b: number, c: number) => number;
   readonly ifcapi_setComputeGeometryHashes: (a: number, b: number, c: number) => void;
   readonly ifcapi_setEntityIndex: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+  readonly ifcapi_setInstantiatedTypeIds: (a: number, b: number, c: number) => void;
+  readonly ifcapi_setMaterialLayerIndex: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number) => void;
   readonly ifcapi_setMergeLayers: (a: number, b: number) => void;
   readonly ifcapi_setRectParamFastPath: (a: number, b: number) => void;
+  readonly ifcapi_setReferencedRepmaps: (a: number, b: number, c: number) => void;
   readonly ifcapi_setSkipSmallCuts: (a: number, b: number) => void;
   readonly ifcapi_setTessellationQuality: (a: number, b: number, c: number, d: number) => void;
   readonly ifcapi_version: (a: number, b: number) => void;

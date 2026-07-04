@@ -231,6 +231,21 @@ impl IfcAPI {
         let mut project_id: Option<u32> = None;
         let mut site_position: Option<(u32, usize, usize)> = None;
         let mut meta_emitted = false;
+
+        // #957 / #563 single-scan hoist: the workers each re-walk the whole file
+        // on their first batch to rebuild these three per-content structures
+        // (referenced RepresentationMaps, instantiated type ids, the material-
+        // layer index). Collect the spans they need HERE, during the one scan the
+        // pre-pass already runs, then build + ship each ONCE below so every
+        // worker skips its own full-file walk. `rel_associates_material` spans are
+        // already stashed in `prepass_spans`.
+        let mut mapped_item_spans: Vec<(u32, usize, usize)> = Vec::new();
+        let mut rel_defines_by_type_spans: Vec<(u32, usize, usize)> = Vec::new();
+        // Mirror `get_or_build_material_layer_index`'s `IFCMATERIALLAYERSET`
+        // substring gate exactly, but detect it from the scan (a layer-set
+        // keyword only appears as an entity type) so we never re-scan the file:
+        // an `IfcMaterialLayerSet`/`...Usage` entity is present iff the gate fires.
+        let mut has_layer_set = false;
         // Plane-angle scale, resolved with the meta by the shared resolver and
         // carried on the meta event so workers seed their batch decoders.
         let mut plane_angle_to_radians = 1.0f64;
@@ -320,6 +335,15 @@ impl IfcAPI {
                 }
                 "IFCRELAGGREGATES" => {
                     prepass_spans.aggregate_rels.push((id, start, end));
+                }
+                "IFCMAPPEDITEM" => {
+                    mapped_item_spans.push((id, start, end));
+                }
+                "IFCRELDEFINESBYTYPE" => {
+                    rel_defines_by_type_spans.push((id, start, end));
+                }
+                "IFCMATERIALLAYERSET" | "IFCMATERIALLAYERSETUSAGE" => {
+                    has_layer_set = true;
                 }
                 _ => {
                     if has_geometry_by_name(type_name) && !disabled_types.contains(type_name) {
@@ -524,6 +548,90 @@ impl IfcAPI {
             &js_sys::Uint8Array::from(mat_colors_vec.as_slice()),
         );
         on_event.call1(&JsValue::NULL, &styles_event.into())?;
+
+        // (B2) Pre-pass columns — the three per-content structures each geometry
+        // worker would otherwise rebuild with its OWN full-file walk on its first
+        // batch (issue #957 orphan/instanced type geometry + #563 material-layer
+        // slicing). Built ONCE here from spans this scan already collected, then
+        // installed on every worker via `set{ReferencedRepmaps,InstantiatedTypeIds,
+        // MaterialLayerIndex}`. Emitted BEFORE the first jobs chunk (below) and
+        // workers apply messages FIFO, so the injected data is always in place
+        // before any `processGeometryBatch` — the lazy per-worker build (the
+        // byte-identical fallback) never fires on the streaming path.
+        let referenced_repmaps =
+            crate::api::styling::build_referenced_representation_maps_from_spans(
+                &mapped_item_spans,
+                &mut decoder,
+            );
+        let instantiated_type_ids =
+            crate::api::styling::build_instantiated_type_ids_from_spans(
+                &rel_defines_by_type_spans,
+                &mut decoder,
+            );
+        // Gate on `has_layer_set` to stay bit-identical to
+        // `get_or_build_material_layer_index`, which ships an EMPTY index when the
+        // file authors no layer set (its substring bail-out). from_spans reuses
+        // the already-stashed IfcRelAssociatesMaterial spans — no extra walk.
+        let material_layer_flat = if has_layer_set {
+            ifc_lite_geometry::MaterialLayerIndex::from_spans(
+                &prepass_spans.rel_associates_material,
+                &mut decoder,
+            )
+            .to_flat()
+        } else {
+            ifc_lite_geometry::MaterialLayerFlat::default()
+        };
+
+        let repmaps_arr: Vec<u32> = referenced_repmaps.into_iter().collect();
+        let type_ids_arr: Vec<u32> = instantiated_type_ids.into_iter().collect();
+        let columns_event = js_sys::Object::new();
+        crate::api::set_js_prop(&columns_event, "type", &"prepass-columns".into());
+        crate::api::set_js_prop(
+            &columns_event,
+            "referencedRepmaps",
+            &js_sys::Uint32Array::from(repmaps_arr.as_slice()),
+        );
+        crate::api::set_js_prop(
+            &columns_event,
+            "instantiatedTypeIds",
+            &js_sys::Uint32Array::from(type_ids_arr.as_slice()),
+        );
+        crate::api::set_js_prop(
+            &columns_event,
+            "mliElementIds",
+            &js_sys::Uint32Array::from(material_layer_flat.element_ids.as_slice()),
+        );
+        crate::api::set_js_prop(
+            &columns_event,
+            "mliAxis",
+            &js_sys::Uint32Array::from(material_layer_flat.axis.as_slice()),
+        );
+        crate::api::set_js_prop(
+            &columns_event,
+            "mliLayerCounts",
+            &js_sys::Uint32Array::from(material_layer_flat.layer_counts.as_slice()),
+        );
+        crate::api::set_js_prop(
+            &columns_event,
+            "mliDirectionSense",
+            &js_sys::Float64Array::from(&material_layer_flat.direction_sense[..]),
+        );
+        crate::api::set_js_prop(
+            &columns_event,
+            "mliOffset",
+            &js_sys::Float64Array::from(&material_layer_flat.offset[..]),
+        );
+        crate::api::set_js_prop(
+            &columns_event,
+            "mliLayerMaterialIds",
+            &js_sys::Uint32Array::from(material_layer_flat.layer_material_ids.as_slice()),
+        );
+        crate::api::set_js_prop(
+            &columns_event,
+            "mliLayerThicknesses",
+            &js_sys::Float64Array::from(&material_layer_flat.layer_thicknesses[..]),
+        );
+        on_event.call1(&JsValue::NULL, &columns_event.into())?;
 
         // (C) First wave — a small chunk routed by element id (no affinity hash)
         // so workers get a quick, cheap first batch the instant the gate opens.
