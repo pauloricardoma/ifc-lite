@@ -388,13 +388,27 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
   );
 
   /**
-   * Derive `<Header>` source files for a topic: one per distinct model its
-   * viewpoint components reference. Falls back to the single loaded model when
-   * no components resolve, so a lone-model topic still records its source file.
+   * Derive `<Header>` source files for a topic: one per distinct model it
+   * references. Falls back to the single loaded model when nothing resolves, so
+   * a lone-model topic still records its source file.
    */
   const headerFilesForViewpoints = useCallback(
     (viewpoints: readonly BCFViewpoint[], date?: string): BCFHeaderFile[] => {
       const modelIds = new Set<string>();
+
+      // Primary source: the live selection's model ids. A topic is created from
+      // the current selection, and the selection knows each element's model
+      // exactly. Resolving component GlobalIds instead would lose a model whose
+      // elements share GlobalIds with another loaded model (revision
+      // federations), collapsing every component onto the first match.
+      const selected = useViewerStore.getState().selectedEntitiesSet;
+      for (const key of selected) {
+        const modelId = key.slice(0, key.indexOf(':'));
+        if (modelId) modelIds.add(modelId);
+      }
+
+      // Also union any model referenced by the viewpoint components but not the
+      // live selection (e.g. hidden/coloured components, or a restored viewpoint).
       for (const vp of viewpoints) {
         const components: { ifcGuid?: string }[] = [
           ...(vp.components?.selection ?? []),
@@ -408,8 +422,8 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
         }
       }
 
-      // No component resolved to a model: record the single loaded model so a
-      // lone-model topic still carries its provenance.
+      // Nothing resolved: record the single loaded model so a lone-model topic
+      // still carries its provenance.
       if (modelIds.size === 0) {
         if (models.size === 1) {
           modelIds.add(models.keys().next().value!);
