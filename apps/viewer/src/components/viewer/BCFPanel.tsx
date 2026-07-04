@@ -92,7 +92,7 @@ export function BCFPanel({ onClose }: BCFPanelProps) {
   const models = useViewerStore((s) => s.models);
 
   // BCF hook for camera/snapshot integration
-  const { createViewpointFromState, applyViewpoint, zoomToTopic, canZoomToTopic } = useBCF();
+  const { createViewpointFromState, headerFilesForViewpoints, applyViewpoint, zoomToTopic, canZoomToTopic } = useBCF();
 
   // Local state
   const [statusFilter, setStatusFilter] = useState('all');
@@ -244,6 +244,16 @@ export function BCFPanel({ onClose }: BCFPanelProps) {
   const handleCreateTopic = useCallback(
     async (data: Partial<BCFTopic>, options?: { includeSnapshot: boolean }) => {
       ensureProject();
+      // Resolve the viewpoint first so the topic's source-file Header can be
+      // derived from the models its selection references before it is stored.
+      let viewpoint = options?.includeSnapshot === false ? null : createViewpoint;
+      if (options?.includeSnapshot !== false && !viewpoint) {
+        viewpoint = await createViewpointFromState({
+          includeSnapshot: true,
+          includeSelection: true,
+          includeHidden: true,
+        });
+      }
       const topic = createBCFTopic({
         title: data.title || 'Untitled',
         description: data.description,
@@ -255,17 +265,10 @@ export function BCFPanel({ onClose }: BCFPanelProps) {
         dueDate: data.dueDate,
         labels: data.labels,
       });
+      // Record the distinct source model(s) this topic touches (#1591 federation).
+      const header = headerFilesForViewpoints(viewpoint ? [viewpoint] : [], topic.creationDate);
+      if (header.length > 0) topic.header = header;
       addTopic(topic);
-      // Attach the previewed viewpoint unless opted out; fall back to a fresh
-      // capture if the preview never resolved.
-      let viewpoint = options?.includeSnapshot === false ? null : createViewpoint;
-      if (options?.includeSnapshot !== false && !viewpoint) {
-        viewpoint = await createViewpointFromState({
-          includeSnapshot: true,
-          includeSelection: true,
-          includeHidden: true,
-        });
-      }
       if (viewpoint) addViewpoint(topic.guid, viewpoint);
       posthog.capture('bcf_topic_created', {
         topic_type: topic.topicType,
@@ -275,7 +278,7 @@ export function BCFPanel({ onClose }: BCFPanelProps) {
       });
       setShowCreateForm(false);
     },
-    [ensureProject, bcfAuthor, addTopic, addViewpoint, createViewpoint, createViewpointFromState]
+    [ensureProject, bcfAuthor, addTopic, addViewpoint, createViewpoint, createViewpointFromState, headerFilesForViewpoints]
   );
 
   // Add comment to topic (optionally associated with a viewpoint)

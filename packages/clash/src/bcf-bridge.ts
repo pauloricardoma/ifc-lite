@@ -27,6 +27,7 @@ import {
   toARGBColor,
   type BCFProject,
   type BCFTopic,
+  type BCFHeaderFile,
   type ViewerCameraState,
   type ViewerBounds,
 } from '@ifc-lite/bcf';
@@ -224,6 +225,27 @@ function buildDescription(
   return lines.join('\n');
 }
 
+/**
+ * Derive the BCF `<Header>` source files for a clash group: one entry per
+ * distinct source model its members reference (#1591 federation provenance).
+ *
+ * A clash is cross-model by nature, so a group typically touches two models.
+ * The clash package sees only the model display name (`ClashElementRef.model`),
+ * not the IfcProject GlobalId, so `ifcProject` is left empty (acceptable per
+ * the BCF schema). `filename`/`reference` carry the model name.
+ */
+function headerFilesForGroup(group: ClashGroup, date: string): BCFHeaderFile[] {
+  const names = unique(
+    group.members.flatMap((m) => [m.a.model, m.b.model]).filter((n): n is string => Boolean(n)),
+  );
+  return names.map((name) => ({
+    isExternal: true,
+    filename: name,
+    date,
+    reference: name,
+  }));
+}
+
 /** Build the topic + framing viewpoint for one group. */
 async function buildTopicForGroup(
   project: BCFProject,
@@ -253,6 +275,10 @@ async function buildTopicForGroup(
   });
   // Deterministic guid: stable function of the group id (input-only).
   topic.guid = uuidFromSeed(group.id);
+  // Record the source model(s) this clash spans so the topic round-trips its
+  // provenance across a federation.
+  const header = headerFilesForGroup(group, topic.creationDate);
+  if (header.length > 0) topic.header = header;
 
   const selectedGuids = unique(group.members.flatMap((m) => [m.a.key, m.b.key]));
   const coloredGuids = [

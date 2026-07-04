@@ -29,6 +29,7 @@ import type {
   BCFExtensions,
   BCFDocumentReference,
   BCFBimSnippet,
+  BCFHeaderFile,
 } from './types.js';
 
 /**
@@ -161,6 +162,10 @@ async function readTopic(zip: JSZip, topicFolder: string): Promise<BCFTopic | nu
   const guid = topicMatch[1];
   const topicContent = topicMatch[2];
 
+  // Header (source IFC files) sits before Topic in the markup, so parse it from
+  // the whole document rather than the Topic body.
+  const header = parseHeaderFiles(markupContent);
+
   // Extract topic attributes
   const topicTypeMatch = markupContent.match(/<Topic[^>]*TopicType="([^"]+)"/);
   const topicStatusMatch = markupContent.match(/<Topic[^>]*TopicStatus="([^"]+)"/);
@@ -225,7 +230,44 @@ async function readTopic(zip: JSZip, topicFolder: string): Promise<BCFTopic | nu
     relatedTopics: relatedTopics.length > 0 ? relatedTopics : undefined,
     comments,
     viewpoints,
+    header: header.length > 0 ? header : undefined,
   };
+}
+
+/**
+ * Parse the markup `<Header>` block into source-file references.
+ *
+ * Tolerant of both BCF versions: 2.1 nests `<File>` directly under `<Header>`
+ * and 3.0 wraps them in `<Files>`, so we match every `<File>` inside the header
+ * regardless of the wrapper.
+ */
+function parseHeaderFiles(markupContent: string): BCFHeaderFile[] {
+  const headerMatch = markupContent.match(/<Header>([\s\S]*?)<\/Header>/);
+  if (!headerMatch) return [];
+
+  const files: BCFHeaderFile[] = [];
+  const fileMatches = headerMatch[1].matchAll(/<File\b([^>]*?)(?:\/>|>([\s\S]*?)<\/File>)/g);
+  for (const match of fileMatches) {
+    const attrs = match[1] ?? '';
+    const body = match[2] ?? '';
+
+    const ifcProject = attrs.match(/IfcProject="([^"]*)"/)?.[1];
+    const ifcSpatial = attrs.match(/IfcSpatialStructureElement="([^"]*)"/)?.[1];
+    // BCF 2.1 spells this `isExternal`, 3.0 `IsExternal`; accept either casing
+    // (and the xs:boolean `1`/`0` forms a foreign tool may emit).
+    const isExternalRaw = attrs.match(/\b[Ii]sExternal="([^"]*)"/)?.[1];
+
+    files.push({
+      ifcProject: ifcProject || undefined,
+      ifcSpatialStructureElement: ifcSpatial || undefined,
+      isExternal: isExternalRaw === undefined ? undefined : (isExternalRaw === 'true' || isExternalRaw === '1'),
+      filename: extractElement(body, 'Filename'),
+      date: extractElement(body, 'Date'),
+      reference: extractElement(body, 'Reference'),
+    });
+  }
+
+  return files;
 }
 
 /**

@@ -417,6 +417,44 @@ describe('BCF round-trip', () => {
     expect(map.get('clash-1')?.[0]?.topicGuid).toBe(uuidFromSeed('group-critical'));
     expect(map.get('clash-3')?.[0]?.topicGuid).toBe(uuidFromSeed('group-major'));
   });
+
+  // Federation provenance (#1591): a cross-model clash topic must record one
+  // <Header> source file per distinct model it spans, surviving write -> read.
+  it('records header source files for every model a clash group spans', async () => {
+    const a: ClashElementRef = { key: 'GUID_A', ref: 1, model: 'architecture.ifc', tag: 'IfcWall' };
+    const b: ClashElementRef = { key: 'GUID_B', ref: 2, model: 'structure.ifc', tag: 'IfcBeam' };
+    const c = clash('cross-model-1', a, b, 'hard', 'critical', 'ARCxSTR');
+    const group = makeGroup('cross-model', 'critical', [c]);
+    const result: ClashResult = {
+      clashes: [c],
+      summary: {
+        total: 1,
+        byRule: { ARCxSTR: 1 },
+        byTypePair: {},
+        bySeverity: { critical: 1, major: 0, minor: 0, info: 0 },
+      },
+      rulesRun: [],
+      settings: { tolerance: 0.002, excludeVoidsAndHosts: true },
+    };
+
+    const project = await createBCFFromClashResult(result, [group], { author: 'tester' });
+    const topic = project.topics.get(uuidFromSeed('cross-model'));
+    expect(topic?.header).toBeDefined();
+    expect(topic?.header?.map((h) => h.filename).sort()).toEqual([
+      'architecture.ifc',
+      'structure.ifc',
+    ]);
+
+    // The header must survive a real write -> read round-trip.
+    const { writeBCF } = await import('@ifc-lite/bcf');
+    const blob = await writeBCF(project);
+    const readBack = await readBCF(await blob.arrayBuffer());
+    const readTopic = readBack.topics.get(uuidFromSeed('cross-model'));
+    expect(readTopic?.header?.map((h) => h.filename).sort()).toEqual([
+      'architecture.ifc',
+      'structure.ifc',
+    ]);
+  });
 });
 
 describe('uuidFromSeed', () => {
