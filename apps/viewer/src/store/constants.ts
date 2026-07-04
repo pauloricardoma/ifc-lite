@@ -116,6 +116,9 @@ function getInitialMergeLayers(): boolean {
 export const GEOM_WORKERS_STORAGE_KEY = 'ifc-lite-geom-workers';
 export const GEOM_TIER_STORAGE_KEY = 'ifc-lite-geom-tier';
 
+/** localStorage key for the source-decoupled mesh-only cache prototype flag. */
+export const MESH_ONLY_CACHE_STORAGE_KEY = 'ifc-lite-mesh-cache';
+
 // Auto-low tessellation density for heavy models. The on-screen load already
 // skips tiny detail boolean cuts on every load (#1286), which removes the
 // exact-tier escalations that dominate boolean-heavy steel; this is the
@@ -236,6 +239,38 @@ export function getGeomTierOverride(): TessellationQuality | undefined {
     console.warn('[geom-tier] override read failed; using heuristic', err);
   }
   return undefined;
+}
+
+/**
+ * Is the source-decoupled mesh-only cache tier enabled? Prototype flag (bet B):
+ * caches tables + geometry + instanced shards WITHOUT the source buffer for
+ * large (150-400MB) files so REPEAT opens skip the 10-90s parse+mesh. Mirrors
+ * `getGeomWorkerOverride`: `?meshCache=1` enables AND persists to localStorage
+ * (survives the reload that a re-measure needs, and a shared link carries it);
+ * `?meshCache=0` clears it. Default OFF — the <=150MB source-persisting tier is
+ * unaffected either way (it never consults this flag).
+ */
+export function isMeshOnlyCacheEnabled(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    const param = new URLSearchParams(window.location.search).get('meshCache');
+    if (param != null) {
+      if (param === '1' || param === 'true' || param === 'on') {
+        localStorage.setItem(MESH_ONLY_CACHE_STORAGE_KEY, '1');
+        return true;
+      }
+      if (param === '0' || param === 'false' || param === 'off') {
+        localStorage.removeItem(MESH_ONLY_CACHE_STORAGE_KEY);
+        return false;
+      }
+    }
+    return localStorage.getItem(MESH_ONLY_CACHE_STORAGE_KEY) === '1';
+  } catch (err) {
+    // Blocked/unavailable storage (Safari private mode) — treat as disabled,
+    // but don't swallow silently (AGENTS.md: no silent catch).
+    console.warn('[mesh-cache] flag read failed; treating as disabled', err);
+    return false;
+  }
 }
 
 /**

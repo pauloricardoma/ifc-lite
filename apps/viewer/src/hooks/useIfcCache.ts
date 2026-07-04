@@ -14,6 +14,7 @@ import {
   BinaryCacheWriter,
   BinaryCacheReader,
   SchemaVersion,
+  xxhash64,
   type CachedEntityIndexColumns,
   type CacheDataStore,
   type GeometryData,
@@ -180,6 +181,28 @@ export function useIfcCache() {
       setGeometryResult(null);
 
       const reader = new BinaryCacheReader();
+
+      // Source-decoupled (mesh-only) tier validation: when the entry persisted NO
+      // source buffer but the caller handed us the freshly read file bytes, verify
+      // the cache header's full-source xxhash64 against that fresh buffer. This
+      // upgrades the weak 4KB fingerprint cache key to full-content validation, so
+      // a fingerprint+size collision (a DIFFERENT file keyed the same) can never
+      // serve stale geometry. On mismatch we throw → the catch below deletes the
+      // entry and returns success:false, and the loader falls back to a normal
+      // parse (a validated miss, not a crash). The classic source-persisting tier
+      // keeps its exact prior behaviour (this branch is skipped when a source was
+      // persisted).
+      if (!cacheResult.sourceBuffer && fallbackSourceBuffer) {
+        const header = reader.readHeader(cacheResult.buffer);
+        const freshHash = xxhash64(new Uint8Array(fallbackSourceBuffer));
+        if (header.sourceHash !== freshHash) {
+          throw new Error(
+            `mesh-only cache validation failed for ${fileName}: source hash mismatch ` +
+            `(header ${header.sourceHash.toString(16)} vs fresh ${freshHash.toString(16)})`,
+          );
+        }
+      }
+
       const result = await reader.read(cacheResult.buffer);
       const cacheReadTime = performance.now() - cacheLoadStart;
 
@@ -349,10 +372,19 @@ export function useIfcCache() {
     dataStore: IfcDataStore,
     geometry: GeometryData,
     sourceBuffer: ArrayBuffer,
-    fileName: string
+    fileName: string,
+    options: { persistSource?: boolean } = {}
   ): Promise<void> => {
+    // `persistSource` (default true) is the classic <=150MB tier: the raw source
+    // is stored alongside the cache so lazy property/quantity accessors + re-export
+    // read it from IndexedDB. The mesh-only tier (150-400MB, prototype) passes
+    // false: the source is too big to persist, so it is omitted from IndexedDB and
+    // rehydrated from the freshly read buffer on re-open. The cache buffer ALWAYS
+    // embeds xxhash64(source) in its header (the writer computes it from
+    // `sourceBuffer` regardless), so a mesh-only hit stays validatable on load.
+    const { persistSource = true } = options;
     try {
-      console.log('[useIfcCache] Starting cache write for:', fileName);
+      console.log(`[useIfcCache] Starting cache write for: ${fileName} (persistSource=${persistSource})`);
       const writer = new BinaryCacheWriter();
 
       // Adapt dataStore to cache format
@@ -373,8 +405,14 @@ export function useIfcCache() {
       console.log('[useIfcCache] Cache buffer written:', cacheBuffer.byteLength, 'bytes');
 
       console.log('[useIfcCache] Saving to cache storage...');
-      await setCached(cacheKey, cacheBuffer, fileName, sourceBuffer.byteLength, sourceBuffer);
-      console.log('[useIfcCache] ✓ Cache saved successfully');
+      await setCached(
+        cacheKey,
+        cacheBuffer,
+        fileName,
+        sourceBuffer.byteLength,
+        persistSource ? sourceBuffer : undefined,
+      );
+      console.log(`[useIfcCache] ✓ Cache saved successfully (${persistSource ? 'with' : 'without'} source)`);
     } catch (err) {
       console.error('[useIfcCache] Failed to cache model:', err);
       console.error('[useIfcCache] Error stack:', err instanceof Error ? err.stack : 'No stack trace');

@@ -46,6 +46,21 @@ export const CACHE_SIZE_THRESHOLD = 10 * 1024 * 1024;
  *  and including it would make the IndexedDB write prohibitively large. */
 export const CACHE_MAX_SOURCE_SIZE = 150 * 1024 * 1024;
 
+/** Maximum file size eligible for the SOURCE-DECOUPLED "mesh-only" cache tier
+ *  (400MB, prototype behind the `?meshCache=1` flag — see `isMeshOnlyCacheEnabled`).
+ *
+ *  Files in (CACHE_MAX_SOURCE_SIZE, CACHE_MESH_ONLY_MAX_SIZE] are too big to
+ *  persist their source buffer in IndexedDB, but their tables + entityIndex +
+ *  geometry + instanced shards CAN be cached without it. On re-open the freshly
+ *  read file buffer hydrates the lazy property/quantity/export accessors (exactly
+ *  the `fallbackSourceBuffer` path `loadFromCache` already supports), so repeat
+ *  opens skip the 10-90s parse+mesh while keeping full feature fidelity.
+ *
+ *  The cache buffer still embeds `xxhash64(fullSource)` in its header, so the
+ *  hit is validated against the fresh buffer on load (see `loadFromCache`),
+ *  upgrading the weak 4KB fingerprint key to full-content validation. */
+export const CACHE_MESH_ONLY_MAX_SIZE = 400 * 1024 * 1024;
+
 /**
  * File size at which the browser-File-API entry path streams directly into a
  * `SharedArrayBuffer` instead of going through `await file.arrayBuffer()`.

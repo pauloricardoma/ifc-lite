@@ -14,7 +14,8 @@ import { useCallback, useRef } from 'react';
 import { flushSync } from 'react-dom';
 import { useShallow } from 'zustand/react/shallow';
 import { getViewerStoreApi, useViewerStore, type FederatedModel } from '@/store';
-import { getGeomWorkerOverride, resolveLoadTessellationTier } from '../store/constants.js';
+import { getGeomWorkerOverride, resolveLoadTessellationTier, isMeshOnlyCacheEnabled } from '../store/constants.js';
+import { classifyCacheTier } from './cacheTier.js';
 import { IfcParser, detectFormat, unwrapIfcZip, type IfcDataStore } from '@ifc-lite/parser';
 import { WorkerParser } from '@ifc-lite/parser/browser';
 import { memoryAccounting } from '../lib/perf/memoryAccounting.js';
@@ -31,7 +32,7 @@ import { buildSpatialIndexGuarded, buildSpatialIndexForModel } from '../utils/lo
 import { buildGeometryCacheKey } from './geometryCacheKey.js';
 import { type GeometryData } from '@ifc-lite/cache';
 
-import { SERVER_URL, USE_SERVER, CACHE_SIZE_THRESHOLD, CACHE_MAX_SOURCE_SIZE, getDynamicBatchConfig } from '../utils/ifcConfig.js';
+import { SERVER_URL, USE_SERVER, CACHE_SIZE_THRESHOLD, CACHE_MAX_SOURCE_SIZE, CACHE_MESH_ONLY_MAX_SIZE, getDynamicBatchConfig } from '../utils/ifcConfig.js';
 import {
   calculateMeshBounds,
   createCoordinateInfo,
@@ -1267,14 +1268,23 @@ export function useIfcLoader() {
                 // for bounds computation alone).
                 buildSpatialIndexGuarded(allMeshes, dataStore, setIfcDataStore);
 
-                // Cache the result in the background (files between 10 MB and 150 MB).
-                // Files above CACHE_MAX_SOURCE_SIZE are not cached because the
-                // source buffer is required for on-demand property/quantity
-                // extraction, spatial hierarchy elevations, and IFC re-export.
-                // Caching without it would silently degrade those features.
+                // Cache the result in the background. Two tiers (see cacheTier.ts):
+                //  - `source` (10-150MB): persist tables + geometry AND the source
+                //    buffer, so lazy property/quantity accessors + IFC re-export read
+                //    it straight from IndexedDB. Unchanged behaviour.
+                //  - `mesh-only` (150-400MB, prototype behind `?meshCache=1`): the
+                //    source is too big to persist, so cache tables + geometry WITHOUT
+                //    it; on re-open the freshly read buffer rehydrates the accessors
+                //    (validated against the header's full-source hash).
+                // Files above 400MB (or the mesh-only flag off) are not cached.
+                const cacheTier = classifyCacheTier(buffer.byteLength, {
+                  meshOnlyEnabled: isMeshOnlyCacheEnabled(),
+                  minSize: CACHE_SIZE_THRESHOLD,
+                  maxSourceSize: CACHE_MAX_SOURCE_SIZE,
+                  maxMeshOnlySize: CACHE_MESH_ONLY_MAX_SIZE,
+                });
                 if (
-                  buffer.byteLength >= CACHE_SIZE_THRESHOLD &&
-                  buffer.byteLength <= CACHE_MAX_SOURCE_SIZE &&
+                  cacheTier !== 'none' &&
                   allMeshes.length > 0 &&
                   finalCoordinateInfo
                 ) {
@@ -1289,7 +1299,9 @@ export function useIfcLoader() {
                     // restore the flat meshes only and drop all instanced occurrences.
                     ...(allInstancedShards.length > 0 ? { instancedShards: allInstancedShards } : {}),
                   };
-                  await saveToCache(cacheKey, dataStore, geometryData, buffer, file.name);
+                  await saveToCache(cacheKey, dataStore, geometryData, buffer, file.name, {
+                    persistSource: cacheTier === 'source',
+                  });
                 }
 
                 // Release closure references to MeshData objects after a delay.
