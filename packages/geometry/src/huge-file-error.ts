@@ -19,14 +19,26 @@ const OOM_SIGNATURE =
 /**
  * Returns a clear error when `err` looks like a wasm OOM trap on a large file,
  * else `null` (the caller then rethrows the original error unchanged).
+ *
+ * IMPORTANT: a Rust panic and a wasm OOM abort BOTH surface to JS as the SAME
+ * `RuntimeError: unreachable executed` — `console_error_panic_hook` prints to
+ * the console but does not re-type the exception, so the message alone can't
+ * prove OOM. This is intentionally a heuristic (large file + an OOM-shaped
+ * trap, and the caller only invokes it AFTER both the SAB-view and the full
+ * in-memory copy attempts trapped — overwhelmingly the 4GB ceiling). To make
+ * sure it never SILENTLY masks a genuine panic/assert on a large model, the
+ * mapped error preserves the original trap: verbatim in the message tail and as
+ * `.cause` for programmatic inspection.
  */
 export function largeFilePrepassError(err: unknown, byteLength: number): Error | null {
   const sizeGB = byteLength / 1e9;
-  const msg = err instanceof Error ? err.message : String(err);
-  if (sizeGB >= HUGE_FILE_GB_THRESHOLD && OOM_SIGNATURE.test(msg)) {
+  const raw = err instanceof Error ? err.message : String(err);
+  if (sizeGB >= HUGE_FILE_GB_THRESHOLD && OOM_SIGNATURE.test(raw)) {
     return new Error(
       `This model is ${sizeGB.toFixed(1)} GB, which exceeds the browser's ~3 GB WebAssembly memory ` +
-        `ceiling (32-bit address space). Open it in the ifc-lite desktop app, which has no such limit.`,
+        `ceiling (32-bit address space). Open it in the ifc-lite desktop app, which has no such limit. ` +
+        `(underlying wasm trap: ${raw})`,
+      { cause: err },
     );
   }
   return null;

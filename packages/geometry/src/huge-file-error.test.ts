@@ -12,6 +12,17 @@ describe('largeFilePrepassError', () => {
     expect(e!.message).toMatch(/4 ?GB|32-bit|WebAssembly/);
   });
 
+  it('PRESERVES the original trap so a genuine panic on a large file is never masked', () => {
+    // A Rust panic surfaces as the same `unreachable executed` as an OOM abort;
+    // the mapped error must keep the original verbatim (message tail + cause) so
+    // a real bug is still diagnosable, not silently relabelled "too large".
+    const original = new Error('unreachable executed');
+    const e = largeFilePrepassError(original, 3.9 * GB);
+    expect(e).not.toBeNull();
+    expect(e!.message).toContain('unreachable executed');
+    expect(e!.cause).toBe(original);
+  });
+
   it('recognises the OOM/abort signatures other engines emit', () => {
     for (const m of [
       'RuntimeError: unreachable',
