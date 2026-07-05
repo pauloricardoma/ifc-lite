@@ -6,7 +6,7 @@
 //!
 //! Originally contributed by Mathias Søndergaard (Sonderwoods/Linkajou).
 
-use crate::types::mesh::MeshData;
+use crate::types::mesh::{InstanceRecord, MeshData};
 use crate::types::response::{
     CoordinateInfo, ModelMetadata, ProcessingStats, QuickMetadataBootstrap,
     QuickMetadataEntitySummary,
@@ -106,6 +106,11 @@ impl OpeningFilterMode {
 /// Result of processing an IFC file.
 pub struct ProcessingResult {
     pub meshes: Vec<MeshData>,
+    /// Per-occurrence instance records emitted when `StreamingOptions.enable_instancing`
+    /// is set (#1623): products whose body is one shared `IfcRepresentationMap` are
+    /// meshed once (a template `MeshData`) and listed here as lightweight placements
+    /// instead of a materialized mesh each. Empty otherwise.
+    pub instances: Vec<InstanceRecord>,
     /// Declares the coordinate space used by serialized mesh vertices.
     pub mesh_coordinate_space: Option<String>,
     /// IfcSite ObjectPlacement as column-major 4x4 matrix (in meters).
@@ -114,6 +119,64 @@ pub struct ProcessingResult {
     pub building_transform: Option<Vec<f64>>,
     pub metadata: ModelMetadata,
     pub stats: ProcessingStats,
+}
+
+/// Collate materialized meshes by representation identity (#1623): every occurrence
+/// beyond the first of each shared template becomes an [`InstanceRecord`] and its
+/// `MeshData` is removed from `meshes`, leaving one template per group (plus all
+/// non-instanced meshes). The per-occurrence transform is template-relative, the
+/// same collation the GLB export instancing (#1443) uses. `rtc` is the model RTC
+/// offset (see `collate_refs`).
+fn collate_into_instances(meshes: &mut Vec<MeshData>, rtc: [f64; 3]) -> Vec<InstanceRecord> {
+    use ifc_lite_geometry::{collate_refs, InstanceMeshRef};
+
+    let refs: Vec<InstanceMeshRef> = meshes
+        .iter()
+        .map(|m| InstanceMeshRef {
+            positions: &m.positions,
+            normals: &m.normals,
+            indices: &m.indices,
+            origin: m.origin,
+            instance_meta: m.instance.as_ref(),
+            entity_id: m.express_id,
+            color: m.color,
+        })
+        .collect();
+    let collated = collate_refs(&refs, 2, rtc);
+
+    let mut instances = Vec::new();
+    let mut drop_mesh = vec![false; meshes.len()];
+    for tpl in &collated.templates {
+        let template_express_id = meshes[tpl.template_index].express_id;
+        for occ in &tpl.occurrences {
+            // The template occurrence is drawn directly from its retained MeshData.
+            if occ.mesh_index == tpl.template_index {
+                continue;
+            }
+            let m = &meshes[occ.mesh_index];
+            instances.push(InstanceRecord {
+                express_id: m.express_id,
+                ifc_type: m.ifc_type.clone(),
+                global_id: m.global_id.clone(),
+                name: m.name.clone(),
+                presentation_layer: m.presentation_layer.clone(),
+                color: m.color,
+                template_express_id,
+                rep_identity: tpl.rep_identity,
+                transform: occ.transform,
+            });
+            drop_mesh[occ.mesh_index] = true;
+        }
+    }
+
+    // Drop the instanced (non-template) occurrence meshes; `retain` visits in order.
+    let mut idx = 0;
+    meshes.retain(|_| {
+        let keep = !drop_mesh[idx];
+        idx += 1;
+        keep
+    });
+    instances
 }
 
 /// Controls the tradeoff between first-frame latency and richer upfront metadata.
@@ -1131,6 +1194,8 @@ pub fn process_geometry_streaming_filtered_with_options(
         FxHashMap::default();
     let mut layer_cache_by_representation: FxHashMap<u32, Option<String>> = FxHashMap::default();
     let mut meshes: Vec<MeshData> = Vec::new();
+    // Instanced output (#1623), populated only when options.enable_instancing.
+    let mut instances: Vec<InstanceRecord> = Vec::new();
     let mut processed_jobs = 0usize;
     let mut total_meshes = 0usize;
     let mut total_vertices = 0usize;
@@ -1498,8 +1563,21 @@ pub fn process_geometry_streaming_filtered_with_options(
         "Geometry processing complete"
     );
 
+    // Instanced output (#1623): collate the retained meshes so occurrences sharing
+    // a template geometry become lightweight InstanceRecords and their materialized
+    // MeshData drop out of `meshes`. Reuses the same rep-identity collation as the
+    // GLB export instancing (#1443). This is the output/memory dedup; the CPU
+    // (don't-bake) win layers on top separately.
+    if options.enable_instancing && options.retain_emitted_meshes {
+        instances = collate_into_instances(
+            &mut meshes,
+            [rtc_offset.0, rtc_offset.1, rtc_offset.2],
+        );
+    }
+
     ProcessingResult {
         meshes,
+        instances,
         mesh_coordinate_space: Some(coord_space.to_string()),
         site_transform,
         building_transform,
