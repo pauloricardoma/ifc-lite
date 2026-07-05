@@ -28,7 +28,7 @@ interface CacheEntry {
  * caps source at 400MB but its decoded geometry can be larger, so the ceiling is
  * comfortably above that while still catching a runaway blob.
  */
-const PER_ENTRY_MAX_BYTES = 1.5 * 1024 * 1024 * 1024;
+export const PER_ENTRY_MAX_BYTES = 1.5 * 1024 * 1024 * 1024;
 
 /**
  * Free-space headroom to keep below the origin quota after a write, so we never
@@ -36,7 +36,7 @@ const PER_ENTRY_MAX_BYTES = 1.5 * 1024 * 1024 * 1024;
  * trip browser eviction of the whole origin). A fixed 128MB is enough to clear
  * the edge without over-reserving on large quotas.
  */
-const QUOTA_HEADROOM_BYTES = 128 * 1024 * 1024;
+export const QUOTA_HEADROOM_BYTES = 128 * 1024 * 1024;
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
@@ -50,7 +50,7 @@ function entryBytes(buffer: ArrayBuffer, sourceBuffer?: ArrayBuffer): number {
  * `Infinity` when the Storage API is unavailable (older Safari / blocked) so the
  * caller falls back to the per-entry ceiling alone rather than refusing writes.
  */
-async function availableQuotaBytes(): Promise<number> {
+export async function availableQuotaBytes(): Promise<number> {
   try {
     if (typeof navigator !== 'undefined' && navigator.storage?.estimate) {
       const { quota, usage } = await navigator.storage.estimate();
@@ -65,29 +65,45 @@ async function availableQuotaBytes(): Promise<number> {
 }
 
 /**
- * Evict least-recently-created entries (oldest `createdAt` first) until at least
- * `targetBytes` have been freed or the store is exhausted, skipping `keepKey`
- * (the entry we're about to (over)write). Returns the bytes actually freed.
+ * Free at least `targetBytes` by evicting least-recently-created entries (oldest
+ * `createdAt` first), skipping `keepKey` (the entry we're about to (over)write).
+ *
+ * NON-DESTRUCTIVE ON FAILURE: it first walks the eligible entries oldest-first
+ * and only deletes them if their combined size actually reaches `targetBytes`.
+ * If even evicting every eligible entry would fall short, it deletes NOTHING and
+ * returns `false`. This matters for a large model on a tight-quota device (e.g.
+ * mobile Safari): without it, we would throw away the user's other cached models
+ * to make room for a write that can't fit anyway — a pure loss. Returns whether
+ * enough room was freed (all deletions commit in one transaction).
  */
-function evictOldestUntilFreed(db: IDBDatabase, targetBytes: number, keepKey: string): Promise<number> {
+export function evictToFree(db: IDBDatabase, targetBytes: number, keepKey: string): Promise<boolean> {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, 'readwrite');
     const store = tx.objectStore(STORE_NAME);
     const cursorReq = store.index('createdAt').openCursor(); // ascending = oldest first
-    let freed = 0;
+    const victims: IDBValidKey[] = [];
+    let cumulative = 0;
+    let enough = false;
 
     cursorReq.onsuccess = () => {
       const cursor = cursorReq.result;
-      if (!cursor || freed >= targetBytes) return; // done; tx will complete
-      const entry = cursor.value as CacheEntry;
-      if (entry.key !== keepKey) {
-        freed += entryBytes(entry.buffer, entry.sourceBuffer);
-        cursor.delete();
+      if (cursor && cumulative < targetBytes) {
+        const entry = cursor.value as CacheEntry;
+        if (entry.key !== keepKey) {
+          cumulative += entryBytes(entry.buffer, entry.sourceBuffer);
+          victims.push(cursor.primaryKey);
+        }
+        cursor.continue();
+        return;
       }
-      cursor.continue();
+      // Cursor exhausted or target reached: commit deletions only if they help.
+      enough = cumulative >= targetBytes;
+      if (enough) {
+        for (const key of victims) store.delete(key);
+      }
     };
     cursorReq.onerror = () => reject(cursorReq.error);
-    tx.oncomplete = () => resolve(freed);
+    tx.oncomplete = () => resolve(enough);
     tx.onerror = () => reject(tx.error);
     tx.onabort = () => reject(tx.error);
   });
@@ -98,7 +114,7 @@ function evictOldestUntilFreed(db: IDBDatabase, targetBytes: number, keepKey: st
  * Storage API reports a tight quota) LRU-evict older entries until it fits.
  * Returns `true` when the write should proceed, `false` when it must be skipped.
  */
-async function ensureRoomForEntry(db: IDBDatabase, bytes: number, keepKey: string): Promise<boolean> {
+export async function ensureRoomForEntry(db: IDBDatabase, bytes: number, keepKey: string): Promise<boolean> {
   if (bytes > PER_ENTRY_MAX_BYTES) {
     console.warn(`[IFC Cache] Entry ${(bytes / 1024 / 1024).toFixed(0)}MB exceeds per-entry ceiling; skipping cache write`);
     return false;
@@ -110,23 +126,22 @@ async function ensureRoomForEntry(db: IDBDatabase, bytes: number, keepKey: strin
   if (available >= required) return true;
 
   const need = required - available;
-  let freed = 0;
   try {
-    freed = await evictOldestUntilFreed(db, need, keepKey);
+    const freedEnough = await evictToFree(db, need, keepKey);
+    if (freedEnough) return true;
   } catch (err) {
     console.warn('[IFC Cache] LRU eviction failed; skipping cache write', err);
     return false;
   }
-  if (available + freed >= required) return true;
 
-  console.warn(`[IFC Cache] Insufficient quota headroom (need ${(need / 1024 / 1024).toFixed(0)}MB, freed ${(freed / 1024 / 1024).toFixed(0)}MB); skipping cache write`);
+  console.warn(`[IFC Cache] Insufficient quota headroom (need ${(need / 1024 / 1024).toFixed(0)}MB after eviction); skipping cache write`);
   return false;
 }
 
 /**
  * Open the IndexedDB database
  */
-function openDatabase(): Promise<IDBDatabase> {
+export function openDatabase(): Promise<IDBDatabase> {
   if (dbPromise) return dbPromise;
 
   dbPromise = new Promise((resolve, reject) => {
@@ -235,8 +250,28 @@ export async function setCached(
     const roomOk = await ensureRoomForEntry(db, entryBytes(buffer, sourceBuffer), key);
     if (!roomOk) return; // non-fatal: a cache miss next open is a slow load, not a crash
 
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, 'readwrite');
+    // A cache write must NEVER break the load (AGENTS.md; task blocker #2): every
+    // failure mode here is caught and turned into a non-fatal skip. We resolve
+    // (not reject) on failure so callers can `await` without a try/catch, and we
+    // wire the transaction's abort/error too — a QuotaExceededError or a
+    // blob-too-large record on Safari often surfaces as a tx abort rather than a
+    // request error, and without this the promise would hang forever.
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      let tx: IDBTransaction;
+      try {
+        tx = db.transaction(STORE_NAME, 'readwrite');
+      } catch (err) {
+        // e.g. InvalidStateError if the connection is closing.
+        console.warn('[IFC Cache] Could not open write transaction; skipping cache write', err);
+        done();
+        return;
+      }
       const store = tx.objectStore(STORE_NAME);
 
       const entry: CacheEntry = {
@@ -248,16 +283,29 @@ export async function setCached(
         createdAt: Date.now(),
       };
 
-      const request = store.put(entry);
-
-      request.onsuccess = () => {
-        resolve();
+      tx.oncomplete = () => done();
+      tx.onabort = () => {
+        console.warn('[IFC Cache] Cache write transaction aborted (quota / blob too large); skipping', tx.error);
+        done();
+      };
+      tx.onerror = () => {
+        console.warn('[IFC Cache] Cache write transaction error; skipping', tx.error);
+        done();
       };
 
-      request.onerror = () => {
-        console.error('[IFC Cache] Failed to cache entry:', request.error);
-        reject(request.error);
-      };
+      try {
+        const request = store.put(entry);
+        request.onerror = () => {
+          // Prevent the error from also aborting the tx as an unhandled error;
+          // the tx.onabort above still resolves us non-fatally.
+          console.warn('[IFC Cache] Failed to cache entry (quota / blob too large); skipping', request.error);
+        };
+      } catch (err) {
+        // Synchronous throw from put() (e.g. DataCloneError on an unclonable value).
+        console.warn('[IFC Cache] Cache put threw; skipping cache write', err);
+        try { tx.abort(); } catch { /* already inactive */ }
+        done();
+      }
     });
   } catch (err) {
     console.warn('[IFC Cache] Cache write failed:', err);

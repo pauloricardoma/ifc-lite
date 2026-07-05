@@ -146,6 +146,16 @@ export interface CacheWriteOptions {
   includeSpatialHierarchy?: boolean;
   /** Compress sections (default: false, future feature) */
   compress?: boolean;
+  /**
+   * Precomputed value for the header's `sourceHash` field. When provided, the
+   * writer stores it verbatim and SKIPS the internal full-buffer `xxhash64` of
+   * `sourceBuffer`. Supply this when the caller already validates the source by
+   * another means (e.g. a strengthened cache key) so a large source doesn't pay
+   * a full-file main-thread hash on write. Omit it for the default behaviour
+   * (the writer hashes the whole `sourceBuffer`, and `reader.validate()` stays
+   * meaningful).
+   */
+  sourceHash?: bigint;
 }
 
 /**

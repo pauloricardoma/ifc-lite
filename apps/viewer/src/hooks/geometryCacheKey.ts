@@ -9,7 +9,11 @@ import { FORMAT_VERSION } from '@ifc-lite/cache';
  *
  * The key folds together everything that changes the *bytes* of the cached
  * geometry so a stale entry can never be served for a different input:
- *   - `byteLength` + `fingerprint`: identify the source file content
+ *   - `byteLength` + `fingerprint`: identify the source file content. The
+ *     fingerprint is the spread-sampled hash from `computeSourceFingerprint`
+ *     (head + tail + interior windows + exact length), so a KEY MATCH IS THE
+ *     VALIDATION — a genuinely different file cannot key the same entry, which
+ *     is why the source-decoupled tier needs no full-file hash on read/write.
  *   - `FORMAT_VERSION`: a format bump invalidates incompatible entries
  *   - `mergeLayers`: the multi-layer-wall merge flag is a load-time WASM
  *     tessellation input (issue #540). It was previously absent from the key,

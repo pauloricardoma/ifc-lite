@@ -62,8 +62,10 @@ export class BinaryCacheWriter {
       includeSpatialHierarchy = true,
     } = options;
 
-    // Compute source hash
-    const sourceHash = xxhash64(sourceBuffer);
+    // Source hash: use the caller's precomputed value when supplied (they
+    // validate the source another way), else hash the whole buffer. Supplying
+    // it skips a full-file main-thread hash on write for large sources.
+    const sourceHash = options.sourceHash ?? xxhash64(sourceBuffer);
 
     // Build sections
     const sectionBuffers: Array<{ type: SectionType; buffer: ArrayBuffer }> = [];

@@ -47,7 +47,7 @@ export const CACHE_SIZE_THRESHOLD = 10 * 1024 * 1024;
 export const CACHE_MAX_SOURCE_SIZE = 150 * 1024 * 1024;
 
 /** Maximum file size eligible for the SOURCE-DECOUPLED "mesh-only" cache tier
- *  (400MB, prototype behind the `?meshCache=1` flag — see `isMeshOnlyCacheEnabled`).
+ *  (400MB, ON BY DEFAULT; kill switch `?meshCache=0` — see `isMeshOnlyCacheEnabled`).
  *
  *  Files in (CACHE_MAX_SOURCE_SIZE, CACHE_MESH_ONLY_MAX_SIZE] are too big to
  *  persist their source buffer in IndexedDB, but their tables + entityIndex +
@@ -56,9 +56,10 @@ export const CACHE_MAX_SOURCE_SIZE = 150 * 1024 * 1024;
  *  the `fallbackSourceBuffer` path `loadFromCache` already supports), so repeat
  *  opens skip the 10-90s parse+mesh while keeping full feature fidelity.
  *
- *  The cache buffer still embeds `xxhash64(fullSource)` in its header, so the
- *  hit is validated against the fresh buffer on load (see `loadFromCache`),
- *  upgrading the weak 4KB fingerprint key to full-content validation. */
+ *  The hit is validated by the strengthened, spread-sampled cache key
+ *  (`sourceFingerprint.ts`) — a key match means the exact byte length AND a
+ *  64-bit hash of a ~160KB spread match — so repeat opens do no full-file hash
+ *  and have no main-thread stall. */
 export const CACHE_MESH_ONLY_MAX_SIZE = 400 * 1024 * 1024;
 
 /**

@@ -15,7 +15,8 @@ import { flushSync } from 'react-dom';
 import { useShallow } from 'zustand/react/shallow';
 import { getViewerStoreApi, useViewerStore, type FederatedModel } from '@/store';
 import { getGeomWorkerOverride, resolveLoadTessellationTier, isMeshOnlyCacheEnabled } from '../store/constants.js';
-import { classifyCacheTier } from './cacheTier.js';
+import { planCacheWrite } from './cacheTier.js';
+import { computeSourceFingerprint } from './sourceFingerprint.js';
 import { IfcParser, detectFormat, unwrapIfcZip, type IfcDataStore } from '@ifc-lite/parser';
 import { WorkerParser } from '@ifc-lite/parser/browser';
 import { memoryAccounting } from '../lib/perf/memoryAccounting.js';
@@ -100,33 +101,6 @@ export type LoadTarget =
       /** Shared RTC offset from the earliest existing model (IFC Z-up). */
       sharedRtcOffset?: { x: number; y: number; z: number };
     };
-
-/**
- * Compute a fast content fingerprint from the first and last 4KB of a buffer.
- * Uses FNV-1a hash for speed — no crypto overhead, sufficient to distinguish
- * files with identical name and byte length.
- */
-function computeFastFingerprint(buffer: ArrayBuffer): string {
-  const CHUNK_SIZE = 4096;
-  const view = new Uint8Array(buffer);
-  const len = view.length;
-
-  // FNV-1a hash
-  let hash = 2166136261; // FNV offset basis (32-bit)
-  const firstEnd = Math.min(CHUNK_SIZE, len);
-  for (let i = 0; i < firstEnd; i++) {
-    hash ^= view[i];
-    hash = Math.imul(hash, 16777619); // FNV prime
-  }
-  if (len > CHUNK_SIZE) {
-    const lastStart = Math.max(CHUNK_SIZE, len - CHUNK_SIZE);
-    for (let i = lastStart; i < len; i++) {
-      hash ^= view[i];
-      hash = Math.imul(hash, 16777619);
-    }
-  }
-  return (hash >>> 0).toString(16);
-}
 
 /**
  * Geometry stream watchdog. Delegates to the package-level helper so the
@@ -625,9 +599,13 @@ export function useIfcLoader() {
         }
       }
 
-      // Cache key uses filename + size + content fingerprint + format version
-      // Fingerprint prevents collisions for different files with the same name and size
-      const fingerprint = computeFastFingerprint(buffer);
+      // Cache key = size + spread-sampled content fingerprint + format version.
+      // The fingerprint (`sourceFingerprint.ts`) hashes a ~160KB spread (head +
+      // tail + interior windows) plus the exact byte length, so a key match is
+      // itself the validation — a genuinely different file can't key the same
+      // entry. `.hash` is reused as the cache header's `sourceHash` so the write
+      // path never pays a full-file hash either.
+      const fingerprint = computeSourceFingerprint(buffer);
       // Snapshot the merge-layers flag *before* the cache lookup: it is a
       // load-time WASM tessellation input (issue #540) and must discriminate
       // the cache key, otherwise toggling it + reloading serves geometry built
@@ -652,7 +630,7 @@ export function useIfcLoader() {
       // added the geometryClass tag the Model/Types switch needs).
       const cacheKey = buildGeometryCacheKey(
         buffer.byteLength,
-        fingerprint,
+        fingerprint.hex,
         mergeLayersAtLoad,
         undefined,
         skipSmallCutsAtLoad,
@@ -660,9 +638,22 @@ export function useIfcLoader() {
       );
       console.log(`[useIfc] loadFile "${file.name}" session=${currentSession} mergeLayers=${mergeLayersAtLoad} geomMode=${geometryModeAtLoad} tier=${loadTessellationTier ?? 'medium'} cacheKey=${cacheKey}`);
 
+      // Decide the cache tier ONCE (single source of truth for read + write, see
+      // cacheTier.ts): the source tier (<=150MB) always caches; the mesh-only
+      // tier (150-400MB) caches only while enabled (kill switch `?meshCache=0`);
+      // nothing else caches. Gating the READ on `shouldCache` too makes the kill
+      // switch complete — with it off, a previously written mesh-only entry is
+      // NOT served (and files outside any band skip a pointless lookup).
+      const cachePlan = planCacheWrite(buffer.byteLength, {
+        meshOnlyEnabled: isMeshOnlyCacheEnabled(),
+        minSize: CACHE_SIZE_THRESHOLD,
+        maxSourceSize: CACHE_MAX_SOURCE_SIZE,
+        maxMeshOnlySize: CACHE_MESH_ONLY_MAX_SIZE,
+      });
+
       // Cache + server are PRIMARY-ONLY: a federated add is WASM-only with no
       // cache/server round-trip (matches the former parseStepBufferViewerModel).
-      if (target.kind === 'primary' && buffer.byteLength >= CACHE_SIZE_THRESHOLD) {
+      if (target.kind === 'primary' && cachePlan.shouldCache) {
         setProgress({ phase: 'Checking cache', percent: 5 });
         const cacheResult = await getCached(cacheKey);
         if (cacheResult) {
@@ -1260,7 +1251,9 @@ export function useIfcLoader() {
 
                 await finalizeModel(dataStore, useViewerStore.getState().geometryResult, getSchemaVersion(dataStore), {
                   loadState: 'complete',
-                  cacheState: buffer.byteLength >= CACHE_SIZE_THRESHOLD ? 'writing' : 'none',
+                  // Only show "writing" when this file will actually be cached
+                  // under the current plan (respects the size bands + kill switch).
+                  cacheState: cachePlan.shouldCache ? 'writing' : 'none',
                 });
                 // Build spatial index from meshes in time-sliced chunks (non-blocking).
                 // Previously this was synchronous inside requestIdleCallback, blocking
@@ -1268,23 +1261,20 @@ export function useIfcLoader() {
                 // for bounds computation alone).
                 buildSpatialIndexGuarded(allMeshes, dataStore, setIfcDataStore);
 
-                // Cache the result in the background. Two tiers (see cacheTier.ts):
+                // Cache the result in the background, reusing the `cachePlan`
+                // decided once above (single source of truth for read + write).
+                // The two tiers differ ONLY in `persistSource` and the size band:
                 //  - `source` (10-150MB): persist tables + geometry AND the source
                 //    buffer, so lazy property/quantity accessors + IFC re-export read
-                //    it straight from IndexedDB. Unchanged behaviour.
-                //  - `mesh-only` (150-400MB, prototype behind `?meshCache=1`): the
-                //    source is too big to persist, so cache tables + geometry WITHOUT
-                //    it; on re-open the freshly read buffer rehydrates the accessors
-                //    (validated against the header's full-source hash).
-                // Files above 400MB (or the mesh-only flag off) are not cached.
-                const cacheTier = classifyCacheTier(buffer.byteLength, {
-                  meshOnlyEnabled: isMeshOnlyCacheEnabled(),
-                  minSize: CACHE_SIZE_THRESHOLD,
-                  maxSourceSize: CACHE_MAX_SOURCE_SIZE,
-                  maxMeshOnlySize: CACHE_MESH_ONLY_MAX_SIZE,
-                });
+                //    it straight from IndexedDB.
+                //  - `mesh-only` (150-400MB, on by default; kill switch `?meshCache=0`):
+                //    the source is too big to persist, so cache tables + geometry
+                //    WITHOUT it; on re-open the freshly read buffer rehydrates the
+                //    accessors. The hit is validated by the strengthened cache key,
+                //    so repeat opens have no main-thread hash stall.
+                // Files above 400MB (or with the mesh-only kill switch set) are not cached.
                 if (
-                  cacheTier !== 'none' &&
+                  cachePlan.shouldCache &&
                   allMeshes.length > 0 &&
                   finalCoordinateInfo
                 ) {
@@ -1300,7 +1290,8 @@ export function useIfcLoader() {
                     ...(allInstancedShards.length > 0 ? { instancedShards: allInstancedShards } : {}),
                   };
                   await saveToCache(cacheKey, dataStore, geometryData, buffer, file.name, {
-                    persistSource: cacheTier === 'source',
+                    persistSource: cachePlan.persistSource,
+                    sourceHash: fingerprint.hash,
                   });
                 }
 

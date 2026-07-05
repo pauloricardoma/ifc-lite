@@ -14,7 +14,6 @@ import {
   BinaryCacheWriter,
   BinaryCacheReader,
   SchemaVersion,
-  xxhash64,
   type CachedEntityIndexColumns,
   type CacheDataStore,
   type GeometryData,
@@ -182,27 +181,15 @@ export function useIfcCache() {
 
       const reader = new BinaryCacheReader();
 
-      // Source-decoupled (mesh-only) tier validation: when the entry persisted NO
-      // source buffer but the caller handed us the freshly read file bytes, verify
-      // the cache header's full-source xxhash64 against that fresh buffer. This
-      // upgrades the weak 4KB fingerprint cache key to full-content validation, so
-      // a fingerprint+size collision (a DIFFERENT file keyed the same) can never
-      // serve stale geometry. On mismatch we throw → the catch below deletes the
-      // entry and returns success:false, and the loader falls back to a normal
-      // parse (a validated miss, not a crash). The classic source-persisting tier
-      // keeps its exact prior behaviour (this branch is skipped when a source was
-      // persisted).
-      if (!cacheResult.sourceBuffer && fallbackSourceBuffer) {
-        const header = reader.readHeader(cacheResult.buffer);
-        const freshHash = xxhash64(new Uint8Array(fallbackSourceBuffer));
-        if (header.sourceHash !== freshHash) {
-          throw new Error(
-            `mesh-only cache validation failed for ${fileName}: source hash mismatch ` +
-            `(header ${header.sourceHash.toString(16)} vs fresh ${freshHash.toString(16)})`,
-          );
-        }
-      }
-
+      // No full-file hash on the repeat-open path (the #1 un-flag blocker). The
+      // hit is already validated by the strengthened, spread-sampled cache key
+      // (`sourceFingerprint.ts`): a key match means the exact byte length AND a
+      // 64-bit hash of a ~160KB spread (head + tail + interior windows) match, so
+      // a genuinely different file can never key the same entry. That makes the
+      // former ~0.7-1.7s `xxhash64(fullSource)` recompute here redundant, and
+      // dropping it removes the main-thread stall for BOTH cache tiers. A
+      // truncated/corrupt cache buffer still fails fast in `reader.read` below →
+      // the catch deletes the entry and returns a graceful miss.
       const result = await reader.read(cacheResult.buffer);
       const cacheReadTime = performance.now() - cacheLoadStart;
 
@@ -373,16 +360,20 @@ export function useIfcCache() {
     geometry: GeometryData,
     sourceBuffer: ArrayBuffer,
     fileName: string,
-    options: { persistSource?: boolean } = {}
+    options: { persistSource?: boolean; sourceHash?: bigint } = {}
   ): Promise<void> => {
     // `persistSource` (default true) is the classic <=150MB tier: the raw source
     // is stored alongside the cache so lazy property/quantity accessors + re-export
-    // read it from IndexedDB. The mesh-only tier (150-400MB, prototype) passes
-    // false: the source is too big to persist, so it is omitted from IndexedDB and
-    // rehydrated from the freshly read buffer on re-open. The cache buffer ALWAYS
-    // embeds xxhash64(source) in its header (the writer computes it from
-    // `sourceBuffer` regardless), so a mesh-only hit stays validatable on load.
-    const { persistSource = true } = options;
+    // read it from IndexedDB. The mesh-only tier (150-400MB) passes false: the
+    // source is too big to persist, so it is omitted from IndexedDB and rehydrated
+    // from the freshly read buffer on re-open.
+    //
+    // `sourceHash` is the cheap spread-sample hash the loader already computed for
+    // the cache key (`computeSourceFingerprint`). Passing it to the writer stores
+    // it in the header verbatim and SKIPS the full-file `xxhash64(sourceBuffer)`,
+    // so even a 400MB cold-load write pays no full-file main-thread hash. The hit
+    // is validated by the key on read, not this header value.
+    const { persistSource = true, sourceHash } = options;
     try {
       console.log(`[useIfcCache] Starting cache write for: ${fileName} (persistSource=${persistSource})`);
       const writer = new BinaryCacheWriter();
@@ -401,7 +392,7 @@ export function useIfcCache() {
       };
 
       console.log('[useIfcCache] Writing cache buffer...');
-      const cacheBuffer = await writer.write(cacheDataStore, geometry, sourceBuffer, { includeGeometry: true });
+      const cacheBuffer = await writer.write(cacheDataStore, geometry, sourceBuffer, { includeGeometry: true, sourceHash });
       console.log('[useIfcCache] Cache buffer written:', cacheBuffer.byteLength, 'bytes');
 
       console.log('[useIfcCache] Saving to cache storage...');
