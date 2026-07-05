@@ -52,7 +52,7 @@ pub use symbolic::{
     extract_symbolic_data, SymbolicCircle, SymbolicData, SymbolicFillArea, SymbolicGridAxis,
     SymbolicPolyline, SymbolicText,
 };
-pub use types::mesh::MeshData;
+pub use types::mesh::{InstanceRecord, MeshData, RawInstanceOccurrence};
 pub use types::response::{
     CoordinateInfo, ModelMetadata, ParseResponse, ProcessingStats,
     QuickMetadataBootstrap, QuickMetadataEntitySummary, QuickMetadataSpatialNode,

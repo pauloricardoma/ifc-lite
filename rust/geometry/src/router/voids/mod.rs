@@ -1903,7 +1903,9 @@ impl GeometryRouter {
             _ => return Ok(SubMeshCollection::new()),
         };
 
-        let sub_meshes = self.process_element_with_submeshes(element, decoder)?;
+        // Voided occurrences materialize their cut geometry, never instance an un-cut
+        // shared template (#1623 Phase 2 don't-bake off here).
+        let sub_meshes = self.process_element_with_submeshes_impl(element, decoder, false)?;
         if sub_meshes.is_empty() {
             return Ok(SubMeshCollection::new());
         }

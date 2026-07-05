@@ -33,6 +33,7 @@ fn processing_result(
 
     ProcessingResult {
         meshes: vec![mesh_a, mesh_b],
+        instances: Vec::new(),
         mesh_coordinate_space: mesh_coordinate_space.map(str::to_string),
         site_transform: site_transform.map(|m| m.to_vec()),
         building_transform: None,

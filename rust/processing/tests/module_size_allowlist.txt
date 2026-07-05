@@ -64,8 +64,10 @@
      659 rust/geometry/src/router/layers.rs
 # +1: unify body-rep predicate — added is_direct_body_representation + docs; net removes ~60 lines from processing.rs and ~12 from layers.rs (crate trends down).
 # +65: promote the per-router IfcMappedItem source cache to a model-wide SharedMappedItemCache (type alias + field + new_/enable_ setters + unique-count diagnostic), meshing each source once model-wide (#1623).
-     638 rust/geometry/src/router/mod.rs
-    1072 rust/geometry/src/router/processing.rs
+# +38: #1623 Phase 2 don't-bake — MappedInstancePlan type alias + output_instancing_plan field + enable_/getter + `mod instancing` decl.
+     676 rust/geometry/src/router/mod.rs
+# +65: #1623 Phase 2 don't-bake — the top-level mapped-item intercept (template retag + instance placeholder) + the public/impl process_element_with_submeshes split; the two eligibility/ensure helpers were extracted to router/instancing.rs (new, 92 lines) to hold the net down.
+    1137 rust/geometry/src/router/processing.rs
 # +26: is_rtc_votable_representation predicate + doc — Surface3D is meshable but must NOT cast RTC votes (#1526 pollution via absolute-coord surfaces).
      472 rust/geometry/src/router/rtc_offset.rs
 # +1: reveal-quads comment expanded to 2 lines (dead-symbol reference fix, no code change).
@@ -76,7 +78,8 @@
 # High/Highest small-opening floor (B11 regression, issue #976).
 # +32: engulf-cutter #635 AABB box-cut suppression on a #1109 budget trip (drop `!capped`) + its rewritten rationale comment and a diag_warn! else-branch (correctness: an engulfing box-cut would DELETE the host).
 # +5: ENGULF_TOLERANCE / ENGULF_TOLERANCE_F32 single-homed (3 sites shared one literal 0.03 tolerance, now one named const each).
-    1936 rust/geometry/src/router/voids/mod.rs
+# +2: #1623 Phase 2 — route the voided sub-mesh path through process_element_with_submeshes_impl(allow_instancing=false) so cut occurrences never instance an un-cut template.
+    1938 rust/geometry/src/router/voids/mod.rs
      621 rust/geometry/src/router/voids/probe.rs
     1002 rust/geometry/src/router/voids/synthesis.rs
     1472 rust/geometry/src/space_dcel/mod.rs
@@ -84,14 +87,16 @@
      782 rust/geometry/src/triangulation.rs
      745 rust/geometry/src/void_index.rs
      499 rust/processing/src/determinism.rs
-     812 rust/processing/src/element.rs
+# +48: #1623 Phase 2 don't-bake — ProducedElementMeshes.instance_occurrences + threading it through produce_inner (tuple returns), and emit_sub_meshes converting empty-with-InstanceMeta placeholders into RawInstanceOccurrences.
+     860 rust/processing/src/element.rs
      468 rust/processing/src/georeferencing.rs
      772 rust/processing/src/prepass.rs
 # +24: build the entity index INLINE in the scan loop instead of a separate build_entity_index pass (perf/single-scan; one file walk instead of two).
 # +15: try_lock the per-worker point cache to fix the nested-par_iter re-entrancy self-deadlock (#1572 regression).
 # +20: add the per-worker placement-transform cache store + its try_lock slot acquisition, mirroring the point cache (perf/placement-cache).
 # +8: construct one model-wide shared IfcMappedItem source cache per process_geometry pass and inject it into each per-job router (#1623).
-    1541 rust/processing/src/processor/mod.rs
+# +74: #1623 Phase 2 don't-bake — ProcessingResult.instances field + StreamingOptions.enable_instancing + the scan-built MappedInstancePlan + the plan/collector threaded into process_entity_job + the finalize call; the finalize/orphan-recovery bodies were extracted to processor/instancing.rs (new, 147 lines) to hold the net down.
+    1615 rust/processing/src/processor/mod.rs
      440 rust/processing/src/symbolic/items.rs
 # +6: wire per-batch point-cache hit/miss stats into record_pipeline_batch (perf/brep-point-cache-instrumentation).
 # +13: attach the per-worker shared IfcMappedItem source cache to each batch router, mirroring the item-dedup attach (#1623).

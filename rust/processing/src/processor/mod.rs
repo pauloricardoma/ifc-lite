@@ -6,7 +6,7 @@
 //!
 //! Originally contributed by Mathias Søndergaard (Sonderwoods/Linkajou).
 
-use crate::types::mesh::MeshData;
+use crate::types::mesh::{InstanceRecord, MeshData, RawInstanceOccurrence};
 use crate::types::response::{
     CoordinateInfo, ModelMetadata, ProcessingStats, QuickMetadataBootstrap,
     QuickMetadataEntitySummary,
@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 mod color_layer;
+mod instancing;
 mod jobs;
 mod opening_filter;
 mod properties;
@@ -106,6 +107,13 @@ impl OpeningFilterMode {
 /// Result of processing an IFC file.
 pub struct ProcessingResult {
     pub meshes: Vec<MeshData>,
+    /// #1623 Phase 2 don't-bake output: per-occurrence instance records emitted when
+    /// `StreamingOptions.enable_instancing` is set. Each non-template occurrence of a
+    /// repeated single-solid `IfcRepresentationMap` skipped its full materialize; the
+    /// template MeshData stays in `meshes` (keyed by `InstanceRecord.template_express_id`)
+    /// and each occurrence here places it by a template-relative transform. Always
+    /// empty when instancing is off, so exporters/determinism see the flat output.
+    pub instances: Vec<InstanceRecord>,
     /// Declares the coordinate space used by serialized mesh vertices.
     pub mesh_coordinate_space: Option<String>,
     /// IfcSite ObjectPlacement as column-major 4x4 matrix (in meters).
@@ -156,6 +164,15 @@ pub struct StreamingOptions {
     /// so it must not present the result as a completed parse. Used by the
     /// server to stop burning a core when an SSE client disconnects.
     pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// #1623 Phase 2 "don't-bake" instancing. When `true` (AND
+    /// `retain_emitted_meshes`), the geometry phase meshes each repeated single-solid
+    /// `IfcRepresentationMap` ONCE (a template occurrence) and emits every OTHER
+    /// occurrence as a lightweight `InstanceRecord` (placement + colour + id) instead
+    /// of materializing a full world-space mesh per occurrence — killing the
+    /// per-occurrence 43M-vertex bake on mapped-item-heavy models. `false` (default)
+    /// reproduces the historical materialized output byte-for-byte, so determinism /
+    /// parity / every exporter are unaffected (none arm this).
+    pub enable_instancing: bool,
 }
 
 impl Default for StreamingOptions {
@@ -171,6 +188,7 @@ impl Default for StreamingOptions {
             tessellation_quality: TessellationQuality::default(),
             entity_index: None,
             cancel: None,
+            enable_instancing: false,
         }
     }
 }
@@ -520,6 +538,11 @@ pub fn process_geometry_streaming_filtered_with_options(
     // orphan type geometry (buildingSMART annex-E showcase files).
     let mut type_product_geometry: Vec<(u32, usize, usize, IfcType, Vec<u32>)> = Vec::new();
     let mut referenced_representation_maps: FxHashSet<u32> = FxHashSet::default();
+    // #1623 Phase 2 don't-bake plan (built only when `enable_instancing`):
+    // `IfcRepresentationMap` id ⇒ (occurrence count, min IfcMappedItem express id).
+    // The min-id occurrence is the deterministic template that materializes; the
+    // rest instance against it. Filtered to count >= 2 after the scan.
+    let mut mapped_item_plan: FxHashMap<u32, (u32, u32)> = FxHashMap::default();
     // #957 follow-up: type ids that an IfcRelDefinesByType instantiates (the type
     // has at least one occurrence). Such a type's geometry is already drawn through
     // its occurrences — directly or via an IfcMappedItem — so it must NOT also be
@@ -742,6 +765,20 @@ pub fn process_geometry_streaming_filtered_with_options(
             let args = parse_step_arguments(&content[start..end]);
             if let Some(source_id) = args.first().and_then(|token| parse_step_ref(token)) {
                 referenced_representation_maps.insert(source_id);
+                // #1623 Phase 2: tally occurrences per source + track the min-id
+                // (deterministic template) occurrence. `id` is this IfcMappedItem's
+                // express id (the router's `item.id` at mesh time).
+                if options.enable_instancing {
+                    mapped_item_plan
+                        .entry(source_id)
+                        .and_modify(|(count, template)| {
+                            *count += 1;
+                            if id < *template {
+                                *template = id;
+                            }
+                        })
+                        .or_insert((1, id));
+                }
             }
         } else if type_name == "IFCRELDEFINESBYTYPE" {
             // IfcRelDefinesByType.RelatingType is the last attribute (index 5);
@@ -1168,6 +1205,26 @@ pub fn process_geometry_streaming_filtered_with_options(
     // held only for a source-mesh get/insert; the meshing runs outside it.
     let mapped_item_cache = GeometryRouter::new_mapped_item_cache();
 
+    // #1623 Phase 2 don't-bake plan (Some only when enabled): filter to repeated
+    // sources (count >= 2) — singletons materialize normally — and share it with
+    // every per-job router via `enable_output_instancing`. Non-template occurrences
+    // of these sources skip the per-occurrence materialize and emit an
+    // `InstanceRecord` at finalize. Requires `retain_emitted_meshes` (the template
+    // MeshData must survive in `meshes` for the finalize to place instances onto it).
+    let instancing_plan: Option<ifc_lite_geometry::MappedInstancePlan> =
+        (options.enable_instancing && options.retain_emitted_meshes).then(|| {
+            Arc::new(
+                mapped_item_plan
+                    .into_iter()
+                    .filter(|(_, (count, _))| *count >= 2)
+                    .collect::<FxHashMap<u32, (u32, u32)>>(),
+            )
+        });
+    // Collect the don't-bake occurrences across all chunks/threads; resolved into
+    // `InstanceRecord`s against the retained template meshes after the geometry phase.
+    let raw_instance_collector: std::sync::Mutex<Vec<RawInstanceOccurrence>> =
+        std::sync::Mutex::new(Vec::new());
+
     // Per-part point-cache instrumentation (feeds `ProcessingStats` and, through
     // it, `PipelineDiagnostics`). `hits`/`misses` count CartesianPoints served
     // by `EntityDecoder::get_polyloop_coords_cached` across every faceted part;
@@ -1353,6 +1410,8 @@ pub fn process_geometry_streaming_filtered_with_options(
                     &backstop_collector,
                     &item_dedup_cache,
                     &mapped_item_cache,
+                    instancing_plan.as_ref(),
+                    &raw_instance_collector,
                     worker_point_cache,
                     worker_placement_cache,
                     &point_cache_hits_collector,
@@ -1481,12 +1540,26 @@ pub fn process_geometry_streaming_filtered_with_options(
         (!diag.is_empty()).then_some(diag)
     });
 
+    // #1623 Phase 2: resolve the don't-bake occurrences into InstanceRecords against
+    // the retained template meshes (min-id occurrence per source). Empty on the flat
+    // path (no armed plan ⇒ no occurrences collected). `meshes` is only appended to
+    // (orphan recovery), so the flat output stays byte-identical.
+    let instances = instancing::finalize_instances(
+        raw_instance_collector
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        &mut meshes,
+        &mapped_item_cache,
+        [rtc_offset.0, rtc_offset.1, rtc_offset.2],
+    );
+
     let total_time = total_start.elapsed();
     pipeline_span.record("element_count", total_jobs as u64);
     pipeline_span.record("total_ms", total_time.as_millis() as u64);
 
     tracing::info!(
         meshes = meshes.len(),
+        instances = instances.len(),
         vertices = total_vertices,
         triangles = total_triangles,
         backstop_count = backstop_dropped,
@@ -1497,6 +1570,7 @@ pub fn process_geometry_streaming_filtered_with_options(
 
     ProcessingResult {
         meshes,
+        instances,
         mesh_coordinate_space: Some(coord_space.to_string()),
         site_transform,
         building_transform,

@@ -9,6 +9,7 @@
 mod caching;
 mod content_hash;
 mod diagnostics;
+mod instancing;
 mod layers;
 mod processing;
 mod rtc_offset;
@@ -96,6 +97,21 @@ pub type ItemDedupCache = Arc<Mutex<FxHashMap<u128, Arc<Mesh>>>>;
 /// `setTessellationQuality` change (which invalidates source-coord tessellation),
 /// exactly as the router's own `set_tessellation_quality` clears the RefCell.
 pub type SharedMappedItemCache = Arc<Mutex<FxHashMap<u32, Arc<Mesh>>>>;
+
+/// #1623 Phase 2 "don't-bake" instancing plan: `IfcRepresentationMap` express id ⇒
+/// `(occurrence_count, template_item_id)`, where `template_item_id` is the SMALLEST
+/// `IfcMappedItem` express id referencing that source (a deterministic, race-free
+/// choice of which occurrence materializes its geometry as the shared template).
+/// Only sources with `occurrence_count >= 2` appear. Built ONCE from the file scan
+/// and injected into every per-element / per-batch router via
+/// [`GeometryRouter::enable_output_instancing`]. When a mapped item's source is in
+/// this plan AND the occurrence is a single-solid ordinary product, the
+/// NON-template occurrences skip the per-occurrence vertex bake and emit an
+/// instance-only placeholder (empty geometry carrying [`crate::mesh::InstanceMeta`])
+/// instead of a full materialized mesh — the ~29s / 43M-vertex materialize this
+/// phase kills. `None` ⇒ every occurrence materializes (historical flat output,
+/// byte-identical); exporters and the determinism harness never arm it.
+pub type MappedInstancePlan = Arc<FxHashMap<u32, (u32, u32)>>;
 
 /// Geometry router - routes entities to processors
 pub struct GeometryRouter {
@@ -199,6 +215,13 @@ pub struct GeometryRouter {
     /// bleed the flag into one another — it used to be a process-wide static.
     /// `false` (default) ⇒ every cut runs, byte-identical to before.
     skip_small_cuts: bool,
+    /// #1623 Phase 2 don't-bake plan (see [`MappedInstancePlan`]). `None` (default)
+    /// ⇒ every mapped-item occurrence materializes a full mesh, byte-identical to
+    /// the historical flat path. When armed, single-solid ordinary occurrences of a
+    /// repeated `IfcRepresentationMap` skip the per-occurrence vertex bake and emit
+    /// an instance-only placeholder instead. Scoped to this router (one per loaded
+    /// build), like `skip_small_cuts`.
+    output_instancing_plan: Option<MappedInstancePlan>,
 }
 
 /// Whether an `IfcShapeRepresentation.RepresentationType` names a meshable
@@ -263,6 +286,7 @@ impl GeometryRouter {
             voids_consumed_hosts: RefCell::new(FxHashSet::default()),
             tessellation_quality: TessellationQuality::Medium,
             skip_small_cuts: false,
+            output_instancing_plan: None, // armed by `enable_output_instancing`
         };
 
         // Register default P0 processors
@@ -395,6 +419,20 @@ impl GeometryRouter {
     /// leaving it unset keeps the per-router fallback for single-shot callers.
     pub fn enable_shared_mapped_item_cache(&mut self, cache: SharedMappedItemCache) {
         self.shared_mapped_item_cache = Some(cache);
+    }
+
+    /// Arm the #1623 Phase 2 don't-bake instancing plan (see [`MappedInstancePlan`])
+    /// on this router. Requires a shared mapped-item cache to be enabled too — the
+    /// don't-bake instance placeholders rely on the source being meshed once into it
+    /// (the orphan-recovery template at finalize reads it). Leaving it unset keeps
+    /// every occurrence materializing (byte-identical flat output).
+    pub fn enable_output_instancing(&mut self, plan: MappedInstancePlan) {
+        self.output_instancing_plan = Some(plan);
+    }
+
+    /// The armed don't-bake plan, if any (see [`Self::enable_output_instancing`]).
+    pub(super) fn output_instancing_plan(&self) -> Option<&MappedInstancePlan> {
+        self.output_instancing_plan.as_ref()
     }
 
     /// Disable content-dedup (drops the cache reference so `item_dedup_key`

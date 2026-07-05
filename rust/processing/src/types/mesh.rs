@@ -215,3 +215,64 @@ impl MeshData {
         self.positions.is_empty() || self.indices.is_empty()
     }
 }
+
+/// #1623 Phase 2 "don't-bake": a non-template occurrence of a shared
+/// `IfcRepresentationMap` that skipped the per-occurrence vertex materialize. The
+/// router emits an instance-only placeholder (empty geometry carrying
+/// `InstanceMeta`); [`crate::element::emit_sub_meshes`] turns it into one of these,
+/// and the streaming finalize resolves it against the template MeshData into an
+/// [`InstanceRecord`]. Purely in-memory (recomputed each load), never serialized.
+#[derive(Debug, Clone)]
+pub struct RawInstanceOccurrence {
+    /// This occurrence's IFC element id.
+    pub express_id: u32,
+    /// IFC type name (e.g. "IfcFlowFitting").
+    pub ifc_type: String,
+    /// IFC GlobalId when available.
+    pub global_id: Option<String>,
+    /// IFC Name when available.
+    pub name: Option<String>,
+    /// IFC presentation layer assignment name when available.
+    pub presentation_layer: Option<String>,
+    /// This occurrence's resolved RGBA colour.
+    pub color: [f32; 4],
+    /// Shared-template key = the `IfcRepresentationMap` express id. Matches the
+    /// template MeshData's `instance.rep_identity`.
+    pub rep_identity: u128,
+    /// PRE-RTC composed world transform (row-major) `transform · local · canonical`
+    /// — the same composition `collate_refs` computes for a baked occurrence, but
+    /// captured WITHOUT materializing vertices. The finalize reduces it to the
+    /// post-RTC frame and derives the template-relative `InstanceRecord.transform`.
+    pub world_transform: [f64; 16],
+}
+
+/// #1623 Phase 2: one resolved occurrence of a shared template geometry, emitted in
+/// [`crate::ProcessingResult::instances`] instead of a full materialized mesh when
+/// `StreamingOptions.enable_instancing` is set. The consumer uploads the template
+/// MeshData (`template_express_id`, still in `meshes`) once and draws this occurrence
+/// by applying `transform` to the template's baked world geometry. Purely in-memory,
+/// like [`MeshData::instance`] — recomputed fresh each load, never round-trips a cache.
+#[derive(Debug, Clone)]
+pub struct InstanceRecord {
+    /// This occurrence's IFC element id.
+    pub express_id: u32,
+    /// IFC type name (e.g. "IfcFlowFitting").
+    pub ifc_type: String,
+    /// IFC GlobalId when available.
+    pub global_id: Option<String>,
+    /// IFC Name when available.
+    pub name: Option<String>,
+    /// IFC presentation layer assignment name when available.
+    pub presentation_layer: Option<String>,
+    /// This occurrence's RGBA colour (may differ from the template occurrence's).
+    pub color: [f32; 4],
+    /// `express_id` of the template `MeshData` this occurrence instantiates — the
+    /// consumer's link from record to the geometry it draws (JS-safe u32).
+    pub template_express_id: u32,
+    /// Representation-identity of the shared geometry (`IfcRepresentationMap` id).
+    pub rep_identity: u128,
+    /// Row-major, TEMPLATE-RELATIVE mat4: applied to the template's baked world
+    /// geometry (`template.origin + positions`) it yields this occurrence's world
+    /// geometry (`rel_k = post_rtc(M_k) · post_rtc(M_ref)⁻¹`).
+    pub transform: [f32; 16],
+}

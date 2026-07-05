@@ -179,6 +179,25 @@ impl GeometryRouter {
         element: &DecodedEntity,
         decoder: &mut EntityDecoder,
     ) -> Result<SubMeshCollection> {
+        // Public entry: the ordinary (non-void) element path, so the #1623 Phase 2
+        // don't-bake instancing is allowed here. The void path
+        // (`process_element_with_submeshes_and_voids`) calls the impl below with
+        // `allow_instancing = false` — a voided occurrence must materialize its cut
+        // geometry, never instance an un-cut shared template.
+        self.process_element_with_submeshes_impl(element, decoder, true)
+    }
+
+    /// [`Self::process_element_with_submeshes`] with an explicit don't-bake gate.
+    /// `allow_instancing` is `true` only on the ordinary (non-void) path; the void
+    /// path passes `false` so its occurrences always materialize. The don't-bake
+    /// additionally requires an armed [`GeometryRouter::enable_output_instancing`]
+    /// plan, so with no plan this is byte-identical to the historical flat path.
+    pub(super) fn process_element_with_submeshes_impl(
+        &self,
+        element: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+        allow_instancing: bool,
+    ) -> Result<SubMeshCollection> {
         // If a material-layer buildup is attached, try slicing single-solid
         // elements (walls / slabs with IfcMaterialLayerSetUsage) first so each
         // layer gets its own sub-mesh keyed by IfcMaterial id. An empty void
@@ -258,7 +277,12 @@ impl GeometryRouter {
 
             // Process each representation item, preserving geometry IDs
             for item in items {
-                self.collect_submeshes_from_item(&item, decoder, &mut sub_meshes)?;
+                self.collect_submeshes_from_item(
+                    &item,
+                    decoder,
+                    &mut sub_meshes,
+                    allow_instancing,
+                )?;
             }
         }
 
@@ -318,14 +342,17 @@ impl GeometryRouter {
     }
 
     /// Collect sub-meshes from a representation item, following MappedItem references.
+    /// `allow_instancing` enables the #1623 Phase 2 don't-bake path at the top-level
+    /// mapped item (see [`Self::collect_submeshes_from_item_inner`]).
     fn collect_submeshes_from_item(
         &self,
         item: &DecodedEntity,
         decoder: &mut EntityDecoder,
         sub_meshes: &mut SubMeshCollection,
+        allow_instancing: bool,
     ) -> Result<()> {
         let mut visited = FxHashSet::default();
-        self.collect_submeshes_from_item_inner(item, decoder, sub_meshes, 0, &mut visited)
+        self.collect_submeshes_from_item_inner(item, decoder, sub_meshes, 0, &mut visited, allow_instancing)
     }
 
     fn collect_submeshes_from_item_inner(
@@ -335,6 +362,7 @@ impl GeometryRouter {
         sub_meshes: &mut SubMeshCollection,
         depth: usize,
         visited: &mut FxHashSet<u32>,
+        allow_instancing: bool,
     ) -> Result<()> {
         if depth >= MAX_MAPPED_ITEM_DEPTH {
             return Err(Error::geometry(format!(
@@ -360,6 +388,7 @@ impl GeometryRouter {
             let source_entity = decoder
                 .resolve_ref(source_attr)?
                 .ok_or_else(|| Error::geometry("Failed to resolve MappingSource".to_string()))?;
+            let source_id = source_entity.id;
 
             // Get MappedRepresentation from RepresentationMap (attribute 1)
             let mapped_repr_attr = source_entity.get(1).ok_or_else(|| {
@@ -385,11 +414,75 @@ impl GeometryRouter {
                 None
             };
 
+            // #1623 Phase 2 "don't-bake": if this top-level mapped item's source is a
+            // REPEATED (count >= 2) single-solid `IfcRepresentationMap` and the armed
+            // plan says so, only the deterministic template occurrence
+            // (min IfcMappedItem id) materializes its geometry; every OTHER occurrence
+            // skips the per-occurrence vertex clone / MappingTarget bake / weld and
+            // emits an instance-only placeholder (empty geometry carrying the mapping
+            // transform + rep_identity in `InstanceMeta`). `apply_submesh_placement`
+            // folds the world placement into `im.transform`; the streaming finalize
+            // turns the placeholder into an `InstanceRecord` against the template.
+            //
+            // Only fires at the TOP level (`depth == 0`) — a mapped item nested inside
+            // another map is part of its parent's shared geometry, not an independent
+            // occurrence — and only when `allow_instancing` (the non-void path). With
+            // no armed plan this is skipped entirely, so the flat output is unchanged.
+            let dont_bake = if allow_instancing && depth == 0 {
+                self.output_instancing_plan()
+                    .and_then(|plan| plan.get(&source_id).copied())
+                    .filter(|&(count, _)| count >= 2)
+                    .and_then(|(count, template_item_id)| {
+                        self.mapped_source_single_item(&mapped_repr, decoder)
+                            .map(|item_id| (count, template_item_id, item_id))
+                    })
+            } else {
+                None
+            };
+            if let Some((_, template_item_id, solid_item_id)) = dont_bake {
+                if item.id != template_item_id {
+                    // NON-template occurrence: don't-bake. Ensure the shared registry
+                    // holds the source geometry (meshed once model-wide) so the
+                    // finalize can recover geometry even in the (effectively
+                    // unreachable) case that the template occurrence never
+                    // materialized, then push the instance-only placeholder. Its
+                    // geometry_id is the nested SOLID's id (not the mapped-item id) so
+                    // emit_sub_meshes resolves the occurrence colour identically to the
+                    // flat/template sub-mesh.
+                    self.ensure_shared_mapped_source(&mapped_repr, source_id, decoder);
+                    let local_rm = mapping_transform.map(|mut t| {
+                        self.scale_transform(&mut t);
+                        mat4_to_row_major(&t)
+                    });
+                    let mut placeholder = Mesh::new();
+                    placeholder.instance_meta = Some(InstanceMeta {
+                        transform: IDENTITY_ROW_MAJOR,
+                        local_transform: local_rm,
+                        canonical_transform: None,
+                        rep_identity: source_id as u128,
+                        instanceable: true,
+                    });
+                    // Push directly (SubMeshCollection::add drops empty meshes; this
+                    // placeholder is intentionally empty — its InstanceMeta is the payload).
+                    sub_meshes
+                        .sub_meshes
+                        .push(crate::SubMesh::new(solid_item_id, placeholder));
+                    visited.remove(&item.id);
+                    return Ok(());
+                }
+            }
+            // Record where THIS mapped item's sub-meshes start, so the don't-bake
+            // TEMPLATE occurrence can be re-tagged with the source-id rep_identity
+            // after the normal materialize below (see the retag after the loop).
+            let mapped_items_start = sub_meshes.len();
+
             // Get items from the mapped representation
             if let Some(items_attr) = mapped_repr.get(3) {
                 let items = decoder.resolve_ref_list(items_attr)?;
                 for nested_item in items {
-                    // Recursively collect sub-meshes (skip unsupported geometry types)
+                    // Recursively collect sub-meshes (skip unsupported geometry types).
+                    // Nested items never independently don't-bake (`allow_instancing =
+                    // false`): they are this occurrence's own shared geometry.
                     let count_before = sub_meshes.len();
                     if let Err(_e) = self.collect_submeshes_from_item_inner(
                         &nested_item,
@@ -397,6 +490,7 @@ impl GeometryRouter {
                         sub_meshes,
                         depth + 1,
                         visited,
+                        false,
                     ) {
                         crate::diag::diag_debug!(
                             { item_id = nested_item.id, ifc_type = ?nested_item.ifc_type,
@@ -440,6 +534,31 @@ impl GeometryRouter {
                                     im.rep_identity = h;
                                 }
                             }
+                        }
+                    }
+                }
+            }
+
+            // #1623 Phase 2: this is the don't-bake TEMPLATE occurrence (min-id). It
+            // materialized normally above (byte-identical to a flat occurrence — a
+            // single-solid source ⇒ exactly one sub-mesh). Re-tag its `rep_identity`
+            // to the source id and record the (scaled) MappingTarget as
+            // `local_transform`, MATCHING the instance placeholders so the finalize
+            // collates them onto this template. The baked geometry is untouched — the
+            // MappingTarget is already folded into both the vertices AND
+            // `local_transform`, which is consistent (the template's world geometry is
+            // `transform · local_transform · source`, so `m_ref` recovers the same
+            // `source` the placeholders reference). See the finalize in processor/mod.rs.
+            if let Some((_, template_item_id, _)) = dont_bake {
+                if item.id == template_item_id {
+                    let local_rm = mapping_transform.map(|mut t| {
+                        self.scale_transform(&mut t);
+                        mat4_to_row_major(&t)
+                    });
+                    for sub in &mut sub_meshes.sub_meshes[mapped_items_start..] {
+                        if let Some(im) = sub.mesh.instance_meta.as_mut() {
+                            im.rep_identity = source_id as u128;
+                            im.local_transform = local_rm;
                         }
                     }
                 }

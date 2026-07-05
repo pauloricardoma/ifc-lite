@@ -136,8 +136,9 @@ pub use error::{Error, Result};
 pub use geom_hash::{hash_mesh_world, GeometryHasher, DEFAULT_GEOM_HASH_TOLERANCE};
 pub use extrusion::{extrude_profile, extrude_profile_lofted, extrude_profile_with_voids};
 pub use instancing::{
-    collate_and_encode, collate_instances, collate_refs, decode_instanced, encode_instanced,
-    encode_refs, verify_recomposition, Collated, DecodedInstance, DecodedInstanced,
+    bake_source_at_world, collate_and_encode, collate_instances, collate_refs,
+    compose_instance_world_row_major, decode_instanced, encode_instanced, encode_refs,
+    instance_rel_row_major_f32, verify_recomposition, Collated, DecodedInstance, DecodedInstanced,
     DecodedTemplate, InstanceMeshRef, InstanceOccurrence, InstanceTemplate, INSTANCED_MAGIC,
     INSTANCED_VERSION,
 };
@@ -161,8 +162,8 @@ pub use router::{
     aggregate_diagnostics, local_frame_set_enabled_override, ClassificationStats,
     GEOMETRY_DIAGNOSTICS_SCHEMA_VERSION,
     ClassificationSummary, GeometryDiagnostics, GeometryProcessor, GeometryRouter,
-    HostOpeningDiagnostic, ItemDedupCache, OpeningDiagnostic, OpeningKindDiag, ReasonCount,
-    RectFastSummary, RectParam, SharedMappedItemCache, WorstHost,
+    HostOpeningDiagnostic, ItemDedupCache, MappedInstancePlan, OpeningDiagnostic, OpeningKindDiag,
+    ReasonCount, RectFastSummary, RectParam, SharedMappedItemCache, WorstHost,
 };
 
 /// The streaming / needs-shift large-coordinate threshold (metres): a world

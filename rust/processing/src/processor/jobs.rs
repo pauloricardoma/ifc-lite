@@ -137,6 +137,10 @@ pub(super) fn process_entity_job(
     // model-wide instead of once per element (a fresh router is built per element,
     // so its RefCell cache only dedups within one element) — #1623.
     mapped_item_cache: &ifc_lite_geometry::SharedMappedItemCache,
+    // #1623 Phase 2: don't-bake plan (Some only when enabled) armed on this job's
+    // router, + the shared sink for its emitted don't-bake occurrences.
+    instancing_plan: Option<&ifc_lite_geometry::MappedInstancePlan>,
+    raw_instance_collector: &std::sync::Mutex<Vec<crate::RawInstanceOccurrence>>,
     // The current rayon worker's PERSISTENT CartesianPoint cache, reused across
     // every element that worker meshes for the whole model (see the
     // `worker_point_caches` store at the call site). Moved into this job's decoder
@@ -188,6 +192,11 @@ pub(super) fn process_entity_job(
     local_router.set_rtc_offset(rtc_offset);
     local_router.enable_content_dedup_shared(item_dedup_cache.clone());
     local_router.enable_shared_mapped_item_cache(mapped_item_cache.clone());
+    // #1623 Phase 2: arm the don't-bake plan so single-solid occurrences of a repeated
+    // mapped source emit instance placeholders instead of full meshes.
+    if let Some(plan) = instancing_plan {
+        local_router.enable_output_instancing(plan.clone());
+    }
     let local_router = local_router;
 
     let metadata = crate::element::ElementMeshMetadata {
@@ -328,6 +337,14 @@ pub(super) fn process_entity_job(
             acc.defer_off_face += rf.defer_off_face;
             acc.defer_near_edge += rf.defer_near_edge;
             acc.defer_no_openings += rf.defer_no_openings;
+        }
+    }
+
+    // #1623 Phase 2: hand this element's don't-bake occurrences to the shared
+    // collector (resolved into InstanceRecords later; empty on the flat path).
+    if !produced.instance_occurrences.is_empty() {
+        if let Ok(mut acc) = raw_instance_collector.lock() {
+            acc.extend(produced.instance_occurrences);
         }
     }
 

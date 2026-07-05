@@ -35,11 +35,11 @@
 //! ```
 
 use crate::style::{FullIndexedColourMap, GeometryStyleInfo};
-use crate::types::mesh::{MeshData, MeshTextureData};
+use crate::types::mesh::{MeshData, MeshTextureData, RawInstanceOccurrence};
 use ifc_lite_core::{DecodedEntity, EntityDecoder, IfcType};
 use ifc_lite_geometry::{
-    calculate_normals, orient_mesh_outward, BoolFailure, GeometryHasher, GeometryRouter, Mesh,
-    ResolvedTextureMap, SubMeshCollection,
+    calculate_normals, compose_instance_world_row_major, orient_mesh_outward, BoolFailure,
+    GeometryHasher, GeometryRouter, Mesh, ResolvedTextureMap, SubMeshCollection,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeMap;
@@ -164,6 +164,12 @@ pub fn plan_type_geometry(
 /// Everything one element produced.
 pub struct ProducedElementMeshes {
     pub meshes: Vec<MeshData>,
+    /// #1623 Phase 2 don't-bake output: this element's occurrences of a repeated
+    /// `IfcRepresentationMap` that skipped the per-occurrence materialize. Empty
+    /// unless the router was armed with an instancing plan
+    /// (`GeometryRouter::enable_output_instancing`); the streaming finalize resolves
+    /// each into a [`crate::InstanceRecord`] against the shared template MeshData.
+    pub instance_occurrences: Vec<RawInstanceOccurrence>,
     /// Per-ELEMENT fingerprint, accumulated across all of the element's
     /// meshes in the native IFC frame (pre-split, pre-site-rotation).
     /// `None` when hashing is off, nothing was produced, or the job is a
@@ -223,7 +229,7 @@ pub fn produce_element_meshes(
         _ => None,
     };
 
-    let meshes = produce_inner(job, ctx, decoder, router, &mut hasher);
+    let (meshes, instance_occurrences) = produce_inner(job, ctx, decoder, router, &mut hasher);
 
     // Drain the router's per-element CSG diagnostics on EVERY return path so
     // a warm (batch-reused) router starts the next element clean.
@@ -235,6 +241,7 @@ pub fn produce_element_meshes(
 
     ProducedElementMeshes {
         meshes,
+        instance_occurrences,
         geometry_hash,
         csg_failures,
         degenerate_triangles_dropped,
@@ -254,13 +261,13 @@ fn produce_inner(
     decoder: &mut EntityDecoder,
     router: &GeometryRouter,
     hasher: &mut Option<GeometryHasher>,
-) -> Vec<MeshData> {
+) -> (Vec<MeshData>, Vec<RawInstanceOccurrence>) {
     // Representation gate, with the IfcAlignment exception: alignments carry
     // their geometry on IfcAlignment*Segment children, so a null
     // Representation attribute does not mean "nothing to render".
     let has_representation = job.entity.get(6).is_some_and(|a| !a.is_null());
     if !has_representation && job.ifc_type != IfcType::IfcAlignment {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     let element_color = job
@@ -268,7 +275,12 @@ fn produce_inner(
         .unwrap_or_else(|| crate::style::default_color_for_type(job.ifc_type).to_array());
 
     if let ElementJobKind::TypeProduct { rep_maps } = &job.kind {
-        return produce_type_geometry(job, rep_maps, element_color, ctx, decoder, router);
+        // Type-product geometry (orphan/instanced RepresentationMaps) never rides the
+        // don't-bake path — it is view-mode-gated by geometry_class, not instanced.
+        return (
+            produce_type_geometry(job, rep_maps, element_color, ctx, decoder, router),
+            Vec::new(),
+        );
     }
 
     let has_openings = ctx
@@ -298,10 +310,10 @@ fn produce_inner(
             router.process_element_with_submeshes_and_voids(job.entity, decoder, ctx.void_index)
         {
             if !sub_meshes.is_empty() {
-                let out =
+                let (out, occ) =
                     emit_sub_meshes(job, sub_meshes, element_color, ctx, decoder, hasher, layer_class);
-                if !out.is_empty() {
-                    return out;
+                if !out.is_empty() || !occ.is_empty() {
+                    return (out, occ);
                 }
             }
         }
@@ -313,10 +325,13 @@ fn produce_inner(
         // happens per item inside `emit_sub_meshes`.
         if let Ok(sub_meshes) = router.process_element_with_submeshes(job.entity, decoder) {
             if !sub_meshes.is_empty() {
-                let out =
+                let (out, occ) =
                     emit_sub_meshes(job, sub_meshes, element_color, ctx, decoder, hasher, layer_class);
-                if !out.is_empty() {
-                    return out;
+                // #1623 Phase 2: a pure don't-bake occurrence produces NO flat mesh
+                // (only instance placeholders); treat that as success so the fallback
+                // chain below does not re-materialize the element flat.
+                if !out.is_empty() || !occ.is_empty() {
+                    return (out, occ);
                 }
             }
         }
@@ -347,10 +362,10 @@ fn produce_inner(
     }
 
     let Some(mut mesh) = mesh_candidate else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     if mesh.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     // Make the assembled body consistently outward-wound. A faceted brep (IFC
@@ -394,7 +409,7 @@ fn produce_inner(
                     ));
                 }
                 if !out.is_empty() {
-                    return out;
+                    return (out, Vec::new());
                 }
             }
         }
@@ -406,7 +421,10 @@ fn produce_inner(
     if let Some(h) = hasher.as_mut() {
         h.add_mesh_with_origin(&mesh.positions, &mesh.indices, mesh.origin);
     }
-    vec![build_mesh_data(job, mesh, element_color, None, None, 0, ctx, None)]
+    (
+        vec![build_mesh_data(job, mesh, element_color, None, None, 0, ctx, None)],
+        Vec::new(),
+    )
 }
 
 /// Emit a sub-mesh collection: per-item colour resolution through the
@@ -424,8 +442,9 @@ fn emit_sub_meshes(
     // a material-layer wall — a section-only detail the 3D renderer skips (the
     // wall renders as one solid) but the 2D/section cut consumes.
     slice_class: u8,
-) -> Vec<MeshData> {
+) -> (Vec<MeshData>, Vec<RawInstanceOccurrence>) {
     let mut out: Vec<MeshData> = Vec::with_capacity(sub_meshes.len());
+    let mut occurrences: Vec<RawInstanceOccurrence> = Vec::new();
     // Material colours for this element, used when a sub-mesh has no direct
     // style — alternated so frame (opaque) and glazing (transparent) split
     // across the window's parts (#913 §2.3).
@@ -435,6 +454,35 @@ fn emit_sub_meshes(
     for sub in sub_meshes.sub_meshes {
         let mut sub_mesh = sub.mesh;
         if sub_mesh.is_empty() {
+            // #1623 Phase 2 don't-bake: an EMPTY sub-mesh carrying instanceable
+            // InstanceMeta is a non-template occurrence of a shared template. Convert
+            // it to a RawInstanceOccurrence (resolving its colour EXACTLY as a
+            // materialized sub-mesh would, keyed on the same nested-solid geometry_id)
+            // instead of dropping it. `transform` was folded into `im.transform` by
+            // `apply_submesh_placement`; we compose the full pre-RTC world transform
+            // here and let the streaming finalize derive the template-relative mat4.
+            if let Some(im) = sub_mesh.instance_meta.as_ref().filter(|im| im.instanceable) {
+                let style = ctx.geometry_style_index.get(&sub.geometry_id);
+                let direct_color = style.map(|s| s.color).or_else(|| {
+                    find_geometry_item_color(sub.geometry_id, ctx.geometry_style_index, decoder)
+                });
+                let color = crate::style::resolve_submesh_color(
+                    direct_color,
+                    material_colors.map(|v| v.as_slice()),
+                    &mut mat_color_idx,
+                    element_color,
+                );
+                occurrences.push(RawInstanceOccurrence {
+                    express_id: job.id,
+                    ifc_type: job.ifc_type.name().to_string(),
+                    global_id: job.metadata.and_then(|m| m.global_id.clone()),
+                    name: job.metadata.and_then(|m| m.name.clone()),
+                    presentation_layer: job.metadata.and_then(|m| m.presentation_layer.clone()),
+                    color,
+                    rep_identity: im.rep_identity,
+                    world_transform: compose_instance_world_row_major(im),
+                });
+            }
             continue;
         }
         // Consistently outward-wind each sub-body (see the single-mesh path); a
@@ -500,7 +548,7 @@ fn emit_sub_meshes(
             None,
         ));
     }
-    out
+    (out, occurrences)
 }
 
 /// geometry_class for the per-layer slices of a material-layer wall. The wall's
