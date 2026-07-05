@@ -222,7 +222,16 @@ impl IfcAPI {
         // tag geometry-bearing rows so we can emit jobs incrementally.
         // Entity index is built from the same pass — no second walk.
         let mut scanner = EntityScanner::new(content);
-        let estimated = content.len() / 50;
+        // Cap the up-front index reservation. On wasm32 the whole `content` slice
+        // is already resident in the 4GB linear memory (wasm-bindgen copies the
+        // buffer in), so reserving `len/50` slots — ~82M entries (~1GB) for a
+        // ~4GB file — ON TOP of that exhausts the address space before the scan
+        // even starts, aborting with a bare `unreachable executed`. Reserve at
+        // most CAP entries; a rarer huge model grows the map via rehash (a
+        // one-time cost) instead of a fatal up-front OOM. Ordinary (<2GB) files
+        // are unaffected — their `len/50` estimate stays under the cap.
+        const PREPASS_INDEX_RESERVE_CAP: usize = 40_000_000; // ~0.5GB reserved
+        let estimated = (content.len() / 50).min(PREPASS_INDEX_RESERVE_CAP);
         let mut entity_index: rustc_hash::FxHashMap<u32, (usize, usize)> =
             rustc_hash::FxHashMap::with_capacity_and_hasher(estimated, Default::default());
 

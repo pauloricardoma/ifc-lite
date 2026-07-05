@@ -4,6 +4,7 @@
 
 import init, { initSync, IfcAPI } from '@ifc-lite/wasm';
 import { initWasmWithRetry } from './wasm-init-retry.js';
+import { largeFilePrepassError } from './huge-file-error.js';
 import type { MeshData, TessellationQuality } from './types.js';
 import { mergeGeometryDiagnostics, type GeometryDiagnostics } from './diagnostics.js';
 import {
@@ -1160,22 +1161,23 @@ async function handleMessage(e: MessageEvent<GeometryWorkerRequest>): Promise<vo
       // them as the streaming-prepass protocol. SAB-decode fallback: try the
       // zero-copy view first, fall back to a materialised copy only if
       // wasm-bindgen rejects the view.
-      let view = viewSharedBytes(sharedBuffer);
-      let triedFallback = false;
       const onEvent = (event: unknown) => {
         (self as unknown as Worker).postMessage({ type: 'prepass-stream', event });
       };
+      const runPrepass = (bytes: Uint8Array) =>
+        ifcApi.buildPrePassStreaming(bytes, onEvent, chunkSize, disabledTypes, skipTypeGeometry);
       try {
-        ifcApi.buildPrePassStreaming(view, onEvent, chunkSize, disabledTypes, skipTypeGeometry);
+        // Zero-copy SAB view first; wasm-bindgen copies it into linear memory.
+        runPrepass(viewSharedBytes(sharedBuffer));
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        if (!triedFallback) {
-          triedFallback = true;
-          console.warn(`[Worker] Streaming prepass with SAB view failed (${msg}), retrying with copy`);
-          view = materialiseSharedBytes(sharedBuffer);
-          ifcApi.buildPrePassStreaming(view, onEvent, chunkSize, disabledTypes, skipTypeGeometry);
-        } else {
-          throw err;
+        console.warn(`[Worker] Streaming prepass with SAB view failed (${msg}), retrying with copy`);
+        try {
+          runPrepass(materialiseSharedBytes(sharedBuffer));
+        } catch (retryErr) {
+          // Both paths trapped — on a very large model this is the wasm32 4GB
+          // limit; surface an actionable error instead of `unreachable executed`.
+          throw largeFilePrepassError(retryErr, sharedBuffer.byteLength) ?? retryErr;
         }
       }
       return;
