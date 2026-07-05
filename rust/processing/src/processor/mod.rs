@@ -1161,6 +1161,13 @@ pub fn process_geometry_streaming_filtered_with_options(
     // a hash get/insert; meshing runs outside it.
     let item_dedup_cache = GeometryRouter::new_dedup_cache();
 
+    // Shared IfcMappedItem source cache for the whole model (#1623): every per-job
+    // router (built fresh per element below) meshes each RepresentationMap source
+    // once against it, instead of once per owning element — the per-router RefCell
+    // cache only dedups within a single element's own mapped items. The lock is
+    // held only for a source-mesh get/insert; the meshing runs outside it.
+    let mapped_item_cache = GeometryRouter::new_mapped_item_cache();
+
     // Per-part point-cache instrumentation (feeds `ProcessingStats` and, through
     // it, `PipelineDiagnostics`). `hits`/`misses` count CartesianPoints served
     // by `EntityDecoder::get_polyloop_coords_cached` across every faceted part;
@@ -1345,6 +1352,7 @@ pub fn process_geometry_streaming_filtered_with_options(
                     &rect_fast_collector,
                     &backstop_collector,
                     &item_dedup_cache,
+                    &mapped_item_cache,
                     worker_point_cache,
                     worker_placement_cache,
                     &point_cache_hits_collector,

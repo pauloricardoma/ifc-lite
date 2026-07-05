@@ -148,6 +148,21 @@ impl IfcAPI {
             router.enable_content_dedup_shared(cache);
         }
 
+        // Arm the shared IfcMappedItem source cache (#1623) against the per-worker
+        // cache so a RepresentationMap source shared across owning elements is
+        // meshed ONCE across batches, not once per batch. Held on the IfcApi like
+        // the item-dedup cache above (one per worker session).
+        {
+            let mut slot = self
+                .cached_mapped_item
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let cache = slot
+                .get_or_insert_with(GeometryRouter::new_mapped_item_cache)
+                .clone();
+            router.enable_shared_mapped_item_cache(cache);
+        }
+
         // Attach the per-content material-layer index so single-solid walls and
         // slabs carrying an IfcMaterialLayerSetUsage slice into one coloured
         // sub-mesh per layer (#563). Built once per load and Arc-shared across

@@ -723,34 +723,45 @@ impl GeometryRouter {
             None
         };
 
-        // Check cache first
-        {
-            let cache = self.mapped_item_cache.borrow();
-            if let Some(cached_mesh) = cache.get(&source_id) {
-                let mut mesh = cached_mesh.as_ref().clone();
-                let mut local_rm = None;
-                if let Some(mut transform) = mapping_transform {
-                    self.scale_transform(&mut transform);
-                    if instancing_enabled() {
-                        local_rm = Some(mat4_to_row_major(&transform));
-                    }
-                    self.transform_mesh_local(&mut mesh, &transform);
-                }
-                // Instancing: all occurrences of this RepresentationMap share the
-                // cached source-coords geometry; `local_transform` is the mapping
-                // (canonical -> element-local), `transform` is filled later by the
-                // element's apply_placement (element-local -> world).
+        // Check cache first. The model-wide shared cache (#1623) takes precedence
+        // over the per-router RefCell fallback so a source shared across owning
+        // elements is meshed once model-wide (a fresh router — hence a fresh
+        // RefCell — is built per element). Only a brief get/clone runs under the
+        // shared lock; the source build below (which nests faceted-brep's rayon
+        // `par_iter`) runs OUTSIDE any lock, so a lock is never held across a nested
+        // join (the #1587 deadlock class).
+        let cached_source: Option<Arc<Mesh>> = match &self.shared_mapped_item_cache {
+            Some(shared) => shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&source_id)
+                .cloned(),
+            None => self.mapped_item_cache.borrow().get(&source_id).cloned(),
+        };
+        if let Some(cached_mesh) = cached_source {
+            let mut mesh = cached_mesh.as_ref().clone();
+            let mut local_rm = None;
+            if let Some(mut transform) = mapping_transform {
+                self.scale_transform(&mut transform);
                 if instancing_enabled() {
-                    mesh.instance_meta = Some(InstanceMeta {
-                        transform: IDENTITY_ROW_MAJOR,
-                        local_transform: local_rm,
-                        canonical_transform: None,
-                        rep_identity: source_id as u128,
-                        instanceable: true,
-                    });
+                    local_rm = Some(mat4_to_row_major(&transform));
                 }
-                return Ok(mesh);
+                self.transform_mesh_local(&mut mesh, &transform);
             }
+            // Instancing: all occurrences of this RepresentationMap share the
+            // cached source-coords geometry; `local_transform` is the mapping
+            // (canonical -> element-local), `transform` is filled later by the
+            // element's apply_placement (element-local -> world).
+            if instancing_enabled() {
+                mesh.instance_meta = Some(InstanceMeta {
+                    transform: IDENTITY_ROW_MAJOR,
+                    local_transform: local_rm,
+                    canonical_transform: None,
+                    rep_identity: source_id as u128,
+                    instanceable: true,
+                });
+            }
+            return Ok(mesh);
         }
 
         // Cache miss - process the geometry
@@ -792,10 +803,33 @@ impl GeometryRouter {
             }
         }
 
-        // Store in cache (before transformation, so cached mesh is in source coordinates)
-        {
-            let mut cache = self.mapped_item_cache.borrow_mut();
-            cache.insert(source_id, Arc::new(mesh.clone()));
+        // Store in cache (before transformation, so cached mesh is in source
+        // coordinates). Shared model-wide cache first (#1623), else the per-router
+        // RefCell. A concurrent miss on the same source by another router rebuilds
+        // an identical source-coords mesh, so an overwrite here is byte-identical.
+        // Brief lock only — the source build above ran outside it (no join held).
+        let source_arc = Arc::new(mesh.clone());
+        match &self.shared_mapped_item_cache {
+            Some(shared) => {
+                // Mirror the item-dedup #1257 guard: a mapped source can contain
+                // IfcBooleanResult/IfcCsgSolid, and on a per-element CSG-budget trip
+                // the boolean bails and returns the UNCUT host. Caching that degraded
+                // source MODEL-WIDE would serve the wrong (uncut) mesh to a later
+                // occurrence in a fresh-budget element that would otherwise get the
+                // full exact cut. Skip the shared insert on a trip (or empty mesh) —
+                // the next occurrence re-meshes and a clean element caches it. The
+                // RefCell fallback arm below stays UNGUARDED: it is per-element
+                // (consistent budget within the element), reproducing main exactly.
+                if !mesh.positions.is_empty() && !crate::kernel::budget::tripped() {
+                    shared
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(source_id, source_arc);
+                }
+            }
+            None => {
+                self.mapped_item_cache.borrow_mut().insert(source_id, source_arc);
+            }
         }
 
         // Apply MappingTarget transformation to this instance

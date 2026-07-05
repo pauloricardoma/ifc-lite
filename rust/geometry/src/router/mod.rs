@@ -76,13 +76,50 @@ pub trait GeometryProcessor {
 /// meshed once regardless of how the work is partitioned across threads/batches.
 pub type ItemDedupCache = Arc<Mutex<FxHashMap<u128, Arc<Mesh>>>>;
 
+/// Shared `IfcMappedItem` source cache: maps an `IfcRepresentationMap` express id
+/// to its SOURCE-coordinate (pre-`MappingTarget`, pre-placement, colour-free) item
+/// mesh. Build ONE per loaded model with
+/// [`GeometryRouter::new_mapped_item_cache`] and inject it into every per-element /
+/// per-batch router via [`GeometryRouter::enable_shared_mapped_item_cache`], so a
+/// source shared by many owning elements is meshed ONCE model-wide instead of once
+/// per element (a fresh router is built per element, so the per-router RefCell
+/// `mapped_item_cache` only dedups WITHIN one element — #1623). The value is the
+/// same source-coords mesh the RefCell would store; the per-occurrence
+/// `MappingTarget` transform + `instance_meta` are applied by the caller AFTER the
+/// lookup, so a cross-router cache hit is byte-identical to a fresh build.
+///
+/// `Arc<Mutex<_>>` so ONE cache outlives any single router (mirrors
+/// [`ItemDedupCache`]). The key is the source express id, stable per model; all
+/// routers in one pass share the same `unit_scale` / `tessellation_quality` / RTC
+/// (baked into the source mesh), so keying by id alone is sufficient within a pass
+/// — the wasm session drops this cache on a content swap AND on a
+/// `setTessellationQuality` change (which invalidates source-coord tessellation),
+/// exactly as the router's own `set_tessellation_quality` clears the RefCell.
+pub type SharedMappedItemCache = Arc<Mutex<FxHashMap<u32, Arc<Mesh>>>>;
+
 /// Geometry router - routes entities to processors
 pub struct GeometryRouter {
     schema: IfcSchema,
     processors: HashMap<IfcType, Arc<dyn GeometryProcessor>>,
     /// Cache for IfcRepresentationMap source geometry (MappedItem instancing)
-    /// Key: RepresentationMap entity ID, Value: Processed mesh
+    /// Key: RepresentationMap entity ID, Value: Processed mesh.
+    ///
+    /// Per-router FALLBACK used when no [`SharedMappedItemCache`] is injected
+    /// (native single-shot / non-streaming callers, tests). A fresh router is
+    /// built per element, so this only dedups mapped sources WITHIN one element;
+    /// the shared cache below promotes reuse to model-wide (#1623).
     mapped_item_cache: RefCell<FxHashMap<u32, Arc<Mesh>>>,
+    /// SHARED `IfcMappedItem` source cache (#1623). When present, takes precedence
+    /// over the per-router `mapped_item_cache` so a source shared by many owning
+    /// elements is meshed ONCE model-wide (the per-router RefCell above resets per
+    /// element). Keyed by `IfcRepresentationMap` id ⇒ SOURCE-coords mesh; the
+    /// per-occurrence `MappingTarget` transform + `instance_meta` are applied AFTER
+    /// the lookup, so a cross-router hit is byte-identical to a fresh build. The
+    /// lock is held only for a map get/clone (hit) or insert (miss) — the source
+    /// meshing (which nests faceted-brep's rayon `par_iter`) runs OUTSIDE the lock,
+    /// so a lock is never held across a nested join (the #1587 deadlock class).
+    /// `None` ⇒ use the RefCell fallback.
+    shared_mapped_item_cache: Option<SharedMappedItemCache>,
     /// Cache for geometry deduplication by content hash
     /// Buildings with repeated floors have 99% identical geometry
     /// Key: Hash of mesh content, Value: Processed mesh
@@ -211,6 +248,7 @@ impl GeometryRouter {
             schema,
             processors: HashMap::new(),
             mapped_item_cache: RefCell::new(FxHashMap::default()),
+            shared_mapped_item_cache: None, // armed by `enable_shared_mapped_item_cache`
             geometry_hash_cache: RefCell::new(FxHashMap::default()),
             item_dedup_cache: None, // armed by `with_units` / `enable_content_dedup_shared`
             content_sig_memo: RefCell::new(FxHashMap::default()),
@@ -340,6 +378,25 @@ impl GeometryRouter {
         self.item_dedup_cache = Some(cache);
     }
 
+    /// A fresh empty shared `IfcMappedItem` source cache, to be cloned into every
+    /// per-element / per-batch router of ONE loaded model so a mapped source shared
+    /// across owning elements is meshed once model-wide (#1623). Mirrors
+    /// [`Self::new_dedup_cache`]. Keep one per model/pass: the cached meshes bake in
+    /// this pass's unit scale / tessellation quality.
+    pub fn new_mapped_item_cache() -> SharedMappedItemCache {
+        Arc::new(Mutex::new(FxHashMap::default()))
+    }
+
+    /// Inject a shared `IfcMappedItem` source cache (see
+    /// [`Self::new_mapped_item_cache`]) into this router. All routers given the
+    /// SAME `Arc` mesh each unique `IfcRepresentationMap` source once across the
+    /// whole model, instead of once per owning element (a fresh router is built per
+    /// element). Takes precedence over the per-router RefCell `mapped_item_cache`;
+    /// leaving it unset keeps the per-router fallback for single-shot callers.
+    pub fn enable_shared_mapped_item_cache(&mut self, cache: SharedMappedItemCache) {
+        self.shared_mapped_item_cache = Some(cache);
+    }
+
     /// Disable content-dedup (drops the cache reference so `item_dedup_key`
     /// returns `None` and meshing is never skipped). Test/bench helper for an A/B
     /// against the deduped path.
@@ -351,6 +408,18 @@ impl GeometryRouter {
     /// pipeline recovered (vs. the meshed-item count). Diagnostics.
     pub fn dedup_unique_count(&self) -> usize {
         self.item_dedup_cache
+            .as_ref()
+            .map(|c| c.lock().unwrap_or_else(|e| e.into_inner()).len())
+            .unwrap_or(0)
+    }
+
+    /// Number of unique `IfcRepresentationMap` sources meshed into the SHARED
+    /// mapped-item cache so far (0 when no shared cache is injected — the RefCell
+    /// fallback isn't counted). Diagnostics, mirroring [`Self::dedup_unique_count`];
+    /// used by the #1623 A/B test to confirm the shared cache actually captured
+    /// sources (so a cross-router hit is genuinely exercised, not a no-op).
+    pub fn mapped_shared_unique_count(&self) -> usize {
+        self.shared_mapped_item_cache
             .as_ref()
             .map(|c| c.lock().unwrap_or_else(|e| e.into_inner()).len())
             .unwrap_or(0)

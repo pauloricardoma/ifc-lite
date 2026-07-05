@@ -162,7 +162,7 @@ pub use router::{
     GEOMETRY_DIAGNOSTICS_SCHEMA_VERSION,
     ClassificationSummary, GeometryDiagnostics, GeometryProcessor, GeometryRouter,
     HostOpeningDiagnostic, ItemDedupCache, OpeningDiagnostic, OpeningKindDiag, ReasonCount,
-    RectFastSummary, RectParam, WorstHost,
+    RectFastSummary, RectParam, SharedMappedItemCache, WorstHost,
 };
 
 /// The streaming / needs-shift large-coordinate threshold (metres): a world
