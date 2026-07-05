@@ -132,6 +132,11 @@ pub(super) fn process_entity_job(
     // Model-wide content-dedup cache shared by every per-job router so identical
     // geometry is meshed once across the rayon pool (#1109 follow-up).
     item_dedup_cache: &ifc_lite_geometry::ItemDedupCache,
+    // Model-wide IfcMappedItem source cache shared by every per-job router so a
+    // RepresentationMap source shared across owning elements is meshed once
+    // model-wide instead of once per element (a fresh router is built per element,
+    // so its RefCell cache only dedups within one element) — #1623.
+    mapped_item_cache: &ifc_lite_geometry::SharedMappedItemCache,
     // The current rayon worker's PERSISTENT CartesianPoint cache, reused across
     // every element that worker meshes for the whole model (see the
     // `worker_point_caches` store at the call site). Moved into this job's decoder
@@ -182,6 +187,7 @@ pub(super) fn process_entity_job(
     let mut local_router = GeometryRouter::with_scale_and_quality(unit_scale, tessellation_quality);
     local_router.set_rtc_offset(rtc_offset);
     local_router.enable_content_dedup_shared(item_dedup_cache.clone());
+    local_router.enable_shared_mapped_item_cache(mapped_item_cache.clone());
     let local_router = local_router;
 
     let metadata = crate::element::ElementMeshMetadata {

@@ -83,6 +83,16 @@ pub struct IfcAPI {
     /// `cached_entity_index`.
     cached_item_dedup: std::sync::Mutex<Option<ifc_lite_geometry::ItemDedupCache>>,
 
+    /// Per-worker shared `IfcMappedItem` source cache (#1623). The `GeometryRouter`
+    /// is rebuilt every `processGeometryBatch`, so its per-router `mapped_item_cache`
+    /// would reset each batch and only dedup within a batch. Holding ONE cache here
+    /// and injecting it into every batch router meshes each RepresentationMap source
+    /// once across the whole worker's workload. Built lazily on first batch; one
+    /// model per `IfcApi` instance, exactly like `cached_item_dedup`. Dropped on a
+    /// content swap AND on `setTessellationQuality` (a quality change invalidates
+    /// the source-coord tessellation — the key is the source id, not the quality).
+    cached_mapped_item: std::sync::Mutex<Option<ifc_lite_geometry::SharedMappedItemCache>>,
+
     /// When `true`, `processGeometryBatch` suppresses geometry emission for
     /// every `IfcBuildingElementPart` whose `IfcRelAggregates` parent (a) has
     /// its own `Representation` and (b) is marked `Sliceable` in
@@ -239,6 +249,7 @@ impl IfcAPI {
             cached_entity_index: std::sync::Mutex::new(None),
             cached_source_bytes: std::sync::Mutex::new(None),
             cached_item_dedup: std::sync::Mutex::new(None),
+            cached_mapped_item: std::sync::Mutex::new(None),
             merge_layers: std::sync::atomic::AtomicBool::new(false),
             cached_parts_to_skip: std::sync::Mutex::new(None),
             cached_material_layer_index: std::sync::Mutex::new(None),
@@ -342,6 +353,14 @@ impl IfcAPI {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
+        // The mapped-item source cache holds the previous model's source meshes,
+        // keyed by RepresentationMap id (baking in that load's unit scale /
+        // tessellation quality). Drop it so a new file on the same reused IfcAPI
+        // starts empty (#1623).
+        self.cached_mapped_item
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         // NB: do NOT reset pipeline_diagnostics here. clearPrePassCache runs in
         // the JS load wrapper's `finally` AFTER the last processGeometryBatch
         // (packages/geometry/src/index.ts), i.e. end-of-load cleanup; resetting
@@ -434,6 +453,13 @@ impl IfcAPI {
         // on content swap so a reused IfcAPI starts the new file with an empty
         // cache (bounds memory across loads).
         self.cached_item_dedup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        // The mapped-item source cache holds the previous model's source meshes —
+        // drop it on content swap so a reused IfcAPI starts the new file empty
+        // (bounds memory across loads; #1623).
+        self.cached_mapped_item
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
@@ -619,6 +645,17 @@ impl IfcAPI {
         };
         self.tessellation_quality
             .store(discriminant, std::sync::atomic::Ordering::Relaxed);
+        // The mapped-item source cache is keyed by RepresentationMap id, not by
+        // quality, and bakes in the tessellation density of its curved sub-items.
+        // A quality change would otherwise serve stale-density source meshes across
+        // subsequent batches, so drop it here — mirroring the router's own
+        // `set_tessellation_quality`, which clears its per-router `mapped_item_cache`
+        // for the same reason. (The content-dedup cache folds quality INTO its key,
+        // so it needs no such clear.)
+        self.cached_mapped_item
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         Ok(())
     }
 

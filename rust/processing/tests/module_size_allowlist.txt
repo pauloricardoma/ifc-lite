@@ -63,7 +63,8 @@
      586 rust/geometry/src/router/diagnostics.rs
      659 rust/geometry/src/router/layers.rs
 # +1: unify body-rep predicate — added is_direct_body_representation + docs; net removes ~60 lines from processing.rs and ~12 from layers.rs (crate trends down).
-     573 rust/geometry/src/router/mod.rs
+# +65: promote the per-router IfcMappedItem source cache to a model-wide SharedMappedItemCache (type alias + field + new_/enable_ setters + unique-count diagnostic), meshing each source once model-wide (#1623).
+     638 rust/geometry/src/router/mod.rs
     1072 rust/geometry/src/router/processing.rs
 # +26: is_rtc_votable_representation predicate + doc — Surface3D is meshable but must NOT cast RTC votes (#1526 pollution via absolute-coord surfaces).
      472 rust/geometry/src/router/rtc_offset.rs
@@ -89,15 +90,19 @@
 # +24: build the entity index INLINE in the scan loop instead of a separate build_entity_index pass (perf/single-scan; one file walk instead of two).
 # +15: try_lock the per-worker point cache to fix the nested-par_iter re-entrancy self-deadlock (#1572 regression).
 # +20: add the per-worker placement-transform cache store + its try_lock slot acquisition, mirroring the point cache (perf/placement-cache).
-    1533 rust/processing/src/processor/mod.rs
+# +8: construct one model-wide shared IfcMappedItem source cache per process_geometry pass and inject it into each per-job router (#1623).
+    1541 rust/processing/src/processor/mod.rs
      440 rust/processing/src/symbolic/items.rs
 # +6: wire per-batch point-cache hit/miss stats into record_pipeline_batch (perf/brep-point-cache-instrumentation).
-     773 rust/wasm-bindings/src/api/gpu_meshes/batch.rs
+# +13: attach the per-worker shared IfcMappedItem source cache to each batch router, mirroring the item-dedup attach (#1623).
+     786 rust/wasm-bindings/src/api/gpu_meshes/batch.rs
 # +108: build the referenced-repmaps + instantiated-type-id sets and the material-layer index ONCE in the streaming pre-pass (from spans this scan already collected) and emit them as a `prepass-columns` event, so every geometry worker skips its own full-file walk on the first batch (perf/single-scan #957/#563).
      735 rust/wasm-bindings/src/api/gpu_meshes/prepass.rs
      436 rust/wasm-bindings/src/api/grid_lines.rs
 # +75: add the setReferencedRepmaps / setInstantiatedTypeIds / setMaterialLayerIndex wasm setters that install the pre-pass-computed per-content structures into the worker's IfcAPI (perf/single-scan #957/#563), mirroring setEntityIndex.
 # +23: add the cached_source_bytes session field (doc + init + clearPrePassCache drop) for cold-load lever 1c (setSourceBytes); the setter + FromSource batch variants live in the new sub-400 gpu_meshes/batch_from_source.rs, not here (perf/coldload-setsourcebytes).
-     976 rust/wasm-bindings/src/api/mod.rs
+# +37: hold the per-worker shared IfcMappedItem source cache field + drop it on content swap / setEntityIndex / setTessellationQuality, mirroring cached_item_dedup (#1623).
+# +10: drop the shared mapped-item cache in set_skip_small_cuts too (boolean-processor swap; #1623 P1 settings-hole fix).
+     1013 rust/wasm-bindings/src/api/mod.rs
      692 rust/wasm-bindings/src/zero_copy/mesh.rs
      743 rust/wasm-bindings/src/zero_copy/symbolic.rs
