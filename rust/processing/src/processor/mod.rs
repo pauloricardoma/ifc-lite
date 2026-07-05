@@ -156,6 +156,16 @@ pub struct StreamingOptions {
     /// so it must not present the result as a completed parse. Used by the
     /// server to stop burning a core when an SSE client disconnects.
     pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Emit product-level `IfcMappedItem` occurrences as INSTANCES instead of
+    /// materializing a full world-space mesh per occurrence (#1623). When a
+    /// product's representation is a single mapped item onto a shared
+    /// `IfcRepresentationMap`, the map's LOCAL geometry is meshed once (a
+    /// class-2 template) and each occurrence emits only a lightweight instance
+    /// record (placement transform + colour + element id) via `InstanceMeta`.
+    /// On instance-heavy models (metering stations, MEP) this skips the
+    /// per-occurrence 43M-vertex materialize. `false` reproduces the historical
+    /// materialized output byte-for-byte (determinism/parity unaffected).
+    pub enable_instancing: bool,
 }
 
 impl Default for StreamingOptions {
@@ -171,6 +181,7 @@ impl Default for StreamingOptions {
             tessellation_quality: TessellationQuality::default(),
             entity_index: None,
             cancel: None,
+            enable_instancing: false,
         }
     }
 }
