@@ -74,3 +74,12 @@ opt-level = 3
 
 [profile.dev.package.ifc-lite-geometry]
 opt-level = 3
+
+# ifc-lite fork of bnum 0.14.4: on wasm32 the exact-CSG-kernel schoolbook uses u32
+# digits instead of u128, replacing a `__multi3` software libcall per partial
+# product with a single `i64.mul` (-9% single-thread geometry time on a CSG-dense
+# model, byte-identical output). Native codegen is unchanged. See
+# `third_party/bnum/README.md`; the ONLY functional diff vs crates.io 0.14.4 is
+# `src/integer/overflowing.rs` (auditable with `diff`).
+[patch.crates-io]
+bnum = { path = "third_party/bnum" }

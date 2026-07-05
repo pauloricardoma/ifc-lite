@@ -91,6 +91,11 @@ bnum = { version = "0.14.4", features = ["numtraits"] }
 
 [dev-dependencies]
 approx = "0.5"
+# Exercised directly by tests/wide_mul_bit_identity.rs, the differential gate for
+# the wasm32 u32-digit multiply fork (third_party/bnum). Same crate/version as the
+# regular dependency above; the workspace `[patch.crates-io]` points both at the
+# in-tree fork.
+bnum = { version = "0.14.4", features = ["numtraits"] }
 # JSON serialization for the GeometryDiagnostics camelCase-contract test (asserts
 # the serde rename_all keys match the @ifc-lite/geometry TS interface).
 serde_json = "1.0"
