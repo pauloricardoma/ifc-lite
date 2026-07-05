@@ -434,6 +434,13 @@ impl GeometryRouter {
                     .filter(|&(count, _)| count >= 2)
                     .and_then(|(count, template_item_id)| {
                         self.mapped_source_single_item(&mapped_repr, decoder)
+                            // #858: a source whose single solid carries an
+                            // IfcIndexedColourMap must materialize flat so
+                            // emit_sub_meshes can split it into one mesh per palette
+                            // group. An instance placeholder resolves ONE colour,
+                            // collapsing the palette (WRONG vs the flat path); route
+                            // to flat instead (byte-identical to instancing-off).
+                            .filter(|&item_id| !self.is_indexed_colour_split_source(item_id))
                             .map(|item_id| (count, template_item_id, item_id))
                     })
             } else {

@@ -222,6 +222,14 @@ pub struct GeometryRouter {
     /// an instance-only placeholder instead. Scoped to this router (one per loaded
     /// build), like `skip_small_cuts`.
     output_instancing_plan: Option<MappedInstancePlan>,
+    /// #858 don't-bake exclusion: geometry-item ids of mapped SOURCES whose single
+    /// solid carries an `IfcIndexedColourMap` (per-triangle palette). Such a source
+    /// must NOT don't-bake — the flat path splits it into one mesh per palette group
+    /// (`split_mesh_by_indexed_colour`), but an instance placeholder resolves ONE
+    /// colour, collapsing the palette. Armed alongside the plan; when a candidate's
+    /// single-solid id is in this set the router routes it to the normal flat
+    /// materialize (byte-identical to instancing-off). `None`/empty ⇒ no exclusion.
+    indexed_colour_split_ids: Option<Arc<FxHashSet<u32>>>,
 }
 
 /// Whether an `IfcShapeRepresentation.RepresentationType` names a meshable
@@ -287,6 +295,7 @@ impl GeometryRouter {
             tessellation_quality: TessellationQuality::Medium,
             skip_small_cuts: false,
             output_instancing_plan: None, // armed by `enable_output_instancing`
+            indexed_colour_split_ids: None, // armed by `enable_indexed_colour_split_guard`
         };
 
         // Register default P0 processors
@@ -433,6 +442,25 @@ impl GeometryRouter {
     /// The armed don't-bake plan, if any (see [`Self::enable_output_instancing`]).
     pub(super) fn output_instancing_plan(&self) -> Option<&MappedInstancePlan> {
         self.output_instancing_plan.as_ref()
+    }
+
+    /// Arm the #858 don't-bake exclusion set: geometry-item ids of mapped sources
+    /// whose single solid carries an `IfcIndexedColourMap`. Such a source is routed
+    /// to the flat materialize (per-palette split) instead of don't-bake, so its
+    /// occurrences keep the per-triangle palette (an instance placeholder would
+    /// collapse it to one colour). Armed alongside [`Self::enable_output_instancing`]
+    /// when the model has any indexed-colour maps; unset ⇒ no exclusion.
+    pub fn enable_indexed_colour_split_guard(&mut self, ids: Arc<FxHashSet<u32>>) {
+        self.indexed_colour_split_ids = Some(ids);
+    }
+
+    /// Whether `geometry_id` is a mapped-source solid carrying an `IfcIndexedColourMap`
+    /// (see [`Self::enable_indexed_colour_split_guard`]) — such a source must not
+    /// don't-bake, so its per-triangle palette survives the flat split.
+    pub(super) fn is_indexed_colour_split_source(&self, geometry_id: u32) -> bool {
+        self.indexed_colour_split_ids
+            .as_ref()
+            .is_some_and(|ids| ids.contains(&geometry_id))
     }
 
     /// Disable content-dedup (drops the cache reference so `item_dedup_key`

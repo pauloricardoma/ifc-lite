@@ -1235,6 +1235,17 @@ pub fn process_geometry_streaming_filtered_with_options(
                     .collect::<FxHashMap<u32, (u32, u32)>>(),
             )
         });
+    // #858 don't-bake exclusion: geometry ids carrying an IfcIndexedColourMap. A
+    // mapped source whose single solid is one of these must NOT don't-bake — the flat
+    // path splits it into one mesh per palette group (element.rs `emit_sub_meshes`),
+    // but an instance placeholder resolves ONE colour, collapsing the palette. Built
+    // only when the plan is armed AND there are indexed-colour maps; armed on every
+    // per-job router so the guard routes those occurrences to flat (byte-identical to
+    // instancing-off). `indexed_colour_full` is keyed by the same face-set id the
+    // router resolves as the source's single solid, so the ids line up 1:1.
+    let indexed_colour_split_ids: Option<Arc<FxHashSet<u32>>> = (instancing_plan.is_some()
+        && !indexed_colour_full.is_empty())
+    .then(|| Arc::new(indexed_colour_full.keys().copied().collect::<FxHashSet<u32>>()));
     // Collect the don't-bake occurrences across all chunks/threads; resolved into
     // `InstanceRecord`s against the retained template meshes after the geometry phase.
     let raw_instance_collector: std::sync::Mutex<Vec<RawInstanceOccurrence>> =
@@ -1426,6 +1437,7 @@ pub fn process_geometry_streaming_filtered_with_options(
                     &item_dedup_cache,
                     &mapped_item_cache,
                     instancing_plan.as_ref(),
+                    indexed_colour_split_ids.as_ref(),
                     &raw_instance_collector,
                     worker_point_cache,
                     worker_placement_cache,

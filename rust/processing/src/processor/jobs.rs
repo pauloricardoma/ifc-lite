@@ -140,6 +140,11 @@ pub(super) fn process_entity_job(
     // #1623 Phase 2: don't-bake plan (Some only when enabled) armed on this job's
     // router, + the shared sink for its emitted don't-bake occurrences.
     instancing_plan: Option<&ifc_lite_geometry::MappedInstancePlan>,
+    // #858: geometry ids of mapped sources carrying an IfcIndexedColourMap (Some only
+    // when the plan is armed AND the model has indexed-colour maps). Armed on this
+    // job's router so such a source materializes flat (per-palette split) instead of
+    // don't-bake, keeping its per-triangle palette.
+    indexed_colour_split_ids: Option<&std::sync::Arc<rustc_hash::FxHashSet<u32>>>,
     raw_instance_collector: &std::sync::Mutex<Vec<crate::RawInstanceOccurrence>>,
     // The current rayon worker's PERSISTENT CartesianPoint cache, reused across
     // every element that worker meshes for the whole model (see the
@@ -196,6 +201,11 @@ pub(super) fn process_entity_job(
     // mapped source emit instance placeholders instead of full meshes.
     if let Some(plan) = instancing_plan {
         local_router.enable_output_instancing(plan.clone());
+        // #858: exclude indexed-colour sources from don't-bake so their per-triangle
+        // palette survives the flat split (only meaningful with the plan armed).
+        if let Some(ids) = indexed_colour_split_ids {
+            local_router.enable_indexed_colour_split_guard(ids.clone());
+        }
     }
     let local_router = local_router;
 

@@ -35,8 +35,12 @@ fn sample_bytes() -> Vec<u8> {
 /// `IfcBuildingElementProxy` occurrences at distinct placements — exercises the
 /// don't-bake path at scale (63 skipped materializes, one template).
 fn synthetic_bytes() -> Vec<u8> {
+    fixture_bytes("mapped_instances_synthetic.ifc")
+}
+
+fn fixture_bytes(name: &str) -> Vec<u8> {
     let path = format!(
-        "{}/../geometry/tests/fixtures/mapped_instances_synthetic.ifc",
+        "{}/../geometry/tests/fixtures/{name}",
         env!("CARGO_MANIFEST_DIR")
     );
     std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))
@@ -215,6 +219,174 @@ fn assert_reduction(bytes: &[u8], label: &str) {
     );
     // Reference the type so the import stays load-bearing regardless of assertions.
     let _: fn(&InstanceRecord) -> u32 = |r| r.express_id;
+}
+
+/// Byte-exact canonical key for one mesh: every geometry-bearing field folded to
+/// its raw bits (f32/f64 via `to_bits`), so two keys are equal iff the meshes are
+/// byte-identical. Metadata that is out of the geometry contract (instance_meta,
+/// local_bounds — all `#[serde(skip)]`, recomputed each load) is excluded.
+fn mesh_key(m: &MeshData) -> Vec<u8> {
+    let mut k = Vec::new();
+    k.extend_from_slice(&m.express_id.to_le_bytes());
+    k.extend_from_slice(m.ifc_type.as_bytes());
+    k.push(0);
+    k.extend_from_slice(&m.geometry_item_id.unwrap_or(u32::MAX).to_le_bytes());
+    k.push(m.geometry_class);
+    for c in m.color {
+        k.extend_from_slice(&c.to_bits().to_le_bytes());
+    }
+    for o in m.origin {
+        k.extend_from_slice(&o.to_bits().to_le_bytes());
+    }
+    for p in &m.positions {
+        k.extend_from_slice(&p.to_bits().to_le_bytes());
+    }
+    for n in &m.normals {
+        k.extend_from_slice(&n.to_bits().to_le_bytes());
+    }
+    for i in &m.indices {
+        k.extend_from_slice(&i.to_le_bytes());
+    }
+    k
+}
+
+/// The full geometry-bearing MeshData stream as an order-independent multiset of
+/// byte-exact keys (parallel meshing emits in nondeterministic order, so sort).
+fn mesh_stream(meshes: &[MeshData]) -> Vec<Vec<u8>> {
+    let mut v: Vec<Vec<u8>> = meshes
+        .iter()
+        .filter(|m| !m.positions.is_empty())
+        .map(mesh_key)
+        .collect();
+    v.sort();
+    v
+}
+
+/// Distinct colours (bit-exact) emitted per element id.
+fn distinct_colors_by_expr(meshes: &[MeshData]) -> FxHashMap<u32, std::collections::HashSet<[u32; 4]>> {
+    let mut out: FxHashMap<u32, std::collections::HashSet<[u32; 4]>> = FxHashMap::default();
+    for m in meshes.iter().filter(|m| !m.positions.is_empty()) {
+        let bits = [
+            m.color[0].to_bits(),
+            m.color[1].to_bits(),
+            m.color[2].to_bits(),
+            m.color[3].to_bits(),
+        ];
+        out.entry(m.express_id).or_default().insert(bits);
+    }
+    out
+}
+
+/// Fix B — a georeferenced (`site_local`) mapped-instance model must produce output
+/// BYTE-IDENTICAL with `enable_instancing` ON vs OFF: the site-local guard routes the
+/// whole model to the flat path (zero `InstanceRecord`s, identical flat MeshData
+/// stream). This proves no perf-regression re-bake AND no misplacement on a
+/// translated/rotated site — the don't-bake path (which drops the template's
+/// `instance_meta` in the site frame) never arms there. The eligibility is real: the
+/// same repeated single-solid source instances at the origin tier (see the synthetic
+/// test), so ONLY the coordinate tier keeps it flat.
+fn assert_georef_routes_to_flat(bytes: &[u8], label: &str) {
+    let flat = run(bytes, false);
+    let inst = run(bytes, true);
+
+    assert_eq!(
+        inst.mesh_coordinate_space.as_deref(),
+        Some("site_local"),
+        "{label}: expected the site-local coordinate tier (the georef path under test)"
+    );
+    // The don't-bake plan must NOT have armed: no InstanceRecords on a site-local model.
+    assert!(
+        inst.instances.is_empty(),
+        "{label}: site-local model produced {} InstanceRecords — the guard did not route to flat",
+        inst.instances.len()
+    );
+    // Genuine multi-occurrence single-solid source (would instance at the origin tier):
+    // at least two occurrences, all sharing one geometry (identical vertex counts).
+    let occ = flat.meshes.iter().filter(|m| !m.positions.is_empty()).count();
+    assert!(
+        occ >= 2,
+        "{label}: expected a repeated mapped source (>=2 occurrences), got {occ}"
+    );
+    // The hard gate: instanced-ON output is byte-identical to instanced-OFF output.
+    assert_eq!(
+        mesh_stream(&flat.meshes),
+        mesh_stream(&inst.meshes),
+        "{label}: site-local instanced-ON MeshData stream differs from instanced-OFF (byte-identity broken)"
+    );
+    eprintln!("[#1623 P2 georef] {label}: site_local, {occ} occurrences, 0 instance records, ON==OFF byte-identical");
+}
+
+/// Fix A (#858) — an indexed-colour mapped source must render the SAME per-triangle
+/// palette whether instancing is ON or OFF. The source sits at the origin tier (the
+/// plan DOES arm), so the ONLY thing keeping it flat is the indexed-colour guard; an
+/// instance placeholder would resolve ONE colour and collapse the palette. Proven by
+/// (1) each occurrence carrying >=2 distinct split-group colours, and (2) full
+/// byte-identity of the ON vs OFF MeshData stream.
+fn assert_indexed_colour_palette_preserved(bytes: &[u8], label: &str) {
+    let flat = run(bytes, false);
+    let inst = run(bytes, true);
+
+    assert_eq!(
+        inst.mesh_coordinate_space.as_deref(),
+        Some("raw_ifc"),
+        "{label}: expected the origin tier so the don't-bake plan actually arms (only the \
+         indexed-colour guard should keep this source flat)"
+    );
+    // Routed to flat by the palette guard, not instanced.
+    assert!(
+        inst.instances.is_empty(),
+        "{label}: indexed-colour source produced {} InstanceRecords — the palette guard did not fire",
+        inst.instances.len()
+    );
+
+    // The split fired: EVERY occurrence has >=2 distinct palette-group colours in BOTH
+    // runs (the buggy don't-bake collapsed non-template occurrences to one colour).
+    for (run_label, res) in [("flat", &flat), ("instanced", &inst)] {
+        for (expr, colors) in distinct_colors_by_expr(&res.meshes) {
+            assert!(
+                colors.len() >= 2,
+                "{label} ({run_label}): occurrence {expr} has {} distinct colour(s); the #858 \
+                 palette split must yield >=2 (palette collapsed?)",
+                colors.len()
+            );
+        }
+    }
+
+    // The hard gate: instanced-ON palette output is byte-identical to instanced-OFF.
+    assert_eq!(
+        mesh_stream(&flat.meshes),
+        mesh_stream(&inst.meshes),
+        "{label}: indexed-colour instanced-ON MeshData stream differs from instanced-OFF \
+         (palette not preserved bit-for-bit)"
+    );
+    eprintln!(
+        "[#858 indexed-colour] {label}: {} occurrence meshes, per-triangle palette preserved, ON==OFF byte-identical",
+        inst.meshes.iter().filter(|m| !m.positions.is_empty()).count()
+    );
+}
+
+#[test]
+fn georef_translated_site_routes_to_flat_byte_identical() {
+    assert_georef_routes_to_flat(
+        &fixture_bytes("mapped_instances_site_translated.ifc"),
+        "site-translated",
+    );
+}
+
+#[test]
+fn georef_rotated_site_routes_to_flat_byte_identical() {
+    assert_georef_routes_to_flat(
+        &fixture_bytes("mapped_instances_site_rotated.ifc"),
+        "site-rotated",
+    );
+}
+
+#[test]
+fn indexed_colour_source_palette_survives_instancing() {
+    assert_indexed_colour_palette_preserved(
+        &fixture_bytes("mapped_instances_indexed_colour.ifc"),
+        "indexed-colour",
+    );
 }
 
 #[test]
