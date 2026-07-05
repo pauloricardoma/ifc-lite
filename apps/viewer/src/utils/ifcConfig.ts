@@ -56,10 +56,13 @@ export const CACHE_MAX_SOURCE_SIZE = 150 * 1024 * 1024;
  *  the `fallbackSourceBuffer` path `loadFromCache` already supports), so repeat
  *  opens skip the 10-90s parse+mesh while keeping full feature fidelity.
  *
- *  The hit is validated by the strengthened, spread-sampled cache key
- *  (`sourceFingerprint.ts`) — a key match means the exact byte length AND a
- *  64-bit hash of a ~160KB spread match — so repeat opens do no full-file hash
- *  and have no main-thread stall. */
+ *  The spread-sampled cache key (`sourceFingerprint.ts`) only keys the lookup;
+ *  because it hydrates cached geometry against the FRESH buffer, a hit is
+ *  VALIDATED by the source File's `lastModified` (mtime guard) plus a TRUE
+ *  full-file hash re-checked off the main thread (see
+ *  `cacheTier.decideMeshOnlyCacheHit` + `utils/sourceContentHash.ts`), so a
+ *  changed source is a safe miss/reload rather than a silent chimera — with no
+ *  main-thread stall on the repeat open. */
 export const CACHE_MESH_ONLY_MAX_SIZE = 400 * 1024 * 1024;
 
 /**

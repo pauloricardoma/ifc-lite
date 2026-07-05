@@ -5,7 +5,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 
-import { classifyCacheTier, planCacheWrite, type CacheTierOptions } from './cacheTier.js';
+import { classifyCacheTier, planCacheWrite, decideMeshOnlyCacheHit, type CacheTierOptions } from './cacheTier.js';
 
 // Mirror the production constants (ifcConfig.ts). Not imported: ifcConfig reads
 // import.meta.env at module load and can't be evaluated under `node:test`.
@@ -77,5 +77,39 @@ describe('planCacheWrite', () => {
     // Kill switch: a 150-400MB file is not cached when the tier is disabled.
     const disabled = planCacheWrite(MAX_SOURCE + 1, off);
     assert.deepEqual(disabled, { tier: 'none', shouldCache: false, persistSource: false });
+  });
+});
+
+describe('decideMeshOnlyCacheHit', () => {
+  it('MISSES when the fresh mtime differs from the stored one (a real on-disk edit)', () => {
+    assert.equal(
+      decideMeshOnlyCacheHit({ storedMtime: 1000, freshMtime: 2000, hasFullHash: true }),
+      'miss',
+    );
+    // Even without a full hash to fall back on, a changed mtime is a miss.
+    assert.equal(
+      decideMeshOnlyCacheHit({ storedMtime: 1000, freshMtime: 2000, hasFullHash: false }),
+      'miss',
+    );
+  });
+
+  it('SERVES when the mtimes match (then the caller background-revalidates)', () => {
+    assert.equal(
+      decideMeshOnlyCacheHit({ storedMtime: 1000, freshMtime: 1000, hasFullHash: true }),
+      'serve',
+    );
+    assert.equal(
+      decideMeshOnlyCacheHit({ storedMtime: 1000, freshMtime: 1000, hasFullHash: false }),
+      'serve',
+    );
+  });
+
+  it('when mtime is UNAVAILABLE, serves only if a full hash can revalidate (never serve unvalidated)', () => {
+    // 0 / undefined mtime = unknown. With a full hash → serve (background check
+    // will validate); without one → miss (don't serve unvalidated).
+    assert.equal(decideMeshOnlyCacheHit({ storedMtime: 0, freshMtime: 1000, hasFullHash: true }), 'serve');
+    assert.equal(decideMeshOnlyCacheHit({ storedMtime: 0, freshMtime: 1000, hasFullHash: false }), 'miss');
+    assert.equal(decideMeshOnlyCacheHit({ freshMtime: 1000, hasFullHash: true }), 'serve');
+    assert.equal(decideMeshOnlyCacheHit({ hasFullHash: false }), 'miss');
   });
 });

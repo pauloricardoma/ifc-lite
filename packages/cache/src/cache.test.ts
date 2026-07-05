@@ -313,28 +313,45 @@ describe('BinaryCacheWriter and BinaryCacheReader', () => {
     expect(header.sections.length).toBeGreaterThan(0);
   });
 
-  it('stores a precomputed sourceHash verbatim and skips the full-file hash', async () => {
-    // The mesh-only tier passes the cheap spread-sample hash so a 400MB source
-    // never pays a full-file main-thread hash on write. A value that is NOT the
-    // real xxhash64(sourceBuffer) proves the writer used ours, not the buffer.
-    const provided = 0x0123456789abcdefn;
-    expect(provided).not.toBe(xxhash64(sourceBuffer));
-
+  it('default write embeds a real full-file xxhash64 and validate() works', async () => {
     const writer = new BinaryCacheWriter();
     const cacheBuffer = await writer.write(dataStore, undefined, sourceBuffer, {
       includeGeometry: false,
-      sourceHash: provided,
     });
+    const reader = new BinaryCacheReader();
+    const header = reader.readHeader(cacheBuffer);
 
-    const header = new BinaryCacheReader().readHeader(cacheBuffer);
-    expect(header.sourceHash).toBe(provided);
+    expect(header.hasSourceHash).toBe(true);
+    expect(header.sourceHash).toBe(xxhash64(sourceBuffer));
+    expect(reader.validate(cacheBuffer, sourceBuffer)).toBe(true);
   });
 
-  it('mesh-only write (provided hash, no persisted source) round-trips geometry byte-identical', async () => {
+  it('omitSourceHash skips the full-file hash and flags the header (SourceHashUnset)', async () => {
+    // The mesh-only tier omits the header hash so a 400MB source pays no
+    // full-file main-thread hash on write; it validates the source another way
+    // (mtime + an app-layer content hash). The header must self-describe this so
+    // a future reader.validate() / read({sourceBuffer}) can't silently fail-close.
+    const writer = new BinaryCacheWriter();
+    const cacheBuffer = await writer.write(dataStore, undefined, sourceBuffer, {
+      includeGeometry: false,
+      omitSourceHash: true,
+    });
+    const reader = new BinaryCacheReader();
+    const header = reader.readHeader(cacheBuffer);
+
+    expect(header.hasSourceHash).toBe(false);
+    expect(header.sourceHash).toBe(0n);
+    // validate() refuses (throws) rather than returning a misleading false.
+    expect(() => reader.validate(cacheBuffer, sourceBuffer)).toThrow(/SourceHashUnset/);
+    // read({sourceBuffer}) does NOT fail-close on an unset hash — it just reads.
+    await expect(reader.read(cacheBuffer, { sourceBuffer })).resolves.toBeTruthy();
+  });
+
+  it('mesh-only write (omitSourceHash, no persisted source) round-trips geometry byte-identical', async () => {
     // Byte-identity of the restored geometry is what makes a mesh-only cache hit
     // equal to a cold load. The write path is source-decoupled (the viewer does
-    // NOT persist the source for this tier), so exercise write→read with only a
-    // precomputed hash and assert the meshes come back bit-for-bit.
+    // NOT persist the source for this tier), so exercise write→read with the hash
+    // omitted and assert the meshes come back bit-for-bit.
     const positions = new Float32Array([0, 0, 0, 1, 0, 0, 1, 1, 0]);
     const normals = new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1]);
     const indices = new Uint32Array([0, 1, 2]);
@@ -351,7 +368,7 @@ describe('BinaryCacheWriter and BinaryCacheReader', () => {
     };
 
     const writer = new BinaryCacheWriter();
-    const cacheBuffer = await writer.write(dataStore, geometry, sourceBuffer, { sourceHash: 42n });
+    const cacheBuffer = await writer.write(dataStore, geometry, sourceBuffer, { omitSourceHash: true });
     const result = await new BinaryCacheReader().read(cacheBuffer);
 
     const mesh = result.geometry!.meshes[0];

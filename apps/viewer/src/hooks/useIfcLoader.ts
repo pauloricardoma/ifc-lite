@@ -10,13 +10,14 @@
  * Extracted from useIfc.ts for better separation of concerns
  */
 
-import { useCallback, useRef } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 import { flushSync } from 'react-dom';
 import { useShallow } from 'zustand/react/shallow';
 import { getViewerStoreApi, useViewerStore, type FederatedModel } from '@/store';
 import { getGeomWorkerOverride, resolveLoadTessellationTier, isMeshOnlyCacheEnabled } from '../store/constants.js';
-import { planCacheWrite } from './cacheTier.js';
+import { planCacheWrite, decideMeshOnlyCacheHit } from './cacheTier.js';
 import { computeSourceFingerprint } from './sourceFingerprint.js';
+import { computeFullSourceHash } from '../utils/sourceContentHash.js';
 import { IfcParser, detectFormat, unwrapIfcZip, type IfcDataStore } from '@ifc-lite/parser';
 import { WorkerParser } from '@ifc-lite/parser/browser';
 import { memoryAccounting } from '../lib/perf/memoryAccounting.js';
@@ -43,7 +44,7 @@ import {
 import { applyColorUpdatesToMeshes } from './meshColorUpdates.js';
 
 // Cache hook
-import { useIfcCache, getCached } from './useIfcCache.js';
+import { useIfcCache, getCached, deleteCached } from './useIfcCache.js';
 
 // Server hook
 import { useIfcServer } from './useIfcServer.js';
@@ -175,6 +176,48 @@ export function useIfcLoader() {
 
   // Server operations from extracted hook
   const { loadFromServer } = useIfcServer();
+
+  // Latest `loadFile`, so the background revalidation can reload without being a
+  // dependency of `loadFile` itself (avoids a definition cycle). Kept current by
+  // the effect below.
+  const loadFileRef = useRef<((file: File, target?: LoadTarget) => Promise<void>) | null>(null);
+
+  /**
+   * Background revalidation for a SERVED source-decoupled (mesh-only) cache hit:
+   * confirm the TRUE full-file hash of the fresh buffer matches what was stored
+   * at write. The mtime guard already rejected any normal on-disk edit before
+   * serving; this closes the deliberate mtime-PRESERVED in-place edit (a GUID or
+   * same-width coordinate patch the O(1) spread key can't see) that the mtime
+   * guard alone would miss. On mismatch: purge the stale entry and auto-reload
+   * (a full reparse) with a notice. Runs off the main thread (Web Crypto), so it
+   * never blocks the instant hit it follows.
+   */
+  const revalidateSourceDecoupledHit = useCallback(async (args: {
+    file: File;
+    target: LoadTarget;
+    buffer: ArrayBufferLike;
+    cacheKey: string;
+    expectedHash: string;
+    session: number;
+  }): Promise<void> => {
+    try {
+      const freshHash = await computeFullSourceHash(args.buffer);
+      // Web Crypto unavailable → can't revalidate; the mtime guard already vetted
+      // this hit, so leave it served rather than churning a reload.
+      if (freshHash === null) return;
+      if (freshHash === args.expectedHash) return; // validated: byte-identical source
+
+      console.warn(`[useIfc] source-decoupled cache was stale (full-hash mismatch) — reloading "${args.file.name}"`);
+      await deleteCached(args.cacheKey);
+      // A newer load superseded this one: the entry is purged; don't yank the
+      // user off whatever they loaded next.
+      if (loadSessionRef.current !== args.session) return;
+      toast.info(`"${args.file.name}" changed since it was cached — reloading with the current file.`);
+      await loadFileRef.current?.(args.file, args.target);
+    } catch (err) {
+      console.warn('[useIfc] background cache revalidation failed', err);
+    }
+  }, []);
 
   const loadFile = useCallback(async (
     file: File,
@@ -657,20 +700,54 @@ export function useIfcLoader() {
         setProgress({ phase: 'Checking cache', percent: 5 });
         const cacheResult = await getCached(cacheKey);
         if (cacheResult) {
-          // Pass the freshly read file buffer as the source fallback: the
-          // desktop cache doesn't persist a sourceBuffer, and without one the
-          // restored store can't carry the lazy entity accessors.
-          const cacheLoadResult = await loadFromCache(cacheResult, file.name, cacheKey, buffer);
-          if (cacheLoadResult.success) {
-            const state = useViewerStore.getState();
-            await finalizeModel(state.ifcDataStore, state.geometryResult, getSchemaVersion(state.ifcDataStore), {
-              loadState: 'complete',
-              cacheState: 'hit',
-            });
-            console.log(`[useIfc] TOTAL LOAD TIME (from cache): ${(performance.now() - totalStartTime).toFixed(0)}ms`);
-            posthog.capture('ifc_model_loaded', { format, file_size_mb: Math.round(fileSizeMB * 100) / 100, load_target: target.kind, load_path: 'cache', total_elapsed_ms: Math.round(performance.now() - totalStartTime) });
-            setLoading(false);
-            return;
+          // A source-decoupled (mesh-only) entry persisted NO source, so it will
+          // hydrate cached geometry against the FRESH buffer — validate the source
+          // before serving. The O(1) spread key can't see a byte-length-preserving
+          // in-place edit that falls between its sample windows, so the mtime guard
+          // is the real gate: a changed on-disk mtime → MISS (reparse); an
+          // unvalidatable hit (no mtime AND no full hash) → MISS. The classic
+          // source-persisting tier serves cached geometry + cached source together
+          // (self-consistent), so it skips this entirely.
+          const isSourceDecoupled = !cacheResult.sourceBuffer;
+          const mayServe = !isSourceDecoupled || decideMeshOnlyCacheHit({
+            storedMtime: cacheResult.lastModified,
+            freshMtime: file.lastModified,
+            hasFullHash: !!cacheResult.fullSourceHash,
+          }) === 'serve';
+
+          if (!mayServe) {
+            console.warn(`[useIfc] source-decoupled cache MISS (source changed / unvalidatable) — reparsing "${file.name}"`);
+            await deleteCached(cacheKey);
+          } else {
+            // Pass the freshly read file buffer as the source fallback: the
+            // desktop cache doesn't persist a sourceBuffer, and without one the
+            // restored store can't carry the lazy entity accessors.
+            const cacheLoadResult = await loadFromCache(cacheResult, file.name, cacheKey, buffer);
+            if (cacheLoadResult.success) {
+              const state = useViewerStore.getState();
+              await finalizeModel(state.ifcDataStore, state.geometryResult, getSchemaVersion(state.ifcDataStore), {
+                loadState: 'complete',
+                cacheState: 'hit',
+              });
+              console.log(`[useIfc] TOTAL LOAD TIME (from cache): ${(performance.now() - totalStartTime).toFixed(0)}ms`);
+              posthog.capture('ifc_model_loaded', { format, file_size_mb: Math.round(fileSizeMB * 100) / 100, load_target: target.kind, load_path: 'cache', total_elapsed_ms: Math.round(performance.now() - totalStartTime) });
+              setLoading(false);
+              // Belt-and-suspenders for the source-decoupled tier: revalidate the
+              // TRUE full-file hash off the main thread and, if the source changed
+              // with its mtime preserved, purge + auto-reload. Fire-and-forget so
+              // the instant hit above is never delayed.
+              if (isSourceDecoupled && cacheResult.fullSourceHash) {
+                void revalidateSourceDecoupledHit({
+                  file,
+                  target,
+                  buffer,
+                  cacheKey,
+                  expectedHash: cacheResult.fullSourceHash,
+                  session: currentSession,
+                });
+              }
+              return;
+            }
           }
         }
       }
@@ -1291,7 +1368,9 @@ export function useIfcLoader() {
                   };
                   await saveToCache(cacheKey, dataStore, geometryData, buffer, file.name, {
                     persistSource: cachePlan.persistSource,
-                    sourceHash: fingerprint.hash,
+                    // mtime guard for a source-decoupled hit (the full-file
+                    // validation hash is computed off-thread inside saveToCache).
+                    lastModified: file.lastModified,
                   });
                 }
 
@@ -1431,7 +1510,13 @@ export function useIfcLoader() {
       setLoading(false);
       setGeometryStreamingActive(false);
     }
-  }, [setLoading, setGeometryStreamingActive, setError, setProgress, setIfcDataStore, setGeometryResult, appendGeometryBatch, appendInstancedShards, updateMeshColors, updateCoordinateInfo, loadFromCache, saveToCache, loadFromServer]);
+  }, [setLoading, setGeometryStreamingActive, setError, setProgress, setIfcDataStore, setGeometryResult, appendGeometryBatch, appendInstancedShards, updateMeshColors, updateCoordinateInfo, loadFromCache, saveToCache, loadFromServer, revalidateSourceDecoupledHit]);
+
+  // Keep the ref pointed at the latest loadFile so a background revalidation can
+  // trigger a reparse-reload without loadFile depending on itself.
+  useEffect(() => {
+    loadFileRef.current = loadFile;
+  }, [loadFile]);
 
   return { loadFile };
 }

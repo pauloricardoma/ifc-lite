@@ -20,6 +20,20 @@ interface CacheEntry {
   fileName: string;
   fileSize: number;
   createdAt: number;
+  /**
+   * The source File's `lastModified` (ms epoch) at write. On a mesh-only hit,
+   * a differing fresh mtime means the on-disk file changed → treat as a miss.
+   * `0`/absent = unknown (fall back to the full-hash revalidation).
+   */
+  lastModified?: number;
+  /**
+   * TRUE full-file content hash of the source (SHA-256 hex) at write. Used to
+   * VALIDATE a mesh-only hit against the fresh buffer in the background — this is
+   * the source-of-truth guard the O(1) spread key can't provide. Stored here in
+   * the record, DISTINCT from the header's `sourceHash` and the key's spread
+   * fingerprint. Absent when Web Crypto was unavailable at write.
+   */
+  fullSourceHash?: string;
 }
 
 /**
@@ -195,6 +209,16 @@ export function openDatabase(): Promise<IDBDatabase> {
 export interface CacheResult {
   buffer: ArrayBuffer;
   sourceBuffer?: ArrayBuffer;
+  /** Source File `lastModified` (ms) stored at write; see {@link CacheEntry}. */
+  lastModified?: number;
+  /** True full-file content hash (SHA-256 hex) stored at write; see {@link CacheEntry}. */
+  fullSourceHash?: string;
+}
+
+/** Extra validation metadata persisted alongside a cache entry (mesh-only tier). */
+export interface CacheEntryMeta {
+  lastModified?: number;
+  fullSourceHash?: string;
 }
 
 /**
@@ -214,6 +238,8 @@ export async function getCached(key: string): Promise<CacheResult | null> {
           resolve({
             buffer: entry.buffer,
             sourceBuffer: entry.sourceBuffer,
+            lastModified: entry.lastModified,
+            fullSourceHash: entry.fullSourceHash,
           });
         } else {
           resolve(null);
@@ -239,7 +265,8 @@ export async function setCached(
   buffer: ArrayBuffer,
   fileName: string,
   fileSize: number,
-  sourceBuffer?: ArrayBuffer
+  sourceBuffer?: ArrayBuffer,
+  meta?: CacheEntryMeta,
 ): Promise<void> {
   try {
     const db = await openDatabase();
@@ -281,6 +308,8 @@ export async function setCached(
         fileName,
         fileSize,
         createdAt: Date.now(),
+        lastModified: meta?.lastModified,
+        fullSourceHash: meta?.fullSourceHash,
       };
 
       tx.oncomplete = () => done();

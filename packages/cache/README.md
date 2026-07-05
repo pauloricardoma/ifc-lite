@@ -66,6 +66,25 @@ const rawKey = xxhash64(buffer);     // same hash as a bigint
 
 The cache keys models by the xxHash64 of the source IFC, and `reader.validate(cacheBuffer, sourceBuffer)` uses the same hash to detect when the source has changed.
 
+## Source-hash contract (and `omitSourceHash`)
+
+By default the header stores the full-file `xxhash64` of the source in `sourceHash`, and `reader.validate()` / `read({ sourceBuffer })` compare against it. Hashing a large source can be a multi-second main-thread cost, so a caller that validates the source **another way** (e.g. an application-layer content hash plus a file modified-time guard, as the viewer's source-decoupled cache tier does) can pass `omitSourceHash: true`:
+
+```typescript
+// Skip the full-file hash; validate the source at the application layer instead.
+const cacheBuffer = await writer.write(dataStore, geometry, ifcBuffer, {
+  includeGeometry: true,
+  omitSourceHash: true,
+});
+```
+
+Such an entry stores `sourceHash = 0n` and sets `HeaderFlags.SourceHashUnset`. Read it back via `CacheHeaderInfo.hasSourceHash`:
+
+- `hasSourceHash === true`  → `sourceHash` is a real full-file hash; `validate()` and `read({ sourceBuffer })` work as usual.
+- `hasSourceHash === false` → `sourceHash` is unset. `read({ sourceBuffer })` **skips** header validation (it does not fail-close on a valid cache), and `validate()` **throws** a clear error instead of returning a misleading `false`. Validate the source yourself (e.g. compare a stored content hash / mtime).
+
+This is backward compatible: entries written before the flag existed have it unset-as-in-absent, so their `sourceHash` remains a real hash and continues to validate normally.
+
 ## API
 
 See the [API Reference](https://ltplus-ag.github.io/ifc-lite/api/typescript/#ifc-litecache).

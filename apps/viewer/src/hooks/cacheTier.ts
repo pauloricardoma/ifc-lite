@@ -75,3 +75,34 @@ export function planCacheWrite(byteLength: number, opts: CacheTierOptions): Cach
     persistSource: tier === 'source',
   };
 }
+
+/**
+ * Whether a MESH-ONLY cache hit may be served, given the file's modified-time
+ * guard and whether a full-file validation hash is available.
+ *
+ * The mesh-only tier hydrates cached geometry against the FRESH source buffer,
+ * so a source that changed since the entry was written would form a silent
+ * chimera (old geometry + new properties). The spread-sampled cache key can't
+ * catch a byte-length-preserving in-place edit that lands between its sample
+ * windows (a GUID/coordinate patch), so this gate is the real validation:
+ *   - both mtimes known and DIFFERENT  → `miss` (a real on-disk edit; reparse);
+ *   - mtime cannot confirm AND no full hash to revalidate → `miss` (never serve
+ *     unvalidated);
+ *   - otherwise → `serve` (mtime confirms it, or the caller can background-
+ *     revalidate the full hash and reload on mismatch).
+ *
+ * `lastModified` of `0`/`undefined` counts as "unknown" (some `File`s lack it).
+ * The classic source-persisting tier does NOT use this — it serves the cached
+ * source alongside the cached geometry, so a hit is always self-consistent.
+ */
+export function decideMeshOnlyCacheHit(opts: {
+  storedMtime?: number;
+  freshMtime?: number;
+  hasFullHash: boolean;
+}): 'serve' | 'miss' {
+  const { storedMtime, freshMtime, hasFullHash } = opts;
+  const mtimeKnown = !!storedMtime && !!freshMtime;
+  if (mtimeKnown && storedMtime !== freshMtime) return 'miss';
+  if (!mtimeKnown && !hasFullHash) return 'miss';
+  return 'serve';
+}

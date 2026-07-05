@@ -76,6 +76,20 @@ describe('ifc-cache quota + robustness (blocker #2)', () => {
     restoreNavigator();
   });
 
+  it('round-trips the mesh-only validation metadata (lastModified + fullSourceHash)', async () => {
+    // These fields are the source-decoupled tier's real validation guard, so a
+    // hit can reject a changed source instead of forming a chimera.
+    await setCached('meta', patterned(8 * KB, 8), 'meta.ifc', 8 * KB, undefined, {
+      lastModified: 1_720_000_000_123,
+      fullSourceHash: 'deadbeef'.repeat(8),
+    });
+    const got = await getCached('meta');
+    assert.ok(got);
+    assert.equal(got!.lastModified, 1_720_000_000_123);
+    assert.equal(got!.fullSourceHash, 'deadbeef'.repeat(8));
+    assert.equal(got!.sourceBuffer, undefined, 'mesh-only entries persist no source');
+  });
+
   it('round-trips a large single record (buffer + source) byte-identical', async () => {
     // Proves a single large IndexedDB record writes AND reads back intact, so
     // the mesh-only geometry blob does not need chunking: the per-entry ceiling

@@ -5,47 +5,43 @@
 import { xxhash64 } from '@ifc-lite/cache';
 
 /**
- * Spread-sampled source fingerprint — the collision-safe content identity that
- * both keys the persisted cache and VALIDATES a hit (`buildGeometryCacheKey`
- * folds {@link SourceFingerprint.hex} into the key, so a key match *is* the
- * validation). It replaces the old first-4KB+last-4KB FNV-32 fingerprint, which
- * ignored the entire interior of the file and only had 32 bits of entropy.
+ * Spread-sampled source fingerprint — a fast, strong cache KEY, NOT a full
+ * content validation. `buildGeometryCacheKey` folds {@link SourceFingerprint.hex}
+ * into the key so the RIGHT entry is looked up; it replaces the old
+ * first-4KB+last-4KB FNV-32 fingerprint (32 bits, interior-blind) with a wider
+ * 64-bit hash over a head/tail/interior spread plus the exact byte length.
  *
- * ## Why this removes the repeat-open stall
- * The mesh-only cache tier does not persist the >150MB source, so it used to
- * recompute a full-file `xxhash64` on every repeat open to validate the hit
- * against the header hash — a 0.7-1.7s PURE-JS main-thread stall that scaled
- * with file size. This samples a fixed ~100KB spread regardless of file size
- * (O(1) in the file length, sub-millisecond even on a 400MB file), so making
- * the KEY the validation lets us drop the full-file hash entirely: no stall on
- * read, and no full-file hash on write either (the writer stores {@link
- * SourceFingerprint.hash} in its header cheaply — see `useIfcCache.saveToCache`).
+ * ## O(1) sampler — and its deliberate blind spot
+ * It touches a FIXED ~160KB spread regardless of file size (head {@link
+ * HEAD_TAIL_BYTES} + tail {@link HEAD_TAIL_BYTES} + {@link INTERIOR_WINDOWS}
+ * interior windows + the 8-byte length), so it is sub-millisecond even on a
+ * 400MB file. That O(1) speed is exactly why it CANNOT be the validation: it
+ * never reads the bytes BETWEEN its sample windows. A byte-length-preserving
+ * in-place edit that lands in a gap — a GUID patch (GUIDs are a fixed 22 chars),
+ * a scripted same-width coordinate/string edit — produces an IDENTICAL
+ * fingerprint. For the source-PERSISTING tier that is harmless (it serves cached
+ * geometry AND cached source together — self-consistent), but for the
+ * source-DECOUPLED (mesh-only) tier, which hydrates cached geometry against the
+ * FRESH buffer, an unvalidated gap-edit hit would be a silent chimera (old
+ * geometry + new properties).
  *
- * ## Why the key match is collision-safe
- * The cache key is `ifc-{exactByteLength}-{hex}-v{fmt}...`, so a stale hit needs
- * a genuinely DIFFERENT file that matches on ALL of:
- *   1. exact byte length (to the byte — folded into both the key and the hash),
- *   2. the first {@link HEAD_TAIL_BYTES} (the ISO-10303-21 header, FILE_NAME
- *      timestamp/author, FILE_SCHEMA, and start of DATA — essentially unique per
- *      model),
- *   3. the last {@link HEAD_TAIL_BYTES} (tail entities + ENDSEC/END-ISO),
- *   4. {@link INTERIOR_WINDOWS} interior windows at fixed fractional offsets, and
- *   5. a 64-bit xxhash collision over the concatenated sample.
- * Requiring all of that simultaneously for two real IFC files is astronomically
- * impossible — far beyond the ~2^-64 of the hash alone. This is strictly
- * stronger than the old key (proved by `sourceFingerprint.test.ts`: a pair that
- * collides on the old weak key is distinguished here), which also closes a
- * latent hazard in the source-persisting tier where an old-key collision could
- * have paired one file's cached geometry with another file's persisted source.
+ * ## Validation lives elsewhere — NOT in this fingerprint
+ * A mesh-only hit is validated by the source File's `lastModified` (mtime guard:
+ * any real on-disk edit bumps it → safe miss) plus a TRUE full-file content hash
+ * (SHA-256, computed off the main thread and re-checked in the background to
+ * catch the deliberate mtime-preserving gap edit → purge + reload). See
+ * `cacheTier.decideMeshOnlyCacheHit`, `utils/sourceContentHash.ts`, and
+ * `useIfcLoader`. This fingerprint's only job is to key the lookup cheaply and
+ * make a false key-hit (a genuinely different file mapping to the same entry)
+ * astronomically rare, so the mtime / full-hash gate almost never has to reject
+ * one. It is still strictly stronger than the old weak key (proved in
+ * `sourceFingerprint.test.ts`), but strength of the KEY is a performance
+ * property, not the safety guarantee.
  */
 export interface SourceFingerprint {
   /** Filename-safe hex of {@link hash} — the content component of the cache key. */
   hex: string;
-  /**
-   * The same value as a 64-bit int, for the cache header's `sourceHash` field
-   * (passed to `BinaryCacheWriter.write({ sourceHash })` so the write path never
-   * pays a full-file hash). It is a cheap content hash, not the full-file hash.
-   */
+  /** The same value as a 64-bit int (the numeric form of {@link hex}). */
   hash: bigint;
 }
 

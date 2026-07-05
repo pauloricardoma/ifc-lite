@@ -147,4 +147,26 @@ describe('computeSourceFingerprint', () => {
       computeSourceFingerprint(new Uint8Array(buf)).hex,
     );
   });
+
+  it('FALSE-HITS a byte-length-preserving edit in a sampler GAP (documents the O(1) blind spot)', () => {
+    // The whole point of the O(1) sampler is that it does NOT read the bytes
+    // between its windows. A same-length in-place edit there (a GUID patch, a
+    // scripted same-width coordinate edit) is INVISIBLE to the fingerprint, so it
+    // keys the same cache entry. This is why the fingerprint is only the LOOKUP
+    // key and the mesh-only tier validates a hit by mtime + a full-file hash.
+    const len = 4_000_000;
+    const a = fill(len, 202);
+    const b = a.slice(0);
+    // 700_000 is between interior window 1 (~444_444) and window 2 (~888_888),
+    // outside the 64KB head/tail — a genuine sampler gap.
+    const gapOffset = 700_000;
+    new Uint8Array(b)[gapOffset] ^= 0xff;
+
+    assert.equal(a.byteLength, b.byteLength, 'edit preserves the byte length');
+    assert.equal(
+      computeSourceFingerprint(a).hex,
+      computeSourceFingerprint(b).hex,
+      'a gap edit is invisible to the fingerprint (the documented limitation)',
+    );
+  });
 });

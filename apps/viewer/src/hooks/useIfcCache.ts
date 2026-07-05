@@ -20,6 +20,7 @@ import {
 } from '@ifc-lite/cache';
 import { SpatialHierarchyBuilder, StepTokenizer, CompactEntityIndex, CompactEntityIndexBuilder, extractLengthUnitScale, attachDataStoreAccessors, type IfcDataStore, type IfcStoreData } from '@ifc-lite/parser';
 import { buildSpatialIndexGuarded } from '../utils/loadingUtils.js';
+import { computeFullSourceHash } from '../utils/sourceContentHash.js';
 import type { MeshData } from '@ifc-lite/geometry';
 
 import { useShallow } from 'zustand/react/shallow';
@@ -360,7 +361,7 @@ export function useIfcCache() {
     geometry: GeometryData,
     sourceBuffer: ArrayBuffer,
     fileName: string,
-    options: { persistSource?: boolean; sourceHash?: bigint } = {}
+    options: { persistSource?: boolean; lastModified?: number } = {}
   ): Promise<void> => {
     // `persistSource` (default true) is the classic <=150MB tier: the raw source
     // is stored alongside the cache so lazy property/quantity accessors + re-export
@@ -368,12 +369,14 @@ export function useIfcCache() {
     // source is too big to persist, so it is omitted from IndexedDB and rehydrated
     // from the freshly read buffer on re-open.
     //
-    // `sourceHash` is the cheap spread-sample hash the loader already computed for
-    // the cache key (`computeSourceFingerprint`). Passing it to the writer stores
-    // it in the header verbatim and SKIPS the full-file `xxhash64(sourceBuffer)`,
-    // so even a 400MB cold-load write pays no full-file main-thread hash. The hit
-    // is validated by the key on read, not this header value.
-    const { persistSource = true, sourceHash } = options;
+    // The header's full-file `xxhash64` is OMITTED (`omitSourceHash`) so a 400MB
+    // cold-load write pays no full-file main-thread hash. The source-decoupled hit
+    // is instead validated by the source File's `lastModified` (mtime guard) plus
+    // a TRUE full-file SHA-256 computed OFF the main thread (`computeFullSourceHash`,
+    // via Web Crypto), both stored in the IndexedDB record — distinct from the
+    // header hash and the key's spread fingerprint. This whole block is
+    // backgrounded on a cold load, so the off-thread hash costs the user nothing.
+    const { persistSource = true, lastModified } = options;
     try {
       console.log(`[useIfcCache] Starting cache write for: ${fileName} (persistSource=${persistSource})`);
       const writer = new BinaryCacheWriter();
@@ -391,9 +394,23 @@ export function useIfcCache() {
         entityIndex: dataStore.entityIndex,
       };
 
+      // Compute the true full-file validation hash off the main thread (runs in
+      // parallel with the cache-buffer serialization below). ONLY for the
+      // source-decoupled tier: the source-persisting tier serves cached geometry
+      // AND cached source together (self-consistent) and never consults it, so
+      // its <=150MB write path stays exactly as it was.
+      const fullHashPromise = persistSource
+        ? Promise.resolve<string | null>(null)
+        : computeFullSourceHash(sourceBuffer);
+
       console.log('[useIfcCache] Writing cache buffer...');
-      const cacheBuffer = await writer.write(cacheDataStore, geometry, sourceBuffer, { includeGeometry: true, sourceHash });
+      const cacheBuffer = await writer.write(cacheDataStore, geometry, sourceBuffer, {
+        includeGeometry: true,
+        omitSourceHash: true,
+      });
       console.log('[useIfcCache] Cache buffer written:', cacheBuffer.byteLength, 'bytes');
+
+      const fullSourceHash = (await fullHashPromise) ?? undefined;
 
       console.log('[useIfcCache] Saving to cache storage...');
       await setCached(
@@ -402,8 +419,9 @@ export function useIfcCache() {
         fileName,
         sourceBuffer.byteLength,
         persistSource ? sourceBuffer : undefined,
+        { lastModified, fullSourceHash },
       );
-      console.log(`[useIfcCache] ✓ Cache saved successfully (${persistSource ? 'with' : 'without'} source)`);
+      console.log(`[useIfcCache] ✓ Cache saved successfully (${persistSource ? 'with' : 'without'} source, mtime=${lastModified ?? 'n/a'}, fullHash=${fullSourceHash ? 'yes' : 'no'})`);
     } catch (err) {
       console.error('[useIfcCache] Failed to cache model:', err);
       console.error('[useIfcCache] Error stack:', err instanceof Error ? err.stack : 'No stack trace');
