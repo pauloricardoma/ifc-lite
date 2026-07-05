@@ -115,6 +115,12 @@ pub struct ProcessingStats {
     pub total_vertices: usize,
     /// Total number of triangles.
     pub total_triangles: usize,
+    /// Occurrences folded into `ProcessingResult.instances` by the instanced
+    /// output path (#1623). 0 unless `StreamingOptions.enable_instancing` was set;
+    /// when non-zero, `total_meshes` counts only the retained (post-collation)
+    /// meshes, so `total_meshes + instanced_occurrences` is the materialized total.
+    #[serde(default)]
+    pub instanced_occurrences: u64,
     /// Time spent parsing entities (ms).
     pub parse_time_ms: u64,
     /// Time spent scanning entities and building initial job lists (ms).

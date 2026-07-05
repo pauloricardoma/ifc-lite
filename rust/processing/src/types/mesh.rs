@@ -215,39 +215,3 @@ impl MeshData {
         self.positions.is_empty() || self.indices.is_empty()
     }
 }
-
-/// One occurrence of a shared template geometry, emitted INSTEAD of a full
-/// materialized mesh when `StreamingOptions.enable_instancing` is set (#1623).
-///
-/// On instance-heavy models (metering stations, MEP, steel) many products share
-/// one `IfcRepresentationMap`; rather than bake a world mesh per occurrence, the
-/// engine meshes the shared geometry ONCE (a `MeshData` template, emitted with
-/// `express_id == template_express_id`) and emits one of these per occurrence.
-/// The consumer draws the template placed by `transform` and identifies/colours
-/// the occurrence from the remaining fields. Purely in-memory (recomputed each
-/// load, never round-trips a cache), like [`MeshData::instance`].
-#[derive(Debug, Clone)]
-pub struct InstanceRecord {
-    /// This occurrence's IFC element id.
-    pub express_id: u32,
-    /// IFC type name (e.g. "IfcFlowFitting").
-    pub ifc_type: String,
-    /// IFC GlobalId when available.
-    pub global_id: Option<String>,
-    /// IFC Name when available.
-    pub name: Option<String>,
-    /// IFC presentation layer assignment name when available.
-    pub presentation_layer: Option<String>,
-    /// This occurrence's RGBA colour (may differ from the template occurrence's).
-    pub color: [f32; 4],
-    /// `express_id` of the template `MeshData` this occurrence instantiates —
-    /// the consumer's link from record to geometry (JS-safe u32).
-    pub template_express_id: u32,
-    /// Representation-identity of the shared geometry (RepresentationMap id).
-    pub rep_identity: u128,
-    /// Row-major, TEMPLATE-RELATIVE mat4: applied to the template's baked world
-    /// geometry (`template.origin + positions`) it yields this occurrence's world
-    /// geometry (`collate_refs`' `rel_k = m_k · m_ref⁻¹`; identity for the template
-    /// occurrence itself, which is why the template is never emitted as a record).
-    pub transform: [f32; 16],
-}

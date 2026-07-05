@@ -6,7 +6,7 @@
 //!
 //! Originally contributed by Mathias Søndergaard (Sonderwoods/Linkajou).
 
-use crate::types::mesh::{InstanceRecord, MeshData};
+use crate::types::mesh::MeshData;
 use crate::types::response::{
     CoordinateInfo, ModelMetadata, ProcessingStats, QuickMetadataBootstrap,
     QuickMetadataEntitySummary,
@@ -23,14 +23,21 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 mod color_layer;
+mod instancing;
+mod job_metadata;
 mod jobs;
 mod opening_filter;
 mod properties;
 mod quick_metadata;
 mod site_local;
 
+pub use instancing::InstanceRecord;
+use instancing::collate_into_instances;
 pub use site_local::convert_mesh_to_site_local;
 
+// Only invoked on the wasm32 serial path (its sole caller is wasm-gated).
+#[cfg(target_arch = "wasm32")]
+use job_metadata::populate_entity_job_metadata;
 use jobs::{build_color_updates_for_jobs, process_entity_job};
 
 use color_layer::{
@@ -107,9 +114,9 @@ impl OpeningFilterMode {
 pub struct ProcessingResult {
     pub meshes: Vec<MeshData>,
     /// Per-occurrence instance records emitted when `StreamingOptions.enable_instancing`
-    /// is set (#1623): products whose body is one shared `IfcRepresentationMap` are
-    /// meshed once (a template `MeshData`) and listed here as lightweight placements
-    /// instead of a materialized mesh each. Empty otherwise.
+    /// is set (#1623): occurrences sharing a template's geometry are folded into these
+    /// lightweight placements and their materialized meshes drop out of `meshes`.
+    /// Empty otherwise. See [`InstanceRecord`].
     pub instances: Vec<InstanceRecord>,
     /// Declares the coordinate space used by serialized mesh vertices.
     pub mesh_coordinate_space: Option<String>,
@@ -119,64 +126,6 @@ pub struct ProcessingResult {
     pub building_transform: Option<Vec<f64>>,
     pub metadata: ModelMetadata,
     pub stats: ProcessingStats,
-}
-
-/// Collate materialized meshes by representation identity (#1623): every occurrence
-/// beyond the first of each shared template becomes an [`InstanceRecord`] and its
-/// `MeshData` is removed from `meshes`, leaving one template per group (plus all
-/// non-instanced meshes). The per-occurrence transform is template-relative, the
-/// same collation the GLB export instancing (#1443) uses. `rtc` is the model RTC
-/// offset (see `collate_refs`).
-fn collate_into_instances(meshes: &mut Vec<MeshData>, rtc: [f64; 3]) -> Vec<InstanceRecord> {
-    use ifc_lite_geometry::{collate_refs, InstanceMeshRef};
-
-    let refs: Vec<InstanceMeshRef> = meshes
-        .iter()
-        .map(|m| InstanceMeshRef {
-            positions: &m.positions,
-            normals: &m.normals,
-            indices: &m.indices,
-            origin: m.origin,
-            instance_meta: m.instance.as_ref(),
-            entity_id: m.express_id,
-            color: m.color,
-        })
-        .collect();
-    let collated = collate_refs(&refs, 2, rtc);
-
-    let mut instances = Vec::new();
-    let mut drop_mesh = vec![false; meshes.len()];
-    for tpl in &collated.templates {
-        let template_express_id = meshes[tpl.template_index].express_id;
-        for occ in &tpl.occurrences {
-            // The template occurrence is drawn directly from its retained MeshData.
-            if occ.mesh_index == tpl.template_index {
-                continue;
-            }
-            let m = &meshes[occ.mesh_index];
-            instances.push(InstanceRecord {
-                express_id: m.express_id,
-                ifc_type: m.ifc_type.clone(),
-                global_id: m.global_id.clone(),
-                name: m.name.clone(),
-                presentation_layer: m.presentation_layer.clone(),
-                color: m.color,
-                template_express_id,
-                rep_identity: tpl.rep_identity,
-                transform: occ.transform,
-            });
-            drop_mesh[occ.mesh_index] = true;
-        }
-    }
-
-    // Drop the instanced (non-template) occurrence meshes; `retain` visits in order.
-    let mut idx = 0;
-    meshes.retain(|_| {
-        let keep = !drop_mesh[idx];
-        idx += 1;
-        keep
-    });
-    instances
 }
 
 /// Controls the tradeoff between first-frame latency and richer upfront metadata.
@@ -219,14 +168,11 @@ pub struct StreamingOptions {
     /// so it must not present the result as a completed parse. Used by the
     /// server to stop burning a core when an SSE client disconnects.
     pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
-    /// Emit product-level `IfcMappedItem` occurrences as INSTANCES instead of
-    /// materializing a full world-space mesh per occurrence (#1623). When a
-    /// product's representation is a single mapped item onto a shared
-    /// `IfcRepresentationMap`, the map's LOCAL geometry is meshed once (a
-    /// class-2 template) and each occurrence emits only a lightweight instance
-    /// record (placement transform + colour + element id) via `InstanceMeta`.
-    /// On instance-heavy models (metering stations, MEP) this skips the
-    /// per-occurrence 43M-vertex materialize. `false` reproduces the historical
+    /// Collapse occurrences of a shared representation into instanced output (#1623):
+    /// after meshing, occurrences that share a template's geometry are folded into
+    /// `ProcessingResult.instances` and their materialized meshes drop out of
+    /// `meshes` (an OUTPUT/memory dedup — the occurrences are still materialized and
+    /// streamed first; collation runs afterwards). `false` reproduces the historical
     /// materialized output byte-for-byte (determinism/parity unaffected).
     pub enable_instancing: bool,
 }
@@ -265,67 +211,6 @@ pub(super) struct EntityJob {
     /// id to render directly (baking its MappingOrigin) instead of walking the
     /// element's `IfcProductDefinitionShape`. `None` for ordinary product jobs.
     pub(super) representation_map_id: Option<u32>,
-}
-
-// Only invoked on the wasm32 serial path; dead on the native build.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-// Threads the full metadata-resolution context; splitting it would not improve clarity.
-#[allow(clippy::too_many_arguments)]
-fn populate_entity_job_metadata(
-    job: &mut EntityJob,
-    geometry_style_index: &FxHashMap<u32, GeometryStyleInfo>,
-    element_material_color: &FxHashMap<u32, [f32; 4]>,
-    layer_by_assigned_representation: &FxHashMap<u32, String>,
-    color_cache_by_product_definition_shape: &mut FxHashMap<u32, Option<[f32; 4]>>,
-    layer_cache_by_product_definition_shape: &mut FxHashMap<u32, Option<String>>,
-    layer_cache_by_representation: &mut FxHashMap<u32, Option<String>>,
-    decoder: &mut EntityDecoder,
-    include_presentation_layers: bool,
-) {
-    if job.global_id.is_some() || job.name.is_some() || job.product_definition_shape_id.is_some() {
-        return;
-    }
-
-    let Ok(entity) = decoder.decode_at(job.start, job.end) else {
-        return;
-    };
-
-    job.global_id = normalize_optional_string(entity.get_string(0));
-    job.name = normalize_optional_string(entity.get_string(2));
-    job.product_definition_shape_id = entity.get_ref(6);
-
-    let Some(product_definition_shape_id) = job.product_definition_shape_id else {
-        return;
-    };
-
-    let resolved_color = color_cache_by_product_definition_shape
-        .entry(product_definition_shape_id)
-        .or_insert_with(|| {
-            resolve_element_color_for_product_definition_shape(
-                product_definition_shape_id,
-                geometry_style_index,
-                decoder,
-            )
-        });
-    if let Some(color) = resolved_color {
-        job.element_color = *color;
-    } else if let Some(color) = element_material_color.get(&job.id) {
-        job.element_color = *color;
-    }
-
-    if include_presentation_layers {
-        let resolved_layer = layer_cache_by_product_definition_shape
-            .entry(product_definition_shape_id)
-            .or_insert_with(|| {
-                resolve_presentation_layer_for_product_definition_shape(
-                    product_definition_shape_id,
-                    layer_by_assigned_representation,
-                    layer_cache_by_representation,
-                    decoder,
-                )
-            });
-        job.presentation_layer = resolved_layer.clone();
-    }
 }
 
 // `GeometryStyleInfo` moved to `crate::style` — it is shared by this
@@ -1196,6 +1081,7 @@ pub fn process_geometry_streaming_filtered_with_options(
     let mut meshes: Vec<MeshData> = Vec::new();
     // Instanced output (#1623), populated only when options.enable_instancing.
     let mut instances: Vec<InstanceRecord> = Vec::new();
+    let mut instanced_occurrences = 0usize;
     let mut processed_jobs = 0usize;
     let mut total_meshes = 0usize;
     let mut total_vertices = 0usize;
@@ -1565,14 +1451,16 @@ pub fn process_geometry_streaming_filtered_with_options(
 
     // Instanced output (#1623): collate the retained meshes so occurrences sharing
     // a template geometry become lightweight InstanceRecords and their materialized
-    // MeshData drop out of `meshes`. Reuses the same rep-identity collation as the
-    // GLB export instancing (#1443). This is the output/memory dedup; the CPU
-    // (don't-bake) win layers on top separately.
+    // MeshData drop out of `meshes`. The counters are recomputed from what remains,
+    // so `stats.total_*` describe the returned meshes, not the pre-collation output.
     if options.enable_instancing && options.retain_emitted_meshes {
-        instances = collate_into_instances(
-            &mut meshes,
-            [rtc_offset.0, rtc_offset.1, rtc_offset.2],
-        );
+        let collated =
+            collate_into_instances(&mut meshes, [rtc_offset.0, rtc_offset.1, rtc_offset.2]);
+        instanced_occurrences = collated.instances.len();
+        instances = collated.instances;
+        total_meshes = collated.total_meshes;
+        total_vertices = collated.total_vertices;
+        total_triangles = collated.total_triangles;
     }
 
     ProcessingResult {
@@ -1596,12 +1484,15 @@ pub fn process_geometry_streaming_filtered_with_options(
             total_meshes,
             total_vertices,
             total_triangles,
+            instanced_occurrences: instanced_occurrences as u64,
             parse_time_ms: parse_time.as_millis() as u64,
             entity_scan_time_ms: entity_scan_time.as_millis() as u64,
             lookup_time_ms: lookup_time.as_millis() as u64,
             preprocess_time_ms: preprocess_time.as_millis() as u64,
             geometry_time_ms: geometry_time.as_millis() as u64,
-            total_time_ms: total_time.as_millis() as u64,
+            // Re-measured here (not `total_time` above) so it includes the
+            // post-pass instancing collation, keeping the counter honest.
+            total_time_ms: total_start.elapsed().as_millis() as u64,
             from_cache: false,
             total_csg_failures: total_csg_failures as u64,
             products_with_failures: products_with_failures as u64,
