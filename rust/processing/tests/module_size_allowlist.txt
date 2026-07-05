@@ -103,6 +103,6 @@
 # +23: add the cached_source_bytes session field (doc + init + clearPrePassCache drop) for cold-load lever 1c (setSourceBytes); the setter + FromSource batch variants live in the new sub-400 gpu_meshes/batch_from_source.rs, not here (perf/coldload-setsourcebytes).
 # +37: hold the per-worker shared IfcMappedItem source cache field + drop it on content swap / setEntityIndex / setTessellationQuality, mirroring cached_item_dedup (#1623).
 # +10: drop the shared mapped-item cache in set_skip_small_cuts too (boolean-processor swap; #1623 P1 settings-hole fix).
-     1013 rust/wasm-bindings/src/api/mod.rs
+     1023 rust/wasm-bindings/src/api/mod.rs
      692 rust/wasm-bindings/src/zero_copy/mesh.rs
      743 rust/wasm-bindings/src/zero_copy/symbolic.rs

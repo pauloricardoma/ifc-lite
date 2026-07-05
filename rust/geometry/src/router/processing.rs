@@ -811,10 +811,21 @@ impl GeometryRouter {
         let source_arc = Arc::new(mesh.clone());
         match &self.shared_mapped_item_cache {
             Some(shared) => {
-                shared
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(source_id, source_arc);
+                // Mirror the item-dedup #1257 guard: a mapped source can contain
+                // IfcBooleanResult/IfcCsgSolid, and on a per-element CSG-budget trip
+                // the boolean bails and returns the UNCUT host. Caching that degraded
+                // source MODEL-WIDE would serve the wrong (uncut) mesh to a later
+                // occurrence in a fresh-budget element that would otherwise get the
+                // full exact cut. Skip the shared insert on a trip (or empty mesh) —
+                // the next occurrence re-meshes and a clean element caches it. The
+                // RefCell fallback arm below stays UNGUARDED: it is per-element
+                // (consistent budget within the element), reproducing main exactly.
+                if !mesh.positions.is_empty() && !crate::kernel::budget::tripped() {
+                    shared
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(source_id, source_arc);
+                }
             }
             None => {
                 self.mapped_item_cache.borrow_mut().insert(source_id, source_arc);

@@ -671,6 +671,16 @@ impl IfcAPI {
     pub fn set_skip_small_cuts(&self, on: bool) {
         self.skip_small_cuts
             .store(on, std::sync::atomic::Ordering::Relaxed);
+        // `skip_small_cuts` swaps the boolean/CSG processors, so a mapped source
+        // containing IfcBooleanResult/IfcCsgSolid meshes differently under it. The
+        // source cache is keyed by RepresentationMap id, not by this flag, so a
+        // toggle would otherwise serve stale-fidelity source meshes (e.g. a worker
+        // reused by a full-fidelity export after a `fast` load). Drop it here,
+        // mirroring `set_tessellation_quality`.
+        self.cached_mapped_item
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 }
 
