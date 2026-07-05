@@ -15,7 +15,7 @@ import type { BCFHeaderFile } from '@ifc-lite/bcf';
 import type { IfcDataStore } from '@ifc-lite/parser';
 import type { FederatedModel } from '@/store/types';
 
-/** Resolve the IfcProject GlobalId for a store (empty string when unavailable). */
+/** Resolve the IfcProject GlobalId for a store (undefined when unavailable). */
 function projectGlobalId(store: IfcDataStore | null | undefined): string | undefined {
   const projectExpressId = store?.spatialHierarchy?.project?.expressId;
   if (projectExpressId === undefined || !store?.entities) return undefined;

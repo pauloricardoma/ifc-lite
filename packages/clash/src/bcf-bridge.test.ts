@@ -421,8 +421,12 @@ describe('BCF round-trip', () => {
   // Federation provenance (#1591): a cross-model clash topic must record one
   // <Header> source file per distinct model it spans, surviving write -> read.
   it('records header source files for every model a clash group spans', async () => {
-    const a: ClashElementRef = { key: 'GUID_A', ref: 1, model: 'architecture.ifc', tag: 'IfcWall' };
-    const b: ClashElementRef = { key: 'GUID_B', ref: 2, model: 'structure.ifc', tag: 'IfcBeam' };
+    // `model` is an opaque model id (viewer uses UUIDs); modelNameOf resolves
+    // it to the display file name for the Header.
+    const a: ClashElementRef = { key: 'GUID_A', ref: 1, model: 'm-arch', tag: 'IfcWall' };
+    const b: ClashElementRef = { key: 'GUID_B', ref: 2, model: 'm-struct', tag: 'IfcBeam' };
+    const modelNameOf = (id: string) =>
+      ({ 'm-arch': 'architecture.ifc', 'm-struct': 'structure.ifc' })[id] ?? id;
     const c = clash('cross-model-1', a, b, 'hard', 'critical', 'ARCxSTR');
     const group = makeGroup('cross-model', 'critical', [c]);
     const result: ClashResult = {
@@ -437,9 +441,10 @@ describe('BCF round-trip', () => {
       settings: { tolerance: 0.002, excludeVoidsAndHosts: true },
     };
 
-    const project = await createBCFFromClashResult(result, [group], { author: 'tester' });
+    const project = await createBCFFromClashResult(result, [group], { author: 'tester', modelNameOf });
     const topic = project.topics.get(uuidFromSeed('cross-model'));
     expect(topic?.header).toBeDefined();
+    // Filenames are the RESOLVED names, not the raw model ids.
     expect(topic?.header?.map((h) => h.filename).sort()).toEqual([
       'architecture.ifc',
       'structure.ifc',

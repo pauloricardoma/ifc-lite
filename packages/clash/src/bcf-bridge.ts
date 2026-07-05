@@ -58,6 +58,13 @@ export interface ClashBcfOptions {
    * `status` for every topic (the pre-review behaviour).
    */
   reviewStatusOf?: (clash: Clash) => ClashReviewStatus;
+  /**
+   * Resolve a `ClashElementRef.model` id to its display file name for the BCF
+   * `<Header>` source files (#1591). The viewer's model ids are opaque UUIDs,
+   * so without this the Header would record UUIDs instead of file names. Omit
+   * when the ids are already human-readable (e.g. the CLI uses file paths).
+   */
+  modelNameOf?: (model: string) => string;
   projectName?: string;
   maxTopics?: number;
   maxMembersPerTopic?: number;
@@ -230,20 +237,24 @@ function buildDescription(
  * distinct source model its members reference (#1591 federation provenance).
  *
  * A clash is cross-model by nature, so a group typically touches two models.
- * The clash package sees only the model display name (`ClashElementRef.model`),
- * not the IfcProject GlobalId, so `ifcProject` is left empty (acceptable per
- * the BCF schema). `filename`/`reference` carry the model name.
+ * `ClashElementRef.model` is a MODEL ID (the viewer uses opaque UUIDs), not a
+ * file name, so callers pass `modelNameOf` to resolve it to the display file
+ * name; it falls back to the id when unresolved. The clash package cannot see
+ * the IfcProject GlobalId, so `ifcProject` is left empty (acceptable per the
+ * BCF schema). `filename`/`reference` carry the resolved name.
  */
-function headerFilesForGroup(group: ClashGroup, date: string): BCFHeaderFile[] {
-  const names = unique(
+function headerFilesForGroup(
+  group: ClashGroup,
+  date: string,
+  modelNameOf?: (model: string) => string,
+): BCFHeaderFile[] {
+  const ids = unique(
     group.members.flatMap((m) => [m.a.model, m.b.model]).filter((n): n is string => Boolean(n)),
   );
-  return names.map((name) => ({
-    isExternal: true,
-    filename: name,
-    date,
-    reference: name,
-  }));
+  return ids.map((id) => {
+    const filename = modelNameOf?.(id) ?? id;
+    return { isExternal: true, filename, date, reference: filename };
+  });
 }
 
 /** Build the topic + framing viewpoint for one group. */
@@ -277,7 +288,7 @@ async function buildTopicForGroup(
   topic.guid = uuidFromSeed(group.id);
   // Record the source model(s) this clash spans so the topic round-trips its
   // provenance across a federation.
-  const header = headerFilesForGroup(group, topic.creationDate);
+  const header = headerFilesForGroup(group, topic.creationDate, opts.modelNameOf);
   if (header.length > 0) topic.header = header;
 
   const selectedGuids = unique(group.members.flatMap((m) => [m.a.key, m.b.key]));
