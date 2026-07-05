@@ -568,6 +568,15 @@ impl IfcAPI {
                 &rel_defines_by_type_spans,
                 &mut decoder,
             );
+        // #1623 Phase 3 don't-bake plan: the RepresentationMap ids an IfcMappedItem
+        // instantiates >= 2 times, tallied from the SAME spans (no extra scan). The
+        // batch path arms its router with these so a repeated single-solid mapped
+        // source materializes once per batch and the rest ride as shard instances.
+        let mapped_instance_plan =
+            crate::api::styling::build_mapped_instance_plan_from_spans(
+                &mapped_item_spans,
+                &mut decoder,
+            );
         // Gate on `has_layer_set` to stay bit-identical to
         // `get_or_build_material_layer_index`, which ships an EMPTY index when the
         // file authors no layer set (its substring bail-out). from_spans reuses
@@ -595,6 +604,11 @@ impl IfcAPI {
             &columns_event,
             "instantiatedTypeIds",
             &js_sys::Uint32Array::from(type_ids_arr.as_slice()),
+        );
+        crate::api::set_js_prop(
+            &columns_event,
+            "mappedInstancePlan",
+            &js_sys::Uint32Array::from(mapped_instance_plan.as_slice()),
         );
         crate::api::set_js_prop(
             &columns_event,

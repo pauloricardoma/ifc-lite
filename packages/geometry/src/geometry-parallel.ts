@@ -891,6 +891,9 @@ export async function* processParallel(
         // after `entity-index` and workers handle messages FIFO, so it holds.
         const referencedRepmaps = evt.referencedRepmaps as Uint32Array;
         const instantiatedTypeIds = evt.instantiatedTypeIds as Uint32Array;
+        // #1623 Phase 3 don't-bake plan (RepresentationMap ids repeated >= 2x).
+        // Absent on older pre-pass builds -> empty, so the batch never arms.
+        const mappedInstancePlan = (evt.mappedInstancePlan as Uint32Array | undefined) ?? new Uint32Array(0);
         const mliElementIds = evt.mliElementIds as Uint32Array;
         const mliAxis = evt.mliAxis as Uint32Array;
         const mliLayerCounts = evt.mliLayerCounts as Uint32Array;
@@ -904,6 +907,7 @@ export async function* processParallel(
           try {
             const rRepmaps = referencedRepmaps.slice();
             const rTypeIds = instantiatedTypeIds.slice();
+            const rMappedPlan = mappedInstancePlan.slice();
             const mIds = mliElementIds.slice();
             const mAxis = mliAxis.slice();
             const mCounts = mliLayerCounts.slice();
@@ -916,6 +920,7 @@ export async function* processParallel(
                 type: 'set-prepass-columns' as const,
                 referencedRepmaps: rRepmaps,
                 instantiatedTypeIds: rTypeIds,
+                mappedInstancePlan: rMappedPlan,
                 mliElementIds: mIds,
                 mliAxis: mAxis,
                 mliLayerCounts: mCounts,
@@ -925,7 +930,7 @@ export async function* processParallel(
                 mliLayerThicknesses: mThick,
               },
               [
-                rRepmaps.buffer, rTypeIds.buffer, mIds.buffer, mAxis.buffer, mCounts.buffer,
+                rRepmaps.buffer, rTypeIds.buffer, rMappedPlan.buffer, mIds.buffer, mAxis.buffer, mCounts.buffer,
                 mDir.buffer, mOff.buffer, mMatIds.buffer, mThick.buffer,
               ],
             );

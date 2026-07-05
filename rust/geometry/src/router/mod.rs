@@ -230,6 +230,23 @@ pub struct GeometryRouter {
     /// single-solid id is in this set the router routes it to the normal flat
     /// materialize (byte-identical to instancing-off). `None`/empty ⇒ no exclusion.
     indexed_colour_split_ids: Option<Arc<FxHashSet<u32>>>,
+    /// #1623 Phase 3 template-selection mode for the don't-bake path. `false`
+    /// (default, NATIVE): the deterministic global template is the plan's min-id
+    /// occurrence (`item.id == template_item_id`), so every occurrence resolves
+    /// against ONE model-wide template across the rayon pool. `true` (the WASM
+    /// per-BATCH path): this router meshes ONE batch onto ONE thread serially, so
+    /// the FIRST occurrence of each source THIS router sees is the template (tracked
+    /// in [`Self::instanced_sources_materialized`]) and the rest don't-bake — each
+    /// per-batch shard is then self-contained (its occurrences' template is in the
+    /// same shard), so a batch never depends on a template materialized in another
+    /// batch. Both modes emit geometrically identical world triangles.
+    instancing_batch_local: bool,
+    /// #1623 Phase 3 (batch-local mode only): the `IfcRepresentationMap` source ids
+    /// this router has already materialized as a batch-local template. The first
+    /// occurrence of a source inserts its id (materializes); later occurrences see
+    /// the id present and don't-bake. Reset implicitly per batch — a fresh router is
+    /// built per `produce_batch`. Unused (stays empty) in the native global mode.
+    instanced_sources_materialized: RefCell<FxHashSet<u32>>,
 }
 
 /// Whether an `IfcShapeRepresentation.RepresentationType` names a meshable
@@ -296,6 +313,8 @@ impl GeometryRouter {
             skip_small_cuts: false,
             output_instancing_plan: None, // armed by `enable_output_instancing`
             indexed_colour_split_ids: None, // armed by `enable_indexed_colour_split_guard`
+            instancing_batch_local: false, // native global-template mode by default
+            instanced_sources_materialized: RefCell::new(FxHashSet::default()),
         };
 
         // Register default P0 processors
@@ -461,6 +480,29 @@ impl GeometryRouter {
         self.indexed_colour_split_ids
             .as_ref()
             .is_some_and(|ids| ids.contains(&geometry_id))
+    }
+
+    /// Select the #1623 Phase 3 batch-local template mode (see
+    /// [`Self::instancing_batch_local`]). The WASM per-batch path sets this so each
+    /// batch materializes its OWN first-seen template per source and stays a
+    /// self-contained shard; the native path leaves it off (global min-id template).
+    pub fn set_instancing_batch_local(&mut self, on: bool) {
+        self.instancing_batch_local = on;
+    }
+
+    /// Whether batch-local template selection is active (see the field doc).
+    #[inline]
+    pub(super) fn instancing_batch_local(&self) -> bool {
+        self.instancing_batch_local
+    }
+
+    /// Batch-local don't-bake template decision: returns `true` (materialize as the
+    /// batch-local template) the FIRST time this router sees `source_id`, `false`
+    /// (don't-bake) every time after. Idempotent per source within one router/batch.
+    pub(super) fn mark_source_materialized_if_first(&self, source_id: u32) -> bool {
+        self.instanced_sources_materialized
+            .borrow_mut()
+            .insert(source_id)
     }
 
     /// Disable content-dedup (drops the cache reference so `item_dedup_key`

@@ -422,6 +422,22 @@ export class IfcAPI {
    */
   setReferencedRepmaps(ids: Uint32Array): void;
   /**
+   * Install the pre-computed #1623 Phase 3 don't-bake plan: the flat list of
+   * `IfcRepresentationMap` ids that an `IfcMappedItem` instantiates >= 2 times.
+   * The streaming pre-pass tallies it in the SAME scan that builds the referenced-
+   * repmap set (`styling::build_mapped_instance_plan_from_spans`) and ships the id
+   * list here. The batch path arms its router with it (batch-local template mode),
+   * so a repeated single-solid mapped source materializes ONCE per batch and the
+   * rest ride as instances in the IFNS shard.
+   *
+   * Same injection contract as [`Self::set_referenced_repmaps`]: installed after
+   * `setEntityIndex` (which clears it on content swap), and a no-op absence leaves
+   * the batch path materializing every occurrence (byte-identical). Each id is
+   * stored as `(2, id)` — the batch-local router only needs the eligibility set
+   * (count >= 2); the min-id template slot is unused in batch-local mode.
+   */
+  setMappedInstancePlan(source_ids: Uint32Array): void;
+  /**
    * Install the pre-computed [`ifc_lite_geometry::MaterialLayerIndex`] (#563)
    * from its flat SoA encoding, so the worker's first batch skips the
    * per-worker [`Self::get_or_build_material_layer_index`] full-file decode
@@ -1231,6 +1247,7 @@ export interface InitOutput {
   readonly ifcapi_setComputeGeometryHashes: (a: number, b: number, c: number) => void;
   readonly ifcapi_setEntityIndex: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
   readonly ifcapi_setInstantiatedTypeIds: (a: number, b: number, c: number) => void;
+  readonly ifcapi_setMappedInstancePlan: (a: number, b: number, c: number) => void;
   readonly ifcapi_setMaterialLayerIndex: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number) => void;
   readonly ifcapi_setMergeLayers: (a: number, b: number) => void;
   readonly ifcapi_setRectParamFastPath: (a: number, b: number) => void;

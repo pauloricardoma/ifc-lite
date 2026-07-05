@@ -9,4 +9,5 @@
 
 mod batch;
 mod batch_from_source;
+mod instancing;
 mod prepass;
