@@ -414,25 +414,26 @@ impl GeometryRouter {
                 None
             };
 
-            // #1623 Phase 2 "don't-bake": if this top-level mapped item's source is a
-            // REPEATED (count >= 2) single-solid `IfcRepresentationMap` and the armed
-            // plan says so, only the deterministic template occurrence
-            // (min IfcMappedItem id) materializes its geometry; every OTHER occurrence
-            // skips the per-occurrence vertex clone / MappingTarget bake / weld and
-            // emits an instance-only placeholder (empty geometry carrying the mapping
-            // transform + rep_identity in `InstanceMeta`). `apply_submesh_placement`
-            // folds the world placement into `im.transform`; the streaming finalize
-            // turns the placeholder into an `InstanceRecord` against the template.
+            // #1623 Phase 2/3 "don't-bake": if this top-level mapped item's source is
+            // a REPEATED (count >= 2) single-solid `IfcRepresentationMap` the armed
+            // plan lists, exactly ONE occurrence (the "template") materializes its
+            // geometry; every OTHER occurrence skips the per-occurrence vertex clone /
+            // MappingTarget bake / weld and emits an instance-only placeholder (empty
+            // geometry carrying the mapping transform + rep_identity in `InstanceMeta`).
+            // `apply_submesh_placement` folds the world placement into `im.transform`;
+            // the finalize turns the placeholder into an occurrence against the template.
             //
+            // `instance_solid_id` is the nested SOLID's id (used as the placeholder's
+            // geometry_id so colour resolves EXACTLY as the flat/template sub-mesh).
             // Only fires at the TOP level (`depth == 0`) — a mapped item nested inside
             // another map is part of its parent's shared geometry, not an independent
             // occurrence — and only when `allow_instancing` (the non-void path). With
             // no armed plan this is skipped entirely, so the flat output is unchanged.
-            let dont_bake = if allow_instancing && depth == 0 {
+            let instance_solid_id: Option<u32> = if allow_instancing && depth == 0 {
                 self.output_instancing_plan()
                     .and_then(|plan| plan.get(&source_id).copied())
                     .filter(|&(count, _)| count >= 2)
-                    .and_then(|(count, template_item_id)| {
+                    .and_then(|_| {
                         self.mapped_source_single_item(&mapped_repr, decoder)
                             // #858: a source whose single solid carries an
                             // IfcIndexedColourMap must materialize flat so
@@ -441,13 +442,32 @@ impl GeometryRouter {
                             // collapsing the palette (WRONG vs the flat path); route
                             // to flat instead (byte-identical to instancing-off).
                             .filter(|&item_id| !self.is_indexed_colour_split_source(item_id))
-                            .map(|item_id| (count, template_item_id, item_id))
                     })
             } else {
                 None
             };
-            if let Some((_, template_item_id, solid_item_id)) = dont_bake {
-                if item.id != template_item_id {
+            // Which occurrence MATERIALIZES the template. Native (global) mode: the
+            // plan's deterministic min-id occurrence, so all occurrences resolve
+            // against ONE model-wide template across the rayon pool. WASM batch-local
+            // mode: the FIRST occurrence of this source seen by this router/batch (the
+            // rest don't-bake), so each per-batch shard is self-contained. Both emit
+            // geometrically identical world triangles.
+            let is_template = match instance_solid_id {
+                None => true, // not eligible ⇒ materialize flat as usual
+                Some(_) if self.instancing_batch_local() => {
+                    self.mark_source_materialized_if_first(source_id)
+                }
+                Some(_) => {
+                    let template_item_id = self
+                        .output_instancing_plan()
+                        .and_then(|plan| plan.get(&source_id))
+                        .map(|&(_, t)| t)
+                        .unwrap_or(item.id);
+                    item.id == template_item_id
+                }
+            };
+            if let Some(solid_item_id) = instance_solid_id {
+                if !is_template {
                     // NON-template occurrence: don't-bake. Ensure the shared registry
                     // holds the source geometry (meshed once model-wide) so the
                     // finalize can recover geometry even in the (effectively
@@ -546,7 +566,7 @@ impl GeometryRouter {
                 }
             }
 
-            // #1623 Phase 2: this is the don't-bake TEMPLATE occurrence (min-id). It
+            // #1623 Phase 2/3: this is the don't-bake TEMPLATE occurrence. It
             // materialized normally above (byte-identical to a flat occurrence — a
             // single-solid source ⇒ exactly one sub-mesh). Re-tag its `rep_identity`
             // to the source id and record the (scaled) MappingTarget as
@@ -556,17 +576,15 @@ impl GeometryRouter {
             // `local_transform`, which is consistent (the template's world geometry is
             // `transform · local_transform · source`, so `m_ref` recovers the same
             // `source` the placeholders reference). See the finalize in processor/mod.rs.
-            if let Some((_, template_item_id, _)) = dont_bake {
-                if item.id == template_item_id {
-                    let local_rm = mapping_transform.map(|mut t| {
-                        self.scale_transform(&mut t);
-                        mat4_to_row_major(&t)
-                    });
-                    for sub in &mut sub_meshes.sub_meshes[mapped_items_start..] {
-                        if let Some(im) = sub.mesh.instance_meta.as_mut() {
-                            im.rep_identity = source_id as u128;
-                            im.local_transform = local_rm;
-                        }
+            if instance_solid_id.is_some() && is_template {
+                let local_rm = mapping_transform.map(|mut t| {
+                    self.scale_transform(&mut t);
+                    mat4_to_row_major(&t)
+                });
+                for sub in &mut sub_meshes.sub_meshes[mapped_items_start..] {
+                    if let Some(im) = sub.mesh.instance_meta.as_mut() {
+                        im.rep_identity = source_id as u128;
+                        im.local_transform = local_rm;
                     }
                 }
             }

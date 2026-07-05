@@ -385,6 +385,108 @@ fn collate_and_encode_matches_mesh_path() {
 }
 
 #[test]
+fn dont_bake_empty_occurrence_refs_recompose_like_materialized() {
+    // #1623 Phase 3: the browser don't-bake path feeds `collate_refs` a single
+    // MATERIALIZED template plus EMPTY-geometry occurrence placeholders (each
+    // carrying only the pre-RTC world transform, id, and colour). The resulting
+    // shard must recompose to the EXACT same world triangles as if every
+    // occurrence had been materialized flat — the byte-identity gate.
+    use std::f64::consts::FRAC_PI_4;
+    let placements = [
+        Matrix4::new_translation(&nalgebra::Vector3::new(2.0, 0.0, 0.0)),
+        Matrix4::from_euler_angles(0.0, 0.0, FRAC_PI_4)
+            * Matrix4::new_translation(&nalgebra::Vector3::new(-6.0, 4.0, 1.0)),
+        Matrix4::from_euler_angles(FRAC_PI_4, 0.0, 0.0)
+            * Matrix4::new_translation(&nalgebra::Vector3::new(30.0, -12.0, 5.0)),
+    ];
+    let meta_for = |m: &Matrix4<f64>| InstanceMeta {
+        transform: mat_rm(m),
+        local_transform: None,
+        canonical_transform: None,
+        rep_identity: 314,
+        instanceable: true,
+    };
+
+    // A: the FLAT baseline — every occurrence materialized (baked verts + meta).
+    let materialized: Vec<Mesh> = placements
+        .iter()
+        .map(|m| mesh_from(baked(&CANON, m), meta_for(m)))
+        .collect();
+    let flat_shard = {
+        let refs: Vec<InstanceMeshRef> = materialized
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let mut r = InstanceMeshRef::from_mesh(m);
+                r.entity_id = 1000 + i as u32;
+                r.color = [0.2, 0.4, 0.6, 1.0];
+                r
+            })
+            .collect();
+        collate_and_encode(&refs, 2, [0.0, 0.0, 0.0])
+    };
+
+    // B: the don't-bake path — occurrence 0 materialized as the template, 1 & 2 as
+    // EMPTY placeholders carrying only their world transform (no baked geometry).
+    let template = &materialized[0];
+    let metas: Vec<InstanceMeta> = placements[1..].iter().map(meta_for).collect();
+    let mut refs_db: Vec<InstanceMeshRef> = Vec::new();
+    let mut tmpl_ref = InstanceMeshRef::from_mesh(template);
+    tmpl_ref.entity_id = 1000;
+    tmpl_ref.color = [0.2, 0.4, 0.6, 1.0];
+    refs_db.push(tmpl_ref);
+    for (k, meta) in metas.iter().enumerate() {
+        refs_db.push(InstanceMeshRef {
+            positions: &[],
+            normals: &[],
+            indices: &[],
+            origin: [0.0; 3],
+            instance_meta: Some(meta),
+            entity_id: 1000 + (k as u32 + 1),
+            color: [0.2, 0.4, 0.6, 1.0],
+        });
+    }
+    let db_shard = collate_and_encode(&refs_db, 2, [0.0, 0.0, 0.0]);
+
+    // Both shards must be byte-identical: same one template geometry (occurrence 0),
+    // same three instances, same ids/colours/transforms. The don't-bake path never
+    // materialized occurrences 1 & 2, yet produces the identical wire shard.
+    assert_eq!(
+        flat_shard, db_shard,
+        "don't-bake empty-occurrence shard must equal the fully-materialized shard byte-for-byte"
+    );
+
+    // And it recomposes to the flat baked world verts within a micrometre.
+    let dec = decode_instanced(&db_shard).expect("decodes");
+    assert_eq!(dec.templates.len(), 1, "one shared template");
+    assert_eq!(dec.instances.len(), 3, "template + two don't-bake occurrences");
+    for inst in &dec.instances {
+        let tmpl = &dec.templates[inst.template_index as usize];
+        let rel = Matrix4::from_row_slice(&inst.transform.map(|v| v as f64));
+        let orig_idx = (inst.entity_id - 1000) as usize;
+        let orig = &materialized[orig_idx];
+        let n = tmpl.positions.len() / 3;
+        for v in 0..n {
+            let w = rel
+                * nalgebra::Vector4::new(
+                    tmpl.origin[0] + tmpl.positions[v * 3] as f64,
+                    tmpl.origin[1] + tmpl.positions[v * 3 + 1] as f64,
+                    tmpl.origin[2] + tmpl.positions[v * 3 + 2] as f64,
+                    1.0,
+                );
+            let gx = orig.origin[0] + orig.positions[v * 3] as f64;
+            let gy = orig.origin[1] + orig.positions[v * 3 + 1] as f64;
+            let gz = orig.origin[2] + orig.positions[v * 3 + 2] as f64;
+            let err = ((w.x / w.w - gx).powi(2)
+                + (w.y / w.w - gy).powi(2)
+                + (w.z / w.w - gz).powi(2))
+            .sqrt();
+            assert!(err < 1e-4, "don't-bake recompose vertex error {err}");
+        }
+    }
+}
+
+#[test]
 fn decode_rejects_bad_magic() {
     assert!(decode_instanced(&[0u8; 32]).is_none());
     assert!(decode_instanced(&[]).is_none());

@@ -126,6 +126,10 @@ export interface GeometryWorkerSetPrepassColumnsMessage {
   type: 'set-prepass-columns';
   referencedRepmaps: Uint32Array;
   instantiatedTypeIds: Uint32Array;
+  /** #1623 Phase 3 don't-bake plan: RepresentationMap ids an IfcMappedItem
+   *  instantiates >= 2x. Installed via `setMappedInstancePlan`; absent/empty ⇒
+   *  the batch never arms the don't-bake path (materializes every occurrence). */
+  mappedInstancePlan?: Uint32Array;
   mliElementIds: Uint32Array;
   mliAxis: Uint32Array;
   mliLayerCounts: Uint32Array;
@@ -377,6 +381,9 @@ type IfcAPIWithMerge = IfcAPI & {
 type IfcAPIWithPrepassColumns = IfcAPI & {
   setReferencedRepmaps?: (ids: Uint32Array) => void;
   setInstantiatedTypeIds?: (ids: Uint32Array) => void;
+  /** #1623 Phase 3: install the don't-bake plan (RepresentationMap ids repeated
+   *  >= 2x). Optional so an older engine binary degrades to full materialize. */
+  setMappedInstancePlan?: (ids: Uint32Array) => void;
   setMaterialLayerIndex?: (
     elementIds: Uint32Array,
     axis: Uint32Array,
@@ -505,6 +512,11 @@ function applyPrepassColumnsToApi(): void {
   }
   if (typeof ifcApi.setInstantiatedTypeIds === 'function') {
     ifcApi.setInstantiatedTypeIds(c.instantiatedTypeIds);
+  }
+  // #1623 Phase 3: install the don't-bake plan so the partitioned batch can arm
+  // batch-local instancing. Empty/absent ⇒ the setter no-ops (nothing repeated).
+  if (typeof ifcApi.setMappedInstancePlan === 'function' && c.mappedInstancePlan) {
+    ifcApi.setMappedInstancePlan(c.mappedInstancePlan);
   }
   if (typeof ifcApi.setMaterialLayerIndex === 'function') {
     ifcApi.setMaterialLayerIndex(

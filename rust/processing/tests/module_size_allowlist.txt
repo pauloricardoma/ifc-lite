@@ -66,10 +66,12 @@
 # +65: promote the per-router IfcMappedItem source cache to a model-wide SharedMappedItemCache (type alias + field + new_/enable_ setters + unique-count diagnostic), meshing each source once model-wide (#1623).
 # +38: #1623 Phase 2 don't-bake — MappedInstancePlan type alias + output_instancing_plan field + enable_/getter + `mod instancing` decl.
 # +28: #858 palette guard — indexed_colour_split_ids field + enable_indexed_colour_split_guard setter + is_indexed_colour_split_source accessor (routes an indexed-colour mapped source to the flat per-palette split instead of a colour-collapsing instance placeholder).
-     704 rust/geometry/src/router/mod.rs
+# +42: #1623 Phase 3 batch-local template mode — instancing_batch_local flag + instanced_sources_materialized tracker fields + set_/getter/mark_source_materialized_if_first methods (browser per-batch don't-bake).
+     746 rust/geometry/src/router/mod.rs
 # +65: #1623 Phase 2 don't-bake — the top-level mapped-item intercept (template retag + instance placeholder) + the public/impl process_element_with_submeshes split; the two eligibility/ensure helpers were extracted to router/instancing.rs (new, 92 lines) to hold the net down.
 # +7: #858 palette guard — exclude an indexed-colour single-solid source from the don't-bake decision (one .filter on the resolved solid id + explanatory comment) so its per-triangle palette survives the flat split.
-    1144 rust/geometry/src/router/processing.rs
+# +16: #1623 Phase 3 — thread the batch-local vs global template decision through the mapped-item intercept (is_template match arm + retag guard).
+    1162 rust/geometry/src/router/processing.rs
 # +26: is_rtc_votable_representation predicate + doc — Surface3D is meshable but must NOT cast RTC votes (#1526 pollution via absolute-coord surfaces).
      472 rust/geometry/src/router/rtc_offset.rs
 # +1: reveal-quads comment expanded to 2 lines (dead-symbol reference fix, no code change).
@@ -105,14 +107,17 @@
      440 rust/processing/src/symbolic/items.rs
 # +6: wire per-batch point-cache hit/miss stats into record_pipeline_batch (perf/brep-point-cache-instrumentation).
 # +13: attach the per-worker shared IfcMappedItem source cache to each batch router, mirroring the item-dedup attach (#1623).
-     786 rust/wasm-bindings/src/api/gpu_meshes/batch.rs
+# +155: #1623 Phase 3 browser don't-bake — produce_batch gains arm_instancing (batch-local plan arm + occurrence collection + finalize call/return-tuple change) and the partitioned path folds the kept occurrences into the IFNS shard as empty-geometry refs; the finalize + recovery bodies were extracted to gpu_meshes/instancing.rs (new, ~165 lines) to hold the net down.
+     941 rust/wasm-bindings/src/api/gpu_meshes/batch.rs
 # +108: build the referenced-repmaps + instantiated-type-id sets and the material-layer index ONCE in the streaming pre-pass (from spans this scan already collected) and emit them as a `prepass-columns` event, so every geometry worker skips its own full-file walk on the first batch (perf/single-scan #957/#563).
-     735 rust/wasm-bindings/src/api/gpu_meshes/prepass.rs
+# +14: #1623 Phase 3 — tally the don't-bake MappedInstancePlan from the same IfcMappedItem spans and emit it on the prepass-columns event (mirrors the referenced-repmaps ship).
+     749 rust/wasm-bindings/src/api/gpu_meshes/prepass.rs
      436 rust/wasm-bindings/src/api/grid_lines.rs
 # +75: add the setReferencedRepmaps / setInstantiatedTypeIds / setMaterialLayerIndex wasm setters that install the pre-pass-computed per-content structures into the worker's IfcAPI (perf/single-scan #957/#563), mirroring setEntityIndex.
 # +23: add the cached_source_bytes session field (doc + init + clearPrePassCache drop) for cold-load lever 1c (setSourceBytes); the setter + FromSource batch variants live in the new sub-400 gpu_meshes/batch_from_source.rs, not here (perf/coldload-setsourcebytes).
 # +37: hold the per-worker shared IfcMappedItem source cache field + drop it on content swap / setEntityIndex / setTessellationQuality, mirroring cached_item_dedup (#1623).
 # +10: drop the shared mapped-item cache in set_skip_small_cuts too (boolean-processor swap; #1623 P1 settings-hole fix).
-     1023 rust/wasm-bindings/src/api/mod.rs
+# +65: #1623 Phase 3 — cached_mapped_instance_plan field (doc + init + clear on clearPrePassCache/setEntityIndex) + setMappedInstancePlan wasm setter + mapped_instance_plan accessor (mirrors setReferencedRepmaps).
+     1088 rust/wasm-bindings/src/api/mod.rs
      692 rust/wasm-bindings/src/zero_copy/mesh.rs
      743 rust/wasm-bindings/src/zero_copy/symbolic.rs

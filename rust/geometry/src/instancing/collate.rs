@@ -141,12 +141,12 @@ pub fn collate_refs(meshes: &[InstanceMeshRef], min_group: usize, rtc: [f64; 3])
     // they're routed to flat_indices and emitted as flat singleton templates.
     // Dropping them here would silently lose geometry now that capture is always-on
     // and real models feed the collator — the unit fixtures were all instanceable,
-    // which hid this. Empty meshes carry nothing to draw and are the only skip.
+    // which hid this. A non-empty non-instanceable mesh goes flat; an EMPTY mesh
+    // carries nothing to draw UNLESS it is a #1623 Phase 3 don't-bake occurrence
+    // placeholder (empty geometry + instanceable InstanceMeta) — the shared template
+    // supplies its geometry, so it joins its rep group like a materialized member.
     let mut flat: Vec<usize> = Vec::new();
     for (i, m) in meshes.iter().enumerate() {
-        if m.positions.is_empty() {
-            continue;
-        }
         match m.instance_meta {
             Some(im) if im.instanceable => {
                 groups
@@ -157,9 +157,25 @@ pub fn collate_refs(meshes: &[InstanceMeshRef], min_group: usize, rtc: [f64; 3])
                     })
                     .push(i);
             }
-            _ => flat.push(i),
+            // Empty + non-instanceable = nothing to draw (skip); non-empty +
+            // non-instanceable = flat singleton.
+            _ if !m.positions.is_empty() => flat.push(i),
+            _ => {}
         }
     }
+
+    // Route only DRAWABLE members flat: an empty don't-bake placeholder carries no
+    // geometry, so it can never render flat — the caller (the wasm don't-bake
+    // finalize) recovers such occurrences flat itself before collation, so a group
+    // it feeds here always has a materialized template and passes the count gate.
+    // Filtering defends against ever silently emitting an empty flat singleton.
+    let drawable = |members: &[usize]| -> Vec<usize> {
+        members
+            .iter()
+            .copied()
+            .filter(|&i| !meshes[i].positions.is_empty())
+            .collect::<Vec<_>>()
+    };
 
     let mut out = Collated {
         flat_indices: flat,
@@ -168,16 +184,27 @@ pub fn collate_refs(meshes: &[InstanceMeshRef], min_group: usize, rtc: [f64; 3])
     for rep in order {
         let members = &groups[&rep];
         if members.len() < min_group.max(1) {
-            out.flat_indices.extend_from_slice(members);
+            out.flat_indices.extend(drawable(members));
             continue;
         }
-        let t_idx = members[0];
+        // Template = the first NON-EMPTY (materialized) member. Empty members are
+        // don't-bake placeholders whose geometry IS this template.
+        let Some(t_idx) = members
+            .iter()
+            .copied()
+            .find(|&i| !meshes[i].positions.is_empty())
+        else {
+            // All-empty group: no template geometry to draw against. Unreachable by
+            // the caller contract (a materialized template always accompanies its
+            // occurrences); drop rather than emit empty singletons that draw nothing.
+            continue;
+        };
         let template = &meshes[t_idx];
         // Compose in the post-RTC frame so the georeferenced offset cancels
         // exactly regardless of each occurrence's rotation (see fn docs).
         let m_ref = to_post_rtc(compose_world(template.instance_meta.unwrap()), rtc);
         let Some(m_ref_inv) = m_ref.try_inverse() else {
-            out.flat_indices.extend_from_slice(members);
+            out.flat_indices.extend(drawable(members));
             continue;
         };
 
@@ -194,14 +221,20 @@ pub fn collate_refs(meshes: &[InstanceMeshRef], min_group: usize, rtc: [f64; 3])
         let mut shapes_match = true;
         for &i in members {
             let mesh = &meshes[i];
-            // Exact-tier occurrences share the SAME local geometry (so same counts),
-            // differing only by placement — we can't byte-compare their BAKED
-            // positions (those legitimately differ). Content-equality is instead
-            // guaranteed upstream: rep_identity is a FULL 128-bit content hash
-            // (compute_mesh_hash_full | tag), so a same-counts/different-content
-            // collision is ~2^-127. The count check stays as a cheap guard.
-            // Rigid-tier occurrences are intentionally non-identical (verified).
-            if !is_rigid && (mesh.positions.len() != vlen || mesh.indices.len() != ilen) {
+            // A #1623 Phase 3 don't-bake placeholder (empty geometry) is pose-only:
+            // its geometry IS the template, so skip the same-shape guard (like the
+            // rigid tier). Exact-tier materialized occurrences share the SAME local
+            // geometry (so same counts), differing only by placement — we can't
+            // byte-compare their BAKED positions (those legitimately differ).
+            // Content-equality is guaranteed upstream: rep_identity is a FULL 128-bit
+            // content hash (or the RepresentationMap id), so a same-counts/
+            // different-content collision is ~2^-127. The count check stays a cheap
+            // guard. Rigid-tier occurrences are intentionally non-identical (verified).
+            let pose_only = mesh.positions.is_empty();
+            if !pose_only
+                && !is_rigid
+                && (mesh.positions.len() != vlen || mesh.indices.len() != ilen)
+            {
                 shapes_match = false;
                 break;
             }
@@ -220,7 +253,7 @@ pub fn collate_refs(meshes: &[InstanceMeshRef], min_group: usize, rtc: [f64; 3])
                 occurrences,
             });
         } else {
-            out.flat_indices.extend_from_slice(members);
+            out.flat_indices.extend(drawable(members));
         }
     }
     out

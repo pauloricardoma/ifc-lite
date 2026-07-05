@@ -142,6 +142,19 @@ pub struct IfcAPI {
     cached_instantiated_type_ids:
         std::sync::Mutex<Option<std::sync::Arc<rustc_hash::FxHashSet<u32>>>>,
 
+    /// #1623 Phase 3 don't-bake plan: `IfcRepresentationMap` id ⇒ `(count, min-id)`
+    /// for every source an `IfcMappedItem` instantiates >= 2 times (the streaming
+    /// pre-pass tallies it in the same scan that builds `cached_referenced_repmaps`).
+    /// When present AND the instanced/partitioned batch path runs, the batch router
+    /// is armed with it in BATCH-LOCAL mode so a repeated single-solid mapped source
+    /// meshes ONCE per batch (the first-seen occurrence) and the rest ride as
+    /// per-occurrence instances in the IFNS shard — killing the per-occurrence
+    /// vertex materialize. `None` (never installed) ⇒ the batch path materializes
+    /// every occurrence exactly as before (byte-identical). Cleared on content swap
+    /// (`setEntityIndex`) and `clearPrePassCache`, like the other pre-pass columns.
+    cached_mapped_instance_plan:
+        std::sync::Mutex<Option<ifc_lite_geometry::MappedInstancePlan>>,
+
     /// Lazily-built surface-texture index keyed by face-set id (issue #961):
     /// decoded RGBA images + per-triangle UV maps from
     /// `IfcIndexedTriangleTextureMap`. Built once per worker (cheap substring
@@ -255,6 +268,7 @@ impl IfcAPI {
             cached_material_layer_index: std::sync::Mutex::new(None),
             cached_referenced_repmaps: std::sync::Mutex::new(None),
             cached_instantiated_type_ids: std::sync::Mutex::new(None),
+            cached_mapped_instance_plan: std::sync::Mutex::new(None),
             cached_texture_index: std::sync::Mutex::new(None),
             cached_indexed_colour_maps: std::sync::Mutex::new(None),
             compute_geometry_hashes: std::sync::atomic::AtomicBool::new(false),
@@ -315,6 +329,12 @@ impl IfcAPI {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inst_slot.take();
+        // The don't-bake mapped-instance plan is keyed off the previous load's
+        // IfcMappedItem scan (#1623 Phase 3); drop it so the next file rebuilds it.
+        self.cached_mapped_instance_plan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         // The texture index is keyed off the previous load's content; drop it.
         let mut texture_slot = self
             .cached_texture_index
@@ -430,6 +450,10 @@ impl IfcAPI {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
+        self.cached_mapped_instance_plan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         self.cached_texture_index
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -502,6 +526,34 @@ impl IfcAPI {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *slot = Some(std::sync::Arc::new(set));
+    }
+
+    /// Install the pre-computed #1623 Phase 3 don't-bake plan: the flat list of
+    /// `IfcRepresentationMap` ids that an `IfcMappedItem` instantiates >= 2 times.
+    /// The streaming pre-pass tallies it in the SAME scan that builds the referenced-
+    /// repmap set (`styling::build_mapped_instance_plan_from_spans`) and ships the id
+    /// list here. The batch path arms its router with it (batch-local template mode),
+    /// so a repeated single-solid mapped source materializes ONCE per batch and the
+    /// rest ride as instances in the IFNS shard.
+    ///
+    /// Same injection contract as [`Self::set_referenced_repmaps`]: installed after
+    /// `setEntityIndex` (which clears it on content swap), and a no-op absence leaves
+    /// the batch path materializing every occurrence (byte-identical). Each id is
+    /// stored as `(2, id)` — the batch-local router only needs the eligibility set
+    /// (count >= 2); the min-id template slot is unused in batch-local mode.
+    #[wasm_bindgen(js_name = setMappedInstancePlan)]
+    pub fn set_mapped_instance_plan(&self, source_ids: &[u32]) {
+        if source_ids.is_empty() {
+            // Nothing repeated ⇒ leave the plan unset so the router never arms.
+            return;
+        }
+        let plan: rustc_hash::FxHashMap<u32, (u32, u32)> =
+            source_ids.iter().map(|&id| (id, (2u32, id))).collect();
+        let mut slot = self
+            .cached_mapped_instance_plan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(std::sync::Arc::new(plan));
     }
 
     /// Install the pre-computed [`ifc_lite_geometry::MaterialLayerIndex`] (#563)
@@ -821,6 +873,19 @@ impl IfcAPI {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *slot = Some(std::sync::Arc::clone(&arc));
         arc
+    }
+
+    /// The installed #1623 Phase 3 don't-bake plan (see [`Self::set_mapped_instance_plan`]),
+    /// or `None` when the pre-pass shipped no repeated mapped sources. UNLIKE the
+    /// referenced-repmap set there is NO lazy full-file fallback: the plan is a pure
+    /// optimization, so absence just means "materialize every occurrence" (the
+    /// byte-identical default), never a correctness gap.
+    pub(crate) fn mapped_instance_plan(&self) -> Option<ifc_lite_geometry::MappedInstancePlan> {
+        self.cached_mapped_instance_plan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(std::sync::Arc::clone)
     }
 
     /// Get or lazily build the set of `IfcRepresentationMap` ids instantiated by
