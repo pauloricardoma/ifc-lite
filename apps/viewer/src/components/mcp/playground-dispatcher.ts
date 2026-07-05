@@ -786,6 +786,8 @@ const IMPLS: Record<string, ToolImpl> = {
     const project = await createBCFFromClashResult(result, groups, {
       author: 'clash@ifc-lite',
       projectName: 'Clash report',
+      // Resolve the (single) model id to its file name for the BCF Header (#1591).
+      modelNameOf: (id) => (id === m.id ? m.name : id),
       ...(status ? { status } : {}),
       ...(maxTopics != null ? { maxTopics } : {}),
     });

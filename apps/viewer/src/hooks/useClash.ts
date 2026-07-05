@@ -607,6 +607,8 @@ export function useClash() {
           author: 'clash@ifc-lite',
           projectName: 'Clash report',
           reviewStatusOf,
+          // Resolve model ids to file names for the BCF Header (#1591).
+          modelNameOf: (id) => state.models.get(id)?.name ?? id,
           maxTopics: config.maxTopics,
           ...(snapshotProvider ? { snapshotProvider } : {}),
         });

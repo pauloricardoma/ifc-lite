@@ -477,4 +477,98 @@ describe('BCF Writer', () => {
       description: 'Spec & Requirements',
     });
   });
+
+  // Federation provenance (#1591): a topic that spans multiple models must
+  // round-trip one <Header><File> per source model so the topic re-anchors to
+  // every model it touches, for BCF 2.1 and 3.0.
+  it.each(['2.1', '3.0'] as const)(
+    'should roundtrip header source files (BCF %s)',
+    async (version) => {
+      const topicGuid = generateUuid();
+      const topic: BCFTopic = {
+        guid: topicGuid,
+        title: 'Federated topic',
+        creationDate: '2026-07-04T00:00:00.000Z',
+        creationAuthor: 'test@example.com',
+        viewpoints: [],
+        comments: [],
+        header: [
+          {
+            ifcProject: '0YvCT2_$X3_xJG3rzD8L_8',
+            isExternal: true,
+            filename: 'architecture.ifc',
+            date: '2026-07-01T10:00:00.000Z',
+            reference: 'architecture.ifc',
+          },
+          {
+            ifcProject: '3aB9cd_ef2Gh1Ij4Kl5Mn6',
+            isExternal: false,
+            filename: 'structure.ifc',
+            date: '2026-07-02T11:30:00.000Z',
+            reference: 'structure.ifc',
+          },
+        ],
+      };
+
+      const project: BCFProject = {
+        version,
+        topics: new Map([[topicGuid, topic]]),
+      };
+
+      const blob = await writeBCF(project);
+      const zip = await JSZip.loadAsync(await blobToArrayBuffer(blob));
+      const markupContent = await zip.file(`${topicGuid}/markup.bcf`)?.async('string');
+      expect(markupContent).toBeDefined();
+
+      // Version-specific container: 3.0 wraps <File> in <Files>, 2.1 does not.
+      if (version === '3.0') {
+        expect(markupContent).toContain('<Files>');
+      } else {
+        expect(markupContent).not.toContain('<Files>');
+      }
+      // Header must precede Topic per the markup schema sequence.
+      expect(markupContent!.indexOf('<Header>')).toBeLessThan(markupContent!.indexOf('<Topic'));
+
+      const readProject = await readBCF(await blob.arrayBuffer());
+      const readTopic = readProject.topics.get(topicGuid);
+      expect(readTopic?.header).toHaveLength(2);
+      expect(readTopic?.header?.[0]).toEqual({
+        ifcProject: '0YvCT2_$X3_xJG3rzD8L_8',
+        ifcSpatialStructureElement: undefined,
+        isExternal: true,
+        filename: 'architecture.ifc',
+        date: '2026-07-01T10:00:00.000Z',
+        reference: 'architecture.ifc',
+      });
+      expect(readTopic?.header?.[1]).toMatchObject({
+        ifcProject: '3aB9cd_ef2Gh1Ij4Kl5Mn6',
+        isExternal: false,
+        filename: 'structure.ifc',
+      });
+    },
+  );
+
+  it('should not emit a Header element for topics without source files', async () => {
+    const topicGuid = generateUuid();
+    const topic: BCFTopic = {
+      guid: topicGuid,
+      title: 'No header',
+      creationDate: new Date().toISOString(),
+      creationAuthor: 'test@example.com',
+      viewpoints: [],
+      comments: [],
+    };
+    const project: BCFProject = {
+      version: '2.1',
+      topics: new Map([[topicGuid, topic]]),
+    };
+
+    const blob = await writeBCF(project);
+    const zip = await JSZip.loadAsync(await blobToArrayBuffer(blob));
+    const markupContent = await zip.file(`${topicGuid}/markup.bcf`)?.async('string');
+    expect(markupContent).not.toContain('<Header>');
+
+    const readProject = await readBCF(await blob.arrayBuffer());
+    expect(readProject.topics.get(topicGuid)?.header).toBeUndefined();
+  });
 });
