@@ -1211,8 +1211,23 @@ pub fn process_geometry_streaming_filtered_with_options(
     // of these sources skip the per-occurrence materialize and emit an
     // `InstanceRecord` at finalize. Requires `retain_emitted_meshes` (the template
     // MeshData must survive in `meshes` for the finalize to place instances onto it).
-    let instancing_plan: Option<ifc_lite_geometry::MappedInstancePlan> =
-        (options.enable_instancing && options.retain_emitted_meshes).then(|| {
+    //
+    // NOT armed for the `site_local` coordinate tier (IfcSite has a non-identity
+    // placement). There, `build_mesh_data` drops the template's `instance_meta`
+    // (site-local meshes are pre-transformed into the site frame via
+    // `convert_mesh_to_site_local`, so a world-placement instance transform no
+    // longer composes) — exactly why the renderer's own instancing (#1238) does not
+    // instance site-local models either. Leaving the plan armed would strand every
+    // occurrence in single-threaded finalize orphan-recovery: a perf REGRESSION on a
+    // translated site (re-bake serially, worse than plain flat) and MISPLACED
+    // geometry on a rotated site (orphan flats baked in the world frame while
+    // siblings sit in the site-local frame). Route the whole model to flat instead —
+    // correct, and no slower than today. (Extending instancing to site-local needs
+    // the renderer to instance in the site frame too; tracked as a follow-up.)
+    let instancing_plan: Option<ifc_lite_geometry::MappedInstancePlan> = (options.enable_instancing
+        && options.retain_emitted_meshes
+        && coord_space != SITE_LOCAL_MESH_COORDINATE_SPACE)
+        .then(|| {
             Arc::new(
                 mapped_item_plan
                     .into_iter()
