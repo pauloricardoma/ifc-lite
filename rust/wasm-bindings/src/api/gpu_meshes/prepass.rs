@@ -473,15 +473,15 @@ impl IfcAPI {
         // (A) Entity-index — workers re-scan the whole file (~5 s) without it, so
         // it must reach them as early as possible. Built from the complete index.
         {
-            let n = index_for_export.len();
-            let ids_arr = js_sys::Uint32Array::new_with_length(n as u32);
-            let starts_arr = js_sys::Uint32Array::new_with_length(n as u32);
-            let lengths_arr = js_sys::Uint32Array::new_with_length(n as u32);
-            for (i, (&id, &(start, end))) in index_for_export.iter().enumerate() {
-                ids_arr.set_index(i as u32, id);
-                starts_arr.set_index(i as u32, start as u32);
-                lengths_arr.set_index(i as u32, (end - start) as u32);
-            }
+            // Bulk-copy in 3 boundary crossings, not ~8.4M per-entry set_index
+            // calls (workers' critical path). Order-free: they zip the 3 arrays.
+            let (ids, (starts, lengths)): (Vec<u32>, (Vec<u32>, Vec<u32>)) = index_for_export
+                .iter()
+                .map(|(&id, &(s, e))| (id, (s as u32, (e - s) as u32)))
+                .unzip();
+            let ids_arr = js_sys::Uint32Array::from(ids.as_slice());
+            let starts_arr = js_sys::Uint32Array::from(starts.as_slice());
+            let lengths_arr = js_sys::Uint32Array::from(lengths.as_slice());
             let index_event = js_sys::Object::new();
             crate::api::set_js_prop(&index_event, "type", &"entity-index".into());
             crate::api::set_js_prop(&index_event, "ids", &ids_arr);
