@@ -124,3 +124,4 @@
      1088 rust/wasm-bindings/src/api/mod.rs
      692 rust/wasm-bindings/src/zero_copy/mesh.rs
      743 rust/wasm-bindings/src/zero_copy/symbolic.rs
+    1065 rust/geometry/src/kernel/fixed_int.rs

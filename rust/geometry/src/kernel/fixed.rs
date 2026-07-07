@@ -37,7 +37,7 @@ use super::{DropAxis, ImplicitPoint, Sign};
 macro_rules! fixed_impl {
     ($T:ty, $scale:expr) => {
         use super::super::{assemble_sign, DropAxis, ImplicitPoint, Lpi, Sign, Tpi};
-        use num_traits::{CheckedAdd, CheckedMul, CheckedSub, FromPrimitive, One, Signed};
+        use num_traits::{CheckedAdd, CheckedMul, CheckedSub, FromPrimitive, One};
 
         type I = $T;
         type V3 = [I; 3];
@@ -249,25 +249,25 @@ const FINE: f64 = 68_719_476_736.0;
 const FINE_OVER_COARSE: i64 = 1 << 20;
 
 mod w256 {
-    fixed_impl!(bnum::types::I256, super::COARSE);
+    fixed_impl!(crate::kernel::fixed_int::FixedInt<4>, super::COARSE);
 }
 mod w512 {
-    fixed_impl!(bnum::types::I512, super::COARSE);
+    fixed_impl!(crate::kernel::fixed_int::FixedInt<8>, super::COARSE);
 }
 mod w1024 {
-    fixed_impl!(bnum::types::I1024, super::COARSE);
+    fixed_impl!(crate::kernel::fixed_int::FixedInt<16>, super::COARSE);
 }
 mod f256 {
-    fixed_impl!(bnum::types::I256, super::FINE);
+    fixed_impl!(crate::kernel::fixed_int::FixedInt<4>, super::FINE);
 }
 mod f512 {
-    fixed_impl!(bnum::types::I512, super::FINE);
+    fixed_impl!(crate::kernel::fixed_int::FixedInt<8>, super::FINE);
 }
 mod f1024 {
-    fixed_impl!(bnum::types::I1024, super::FINE);
+    fixed_impl!(crate::kernel::fixed_int::FixedInt<16>, super::FINE);
 }
 mod f2048 {
-    fixed_impl!(bnum::types::I2048, super::FINE);
+    fixed_impl!(crate::kernel::fixed_int::FixedInt<32>, super::FINE);
 }
 
 // Tiered dispatch: narrowest width first, escalate on overflow; the coarse-scale
@@ -311,7 +311,7 @@ cascade!(indirect_orient3d(p: &ImplicitPoint, p2: [f64; 3], p3: [f64; 3], p4: [f
 // ~2^742 for fine LPI pairs) overflow I512 and fall to the dual-scale cascade —
 // a deliberate trade that keeps the cache at I512 width for the coarse-grid
 // majority (an I1024 cache measured +35% on the 841 corpus).
-type Big = bnum::types::I512;
+type Big = crate::kernel::fixed_int::FixedInt<8>;
 pub type Lam = ([Big; 3], Big);
 
 #[inline]
@@ -324,7 +324,6 @@ fn bsub(a: Big, b: Big) -> Option<Big> {
 }
 #[inline]
 fn bsign(x: &Big) -> Sign {
-    use num_traits::Signed;
     if x.is_negative() {
         Sign::Negative
     } else if x.is_zero() {

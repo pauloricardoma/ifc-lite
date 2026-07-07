@@ -19,6 +19,7 @@ pub mod broadphase;
 pub mod budget;
 pub mod coplanar;
 pub mod fixed;
+pub mod fixed_int;
 pub mod interner;
 pub mod interval;
 pub mod manifest;
