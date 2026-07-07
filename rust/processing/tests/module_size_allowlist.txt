@@ -124,4 +124,5 @@
      1088 rust/wasm-bindings/src/api/mod.rs
      692 rust/wasm-bindings/src/zero_copy/mesh.rs
      743 rust/wasm-bindings/src/zero_copy/symbolic.rs
+# NEW: FixedInt<K> exact-arithmetic type replacing bnum in the predicate tier (~15-28% geometry), plus its ~6M-assertion differential-fuzz proof vs bnum across 4 widths. The fuzz (boundary + overflow + conversion-lock) needs the impl and the bnum-comparison harness co-located to stay a drop-in-equivalence gate; splitting the tests out would break that coupling for no size win on the impl (~730 lines).
     1065 rust/geometry/src/kernel/fixed_int.rs

@@ -32,9 +32,9 @@
 //! each width K in {4, 8, 16, 32} it checks >100k sample pairs (random +
 //! boundary) Option-for-Option against the corresponding bnum type.
 //!
-//! NOT yet wired into `fixed.rs` — the alias swap (fixed.rs:252-271, 314) is
-//! a separate integration step gated on the pinned mesh-determinism /
-//! boolean-manifest suites.
+//! Wired into `fixed.rs` (the alias swap at fixed.rs:252-271, 314), gated by
+//! the pinned mesh-determinism / boolean-manifest suites and the
+//! differential-fuzz proof in this module's tests.
 
 use core::cmp::Ordering;
 use core::ops::{Add, Div, Mul, Neg, Rem, Sub};
