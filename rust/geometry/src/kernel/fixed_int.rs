@@ -306,9 +306,12 @@ impl<const K: usize> FixedInt<K> {
                 borrow = (b1 | b2) as u64;
             }
         }
-        // Fits iff the high half is the sign-extension of the low half.
+        // Fits iff the high half is the sign-extension of the low half. Uses the
+        // XOR/OR-reduce helper, NOT `hi.iter().any(|&h| h != sign_ext)`: that
+        // per-element compare is the same shape that lowers to an unselectable
+        // `v16i8 setcc` under wasm32 `+simd128` (see `all_limbs_eq`).
         let sign_ext = if (lo[K - 1] >> 63) != 0 { u64::MAX } else { 0 };
-        if hi.iter().any(|&h| h != sign_ext) {
+        if !all_limbs_eq(&hi, sign_ext) {
             return None;
         }
         Some(Self { limbs: lo })
