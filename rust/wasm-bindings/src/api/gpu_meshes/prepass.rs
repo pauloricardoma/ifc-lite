@@ -261,15 +261,6 @@ impl IfcAPI {
         // keyword only appears as an entity type) so we never re-scan the file:
         // an `IfcMaterialLayerSet`/`...Usage` entity is present iff the gate fires.
         let mut has_layer_set = false;
-        // #957 orphan-type gate. `collect_type_geometry_jobs` used to bail on a
-        // whole-file `IFCREPRESENTATIONMAP` substring check; we detect the same
-        // condition from the scan (a RepresentationMap keyword only appears as an
-        // entity type) and skip the span collector entirely when absent. This
-        // keeps the no-type-geometry common case free AND stays byte-identical to
-        // the old bail-out: with no RepresentationMap entity there is nothing a
-        // type's attr-6 can validly reference, so the job list is empty either
-        // way (and a dangling attr-6 ref no longer fabricates a phantom job).
-        let mut has_representation_map = false;
         // Plane-angle scale, resolved with the meta by the shared resolver and
         // carried on the meta event so workers seed their batch decoders.
         let mut plane_angle_to_radians = 1.0f64;
@@ -368,9 +359,6 @@ impl IfcAPI {
                 }
                 "IFCMATERIALLAYERSET" | "IFCMATERIALLAYERSETUSAGE" => {
                     has_layer_set = true;
-                }
-                "IFCREPRESENTATIONMAP" => {
-                    has_representation_map = true;
                 }
                 _ => {
                     // #957/#962: an IfcTypeProduct subtype (its geometry is
@@ -738,16 +726,16 @@ impl IfcAPI {
         //
         // #962 done: the mapped-item source + type-candidate spans were collected
         // by the streaming scan above, so this resolves orphans from those stashes
-        // with NO second EntityScanner pass. `has_representation_map` reproduces
-        // the old whole-file `IFCREPRESENTATIONMAP` substring bail-out: with no
-        // RepresentationMap entity there can be no orphan type geometry, so skip
-        // the collector entirely — free on the ~all-files-without-type-geometry
-        // common case, and byte-identical to the old guard (no phantom job from a
-        // dangling type attr-6 ref).
+        // with NO second EntityScanner pass. The gate is the SAME predicate the old
+        // `collect_type_geometry_jobs` bailed on — an `IFCREPRESENTATIONMAP`
+        // substring (a SIMD memmem, not a full scan) — so behaviour stays byte-
+        // identical to the old path and `combined_pre_pass`, free on the no-type case.
         // #1097 perf: the viewer's default Model view does not render the
         // type-library (#957) geometry, so skip producing it at load when the
         // caller asks (the Types view re-loads on demand).
-        if !skip_type_geometry && has_representation_map {
+        if !skip_type_geometry
+            && memchr::memmem::find(content, b"IFCREPRESENTATIONMAP").is_some()
+        {
             let type_jobs = crate::api::styling::collect_type_geometry_jobs_from_spans(
                 &mapped_item_spans,
                 &type_candidate_spans,
