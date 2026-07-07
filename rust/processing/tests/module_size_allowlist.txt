@@ -35,7 +35,7 @@
      998 rust/geometry/src/extrusion.rs
 # +4: refine_high_aspect_slivers routes its rebuild through Mesh::rebuilt_like so a slivered host keeps its local-frame origin + #1474 placement capture (B7 metadata-loss fix).
 # +1: SNAP_GRID/NORMAL_QUANT single-homed to kernel::mesh_bridge / crate::grid (import replaces local const; doc rewrap costs a line).
-     764 rust/geometry/src/facet_weld.rs
+          778 rust/geometry/src/facet_weld.rs
 # +2: mix64 made pub(crate); doc-comment noting the shared use by router::content_hash.
      410 rust/geometry/src/geom_hash.rs
      633 rust/geometry/src/kernel/arrangement/classify.rs
