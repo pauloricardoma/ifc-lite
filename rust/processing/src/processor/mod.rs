@@ -39,11 +39,7 @@ use color_layer::{
     resolve_presentation_layer_for_product_definition_shape,
 };
 use opening_filter::apply_opening_filter;
-use properties::{
-    assign_space_zone_properties, collect_property_set_definition,
-    collect_rel_defines_by_properties_link, extract_property_name_and_value, PropertySetDefinition,
-    RelDefinesByPropertiesLink,
-};
+use properties::resolve_space_zone_properties_lazy;
 use quick_metadata::{
     build_quick_spatial_tree_node, extract_name_from_args, extract_storey_elevation_from_args,
     is_quick_spatial_type_ci, parse_step_arguments, parse_step_ref, parse_step_ref_list,
@@ -525,9 +521,13 @@ pub fn process_geometry_streaming_filtered_with_options(
     let mut prepass_spans = crate::prepass::PrepassSpans::default();
     let mut project_id: Option<u32> = None;
     let mut presentation_layer_by_assigned_id: FxHashMap<u32, String> = FxHashMap::default();
-    let mut property_values_by_id: FxHashMap<u32, (String, String)> = FxHashMap::default();
-    let mut property_sets_by_id: FxHashMap<u32, PropertySetDefinition> = FxHashMap::default();
-    let mut rel_defines_by_properties: Vec<RelDefinesByPropertiesLink> = Vec::new();
+    // Space/zone property resolution is demand-driven (see the lookup phase and
+    // `resolve_space_zone_properties_lazy`). The scan only stashes the
+    // IfcRelDefinesByProperties spans; property sets and property atoms are
+    // decoded later, and only for the handful a space/zone actually references —
+    // skipping the eager decode of ~25% of a model's entities that was the
+    // dominant single-threaded cold-load cost on parse-bound models.
+    let mut rel_defines_spans: Vec<(usize, usize)> = Vec::new();
 
     // Collect geometry entities
     let mut scanner = EntityScanner::new(content);
@@ -674,34 +674,17 @@ pub fn process_geometry_streaming_filtered_with_options(
             }
             continue;
         } else if type_name == "IFCPROPERTYSET" {
-            if !options.include_properties {
-                continue;
-            }
-            if let Ok(property_set) = decoder.decode_at(start, end) {
-                if let Some(definition) = collect_property_set_definition(&property_set) {
-                    property_sets_by_id.insert(id, definition);
-                }
-            }
+            // Decoded lazily in the lookup phase, and only when referenced by a
+            // space/zone (its sole consumer). The inline index holds the span.
             continue;
         } else if type_name == "IFCRELDEFINESBYPROPERTIES" {
-            if !options.include_properties {
-                continue;
-            }
-            if let Ok(rel_defines) = decoder.decode_at(start, end) {
-                if let Some(link) = collect_rel_defines_by_properties_link(&rel_defines) {
-                    rel_defines_by_properties.push(link);
-                }
+            if options.include_properties {
+                rel_defines_spans.push((start, end));
             }
             continue;
         } else if type_name.starts_with("IFCPROPERTY") {
-            if !options.include_properties {
-                continue;
-            }
-            if let Ok(property_entity) = decoder.decode_at(start, end) {
-                if let Some((name, value)) = extract_property_name_and_value(&property_entity) {
-                    property_values_by_id.insert(id, (name, value));
-                }
-            }
+            // Individual property values are resolved lazily by id in the lookup
+            // phase (only those a referenced space/zone property set lists).
             continue;
         } else if type_name == "IFCRELVOIDSELEMENT" {
             prepass_spans.void_rels.push((id, start, end));
@@ -887,12 +870,7 @@ pub fn process_geometry_streaming_filtered_with_options(
     let lookup_start = Clock::now();
     let lookup_span = tracing::debug_span!("lookup", phase_ms = tracing::field::Empty).entered();
     if options.include_properties {
-        assign_space_zone_properties(
-            &mut entity_jobs,
-            &property_values_by_id,
-            &property_sets_by_id,
-            &rel_defines_by_properties,
-        );
+        resolve_space_zone_properties_lazy(&mut entity_jobs, &mut decoder, &rel_defines_spans);
     }
     if options.fast_first_batch {
         entity_jobs.sort_by(|left, right| {
