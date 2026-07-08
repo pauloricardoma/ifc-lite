@@ -6,7 +6,10 @@
 //! ifc-lite's `Mesh` (f32 positions/normals/indices). `subtract`/`union`/
 //! `intersection` here are what the `ClippingProcessor` seam calls.
 
-use super::arrangement::{boolean, difference_all, union_all, BoolOp, Tri};
+use super::arrangement::{
+    boolean, difference_all, difference_all_lenient, union_all, BoolOp, Tri,
+};
+use super::signed_volume::signed_volume6;
 use crate::mesh::Mesh;
 
 /// f32-near-coplanar reconciliation snap grid (metres). A POWER OF TWO so the
@@ -95,57 +98,6 @@ pub fn tris_to_mesh(tris: &[Tri]) -> Mesh {
     m
 }
 
-/// Twice-the-signed-volume sum for a triangle list (divergence theorem, ×6):
-/// `Σ (v0−o)·((v1−o)×(v2−o))`, ABOUT THE OPERAND'S OWN AABB CENTER `o`. A closed
-/// outward-wound mesh has this `> 0`; an inward-wound one `< 0`. Computed in
-/// plain FMA-free f64 over the snapped operand coords, so only its SIGN is
-/// consumed — byte-identical native==wasm. (The magnitude is irrelevant; we
-/// never compare it to a tolerance.)
-///
-/// WHY the local reference point: for a CLOSED mesh
-/// the sign is translation-invariant, so the reference is free. But an operand
-/// that re-enters a SEQUENTIAL void-cut loop can carry sliver cracks from the
-/// previous subtract (flush-interface seams, the open-edge family) — and for an
-/// OPEN surface the divergence sum is translation-VARIANT: the boundary-loop
-/// flux grows linearly with the distance to the reference point. Referenced to
-/// the WORLD origin, a 250–410 m-out tunnel wall with a 2.65 m sliver crack read
-/// `vol < 0` (e.g. −59.8 from a +0.30 m³ solid), which made [`orient_outward`]
-/// flip the whole host inside-out and invert the next cut (#198779's −49.3
-/// cascade). About the AABB center the crack flux is bounded by the operand's
-/// own extent — the sign is decided by the solid, not by where the model sits.
-fn signed_volume6(tris: &[Tri]) -> f64 {
-    let mut lo = [f64::MAX; 3];
-    let mut hi = [f64::MIN; 3];
-    for t in tris {
-        for v in t {
-            for k in 0..3 {
-                lo[k] = lo[k].min(v[k]);
-                hi[k] = hi[k].max(v[k]);
-            }
-        }
-    }
-    if tris.is_empty() {
-        return 0.0;
-    }
-    let o = [
-        (lo[0] + hi[0]) * 0.5,
-        (lo[1] + hi[1]) * 0.5,
-        (lo[2] + hi[2]) * 0.5,
-    ];
-    tris.iter()
-        .map(|t| {
-            let a = [t[0][0] - o[0], t[0][1] - o[1], t[0][2] - o[2]];
-            let b = [t[1][0] - o[0], t[1][1] - o[1], t[1][2] - o[2]];
-            let c = [t[2][0] - o[0], t[2][1] - o[1], t[2][2] - o[2]];
-            let cr = [
-                b[1] * c[2] - b[2] * c[1],
-                b[2] * c[0] - b[0] * c[2],
-                b[0] * c[1] - b[1] * c[0],
-            ];
-            a[0] * cr[0] + a[1] * cr[1] + a[2] * cr[2]
-        })
-        .sum()
-}
 
 /// Orient a closed operand OUTWARD before it enters the arrangement.
 ///
@@ -372,12 +324,11 @@ pub fn subtract(host: &Mesh, cutter: &Mesh) -> Mesh {
 /// promoted onto the host faces and oriented outward INDIVIDUALLY — the global
 /// signed-volume orientation of [`subtract`] cannot fix mixed per-component
 /// winding of a multi-component operand (the #2176 lesson) — then the whole
-/// group is subtracted in ONE conforming arrangement (`difference_all`), so
+/// group is subtracted in ONE arrangement (`difference_all_volume_safe`), so
 /// there is no per-cutter f64→f32→snap round-trip to re-jitter and re-crack the
 /// previous cut's seams. Component order is the caller's (deterministic).
-/// Returns `None` when the arrangement could not fully conform (an unrecovered
-/// constraint — see [`difference_all`]); the caller must fall back to
-/// sequential per-cutter subtraction.
+/// Returns `None` only when even the volume-safe non-conforming batch is
+/// untrustworthy; the caller then falls back to sequential per-cutter subtraction.
 pub fn subtract_many(host: &Mesh, cutters: &[&Mesh]) -> Option<Mesh> {
     #[cfg(feature = "csg_capture")]
     crate::csg_capture::record_many(host, cutters);
@@ -391,7 +342,32 @@ pub fn subtract_many(host: &Mesh, cutters: &[&Mesh]) -> Option<Mesh> {
         })
         .collect();
     let refs: Vec<&[Tri]> = comp_tris.iter().map(|c| c.as_slice()).collect();
-    Some(tris_to_mesh(&difference_all(&h, &refs)?))
+    // Conforming batch: the fast, exact, byte-identical common path.
+    if let Some(r) = difference_all(&h, &refs) {
+        return Some(tris_to_mesh(&r));
+    }
+    // Non-conforming batch (an unrecovered constraint remains after the robust
+    // traversal recovery). Its exact topology is CLEANER than sequential per-cutter
+    // re-jitter on dense faceted-reveal walls (issue #098 V5C: 532→108 open edges),
+    // but a straddling misclassification can over/under-cut VOLUME (#559171/#1167).
+    // Trust the lenient batch ONLY when its removed volume matches the sequential
+    // reference; else None, so the caller runs its full sequential path.
+    let batch = difference_all_lenient(&h, &refs);
+    let mut seq = tris_to_mesh(&h);
+    for c in cutters {
+        seq = subtract(&seq, c);
+    }
+    let host_v = signed_volume6(&h).abs();
+    let batch_removed = host_v - signed_volume6(&batch).abs();
+    let seq_removed = host_v - signed_volume6(&mesh_to_tris(&seq)).abs();
+    // 1% agreement — above f64/FMA noise (parity-stable branch), tight enough to
+    // reject the #1167 gross under-cut (3.7 m³ vs 13 m³).
+    let tol = seq_removed.abs().max(1.0e-9) * 0.01;
+    if (batch_removed - seq_removed).abs() <= tol {
+        Some(tris_to_mesh(&batch))
+    } else {
+        None
+    }
 }
 
 /// `a ∪ b` as a `Mesh`.
