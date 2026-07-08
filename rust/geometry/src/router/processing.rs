@@ -666,10 +666,8 @@ impl GeometryRouter {
         //    the cut wins over deduping a degraded result. (#1257 review P1.)
         if let (Some(key), Some(cache)) = (dedup_key, self.item_dedup_cache.as_ref()) {
             if !mesh.positions.is_empty() && !crate::kernel::budget::tripped() {
-                // Clone the mesh into its Arc BEFORE taking the lock: the deep copy
-                // must not run inside the critical section, or every dedup miss
-                // serializes the whole worker pool behind one another's mesh copies
-                // (the shared cache is a single Mutex hit by every element).
+                // Clone into the Arc BEFORE locking: a mesh deep-copy inside the
+                // single-Mutex critical section serializes the pool on every miss.
                 let cached = Arc::new(mesh.clone());
                 cache
                     .lock()
