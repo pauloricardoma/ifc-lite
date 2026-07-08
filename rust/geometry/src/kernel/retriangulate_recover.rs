@@ -296,13 +296,19 @@ pub(crate) fn recover_via_traversal(mesh: &mut Mesh2d, it: &Interner, a: Vid, b:
             let (u, v) = (t[(ai + 1) % 3], t[(ai + 2) % 3]);
             let (su, sv) = (orient2d_v(it, start, end, u, axis), orient2d_v(it, start, end, v, axis));
             if su == Sign::Zero || sv == Sign::Zero || su == sv {
+                continue; // u,v don't straddle line start→end
+            }
+            // The segment must actually cross the opposite edge (u,v) TOWARD `end`
+            // — `start` and `end` on opposite sides of line (u,v). Without this a
+            // complex fan around `start` (many constraint sub-triangles) admits a
+            // FARTHER wedge triangle whose edge the segment crosses AWAY from
+            // `end`, and the walk then overshoots to the mesh boundary (the
+            // near-degenerate reveal-step segments, issue #098 V5C residual).
+            let (sa, sb) = (orient2d_v(it, u, v, start, axis), orient2d_v(it, u, v, end, axis));
+            if sa == Sign::Zero || sb == Sign::Zero || sa == sb {
                 continue;
             }
-            if orient2d_v(it, start, u, end, axis) == orient2d_v(it, start, u, v, axis)
-                && orient2d_v(it, start, v, end, axis) == orient2d_v(it, start, v, u, axis)
-            {
-                return Some(if su == w0 { (ti, u, v) } else { (ti, v, u) });
-            }
+            return Some(if su == w0 { (ti, u, v) } else { (ti, v, u) });
         }
         None
     };
