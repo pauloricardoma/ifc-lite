@@ -1,0 +1,8 @@
+# Build artifacts / deps — não precisam ir pro contexto do server (Rust)
+target/
+**/node_modules/
+.git/
+**/dist/
+**/.nx/
+**/coverage/
+**/*.log
