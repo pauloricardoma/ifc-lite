@@ -259,8 +259,14 @@ async function buildDisciplineButtons() {
 (document.getElementById('clear') as HTMLButtonElement).addEventListener('click', clearScene);
 buildDisciplineButtons();
 
-// ── DOR: comparar padrão vs otimizado (standalone, pesado) ────────────────────
-async function loadDor(kind: 'std' | 'opt') {
+// ── DOR: comparar variantes de opening-filter (standalone, pesado) ────────────
+// std = default (todas aberturas + cortes CSG) · opt = default otimizado
+// fast = ignore_all (sem janelas/portas) · opaque = ignore_opaque (mantém vidros)
+const DOR_LABEL: Record<'std' | 'opt' | 'fast' | 'opaque', string> = {
+  std: 'padrão (default)', opt: 'otimizado (default)',
+  fast: 'fast (ignore_all)', opaque: 'opaque (ignore_opaque)',
+};
+async function loadDor(kind: 'std' | 'opt' | 'fast' | 'opaque') {
   clearScene();
   const t0 = performance.now();
   say(`DOR ${kind}: buscando…`);
@@ -285,11 +291,13 @@ async function loadDor(kind: 'std' | 'opt') {
     renderer.fitToView();
     renderer.requestRender();
     const tris = meshes.reduce((s: number, m: any) => s + (m.indices?.length ?? 0) / 3, 0);
-    say(`DOR ${kind === 'opt' ? 'otimizado' : 'padrão'} ✓\n${meshes.length} malhas · ${(tris / 1e6).toFixed(1)}M tri · ${((performance.now() - t0) / 1000).toFixed(1)}s · RAM ~${mb(mem())} MB`);
+    say(`DOR ${DOR_LABEL[kind]} ✓\n${meshes.length} malhas · ${(tris / 1e6).toFixed(1)}M tri · ${((performance.now() - t0) / 1000).toFixed(1)}s · RAM ~${mb(mem())} MB`);
   } catch (e: any) { say(`DOR ${kind} FALHOU: ${e.message}`, true); }
 }
 (document.getElementById('dor-std') as HTMLButtonElement).addEventListener('click', () => loadDor('std'));
 (document.getElementById('dor-opt') as HTMLButtonElement).addEventListener('click', () => loadDor('opt'));
+(document.getElementById('dor-fast') as HTMLButtonElement).addEventListener('click', () => loadDor('fast'));
+(document.getElementById('dor-opaque') as HTMLButtonElement).addEventListener('click', () => loadDor('opaque'));
 
 loadBtn.addEventListener('click', () => load(modelInput.value.trim()));
 modelInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') load(modelInput.value.trim()); });
