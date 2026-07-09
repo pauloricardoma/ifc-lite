@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ifc-lite · artifact POC</title>
+    <style>
+      * { margin: 0; box-sizing: border-box; }
+      html, body { height: 100%; background: #16181d; color: #e6e6e6;
+        font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; }
+      #c { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+      #panel { position: fixed; top: 12px; left: 12px; z-index: 10;
+        background: rgba(24,26,32,.85); border: 1px solid #2c2f38; border-radius: 8px;
+        padding: 10px 12px; backdrop-filter: blur(8px); max-width: 320px; }
+      #panel h1 { font-size: 12px; font-weight: 600; letter-spacing: .04em;
+        color: #7aa2f7; margin-bottom: 8px; text-transform: uppercase; }
+      #panel input { background: #0f1116; border: 1px solid #2c2f38; color: #e6e6e6;
+        border-radius: 5px; padding: 5px 7px; width: 150px; font: inherit; }
+      #panel button { background: #7aa2f7; color: #0f1116; border: 0; border-radius: 5px;
+        padding: 5px 10px; font: inherit; font-weight: 600; cursor: pointer; margin-left: 4px; }
+      #status { margin-top: 8px; color: #9aa0ac; white-space: pre-wrap; }
+      #status.err { color: #f7768e; }
+      #hint { position: fixed; bottom: 10px; left: 12px; color: #565a66; z-index: 10; }
+    </style>
+  </head>
+  <body>
+    <canvas id="c"></canvas>
+    <div id="panel">
+      <h1>artifact POC</h1>
+      <div style="margin-bottom:6px">
+        <span style="color:#565a66">CDN:</span>
+        <input id="model" value="brep" spellcheck="false" style="width:110px" />
+        <button id="load">abrir</button>
+      </div>
+      <div style="margin-bottom:4px">
+        <span style="color:#565a66">tessellation:</span>
+        <select id="tier" style="background:#0f1116;color:#e6e6e6;border:1px solid #2c2f38;border-radius:5px;padding:4px">
+          <option value="lowest">lowest (×0.25)</option>
+          <option value="low" selected>low (×0.5)</option>
+          <option value="medium">medium (×1)</option>
+        </select>
+      </div>
+      <div style="margin-bottom:6px">
+        <span style="color:#565a66">client parse:</span>
+        <input id="file" type="file" accept=".ifc" style="width:150px;border:0;padding:0" />
+      </div>
+      <div style="margin-bottom:4px">
+        <span style="color:#565a66">disciplinas (clique p/ adicionar):</span>
+        <button id="clear" style="background:#f7768e;color:#0f1116;float:right;padding:2px 8px">limpar</button>
+      </div>
+      <div id="disc" style="display:flex;flex-wrap:wrap;gap:4px;max-height:200px;overflow:auto;margin-bottom:6px"></div>
+      <div style="margin-bottom:6px;border-top:1px solid #2c2f38;padding-top:6px">
+        <span style="color:#565a66">DOR (comparar, pesado):</span><br>
+        <button id="dor-std" style="background:#e0af68;color:#0f1116">DOR padrão (1.3GB)</button>
+        <button id="dor-opt" style="background:#7aa2f7;color:#0f1116">DOR otimizado (761MB)</button>
+      </div>
+      <div id="status">pronto — CDN (/artifacts/&lt;modelo&gt;/) ou escolha um .ifc pra parsear no browser</div>
+    </div>
+    <div id="hint">arrastar = orbitar · shift/botão-direito = pan · scroll = zoom</div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,26 @@
+{
+  "name": "@ifc-lite/artifact-poc",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "node ../../scripts/fetch-prebuilt-wasm.mjs && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@ifc-lite/renderer": "workspace:*",
+    "@ifc-lite/server-client": "workspace:*",
+    "@ifc-lite/geometry": "workspace:*",
+    "@aws-sdk/client-s3": "^3",
+    "@aws-sdk/s3-request-presigner": "^3",
+    "apache-arrow": "^21.1.0",
+    "parquet-wasm": "^0.7.1"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3",
+    "vite": "^8.1.0",
+    "vite-plugin-top-level-await": "^1.6.0",
+    "vite-plugin-wasm": "^3.6.0"
+  }
+}
