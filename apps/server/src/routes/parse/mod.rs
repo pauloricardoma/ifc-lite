@@ -6,11 +6,13 @@
 
 mod cache_keys;
 mod fetch;
+mod instanced;
 mod json;
 mod parquet;
 mod parquet_stream;
 
 pub use fetch::{check_cache, get_cached_geometry, get_data_model, get_symbolic};
+pub use instanced::parse_instanced;
 pub use json::{parse_full, parse_metadata, parse_stream};
 pub use parquet::{parse_parquet, parse_parquet_optimized};
 pub use parquet_stream::parse_parquet_stream;

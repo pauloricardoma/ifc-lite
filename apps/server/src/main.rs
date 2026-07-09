@@ -166,6 +166,10 @@ fn build_router(state: AppState) -> Router {
         )
         .route("/api/v1/parse/parquet", post(routes::parse::parse_parquet))
         .route(
+            "/api/v1/parse/instanced",
+            post(routes::parse::parse_instanced),
+        )
+        .route(
             "/api/v1/parse/parquet/optimized",
             post(routes::parse::parse_parquet_optimized),
         )
