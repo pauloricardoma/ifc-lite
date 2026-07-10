@@ -3,7 +3,7 @@
 // Prova o caminho quente do next_04 (Blob/CDN → decoder → renderer).
 import { Renderer } from '@ifc-lite/renderer';
 import { decodeParquetGeometry, decodeOptimizedParquetGeometry } from '@ifc-lite/server-client';
-import { GeometryProcessor } from '@ifc-lite/geometry';
+import { GeometryProcessor, decodeInstancedShard } from '@ifc-lite/geometry';
 
 const canvas = document.getElementById('c') as HTMLCanvasElement;
 const statusEl = document.getElementById('status')!;
@@ -157,24 +157,56 @@ async function parseClientSide(file: File) {
 
   const tier = (document.getElementById('tier') as HTMLSelectElement).value as any;
   say(`init do parser WASM… (tessellation=${tier})`);
+  // enableInstancing NÃO é setado → default TRUE, igual ao viewer oficial: a
+  // geometria opaca repetida sai como instancedShards (economia de memória).
   const gp = new GeometryProcessor({ tessellationQuality: tier }); // tier baixo = menos triângulos
   await gp.init();
 
-  const meshes: any[] = [];
-  let batches = 0, tris = 0;
+  // Cena limpa antes de streamar (append progressivo NÃO reseta como loadGeometry).
+  renderer.getScene().clear();
+  const scene = renderer.getScene();
+  const device = renderer.getGPUDevice();
+
+  let batches = 0, meshCount = 0, shardCount = 0, tris = 0;
+  let framed = false;
   const tParse = performance.now();
-  for await (const ev of gp.processStreaming(bytes)) {
-    if (ev.type === 'batch') {
-      meshes.push(...ev.meshes);
-      batches++;
+
+  // processAdaptive: arquivos ≥2MB seguem o caminho PARALELO (SAB + pool de
+  // workers multi-core), igual ao ifclite.com — em vez do processStreaming
+  // single-thread. Emite batches progressivos + shards de instancing.
+  for await (const ev of gp.processAdaptive(bytes, { sizeThreshold: 2 * 1024 * 1024 })) {
+    if (ev.type !== 'batch') continue;
+
+    // Append PROGRESSIVO por batch: não acumulamos as malhas no heap JS. É isso
+    // que corta o pico de memória e dá o carregamento "particionado" na tela.
+    if (ev.meshes.length > 0) {
+      renderer.addMeshes(ev.meshes, true);
+      meshCount += ev.meshes.length;
       for (const m of ev.meshes) tris += (m.indices?.length ?? 0) / 3;
-      if (batches % 20 === 0) say(`parseando… ${meshes.length} malhas · ${(tris / 1e6).toFixed(1)}M tri · RAM ~${mb(mem() - memStart)} MB`);
     }
+
+    // Geometria opaca repetida vem SÓ como shard de instancing — precisa
+    // decodificar + subir pra GPU, senão some do modelo. Falha de shard é
+    // não-fatal (a geometria flat continua renderizando).
+    if (device && ev.instancedShards?.length) {
+      for (const buf of ev.instancedShards) {
+        try {
+          const shard = decodeInstancedShard(new Uint8Array(buf));
+          if (shard) { scene.addInstancedShard(device, shard); shardCount++; }
+        } catch (err) {
+          console.warn('[poc] instanced shard falhou, pulando:', err);
+        }
+      }
+    }
+
+    batches++;
+    renderer.requestRender();
+    // Enquadra assim que houver algo visível (primeiro frame rápido).
+    if (!framed && (meshCount > 0 || shardCount > 0)) { renderer.fitToView(); framed = true; }
+    if (batches % 10 === 0) say(`parseando… ${meshCount} malhas · ${shardCount} shards · ${(tris / 1e6).toFixed(1)}M tri · RAM ~${mb(mem() - memStart)} MB`);
   }
   const parseMs = performance.now() - tParse;
 
-  say(`renderizando ${meshes.length} malhas…`);
-  renderer.loadGeometry(meshes as any);
   renderer.fitToView();
   renderer.requestRender();
 
@@ -185,7 +217,7 @@ async function parseClientSide(file: File) {
   // A medição de GLB vai pro SERVER (Rust, sem teto de 4 GB) — caminho seguro.
   say(
     `CLIENT PARSE ✓  ${file.name} (${mb(file.size)} MB) · tier=${tier}\n` +
-    `${meshes.length} malhas · ${(tris / 1e6).toFixed(1)}M triângulos\n` +
+    `${meshCount} malhas · ${shardCount} shards · ${(tris / 1e6).toFixed(1)}M triângulos\n` +
     `parse: ${(parseMs / 1000).toFixed(1)}s · total: ${(totalMs / 1000).toFixed(1)}s\n` +
     `RAM JS: +${mb(memPeak)} MB (heap usado)`
   );
