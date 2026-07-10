@@ -148,6 +148,8 @@ function wireControls() {
 const fileInput = document.getElementById('file') as HTMLInputElement;
 const mem = () => (performance as any).memory?.usedJSHeapSize ?? 0;
 const mb = (n: number) => (n / 1024 / 1024).toFixed(0);
+// Quantos modelos .ifc já foram federados via upload (define o próximo modelIndex).
+let uploadModels = 0;
 
 async function parseClientSide(file: File) {
   const t0 = performance.now();
@@ -162,10 +164,18 @@ async function parseClientSide(file: File) {
   const gp = new GeometryProcessor({ tessellationQuality: tier }); // tier baixo = menos triângulos
   await gp.init();
 
-  // Cena limpa antes de streamar (append progressivo NÃO reseta como loadGeometry).
-  renderer.getScene().clear();
+  // Federar: somar à cena (não limpar) e dar um modelIndex distinto por modelo,
+  // pra seleção/picking multi-modelo não colidir expressId entre disciplinas.
+  // Desligado = substitui (limpa a cena antes de streamar).
+  const federate = (document.getElementById('federate') as HTMLInputElement)?.checked ?? false;
   const scene = renderer.getScene();
   const device = renderer.getGPUDevice();
+  if (!federate) {
+    // Append progressivo NÃO reseta como loadGeometry — limpar explicitamente.
+    scene.clear();
+    uploadModels = 0;
+  }
+  const modelIndex = uploadModels;
 
   let batches = 0, meshCount = 0, shardCount = 0, tris = 0;
   let framed = false;
@@ -180,6 +190,7 @@ async function parseClientSide(file: File) {
     // Append PROGRESSIVO por batch: não acumulamos as malhas no heap JS. É isso
     // que corta o pico de memória e dá o carregamento "particionado" na tela.
     if (ev.meshes.length > 0) {
+      for (const m of ev.meshes) (m as any).modelIndex = modelIndex;
       renderer.addMeshes(ev.meshes, true);
       meshCount += ev.meshes.length;
       for (const m of ev.meshes) tris += (m.indices?.length ?? 0) / 3;
@@ -209,14 +220,18 @@ async function parseClientSide(file: File) {
 
   renderer.fitToView();
   renderer.requestRender();
+  // Este modelo passou a ocupar `modelIndex`; o próximo federado usa o seguinte.
+  uploadModels = modelIndex + 1;
 
   const totalMs = performance.now() - t0;
   const memPeak = mem() - memStart;
 
   // OBS: exportGlb no browser OOMa em arquivo grande (roda sobre o heap já cheio).
   // A medição de GLB vai pro SERVER (Rust, sem teto de 4 GB) — caminho seguro.
+  const fedLine = federate ? `federado ✓ · ${uploadModels} modelo(s) na cena\n` : '';
   say(
     `CLIENT PARSE ✓  ${file.name} (${mb(file.size)} MB) · tier=${tier}\n` +
+    fedLine +
     `${meshCount} malhas · ${shardCount} shards · ${(tris / 1e6).toFixed(1)}M triângulos\n` +
     `parse: ${(parseMs / 1000).toFixed(1)}s · total: ${(totalMs / 1000).toFixed(1)}s\n` +
     `RAM JS: +${mb(memPeak)} MB (heap usado)`
@@ -262,7 +277,7 @@ async function loadDiscipline(model: any, index: number, btn: HTMLButtonElement)
 function clearScene() {
   renderer.getScene().clear();
   renderer.requestRender();
-  loadedMeshes = 0; loadedSet.clear();
+  loadedMeshes = 0; loadedSet.clear(); uploadModels = 0;
   document.querySelectorAll('#disc button').forEach((b) => {
     (b as HTMLButtonElement).style.background = '#0f1116';
     (b as HTMLButtonElement).style.color = '#e6e6e6';
