@@ -2,7 +2,7 @@
 // decodifica no browser (SEM parse de IFC, SEM server) e renderiza com o @ifc-lite/renderer.
 // Prova o caminho quente do next_04 (Blob/CDN → decoder → renderer).
 import { Renderer } from '@ifc-lite/renderer';
-import { decodeParquetGeometry, decodeOptimizedParquetGeometry } from '@ifc-lite/server-client';
+import { decodeParquetGeometryStreaming, decodeOptimizedParquetGeometry } from '@ifc-lite/server-client';
 import { GeometryProcessor, decodeInstancedShard } from '@ifc-lite/geometry';
 
 const canvas = document.getElementById('c') as HTMLCanvasElement;
@@ -88,18 +88,26 @@ async function load(model: string) {
       fetch(`${base}/metadata.json`).then((r) => (r.ok ? r.json() : null))
     ]);
     say(`decodificando ${(geoBuf.byteLength / 1024).toFixed(0)} KB…`);
-    const decoded = await decodeParquetGeometry(geoBuf);
+    // Streaming: decodifica + sobe por batch, sem materializar o modelo inteiro
+    // 2x no heap JS (era o que estourava no parquet grande).
+    renderer.getScene().clear();
+    let meshCount = 0, tris = 0, framed = false;
     // decoder devolve snake_case (express_id/ifc_type); renderer espera camelCase.
-    const meshes = decoded.map((m: any) => ({
-      expressId: m.express_id, ifcType: m.ifc_type,
-      positions: m.positions, normals: m.normals, indices: m.indices, color: m.color
-    }));
-    renderer.loadGeometry(meshes as any);
+    for await (const chunk of decodeParquetGeometryStreaming(geoBuf)) {
+      const meshes = chunk.map((m: any) => ({
+        expressId: m.express_id, ifcType: m.ifc_type,
+        positions: m.positions, normals: m.normals, indices: m.indices, color: m.color,
+      }));
+      renderer.addMeshes(meshes as any, true);
+      meshCount += meshes.length;
+      for (const m of meshes) tris += (m.indices?.length ?? 0) / 3;
+      renderer.requestRender();
+      if (!framed && meshCount > 0) { renderer.fitToView(); framed = true; }
+    }
     renderer.fitToView();
     renderer.requestRender();
     const dt = (performance.now() - t0).toFixed(0);
-    const tris = meshes.reduce((s: number, m: any) => s + (m.indices?.length ?? 0) / 3, 0);
-    say(`${model} · ${meshes.length} malhas · ~${tris | 0} triângulos · ${dt}ms\n(render sem tocar o server ✓)`);
+    say(`${model} · ${meshCount} malhas · ~${tris | 0} triângulos · ${dt}ms\n(render sem tocar o server ✓)`);
   } catch (e: any) {
     say(`erro ao carregar: ${e.message}`, true);
   }
@@ -254,14 +262,17 @@ async function loadDiscipline(model: any, index: number, btn: HTMLButtonElement)
   try {
     const url = await artifactUrl(`federated/${model.slug}/geometry.parquet`);
     const geoBuf = await fetch(url).then((r) => r.arrayBuffer());
-    const decoded = await decodeParquetGeometry(geoBuf);
-    const meshes = decoded.map((mm: any) => ({
-      expressId: mm.express_id, ifcType: mm.ifc_type,
-      positions: mm.positions, normals: mm.normals, indices: mm.indices,
-      color: mm.color, modelIndex: index,
-    }));
-    renderer.addMeshes(meshes as any);
-    loadedMeshes += meshes.length;
+    // Streaming: sobe por batch (federado NÃO limpa a cena — soma à existente).
+    for await (const chunk of decodeParquetGeometryStreaming(geoBuf)) {
+      const meshes = chunk.map((mm: any) => ({
+        expressId: mm.express_id, ifcType: mm.ifc_type,
+        positions: mm.positions, normals: mm.normals, indices: mm.indices,
+        color: mm.color, modelIndex: index,
+      }));
+      renderer.addMeshes(meshes as any, true);
+      loadedMeshes += meshes.length;
+      renderer.requestRender();
+    }
     loadedSet.add(index);
     renderer.fitToView();
     renderer.requestRender();
@@ -327,18 +338,34 @@ async function loadDor(kind: 'std' | 'opt' | 'fast' | 'opaque') {
       fetch(metaUrl).then((r) => r.json()),
     ]);
     say(`DOR ${kind}: decodificando ${mb(geoBuf.byteLength)} MB…`);
-    const decoded = kind === 'opt'
-      ? await decodeOptimizedParquetGeometry(geoBuf, meta.vertex_multiplier ?? 10000)
-      : await decodeParquetGeometry(geoBuf);
-    const meshes = decoded.map((m: any) => ({
-      expressId: m.express_id, ifcType: m.ifc_type,
-      positions: m.positions, normals: m.normals, indices: m.indices, color: m.color,
-    }));
-    renderer.loadGeometry(meshes as any);
+    let meshCount = 0, tris = 0, framed = false;
+    if (kind === 'opt') {
+      // Formato otimizado/instanced ainda não tem decoder streaming — caminho antigo.
+      const decoded = await decodeOptimizedParquetGeometry(geoBuf, meta.vertex_multiplier ?? 10000);
+      const meshes = decoded.map((m: any) => ({
+        expressId: m.express_id, ifcType: m.ifc_type,
+        positions: m.positions, normals: m.normals, indices: m.indices, color: m.color,
+      }));
+      renderer.addMeshes(meshes as any, true);
+      meshCount = meshes.length;
+      for (const m of meshes) tris += (m.indices?.length ?? 0) / 3;
+    } else {
+      // Streaming: decodifica + sobe por batch (é o que faz o 1.3GB renderizar).
+      for await (const chunk of decodeParquetGeometryStreaming(geoBuf)) {
+        const meshes = chunk.map((m: any) => ({
+          expressId: m.express_id, ifcType: m.ifc_type,
+          positions: m.positions, normals: m.normals, indices: m.indices, color: m.color,
+        }));
+        renderer.addMeshes(meshes as any, true);
+        meshCount += meshes.length;
+        for (const m of meshes) tris += (m.indices?.length ?? 0) / 3;
+        renderer.requestRender();
+        if (!framed && meshCount > 0) { renderer.fitToView(); framed = true; }
+      }
+    }
     renderer.fitToView();
     renderer.requestRender();
-    const tris = meshes.reduce((s: number, m: any) => s + (m.indices?.length ?? 0) / 3, 0);
-    say(`DOR ${DOR_LABEL[kind]} ✓\n${meshes.length} malhas · ${(tris / 1e6).toFixed(1)}M tri · ${((performance.now() - t0) / 1000).toFixed(1)}s · RAM ~${mb(mem())} MB`);
+    say(`DOR ${DOR_LABEL[kind]} ✓\n${meshCount} malhas · ${(tris / 1e6).toFixed(1)}M tri · ${((performance.now() - t0) / 1000).toFixed(1)}s · RAM ~${mb(mem())} MB`);
   } catch (e: any) { say(`DOR ${kind} FALHOU: ${e.message}`, true); }
 }
 (document.getElementById('dor-std') as HTMLButtonElement).addEventListener('click', () => loadDor('std'));
