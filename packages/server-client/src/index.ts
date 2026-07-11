@@ -30,7 +30,7 @@
 
 export * from './client.js';
 export * from './types.js';
-export { decodeParquetGeometry, decodeParquetGeometryStreaming, decodeOptimizedParquetGeometry, isParquetAvailable } from './parquet-decoder.js';
+export { decodeParquetGeometry, decodeOptimizedParquetGeometry, isParquetAvailable } from './parquet-decoder.js';
 export {
   decodeDataModel,
   type DataModel,

@@ -130,33 +130,6 @@ interface MeshMetadata {
  * @returns Decoded MeshData array
  */
 export async function decodeParquetGeometry(data: ArrayBuffer): Promise<MeshData[]> {
-  // Back-compat wrapper: drain the streaming decoder into one array.
-  const all: MeshData[] = [];
-  for await (const batch of decodeParquetGeometryStreaming(data)) {
-    for (const m of batch) all.push(m);
-  }
-  return all;
-}
-
-/**
- * Streaming variant of {@link decodeParquetGeometry}: yields meshes in batches
- * instead of building the whole model as a second full copy. The caller uploads
- * each batch to the renderer and drops it, so peak heap ≈ the Arrow columns (one
- * copy) + one batch — NOT Arrow columns + a full reconstructed `meshes[]`. Lets
- * huge models (1GB+ parquet) render without blowing the browser's ~4GB heap.
- *
- * NOTE: this streams the DECODE OUTPUT, not the network read — the whole parquet
- * still arrives + decodes in memory. True CDN streaming needs a row-group /
- * chunked artifact format (see readRowGroupAsync). This removes the 2x-copy
- * blowup that was the actual OOM.
- *
- * @param data - Binary Parquet response (same 3-section container as the sync fn)
- * @param batchSize - Meshes per yielded batch (default 4000)
- */
-export async function* decodeParquetGeometryStreaming(
-  data: ArrayBuffer,
-  batchSize = 4000,
-): AsyncGenerator<MeshData[]> {
   // Initialize WASM module (only runs once)
   const parquet = await ensureParquetInit();
 
@@ -239,10 +212,9 @@ export async function* decodeParquetGeometryStreaming(
     throw new Error('Malformed Parquet geometry: inconsistent parallel column lengths');
   }
 
-  // Reconstruct MeshData in batches, yielding each so the caller uploads +
-  // releases it. Never holds the whole model as a second copy.
+  // Reconstruct MeshData array
   const meshCount = expressIds.length;
-  let batch: MeshData[] = [];
+  const meshes: MeshData[] = new Array(meshCount);
 
   for (let i = 0; i < meshCount; i++) {
     const vertexStart = vertexStarts[i];
@@ -299,22 +271,17 @@ export async function* decodeParquetGeometryStreaming(
       indices[t * 3 + 2] = idx2[srcIdx];
     }
 
-    batch.push({
+    meshes[i] = {
       express_id: expressIds[i],
       ifc_type: (ifcTypes?.get(i) as string) ?? 'Unknown',
       positions,
       normals,
       indices,
       color: [colorR[i], colorG[i], colorB[i], colorA[i]],
-    });
-
-    if (batch.length >= batchSize) {
-      yield batch;
-      batch = [];
-    }
+    };
   }
 
-  if (batch.length > 0) yield batch;
+  return meshes;
 }
 
 /**
