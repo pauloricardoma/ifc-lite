@@ -2,7 +2,8 @@
 // decodifica no browser (SEM parse de IFC, SEM server) e renderiza com o @ifc-lite/renderer.
 // Prova o caminho quente do next_04 (Blob/CDN → decoder → renderer).
 import { Renderer } from '@ifc-lite/renderer';
-import { decodeParquetGeometryStreaming, decodeOptimizedParquetGeometry } from '@ifc-lite/server-client';
+import { decodeOptimizedParquetGeometry } from '@ifc-lite/server-client';
+import { decodeStdParquetStreaming } from './parquet-stream.js';
 import { GeometryProcessor, decodeInstancedShard } from '@ifc-lite/geometry';
 
 const canvas = document.getElementById('c') as HTMLCanvasElement;
@@ -80,27 +81,20 @@ async function load(model: string) {
   say(`buscando ${base}/ …`);
   const t0 = performance.now();
   try {
-    const [geoBuf, meta] = await Promise.all([
+    const [geoBlob, meta] = await Promise.all([
       fetch(`${base}/geometry.parquet`).then((r) => {
         if (!r.ok) throw new Error(`geometry.parquet → ${r.status}`);
-        return r.arrayBuffer();
+        return r.blob(); // Blob (lazy, disco) — não segura o arquivo no heap JS.
       }),
       fetch(`${base}/metadata.json`).then((r) => (r.ok ? r.json() : null))
     ]);
-    say(`decodificando ${(geoBuf.byteLength / 1024).toFixed(0)} KB…`);
-    // Streaming: decodifica + sobe por batch, sem materializar o modelo inteiro
-    // 2x no heap JS (era o que estourava no parquet grande).
+    say(`decodificando ${(geoBlob.size / 1e6).toFixed(0)} MB (streaming por row group)…`);
     renderer.getScene().clear();
     let meshCount = 0, tris = 0, framed = false;
-    // decoder devolve snake_case (express_id/ifc_type); renderer espera camelCase.
-    for await (const chunk of decodeParquetGeometryStreaming(geoBuf)) {
-      const meshes = chunk.map((m: any) => ({
-        expressId: m.express_id, ifcType: m.ifc_type,
-        positions: m.positions, normals: m.normals, indices: m.indices, color: m.color,
-      }));
-      renderer.addMeshes(meshes as any, true);
-      meshCount += meshes.length;
-      for (const m of meshes) tris += (m.indices?.length ?? 0) / 3;
+    for await (const chunk of decodeStdParquetStreaming(geoBlob)) {
+      renderer.addMeshes(chunk as any, true);
+      meshCount += chunk.length;
+      for (const m of chunk) tris += (m.indices?.length ?? 0) / 3;
       renderer.requestRender();
       if (!framed && meshCount > 0) { renderer.fitToView(); framed = true; }
     }
@@ -261,16 +255,12 @@ async function loadDiscipline(model: any, index: number, btn: HTMLButtonElement)
   say(`carregando ${model.slug} (${model.geomMB} MB)…`);
   try {
     const url = await artifactUrl(`federated/${model.slug}/geometry.parquet`);
-    const geoBuf = await fetch(url).then((r) => r.arrayBuffer());
-    // Streaming: sobe por batch (federado NÃO limpa a cena — soma à existente).
-    for await (const chunk of decodeParquetGeometryStreaming(geoBuf)) {
-      const meshes = chunk.map((mm: any) => ({
-        expressId: mm.express_id, ifcType: mm.ifc_type,
-        positions: mm.positions, normals: mm.normals, indices: mm.indices,
-        color: mm.color, modelIndex: index,
-      }));
-      renderer.addMeshes(meshes as any, true);
-      loadedMeshes += meshes.length;
+    const geoBlob = await fetch(url).then((r) => r.blob());
+    // Streaming row-group: sobe por batch (federado NÃO limpa a cena — soma).
+    for await (const chunk of decodeStdParquetStreaming(geoBlob)) {
+      for (const m of chunk) (m as any).modelIndex = index;
+      renderer.addMeshes(chunk as any, true);
+      loadedMeshes += chunk.length;
       renderer.requestRender();
     }
     loadedSet.add(index);
@@ -333,15 +323,16 @@ async function loadDor(kind: 'std' | 'opt' | 'fast' | 'opaque') {
       artifactUrl(`dor/${kind}/geometry.parquet`),
       artifactUrl(`dor/${kind}/metadata.json`),
     ]);
-    const [geoBuf, meta] = await Promise.all([
-      fetch(geoUrl).then((r) => r.arrayBuffer()),
+    const [geoBlob, meta] = await Promise.all([
+      fetch(geoUrl).then((r) => r.blob()),
       fetch(metaUrl).then((r) => r.json()),
     ]);
-    say(`DOR ${kind}: decodificando ${mb(geoBuf.byteLength)} MB…`);
+    say(`DOR ${kind}: decodificando ${mb(geoBlob.size)} MB…`);
     let meshCount = 0, tris = 0, framed = false;
     if (kind === 'opt') {
-      // Formato otimizado/instanced ainda não tem decoder streaming — caminho antigo.
-      const decoded = await decodeOptimizedParquetGeometry(geoBuf, meta.vertex_multiplier ?? 10000);
+      // Formato otimizado/instanced ainda não tem decoder row-group — caminho antigo
+      // (buffer inteiro; ainda pode estourar o WASM em modelo grande — TODO chunked).
+      const decoded = await decodeOptimizedParquetGeometry(await geoBlob.arrayBuffer(), meta.vertex_multiplier ?? 10000);
       const meshes = decoded.map((m: any) => ({
         expressId: m.express_id, ifcType: m.ifc_type,
         positions: m.positions, normals: m.normals, indices: m.indices, color: m.color,
@@ -350,15 +341,11 @@ async function loadDor(kind: 'std' | 'opt' | 'fast' | 'opaque') {
       meshCount = meshes.length;
       for (const m of meshes) tris += (m.indices?.length ?? 0) / 3;
     } else {
-      // Streaming: decodifica + sobe por batch (é o que faz o 1.3GB renderizar).
-      for await (const chunk of decodeParquetGeometryStreaming(geoBuf)) {
-        const meshes = chunk.map((m: any) => ({
-          expressId: m.express_id, ifcType: m.ifc_type,
-          positions: m.positions, normals: m.normals, indices: m.indices, color: m.color,
-        }));
-        renderer.addMeshes(meshes as any, true);
-        meshCount += meshes.length;
-        for (const m of meshes) tris += (m.indices?.length ?? 0) / 3;
+      // Streaming row-group: decodifica 1 RG por vez (é o que faz o 1.3GB renderizar).
+      for await (const chunk of decodeStdParquetStreaming(geoBlob)) {
+        renderer.addMeshes(chunk as any, true);
+        meshCount += chunk.length;
+        for (const m of chunk) tris += (m.indices?.length ?? 0) / 3;
         renderer.requestRender();
         if (!framed && meshCount > 0) { renderer.fitToView(); framed = true; }
       }
