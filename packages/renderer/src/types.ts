@@ -75,6 +75,12 @@ export interface BatchedMesh {
    *  space (world = origin + position). Keeps f32 vertex coords element-small at
    *  building/georef scale (no fan collapse). [0,0,0] = absolute (legacy). */
   origin?: [number, number, number];
+  /** GPU residency (issue #1682 phase 3a): `false` = evicted metadata shell —
+   *  bounds/expressIds/counts remain valid for culling, picking-fallback and
+   *  bookkeeping, but the GPU buffers are destroyed and MUST NOT be bound.
+   *  The draw loop skips such batches and requests a rebuild via
+   *  `Scene.requestBatchResidency`. `undefined`/`true` = resident. */
+  gpuResident?: boolean;
 }
 
 // Section plane for clipping
@@ -275,6 +281,15 @@ export interface RenderOptions {
    * option stay exhaustive.
    */
   contributionCull?: import('./contribution-cull.js').ContributionCullOptions;
+  /**
+   * One-shot capture renders (IDS/clash/BCF snapshots): synchronously
+   * rebuild every GPU-evicted batch before drawing, so isolation options
+   * that reveal batches aged out under the residency budget still capture a
+   * complete image. Has a frame-time cost proportional to the evicted set —
+   * do NOT pass it on the interactive render loop (evicted batches restore
+   * asynchronously there).
+   */
+  restoreEvictedForCapture?: boolean;
 }
 
 /**

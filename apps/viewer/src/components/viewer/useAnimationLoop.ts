@@ -119,6 +119,7 @@ export function useAnimationLoop(params: UseAnimationLoopParams): void {
     let lastScaleUpdate = 0;
     let lastRenderTime = 0;
     let wasAnimating = false;
+    let residencyRestoreErrorLogged = false;
 
     // Adaptive render throttle: large models get fewer FPS during continuous
     // rendering (interaction + inertia) to prevent the main thread from being
@@ -160,6 +161,26 @@ export function useAnimationLoop(params: UseAnimationLoopParams): void {
           if (queueFlushed) {
             renderer.clearCaches();
             updateThrottle();
+          }
+        }
+      }
+
+      // 1b. Rebuild GPU-evicted batches the last frame asked for (residency
+      // budget, issue #1682 phase 3a). Time-budgeted; requests a render so
+      // the restored batches appear on the next frame. Guarded like the
+      // instanced-shard drain: an uncaught throw here (e.g. buffer creation
+      // on a lost device) would kill the rAF loop and blank the canvas.
+      if (scene.hasResidencyRestoreWork()) {
+        try {
+          const device = renderer.getGPUDevice();
+          const pipeline = renderer.getPipeline();
+          if (device && pipeline && scene.processResidencyRestores(device, pipeline) > 0) {
+            renderer.requestRender();
+          }
+        } catch (err) {
+          if (!residencyRestoreErrorLogged) {
+            residencyRestoreErrorLogged = true;
+            console.warn('[useAnimationLoop] residency restore failed (will keep rendering):', err);
           }
         }
       }
