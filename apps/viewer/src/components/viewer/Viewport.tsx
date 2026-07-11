@@ -33,6 +33,7 @@ import { projectToCssScreen } from '../../utils/projectScreen.js';
 import { getSpatialChunkingConfig } from '../../utils/spatialChunkConfig.js';
 import { getGpuResidencyBudgetBytes, getHostResidencyBudgetBytes } from '../../utils/gpuBudgetConfig.js';
 import { getLodScreenPx } from '../../utils/lodConfig.js';
+import { isQuantizedEnabled } from '../../utils/quantizedConfig.js';
 import {
   getEntityBounds,
   getThemeClearColor,
@@ -719,16 +720,16 @@ export function Viewport({
     renderer.init().then(() => {
       if (aborted) return;
       // Spatial chunk bucketing (issue #1682 phase 2) — must be configured
-      // before any geometry streams into the scene. Session-level A/B knob;
-      // off by default.
+      // before any geometry streams into the scene. ON by default since the
+      // flip sweep; kill switch __IFC_LITE_CHUNKS = 0.
       const chunking = getSpatialChunkingConfig();
       if (chunking) {
         renderer.getScene().setSpatialChunking(chunking);
         console.log(`[Viewport] spatial chunk bucketing on (cellSize=${chunking.cellSize}m)`);
       }
-      // GPU residency budget (issue #1682 phase 3a) — session knob, off by
-      // default. Evicts least-recently-drawn chunk batches over the budget;
-      // the animation loop pumps the on-demand rebuilds.
+      // GPU residency budget (issue #1682 phase 3a) — ON by default (2048MB
+      // target; kill switch = 0). Evicts least-recently-drawn chunk batches
+      // over the budget; the animation loop pumps the on-demand rebuilds.
       const gpuBudget = getGpuResidencyBudgetBytes();
       if (gpuBudget !== null) {
         renderer.getScene().setGpuResidencyBudget(gpuBudget);
@@ -743,6 +744,17 @@ export function Viewport({
       if (lodPx !== null) {
         renderer.getScene().setLodBuildsEnabled(true);
         console.log(`[Viewport] LOD1 on (below ${lodPx}px projected)`);
+      }
+      // 12-byte quantized batch vertices (issue #1682 phase 6) — ON by
+      // default since the flip sweep (kill switch __IFC_LITE_QUANTIZED = 0).
+      // The probe verifies the quantized pipeline variants exist before the
+      // scene starts producing 12B buffers.
+      if (isQuantizedEnabled()) {
+        // Async: WebGPU validates the quantized pipelines before the scene
+        // may produce 12B buffers; batches built in the meantime stay f32.
+        void renderer.enableQuantizedBatches().then((on) => {
+          console.log(`[Viewport] quantized vertices ${on ? 'on (12B lattice)' : 'UNAVAILABLE (pipeline probe failed)'}`);
+        });
       }
       // Read-only debug/e2e hook (same convention as __ifc_lite_viewer_store__):
       // live frame stats + resident GPU/CPU bytes for Playwright assertions
