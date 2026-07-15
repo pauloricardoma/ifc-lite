@@ -8,11 +8,33 @@ import { GeometryProcessor, decodeInstancedShard } from '@ifc-lite/geometry';
 
 // Residência/LOD do upstream #1682. Espelha os defaults do apps/viewer
 // (gpuBudgetConfig/lodConfig/contributionCull), que NÃO valem aqui: são do app
-// deles, não do renderer. Sobrescreva no console p/ A/B, ex.:
-//   __IFC_LITE_GPU_BUDGET_MB = 0   → desliga o budget (baseline pré-#1682)
-const GPU_BUDGET_MB = (globalThis as any).__IFC_LITE_GPU_BUDGET_MB ?? 2048;
-const LOD_SCREEN_PX = (globalThis as any).__IFC_LITE_LOD_PX ?? 48;
-const CONTRIB_CULL = { pixelRadius: 0.5, interactingPixelRadius: 2 };
+// deles, não do renderer.
+//
+// A/B: use QUERY PARAM, não o console. O boot() roda no load do módulo, então
+// setar o global no console já é tarde — o renderer foi configurado antes.
+//   ?gpuBudget=0   desliga o budget de GPU      ?lod=0    desliga o LOD1
+//   ?quant=0       desliga o vértice de 12B     ?cull=0   desliga contribution cull
+//   ?gpuBudget=512 budget custom em MB
+const QS = new URLSearchParams(location.search);
+const knob = (param: string, globalName: string, dflt: number): number => {
+  const raw = QS.get(param);
+  if (raw !== null) {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  const g = (globalThis as any)[globalName];
+  return typeof g === 'number' && Number.isFinite(g) && g >= 0 ? g : dflt;
+};
+
+const GPU_BUDGET_MB = knob('gpuBudget', '__IFC_LITE_GPU_BUDGET_MB', 2048);
+const LOD_SCREEN_PX = knob('lod', '__IFC_LITE_LOD_PX', 48);
+const CULL_PX = knob('cull', '__IFC_LITE_CONTRIB_CULL', 0.5);
+const QUANTIZED = knob('quant', '__IFC_LITE_QUANTIZED', 1) !== 0;
+// 0 em qualquer um = desligado (o renderer trata ausente/null como off).
+const CONTRIB_CULL = CULL_PX > 0
+  ? { pixelRadius: CULL_PX, interactingPixelRadius: CULL_PX * 4 }
+  : undefined;
+const LOD = LOD_SCREEN_PX > 0 ? { screenPx: LOD_SCREEN_PX } : undefined;
 
 const canvas = document.getElementById('c') as HTMLCanvasElement;
 const statusEl = document.getElementById('status')!;
@@ -81,12 +103,17 @@ async function boot() {
   // configurado ANTES de qualquer geometria entrar na cena.
   const scene = renderer.getScene();
   scene.setSpatialChunking({ cellSize: DEFAULT_CHUNK_CELL_SIZE });
-  scene.setGpuResidencyBudget(GPU_BUDGET_MB * 1024 * 1024);
-  scene.setLodBuildsEnabled(true);
+  scene.setGpuResidencyBudget(GPU_BUDGET_MB > 0 ? GPU_BUDGET_MB * 1024 * 1024 : null);
+  scene.setLodBuildsEnabled(LOD !== undefined);
   // setHostResidencyBudget é NO-OP aqui: o tier cold precisa de um restore
-  // source (cache v13 em disco) que o caminho parquet/CDN não tem.
-  const quantized = await renderer.enableQuantizedBatches();
-  console.log(`[poc] chunking=${DEFAULT_CHUNK_CELL_SIZE}m · gpuBudget=${GPU_BUDGET_MB}MB · lod=${LOD_SCREEN_PX}px · quantized=${quantized ? 'on (12B)' : 'INDISPONÍVEL (probe falhou)'}`);
+  // source (cache v13 em disco) que o caminho parquet/CDN não tem. É por isso
+  // que o budget de GPU não move o pico do FEDERADO: lá a memória é CPU-side.
+  const quantized = QUANTIZED ? await renderer.enableQuantizedBatches() : false;
+  console.log(
+    `[poc] chunking=${DEFAULT_CHUNK_CELL_SIZE}m · gpuBudget=${GPU_BUDGET_MB > 0 ? GPU_BUDGET_MB + 'MB' : 'OFF'}`
+    + ` · lod=${LOD ? LOD_SCREEN_PX + 'px' : 'OFF'} · cull=${CONTRIB_CULL ? CULL_PX + 'px' : 'OFF'}`
+    + ` · quantized=${!QUANTIZED ? 'OFF' : quantized ? 'on (12B)' : 'INDISPONÍVEL (probe falhou)'}`,
+  );
 
   // Hook de medição (mesma convenção do apps/viewer): bytes residentes exatos.
   (globalThis as any).__ifc_lite_render_stats__ = () => ({
@@ -165,7 +192,7 @@ function startLoop() {
     renderer.render({
       clearColor: [0.10, 0.11, 0.13, 1],  // pinta todo frame (POC)
       contributionCull: CONTRIB_CULL,
-      lod: { screenPx: LOD_SCREEN_PX },
+      lod: LOD,
     });
     requestAnimationFrame(frame);
   };
