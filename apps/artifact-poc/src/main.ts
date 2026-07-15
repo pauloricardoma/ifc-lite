@@ -1,10 +1,18 @@
 // Harness POC: busca os 4 artefatos como se fossem CDN (/artifacts/<modelo>/),
 // decodifica no browser (SEM parse de IFC, SEM server) e renderiza com o @ifc-lite/renderer.
 // Prova o caminho quente do next_04 (Blob/CDN → decoder → renderer).
-import { Renderer } from '@ifc-lite/renderer';
+import { Renderer, DEFAULT_CHUNK_CELL_SIZE } from '@ifc-lite/renderer';
 import { decodeOptimizedParquetGeometry } from '@ifc-lite/server-client';
 import { decodeStdParquetStreaming } from './parquet-stream.js';
 import { GeometryProcessor, decodeInstancedShard } from '@ifc-lite/geometry';
+
+// Residência/LOD do upstream #1682. Espelha os defaults do apps/viewer
+// (gpuBudgetConfig/lodConfig/contributionCull), que NÃO valem aqui: são do app
+// deles, não do renderer. Sobrescreva no console p/ A/B, ex.:
+//   __IFC_LITE_GPU_BUDGET_MB = 0   → desliga o budget (baseline pré-#1682)
+const GPU_BUDGET_MB = (globalThis as any).__IFC_LITE_GPU_BUDGET_MB ?? 2048;
+const LOD_SCREEN_PX = (globalThis as any).__IFC_LITE_LOD_PX ?? 48;
+const CONTRIB_CULL = { pixelRadius: 0.5, interactingPixelRadius: 2 };
 
 const canvas = document.getElementById('c') as HTMLCanvasElement;
 const statusEl = document.getElementById('status')!;
@@ -66,6 +74,27 @@ async function boot() {
   renderer = new Renderer(canvas);
   await renderer.init();
   camera = renderer.getCamera();
+
+  // Residência/LOD do upstream #1682. ATENÇÃO: NÃO é "ligado por padrão" no
+  // renderer — os defaults (2048MB/32m/48px) moram no apps/viewer, que os passa
+  // à Scene. Aqui a POC liga na mão. Ordem importa: o bucketing tem de ser
+  // configurado ANTES de qualquer geometria entrar na cena.
+  const scene = renderer.getScene();
+  scene.setSpatialChunking({ cellSize: DEFAULT_CHUNK_CELL_SIZE });
+  scene.setGpuResidencyBudget(GPU_BUDGET_MB * 1024 * 1024);
+  scene.setLodBuildsEnabled(true);
+  // setHostResidencyBudget é NO-OP aqui: o tier cold precisa de um restore
+  // source (cache v13 em disco) que o caminho parquet/CDN não tem.
+  const quantized = await renderer.enableQuantizedBatches();
+  console.log(`[poc] chunking=${DEFAULT_CHUNK_CELL_SIZE}m · gpuBudget=${GPU_BUDGET_MB}MB · lod=${LOD_SCREEN_PX}px · quantized=${quantized ? 'on (12B)' : 'INDISPONÍVEL (probe falhou)'}`);
+
+  // Hook de medição (mesma convenção do apps/viewer): bytes residentes exatos.
+  (globalThis as any).__ifc_lite_render_stats__ = () => ({
+    frame: renderer.getFrameStats(),
+    gpu: renderer.getScene().getResidentGpuBytes(),
+    cpuBytes: renderer.getScene().getResidentCpuBytes(),
+  });
+
   wireControls();
   startLoop();
   say('renderer pronto ✓ — carregando modelo…');
@@ -111,11 +140,33 @@ async function load(model: string) {
 // precisa rodar o rAF, avançar a câmera (update) e chamar render(). (padrão do useAnimationLoop)
 function startLoop() {
   let last = performance.now();
+  let restoreErrorLogged = false;
   const frame = (now: number) => {
     const dt = (now - last) / 1000; last = now;
+
+    // Reconstrói os batches que o budget de GPU evictou e o último frame pediu
+    // de volta. SEM isto o modelo ganha buracos: o budget evicta e nada restaura.
+    const scene = renderer.getScene();
+    if (scene.hasResidencyRestoreWork()) {
+      try {
+        const device = renderer.getGPUDevice();
+        const pipeline = renderer.getPipeline();
+        if (device && pipeline) scene.processResidencyRestores(device, pipeline);
+      } catch (err) {
+        if (!restoreErrorLogged) {
+          restoreErrorLogged = true;
+          console.warn('[poc] residency restore falhou (segue renderizando):', err);
+        }
+      }
+    }
+
     camera.update(dt);                 // avança animação de câmera / inércia
     renderer.consumeRenderRequest();
-    renderer.render({ clearColor: [0.10, 0.11, 0.13, 1] });  // pinta todo frame (POC)
+    renderer.render({
+      clearColor: [0.10, 0.11, 0.13, 1],  // pinta todo frame (POC)
+      contributionCull: CONTRIB_CULL,
+      lod: { screenPx: LOD_SCREEN_PX },
+    });
     requestAnimationFrame(frame);
   };
   requestAnimationFrame(frame);
