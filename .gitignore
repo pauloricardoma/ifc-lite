@@ -9,9 +9,6 @@ build/
 *.tsbuildinfo
 .turbo/
 
-# IDE directories
-.agents/
-
 # Rust
 target/
 **/*.rs.bk
@@ -94,7 +91,6 @@ tests/models/various
 tests/models/**/*.ifc
 tests/models/**/*.IFC
 tests/models/**/*.ifcx
-tests/models/**/*.ifczip
 # Partial downloads from the fetcher.
 tests/models/**/*.part
 
@@ -113,7 +109,6 @@ tests/benchmark/benchmark-results/viewer-*.console.log
 /playwright/.cache/
 .vercel
 
-# Railway `railway config pull` scratch output. These land as
-# `.railway-config-pull-<n>/railway.ts` placeholders and must never be
-# committed; the desired Railway state lives elsewhere.
-.railway-config-pull-*/
+# credenciais R2 do artifact-poc (upload) — NUNCA commitar
+.r2.env
+upload-r2.mjs
