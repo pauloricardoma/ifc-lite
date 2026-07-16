@@ -108,3 +108,7 @@ tests/benchmark/benchmark-results/viewer-*.console.log
 /blob-report/
 /playwright/.cache/
 .vercel
+
+# credenciais R2 do artifact-poc (upload) — NUNCA commitar
+.r2.env
+upload-r2.mjs
