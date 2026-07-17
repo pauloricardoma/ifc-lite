@@ -1,0 +1,25 @@
+{
+  "name": "@ifc-lite/coordly-embed",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "node ../../scripts/fetch-prebuilt-wasm.mjs && vite build",
+    "preview": "vite preview",
+    "copy-to-web": "node scripts/deploy-to-web.mjs"
+  },
+  "dependencies": {
+    "@ifc-lite/renderer": "workspace:*",
+    "@ifc-lite/geometry": "workspace:*",
+    "@ifc-lite/server-client": "workspace:*",
+    "apache-arrow": "^21.1.0",
+    "parquet-wasm": "^0.7.1"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3",
+    "vite": "^8.1.0",
+    "vite-plugin-top-level-await": "^1.6.0",
+    "vite-plugin-wasm": "^3.6.0"
+  }
+}

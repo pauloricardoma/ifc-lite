@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>coordly-embed (dev)</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #1a1c22; }
+      #bim-container { width: 100vw; height: 100vh; }
+      #dev { position: fixed; top: 8px; left: 8px; z-index: 10; font: 12px system-ui; color: #ccc; }
+      #dev input { width: 320px; }
+    </style>
+  </head>
+  <body>
+    <!-- Harness só de dev: no web/ o container e os placeholders vêm prontos. -->
+    <div id="dev">
+      <input id="ifc" type="file" accept=".ifc" />
+    </div>
+    <div id="bim-container"></div>
+    <script type="module" src="/src/dev.ts"></script>
+  </body>
+</html>
