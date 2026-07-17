@@ -21,10 +21,26 @@ export class ViewerEngine {
   private disposed = false;
   private aborter = new AbortController();
   private restoreErrorLogged = false;
+  private restoreConsole: (() => void) | null = null;
 
   constructor(private canvas: HTMLCanvasElement, private events: EngineEvents) {}
 
+  // O motor de geometria (JS + WASM) cospe diagnóstico verboso do pipeline de
+  // aberturas/camadas. Não dá pra tirar no build (parte vem do wasm) nem patchar
+  // packages/ — filtramos por prefixo enquanto o viewer vive.
+  private silenceEngineLogs(): void {
+    const noisy = /^\[(ifc-lite|IFC-LITE)/;
+    const orig = { log: console.log, warn: console.warn };
+    const wrap = (fn: (...a: any[]) => void) => (...args: any[]) =>
+      (typeof args[0] === 'string' && noisy.test(args[0])) ? undefined : fn(...args);
+    console.log = wrap(orig.log);
+    console.warn = wrap(orig.warn);
+    this.restoreConsole = () => { console.log = orig.log; console.warn = orig.warn; };
+  }
+
   async init(): Promise<boolean> {
+    this.silenceEngineLogs();
+
     const gpu = (navigator as any).gpu;
     if (!gpu || !(await gpu.requestAdapter())) {
       this.events.onError('no-webgpu', 'WebGPU indisponível');
@@ -85,19 +101,13 @@ export class ViewerEngine {
         ? gp.processAdaptive(bytes, { sizeThreshold: 2 * 1024 * 1024 })
         : gp.processStreaming(bytes);
 
-      console.log(`[coordly-embed] parse iniciado (${(bytes.length / 1e6).toFixed(1)} MB)`);
-      let batches = 0;
       for await (const ev of stream) {
         if (this.disposed) { return; }
-        if (ev.type !== 'batch') { console.log(`[coordly-embed] evento ${ev.type}`); continue; }
+        if (ev.type !== 'batch') { continue; }
 
-        batches++;
         if (ev.meshes.length > 0) {
           this.renderer.addMeshes(ev.meshes, true);
           meshCount += ev.meshes.length;
-        }
-        if (batches % 5 === 0 || batches === 1) {
-          console.log(`[coordly-embed] batch ${batches} · ${meshCount} malhas`);
         }
 
         // Geometria opaca repetida vem só como shard de instancing; sem subir
@@ -164,6 +174,7 @@ export class ViewerEngine {
   dispose(): void {
     this.disposed = true;
     this.aborter.abort();
+    this.restoreConsole?.();
     delete (globalThis as any).__ifc_lite_render_stats__;
     try { this.renderer?.dispose?.(); } catch { /* já pode estar solto */ }
   }
