@@ -30,7 +30,10 @@ export class ViewerEngine {
   // Seleção (single). Passada por frame pro renderer, que aplica o highlight
   // (instanced + flat) internamente — não é estado guardado no renderer.
   private selectedId: number | null = null;
-  private selectedModelIndex = 0;
+  // Cru do pick (undefined em modelo único). NÃO coagir pra 0: o highlight do
+  // caminho flat filtra por modelIndex, e as malhas de modelo único têm
+  // modelIndex undefined → passar 0 filtraria o highlight fora.
+  private selectedModelIndex: number | undefined = undefined;
 
   constructor(private canvas: HTMLCanvasElement, private events: EngineEvents) {}
 
@@ -191,9 +194,9 @@ export class ViewerEngine {
       const hit = await this.renderer.pick(clientX - rect.left, clientY - rect.top);
       if (this.disposed) { return; }
       this.selectedId = hit?.expressId ?? null;
-      this.selectedModelIndex = hit?.modelIndex ?? 0;
+      this.selectedModelIndex = hit?.modelIndex;
       this.renderer.requestRender();
-      this.events.onSelect({ expressId: this.selectedId, modelIndex: this.selectedModelIndex });
+      this.events.onSelect({ expressId: this.selectedId, modelIndex: hit?.modelIndex ?? 0 });
     } catch { /* pick pode falhar em frame de transição; ignora */ }
   }
 
