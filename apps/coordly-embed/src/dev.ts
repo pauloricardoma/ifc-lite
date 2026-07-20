@@ -11,7 +11,8 @@ const log = (name: string) => (d: any) => console.log(`[dev] ${name}`, d);
 const engine = new ViewerEngine(canvas, {
   onProgress: (phase, done, total) => console.log(`[dev] progress ${phase} ${done}/${total}`),
   onLoaded: log('loaded'),
-  onError: (code, message) => console.error(`[dev] error ${code}: ${message}`)
+  onError: (code, message) => console.error(`[dev] error ${code}: ${message}`),
+  onSelect: log('select')
 });
 
 engine.init().then((ok) => {

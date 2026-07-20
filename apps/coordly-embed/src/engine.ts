@@ -13,7 +13,12 @@ interface EngineEvents {
   onProgress(phase: LoadPhase, done: number, total: number): void;
   onLoaded(detail: { elementCount: number; schema?: string }): void;
   onError(code: string, message: string): void;
+  onSelect(detail: { expressId: number | null; modelIndex: number }): void;
 }
+
+// Clique = pointerdown→up sem passar deste deslocamento acumulado (CSS px).
+// Acima disso é orbit/pan, não seleção.
+const CLICK_DRAG_PX = 5;
 
 export class ViewerEngine {
   private renderer!: Renderer;
@@ -22,6 +27,10 @@ export class ViewerEngine {
   private aborter = new AbortController();
   private restoreErrorLogged = false;
   private restoreConsole: (() => void) | null = null;
+  // Seleção (single). Passada por frame pro renderer, que aplica o highlight
+  // (instanced + flat) internamente — não é estado guardado no renderer.
+  private selectedId: number | null = null;
+  private selectedModelIndex = 0;
 
   constructor(private canvas: HTMLCanvasElement, private events: EngineEvents) {}
 
@@ -171,6 +180,23 @@ export class ViewerEngine {
     this.renderer?.requestRender();
   }
 
+  // Raycast no clique. pick() espera coordenada CSS relativa ao canvas; o evento
+  // dá clientX/Y (viewport), daí o offset pelo boundingRect. Reuso puro do motor:
+  // o Renderer já faz o picking (CPU raycast + GPU id) e o highlight sai do render()
+  // via selectedId. Clique no vazio (pick null) limpa a seleção.
+  private async handlePick(clientX: number, clientY: number): Promise<void> {
+    if (this.disposed || !this.renderer) { return; }
+    const rect = this.canvas.getBoundingClientRect();
+    try {
+      const hit = await this.renderer.pick(clientX - rect.left, clientY - rect.top);
+      if (this.disposed) { return; }
+      this.selectedId = hit?.expressId ?? null;
+      this.selectedModelIndex = hit?.modelIndex ?? 0;
+      this.renderer.requestRender();
+      this.events.onSelect({ expressId: this.selectedId, modelIndex: this.selectedModelIndex });
+    } catch { /* pick pode falhar em frame de transição; ignora */ }
+  }
+
   dispose(): void {
     this.disposed = true;
     this.aborter.abort();
@@ -217,7 +243,13 @@ export class ViewerEngine {
 
       this.camera.update(dt);
       this.renderer.consumeRenderRequest();
-      this.renderer.render({ clearColor: [0.10, 0.11, 0.13, 1], contributionCull: CONTRIB_CULL, lod: LOD });
+      this.renderer.render({
+        clearColor: [0.10, 0.11, 0.13, 1],
+        contributionCull: CONTRIB_CULL,
+        lod: LOD,
+        selectedId: this.selectedId,
+        selectedModelIndex: this.selectedModelIndex
+      });
       requestAnimationFrame(frame);
     };
     requestAnimationFrame(frame);
@@ -225,17 +257,22 @@ export class ViewerEngine {
 
   private wireControls(): void {
     const c = this.canvas;
-    let dragging = false, lastX = 0, lastY = 0, button = 0;
+    let dragging = false, lastX = 0, lastY = 0, button = 0, moved = 0;
     c.addEventListener('contextmenu', (e) => e.preventDefault());
     c.addEventListener('pointerdown', (e) => {
-      dragging = true; lastX = e.clientX; lastY = e.clientY; button = e.button;
+      dragging = true; lastX = e.clientX; lastY = e.clientY; button = e.button; moved = 0;
       c.setPointerCapture(e.pointerId);
     });
-    c.addEventListener('pointerup', () => { dragging = false; });
+    c.addEventListener('pointerup', (e) => {
+      dragging = false;
+      // Clique esquerdo sem arrastar = seleção; orbit/pan não seleciona.
+      if (button === 0 && moved < CLICK_DRAG_PX) { void this.handlePick(e.clientX, e.clientY); }
+    });
     c.addEventListener('pointermove', (e) => {
       if (!dragging) { return; }
       const dx = e.clientX - lastX, dy = e.clientY - lastY;
       lastX = e.clientX; lastY = e.clientY;
+      moved += Math.abs(dx) + Math.abs(dy);
       if (button === 2 || e.shiftKey) { this.camera.pan(dx, dy); } else { this.camera.orbit(dx, dy); }
       this.renderer.requestRender();
     });

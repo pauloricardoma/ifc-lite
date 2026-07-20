@@ -30,7 +30,8 @@ export function initCoordly3DViewer(config: BimConfig): BimInstance {
   const engine = new ViewerEngine(canvas, {
     onProgress: (phase: LoadPhase, done, total) => emit('bim-load-progress', { phase, done, total }),
     onLoaded: (detail) => emit('bim-file-loaded', { modelId: config.fileName, ...detail }),
-    onError: (code, message) => emit('bim-load-error', { code, message })
+    onError: (code, message) => emit('bim-load-error', { code, message }),
+    onSelect: (detail) => emit('bim-selection-changed', detail)
   });
 
   window.bimExec = (cmd: string) => {
