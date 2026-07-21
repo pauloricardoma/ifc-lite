@@ -103,7 +103,10 @@ export class ViewerEngine {
       if (this.disposed) { return; }
       this.events.onProgress('download', 1, 1);
 
-      const gp = new GeometryProcessor({ tessellationQuality: 'medium' as any });
+      // skipSmallCuts: pula cortes booleanos minúsculos (copes/notches de viga) —
+      // é o que o viewer de referência liga no load on-screen. Sem isso, todo
+      // corte roda: fica lento em modelos opening-heavy e pode fatiar vigas.
+      const gp = new GeometryProcessor({ tessellationQuality: 'medium' as any, skipSmallCuts: true });
       await gp.init();
 
       const scene = this.renderer.getScene();
@@ -202,7 +205,7 @@ export class ViewerEngine {
       if (this.disposed) { return; }
       this.events.onProgress('download', 1, 1);
 
-      const gp = new GeometryProcessor({ tessellationQuality: 'medium' as any, enableInstancing: false });
+      const gp = new GeometryProcessor({ tessellationQuality: 'medium' as any, enableInstancing: false, skipSmallCuts: true });
       await gp.init();
 
       let meshCount = 0;
