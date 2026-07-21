@@ -18,11 +18,15 @@ const engine = new ViewerEngine(canvas, {
 engine.init().then((ok) => {
   if (!ok) { return; }
   const input = document.getElementById('ifc') as HTMLInputElement;
+  // Federação: aceita vários .ifc e carrega aditivo (addModelFromIfc), cada um
+  // com modelId = nome do arquivo. Um só arquivo = federação de 1 (mesmo caminho).
+  input.multiple = true;
   input.addEventListener('change', async () => {
-    const file = input.files?.[0];
-    if (!file) { return; }
-    const url = URL.createObjectURL(file);
-    await engine.loadFromIfc(url);
-    URL.revokeObjectURL(url);
+    const files = Array.from(input.files ?? []);
+    for (const file of files) {
+      const url = URL.createObjectURL(file);
+      await engine.addModelFromIfc(url, file.name);
+      URL.revokeObjectURL(url);
+    }
   });
 });

@@ -34,6 +34,10 @@ export class ViewerEngine {
   // caminho flat filtra por modelIndex, e as malhas de modelo único têm
   // modelIndex undefined → passar 0 filtraria o highlight fora.
   private selectedModelIndex: number | undefined = undefined;
+  // Federação: modelId → modelIndex (ordem de entrada). O 1º modelo fixa o frame
+  // de coordenadas; os demais reusam via sharedRtcOffset pra ficarem alinhados.
+  private models = new Map<string, number>();
+  private federationRtc: { x: number; y: number; z: number } | undefined;
 
   constructor(private canvas: HTMLCanvasElement, private events: EngineEvents) {}
 
@@ -176,6 +180,76 @@ export class ViewerEngine {
     } catch (err: any) {
       if (err?.name !== 'AbortError') { this.events.onError('decode-failed', String(err?.message ?? err)); }
     }
+  }
+
+  // Federação (client-parse): adiciona um modelo à cena SEM limpar. Cada modelo
+  // ganha um modelIndex (chave composta expressId+modelIndex evita colisão entre
+  // disciplinas). instancing OFF — o caminho instanced do renderer é primary-only,
+  // então geometria instanciada não receberia modelIndex; flat recebe. O 1º modelo
+  // fixa o rtc; os demais reusam (sharedRtcOffset) pra ficarem alinhados no mesmo frame.
+  async addModelFromIfc(fileUrl: string, modelId: string): Promise<void> {
+    if (this.disposed || this.models.has(modelId)) { return; }
+    const modelIndex = this.models.size;
+    this.models.set(modelId, modelIndex);
+    const isFirst = modelIndex === 0;
+    const isolated = typeof self !== 'undefined' && self.crossOriginIsolated;
+
+    try {
+      this.events.onProgress('download', 0, 1);
+      const res = await fetch(fileUrl, { signal: this.aborter.signal });
+      if (!res.ok) { throw new Error(`download do .ifc → ${res.status}`); }
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      if (this.disposed) { return; }
+      this.events.onProgress('download', 1, 1);
+
+      const gp = new GeometryProcessor({ tessellationQuality: 'medium' as any, enableInstancing: false });
+      await gp.init();
+
+      let meshCount = 0;
+      let framed = false;
+      const stream = isolated
+        ? gp.processAdaptive(bytes, {
+            sizeThreshold: 2 * 1024 * 1024,
+            sharedRtcOffset: isFirst ? undefined : this.federationRtc
+          })
+        : gp.processStreaming(bytes, undefined, undefined, isFirst ? undefined : this.federationRtc);
+
+      for await (const ev of stream) {
+        if (this.disposed) { return; }
+        // O 1º modelo emite o rtc do frame; guardamos pra alinhar os próximos.
+        if ((ev as any).type === 'rtcOffset') {
+          if (isFirst) { this.federationRtc = (ev as any).rtcOffset; }
+          continue;
+        }
+        if (ev.type !== 'batch') { continue; }
+
+        if (ev.meshes.length > 0) {
+          this.renderer.addMeshes(ev.meshes.map((m) => ({ ...m, modelIndex })), true);
+          meshCount += ev.meshes.length;
+        }
+        this.renderer.requestRender();
+        if (!framed && meshCount > 0) { this.renderer.fitToView(); framed = true; }
+        this.events.onProgress('parse', meshCount, meshCount);
+      }
+
+      if (this.disposed) { return; }
+      this.renderer.fitToView(); // enquadra a união de todos os modelos
+      this.renderer.requestRender();
+      this.events.onLoaded({ elementCount: meshCount });
+    } catch (err: any) {
+      this.models.delete(modelId); // rollback do índice se este modelo falhou
+      if (err?.name !== 'AbortError') { this.events.onError('parse-failed', String(err?.message ?? err)); }
+    }
+  }
+
+  // Reset da sessão federada (esvazia a cena e volta a poder escolher o motor).
+  clearModels(): void {
+    this.renderer?.getScene().clear();
+    this.models.clear();
+    this.federationRtc = undefined;
+    this.selectedId = null;
+    this.selectedModelIndex = undefined;
+    this.renderer?.requestRender();
   }
 
   fitToView(): void {
