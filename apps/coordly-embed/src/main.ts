@@ -10,6 +10,9 @@ export interface BimConfig {
   fileName?: string;
   artifacts?: IfcArtifacts | null;
   container?: HTMLElement;
+  // Federação: monta a cena vazia (sem auto-load); o web adiciona modelos via
+  // bimHelpers.addModel(). Sem isto, ausência de fileUrl/artifacts vira erro.
+  federated?: boolean;
 }
 
 export interface BimInstance {
@@ -37,12 +40,19 @@ export function initCoordly3DViewer(config: BimConfig): BimInstance {
   window.bimExec = (cmd: string) => {
     if (cmd === 'zoomfit' || cmd === 'home') { engine.fitToView(); }
   };
-  window.bimHelpers = { fitToView: () => engine.fitToView(), dispose: () => engine.dispose() };
+  window.bimHelpers = {
+    fitToView: () => engine.fitToView(),
+    addModel: (fileUrl: string, modelId: string) => engine.addModelFromIfc(fileUrl, modelId),
+    clearModels: () => engine.clearModels(),
+    dispose: () => engine.dispose()
+  };
 
   engine.init().then((ok) => {
     if (!ok) { return; }
     if (config.artifacts) { return engine.loadFromArtifacts(config.artifacts); }
     if (config.fileUrl) { return engine.loadFromIfc(config.fileUrl); }
+    // Federação: cena vazia, o web adiciona modelos via bimHelpers.addModel.
+    if (config.federated) { return; }
     emit('bim-load-error', { code: 'no-source', message: 'sem fileUrl nem artifacts' });
   }).catch((err) => emit('bim-load-error', { code: 'boot-failed', message: String(err?.message ?? err) }));
 
@@ -54,6 +64,11 @@ export function initCoordly3DViewer(config: BimConfig): BimInstance {
 declare global {
   interface Window {
     bimExec: (cmd: string, args?: unknown) => void;
-    bimHelpers: { fitToView(): void; dispose(): void };
+    bimHelpers: {
+      fitToView(): void;
+      addModel(fileUrl: string, modelId: string): Promise<void>;
+      clearModels(): void;
+      dispose(): void;
+    };
   }
 }
