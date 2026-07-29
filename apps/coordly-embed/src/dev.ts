@@ -15,9 +15,26 @@ const engine = new ViewerEngine(canvas, {
   onSelect: log('select')
 });
 
+// ?diff=1 → não renderiza: roda o mesmo arquivo no single e no paralelo e
+// compara (src/cut-diff.ts). Precisa de cross-origin isolation p/ o paralelo
+// existir — o dev server do embed já manda COOP/COEP.
+const diffMode = new URLSearchParams(location.search).get('diff') === '1';
+
 engine.init().then((ok) => {
   if (!ok) { return; }
   const input = document.getElementById('ifc') as HTMLInputElement;
+
+  if (diffMode) {
+    console.log(`[dev] modo DIFF (crossOriginIsolated=${self.crossOriginIsolated})`);
+    input.addEventListener('change', async () => {
+      const file = input.files?.[0];
+      if (!file) { return; }
+      const { runCutDiff } = await import('./cut-diff.js');
+      await runCutDiff(new Uint8Array(await file.arrayBuffer()));
+    });
+    return;
+  }
+
   // Federação: aceita vários .ifc e carrega aditivo (addModelFromIfc), cada um
   // com modelId = nome do arquivo. Um só arquivo = federação de 1 (mesmo caminho).
   input.multiple = true;

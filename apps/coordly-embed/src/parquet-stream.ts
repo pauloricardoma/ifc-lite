@@ -33,7 +33,29 @@ function ensureInit(): Promise<unknown> {
 
 async function readU32LE(blob: Blob, pos: number): Promise<number> {
   const b = await blob.slice(pos, pos + 4).arrayBuffer();
+  if (b.byteLength < 4) {
+    throw new Error(`container truncado: sem u32 em ${pos} (tamanho ${blob.size})`);
+  }
   return new DataView(b).getUint32(0, true);
+}
+
+const PARQUET_MAGIC = 'PAR1';
+
+async function magicAt(blob: Blob, pos: number): Promise<string> {
+  return new TextDecoder().decode(await blob.slice(pos, pos + 4).arrayBuffer());
+}
+
+/**
+ * Offset onde o container começa de verdade. O artefato do CDN começa direto no
+ * `[u32 len][mesh…]`; a resposta de `/api/v1/parse/parquet` vem com um u32 de
+ * tamanho total na frente. Em vez de adivinhar pela origem, procuramos o magic
+ * `PAR1` logo após o u32 de comprimento — é o que distingue os dois sem ambiguidade.
+ */
+async function containerBase(source: Blob): Promise<number> {
+  for (const base of [0, 4]) {
+    if (await magicAt(source, base + 4) === PARQUET_MAGIC) { return base; }
+  }
+  throw new Error('container de geometria irreconhecível (magic PAR1 não encontrado)');
 }
 
 // Prefix sums das linhas por row group → mapeia índice global p/ (RG, offset local).
@@ -64,9 +86,15 @@ export async function* decodeStdParquetStreaming(
   await ensureInit();
 
   // Parse do container via slices da Blob (sem ler tudo na memória).
-  const meshLen = await readU32LE(source, 0);
-  const meshBlob = source.slice(4, 4 + meshLen);
-  const vtxLenPos = 4 + meshLen;
+  //
+  // O endpoint /api/v1/parse/parquet prefixa o container com um u32 de tamanho
+  // TOTAL, que o artefato do CDN não tem. Detectamos pelo magic do parquet em vez
+  // de assumir um dos dois: onde estiver "PAR1" logo depois do u32 de comprimento,
+  // ali começa o container de verdade.
+  const base = await containerBase(source);
+  const meshLen = await readU32LE(source, base);
+  const meshBlob = source.slice(base + 4, base + 4 + meshLen);
+  const vtxLenPos = base + 4 + meshLen;
   const vtxLen = await readU32LE(source, vtxLenPos);
   const vtxBlob = source.slice(vtxLenPos + 4, vtxLenPos + 4 + vtxLen);
   const idxLenPos = vtxLenPos + 4 + vtxLen;

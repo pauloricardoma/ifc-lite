@@ -13,6 +13,12 @@ export interface BimConfig {
   // Federação: monta a cena vazia (sem auto-load); o web adiciona modelos via
   // bimHelpers.addModel(). Sem isto, ausência de fileUrl/artifacts vira erro.
   federated?: boolean;
+  /**
+   * URL do server ifc-lite. Presente = o `.ifc` é parseado NO SERVER e o browser
+   * só decodifica o parquet. É o caminho padrão desde que o parse client-side foi
+   * descartado (single-thread do motor perde geometria e não há SAB sem isolar).
+   */
+  serverUrl?: string;
 }
 
 export interface BimInstance {
@@ -42,14 +48,34 @@ export function initCoordly3DViewer(config: BimConfig): BimInstance {
   };
   window.bimHelpers = {
     fitToView: () => engine.fitToView(),
-    addModel: (fileUrl: string, modelId: string) => engine.addModelFromIfc(fileUrl, modelId),
+    // Federação segue a mesma regra do single: com server configurado, quem
+    // tessela é ele — o parse client-side perde geometria no single-thread.
+    addModel: (fileUrl: string, modelId: string) => (
+      config.serverUrl
+        ? engine.addModelFromServerParse(fileUrl, modelId, config.serverUrl)
+        : engine.addModelFromIfc(fileUrl, modelId)
+    ),
     clearModels: () => engine.clearModels(),
     dispose: () => engine.dispose()
   };
 
   engine.init().then((ok) => {
     if (!ok) { return; }
+    // Artefatos prontos (CDN) > parse no server > parse no browser. O client fica
+    // só como fallback explícito, quando não há server configurado.
     if (config.artifacts) { return engine.loadFromArtifacts(config.artifacts); }
+    if (config.fileUrl && config.serverUrl) {
+      // Padrão: perguntar ao cache antes de subir (`loadFromServerCached`) —
+      // arquivo já parseado nem faz upload, e o grande não depende de receber
+      // 1.8GB de SSE em base64, que travava a aba.
+      //
+      // `?mode=sse` força o streaming (bom pra arquivo pequeno: progresso por
+      // batch) e `?mode=post` o endpoint inteiro — os dois seguem úteis pra A/B.
+      const mode = new URLSearchParams(location.search).get('mode');
+      if (mode === 'sse') { return engine.loadFromServerStream(config.fileUrl, config.serverUrl); }
+      if (mode === 'post') { return engine.loadFromServerParse(config.fileUrl, config.serverUrl); }
+      return engine.loadFromServerCached(config.fileUrl, config.serverUrl);
+    }
     if (config.fileUrl) { return engine.loadFromIfc(config.fileUrl); }
     // Federação: cena vazia, o web adiciona modelos via bimHelpers.addModel.
     if (config.federated) { return; }
