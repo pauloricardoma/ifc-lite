@@ -26,7 +26,8 @@ export interface StreamMesh {
 }
 
 let ready: Promise<unknown> | null = null;
-function ensureInit(): Promise<unknown> {
+/** Exportado: o decoder do data model usa o MESMO módulo wasm (init roda uma vez só). */
+export function ensureInit(): Promise<unknown> {
   if (!ready) ready = init(wasmUrl);
   return ready;
 }

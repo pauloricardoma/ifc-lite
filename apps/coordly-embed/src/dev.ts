@@ -12,7 +12,8 @@ const engine = new ViewerEngine(canvas, {
   onProgress: (phase, done, total) => console.log(`[dev] progress ${phase} ${done}/${total}`),
   onLoaded: log('loaded'),
   onError: (code, message) => console.error(`[dev] error ${code}: ${message}`),
-  onSelect: log('select')
+  onSelect: log('select'),
+  onDataModel: log('datamodel')
 });
 
 // ?diff=1 → não renderiza: roda o mesmo arquivo no single e no paralelo e
@@ -31,6 +32,25 @@ engine.init().then((ok) => {
       if (!file) { return; }
       const { runCutDiff } = await import('./cut-diff.js');
       await runCutDiff(new Uint8Array(await file.arrayBuffer()));
+    });
+    return;
+  }
+
+  // `?server=<url>` roda o MESMO caminho do web/ (parse no server + data model),
+  // que é o único que popula árvore e propriedades — o client-parse não busca
+  // data model. Sem o param, segue no client-parse (federação).
+  const serverUrl = new URLSearchParams(location.search).get('server');
+  if (serverUrl) {
+    console.log('[dev] modo SERVER:', serverUrl);
+    input.addEventListener('change', async () => {
+      const file = input.files?.[0];
+      if (!file) { return; }
+      const url = URL.createObjectURL(file);
+      await engine.loadFromServerCached(url, serverUrl);
+      URL.revokeObjectURL(url);
+      // Atalhos de inspeção manual da fatia de árvore/propriedades.
+      (window as any).tree = () => engine.getSpatialTree();
+      (window as any).props = (id: number) => engine.getEntityProperties(id);
     });
     return;
   }

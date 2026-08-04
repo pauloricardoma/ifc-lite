@@ -1,5 +1,7 @@
 import { ViewerEngine, LoadPhase } from './engine.js';
+import type { BimEntityProperties, BimTreeNode } from './data-model.js';
 import type { IfcArtifacts } from './types.js';
+import type { SectionPlane } from '@ifc-lite/renderer';
 
 // Carregado por <script src> (não textContent): assim os imports dinâmicos
 // relativos do bundle resolvem contra a URL do script, e o arquivo fica
@@ -40,14 +42,37 @@ export function initCoordly3DViewer(config: BimConfig): BimInstance {
     onProgress: (phase: LoadPhase, done, total) => emit('bim-load-progress', { phase, done, total }),
     onLoaded: (detail) => emit('bim-file-loaded', { modelId: config.fileName, ...detail }),
     onError: (code, message) => emit('bim-load-error', { code, message }),
-    onSelect: (detail) => emit('bim-selection-changed', detail)
+    onSelect: (detail) => emit('bim-selection-changed', detail),
+    onDataModel: (detail) => emit('bim-datamodel-ready', detail)
   });
 
   window.bimExec = (cmd: string) => {
     if (cmd === 'zoomfit' || cmd === 'home') { engine.fitToView(); }
+    if (cmd === 'showall') { engine.showAll(); }
   };
   window.bimHelpers = {
     fitToView: () => engine.fitToView(),
+    // Árvore espacial e propriedades: dados do MESMO artefato da geometria.
+    hasDataModel: () => engine.hasDataModel(),
+    getSpatialTree: () => engine.getSpatialTree(),
+    getEntityProperties: (expressId: number) => engine.getEntityProperties(expressId),
+    getEntityLabels: (expressIds: number[]) => engine.getEntityLabels(expressIds),
+    // Seleção da árvore → 3D (o inverso já sai por 'bim-selection-changed').
+    select: (expressId: number | null, opts?: { frame?: boolean; additive?: boolean }) =>
+      engine.selectEntity(expressId, opts ?? {}),
+    clearSelection: () => engine.clearSelection(),
+    // Modo "adicionar à seleção" (o botão da toolbar); Ctrl/Shift no clique
+    // fazem o mesmo pontualmente.
+    setMultiSelect: (enabled: boolean) => engine.setMultiSelect(enabled),
+    // X-Ray: o não-selecionado fica translúcido. Ligado sozinho no duplo clique.
+    setGhostMode: (enabled: boolean) => engine.setGhostMode(enabled),
+    focusSelection: () => engine.focusSelection(),
+    frameEntities: (expressIds: number[]) => engine.frameEntities(expressIds),
+    isolate: (expressIds: number[] | null) => engine.isolate(expressIds),
+    hide: (expressIds: number[]) => engine.hide(expressIds),
+    show: (expressIds: number[]) => engine.show(expressIds),
+    showAll: () => engine.showAll(),
+    setSectionPlane: (section: SectionPlane | null) => engine.setSectionPlane(section),
     // Federação segue a mesma regra do single: com server configurado, quem
     // tessela é ele — o parse client-side perde geometria no single-thread.
     addModel: (fileUrl: string, modelId: string) => (
@@ -55,6 +80,9 @@ export function initCoordly3DViewer(config: BimConfig): BimInstance {
         ? engine.addModelFromServerParse(fileUrl, modelId, config.serverUrl)
         : engine.addModelFromIfc(fileUrl, modelId)
     ),
+    // Tira UM modelo da cena; os outros ficam como estão (sem re-parse).
+    removeModel: (modelId: string) => engine.removeModel(modelId),
+    hasModel: (modelId: string) => engine.hasModel(modelId),
     clearModels: () => engine.clearModels(),
     dispose: () => engine.dispose()
   };
@@ -92,7 +120,24 @@ declare global {
     bimExec: (cmd: string, args?: unknown) => void;
     bimHelpers: {
       fitToView(): void;
+      hasDataModel(): boolean;
+      getSpatialTree(): BimTreeNode[];
+      getEntityProperties(expressId: number): BimEntityProperties | null;
+      getEntityLabels(expressIds: number[]): { expressId: number; name: string }[];
+      select(expressId: number | null, opts?: { frame?: boolean; additive?: boolean }): void;
+      clearSelection(): void;
+      setMultiSelect(enabled: boolean): void;
+      setGhostMode(enabled: boolean): void;
+      focusSelection(): void;
+      frameEntities(expressIds: number[]): void;
+      isolate(expressIds: number[] | null): void;
+      hide(expressIds: number[]): void;
+      show(expressIds: number[]): void;
+      showAll(): void;
+      setSectionPlane(section: SectionPlane | null): void;
       addModel(fileUrl: string, modelId: string): Promise<void>;
+      removeModel(modelId: string): void;
+      hasModel(modelId: string): boolean;
       clearModels(): void;
       dispose(): void;
     };

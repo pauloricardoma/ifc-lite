@@ -1,13 +1,26 @@
 import { Renderer, DEFAULT_CHUNK_CELL_SIZE } from '@ifc-lite/renderer';
+import type { SectionPlane } from '@ifc-lite/renderer';
 import { GeometryProcessor, decodeInstancedShard } from '@ifc-lite/geometry';
 import type { TessellationQuality } from '@ifc-lite/geometry';
 import { decodeStdParquetStreaming } from './parquet-stream.js';
+import { ModelDataStore } from './data-model.js';
+import type { BimEntityProperties, BimTreeNode } from './data-model.js';
 import type { IfcArtifacts } from './types.js';
 
 // Espera pelo parse frio no server. 5min cobre modelo grande (o de 264MB levou
 // ~250s de tesselação); estourando, o parse continua lá e a próxima abertura pega
 // do cache — por isso a mensagem é "tente de novo", não "falhou".
 const CACHE_POLL = { intervalMs: 5000, timeoutMs: 5 * 60 * 1000 };
+
+// O data model é escrito no cache DEPOIS da geometria (o server responde o
+// parquet e grava o resto em background), então um 202 logo após o load é
+// normal — não é erro, é "ainda não".
+const DATA_MODEL_POLL = { intervalMs: 3000, quickAttempts: 3, attempts: 40 };
+
+// Sufixo do `cache_key` do server: `{sha256}-{opening_filter}{-qualidade}`.
+// Nunca mandamos `opening_filter` nem `tessellation_quality` nas chamadas, então
+// o server resolve os defaults — `default` e `medium` (medium não gera sufixo).
+const DEFAULT_OPENING_FILTER = 'default';
 
 
 const GPU_BUDGET_MB = 2048;
@@ -34,12 +47,48 @@ interface EngineEvents {
   onProgress(phase: LoadPhase, done: number, total: number): void;
   onLoaded(detail: { elementCount: number; schema?: string }): void;
   onError(code: string, message: string): void;
-  onSelect(detail: { expressId: number | null; modelIndex: number }): void;
+  onSelect(detail: {
+    expressId: number | null;
+    modelIndex: number;
+    /** Seleção completa (multi-seleção); `expressId` é o último clicado. */
+    expressIds: number[];
+  }): void;
+  // Árvore espacial e propriedades ficam disponíveis; chega depois do render
+  // porque o data model é buscado sem bloquear a geometria.
+  onDataModel(detail: { available: boolean }): void;
 }
 
 // Clique = pointerdown→up sem passar deste deslocamento acumulado (CSS px).
 // Acima disso é orbit/pan, não seleção.
 const CLICK_DRAG_PX = 5;
+
+/**
+ * Faixa de expressId reservada por modelo federado.
+ *
+ * Por que existe: a remoção da cena (`scene.removeMeshesForEntities`) é por
+ * expressId e NÃO filtra por modelo — e disciplinas diferentes reusam os mesmos
+ * ids. Sem separar as faixas, desligar uma disciplina apagaria malhas de outra
+ * que tivessem o mesmo id. Com o offset, cada modelo ocupa um intervalo próprio
+ * e sai da cena sozinho, sem o clear + re-add de todos os outros.
+ *
+ * O tamanho é um compromisso: o id vai pra GPU como u32 (teto ~4.29e9), então
+ * 50M por modelo dá ~85 disciplinas — folgado para as 29 medidas — e cabe
+ * qualquer IFC real (o de 264MB não chega a 3M entidades).
+ *
+ * `modelIndex` continua carimbado e é o que o highlight usa; o offset resolve
+ * só a remoção. Os dois convivem.
+ */
+const MODEL_ID_STEP = 50_000_000;
+
+/** Desfaz o offset: o mundo fora do engine só conhece o expressId do arquivo. */
+const localExpressId = (expressId: number): number => expressId % MODEL_ID_STEP;
+
+interface FederatedModel {
+  index: number;
+  idOffset: number;
+  /** Ids (já deslocados) que este modelo pôs na cena — o que `removeModel` tira. */
+  ids: Set<number>;
+}
 
 // Tipos que o viewer de referência esconde por padrão — espelha
 // `TYPE_VISIBILITY_SEMANTIC_DEFAULTS` (apps/viewer/src/store/constants.ts), com o
@@ -164,12 +213,45 @@ export class ViewerEngine {
   // caminho flat filtra por modelIndex, e as malhas de modelo único têm
   // modelIndex undefined → passar 0 filtraria o highlight fora.
   private selectedModelIndex: number | undefined = undefined;
-  // Federação: modelId → modelIndex (ordem de entrada). O 1º modelo fixa o frame
-  // de coordenadas; os demais reusam via sharedRtcOffset pra ficarem alinhados.
-  private models = new Map<string, number>();
+  // Multi-seleção: ids DA CENA (com offset federado). `selectedId` é o último
+  // clicado — é dele que saem as propriedades no painel.
+  private selectedIds = new Set<number>();
+  // Modo "adicionar à seleção" da toolbar. Ctrl/Shift no clique fazem o mesmo
+  // pontualmente, sem precisar entrar no modo.
+  private multiSelect = false;
+  // X-Ray: tudo que não está selecionado fica translúcido. Ligado no duplo
+  // clique porque enquadrar um elemento cercado de paredes não adianta se elas
+  // continuam opacas na frente dele.
+  private ghost = false;
+  // Federação: modelId → estado do modelo na cena. O 1º modelo fixa o frame de
+  // coordenadas; os demais reusam via sharedRtcOffset pra ficarem alinhados.
+  private models = new Map<string, FederatedModel>();
+  // Monotônico, NÃO `models.size`: remover um modelo e adicionar outro reusaria
+  // o índice/offset do que saiu e misturaria os dois.
+  private nextModelSlot = 0;
   private federationRtc: { x: number; y: number; z: number } | undefined;
+  // Atributos/Psets/Qtos/hierarquia do MESMO artefato da geometria. Null até o
+  // data model chegar (ou pra sempre, se o modelo veio por um caminho que não o
+  // publica — o render nunca depende dele).
+  private dataStore: ModelDataStore | null = null;
+  // Visibilidade e corte são estado do app, aplicados POR FRAME no render() —
+  // mesmo contrato do selectedId. O renderer compara por conteúdo, então passar
+  // o mesmo Set todo frame não invalida cache.
+  private hiddenIds = new Set<number>();
+  private isolatedIds: Set<number> | null = null;
+  private section: SectionPlane | null = null;
 
   constructor(private canvas: HTMLCanvasElement, private events: EngineEvents) {}
+
+  // Campo (não método) pra manter a mesma referência no add/removeEventListener.
+  private onKeyDown = (e: KeyboardEvent): void => {
+    if (this.disposed || e.key !== 'Escape') { return; }
+    // Não roubar o Esc de quem está digitando num campo do app.
+    const target = e.target as HTMLElement | null;
+    const tag = target?.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || target?.isContentEditable) { return; }
+    if (this.selectedIds.size > 0) { this.clearSelection(); }
+  };
 
   // O motor de geometria (JS + WASM) cospe diagnóstico verboso do pipeline de
   // aberturas/camadas. Não dá pra tirar no build (parte vem do wasm) nem patchar
@@ -333,17 +415,32 @@ export class ViewerEngine {
    */
   private async renderParquet(
     geometry: Blob,
-    opts: { additive?: boolean; modelIndex?: number } = {},
+    opts: { additive?: boolean; model?: FederatedModel } = {},
   ): Promise<void> {
     if (!opts.additive) { this.renderer.getScene().clear(); }
     let meshCount = 0;
     let framed = opts.additive === true; // federação: não reenquadra a cada modelo
+    let idOverflowLogged = false;
 
     for await (const chunk of decodeStdParquetStreaming(geometry)) {
       if (this.disposed) { return; }
       const meshes = visibleOnly(chunk);
-      if (opts.modelIndex !== undefined) {
-        for (const mesh of meshes) { (mesh as any).modelIndex = opts.modelIndex; }
+      const model = opts.model;
+      if (model) {
+        for (const mesh of meshes) {
+          (mesh as any).modelIndex = model.index;
+          if (mesh.expressId >= MODEL_ID_STEP && !idOverflowLogged) {
+            // Estourar a faixa faria o id cair no intervalo do modelo vizinho:
+            // a remoção começaria a apagar a disciplina errada. Nunca visto em
+            // modelo real, mas é o tipo de coisa que não pode falhar em silêncio.
+            idOverflowLogged = true;
+            console.warn(
+              `[coordly-embed] expressId ${mesh.expressId} passa da faixa de ${MODEL_ID_STEP} por modelo`,
+            );
+          }
+          mesh.expressId += model.idOffset;
+          model.ids.add(mesh.expressId);
+        }
       }
       this.renderer.addMeshes(meshes as any, true);
       meshCount += meshes.length;
@@ -472,12 +569,121 @@ export class ViewerEngine {
    */
   async loadFromServerCached(fileUrl: string, serverUrl: string): Promise<void> {
     try {
-      const geometry = await this.geometryFromServer(fileUrl, serverUrl);
+      const { geometry, hash, ifc } = await this.geometryFromServer(fileUrl, serverUrl);
       if (this.disposed) { return; }
       await this.renderParquet(geometry);
+      // Depois do render, nunca antes: a árvore e as propriedades não podem
+      // atrasar o primeiro paint do modelo.
+      void this.loadDataModel(hash, serverUrl, ifc);
     } catch (err: any) {
       if (this.disposed || err?.name === 'AbortError') { return; }
       this.events.onError('server-parse-failed', String(err?.message ?? err));
+    }
+  }
+
+  /**
+   * Busca o data model do MESMO `cache_key` da geometria. Falha aqui não é falha
+   * de viewer: o modelo continua na tela, só sem árvore/propriedades — por isso
+   * não emite `onError` (que dispararia o fallback pro Autodesk).
+   */
+  private async loadDataModel(hash: string, serverUrl: string, ifc?: Blob): Promise<void> {
+    const cacheKey = `${hash}-${DEFAULT_OPENING_FILTER}`;
+
+    // Rodada curta: se a geometria acabou de ser parseada, o data model está
+    // sendo escrito agora e chega em segundos.
+    if (await this.pollDataModel(cacheKey, serverUrl, DATA_MODEL_POLL.quickAttempts)) { return; }
+    if (this.disposed) { return; }
+
+    // Continuou 202. Não é lentidão: o `parse/parquet` responde do cache ANTES
+    // de processar, e nesse caminho ele NÃO grava o data model — um arquivo
+    // parseado por uma versão anterior do server nunca teria árvore nem
+    // propriedades, por mais que a gente esperasse.
+    //
+    // O `parse/parquet-stream` não tem esse curto-circuito: ele sempre dispara a
+    // extração do data model num `tokio::spawn`. Então subimos o arquivo só pra
+    // popular esse cache e abandonamos a resposta (a geometria já está na tela).
+    if (!ifc) {
+      console.warn('[coordly-embed] data model ausente e sem o .ifc em mãos pra gerar');
+      this.events.onDataModel({ available: false });
+      return;
+    }
+
+    console.log('[coordly-embed] data model ausente no cache; disparando extração no server…');
+    if (!await this.requestDataModelFill(ifc, serverUrl)) {
+      this.events.onDataModel({ available: false });
+      return;
+    }
+
+    if (await this.pollDataModel(cacheKey, serverUrl, DATA_MODEL_POLL.attempts)) { return; }
+    if (this.disposed) { return; }
+    console.warn('[coordly-embed] data model não ficou pronto a tempo');
+    this.events.onDataModel({ available: false });
+  }
+
+  /** Devolve `true` quando o data model chegou e foi decodificado. */
+  private async pollDataModel(
+    cacheKey: string,
+    serverUrl: string,
+    attempts: number,
+  ): Promise<boolean> {
+    const url = this.serverEndpoint(serverUrl, `api/v1/parse/data-model/${cacheKey}`);
+
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      if (this.disposed) { return false; }
+      try {
+        const res = await fetch(url, { signal: this.aborter.signal });
+        // 202 = ainda não existe no cache (ou está sendo escrito agora).
+        if (res.status === 202) {
+          await new Promise((r) => setTimeout(r, DATA_MODEL_POLL.intervalMs));
+          continue;
+        }
+        if (!res.ok) { throw new Error(`data model → ${res.status}`); }
+
+        const buffer = await res.arrayBuffer();
+        if (this.disposed) { return false; }
+        this.dataStore = await ModelDataStore.decode(buffer);
+        if (this.disposed) { return false; }
+        console.log(`[coordly-embed] data model pronto (${(buffer.byteLength / 1024 / 1024).toFixed(1)}MB)`);
+        this.events.onDataModel({ available: true });
+        return true;
+      } catch (err: any) {
+        if (this.disposed || err?.name === 'AbortError') { return false; }
+        console.warn('[coordly-embed] data model indisponível:', err?.message ?? err);
+        return false;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Sobe o `.ifc` no endpoint SSE só pra disparar a extração do data model, e
+   * **abandona a resposta**: a geometria já está renderizada, e ler o corpo
+   * traria os mesmos MBs de volta em base64 sem serventia. O cancelamento não
+   * aborta o trabalho — a extração roda num `tokio::spawn` independente da
+   * conexão (o mesmo motivo pelo qual o cache de geometria sobrevive a um
+   * gateway timeout).
+   */
+  private async requestDataModelFill(ifc: Blob, serverUrl: string): Promise<boolean> {
+    const form = new FormData();
+    form.append('file', ifc, 'model.ifc');
+
+    const fill = new AbortController();
+    // Se o viewer for descartado no meio, cancela junto.
+    this.aborter.signal.addEventListener('abort', () => fill.abort(), { once: true });
+
+    try {
+      const res = await fetch(this.serverEndpoint(serverUrl, 'api/v1/parse/parquet-stream'), {
+        method: 'POST',
+        body: form,
+        signal: fill.signal,
+      });
+      const ok = res.ok;
+      fill.abort(); // headers recebidos = o server já está processando
+      return ok;
+    } catch (err: any) {
+      if (this.disposed || err?.name === 'AbortError') { return !this.disposed; }
+      console.warn('[coordly-embed] falha ao disparar extração do data model:', err?.message ?? err);
+      return false;
     }
   }
 
@@ -486,7 +692,10 @@ export class ViewerEngine {
    * pelo modelo único quanto pela federação — o federado tem ainda mais a ganhar,
    * porque cada disciplina extra seria outro upload.
    */
-  private async geometryFromServer(fileUrl: string, serverUrl: string): Promise<Blob> {
+  private async geometryFromServer(
+    fileUrl: string,
+    serverUrl: string,
+  ): Promise<{ geometry: Blob; hash: string; ifc: Blob }> {
     const ifcBlob = await this.downloadIfc(fileUrl);
 
     this.events.onProgress('parse', 0, 1);
@@ -504,7 +713,9 @@ export class ViewerEngine {
       }
     }
 
-    return this.fetchCachedGeometry(hash, serverUrl);
+    // O Blob do `.ifc` vai junto: vive em disco (não no heap) e é o que permite
+    // gerar o data model quando o cache da geometria é HIT mas o dele não existe.
+    return { geometry: await this.fetchCachedGeometry(hash, serverUrl), hash, ifc: ifcBlob };
   }
 
   /**
@@ -647,18 +858,69 @@ export class ViewerEngine {
    */
   async addModelFromServerParse(fileUrl: string, modelId: string, serverUrl: string): Promise<void> {
     if (this.disposed || this.models.has(modelId)) { return; }
-    const modelIndex = this.models.size;
-    this.models.set(modelId, modelIndex);
+    const slot = this.nextModelSlot++;
+    const model: FederatedModel = {
+      index: slot,
+      idOffset: slot * MODEL_ID_STEP,
+      ids: new Set<number>(),
+    };
+    this.models.set(modelId, model);
 
     try {
-      const geometry = await this.geometryFromServer(fileUrl, serverUrl);
+      const { geometry } = await this.geometryFromServer(fileUrl, serverUrl);
       if (this.disposed) { return; }
-      await this.renderParquet(geometry, { additive: true, modelIndex });
+      await this.renderParquet(geometry, { additive: true, model });
     } catch (err: any) {
-      this.models.delete(modelId); // libera o índice: o modelo não entrou na cena
+      this.models.delete(modelId); // o modelo não entrou na cena
       if (this.disposed || err?.name === 'AbortError') { return; }
       this.events.onError('server-parse-failed', String(err?.message ?? err));
     }
+  }
+
+  /**
+   * Tira UM modelo da cena, sem tocar nos outros — o que o offset de id (§
+   * `MODEL_ID_STEP`) viabiliza. Antes disso a única remoção possível era
+   * `scene.clear()`, e desligar 1 de N custava re-baixar e re-parsear os N-1
+   * que ficavam.
+   */
+  removeModel(modelId: string): void {
+    const model = this.models.get(modelId);
+    if (!model || !this.renderer) { return; }
+
+    const scene = this.renderer.getScene();
+    scene.removeMeshesForEntities(model.ids);
+    // A remoção só marca os buckets; sem o rebuild a geometria continua na GPU
+    // e desenhando.
+    const device = this.renderer.getGPUDevice();
+    const pipeline = this.renderer.getPipeline();
+    if (device && pipeline) { scene.rebuildPendingBatches(device, pipeline); }
+
+    let selectionChanged = false;
+    for (const id of Array.from(this.selectedIds)) {
+      if (model.ids.has(id)) { this.selectedIds.delete(id); selectionChanged = true; }
+    }
+    if (this.selectedId !== null && model.ids.has(this.selectedId)) {
+      this.selectedId = null;
+      this.selectedModelIndex = undefined;
+    }
+    if (selectionChanged) { this.emitSelection(); }
+    // Visibilidade guardada por id do modelo que saiu vira lixo que voltaria a
+    // valer se a faixa fosse reusada.
+    for (const id of model.ids) { this.hiddenIds.delete(id); }
+    if (this.isolatedIds) {
+      for (const id of model.ids) { this.isolatedIds.delete(id); }
+      if (this.isolatedIds.size === 0) { this.isolatedIds = null; }
+    }
+
+    this.models.delete(modelId);
+    // O frame de coordenadas é do 1º modelo carregado; se ele saiu e a cena
+    // esvaziou, o próximo a entrar refaz o rtc.
+    if (this.models.size === 0) { this.federationRtc = undefined; }
+    this.renderer.requestRender();
+  }
+
+  hasModel(modelId: string): boolean {
+    return this.models.has(modelId);
   }
 
   // Modo server: geometria já tesselada vem do CDN. Streaming por row group é o
@@ -677,9 +939,29 @@ export class ViewerEngine {
       this.events.onProgress('download', 1, 1);
 
       await this.renderParquet(blob);
+      // Tier 2 do contrato de artefatos: quando o backend publicar o data model
+      // no CDN, a árvore e as propriedades saem do mesmo pacote da geometria.
+      if (artifacts.urls?.datamodel) { void this.loadDataModelFrom(artifacts.urls.datamodel); }
     } catch (err: any) {
       if (this.disposed || err?.name === 'AbortError') { return; }
       this.events.onError('decode-failed', String(err?.message ?? err));
+    }
+  }
+
+  /** Data model por URL direta (CDN). Falhar aqui não derruba o viewer. */
+  private async loadDataModelFrom(url: string): Promise<void> {
+    try {
+      const res = await fetch(url, { signal: this.aborter.signal });
+      if (!res.ok) { throw new Error(`data model → ${res.status}`); }
+      const buffer = await res.arrayBuffer();
+      if (this.disposed) { return; }
+      this.dataStore = await ModelDataStore.decode(buffer);
+      if (this.disposed) { return; }
+      this.events.onDataModel({ available: true });
+    } catch (err: any) {
+      if (this.disposed || err?.name === 'AbortError') { return; }
+      console.warn('[coordly-embed] data model do CDN indisponível:', err?.message ?? err);
+      this.events.onDataModel({ available: false });
     }
   }
 
@@ -690,9 +972,15 @@ export class ViewerEngine {
   // fixa o rtc; os demais reusam (sharedRtcOffset) pra ficarem alinhados no mesmo frame.
   async addModelFromIfc(fileUrl: string, modelId: string): Promise<void> {
     if (this.disposed || this.models.has(modelId)) { return; }
-    const modelIndex = this.models.size;
-    this.models.set(modelId, modelIndex);
-    const isFirst = modelIndex === 0;
+    const slot = this.nextModelSlot++;
+    const modelIndex = slot;
+    const model: FederatedModel = {
+      index: slot,
+      idOffset: slot * MODEL_ID_STEP,
+      ids: new Set<number>(),
+    };
+    this.models.set(modelId, model);
+    const isFirst = slot === 0;
     // `?parallel=0` força o caminho single mesmo com isolamento — é o que permite
     // comparar single × paralelo no MESMO app/arquivo/máquina, sem depender de
     // COOP/COEP para trocar de caminho.
@@ -733,7 +1021,14 @@ export class ViewerEngine {
 
         const meshes = visibleOnly(ev.meshes);
         if (meshes.length > 0) {
-          this.renderer.addMeshes(meshes.map((m) => ({ ...m, modelIndex })), true);
+          // Mesmo offset de id do caminho server: é o que permite `removeModel`
+          // tirar só este modelo da cena.
+          const stamped = meshes.map((m) => {
+            const expressId = m.expressId + model.idOffset;
+            model.ids.add(expressId);
+            return { ...m, expressId, modelIndex };
+          });
+          this.renderer.addMeshes(stamped, true);
           meshCount += meshes.length;
         }
         this.renderer.requestRender();
@@ -756,9 +1051,16 @@ export class ViewerEngine {
   clearModels(): void {
     this.renderer?.getScene().clear();
     this.models.clear();
+    this.nextModelSlot = 0;
     this.federationRtc = undefined;
     this.selectedId = null;
     this.selectedModelIndex = undefined;
+    // Visibilidade e corte são estado da CENA: sobreviver a um reset deixaria
+    // elementos ocultos por ids que nem existem mais.
+    this.hiddenIds.clear();
+    this.isolatedIds = null;
+    this.section = null;
+    this.dataStore = null;
     this.renderer?.requestRender();
   }
 
@@ -767,26 +1069,242 @@ export class ViewerEngine {
     this.renderer?.requestRender();
   }
 
+  // ---------------------------------------------------------------------------
+  // Árvore espacial e propriedades (data model)
+  // ---------------------------------------------------------------------------
+
+  hasDataModel(): boolean {
+    return this.dataStore !== null;
+  }
+
+  getSpatialTree(): BimTreeNode[] {
+    return this.dataStore?.getSpatialTree() ?? [];
+  }
+
+  getEntityProperties(expressId: number): BimEntityProperties | null {
+    return this.dataStore?.getEntityProperties(expressId) ?? null;
+  }
+
+  getEntityLabels(expressIds: number[]): { expressId: number; name: string }[] {
+    return this.dataStore?.getEntityLabels(expressIds) ?? [];
+  }
+
+  // ---------------------------------------------------------------------------
+  // Seleção, visibilidade e corte — estado do app aplicado por frame no render()
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Seleção vinda de fora do canvas (clique na árvore). `null` limpa.
+   * `frame` enquadra o elemento — a árvore de um prédio inteiro seleciona coisas
+   * fora da tela, e destacar sem enquadrar não mostra nada ao usuário.
+   */
+  selectEntity(
+    expressId: number | null,
+    opts: { frame?: boolean; additive?: boolean } = {},
+  ): void {
+    if (this.disposed || !this.renderer) { return; }
+
+    if (expressId === null) { this.clearSelection(); return; }
+
+    // Vem do app (árvore) com id do arquivo; o highlight compara id da cena.
+    const sceneId = this.models.size === 0
+      ? expressId
+      : this.sceneIds([expressId])[0] ?? expressId;
+
+    if (opts.additive || this.multiSelect) {
+      if (this.selectedIds.has(sceneId)) { this.selectedIds.delete(sceneId); }
+      else { this.selectedIds.add(sceneId); }
+    } else {
+      this.selectedIds.clear();
+      this.selectedIds.add(sceneId);
+    }
+    this.selectedId = this.selectedIds.has(sceneId) ? sceneId : null;
+    // Seleção externa não sabe de modelIndex; deixar undefined faz o highlight
+    // do caminho flat não filtrar por modelo (o mesmo motivo do pick).
+    this.selectedModelIndex = undefined;
+
+    if (opts.frame) { this.frameEntities([expressId]); }
+    this.renderer.requestRender();
+    this.emitSelection();
+  }
+
+  clearSelection(): void {
+    this.selectedIds.clear();
+    this.selectedId = null;
+    this.selectedModelIndex = undefined;
+    // O X-Ray existe pra destacar a seleção; sem seleção, ele só escureceria o
+    // modelo inteiro sem motivo.
+    this.ghost = false;
+    this.renderer?.requestRender();
+    this.emitSelection();
+  }
+
+  /** Modo "adicionar à seleção" (botão da toolbar). */
+  setMultiSelect(enabled: boolean): void {
+    this.multiSelect = enabled;
+  }
+
+  /** X-Ray: o que não está selecionado fica translúcido. */
+  setGhostMode(enabled: boolean): void {
+    this.ghost = enabled && this.selectedIds.size > 0;
+    this.renderer?.requestRender();
+  }
+
+  isGhostMode(): boolean {
+    return this.ghost;
+  }
+
+  /**
+   * Foco (duplo clique): enquadra a seleção e liga o X-Ray. Enquadrar sozinho
+   * costuma não bastar — a câmera chega numa posição em que paredes e lajes
+   * ficam na frente do elemento.
+   */
+  focusSelection(): void {
+    if (this.selectedIds.size === 0) { return; }
+    this.frameEntities(Array.from(this.selectedIds));
+    this.ghost = true;
+    this.renderer?.requestRender();
+  }
+
+  private emitSelection(): void {
+    const ids = Array.from(this.selectedIds, localExpressId);
+    this.events.onSelect({
+      expressId: this.selectedId === null ? null : localExpressId(this.selectedId),
+      modelIndex: this.selectedModelIndex ?? 0,
+      expressIds: ids,
+    });
+  }
+
+  /** Enquadra a união dos bounding boxes das entidades (zoom-to-selection). */
+  frameEntities(localIds: number[]): void {
+    if (this.disposed || !this.renderer || localIds.length === 0) { return; }
+    const scene = this.renderer.getScene();
+    // Aceita id do arquivo OU da cena: `frameEntities` é chamada tanto pelo app
+    // (árvore) quanto internamente pelo foco, que já trabalha com id da cena.
+    const expressIds = this.models.size === 0 ? localIds : this.sceneIds(localIds).concat(localIds);
+
+    let min = { x: Infinity, y: Infinity, z: Infinity };
+    let max = { x: -Infinity, y: -Infinity, z: -Infinity };
+    let found = false;
+    for (const id of expressIds) {
+      const box = scene.getEntityBoundingBox(id);
+      if (!box) { continue; }
+      found = true;
+      min = { x: Math.min(min.x, box.min.x), y: Math.min(min.y, box.min.y), z: Math.min(min.z, box.min.z) };
+      max = { x: Math.max(max.x, box.max.x), y: Math.max(max.y, box.max.y), z: Math.max(max.z, box.max.z) };
+    }
+    // Sem geometria carregada pra esses ids (elemento sem representação, ou
+    // ainda não decodificado): melhor não mover a câmera do que mandá-la pro
+    // infinito.
+    if (!found) { return; }
+
+    void this.camera.frameBounds(min, max);
+    this.renderer.requestRender();
+  }
+
+  /**
+   * Traduz ids do ARQUIVO (o que o app conhece) para ids DA CENA (com o offset
+   * federado). Single-model não tem offset, então é identidade; no federado um
+   * mesmo id pode existir em várias disciplinas e todas entram.
+   */
+  private sceneIds(localIds: number[]): number[] {
+    if (this.models.size === 0) { return localIds; }
+    const out: number[] = [];
+    for (const local of localIds) {
+      for (const model of this.models.values()) {
+        const sceneId = local + model.idOffset;
+        if (model.ids.has(sceneId)) { out.push(sceneId); }
+      }
+    }
+    return out;
+  }
+
+  /** `null`/vazio desliga o isolamento. */
+  isolate(expressIds: number[] | null): void {
+    const ids = expressIds && expressIds.length > 0 ? this.sceneIds(expressIds) : [];
+    this.isolatedIds = ids.length > 0 ? new Set(ids) : null;
+    this.renderer?.requestRender();
+  }
+
+  hide(localIds: number[]): void {
+    const expressIds = this.sceneIds(localIds);
+    for (const id of expressIds) { this.hiddenIds.add(id); }
+    // Diagnóstico: "sumiu mais do que eu selecionei" quase sempre é o conjunto
+    // pedido ser maior do que o usuário imagina (nó de árvore, multi-seleção) —
+    // ou um expressId que responde por várias malhas do mesmo elemento IFC.
+    console.log(
+      `[coordly-embed] ocultar: ${expressIds.length} id(s) · total oculto ${this.hiddenIds.size}`,
+      expressIds.slice(0, 20).map(localExpressId),
+    );
+    this.renderer?.requestRender();
+  }
+
+  show(localIds: number[]): void {
+    for (const id of this.sceneIds(localIds)) { this.hiddenIds.delete(id); }
+    this.renderer?.requestRender();
+  }
+
+  showAll(): void {
+    this.hiddenIds.clear();
+    this.isolatedIds = null;
+    this.renderer?.requestRender();
+  }
+
+  /** `null` desliga o corte. Reflete no frame seguinte, sem recarregar nada. */
+  setSectionPlane(section: SectionPlane | null): void {
+    this.section = section && section.enabled ? section : null;
+    this.renderer?.requestRender();
+  }
+
   // Raycast no clique. pick() espera coordenada CSS relativa ao canvas; o evento
   // dá clientX/Y (viewport), daí o offset pelo boundingRect. Reuso puro do motor:
   // o Renderer já faz o picking (CPU raycast + GPU id) e o highlight sai do render()
   // via selectedId. Clique no vazio (pick null) limpa a seleção.
-  private async handlePick(clientX: number, clientY: number): Promise<void> {
+  private async handlePick(
+    clientX: number,
+    clientY: number,
+    opts: { additive?: boolean; focus?: boolean } = {},
+  ): Promise<void> {
     if (this.disposed || !this.renderer) { return; }
     const rect = this.canvas.getBoundingClientRect();
     try {
-      const hit = await this.renderer.pick(clientX - rect.left, clientY - rect.top);
+      // Passa a visibilidade: o que está oculto/fora do isolamento não pode ser
+      // selecionado por trás do que está na tela.
+      const hit = await this.renderer.pick(clientX - rect.left, clientY - rect.top, {
+        hiddenIds: this.hiddenIds,
+        isolatedIds: this.isolatedIds,
+      });
       if (this.disposed) { return; }
-      this.selectedId = hit?.expressId ?? null;
-      this.selectedModelIndex = hit?.modelIndex;
+
+      if (!hit) {
+        // Clique no vazio limpa — a não ser que esteja somando à seleção, onde
+        // errar o alvo não pode custar o que já foi selecionado.
+        if (!(opts.additive || this.multiSelect)) { this.clearSelection(); }
+        return;
+      }
+
+      const additive = opts.additive || this.multiSelect;
+      if (additive) {
+        if (this.selectedIds.has(hit.expressId)) { this.selectedIds.delete(hit.expressId); }
+        else { this.selectedIds.add(hit.expressId); }
+      } else {
+        this.selectedIds.clear();
+        this.selectedIds.add(hit.expressId);
+      }
+      // `selectedId` fica com o id DA CENA (deslocado) porque é ele que o
+      // renderer compara no highlight; quem sai pra fora é o id do arquivo.
+      this.selectedId = this.selectedIds.has(hit.expressId) ? hit.expressId : null;
+      this.selectedModelIndex = hit.modelIndex;
+      if (opts.focus) { this.focusSelection(); }
       this.renderer.requestRender();
-      this.events.onSelect({ expressId: this.selectedId, modelIndex: hit?.modelIndex ?? 0 });
+      this.emitSelection();
     } catch { /* pick pode falhar em frame de transição; ignora */ }
   }
 
   dispose(): void {
     this.disposed = true;
     this.aborter.abort();
+    window.removeEventListener('keydown', this.onKeyDown);
     this.restoreConsole?.();
     delete (globalThis as any).__ifc_lite_render_stats__;
     try { this.renderer?.dispose?.(); } catch { /* já pode estar solto */ }
@@ -839,7 +1357,13 @@ export class ViewerEngine {
         contributionCull: flag('cull') ? CONTRIB_CULL : undefined,
         lod: flag('lod') ? LOD : undefined,
         selectedId: this.selectedId,
-        selectedModelIndex: this.selectedModelIndex
+        selectedIds: this.selectedIds,
+        selectedModelIndex: this.selectedModelIndex,
+        hiddenIds: this.hiddenIds,
+        isolatedIds: this.isolatedIds,
+        sectionPlane: this.section ?? undefined,
+        // X-Ray: só o selecionado fica opaco; o resto vira contexto translúcido.
+        ghostExceptIds: this.ghost && this.selectedIds.size > 0 ? this.selectedIds : null
       });
       requestAnimationFrame(frame);
     };
@@ -857,8 +1381,20 @@ export class ViewerEngine {
     c.addEventListener('pointerup', (e) => {
       dragging = false;
       // Clique esquerdo sem arrastar = seleção; orbit/pan não seleciona.
-      if (button === 0 && moved < CLICK_DRAG_PX) { void this.handlePick(e.clientX, e.clientY); }
+      // Ctrl/Cmd/Shift somam à seleção sem precisar do modo da toolbar.
+      if (button === 0 && moved < CLICK_DRAG_PX) {
+        void this.handlePick(e.clientX, e.clientY, {
+          additive: e.ctrlKey || e.metaKey || e.shiftKey,
+        });
+      }
     });
+    // Duplo clique = focar: seleciona, enquadra e liga o X-Ray.
+    c.addEventListener('dblclick', (e) => {
+      void this.handlePick(e.clientX, e.clientY, { focus: true });
+    });
+    // Esc limpa a seleção (e o X-Ray junto). No window, não no canvas: depois de
+    // clicar num drawer o foco sai do canvas e a tecla não chegaria nele.
+    window.addEventListener('keydown', this.onKeyDown);
     c.addEventListener('pointermove', (e) => {
       if (!dragging) { return; }
       const dx = e.clientX - lastX, dy = e.clientY - lastY;
