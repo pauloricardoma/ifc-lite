@@ -23,6 +23,7 @@ export class VisibilityEpochTracker {
   // compare against what we saw LAST frame, not against itself.
   private hiddenSnapshot: ReadonlySet<number> | null = null;
   private isolatedSnapshot: ReadonlySet<number> | null = null;
+  private ghostSnapshot: ReadonlySet<number> | null = null;
 
   /**
    * Feed the sets passed to render(); returns the current version, bumped when
@@ -35,15 +36,21 @@ export class VisibilityEpochTracker {
   update(
     hiddenIds: ReadonlySet<number> | null | undefined,
     isolatedIds: ReadonlySet<number> | null | undefined,
+    ghostIds?: ReadonlySet<number> | null,
   ): number {
     const hidden = hiddenIds && hiddenIds.size > 0 ? hiddenIds : null;
     const isolated = isolatedIds ?? null;
+    // Ghosted ids split their batch (see RenderOptions.ghostIds), so the
+    // per-batch visibility cache depends on them exactly like hide/isolate.
+    const ghost = ghostIds && ghostIds.size > 0 ? ghostIds : null;
     const hiddenChanged = !contentEquals(hidden, this.hiddenSnapshot);
     const isolatedChanged = !contentEquals(isolated, this.isolatedSnapshot);
-    if (hiddenChanged || isolatedChanged) {
+    const ghostChanged = !contentEquals(ghost, this.ghostSnapshot);
+    if (hiddenChanged || isolatedChanged || ghostChanged) {
       this.version++;
       if (hiddenChanged) this.hiddenSnapshot = hidden ? new Set(hidden) : null;
       if (isolatedChanged) this.isolatedSnapshot = isolated ? new Set(isolated) : null;
+      if (ghostChanged) this.ghostSnapshot = ghost ? new Set(ghost) : null;
     }
     return this.version;
   }

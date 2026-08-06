@@ -74,6 +74,17 @@ describe('VisibilityEpochTracker', () => {
     assert.strictEqual(t.update(new Set([1, 2]), undefined), v2);
   });
 
+  it('tracks the ghost set: it splits batches, so the cache depends on it', () => {
+    const t = new VisibilityEpochTracker();
+    const v0 = t.update(undefined, undefined, null);
+    const v1 = t.update(undefined, undefined, new Set([1]));
+    assert.ok(v1 > v0, 'ghosting an id is a change');
+    assert.strictEqual(t.update(undefined, undefined, new Set([1])), v1, 'same content, no bump');
+    const v2 = t.update(undefined, undefined, new Set([1, 2]));
+    assert.ok(v2 > v1);
+    assert.ok(t.update(undefined, undefined, new Set()) > v2, 'un-ghosting everything is a change');
+  });
+
   it('hide -> show-all -> hide same set -> different set bumps each transition', () => {
     const t = new VisibilityEpochTracker();
     const a = new Set([1, 2]);

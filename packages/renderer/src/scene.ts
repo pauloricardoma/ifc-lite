@@ -159,6 +159,8 @@ export class Scene {
   private instancedHidden: Set<number> = new Set();               // currently hidden instanced express_ids (hide/isolate)
   private instancedOverridden: Set<number> = new Set();            // currently colour-overridden instanced express_ids
   private instancedHasTransparent = false;                         // an override made some instanced occurrence translucent
+  private instancedGhosted: Set<number> = new Set();                // currently ghosted instanced express_ids (RenderOptions.ghostIds)
+  private instancedGhostAlpha = 0;                                  // alpha last written for the ghosted set
   // Content-based change guard for setInstancedVisibility — same contract as
   // RenderOptions.hiddenIds (in-place mutation and fresh identical Sets both
   // behave), keeping the instanced path in lockstep with the batched path.
@@ -2547,6 +2549,7 @@ export class Scene {
       indexCount: merged.indices.length,
       color,
       expressIds,
+      sourceMeshData: meshDataArray,
       bindGroup,
       uniformBuffer,
       bounds: merged.bounds,
@@ -2659,7 +2662,8 @@ export class Scene {
     visibleIds: Set<number>,
     device: GPUDevice,
     pipeline: RenderPipeline,
-    visibilityEpoch?: number
+    visibilityEpoch?: number,
+    sourceMeshData?: MeshData[]
   ): BatchedMesh | undefined {
     // Cannot create partial batches after geometry data has been released
     if (this.geometryReleased) return undefined;
@@ -2693,7 +2697,13 @@ export class Scene {
       hash = hash >>> 0; // Convert to unsigned 32-bit
     }
     const idsHash = `${sortedIds.length}:${hash.toString(16)}`;
-    const cacheKey = `${colorKey}:${idsHash}`;
+    // Rebuilding from the parent's own meshes: key by the PARENT, not by colour.
+    // Two streaming fragments can share a colour key and carry the same ids
+    // (a split mesh, or the same element across appends) — a colour-keyed entry
+    // would let one fragment's clone overwrite (and leak) the other's.
+    const cacheKey = sourceMeshData
+      ? `${sourceBatchKey}:${idsHash}`
+      : `${colorKey}:${idsHash}`;
 
     // Check if we already have this exact partial batch cached
     const currentCacheKey = this.partialBatchCacheKeys.get(sourceBatchKey);
@@ -2723,16 +2733,26 @@ export class Scene {
     // matched through bucketBaseKey so the comparison stays correct with
     // spatial chunking on (base key = "cell~colour" then, and a piece only
     // belongs to this batch when BOTH its cell and colour match).
-    const baseKey = this.baseColorKey(colorKey);
     const visibleMeshData: MeshData[] = [];
-    for (const expressId of visibleIds) {
-      const pieces = this.meshDataMap.get(expressId);
-      if (pieces) {
-        // Add all pieces for this element
-        for (const piece of pieces) {
-          // Only include pieces that match this batch's cell + color
-          if (this.bucketBaseKey(piece) === baseKey) {
-            visibleMeshData.push(piece);
+    if (sourceMeshData) {
+      // The parent knows exactly which meshes it merged — filter those. Works
+      // for bucket batches AND streaming fragments (whose colorKey can't be
+      // matched against piece keys), and never pulls in a sibling fragment's
+      // geometry, which would draw the same element twice.
+      for (const piece of sourceMeshData) {
+        if (visibleIds.has(piece.expressId)) visibleMeshData.push(piece);
+      }
+    } else {
+      const baseKey = this.baseColorKey(colorKey);
+      for (const expressId of visibleIds) {
+        const pieces = this.meshDataMap.get(expressId);
+        if (pieces) {
+          // Add all pieces for this element
+          for (const piece of pieces) {
+            // Only include pieces that match this batch's cell + color
+            if (this.bucketBaseKey(piece) === baseKey) {
+              visibleMeshData.push(piece);
+            }
           }
         }
       }
@@ -3361,10 +3381,61 @@ export class Scene {
     this.instancedHasTransparent = hasTransparent;
   }
 
-  /** True when an active colour override made some instanced occurrence translucent,
-   *  so the renderer should run the transparent instanced sub-pass. */
+  /**
+   * "Hide as ghost" for instanced occurrences (RenderOptions.ghostIds). The
+   * batched path splits a batch so ghosted ids route through the transparent
+   * pipeline; an occurrence has no batch to split, but it DOES carry a
+   * per-instance colour — so it ghosts by keeping its own colour at
+   * `alpha`, which the transparent instanced sub-pass then blends.
+   *
+   * Diffed against the previous set: only flips touch the GPU buffer, so
+   * calling it every frame is cheap. Occurrences under a colour override
+   * (lens/IDS/compare) are left to the override — the two don't compose.
+   */
+  setInstancedGhost(ghostIds: ReadonlySet<number> | null | undefined, alpha: number): number {
+    const device = this.instancedDevice;
+    if (!device || this.instancedTemplates.length === 0) return 0;
+    const next = new Set<number>();
+    if (ghostIds) {
+      for (const eid of ghostIds) {
+        if (this.instancedEntityMap.has(eid) && !this.instancedOverridden.has(eid)) next.add(eid);
+      }
+    }
+    if (next.size === this.instancedGhosted.size) {
+      let same = true;
+      for (const eid of next) {
+        if (!this.instancedGhosted.has(eid)) { same = false; break; }
+      }
+      if (same && alpha === this.instancedGhostAlpha) return next.size;
+    }
+    for (const eid of this.instancedGhosted) {
+      if (!next.has(eid)) this.restoreInstanceColor(device, eid);
+    }
+    for (const eid of next) {
+      this.writeInstanceAlpha(device, eid, alpha);
+    }
+    this.instancedGhosted = next;
+    this.instancedGhostAlpha = alpha;
+    return next.size;
+  }
+
+  /** Rewrite an occurrence's colour keeping its own RGB, only dropping alpha. */
+  private writeInstanceAlpha(device: GPUDevice, eid: number, alpha: number): void {
+    const locs = this.instancedEntityMap.get(eid);
+    if (!locs) return;
+    for (const loc of locs) {
+      const buf = this.instancedTemplates[loc.templateIndex]?.instanceBuffer;
+      if (!buf) continue;
+      const rgb = loc.originalColor;
+      const data = new Float32Array([rgb[0], rgb[1], rgb[2], alpha]);
+      device.queue.writeBuffer(buf, loc.byteOffset + INSTANCE_COLOR_OFFSET, data);
+    }
+  }
+
+  /** True when an active colour override or ghost made some instanced occurrence
+   *  translucent, so the renderer should run the transparent instanced sub-pass. */
   hasTransparentInstances(): boolean {
-    return this.instancedHasTransparent;
+    return this.instancedHasTransparent || this.instancedGhosted.size > 0;
   }
 
   /** Write the combined flag lane (selected | hidden) for every occurrence of `eid`.
@@ -3600,6 +3671,7 @@ export class Scene {
     this.instancedSelected.clear();
     this.instancedHidden.clear();
     this.instancedOverridden.clear();
+    this.instancedGhosted.clear();
     this.instancedHasTransparent = false;
     // Force the next setInstancedVisibility to recompute against fresh state.
     this.lastInstancedVisibilityVersion = -1;

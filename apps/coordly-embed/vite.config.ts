@@ -14,6 +14,11 @@ const BASE = '/coordly3DViewer/v1.0.0/';
 
 export default defineConfig({
   base: BASE,
+  // Carimbo do build: o bundle é copiado à mão pro web/, então "o que está na tela
+  // é a versão nova?" é a primeira pergunta de todo bug daqui.
+  define: {
+    __ENGINE_BUILD__: JSON.stringify(new Date().toISOString().slice(0, 16).replace('T', ' ')),
+  },
   plugins: [wasm(), topLevelAwait()],
   worker: { format: 'es', plugins: () => [wasm(), topLevelAwait()] },
   resolve: {

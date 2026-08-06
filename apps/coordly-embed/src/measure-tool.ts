@@ -4,6 +4,7 @@ import {
   Vec3,
   buildMeasurement,
   closesByProximity,
+  crossesOnScreen,
   distance3,
   formatArea,
   formatLength,
@@ -99,7 +100,7 @@ export class MeasureTool {
 
     // O segmento novo cruzaria o que já foi traçado: fecha o polígono com o
     // primeiro ponto em vez de aceitar o laço, que tornaria a área sem sentido.
-    if (wouldSelfIntersect(this.points, point)) {
+    if (this.wouldCross(point, { x, y })) {
       this.commit();
       this.sync();
       return true;
@@ -171,6 +172,21 @@ export class MeasureTool {
     return this.points.length > 0 ? this.deps.project(this.points[0]) : null;
   }
 
+  /**
+   * O segmento até `point` fecharia o polígono por cruzamento? Vale o traçado no
+   * plano E o traçado na tela: o primeiro é o correto em geometria, o segundo é
+   * o que o usuário enxerga quando os vértices não são exatamente coplanares.
+   */
+  private wouldCross(point: Vec3, cursor: P2 | null): boolean {
+    if (this.points.length < 3) { return false; }
+    if (wouldSelfIntersect(this.points, point)) { return true; }
+    const tip = this.deps.project(point) ?? cursor;
+    if (!tip) { return false; }
+    const drawn = this.points.map((p) => this.deps.project(p));
+    if (drawn.some((p) => !p)) { return false; } // algum vértice atrás da câmera
+    return crossesOnScreen(drawn as P2[], tip);
+  }
+
   /** Redesenha o overlay. Chamado a cada frame: a câmera muda, a tela muda. */
   sync(): void {
     if (this.measurements.length === 0 && this.points.length === 0) {
@@ -221,9 +237,11 @@ export class MeasureTool {
       const preview = this.previewLabel();
       if (preview) { nodes.push(this.label(midpoint(pts[pts.length - 1], tip), preview)); }
     }
-    // Primeiro vértice destacado quando o cursor entra no raio de fechamento —
-    // sem isto a regra de proximidade seria invisível até acontecer.
-    const closing = closesByProximity(this.points.length, this.cursor, pts[0]);
+    // Primeiro vértice destacado quando o próximo clique fecharia — por
+    // proximidade ou por cruzamento. Sem isto as duas regras seriam invisíveis
+    // até acontecerem, e o polígono fecharia "sozinho" aos olhos do usuário.
+    const closing = closesByProximity(this.points.length, this.cursor, pts[0])
+      || (!!this.cursorWorld && this.wouldCross(this.cursorWorld, this.cursor));
     pts.forEach((p, i) => nodes.push(this.dot(p, ACTIVE_COLOR, i === 0 && closing)));
     return nodes;
   }

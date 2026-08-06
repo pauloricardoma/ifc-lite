@@ -448,3 +448,72 @@ describe('hydrated selection meshes across renders', () => {
         assert.strictEqual(scene.getMeshes().filter((m) => m.hydrated).length, 0);
     });
 });
+
+describe('ghostIds: ocultar como fantasma', () => {
+    it('desenha o subconjunto fantasma em vez de descartá-lo', () => {
+        const h = makeHarness();
+        const { grey, red } = seedBatches(h);
+        const scene = h.renderer.getScene();
+
+        // grey = {1, 2}: id 1 vira fantasma. O batch pai não pode desenhar (o
+        // fantasma tem alpha próprio), e DOIS sub-batches nascem: o visível {2}
+        // e o fantasma {1}.
+        h.render({ ghostIds: new Set([1]) });
+        assert.ok(!h.stats.draws.includes(grey.vertexBuffer),
+            'batch com fantasma não pode desenhar dos próprios buffers');
+        assert.ok(h.stats.draws.includes(red.vertexBuffer), 'o batch vizinho segue intacto');
+        assert.strictEqual(scene['partialBatchCache'].size, 2,
+            'um sub-batch visível e um sub-batch fantasma');
+        const clones = [...scene['partialBatchCache'].values()] as BatchedMesh[];
+        for (const clone of clones) {
+            assert.ok(h.stats.draws.includes(clone.vertexBuffer),
+                'todo sub-batch (inclusive o fantasma) precisa desenhar');
+        }
+    });
+
+    it('batch inteiro fantasma continua desenhando (não some como hiddenIds)', () => {
+        const h = makeHarness();
+        const { grey, red } = seedBatches(h);
+        const scene = h.renderer.getScene();
+
+        h.render({ ghostIds: new Set([1, 2]) });
+        const clones = [...scene['partialBatchCache'].values()] as BatchedMesh[];
+        assert.strictEqual(clones.length, 1, 'só o sub-batch fantasma');
+        assert.ok(h.stats.draws.includes(clones[0].vertexBuffer),
+            'batch 100% fantasma desenha translúcido — some só com hiddenIds');
+        assert.ok(!h.stats.draws.includes(grey.vertexBuffer));
+        assert.ok(h.stats.draws.includes(red.vertexBuffer));
+    });
+});
+
+// O caminho REAL do coordly-embed: geometria entra por streaming (fragmentos) e
+// com chunking espacial ligado — nunca há finalizeStreaming(). O fragmento não
+// nasce de um bucket, então sua colorKey é a cor pura, sem o prefixo da célula:
+// filtrar o meshDataMap por essa chave não casa com peça nenhuma e o sub-batch
+// vinha vazio (geometria sumindo em vez de ficar translúcida).
+function seedStreamingBatches(h: Harness): BatchedMesh[] {
+    const scene = h.renderer.getScene();
+    const device = h.renderer['device'].getDevice();
+    const pipeline = h.renderer['pipeline'] as never;
+    scene.setSpatialChunking({ cellSize: 50 });
+    scene.appendToBatches([triangle(1, GREY), triangle(2, GREY)], device, pipeline, true);
+    const batches = scene.getBatchedMeshes();
+    for (const b of batches) b.bounds = undefined;
+    return batches;
+}
+
+describe('ghostIds em geometria de streaming (o caminho do coordly-embed)', () => {
+    it('desenha o fantasma de um fragmento de streaming', () => {
+        const h = makeHarness();
+        const batches = seedStreamingBatches(h);
+        assert.ok(batches.length > 0, 'fixture precisa de pelo menos um fragmento');
+
+        h.render({ ghostIds: new Set([1, 2]) });
+        const scene = h.renderer.getScene();
+        const clones = [...scene['partialBatchCache'].values()] as BatchedMesh[];
+        assert.ok(clones.length > 0, 'o sub-batch fantasma precisa nascer com geometria');
+        for (const clone of clones) {
+            assert.ok(h.stats.draws.includes(clone.vertexBuffer), 'o sub-batch fantasma precisa desenhar');
+        }
+    });
+});

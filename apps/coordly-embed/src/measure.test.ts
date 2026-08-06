@@ -2,6 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   closesByProximity,
+  crossesOnScreen,
   distance3,
   polygonArea,
   polygonPerimeter,
@@ -127,6 +128,39 @@ describe('wouldSelfIntersect', () => {
   // significado, entao o clique fecha o poligono em vez de aceitar o cruzamento.
   it('quarto ponto que cria um laco cruza', () => {
     assert.equal(wouldSelfIntersect(square, { x: 1, y: -1, z: 0 }), true);
+  });
+});
+
+describe('crossesOnScreen', () => {
+  // Em px de tela: o traçado que o usuario ve, nao o plano do poligono.
+  const drawn = [
+    { x: 0, y: 0 },
+    { x: 100, y: 0 },
+    { x: 100, y: 100 },
+  ];
+
+  it('nao testa nada com menos de tres pontos', () => {
+    assert.equal(crossesOnScreen([{ x: 0, y: 0 }, { x: 100, y: 0 }], { x: 50, y: 50 }), false);
+  });
+
+  it('quarto ponto que fecha o quadrado nao cruza', () => {
+    assert.equal(crossesOnScreen(drawn, { x: 0, y: 100 }), false);
+  });
+
+  it('quarto ponto em laco cruza a primeira aresta', () => {
+    assert.equal(crossesOnScreen(drawn, { x: 50, y: -50 }), true);
+  });
+
+  // O caso que o teste no plano deixa passar: vertices em superficies
+  // diferentes (piso e viga) tiram a coplanaridade e o laco so aparece na tela.
+  it('pega o laco mesmo quando os vertices nao sao coplanares', () => {
+    const points = [
+      { x: 0, y: 0, z: 0 },
+      { x: 2, y: 0.9, z: 0 },
+      { x: 2, y: 0, z: 2 },
+    ];
+    const flat = points.map((p) => ({ x: p.x * 100, y: p.z * 100 }));
+    assert.equal(crossesOnScreen(flat, { x: 100, y: -100 }), true);
   });
 });
 

@@ -292,7 +292,7 @@ export class Renderer {
     private _batchVisibilityEpoch: number = -1;
     private _batchVisibilityCache = new WeakMap<
         BatchedMesh,
-        { visible: boolean; fullyVisible: boolean; visibleIds?: Set<number> }
+        { visible: boolean; fullyVisible: boolean; visibleIds?: Set<number>; ghostedIds?: Set<number> }
     >();
     // Selection snapshot from the previous frame — a change triggers disposal of
     // now-unselected hydrated meshes (leak + double-draw fix). The model index
@@ -1371,7 +1371,10 @@ export class Renderer {
         // Check if visibility filtering is active
         const hasHiddenFilter = options.hiddenIds && options.hiddenIds.size > 0;
         const hasIsolatedFilter = options.isolatedIds !== null && options.isolatedIds !== undefined;
-        const hasVisibilityFiltering = hasHiddenFilter || hasIsolatedFilter;
+        // Ghosted ids stay in the draw list (translucent) but force their batch
+        // through the partial path, so they count as visibility filtering.
+        const ghostIds = options.ghostIds && options.ghostIds.size > 0 ? options.ghostIds : null;
+        const hasVisibilityFiltering = hasHiddenFilter || hasIsolatedFilter || ghostIds !== null;
 
         // ─── Visibility / override epoch bookkeeping ────────────────────────
         // The tracker compares hide/isolate CONTENT against a snapshot, so both
@@ -1380,7 +1383,7 @@ export class Renderer {
         // `_visibilityVersion` invalidates the per-batch visibility cache; the
         // partial sub-batch cache additionally depends on colour-override
         // promotion, so its epoch bumps on either.
-        const newVisibilityVersion = this._visibilityEpochs.update(options.hiddenIds, options.isolatedIds);
+        const newVisibilityVersion = this._visibilityEpochs.update(options.hiddenIds, options.isolatedIds, ghostIds);
         const visibilityChanged = newVisibilityVersion !== this._visibilityVersion;
         this._visibilityVersion = newVisibilityVersion;
         const colorOverrideGen = this.scene.getColorOverrideGeneration();
@@ -1436,6 +1439,10 @@ export class Renderer {
         // it carries a per-instance hidden flag the shader discards on). Diffed → a
         // no-op when visibility is unchanged.
         this.scene.setInstancedVisibility(options.hiddenIds, options.isolatedIds);
+        // Ghost (RenderOptions.ghostIds) on the instanced path: no batch to split,
+        // so the occurrence keeps its colour at ghostAlpha and the transparent
+        // instanced sub-pass blends it. Diffed → no-op when unchanged.
+        this.scene.setInstancedGhost(ghostIds, options.ghostAlpha ?? 0.12);
 
         // Per-frame alpha overrides for X-Ray mode. See RenderOptions.transparencyOverrides.
         // Snapshot the caller's map so mid-frame mutation can't desync classification
@@ -1451,7 +1458,7 @@ export class Renderer {
         const ghostExceptIds = options.ghostExceptIds ?? null;
         const ghostAlpha = options.ghostAlpha ?? 0.12;
         const hasGhost = ghostExceptIds != null;
-        const hasTxOverrides = hasTxMap || hasGhost;
+        const hasTxOverrides = hasTxMap || hasGhost || ghostIds !== null;
         const alphaForMesh = (expressId: number, fallback: number): number => {
             if (!hasTxOverrides) return fallback;
             // Selected meshes are exempt — the highlight pass renders them last,
@@ -1461,6 +1468,7 @@ export class Renderer {
             if (hasSelected && selectedExpressIds.has(expressId)) return fallback;
             const a = txOverrides?.get(expressId);
             if (a !== undefined) return a;
+            if (ghostIds !== null && ghostIds.has(expressId)) return ghostAlpha;
             if (hasGhost && !ghostExceptIds!.has(expressId)) return ghostAlpha;
             return fallback;
         };
@@ -1487,7 +1495,10 @@ export class Renderer {
                 const a = txOverrides?.get(eid);
                 if (a !== undefined) {
                     if (a < minAlpha) minAlpha = a;
-                } else if (hasGhost && !ghostExceptIds!.has(eid)) {
+                } else if (
+                    (ghostIds !== null && ghostIds.has(eid))
+                    || (hasGhost && !ghostExceptIds!.has(eid))
+                ) {
                     if (ghostAlpha < minAlpha) minAlpha = ghostAlpha;
                 }
             }
@@ -2040,23 +2051,36 @@ export class Renderer {
                 const batchVisibilityCache = this._batchVisibilityCache;
                 const getBatchVisibility = (
                     batch: typeof allBatchedMeshes[number],
-                ): { visible: boolean; fullyVisible: boolean; visibleIds?: Set<number> } => {
+                ): {
+                    visible: boolean;
+                    fullyVisible: boolean;
+                    visibleIds?: Set<number>;
+                    ghostedIds?: Set<number>;
+                } => {
                     let vis = batchVisibilityCache.get(batch);
                     if (vis) return vis;
                     const total = batch.expressIds.length;
                     // Build the visible-id set in one pass; drop it for fully-visible
                     // batches (they draw from their own buffers, no subset needed).
+                    // Ghosted ids are pulled OUT of it into their own subset: they
+                    // still draw, but translucent and from a separate sub-batch, so
+                    // their opaque batchmates aren't dragged down to the ghost alpha.
                     const visibleIds = new Set<number>();
+                    const ghostedIds = ghostIds !== null ? new Set<number>() : undefined;
                     for (const expressId of batch.expressIds) {
                         const isHidden = options.hiddenIds?.has(expressId) ?? false;
                         const isIsolated = !hasIsolatedFilter || options.isolatedIds!.has(expressId);
-                        if (!isHidden && isIsolated) visibleIds.add(expressId);
+                        if (isHidden || !isIsolated) continue;
+                        if (ghostedIds && ghostIds!.has(expressId)) ghostedIds.add(expressId);
+                        else visibleIds.add(expressId);
                     }
+                    const ghostedCount = ghostedIds?.size ?? 0;
                     const fullyVisible = visibleIds.size === total;
                     vis = {
-                        visible: visibleIds.size > 0,
+                        visible: visibleIds.size > 0 || ghostedCount > 0,
                         fullyVisible,
                         visibleIds: fullyVisible ? undefined : visibleIds,
+                        ghostedIds: ghostedCount > 0 ? ghostedIds : undefined,
                     };
                     batchVisibilityCache.set(batch, vis);
                     return vis;
@@ -2075,6 +2099,8 @@ export class Renderer {
                     colorKey: string;
                     visibleIds: Set<number>;
                     color: [number, number, number, number];
+                    /** Geometria do batch pai — de onde o sub-batch é reconstruído. */
+                    sourceMeshData?: MeshData[];
                 }> = [];
 
                 // Push a partial sub-batch entry, splitting by promotion when needed.
@@ -2094,6 +2120,7 @@ export class Renderer {
                             colorKey: sourceBatch.colorKey,
                             visibleIds,
                             color: sourceBatch.color,
+                            sourceMeshData: sourceBatch.sourceMeshData,
                         });
                         return;
                     }
@@ -2106,6 +2133,7 @@ export class Renderer {
                             colorKey: sourceBatch.colorKey,
                             visibleIds,
                             color: sourceBatch.color,
+                            sourceMeshData: sourceBatch.sourceMeshData,
                         });
                         return;
                     }
@@ -2117,12 +2145,14 @@ export class Renderer {
                         colorKey: sourceBatch.colorKey,
                         visibleIds: split.promoted,
                         color: sourceBatch.color,
+                        sourceMeshData: sourceBatch.sourceMeshData,
                     });
                     partiallyVisibleBatches.push({
                         sourceBatchKey: `${baseKey}:remaining`,
                         colorKey: sourceBatch.colorKey,
                         visibleIds: split.remaining,
                         color: sourceBatch.color,
+                        sourceMeshData: sourceBatch.sourceMeshData,
                     });
                 };
 
@@ -2167,6 +2197,18 @@ export class Renderer {
                             const visibleIds = vis.visibleIds;
                             if (visibleIds && visibleIds.size > 0) {
                                 pushVisibleAsPartial(batch, visibleIds, nativelyTransparent);
+                            }
+                            // Ghosted subset: its own sub-batch, resolved to ghostAlpha
+                            // by alphaForBatch (every id in it is ghosted) and therefore
+                            // routed through the transparent pipeline downstream.
+                            if (vis.ghostedIds) {
+                                partiallyVisibleBatches.push({
+                                    sourceBatchKey: `${batch.colorKey}:${batch.id}:ghost`,
+                                    colorKey: batch.colorKey,
+                                    visibleIds: vis.ghostedIds,
+                                    color: batch.color,
+                                    sourceMeshData: batch.sourceMeshData,
+                                });
                             }
                             // A COLD parent has no CPU meshData, so the partial
                             // sub-batch above comes back empty — queue the
@@ -2458,7 +2500,7 @@ export class Renderer {
                 // would show open, un-capped cut holes.
                 const opaqueSubBatches: typeof allBatchedMeshes = [];
                 if (partiallyVisibleBatches.length > 0) {
-                    for (const { sourceBatchKey, colorKey, visibleIds, color } of partiallyVisibleBatches) {
+                    for (const { sourceBatchKey, colorKey, visibleIds, color, sourceMeshData } of partiallyVisibleBatches) {
                         // Get or create a cached sub-batch for this visibility state
                         const subBatch = this.scene.getOrCreatePartialBatch(
                             sourceBatchKey,
@@ -2466,7 +2508,8 @@ export class Renderer {
                             visibleIds,
                             device,
                             this.pipeline,
-                            this._partialBatchEpoch
+                            this._partialBatchEpoch,
+                            sourceMeshData
                         );
 
                         if (subBatch) {

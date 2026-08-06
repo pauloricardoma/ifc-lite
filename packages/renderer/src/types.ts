@@ -72,6 +72,14 @@ export interface BatchedMesh {
   indexCount: number;
   color: [number, number, number, number];
   expressIds: number[];  // For picking - all expressIds in this batch
+  /** The exact meshes this batch was merged from — the source a partial
+   *  sub-batch (hide/isolate/ghost) is rebuilt from. Streaming fragments are
+   *  not bucket-owned, so their `colorKey` is the bare colour and cannot be
+   *  used to re-find their pieces in `meshDataMap` (with spatial chunking the
+   *  piece key is `cell~colour`); without this the sub-batch came back empty
+   *  and the geometry vanished instead of being filtered. Held as references —
+   *  the arrays already live in `meshDataMap`/the bucket. */
+  sourceMeshData?: import('@ifc-lite/geometry').MeshData[];
   bindGroup?: GPUBindGroup;
   uniformBuffer?: GPUBuffer;
   // Bounding box for frustum culling (optional) — WORLD space.
@@ -267,7 +275,22 @@ export interface RenderOptions {
    * (the clash viewer co-selects the focused pair for exactly this reason).
    */
   ghostExceptIds?: Set<number> | null;
-  /** Alpha (0..1) for ghosted meshes under {@link ghostExceptIds}. Default 0.12. */
+  /**
+   * "Hide as ghost": these ids render at {@link ghostAlpha} instead of being
+   * dropped like {@link hiddenIds}, so hiding an element from a tree/eye toggle
+   * leaves translucent context behind instead of a hole.
+   *
+   * Unlike {@link ghostExceptIds} (which fades *everything else*, so whole
+   * batches go translucent together), this fades a SUBSET: a batch containing
+   * both ghosted and normal ids is split into two sub-batches — the ghosted ids
+   * route through the transparent pipeline, their batchmates stay opaque. Same
+   * id space as `hiddenIds` (federated global id).
+   *
+   * GPU-instanced occurrences carry a per-instance colour, so they ghost by
+   * alpha override; they are otherwise unaffected by the batch split.
+   */
+  ghostIds?: Set<number> | null;
+  /** Alpha (0..1) for ghosted meshes under {@link ghostExceptIds} / {@link ghostIds}. Default 0.12. */
   ghostAlpha?: number;
   // Building rotation in radians (from IfcSite placement) - used to orient section planes
   buildingRotation?: number;

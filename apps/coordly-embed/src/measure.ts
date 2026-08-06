@@ -141,6 +141,26 @@ export const wouldSelfIntersect = (points: Vec3[], next: Vec3): boolean => {
   return false;
 };
 
+/**
+ * O novo segmento cruza alguma aresta já traçada NA TELA?
+ *
+ * Complementa `wouldSelfIntersect`: para um polígono planar os dois testes dão o
+ * mesmo resultado (a projeção de um plano é uma homografia, que preserva
+ * cruzamento), mas os vértices vêm de raycasts em superfícies diferentes e aí o
+ * plano de Newell é uma aproximação que deixa passar laço visível. O usuário
+ * fecha pelo que vê, então o que se vê cruzado fecha.
+ */
+export const crossesOnScreen = (drawn: P2[], next: P2): boolean => {
+  if (drawn.length < 3) { return false; }
+  const last = drawn[drawn.length - 1];
+  // Até `drawn.length - 3`: a aresta que termina em `last` encosta no novo
+  // segmento por definição, e encostar não é cruzar.
+  for (let i = 0; i < drawn.length - 2; i++) {
+    if (segmentsCross(last, next, drawn[i], drawn[i + 1])) { return true; }
+  }
+  return false;
+};
+
 const formatNumber = (value: number, digits: number): string =>
   new Intl.NumberFormat(undefined, {
     minimumFractionDigits: digits,

@@ -1289,7 +1289,7 @@ export class ViewerEngine {
     // pedido ser maior do que o usuário imagina (nó de árvore, multi-seleção) —
     // ou um expressId que responde por várias malhas do mesmo elemento IFC.
     console.log(
-      `[coordly-embed] ocultar: ${expressIds.length} id(s) · total oculto ${this.hiddenIds.size}`,
+      `[coordly-embed] ocultar (fantasma): ${expressIds.length} id(s) · total oculto ${this.hiddenIds.size}`,
       expressIds.slice(0, 20).map(localExpressId),
     );
     this.renderer?.requestRender();
@@ -1345,7 +1345,9 @@ export class ViewerEngine {
     const rect = this.canvas.getBoundingClientRect();
     try {
       // Passa a visibilidade: o que está oculto/fora do isolamento não pode ser
-      // selecionado por trás do que está na tela.
+      // selecionado por trás do que está na tela. O oculto continua na cena como
+      // fantasma, mas segue fora do pick — ocultar é justamente tirá-lo da
+      // frente do que o usuário quer alcançar.
       const hit = await this.renderer.pick(clientX - rect.left, clientY - rect.top, {
         hiddenIds: this.hiddenIds,
         isolatedIds: this.isolatedIds,
@@ -1437,7 +1439,10 @@ export class ViewerEngine {
         selectedId: this.selectedId,
         selectedIds: this.selectedIds,
         selectedModelIndex: this.selectedModelIndex,
-        hiddenIds: this.hiddenIds,
+        // Ocultar pelo olho da árvore não apaga o elemento: ele fica translúcido,
+        // como o X-Ray. Sumir de vez tira a referência de onde a peça estava —
+        // e é o isolamento que serve pra ficar só com o que interessa.
+        ghostIds: this.hiddenIds,
         isolatedIds: this.isolatedIds,
         sectionPlane: this.section ?? undefined,
         // X-Ray: só o selecionado fica opaco; o resto vira contexto translúcido.

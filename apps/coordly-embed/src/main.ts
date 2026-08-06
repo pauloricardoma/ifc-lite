@@ -31,7 +31,13 @@ export interface BimInstance {
 const emit = (name: string, detail?: unknown) =>
   window.dispatchEvent(new CustomEvent(name, { detail }));
 
+// Injetado pelo vite (define). O bundle vai pro web/ por cópia manual, então
+// todo bug começa com a dúvida de estar olhando pro arquivo antigo: isto fica
+// em `window.__coordly3DViewerBuild` para responder no console, sem poluí-lo.
+declare const __ENGINE_BUILD__: string;
+
 export function initCoordly3DViewer(config: BimConfig): BimInstance {
+  (window as any).__coordly3DViewerBuild = __ENGINE_BUILD__;
   const container = config.container ?? document.getElementById('bim-container');
   if (!container) { throw new Error('bim-container ausente'); }
 
