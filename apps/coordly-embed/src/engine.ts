@@ -3,6 +3,8 @@ import type { SectionPlane } from '@ifc-lite/renderer';
 import { GeometryProcessor, decodeInstancedShard } from '@ifc-lite/geometry';
 import type { TessellationQuality } from '@ifc-lite/geometry';
 import { decodeStdParquetStreaming } from './parquet-stream.js';
+import { MeasureTool } from './measure-tool.js';
+import type { Measurement, MeasureMode, Vec3 } from './measure.js';
 import { ModelDataStore } from './data-model.js';
 import type { BimEntityProperties, BimTreeNode } from './data-model.js';
 import type { IfcArtifacts } from './types.js';
@@ -56,6 +58,8 @@ interface EngineEvents {
   // Árvore espacial e propriedades ficam disponíveis; chega depois do render
   // porque o data model é buscado sem bloquear a geometria.
   onDataModel(detail: { available: boolean }): void;
+  /** Modo + lista completa a cada mudança (criar, remover, limpar, sair). */
+  onMeasure(detail: { mode: MeasureMode; measurements: Measurement[] }): void;
 }
 
 // Clique = pointerdown→up sem passar deste deslocamento acumulado (CSS px).
@@ -240,16 +244,31 @@ export class ViewerEngine {
   private hiddenIds = new Set<number>();
   private isolatedIds: Set<number> | null = null;
   private section: SectionPlane | null = null;
+  // Criada no init(), quando já existe câmera para projetar o overlay.
+  private measure: MeasureTool | null = null;
 
   constructor(private canvas: HTMLCanvasElement, private events: EngineEvents) {}
 
   // Campo (não método) pra manter a mesma referência no add/removeEventListener.
   private onKeyDown = (e: KeyboardEvent): void => {
-    if (this.disposed || e.key !== 'Escape') { return; }
-    // Não roubar o Esc de quem está digitando num campo do app.
+    if (this.disposed) { return; }
+    if (e.key !== 'Escape' && e.key !== 'Enter') { return; }
+    // Não roubar a tecla de quem está digitando num campo do app.
     const target = e.target as HTMLElement | null;
     const tag = target?.tagName;
     if (tag === 'INPUT' || tag === 'TEXTAREA' || target?.isContentEditable) { return; }
+
+    if (e.key === 'Enter') {
+      if (this.measure?.handleDoubleClick()) { this.renderer?.requestRender(); }
+      return;
+    }
+    // Esc: a medição vem primeiro — é o que o usuário está fazendo. Sai da ação
+    // inteira (traçado + ferramenta), por isso o cursor volta junto.
+    if (this.measure?.cancel()) {
+      this.canvas.style.cursor = '';
+      this.renderer?.requestRender();
+      return;
+    }
     if (this.selectedIds.size > 0) { this.clearSelection(); }
   };
 
@@ -298,9 +317,46 @@ export class ViewerEngine {
       cpuBytes: this.renderer.getScene().getResidentCpuBytes()
     });
 
+    this.measure = new MeasureTool({
+      container: this.canvas.parentElement ?? this.canvas,
+      project: (point) => this.projectToScreen(point),
+      raycast: (x, y) => this.raycastWorld(x, y),
+      onChange: (state) => this.events.onMeasure(state),
+    });
+
     this.wireControls();
     this.startLoop();
     return true;
+  }
+
+  /**
+   * Mundo → px CSS. `projectToScreen` devolve coordenada do DRAWING BUFFER, que
+   * é alinhado pra baixo em múltiplo de 64 e portanto um pouco mais estreito que
+   * a caixa CSS: sem reescalar, o overlay desgruda do cursor, cada vez mais perto
+   * da borda direita.
+   */
+  private projectToScreen(point: Vec3): { x: number; y: number } | null {
+    const projected = this.camera?.projectToScreen(point, this.canvas.width, this.canvas.height);
+    if (!projected) { return null; }
+    const rect = this.canvas.getBoundingClientRect();
+    if (!this.canvas.width || !this.canvas.height || !rect.width) { return projected; }
+    return {
+      x: projected.x * (rect.width / this.canvas.width),
+      y: projected.y * (rect.height / this.canvas.height),
+    };
+  }
+
+  /** Ponto de superfície sob o cursor, com snap a vértice/aresta/face. */
+  private raycastWorld(x: number, y: number): Vec3 | null {
+    const hit = this.renderer?.raycastScene(x, y, {
+      hiddenIds: this.hiddenIds,
+      isolatedIds: this.isolatedIds,
+      snapOptions: { snapToVertices: true, snapToEdges: true, snapToFaces: true, screenSnapRadius: 40 },
+    });
+    if (!hit) { return null; }
+    // O snap ganha do ponto cru: medir aresta a aresta é o caso comum, e sem ele
+    // cada clique cai a alguns milímetros da quina.
+    return hit.snap?.position ?? hit.intersection?.point ?? null;
   }
 
   // Parse do .ifc no browser. Com cross-origin isolation vai pro caminho
@@ -1250,6 +1306,26 @@ export class ViewerEngine {
     this.renderer?.requestRender();
   }
 
+  /**
+   * Liga/desliga a medição. Com um modo ativo o clique deixa de selecionar
+   * elemento — senão medir uma parede a selecionaria a cada ponto.
+   */
+  setMeasureMode(mode: MeasureMode): void {
+    this.measure?.setMode(mode);
+    this.canvas.style.cursor = mode === 'none' ? '' : 'crosshair';
+    this.renderer?.requestRender();
+  }
+
+  clearMeasurements(): void {
+    this.measure?.clear();
+    this.renderer?.requestRender();
+  }
+
+  deleteMeasurement(id: string): void {
+    this.measure?.remove(id);
+    this.renderer?.requestRender();
+  }
+
   /** `null` desliga o corte. Reflete no frame seguinte, sem recarregar nada. */
   setSectionPlane(section: SectionPlane | null): void {
     this.section = section && section.enabled ? section : null;
@@ -1305,6 +1381,8 @@ export class ViewerEngine {
     this.disposed = true;
     this.aborter.abort();
     window.removeEventListener('keydown', this.onKeyDown);
+    this.measure?.dispose();
+    this.measure = null;
     this.restoreConsole?.();
     delete (globalThis as any).__ifc_lite_render_stats__;
     try { this.renderer?.dispose?.(); } catch { /* já pode estar solto */ }
@@ -1365,6 +1443,8 @@ export class ViewerEngine {
         // X-Ray: só o selecionado fica opaco; o resto vira contexto translúcido.
         ghostExceptIds: this.ghost && this.selectedIds.size > 0 ? this.selectedIds : null
       });
+      // Depois do render: o overlay é projeção da câmera DESTE frame.
+      this.measure?.sync();
       requestAnimationFrame(frame);
     };
     requestAnimationFrame(frame);
@@ -1380,22 +1460,35 @@ export class ViewerEngine {
     });
     c.addEventListener('pointerup', (e) => {
       dragging = false;
-      // Clique esquerdo sem arrastar = seleção; orbit/pan não seleciona.
-      // Ctrl/Cmd/Shift somam à seleção sem precisar do modo da toolbar.
-      if (button === 0 && moved < CLICK_DRAG_PX) {
-        void this.handlePick(e.clientX, e.clientY, {
-          additive: e.ctrlKey || e.metaKey || e.shiftKey,
-        });
+      if (button !== 0 || moved >= CLICK_DRAG_PX) { return; }
+      // Medindo, o clique é ponto de medida — não seleção. Orbitar continua
+      // valendo (o arrasto nem chega aqui).
+      const rect = c.getBoundingClientRect();
+      if (this.measure?.handleClick(e.clientX - rect.left, e.clientY - rect.top)) {
+        this.renderer.requestRender();
+        return;
       }
+      // Clique esquerdo sem arrastar = seleção.
+      // Ctrl/Cmd/Shift somam à seleção sem precisar do modo da toolbar.
+      void this.handlePick(e.clientX, e.clientY, {
+        additive: e.ctrlKey || e.metaKey || e.shiftKey,
+      });
     });
-    // Duplo clique = focar: seleciona, enquadra e liga o X-Ray.
+    // Duplo clique fecha a área em curso; fora da medição, foca o elemento
+    // (seleciona, enquadra e liga o X-Ray).
     c.addEventListener('dblclick', (e) => {
+      if (this.measure?.handleDoubleClick()) { return; }
       void this.handlePick(e.clientX, e.clientY, { focus: true });
     });
     // Esc limpa a seleção (e o X-Ray junto). No window, não no canvas: depois de
     // clicar num drawer o foco sai do canvas e a tecla não chegaria nele.
     window.addEventListener('keydown', this.onKeyDown);
     c.addEventListener('pointermove', (e) => {
+      if (!dragging && this.measure?.isActive()) {
+        const rect = c.getBoundingClientRect();
+        this.measure.handleMove(e.clientX - rect.left, e.clientY - rect.top);
+        this.renderer.requestRender();
+      }
       if (!dragging) { return; }
       const dx = e.clientX - lastX, dy = e.clientY - lastY;
       lastX = e.clientX; lastY = e.clientY;

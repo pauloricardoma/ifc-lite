@@ -1,5 +1,6 @@
 import { ViewerEngine, LoadPhase } from './engine.js';
 import type { BimEntityProperties, BimTreeNode } from './data-model.js';
+import type { Measurement, MeasureMode } from './measure.js';
 import type { IfcArtifacts } from './types.js';
 import type { SectionPlane } from '@ifc-lite/renderer';
 
@@ -43,7 +44,8 @@ export function initCoordly3DViewer(config: BimConfig): BimInstance {
     onLoaded: (detail) => emit('bim-file-loaded', { modelId: config.fileName, ...detail }),
     onError: (code, message) => emit('bim-load-error', { code, message }),
     onSelect: (detail) => emit('bim-selection-changed', detail),
-    onDataModel: (detail) => emit('bim-datamodel-ready', detail)
+    onDataModel: (detail) => emit('bim-datamodel-ready', detail),
+    onMeasure: (detail) => emit('bim-measure-changed', detail)
   });
 
   window.bimExec = (cmd: string) => {
@@ -73,6 +75,11 @@ export function initCoordly3DViewer(config: BimConfig): BimInstance {
     show: (expressIds: number[]) => engine.show(expressIds),
     showAll: () => engine.showAll(),
     setSectionPlane: (section: SectionPlane | null) => engine.setSectionPlane(section),
+    // Medição: com um modo ativo o clique vira ponto de medida, não seleção.
+    // O resultado sai por 'bim-measure-changed', já com o rótulo formatado.
+    setMeasureMode: (mode: MeasureMode) => engine.setMeasureMode(mode),
+    clearMeasurements: () => engine.clearMeasurements(),
+    deleteMeasurement: (id: string) => engine.deleteMeasurement(id),
     // Federação segue a mesma regra do single: com server configurado, quem
     // tessela é ele — o parse client-side perde geometria no single-thread.
     addModel: (fileUrl: string, modelId: string) => (
@@ -135,6 +142,9 @@ declare global {
       show(expressIds: number[]): void;
       showAll(): void;
       setSectionPlane(section: SectionPlane | null): void;
+      setMeasureMode(mode: MeasureMode): void;
+      clearMeasurements(): void;
+      deleteMeasurement(id: string): void;
       addModel(fileUrl: string, modelId: string): Promise<void>;
       removeModel(modelId: string): void;
       hasModel(modelId: string): boolean;

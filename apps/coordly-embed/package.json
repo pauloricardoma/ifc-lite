@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "node ../../scripts/fetch-prebuilt-wasm.mjs && vite build",
     "preview": "vite preview",
+    "test": "tsx --test src/*.test.ts",
     "copy-to-web": "node scripts/deploy-to-web.mjs"
   },
   "dependencies": {
