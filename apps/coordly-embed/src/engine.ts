@@ -9,11 +9,6 @@ import { ModelDataStore } from './data-model.js';
 import type { BimEntityProperties, BimTreeNode } from './data-model.js';
 import type { IfcArtifacts } from './types.js';
 
-// Espera pelo parse frio no server. 5min cobre modelo grande (o de 264MB levou
-// ~250s de tesselação); estourando, o parse continua lá e a próxima abertura pega
-// do cache — por isso a mensagem é "tente de novo", não "falhou".
-const CACHE_POLL = { intervalMs: 5000, timeoutMs: 5 * 60 * 1000 };
-
 // O data model é escrito no cache DEPOIS da geometria (o server responde o
 // parquet e grava o resto em background), então um 202 logo após o load é
 // normal — não é erro, é "ainda não".
@@ -233,6 +228,8 @@ export class ViewerEngine {
   // Monotônico, NÃO `models.size`: remover um modelo e adicionar outro reusaria
   // o índice/offset do que saiu e misturaria os dois.
   private nextModelSlot = 0;
+  // Diagnóstico de estouro da faixa de id federada: uma vez por sessão basta.
+  private idOverflowLogged = false;
   private federationRtc: { x: number; y: number; z: number } | undefined;
   // Atributos/Psets/Qtos/hierarquia do MESMO artefato da geometria. Null até o
   // data model chegar (ou pra sempre, se o modelo veio por um caminho que não o
@@ -476,28 +473,10 @@ export class ViewerEngine {
     if (!opts.additive) { this.renderer.getScene().clear(); }
     let meshCount = 0;
     let framed = opts.additive === true; // federação: não reenquadra a cada modelo
-    let idOverflowLogged = false;
 
     for await (const chunk of decodeStdParquetStreaming(geometry)) {
       if (this.disposed) { return; }
-      const meshes = visibleOnly(chunk);
-      const model = opts.model;
-      if (model) {
-        for (const mesh of meshes) {
-          (mesh as any).modelIndex = model.index;
-          if (mesh.expressId >= MODEL_ID_STEP && !idOverflowLogged) {
-            // Estourar a faixa faria o id cair no intervalo do modelo vizinho:
-            // a remoção começaria a apagar a disciplina errada. Nunca visto em
-            // modelo real, mas é o tipo de coisa que não pode falhar em silêncio.
-            idOverflowLogged = true;
-            console.warn(
-              `[coordly-embed] expressId ${mesh.expressId} passa da faixa de ${MODEL_ID_STEP} por modelo`,
-            );
-          }
-          mesh.expressId += model.idOffset;
-          model.ids.add(mesh.expressId);
-        }
-      }
+      const meshes = this.prepareMeshes(chunk, opts.model);
       this.renderer.addMeshes(meshes as any, true);
       meshCount += meshes.length;
       this.renderer.requestRender();
@@ -509,76 +488,127 @@ export class ViewerEngine {
   }
 
   /**
-   * Parse no server via SSE (`/api/v1/parse/parquet-stream`), com render
-   * progressivo. É o caminho para arquivo grande.
-   *
-   * O endpoint não-streaming fica minutos calado tesselando antes de responder o
-   * primeiro byte, e o gateway do Azure derruba conexão ociosa (~230s) com 502 —
-   * foi o que aconteceu no modelo de 264MB. Aqui os eventos começam a fluir em
-   * segundos: cada `batch` traz um container parquet (mesmo formato do endpoint
-   * inteiro, só que parcial) que decodificamos e mandamos pra cena na hora.
+   * Filtra os tipos escondidos e carimba a disciplina (federação). Compartilhado
+   * pelo decode de container inteiro (`renderParquet`) e pelo de batch do SSE —
+   * os dois põem malha na cena e precisam do mesmo tratamento de id.
+   */
+  private prepareMeshes<T extends { ifcType?: string; expressId: number }>(
+    chunk: T[],
+    model?: FederatedModel,
+  ): T[] {
+    const meshes = visibleOnly(chunk);
+    if (!model) { return meshes; }
+
+    for (const mesh of meshes) {
+      (mesh as any).modelIndex = model.index;
+      if (mesh.expressId >= MODEL_ID_STEP && !this.idOverflowLogged) {
+        // Estourar a faixa faria o id cair no intervalo do modelo vizinho:
+        // a remoção começaria a apagar a disciplina errada. Nunca visto em
+        // modelo real, mas é o tipo de coisa que não pode falhar em silêncio.
+        this.idOverflowLogged = true;
+        console.warn(
+          `[coordly-embed] expressId ${mesh.expressId} passa da faixa de ${MODEL_ID_STEP} por modelo`,
+        );
+      }
+      mesh.expressId += model.idOffset;
+      model.ids.add(mesh.expressId);
+    }
+    return meshes;
+  }
+
+  /**
+   * Força o parse por streaming ignorando o cache (`?mode=sse`). Serve pra A/B e
+   * pra reprocessar um arquivo cujo cache está velho — o caminho normal
+   * (`loadFromServerCached`) já usa o streaming sozinho quando dá MISS.
    */
   async loadFromServerStream(fileUrl: string, serverUrl: string): Promise<void> {
-    console.log('[coordly-embed] parse: SERVER STREAMING (SSE)');
+    console.log('[coordly-embed] parse: SERVER STREAMING (SSE, forçado)');
 
     try {
       const ifcBlob = await this.downloadIfc(fileUrl);
       if (this.disposed) { return; }
 
-      const form = new FormData();
-      form.append('file', ifcBlob, 'model.ifc');
+      await this.streamFromServer(ifcBlob, serverUrl);
+      if (this.disposed) { return; }
 
-      const endpoint = new URL(
-        'api/v1/parse/parquet-stream',
-        serverUrl.endsWith('/') ? serverUrl : `${serverUrl}/`,
-      );
-      console.log(`[coordly-embed] enviando ${(ifcBlob.size / 1024 / 1024).toFixed(1)}MB para ${endpoint}`);
-
-      const parsed = await fetch(endpoint.toString(), {
-        method: 'POST',
-        body: form,
-        signal: this.aborter.signal,
-      }).catch((err) => {
-        throw new Error(`POST ao server de parse falhou (rede/CORS): ${err?.message ?? err}`);
-      });
-      if (!parsed.ok) {
-        const body = await parsed.text().catch(() => '');
-        throw new Error(`server de parse → ${parsed.status} ${parsed.statusText} ${body}`.trim());
-      }
-      if (!parsed.body) { throw new Error('resposta do server sem corpo streamável'); }
-
-      this.renderer.getScene().clear();
-      let meshCount = 0;
-      let framed = false;
-
-      for await (const ev of readSseEvents(parsed.body)) {
-        if (this.disposed) { return; }
-
-        if (ev.type === 'error') { throw new Error(`server: ${ev.message}`); }
-        if (ev.type === 'progress') {
-          this.events.onProgress('parse', ev.processed ?? 0, ev.total ?? 0);
-          continue;
-        }
-        if (ev.type !== 'batch' || !ev.data) { continue; }
-
-        const container = new Blob([base64ToBytes(ev.data)]);
-        for await (const chunk of decodeStdParquetStreaming(container)) {
-          if (this.disposed) { return; }
-          const meshes = visibleOnly(chunk);
-      this.renderer.addMeshes(meshes as any, true);
-          meshCount += meshes.length;
-        }
-
-        this.renderer.requestRender();
-        if (!framed && meshCount > 0) { this.renderer.fitToView(); framed = true; }
-        this.events.onProgress('decode', meshCount, meshCount);
-      }
-
-      this.finishLoad(meshCount);
+      // Hash só agora: são segundos de CPU num arquivo grande, e antes do render
+      // eles atrasariam o primeiro paint sem necessidade — aqui o modelo já está
+      // na tela e o que falta é só a árvore.
+      void this.loadDataModel(await this.hashBlob(ifcBlob), serverUrl, ifcBlob);
     } catch (err: any) {
       if (this.disposed || err?.name === 'AbortError') { return; }
       this.events.onError('server-parse-failed', String(err?.message ?? err));
     }
+  }
+
+  /**
+   * Parse no server via SSE (`/api/v1/parse/parquet-stream`), com render
+   * progressivo. É o caminho de todo cache MISS.
+   *
+   * O endpoint não-streaming (`parse/parquet`) fica minutos calado tesselando
+   * antes de responder o primeiro byte, e o gateway do Azure derruba conexão
+   * ociosa (~230s) com 502 — foi o que matou o modelo de 264MB. Pior: naquele
+   * endpoint a gravação do cache só acontece DEPOIS do parse inteiro, dentro do
+   * mesmo handler, então o corte do gateway descartava os ~250s de trabalho e a
+   * abertura seguinte dava MISS de novo. Aqui não: o SSE manda keep-alive (a
+   * conexão nunca fica ociosa) e o server grava o cache incrementalmente, batch a
+   * batch, além de extrair o data model num `tokio::spawn` dono dos bytes.
+   *
+   * O custo é o base64 dos batches, pago só na primeira abertura de cada arquivo
+   * — da segunda em diante o HIT vem binário por `fetchCachedGeometry`.
+   */
+  private async streamFromServer(
+    ifcBlob: Blob,
+    serverUrl: string,
+    opts: { additive?: boolean; model?: FederatedModel } = {},
+  ): Promise<void> {
+    const form = new FormData();
+    form.append('file', ifcBlob, 'model.ifc');
+
+    const endpoint = this.serverEndpoint(serverUrl, 'api/v1/parse/parquet-stream');
+    console.log(`[coordly-embed] enviando ${(ifcBlob.size / 1024 / 1024).toFixed(1)}MB para ${endpoint}`);
+
+    const parsed = await fetch(endpoint, {
+      method: 'POST',
+      body: form,
+      signal: this.aborter.signal,
+    }).catch((err) => {
+      throw new Error(`POST ao server de parse falhou (rede/CORS): ${err?.message ?? err}`);
+    });
+    if (!parsed.ok) {
+      const body = await parsed.text().catch(() => '');
+      throw new Error(`server de parse → ${parsed.status} ${parsed.statusText} ${body}`.trim());
+    }
+    if (!parsed.body) { throw new Error('resposta do server sem corpo streamável'); }
+
+    if (!opts.additive) { this.renderer.getScene().clear(); }
+    let meshCount = 0;
+    let framed = opts.additive === true;
+
+    for await (const ev of readSseEvents(parsed.body)) {
+      if (this.disposed) { return; }
+
+      if (ev.type === 'error') { throw new Error(`server: ${ev.message}`); }
+      if (ev.type === 'progress') {
+        this.events.onProgress('parse', ev.processed ?? 0, ev.total ?? 0);
+        continue;
+      }
+      if (ev.type !== 'batch' || !ev.data) { continue; }
+
+      const container = new Blob([base64ToBytes(ev.data)]);
+      for await (const chunk of decodeStdParquetStreaming(container)) {
+        if (this.disposed) { return; }
+        const meshes = this.prepareMeshes(chunk, opts.model);
+        this.renderer.addMeshes(meshes as any, true);
+        meshCount += meshes.length;
+      }
+
+      this.renderer.requestRender();
+      if (!framed && meshCount > 0) { this.renderer.fitToView(); framed = true; }
+      this.events.onProgress('decode', meshCount, meshCount);
+    }
+
+    this.finishLoad(meshCount);
   }
 
   /**
@@ -614,27 +644,54 @@ export class ViewerEngine {
    * Caminho padrão do modo server. Ordem: perguntar antes de mandar.
    *
    *   1. sha256 do arquivo → `cache/check`
-   *   2. JÁ TEM  → baixa a geometria pronta (sem upload nenhum)
-   *   3. NÃO TEM → sobe pra disparar o parse. Se a resposta vier, usa direto; se o
-   *      gateway cortar (arquivo grande passa dos ~230s), NÃO é erro: o server
-   *      escreve o cache num `tokio::spawn` independente da resposta, então
-   *      entramos em polling no `check` até a geometria existir.
+   *   2. JÁ TEM  → baixa a geometria pronta, binária, sem upload nenhum
+   *   3. NÃO TEM → sobe e renderiza pelo SSE, que grava o cache batch a batch
    *
-   * Isso evita o que quebrava antes: subir 264MB e receber 1.8GB de SSE em base64
-   * — o upload continua sendo necessário só na primeira vez de cada arquivo.
+   * A decisão é pelo ESTADO DO CACHE, não pelo tamanho do arquivo: o que estoura
+   * o gateway é o parse passar dos ~230s, e isso depende da densidade do modelo,
+   * não dos MB (um IFC de 90MB denso estoura, um de 150MB simples não). Assim o
+   * base64 do SSE é pago só na primeira abertura de cada arquivo, que é
+   * exatamente quando não existe alternativa.
    */
   async loadFromServerCached(fileUrl: string, serverUrl: string): Promise<void> {
     try {
-      const { geometry, hash, ifc } = await this.geometryFromServer(fileUrl, serverUrl);
+      const ifcBlob = await this.downloadIfc(fileUrl);
       if (this.disposed) { return; }
-      await this.renderParquet(geometry);
+
+      const hash = await this.hashBlob(ifcBlob);
+      if (this.disposed) { return; }
+
+      await this.renderFromServer(ifcBlob, hash, serverUrl);
+      if (this.disposed) { return; }
+
       // Depois do render, nunca antes: a árvore e as propriedades não podem
       // atrasar o primeiro paint do modelo.
-      void this.loadDataModel(hash, serverUrl, ifc);
+      void this.loadDataModel(hash, serverUrl, ifcBlob);
     } catch (err: any) {
       if (this.disposed || err?.name === 'AbortError') { return; }
       this.events.onError('server-parse-failed', String(err?.message ?? err));
     }
+  }
+
+  /**
+   * Geometria na cena pelo caminho mais barato disponível: cache quando existe,
+   * streaming quando não. Usado pelo modelo único e pela federação — o federado
+   * tem ainda mais a ganhar, porque cada disciplina extra seria outro upload.
+   */
+  private async renderFromServer(
+    ifcBlob: Blob,
+    hash: string,
+    serverUrl: string,
+    opts: { additive?: boolean; model?: FederatedModel } = {},
+  ): Promise<void> {
+    const cached = await this.isCached(hash, serverUrl);
+    console.log(`[coordly-embed] cache do server: ${cached ? 'HIT' : 'MISS'} (${hash.slice(0, 12)}…)`);
+
+    if (cached) {
+      await this.renderParquet(await this.fetchCachedGeometry(hash, serverUrl), opts);
+      return;
+    }
+    await this.streamFromServer(ifcBlob, serverUrl, opts);
   }
 
   /**
@@ -650,14 +707,13 @@ export class ViewerEngine {
     if (await this.pollDataModel(cacheKey, serverUrl, DATA_MODEL_POLL.quickAttempts)) { return; }
     if (this.disposed) { return; }
 
-    // Continuou 202. Não é lentidão: o `parse/parquet` responde do cache ANTES
-    // de processar, e nesse caminho ele NÃO grava o data model — um arquivo
-    // parseado por uma versão anterior do server nunca teria árvore nem
-    // propriedades, por mais que a gente esperasse.
-    //
-    // O `parse/parquet-stream` não tem esse curto-circuito: ele sempre dispara a
-    // extração do data model num `tokio::spawn`. Então subimos o arquivo só pra
-    // popular esse cache e abandonamos a resposta (a geometria já está na tela).
+    // Continuou 202 = cache LEGADO. Todo MISS hoje passa pelo `parquet-stream`,
+    // que sempre dispara a extração num `tokio::spawn` — então geometria nova
+    // sempre tem data model a caminho e o poll curto acima basta. O que cai aqui
+    // é arquivo cujo cache foi gravado pelo `parse/parquet`, que respondia do
+    // cache ANTES de processar e não gravava data model nenhum: por mais que a
+    // gente esperasse, ele nunca apareceria. Subimos o arquivo só pra popular
+    // esse cache e abandonamos a resposta (a geometria já está na tela).
     if (!ifc) {
       console.warn('[coordly-embed] data model ausente e sem o .ifc em mãos pra gerar');
       this.events.onDataModel({ available: false });
@@ -741,80 +797,6 @@ export class ViewerEngine {
       console.warn('[coordly-embed] falha ao disparar extração do data model:', err?.message ?? err);
       return false;
     }
-  }
-
-  /**
-   * Geometria tesselada de um `.ifc`, com o cache do server na frente. Usado tanto
-   * pelo modelo único quanto pela federação — o federado tem ainda mais a ganhar,
-   * porque cada disciplina extra seria outro upload.
-   */
-  private async geometryFromServer(
-    fileUrl: string,
-    serverUrl: string,
-  ): Promise<{ geometry: Blob; hash: string; ifc: Blob }> {
-    const ifcBlob = await this.downloadIfc(fileUrl);
-
-    this.events.onProgress('parse', 0, 1);
-    const hash = await this.hashBlob(ifcBlob);
-
-    let cached = await this.isCached(hash, serverUrl);
-    console.log(`[coordly-embed] cache do server: ${cached ? 'HIT' : 'MISS'} (${hash.slice(0, 12)}…)`);
-
-    if (!cached) {
-      cached = await this.seedServerCache(ifcBlob, hash, serverUrl);
-      if (!cached) {
-        throw new Error(
-          'o modelo ainda está sendo processado no servidor — tente novamente em alguns minutos',
-        );
-      }
-    }
-
-    // O Blob do `.ifc` vai junto: vive em disco (não no heap) e é o que permite
-    // gerar o data model quando o cache da geometria é HIT mas o dele não existe.
-    return { geometry: await this.fetchCachedGeometry(hash, serverUrl), hash, ifc: ifcBlob };
-  }
-
-  /**
-   * Sobe o arquivo pra popular o cache e espera ficar pronto. Devolve `false` se
-   * estourar a paciência — o parse continua no server, então a próxima abertura
-   * costuma ser HIT.
-   */
-  private async seedServerCache(ifcBlob: Blob, hash: string, serverUrl: string): Promise<boolean> {
-    const form = new FormData();
-    form.append('file', ifcBlob, 'model.ifc');
-
-    console.log(`[coordly-embed] cache MISS: enviando ${(ifcBlob.size / 1024 / 1024).toFixed(1)}MB pro server`);
-    try {
-      // Endpoint binário (não o SSE): a resposta não passa por JS e, se o gateway
-      // cortar, o parse segue no server do mesmo jeito.
-      const res = await fetch(this.serverEndpoint(serverUrl, 'api/v1/parse/parquet'), {
-        method: 'POST',
-        body: form,
-        signal: this.aborter.signal,
-      });
-      if (res.ok) { return true; }
-      console.warn(`[coordly-embed] parse respondeu ${res.status}; seguindo pelo cache`);
-    } catch (err: any) {
-      if (err?.name === 'AbortError') { throw err; }
-      // Conexão cortada não significa parse perdido — o cache é escrito em background.
-      console.warn('[coordly-embed] conexão do parse caiu; seguindo pelo cache:', err?.message ?? err);
-    }
-
-    return this.waitForCache(hash, serverUrl);
-  }
-
-  /** Polling no `check` enquanto o server termina o parse. */
-  private async waitForCache(hash: string, serverUrl: string): Promise<boolean> {
-    const deadline = Date.now() + CACHE_POLL.timeoutMs;
-    while (Date.now() < deadline) {
-      if (this.disposed) { return false; }
-      await new Promise((r) => setTimeout(r, CACHE_POLL.intervalMs));
-      if (await this.isCached(hash, serverUrl)) { return true; }
-      const restante = Math.max(0, Math.round((deadline - Date.now()) / 1000));
-      console.log(`[coordly-embed] aguardando parse no server… (${restante}s restantes)`);
-      this.events.onProgress('parse', 0, 0);
-    }
-    return false;
   }
 
   /**
@@ -923,9 +905,11 @@ export class ViewerEngine {
     this.models.set(modelId, model);
 
     try {
-      const { geometry } = await this.geometryFromServer(fileUrl, serverUrl);
+      const ifcBlob = await this.downloadIfc(fileUrl);
       if (this.disposed) { return; }
-      await this.renderParquet(geometry, { additive: true, model });
+      const hash = await this.hashBlob(ifcBlob);
+      if (this.disposed) { return; }
+      await this.renderFromServer(ifcBlob, hash, serverUrl, { additive: true, model });
     } catch (err: any) {
       this.models.delete(modelId); // o modelo não entrou na cena
       if (this.disposed || err?.name === 'AbortError') { return; }
