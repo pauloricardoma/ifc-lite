@@ -1,5 +1,106 @@
 # @ifc-lite/lists
 
+## 1.23.1
+
+### Patch Changes
+
+- Updated dependencies [[`02079a6`](https://github.com/LTplus-AG/ifc-lite/commit/02079a66042a6e446b9f83f656685f6056020718)]:
+  - @ifc-lite/data@3.3.0
+
+## 1.23.0
+
+### Minor Changes
+
+- [#2515](https://github.com/LTplus-AG/ifc-lite/pull/2515) [`ed9acf0`](https://github.com/LTplus-AG/ifc-lite/commit/ed9acf0d5a11c291caa70165e9d673812c75c7fa) Thanks [@louistrue](https://github.com/louistrue)! - Add `zone` column/condition modes that report how much VOLUME of an element sits in each zone (`Volume (mesh)` and `Volume breakdown (mesh)`), backed by a new optional `ListDataProvider.getZoneVolumeShares` hook. The numeric mode is tagged as a volume quantity so the shared per-column unit resolver converts and labels it like any declared `NetVolume`. Providers built before this simply have no volume data and the columns read `null`.
+
+### Patch Changes
+
+- Updated dependencies [[`b4b3e0c`](https://github.com/LTplus-AG/ifc-lite/commit/b4b3e0cfa8ffa9185e96dc266dd6fdc3fef34797)]:
+  - @ifc-lite/encoding@2.0.0
+  - @ifc-lite/data@3.2.4
+
+## 1.22.5
+
+### Patch Changes
+
+- Updated dependencies [[`eb39b27`](https://github.com/LTplus-AG/ifc-lite/commit/eb39b27f5eba186b23b3a683c25fff2c60084d9c), [`7c686f9`](https://github.com/LTplus-AG/ifc-lite/commit/7c686f9ac39f78a707dc083c798b6ef3d255e171)]:
+  - @ifc-lite/encoding@1.16.0
+  - @ifc-lite/data@3.2.3
+
+## 1.22.4
+
+### Patch Changes
+
+- [#2373](https://github.com/LTplus-AG/ifc-lite/pull/2373) [`d954df3`](https://github.com/LTplus-AG/ifc-lite/commit/d954df35ef9e01f30e0a26333381b4dd50f9e59e) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `equals`/`notEquals` list conditions being case-sensitive for boolean-like values, while their `contains` sibling was already case-insensitive. An `IfcBoolean` property displays as `"True"`/`"False"`, and a location-zone `Straddles` condition resolves to a raw JS boolean that stringifies as `"true"`/`"false"` — a condition typed as `IsExternal = true` (or a saved zone `Straddles = True` filter) could silently fail to match, and the equivalent `notEquals` condition could silently include rows that only differed by letter case.
+
+  The fix is scoped to values that look like a boolean/logical (`"true"`/`"false"`/`"unknown"`, any case, or a genuine JS boolean) on both sides of the comparison. Every other value type — GlobalId, Name, classification codes, spatial container names, and any other string property — keeps the original exact, case-sensitive comparison, since e.g. two distinct IFC GlobalIds can differ only by case.
+
+- Updated dependencies [[`d75786f`](https://github.com/LTplus-AG/ifc-lite/commit/d75786f631047d234f204289426f708f0be8674b), [`273b068`](https://github.com/LTplus-AG/ifc-lite/commit/273b06827ef1469f63c396d204474a9f2400c642), [`58fbc63`](https://github.com/LTplus-AG/ifc-lite/commit/58fbc634994742c79375830c1983508752fd78e9), [`d9490e6`](https://github.com/LTplus-AG/ifc-lite/commit/d9490e6e2ecacb65aea42fcaef73fd292a4c3095), [`deb54d3`](https://github.com/LTplus-AG/ifc-lite/commit/deb54d3ff75f35c3c9206c8ea9a1e875426352c6)]:
+  - @ifc-lite/data@3.2.2
+  - @ifc-lite/encoding@1.15.1
+
+## 1.22.3
+
+### Patch Changes
+
+- Updated dependencies [[`befc108`](https://github.com/LTplus-AG/ifc-lite/commit/befc1083e377315231006352cb3fe95949e92b47)]:
+  - @ifc-lite/data@3.2.1
+
+## 1.22.2
+
+### Patch Changes
+
+- Updated dependencies [[`e4d2db5`](https://github.com/LTplus-AG/ifc-lite/commit/e4d2db5f11798e3ec78f45249139d69aa1e65275)]:
+  - @ifc-lite/data@3.2.0
+
+## 1.22.1
+
+### Patch Changes
+
+- [#1927](https://github.com/LTplus-AG/ifc-lite/pull/1927) [`f2357a2`](https://github.com/LTplus-AG/ifc-lite/commit/f2357a2115d8787b62b68fa11951a76f01e6b2de) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix the Wall Schedule preset asking for a quantity that does not exist in IFC. `Qto_WallBaseQuantities` has no `NetArea` member in any schema version — the wall side-area quantity is `NetSideArea` — so the preset's last column resolved against nothing and rendered permanently empty. Closes [#1873](https://github.com/LTplus-AG/ifc-lite/issues/1873).
+
+- Updated dependencies [[`9a7b5a2`](https://github.com/LTplus-AG/ifc-lite/commit/9a7b5a2fc1bb85ce60e954ccf7819829e43431d6)]:
+  - @ifc-lite/data@3.1.0
+
+## 1.22.0
+
+### Minor Changes
+
+- [#1867](https://github.com/LTplus-AG/ifc-lite/pull/1867) [`8492e51`](https://github.com/LTplus-AG/ifc-lite/commit/8492e516f23775930e55a192abe526ff507d79bc) Thanks [@louistrue](https://github.com/louistrue)! - Add `toScheduleRows()`: project a grouped `ListResult` down to a Bonsai-style
+  schedule / pivot presentation — one row per group-value tuple (leaf group),
+  carrying its Count aggregate and configured sums as first-class fields,
+  instead of the nested tree `ListGroup[]` already returned.
+
+  Follow-up to the multi-criteria grouping added for issue [#1790](https://github.com/LTplus-AG/ifc-lite/issues/1790): the reporter
+  came back asking for Count as its own column (not a badge next to the group
+  label) and a pivot/schedule table (grouping columns become leading columns,
+  one row per combination) matching Bonsai's own output — plus a CSV export
+  that mirrors that arrangement.
+
+  `ListGrouping` gains an optional `view?: 'nested' | 'schedule'` field
+  (`undefined` keeps the existing nested-tree behaviour, so persisted lists are
+  unaffected) and a new `ListScheduleRow` type describes each schedule row.
+  The viewer's Lists panel and its CSV/XLSX/PDF export now offer a schedule
+  (pivot) view alongside the existing nested tree.
+
+- [#1869](https://github.com/LTplus-AG/ifc-lite/pull/1869) [`f8a3f39`](https://github.com/LTplus-AG/ifc-lite/commit/f8a3f3970844edf266ae6887884ed3be4293ff8c) Thanks [@louistrue](https://github.com/louistrue)! - Add a `zone` column/condition source (issue [#1810](https://github.com/LTplus-AG/ifc-lite/issues/1810)): location-zone
+  classification (which user-defined 3D zone box an element falls into, plus a
+  "straddles" flag when its bounds cross a zone boundary) can now be surfaced as
+  a list column, grouped/sorted/exported, and used as a filter condition.
+
+  `ColumnDefinition.source` / `PropertyCondition.source` gain a `'zone'` variant
+  (`psetName` holds the zone-SET id, `propertyName` selects `Zone` (default) or
+  `Straddles`). `ListDataProvider` gains two new OPTIONAL accessors,
+  `getZoneAssignment` and `getZoneSetNames` — providers built before this change
+  simply resolve every `zone` column to `null`, so this is purely additive and
+  backward compatible.
+
+### Patch Changes
+
+- Updated dependencies [[`382fa7c`](https://github.com/LTplus-AG/ifc-lite/commit/382fa7cf97c04bad07963e25052cbaeb6c2ba7e3), [`6792dd1`](https://github.com/LTplus-AG/ifc-lite/commit/6792dd11ad7049acb7329221ea8809d6333aefb7), [`8799484`](https://github.com/LTplus-AG/ifc-lite/commit/87994844a5edb66404fa12b0719c89f5ec026c4d), [`22bffac`](https://github.com/LTplus-AG/ifc-lite/commit/22bffac737efa9bdd6ca583518f637593cb4d4bc), [`205a136`](https://github.com/LTplus-AG/ifc-lite/commit/205a136ee69e378ea01cd0d0a8a6dc81cf2fb08f)]:
+  - @ifc-lite/encoding@1.15.0
+  - @ifc-lite/data@3.0.0
+
 ## 1.21.0
 
 ### Minor Changes

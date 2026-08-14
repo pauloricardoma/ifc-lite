@@ -7,6 +7,9 @@ including the jaws of people who fund frontier infrastructure?
 
 ## 1. What six months actually built
 
+<!-- numeral-ok: 1,376 :: repository commit count on the day this section was
+     written, from `git rev-list --count`. A fact about the repo, not a bet
+     measurement; no artifact emits it and none should. -->
 The repo is 1,376 commits old (first commit 2026-01-12). The commit rate tripled from ~120/month
 in Jan-Apr to 368 in June. Underneath the viewer, the following assets now exist and are verified
 in CI, and together they form something no other codebase in AEC has:
@@ -41,8 +44,21 @@ in CI, and together they form something no other codebase in AEC has:
    (threaded wasm honestly recorded at 0.87x for the full pipeline, then re-measured and
    revised when the workload changed shape).
 8. **Two de-risked engine levers already measured and documented:** wasm wide-arithmetic
-   (1.9-3.1x on predicates, 1.71x end-to-end CSG, blocked only on browser flags) and threaded
+   (1.9-3.1x on predicates, 1.71x end-to-end CSG, blocked on V8 not implementing the
+   opcodes) and threaded
    CSG via wasm-bindgen-rayon (2.9-4.2x on the CSG step, architecture validated).
+
+<!-- numeral-src: 1.9, 1.71x, 3.1x :: none - wasm wide-arithmetic speedups: BOTH
+     endpoints of the predicate range (1.9x to 3.1x) plus the 1.71x end-to-end
+     CSG figure. Measured by docs/architecture/wasm-wide-arithmetic.md and its
+     benchmark; cited here, produced elsewhere, and no scripts/moonshot artifact
+     emits any of them. Bound to `none` rather than left to the union index so
+     that a coincidental hit on a bare 1.9 or 2.9 cannot read as provenance. -->
+<!-- numeral-src: 2.9, 4.2x :: none - BOTH endpoints of M6b's threaded-CSG range
+     (2.9x to 4.2x), a CSG-STAGE figure and not an end-to-end one; see the
+     negative-results ledger entry N4 in moonshots-execution-plan.md. Measured
+     before this program committed any artifact for it; nothing in
+     scripts/moonshot/ emits it. -->
 
 Compressed to one sentence: **this is the only geometry system in the built-world domain that
 is simultaneously exact, deterministic to the byte, content-addressable, browser-native,
@@ -221,9 +237,11 @@ The hardcore systems moonshot underneath all of the above: make exact geometry s
 sit inside every loop that currently cannot afford it (per-token decoding feedback in M5,
 per-gradient-step projection in M3, per-frame verification in M4). Three stacked levers:
 
-1. **Wasm wide-arithmetic:** already measured at 1.71x end-to-end; ships the moment browser
-   engines flip the flag (V8 has it behind one today). Zero-risk, pure patience, and this repo
-   would likely be the first real-world workload on it.
+1. **Wasm wide-arithmetic:** already measured at 1.71x end-to-end; ships once browser
+   engines implement the opcodes. Measured 2026-07-31: V8 rejects them outright
+   (`invalid numeric opcode: 0xfc13`) and exposes no flag to enable them, so there is no
+   switch waiting to be flipped; Firefox and Safari are unverified. Zero-risk, pure
+   patience, and this repo would likely be the first real-world workload on it.
 2. **Threaded CSG:** 2.9-4.2x already validated via wasm-bindgen-rayon on the CSG-heavy loop.
 3. **Exact predicates on GPU:** the research-grade one. Multi-word integer arithmetic (I256+)
    and Shewchuk-style adaptive filters implemented in WGSL compute, batching millions of

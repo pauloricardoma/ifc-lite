@@ -1,5 +1,66 @@
 # @ifc-lite/ifcx
 
+## 2.3.5
+
+### Patch Changes
+
+- [#2564](https://github.com/LTplus-AG/ifc-lite/pull/2564) [`02079a6`](https://github.com/LTplus-AG/ifc-lite/commit/02079a66042a6e446b9f83f656685f6056020718) Thanks [@louistrue](https://github.com/louistrue)! - One constant for the IFCX header version, exported as `IFCX_VERSION` from `@ifc-lite/data` and re-exported by `@ifc-lite/ifcx`.
+
+  Seven call sites hardcoded this string and they did not agree: six said `ifcx_alpha`, and `@ifc-lite/ifcx`'s own `IfcxWriter` said `IFCX-1.0`. Nothing caught it because `parseIfcx` matches case-insensitively on the substring `ifcx`, so both parse. The same forgiving read is why the Rust exporter could write the version under `header.version` for its entire life while every file it produced was rejected by our own parser ([#2556](https://github.com/LTplus-AG/ifc-lite/issues/2556)).
+
+  **Behaviour change:** `IfcxWriter` / `exportToIfcx` now stamp `ifcx_alpha` instead of `IFCX-1.0`, matching every other writer here and buildingSMART's own reference files. Readers accepting either value are unaffected, and no internal caller was relying on the old string. Layer content addresses are unaffected — the layer paths already wrote `ifcx_alpha`.
+
+- Updated dependencies [[`02079a6`](https://github.com/LTplus-AG/ifc-lite/commit/02079a66042a6e446b9f83f656685f6056020718), [`6d09c4a`](https://github.com/LTplus-AG/ifc-lite/commit/6d09c4a768a9caa1600fb6db38d0e80ec8051aee)]:
+  - @ifc-lite/data@3.3.0
+  - @ifc-lite/mutations@1.26.0
+
+## 2.3.4
+
+### Patch Changes
+
+- [#2336](https://github.com/LTplus-AG/ifc-lite/pull/2336) [`a220406`](https://github.com/LTplus-AG/ifc-lite/commit/a2204062ba1fc555e4529896cbc82efccc7a5146) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `composeIfcx` and `composeFederated` dropping a `children: { name: null }` removal opinion when the same node also has an `inherits` reference that defines a child of the same name. Attribute removals already survived flattening as a mask so they shadow an inherited value ([#1031](https://github.com/LTplus-AG/ifc-lite/issues/1031)); the identical `children` removal was deleted at flatten/merge time instead of preserved, so the inherited child silently reappeared in the composed tree. Children now use the same mask-and-resolve pattern as attributes in both composers, so an explicit `null` removes an inherited child too, and a later non-null opinion still resurrects it.
+
+- [#2165](https://github.com/LTplus-AG/ifc-lite/pull/2165) [`c866bee`](https://github.com/LTplus-AG/ifc-lite/commit/c866bee62a7d6e40b15a7de63948354cbbe049a7) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `getDescendants` returning only the direct children instead of the whole subtree.
+
+  `getDescendants` (published from the package index) marked each child visited in the loop _before_ recursing into it, so the recursive `traverse` call tripped its own `if (visited.has(n.path)) return` entry guard and returned without walking anything. The function was a one-level walk: for `a -> b -> c -> d` it answered `[b]` rather than `[b, c, d]`, and for a diamond `root -> {l, r} -> shared` it answered `[l, r]`, dropping the shared grandchild entirely. The child is now marked by the recursive call that opens on it, which is where the existing cycle guard already expects the marking to happen.
+
+  Found while mutation-auditing the tests added in this PR: neither test over the function could observe the truncation. One asserted only that the result is duplicate-free, which a one-level result satisfies; the other's expectation for a two-node cycle — `['b']` — is what the truncated walk produces anyway. Both now assert the reached depth directly.
+
+  No in-repo caller was affected (the function has no consumer besides the export and its tests), so this only changes behaviour for external users of `@ifc-lite/ifcx`, for whom it was previously unusable for its documented purpose.
+
+- [#2272](https://github.com/LTplus-AG/ifc-lite/pull/2272) [`262b9df`](https://github.com/LTplus-AG/ifc-lite/commit/262b9df485e4bfd3760f73c30d93bb518e599b72) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `IfcxWriter` emitting dangling child references in the spatial hierarchy on every plain STEP-IFC → IFCX export.
+
+  `collectNodes()` synthesized each entity's own node path via `idToPath?.get(expressId) ?? generatePath(expressId, typeEnum)` (e.g. `ifc:IfcWall.42`), while `getChildrenForEntity()` synthesized the _reference_ to that same entity as a child independently, via `idToPath?.get(childId) || 'element:' + childId` (e.g. `element:42`). Whenever `idToPath` was not supplied — which is the normal case; it is only populated on IFCX → IFCX round-trips — the two never agreed, and every emitted `children` entry pointed at a path no node in the file actually had.
+
+  The writer now builds a single expressId → path map once while iterating entities in `collectNodes()`, seeded from `idToPath` first (so a child referenced only by id, with no entity row of its own in this file, can still resolve if the caller already knows its path) and filled in with `generatePath()` for every entity. `getChildrenForEntity()` resolves child paths from that same map instead of re-deriving them. A child id with neither an entity row nor an `idToPath` entry is now omitted from `children` rather than emitted as an unresolvable `element:${id}` reference.
+
+- Updated dependencies [[`d75786f`](https://github.com/LTplus-AG/ifc-lite/commit/d75786f631047d234f204289426f708f0be8674b), [`58fbc63`](https://github.com/LTplus-AG/ifc-lite/commit/58fbc634994742c79375830c1983508752fd78e9), [`bf44de2`](https://github.com/LTplus-AG/ifc-lite/commit/bf44de2d8d023f22e2f4010a0c7832543221909e), [`710fd83`](https://github.com/LTplus-AG/ifc-lite/commit/710fd83638b51b2e4744a1ac364827a27dc0fc73), [`d9490e6`](https://github.com/LTplus-AG/ifc-lite/commit/d9490e6e2ecacb65aea42fcaef73fd292a4c3095), [`8751ba4`](https://github.com/LTplus-AG/ifc-lite/commit/8751ba41dc4d1893530b0f1db6ad0f8fa0d5d3fd), [`deb54d3`](https://github.com/LTplus-AG/ifc-lite/commit/deb54d3ff75f35c3c9206c8ea9a1e875426352c6), [`35e37ac`](https://github.com/LTplus-AG/ifc-lite/commit/35e37ac99ab444773bfec669cfc5cf3937443942)]:
+  - @ifc-lite/data@3.2.2
+  - @ifc-lite/pointcloud@0.6.1
+  - @ifc-lite/mutations@1.24.2
+
+## 2.3.3
+
+### Patch Changes
+
+- Updated dependencies [[`9d9c804`](https://github.com/LTplus-AG/ifc-lite/commit/9d9c8049075c9d8692a483ef1fa75325e822c15a), [`a25dd32`](https://github.com/LTplus-AG/ifc-lite/commit/a25dd32a78626a0ed697a21ed2c4963641bb7b89), [`4c739be`](https://github.com/LTplus-AG/ifc-lite/commit/4c739be2aba74ad6868b6dca51dad441c6fa9903), [`f493930`](https://github.com/LTplus-AG/ifc-lite/commit/f4939309aed136979bd5cc1f95a25c2a0ebe779f), [`befc108`](https://github.com/LTplus-AG/ifc-lite/commit/befc1083e377315231006352cb3fe95949e92b47)]:
+  - @ifc-lite/pointcloud@0.6.0
+  - @ifc-lite/mutations@1.24.1
+  - @ifc-lite/data@3.2.1
+
+## 2.3.2
+
+### Patch Changes
+
+- [#1857](https://github.com/LTplus-AG/ifc-lite/pull/1857) [`205a136`](https://github.com/LTplus-AG/ifc-lite/commit/205a136ee69e378ea01cd0d0a8a6dc81cf2fb08f) Thanks [@louistrue](https://github.com/louistrue)! - Route `getStoreyByElevation` through the shared `findStoreyByElevation` resolver from `@ifc-lite/data` (issue [#1841](https://github.com/LTplus-AG/ifc-lite/issues/1841)).
+
+  Both packages previously shipped their own always-snap-to-nearest implementations: the worker-transport rehydration in `@ifc-lite/parser` (`data-store-transport.ts`) and the IFCX hierarchy builder (`hierarchy-builder.ts`). Both now apply the same 1m tolerance and deterministic tie-break as the fresh-parse path, so a Z resolves to the same storey regardless of entry path or which side of the worker boundary the store was read from.
+
+- Updated dependencies [[`6792dd1`](https://github.com/LTplus-AG/ifc-lite/commit/6792dd11ad7049acb7329221ea8809d6333aefb7), [`b23a173`](https://github.com/LTplus-AG/ifc-lite/commit/b23a173775785eea179d7c243948bb86401920f4), [`653a685`](https://github.com/LTplus-AG/ifc-lite/commit/653a685625bda0c983a3123dda73e0d009529f4b), [`6869d5c`](https://github.com/LTplus-AG/ifc-lite/commit/6869d5ced2d19ac4ab8b2591847f3ffd52236d14), [`22bffac`](https://github.com/LTplus-AG/ifc-lite/commit/22bffac737efa9bdd6ca583518f637593cb4d4bc), [`205a136`](https://github.com/LTplus-AG/ifc-lite/commit/205a136ee69e378ea01cd0d0a8a6dc81cf2fb08f)]:
+  - @ifc-lite/data@3.0.0
+  - @ifc-lite/pointcloud@0.5.0
+  - @ifc-lite/mutations@1.21.1
+
 ## 2.3.1
 
 ### Patch Changes

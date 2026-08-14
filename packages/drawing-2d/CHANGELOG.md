@@ -1,5 +1,62 @@
 # @ifc-lite/drawing-2d
 
+## 1.21.1
+
+### Patch Changes
+
+- [#2381](https://github.com/LTplus-AG/ifc-lite/pull/2381) [`3029cb2`](https://github.com/LTplus-AG/ifc-lite/commit/3029cb2813940438dd43de3cca9e6b25546dad80) Thanks [@louistrue](https://github.com/louistrue)! - Fix an infinite loop in `PolygonBuilder.classifyLoops` that hung the viewer at ~95% load (issue [#2364](https://github.com/LTplus-AG/ifc-lite/issues/2364)). The nearest-ancestor search introduced by [#2331](https://github.com/LTplus-AG/ifc-lite/issues/2331) tested containment with a single point, so two partially-overlapping loops could each "contain" the other's start vertex, making the parent pointers cyclic and the nesting-depth walk spin forever. Parents are now restricted to earlier (larger-or-equal-area) loops in the area-descending sort, which keeps the ancestor relation acyclic by construction.
+
+- [#2331](https://github.com/LTplus-AG/ifc-lite/pull/2331) [`70c431d`](https://github.com/LTplus-AG/ifc-lite/commit/70c431d3d9a12a5217ac0c1912da18bce7548e4e) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `PolygonBuilder.classifyLoops` misclassifying an island (e.g. a mullion cross-section, or a column stub) nested inside a hole as a second hole of the outer boundary, instead of a solid polygon in its own right. Previously every ring's containment was tested only against the top-level outer boundary, so anything geometrically inside it — at any nesting depth — became a hole, silently turning the island into void in the rendered section drawing. Loops are now classified by nesting depth relative to their nearest containing ancestor: even depth is a solid outer boundary, odd depth is a hole of its immediate parent.
+
+- Updated dependencies [[`d89960a`](https://github.com/LTplus-AG/ifc-lite/commit/d89960aaab08387fbd2307c0f238bd112c684933)]:
+  - @ifc-lite/geometry@3.7.1
+
+## 1.21.0
+
+### Minor Changes
+
+- [#2119](https://github.com/LTplus-AG/ifc-lite/pull/2119) [`f566a3a`](https://github.com/LTplus-AG/ifc-lite/commit/f566a3af5d92728d682a150282e37de3ece3a613) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix a showstopper found in review of the scaled PDF export ([#2042](https://github.com/LTplus-AG/ifc-lite/issues/2042), reported on PR [#2119](https://github.com/LTplus-AG/ifc-lite/issues/2119)): `front` and `side` section PDF exports rendered off-page for any model at ordinary (asymmetric-about-zero) world coordinates. The page layout was derived from the drawing's un-flipped bounds while points were drawn flipped, which only produced a correctly-positioned page when the bounds happened to be symmetric about zero — the uncommon case. `computePdfScaleLayout`'s offsets must now be derived from the bounds as they are actually drawn; the new `flipBounds2D` helper (and `@ifc-lite/viewer`'s `computePdfSectionLayout`/`makeSectionMapPoint`) keep the two in sync. Also: the PDF export filename no longer rounds the scale factor with `Math.round` (v1 has no title block, so the filename is the sole record of a sheet's scale — a 1:99.5 export used to be filed as `…-1-100`); it now reuses the same rounding rule as the SVG title block's scale label (`formatScaleFactorLabel`, extracted from PR [#2131](https://github.com/LTplus-AG/ifc-lite/issues/2131)). `computePdfScaleLayout` now also validates its derived OUTPUTS (page size, offsets), not just its inputs, since finite inputs can still multiply/divide out to a non-finite page size that would otherwise reach jsPDF. The async PDF-construction/download path now shows an alert on failure (e.g. a failed `jspdf` chunk load) instead of surfacing only as an unhandled promise rejection. The PDF export's cut-line skip is now scoped to entities actually covered by a cut-polygon outline — cut-category `drawing.lines` are still drawn when the polygon reconstruction failed to close a loop for that entity, instead of being silently dropped.
+
+- [#2119](https://github.com/LTplus-AG/ifc-lite/pull/2119) [`f566a3a`](https://github.com/LTplus-AG/ifc-lite/commit/f566a3af5d92728d682a150282e37de3ece3a613) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Add `computePdfScaleLayout`, `worldPointToPdfMm`, and `worldLengthToPdfMm`: pure scale/extent arithmetic for exporting a section drawing to a dimensionally accurate ("to scale") PDF page ([#2042](https://github.com/LTplus-AG/ifc-lite/issues/2042)). The page is sized to the drawing extent at the exact chosen scale plus a margin, rather than fit into a fixed named paper size, so a selected scale (e.g. 1:100) is never silently re-scaled to make the drawing fit — unlike the existing sheet-fit transform in `sheet/sheet-types.ts`, which is correct for an on-screen preview but not for a document someone measures from.
+
+### Patch Changes
+
+- [#2131](https://github.com/LTplus-AG/ifc-lite/pull/2131) [`ae2debf`](https://github.com/LTplus-AG/ifc-lite/commit/ae2debf665fdbe25afd9e16411bd2347dcd4f39d) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Make `SVGExportOptions.padding` (documented as "Padding around drawing in mm") actually affect `SVGExporter.export()` / `.exportPolygons()` output. Since the exporter's original commit, `computeTransform` derived `availableWidth`/`availableHeight` from `padding` and never used them anywhere — the option was a silent no-op regardless of value.
+
+  **Behaviour change:** `padding` is now a minimum-margin guarantee. `computeTransform` keeps the caller's exact requested `scale` when the drawing already leaves at least `padding` mm of margin on the chosen paper (the common case, and unchanged from before). When it would leave less than that — or the drawing overflows the paper outright — the effective scale is shrunk (never enlarged) just enough to respect the margin; centring is otherwise unaffected, since padding is applied uniformly on all sides.
+
+  `padding` defaults to `20` (mm) in both `export()` and `exportPolygons()`, so **this can change output for callers who never pass `padding` explicitly** — not just callers who pass a non-zero value — whenever their drawing, at its requested scale, is closer than 20mm to the paper edge. `padding: 0` is unaffected except in the pre-existing edge case where a drawing already overflows the paper at the requested scale with no padding at all (previously silently overflowed the page; now clamped to fit).
+
+  **Review follow-ups (both are cases where "padding is a minimum-margin guarantee" was not actually a contract):**
+
+  - **The title block's "Scale:" label could lie.** `computeTransform` clamps the effective scale to honour the margin, but `createTitleBlock` printed the caller's _requested_ `scale.name` unconditionally — a sheet clamped from 1:100 to, say, ~1:973 still read "Scale: 1:100". That is a confidently wrong document: scaling a dimension off the printout is the entire reason a scale label exists, and it would be silently wrong by the clamp ratio. The label is now derived from the _effective_ scale whenever the drawing was clamped (rounded to 2 decimal places, trailing zeros stripped, e.g. `1:127.3`), and continues to print the exact requested name unchanged — no floating-point re-derivation — on the common, unclamped path.
+  - **An impossible `padding` (`padding * 2 >= paperSize.width` or `.height`) used to disable the clamp entirely** on the affected axis, silently falling back to rendering at the full requested scale with no margin honoured at all — the same "no padding at all" failure this changeset otherwise removes, just reached from the opposite direction. `padding` is now clamped to the largest value the paper's shorter dimension can still hold (leaving a minimum 1mm sliver of drawable area) and a `console.warn` is emitted; the export keeps working rather than throwing, since this is a published package and a large-`padding` caller should not have their existing integration start throwing on upgrade.
+
+- Updated dependencies [[`2c47277`](https://github.com/LTplus-AG/ifc-lite/commit/2c47277ee6dfbd9779eb4948d1f2e7b0ea61d00e), [`5371d7d`](https://github.com/LTplus-AG/ifc-lite/commit/5371d7def2671f6568c838879b8be058bb6247c9), [`befc108`](https://github.com/LTplus-AG/ifc-lite/commit/befc1083e377315231006352cb3fe95949e92b47), [`0ceb99a`](https://github.com/LTplus-AG/ifc-lite/commit/0ceb99a36125a2dfc8775e762d9f4f9ddb69d733), [`d44b6c1`](https://github.com/LTplus-AG/ifc-lite/commit/d44b6c1710ee86596e96e0204785d2bf7c0940a9)]:
+  - @ifc-lite/geometry@3.7.0
+
+## 1.20.0
+
+### Minor Changes
+
+- [#1871](https://github.com/LTplus-AG/ifc-lite/pull/1871) [`0f15d56`](https://github.com/LTplus-AG/ifc-lite/commit/0f15d5629c532a9ae6b8d79586e6b16613000498) Thanks [@louistrue](https://github.com/louistrue)! - Add a DXF exporter (`DXFExporter` / `exportToDXF`) alongside the existing SVG exporter. The underlying ASCII DXF R12 writer stays package-internal; only the exporter facade (and its `DXFExportOptions` / `DXFUnderlayOptions` types) is public API.
+
+  `exportToDXF` mirrors `exportToSVG`'s `Drawing2D` + reference-underlay input contract (same polylines/edges, hatch-boundary polygons, text/annotations, and per-style layers) and writes ASCII DXF R12 (`$ACADVER` = `AC1009`): HEADER, TABLES (LTYPE, STYLE, LAYER), ENTITIES (classic POLYLINE/VERTEX/SEQEND, LINE, TEXT). Layer names follow the strict R12 symbol rules (31 characters, `A-Z a-z 0-9 $ - _`), with numeric-suffix disambiguation when distinct source names collide after sanitizing. R12 is deliberate — entity handles and subclass markers are mandatory from R13 on and this writer emits neither, so declaring a later version would produce an invalid hybrid file that strict readers (AutoCAD, ODA/Teigha-based tools) reject or force-repair. R12 has no `$INSUNITS`; the unit (always metres) and, when known, the target CRS are stated in a leading `999` comment instead. Hatched cut polygons are represented as closed POLYLINE boundaries on a dedicated layer rather than a HATCH entity. An optional `coordinateTransform` lets a caller re-derive world/map coordinates before points reach the writer (used by the viewer's "Download DXF" section-panel export, issue [#1861](https://github.com/LTplus-AG/ifc-lite/issues/1861), to georeference plan sections).
+
+- [#1874](https://github.com/LTplus-AG/ifc-lite/pull/1874) [`ae0498a`](https://github.com/LTplus-AG/ifc-lite/commit/ae0498a23d61dd63baede3df86cd2f9ec74b1203) Thanks [@louistrue](https://github.com/louistrue)! - Export `projectTo2DBasis` from the package root.
+
+  It already existed in `math.ts` and is used internally by `section-cutter.ts`
+  for face-picked custom-plane sections, but was never re-exported. The new
+  point-cloud "scan" layer on the 2D section view (issue [#1805](https://github.com/LTplus-AG/ifc-lite/issues/1805)) needs it as a
+  consumer outside the package, to project retained scan points into the same
+  drawing-space coordinates the section cutter produces for custom (non-cardinal)
+  cut planes.
+
+### Patch Changes
+
+- Updated dependencies [[`428c5ae`](https://github.com/LTplus-AG/ifc-lite/commit/428c5ae54bac236a3950f451ee12a0dc23226336), [`3dc3eb5`](https://github.com/LTplus-AG/ifc-lite/commit/3dc3eb56bd372ddd0e317347db1cad888dffd609)]:
+  - @ifc-lite/geometry@3.5.0
+
 ## 1.19.0
 
 ### Minor Changes

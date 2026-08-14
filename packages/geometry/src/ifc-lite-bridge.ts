@@ -11,6 +11,12 @@ import { createLogger } from '@ifc-lite/data';
 import type { KmzAltitudeMode, TessellationQuality } from './types.js';
 import type { GeometryDiagnostics } from './diagnostics.js';
 import { getStartedSharedWasmModule } from './wasm-shared-module.js';
+import {
+  isWasmRuntimeTrap,
+  notifyWasmRuntimeUnrecoverable,
+  wasmRuntimeUnrecoverableError,
+} from './wasm-runtime-trap.js';
+import { initWasmWithRetry } from './wasm-init-retry.js';
 import init, {
   IfcAPI,
   SymbolicRepresentationCollection,
@@ -32,8 +38,6 @@ export type {
 };
 
 const log = createLogger('Geometry');
-const FATAL_WASM_RELOAD_REQUIRED_MESSAGE = 'IFC-Lite WASM cannot recover from a fatal runtime error within the same document lifetime. Reload the page or recreate the worker process before calling init() again.';
-let fatalWasmRuntimeError: Error | null = null;
 
 /**
  * Typed wrapper for the IFC-Lite WASM API including the optional
@@ -89,12 +93,58 @@ export class IfcLiteBridge {
   private skipSmallCuts: boolean = false;
 
   private isWasmRuntimeError(error: unknown): boolean {
-    return error instanceof WebAssembly.RuntimeError;
+    return isWasmRuntimeTrap(error);
   }
 
-  private markFatalWasmRuntimeError(): void {
-    fatalWasmRuntimeError = new Error(FATAL_WASM_RELOAD_REQUIRED_MESSAGE);
-    this.reset();
+  /**
+   * An operation on THIS bridge's engine took a WebAssembly runtime trap
+   * (#1898). Everything a trap can wedge lives on the `IfcAPI` handle — the
+   * per-load pre-pass / entity / style caches behind its mutexes — so the
+   * recovery is to drop that handle. The next `init()` (on this bridge or any
+   * other) builds a clean one and works; the trap itself propagates to the
+   * caller unchanged, so the failing operation still fails loudly with its own
+   * stack.
+   *
+   * This deliberately does NOT latch any realm-wide state. The previous
+   * behaviour stored one Error in a module global and refused every later
+   * `init()` in the document, which bricked every unrelated main-thread
+   * consumer (model load, grid / drawing meshers, the other exporters) after a
+   * single failed export — while bridges that happened to be initialized
+   * already kept running, so the "unrecoverable" claim contradicted itself.
+   */
+  private recordWasmRuntimeTrap(): void {
+    this.disposeBestEffort();
+  }
+
+  /**
+   * Free the WASM handle if one exists, best-effort, then drop the JS-side
+   * reference either way. `free()` runs Rust code — if the runtime just
+   * trapped (or is what's trapping), `free()` itself can throw or trap
+   * again, so any failure here is logged (never rethrown) and we fall back
+   * to just nulling the reference via `reset()`. This never throws: callers
+   * rely on that so a secondary `free()` failure can never replace/mask
+   * whatever error the caller is already unwinding with.
+   */
+  private disposeBestEffort(): void {
+    try {
+      this.dispose();
+    } catch (error) {
+      // `free()` runs Rust code. If the allocator is what trapped, freeing can
+      // trap again — drop the reference anyway. A secondary failure here must
+      // never replace the original error on its way to the caller, so it's
+      // reported the same way every other catch site in this file reports a
+      // recovered failure: `log.error`. The logger call itself is guarded —
+      // a throwing logger would defeat the entire point of this method,
+      // which callers rely on to never throw.
+      try {
+        log.error('Secondary failure while disposing WASM handle', error, {
+          operation: 'disposeBestEffort',
+        });
+      } catch {
+        // A logger that throws must not escape this best-effort path either.
+      }
+      this.reset();
+    }
   }
 
   /**
@@ -103,9 +153,6 @@ export class IfcLiteBridge {
    */
   async init(): Promise<void> {
     if (this.initialized) return;
-    if (fatalWasmRuntimeError) {
-      throw fatalWasmRuntimeError;
-    }
 
     try {
       // Initialize WASM module. In the browser/worker, wasm-bindgen resolves the
@@ -142,8 +189,20 @@ export class IfcLiteBridge {
       // Browser: init() with no arg fetches from import.meta.url. Node: pass the
       // bytes via the modern object form ({ module_or_path }) to avoid the
       // deprecated positional-bytes signature.
+      //
+      // Wrapped in `initWasmWithRetry` (issue #1903) so one blip on the ~1.3 MB
+      // (brotli) engine download no longer kills the whole load. This was the
+      // only self-fetching `init()` in the app WITHOUT the retry both workers
+      // already use, and it is the one a first-time visitor hits first — a
+      // returning visitor has the binary in the immutable `/assets/*` cache.
+      // `isTransientWasmLoadError` gates the retry, so a corrupt/invalid module
+      // still fails fast; the shared-module and Node paths pass a prebuilt
+      // `Module`/bytes and cannot be transient, so they never retry.
       const initArg = wasmInitArg ?? sharedModule ?? undefined;
-      await init(initArg ? { module_or_path: initArg } : undefined);
+      await initWasmWithRetry(
+        () => init(initArg ? { module_or_path: initArg } : undefined),
+        { label: 'ifc-lite-bridge' },
+      );
 
       // The WASM bundle has no in-WASM thread pool; rayon `par_iter()`
       // (e.g. FacetedBrep preprocessing) runs sequentially on the main
@@ -168,10 +227,31 @@ export class IfcLiteBridge {
       log.error('Failed to initialize WASM geometry engine', error, {
         operation: 'init',
       });
+      // `init()` can throw after `this.ifcApi = new IfcAPI()` (line ~189) —
+      // any of the four `apply*` replay calls below it can throw or trap.
+      // A handle built here and then abandoned on this catch path must be
+      // freed, not just have its reference dropped, or it leaks for the
+      // life of the document (it's a `null` handle no `dispose()` can ever
+      // reach again). Best-effort: freeing itself can re-trap (see
+      // `disposeBestEffort`), and either way this never throws, so it can't
+      // mask the real error below — including on the fatal
+      // `isWasmRuntimeError` branch, where the written recovery contract in
+      // `wasm-runtime-trap.ts` is the same "drop (and free) the handle,
+      // propagate the trap unchanged" rule every other call site already
+      // follows via `recordWasmRuntimeTrap`.
+      this.disposeBestEffort();
       if (this.isWasmRuntimeError(error)) {
-        this.markFatalWasmRuntimeError();
-      } else {
-        this.reset();
+        // The one genuinely unrecoverable case: the engine trapped while
+        // standing itself up. Any `IfcAPI` handle that did exist was just
+        // best-effort freed above; either way this realm has no working
+        // engine to fall back on. Report it as such — freshly constructed so
+        // the stack is this throw site, carrying the trap as `cause` — and
+        // tell the host, which offers the user a reload. The verdict is
+        // advisory, not a latch: a later `init()` still tries, so no
+        // unrelated consumer is disabled by it. (#1898)
+        const fatal = wasmRuntimeUnrecoverableError(error, 'init');
+        notifyWasmRuntimeUnrecoverable(fatal);
+        throw fatal;
       }
       throw error;
     }
@@ -231,7 +311,7 @@ export class IfcLiteBridge {
         data: { contentLength: content.length },
       });
       if (this.isWasmRuntimeError(error)) {
-        this.markFatalWasmRuntimeError();
+        this.recordWasmRuntimeTrap();
       }
       throw error;
     }
@@ -257,7 +337,7 @@ export class IfcLiteBridge {
         data: { contentLength: content.length },
       });
       if (this.isWasmRuntimeError(error)) {
-        this.markFatalWasmRuntimeError();
+        this.recordWasmRuntimeTrap();
       }
       throw error;
     }
@@ -285,7 +365,7 @@ export class IfcLiteBridge {
         data: { contentLength: content.length },
       });
       if (this.isWasmRuntimeError(error)) {
-        this.markFatalWasmRuntimeError();
+        this.recordWasmRuntimeTrap();
       }
       throw error;
     }
@@ -311,7 +391,7 @@ export class IfcLiteBridge {
         data: { contentLength: content.length },
       });
       if (this.isWasmRuntimeError(error)) {
-        this.markFatalWasmRuntimeError();
+        this.recordWasmRuntimeTrap();
       }
       throw error;
     }
@@ -340,7 +420,7 @@ export class IfcLiteBridge {
         data: { contentLength: content.length },
       });
       if (this.isWasmRuntimeError(error)) {
-        this.markFatalWasmRuntimeError();
+        this.recordWasmRuntimeTrap();
       }
       throw error;
     }
@@ -377,7 +457,7 @@ export class IfcLiteBridge {
     } catch (error) {
       log.error('Failed to diagnose geometry', error, { operation: 'diagnoseGeometry' });
       if (this.isWasmRuntimeError(error)) {
-        this.markFatalWasmRuntimeError();
+        this.recordWasmRuntimeTrap();
       }
       throw error;
     }
@@ -456,7 +536,7 @@ export class IfcLiteBridge {
     } catch (error) {
       log.error('Failed to exportMerged', error, { operation: 'exportMerged' });
       if (this.isWasmRuntimeError(error)) {
-        this.markFatalWasmRuntimeError();
+        this.recordWasmRuntimeTrap();
       }
       throw error;
     }
@@ -467,6 +547,11 @@ export class IfcLiteBridge {
     return this.runExport('exportIfcx', content, (api) =>
       api.exportIfcx(content, onlyKnownProperties, pretty),
     );
+  }
+
+  /** Export OpenUSD (`.usda` ASCII) — a real Z-up USD stage (geometry-backed). */
+  exportUsd(content: Uint8Array): Uint8Array {
+    return this.runExport('exportUsd', content, (api) => api.exportUsd(content));
   }
 
   /**
@@ -514,7 +599,7 @@ export class IfcLiteBridge {
     } catch (error) {
       log.error('Failed to exportGlbFromMeshes', error, { operation: 'exportGlbFromMeshes' });
       if (this.isWasmRuntimeError(error)) {
-        this.markFatalWasmRuntimeError();
+        this.recordWasmRuntimeTrap();
       }
       throw error;
     }
@@ -554,7 +639,7 @@ export class IfcLiteBridge {
     } catch (error) {
       log.error('Failed to simplifyMeshes', error, { operation: 'simplifyMeshes' });
       if (this.isWasmRuntimeError(error)) {
-        this.markFatalWasmRuntimeError();
+        this.recordWasmRuntimeTrap();
       }
       throw error;
     }
@@ -582,7 +667,7 @@ export class IfcLiteBridge {
     } catch (error) {
       log.error('Failed to exportKmz', error, { operation: 'exportKmz' });
       if (this.isWasmRuntimeError(error)) {
-        this.markFatalWasmRuntimeError();
+        this.recordWasmRuntimeTrap();
       }
       throw error;
     }
@@ -624,7 +709,7 @@ export class IfcLiteBridge {
     } catch (error) {
       log.error('Failed to exportKmzFromMeshes', error, { operation: 'exportKmzFromMeshes' });
       if (this.isWasmRuntimeError(error)) {
-        this.markFatalWasmRuntimeError();
+        this.recordWasmRuntimeTrap();
       }
       throw error;
     }
@@ -640,6 +725,16 @@ export class IfcLiteBridge {
   }
 
   /**
+   * Export the `IfcSpace` volumes in `content` as a Dragonfly DFJSON string
+   * (Ladybug Tools energy model). Each space becomes an extruded `Room2D`
+   * (floor polygon + height) grouped into stories — the simpler target for
+   * mostly-vertical-wall models.
+   */
+  exportDfjson(content: Uint8Array, name: string): string {
+    return this.runExport('exportDfjson', content, (api) => api.exportDfjson(content, name));
+  }
+
+  /**
    * Shared wrapper for the domain-format exporters: init guard + structured error
    * logging + fatal-wasm-error marking, mirroring the other bridge entry points.
    */
@@ -652,7 +747,7 @@ export class IfcLiteBridge {
     } catch (error) {
       log.error(`Failed to ${op}`, error, { operation: op, data: { contentLength: content.length } });
       if (this.isWasmRuntimeError(error)) {
-        this.markFatalWasmRuntimeError();
+        this.recordWasmRuntimeTrap();
       }
       throw error;
     }

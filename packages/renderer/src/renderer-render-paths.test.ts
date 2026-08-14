@@ -5,16 +5,20 @@
 import { describe, it, mock } from 'node:test';
 import assert from 'node:assert';
 import { Renderer } from './index.js';
-import type { MeshData, RenderOptions, BatchedMesh } from './types.js';
+import { Picker } from './picker.js';
+import type { MeshData } from '@ifc-lite/geometry';
+import type { RenderOptions, BatchedMesh } from './types.js';
 
 /**
  * Drives the REAL render() loop against a stub GPU so the frame-lifecycle
  * fixes are exercised end to end without a browser: error-scope push/pop
  * balance on every exit path, destroy() idempotency, content-based
  * visibility epochs reaching the batched draw path, partial-cache
- * drop/rebuild on hide/isolate toggling, and hydrated-mesh disposal across
- * selections and federated models. The stub records buffer creates/destroys
- * and draw calls; everything else (Scene, Camera, batching, caches) is real.
+ * drop/rebuild on hide/isolate toggling, hydrated-mesh disposal across
+ * selections and federated models, and the pick path's device-liveness
+ * guard. The stub records buffer creates/destroys, draw calls and
+ * `mapAsync` readbacks; everything else (Scene, Camera, batching, caches,
+ * Picker, PickingManager) is real.
  */
 
 // WebGPU enum globals used by Scene buffer creation (not defined in node).
@@ -26,10 +30,19 @@ import type { MeshData, RenderOptions, BatchedMesh } from './types.js';
     COPY_SRC: 1, COPY_DST: 2, TEXTURE_BINDING: 4, STORAGE_BINDING: 8, RENDER_ATTACHMENT: 16,
 };
 
+/**
+ * Verbatim Chromium/Dawn wording when a pending (or newly issued) buffer map
+ * is completed by wire-client shutdown — i.e. the GPU device behind it is
+ * destroyed or lost. This is the exact string reported in #1901.
+ */
+const MAP_ASYNC_ABORT =
+    "Failed to execute 'mapAsync' on 'GPUBuffer': A valid external Instance reference no longer exists.";
+
 interface FakeBuffer {
     size: number;
     destroyed: number;
     getMappedRange(): ArrayBuffer;
+    mapAsync(mode: number): Promise<void>;
     unmap(): void;
     destroy(): void;
 }
@@ -42,6 +55,10 @@ interface Harness {
         /** vertex buffer bound at slot 0 when each drawIndexed fired */
         draws: unknown[];
         createdBuffers: FakeBuffer[];
+        /** how many times a readback buffer was actually mapped */
+        mapAsync: number;
+        /** every `queue.writeBuffer` payload, copied at call time */
+        writes: { buffer: unknown; floats: Float32Array }[];
     };
     knobs: {
         /** 'texture' = getCurrentTexture succeeds; 'null' = returns null */
@@ -50,15 +67,36 @@ interface Harness {
         encodeThrows: boolean;
         /** make popErrorScope() reject (device lost while scope pending) */
         popRejects: boolean;
+        /**
+         * The GPU device behind the stub is gone (destroyed by us, or lost to a
+         * driver reset / GPU-process crash). Set automatically by
+         * `device.destroy()`; set by hand to model an involuntary loss, where
+         * the device object stays wired up but every map rejects.
+         */
+        gpuDead: boolean;
+        /**
+         * Park every `mapAsync` instead of resolving it, so a test can land a
+         * teardown *while a readback is in flight* — the window no entry guard
+         * can close. `settlePendingMaps()` decides how each parked map ends.
+         */
+        deferMaps: boolean;
     };
     render(options?: RenderOptions): void;
     /** flush the popErrorScope() promise chains */
     settle(): Promise<void>;
+    /** number of `mapAsync` calls currently parked (deferMaps) */
+    pendingMaps(): number;
+    /** complete every parked map: resolve it, or reject it with `reason` */
+    settlePendingMaps(reason?: unknown): void;
 }
 
 function makeHarness(): Harness {
-    const stats: Harness['stats'] = { push: 0, pop: 0, draws: [], createdBuffers: [] };
-    const knobs: Harness['knobs'] = { textureMode: 'texture', encodeThrows: false, popRejects: false };
+    const stats: Harness['stats'] = { push: 0, pop: 0, draws: [], createdBuffers: [], mapAsync: 0, writes: [] };
+    const knobs: Harness['knobs'] = {
+        textureMode: 'texture', encodeThrows: false, popRejects: false, gpuDead: false,
+        deferMaps: false,
+    };
+    const parkedMaps: { resolve: () => void; reject: (e: unknown) => void }[] = [];
 
     const makeBuffer = (desc: { size: number }): FakeBuffer => {
         const buf: FakeBuffer & { _ab: ArrayBuffer } = {
@@ -66,6 +104,18 @@ function makeHarness(): Harness {
             destroyed: 0,
             _ab: new ArrayBuffer(desc.size),
             getMappedRange() { return this._ab; },
+            mapAsync() {
+                stats.mapAsync++;
+                // Same failure mode as the browser: a map issued against a dead
+                // device rejects rather than resolving.
+                if (knobs.gpuDead) {
+                    return Promise.reject(new DOMException(MAP_ASYNC_ABORT, 'AbortError'));
+                }
+                if (knobs.deferMaps) {
+                    return new Promise<void>((resolve, reject) => { parkedMaps.push({ resolve, reject }); });
+                }
+                return Promise.resolve();
+            },
             unmap() { /* no-op */ },
             destroy() { this.destroyed++; },
         };
@@ -100,7 +150,17 @@ function makeHarness(): Harness {
     });
 
     const queue = {
-        writeBuffer() { /* no-op */ },
+        // Copied eagerly: the renderer reuses one scratch array for every
+        // per-mesh uniform, so holding the reference would read back only the
+        // LAST value written in the frame.
+        writeBuffer(buffer: unknown, _offset: number, data: ArrayBufferView | ArrayBuffer) {
+            const floats = ArrayBuffer.isView(data)
+                ? new Float32Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength))
+                : new Float32Array(data.slice(0));
+            stats.writes.push({ buffer, floats });
+        },
+        writeTexture() { /* no-op */ },
+        copyExternalImageToTexture() { /* no-op */ },
         submit() { /* no-op */ },
         onSubmittedWorkDone() { return Promise.resolve(); },
     };
@@ -119,7 +179,24 @@ function makeHarness(): Harness {
                 case 'createCommandEncoder': return () => encoder;
                 case 'createBuffer': return (desc: { size: number }) => makeBuffer(desc);
                 case 'createBindGroup': return () => ({});
-                case 'createTexture': return () => ({ createView: () => ({}), destroy() { /* no-op */ } });
+                case 'createTexture': return (desc: { size: { width: number; height: number } }) => ({
+                    width: desc.size.width,
+                    height: desc.size.height,
+                    createView: () => ({}),
+                    destroy() { /* no-op */ },
+                });
+                // Picker builds real pipelines in its constructor and binds
+                // through the auto layout, so both arms must return objects.
+                case 'createShaderModule': return () => ({});
+                case 'createRenderPipeline': return () => ({ getBindGroupLayout: () => ({}) });
+                // Destroying a device also completes every map still pending
+                // against it — with an AbortError, exactly as Chromium does.
+                case 'destroy': return () => {
+                    knobs.gpuDead = true;
+                    for (const m of parkedMaps.splice(0)) {
+                        m.reject(new DOMException(MAP_ASYNC_ABORT, 'AbortError'));
+                    }
+                };
                 default: return () => undefined;
             }
         },
@@ -179,6 +256,12 @@ function makeHarness(): Harness {
             await Promise.resolve();
             await Promise.resolve();
             await Promise.resolve();
+        },
+        pendingMaps() { return parkedMaps.length; },
+        settlePendingMaps(reason?: unknown) {
+            for (const m of parkedMaps.splice(0)) {
+                if (reason === undefined) m.resolve(); else m.reject(reason);
+            }
         },
     };
 }
@@ -515,5 +598,311 @@ describe('ghostIds em geometria de streaming (o caminho do coordly-embed)', () =
         for (const clone of clones) {
             assert.ok(h.stats.draws.includes(clone.vertexBuffer), 'o sub-batch fantasma precisa desenhar');
         }
+    });
+});
+
+/**
+ * Regression for #1901: an unhandled `AbortError` from `mapAsync` on every
+ * click after the GPU device went away.
+ *
+ * `render()` has always early-returned on a destroyed/lost device; the pick
+ * path did not. A pick is a full GPU round trip ending in a `mapAsync`
+ * readback, so once the device is gone that readback rejects — and the DOM
+ * click/contextmenu handlers that reach here are `async` listeners whose
+ * promise nobody awaits, so the rejection escapes unhandled. Not a one-shot
+ * teardown race: the picker stays dead, so it fired once per click (three
+ * aborts 0.8 s apart in one production session).
+ *
+ * Every assertion below is on `stats.mapAsync`, not just on the returned
+ * value: the fix must short-circuit BEFORE the GPU call. A try/catch around
+ * the readback would still report a non-zero count and fail these.
+ */
+describe('pick path survives a dead GPU device (#1901)', () => {
+    /** Wire a REAL Picker into the renderer (init() needs a browser). */
+    function installPicker(h: Harness): Picker {
+        const picker = new Picker(h.renderer['device'], 256, 256);
+        (h.renderer as unknown as Record<string, unknown>)['picker'] = picker;
+        h.renderer['pickingManager'].setPicker(picker);
+        return picker;
+    }
+
+    /** Model an involuntary loss (driver reset / GPU-process crash). */
+    function loseDevice(h: Harness): void {
+        h.knobs.gpuDead = true;
+        h.renderer['handleDeviceLost']({ message: 'device lost', reason: 'unknown' });
+    }
+
+    it('positive control: a healthy pick really does reach the mapAsync readback', async () => {
+        const h = makeHarness();
+        installPicker(h);
+        // Resolves null because the stub reads back a zeroed sample (no hit);
+        // the readback COUNT is what proves the pass ran, not the value.
+        assert.strictEqual(await h.renderer.pick(10, 10), null);
+        assert.strictEqual(h.stats.mapAsync, 2, 'pick() maps the colour + depth readbacks');
+
+        h.stats.mapAsync = 0;
+        assert.deepStrictEqual(await h.renderer.pickRect(0, 0, 8, 8), new Set());
+        assert.strictEqual(h.stats.mapAsync, 1, 'pickRect() maps the rect readback');
+    });
+
+    it('pick() after destroy() resolves null instead of rejecting with AbortError', async () => {
+        const h = makeHarness();
+        installPicker(h);
+        h.renderer.destroy();
+
+        h.stats.mapAsync = 0;
+        assert.strictEqual(await h.renderer.pick(10, 10), null);
+        assert.strictEqual(h.stats.mapAsync, 0, 'guard must fire before the GPU readback');
+    });
+
+    it('pick() after an involuntary device loss resolves null instead of rejecting', async () => {
+        const h = makeHarness();
+        installPicker(h);
+        // The production shape: renderer still mounted, canvas frozen, user
+        // keeps clicking. Every click used to mint an unhandled rejection.
+        loseDevice(h);
+
+        h.stats.mapAsync = 0;
+        for (let i = 0; i < 3; i++) {
+            assert.strictEqual(await h.renderer.pick(10, 10), null);
+        }
+        assert.strictEqual(h.stats.mapAsync, 0, 'no click may reach the GPU readback');
+    });
+
+    it('pickRect() resolves an empty set after destroy() and after device loss', async () => {
+        const destroyed = makeHarness();
+        installPicker(destroyed);
+        destroyed.renderer.destroy();
+        destroyed.stats.mapAsync = 0;
+        assert.deepStrictEqual(await destroyed.renderer.pickRect(0, 0, 8, 8), new Set());
+        assert.strictEqual(destroyed.stats.mapAsync, 0);
+
+        const lost = makeHarness();
+        installPicker(lost);
+        loseDevice(lost);
+        lost.stats.mapAsync = 0;
+        assert.deepStrictEqual(await lost.renderer.pickRect(0, 0, 8, 8), new Set());
+        assert.strictEqual(lost.stats.mapAsync, 0);
+    });
+
+    it('Picker itself is inert after destroy() (it is a public export, usable standalone)', async () => {
+        const h = makeHarness();
+        const picker = installPicker(h);
+        const viewProj = new Float32Array(16);
+        picker.destroy();
+        h.knobs.gpuDead = true;
+
+        h.stats.mapAsync = 0;
+        assert.strictEqual(await picker.pick(10, 10, 256, 256, [], viewProj), null);
+        assert.deepStrictEqual(await picker.pickRect(0, 0, 8, 8, 256, 256, [], viewProj), new Set());
+        assert.strictEqual(h.stats.mapAsync, 0);
+    });
+
+    it('destroy() clears the picker the PickingManager holds, not just the renderer\'s', () => {
+        const h = makeHarness();
+        installPicker(h);
+        h.renderer.destroy();
+        assert.strictEqual(h.renderer['pickingManager']['picker'], null,
+            'a dangling manager reference keeps driving destroyed GPU resources');
+    });
+});
+
+/**
+ * Second half of #1901: the window the entry guards CANNOT close.
+ *
+ * A pick that was perfectly legal when it started is still aborted if the
+ * device dies between `queue.submit()` and the `mapAsync` settling — the
+ * canvas unmounts, the model reloads (`Renderer.destroy()` ends in
+ * `device.destroy()`), or the driver resets. Same `AbortError`, same async
+ * stack (the awaiting `pick` frames are preserved), same unhandled rejection,
+ * because the DOM listeners that reach here are `async` functions nobody
+ * awaits.
+ *
+ * These tests deliberately let the readback RUN (`stats.mapAsync > 0`) — that
+ * is the whole point, the guard already fired for everything it can see.
+ */
+describe('pick path survives the device dying mid-readback (#1901)', () => {
+    function installPicker(h: Harness): Picker {
+        const picker = new Picker(h.renderer['device'], 256, 256);
+        (h.renderer as unknown as Record<string, unknown>)['picker'] = picker;
+        h.renderer['pickingManager'].setPicker(picker);
+        return picker;
+    }
+
+    /**
+     * Run the pick up to the point where it is parked on `mapAsync`. Boxed in
+     * an object because `await` unwraps a promise-of-a-promise — returning the
+     * in-flight promise directly would await the very thing we want to keep
+     * parked.
+     */
+    async function park(h: Harness, start: () => Promise<unknown>): Promise<{ inflight: Promise<unknown> }> {
+        h.knobs.deferMaps = true;
+        const inflight = start();
+        for (let i = 0; i < 5; i++) await Promise.resolve();
+        assert.ok(h.pendingMaps() > 0, 'pick should be parked on the mapAsync readback');
+        return { inflight };
+    }
+
+    it('pick() parked on mapAsync when destroy() lands resolves null, not AbortError', async () => {
+        const h = makeHarness();
+        installPicker(h);
+        const { inflight } = await park(h, () => h.renderer.pick(10, 10));
+        h.renderer.destroy();
+        assert.strictEqual(await inflight, null);
+        assert.ok(h.stats.mapAsync > 0, 'the readback really was in flight');
+    });
+
+    it('pickRect() parked on mapAsync when destroy() lands resolves empty, not AbortError', async () => {
+        const h = makeHarness();
+        installPicker(h);
+        const { inflight } = await park(h, () => h.renderer.pickRect(0, 0, 8, 8));
+        h.renderer.destroy();
+        assert.deepStrictEqual(await inflight, new Set());
+    });
+
+    it('an involuntary loss mid-readback degrades the same way', async () => {
+        const h = makeHarness();
+        installPicker(h);
+        const { inflight } = await park(h, () => h.renderer.pick(10, 10));
+        h.knobs.gpuDead = true;
+        h.renderer['handleDeviceLost']({ message: 'device lost', reason: 'unknown' });
+        h.settlePendingMaps(new DOMException(MAP_ASYNC_ABORT, 'AbortError'));
+        assert.strictEqual(await inflight, null);
+    });
+
+    it('overlapping picks are all released, not just the newest', async () => {
+        const h = makeHarness();
+        installPicker(h);
+        h.knobs.deferMaps = true;
+        const first = h.renderer.pick(10, 10);
+        for (let i = 0; i < 3; i++) await Promise.resolve();
+        const second = h.renderer.pick(20, 20);
+        for (let i = 0; i < 3; i++) await Promise.resolve();
+        // Without this the case can pass vacuously: if the picks need more
+        // microtask turns to reach mapAsync than we spun, destroy() lands
+        // before submit and both settle via the ENTRY guard, never exercising
+        // the overlapping-in-flight release this case exists to cover.
+        // Two picks x (colour + depth) = 4 parked readbacks.
+        assert.strictEqual(h.pendingMaps(), 4, 'both picks must be parked on their readbacks');
+        h.renderer.destroy();
+        const settled = await Promise.allSettled([first, second]);
+        assert.deepStrictEqual(settled.map((s) => s.status), ['fulfilled', 'fulfilled']);
+    });
+
+    it('a REAL readback fault still propagates — the catch is not a blanket swallow', async () => {
+        const h = makeHarness();
+        installPicker(h);
+        const { inflight } = await park(h, () => h.renderer.pick(10, 10));
+        // Validation failures reject with OperationError, never AbortError.
+        h.settlePendingMaps(new DOMException('Buffer is already mapped', 'OperationError'));
+        await assert.rejects(inflight, /already mapped/);
+
+        const rect = makeHarness();
+        installPicker(rect);
+        const rectInflight = await park(rect, () => rect.renderer.pickRect(0, 0, 8, 8));
+        rect.settlePendingMaps(new DOMException('Buffer is already mapped', 'OperationError'));
+        await assert.rejects(rectInflight.inflight, /already mapped/);
+    });
+
+    it('a REAL readback fault still frees the readback buffers on its way out', async () => {
+        // #1901: the abort path released the readbacks but the rethrow path did
+        // not, so every real fault leaked its GPU allocation for the life of the
+        // device. Promise.all rejects the moment ONE map fails, so the other
+        // buffer can be mapped and live at that point — both must be freed.
+        const h = makeHarness();
+        installPicker(h);
+        const before = h.stats.createdBuffers.length;
+        const { inflight } = await park(h, () => h.renderer.pick(10, 10));
+        h.settlePendingMaps(new DOMException('Buffer is already mapped', 'OperationError'));
+        await assert.rejects(inflight, /already mapped/);
+
+        const readbacks = h.stats.createdBuffers.slice(before);
+        assert.strictEqual(readbacks.length, 2, 'pick() allocates the colour + depth readbacks');
+        for (const buf of readbacks) {
+            assert.ok(buf.destroyed > 0, 'a readback buffer survived the rethrow — leaked');
+        }
+    });
+});
+
+/**
+ * #1973 — the textured sub-pass must carry each mesh's per-element `origin` as
+ * its model translation. It used to hoist `tpl[28..30] = 0` out of the loop,
+ * which was right only for the orphan type-geometry path (absolute positions,
+ * `origin == 0`) and drew every textured occurrence offset by `-origin`.
+ *
+ * The scene-side bookkeeping is covered in `scene-textured-origin.test.ts`;
+ * this asserts the value that actually reaches the GPU.
+ */
+function texturedTriangle(expressId: number, origin?: [number, number, number]): MeshData {
+    return {
+        expressId,
+        positions: new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]),
+        normals: new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1]),
+        indices: new Uint32Array([0, 1, 2]),
+        color: [1, 1, 1, 1],
+        uvs: new Float32Array([0, 0, 1, 0, 0, 1]),
+        texture: { width: 1, height: 1, data: new Uint8Array([255, 255, 255, 255]) },
+        ...(origin ? { origin } : {}),
+    } as unknown as MeshData;
+}
+
+/** The model-matrix translation column of the uniform written for `tm`. */
+function translationFor(h: Harness, uniformBuffer: unknown): number[] | null {
+    for (let i = h.stats.writes.length - 1; i >= 0; i--) {
+        const w = h.stats.writes[i];
+        if (w.buffer === uniformBuffer && w.floats.length > 30) {
+            return [w.floats[28], w.floats[29], w.floats[30]];
+        }
+    }
+    return null;
+}
+
+describe('textured sub-pass carries the per-element origin (#1973)', () => {
+    const ORIGIN: [number, number, number] = [12.5, 10.5, -3.25];
+
+    function seedTextured(h: Harness, meshes: MeshData[]) {
+        const scene = h.renderer.getScene();
+        const device = h.renderer['device'].getDevice();
+        const pipeline = h.renderer['pipeline'] as never;
+        scene.appendToBatches(meshes, device, pipeline, false);
+        return scene.getTexturedMeshes();
+    }
+
+    it('writes the mesh origin into the model translation', () => {
+        const h = makeHarness();
+        const textured = seedTextured(h, [texturedTriangle(1, ORIGIN)]);
+        assert.strictEqual(textured.length, 1);
+
+        h.stats.writes.length = 0;
+        h.render();
+
+        assert.deepStrictEqual(translationFor(h, textured[0].uniformBuffer), ORIGIN);
+    });
+
+    it('writes zero for a mesh whose positions are already absolute', () => {
+        // The #961 orphan type-geometry path: `transform_mesh_local` leaves
+        // positions in world space and sets no origin.
+        const h = makeHarness();
+        const textured = seedTextured(h, [texturedTriangle(1)]);
+
+        h.stats.writes.length = 0;
+        h.render();
+
+        assert.deepStrictEqual(translationFor(h, textured[0].uniformBuffer), [0, 0, 0]);
+    });
+
+    it('gives each textured mesh its OWN origin, not the last one written', () => {
+        // The bug class this replaces was a single hoisted write shared by every
+        // mesh in the pass, so per-mesh divergence is the property that matters.
+        const h = makeHarness();
+        const other: [number, number, number] = [-4, 0.5, 88];
+        const textured = seedTextured(h, [texturedTriangle(1, ORIGIN), texturedTriangle(2, other)]);
+        assert.strictEqual(textured.length, 2);
+
+        h.stats.writes.length = 0;
+        h.render();
+
+        assert.deepStrictEqual(translationFor(h, textured[0].uniformBuffer), ORIGIN);
+        assert.deepStrictEqual(translationFor(h, textured[1].uniformBuffer), other);
     });
 });

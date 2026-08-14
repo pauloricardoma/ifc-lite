@@ -3,18 +3,29 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * Classification + humanisation of model-load failures.
+ * Classification of model-load failures. This module owns the taxonomy and the
+ * ORDER the buckets are tried in; the user-facing humanisation lives in
+ * ./load-error-message.ts, and the two families whose matchers carry more
+ * rationale than pattern have their own modules (./webgl-unavailable.ts,
+ * ./cancelled-and-network-errors.ts) rather than a longer file here.
  *
- * The geometry/parser workers both initialise the same `@ifc-lite/wasm`
- * binary. wasm-bindgen's streaming loader rethrows on a non-OK HTTP status
- * (it only falls back for the wrong-MIME case), surfacing as a cryptic
- * `TypeError: Failed to execute 'compile' on 'WebAssembly': HTTP status code
- * is not ok`. That message is meaningless to a user and, captured raw, is
- * hard to triage in error tracking.
+ * Despite the name, this is the viewer's ONLY error-family classifier —
+ * `analytics-scrub.ts` runs it over every captured `$exception` — so a non-load
+ * family needing grouping belongs here too, not in a second one that would
+ * drift. The sibling modules are not that: they hold a family's WORDINGS, while
+ * every kind and the order it is tried in stays in {@link classifyLoadError}.
  *
- * This module maps such failures to a stable `kind` (for analytics
- * grouping) and a human-readable message (for the toast / model loadError).
+ * The geometry/parser workers both initialise the same `@ifc-lite/wasm` binary.
+ * wasm-bindgen's streaming loader rethrows on a non-OK HTTP status (it only
+ * falls back for the wrong-MIME case), surfacing as a cryptic `TypeError:
+ * Failed to execute 'compile' on 'WebAssembly': HTTP status code is not ok` —
+ * meaningless to a user and, captured raw, hard to triage. This module maps
+ * such failures to a stable `kind` for analytics grouping; `formatLoadError` in
+ * ./load-error-message.ts turns that kind into the user-facing message.
  */
+
+import { isCancelledError, isNetworkUnavailableError } from './cancelled-and-network-errors.js';
+import { isWebglUnavailable } from './webgl-unavailable.js';
 
 /** Stable, analytics-friendly classification of a load failure. */
 export type LoadErrorKind =
@@ -46,8 +57,38 @@ export type LoadErrorKind =
    * the user just needs to pick the file again.
    */
   | 'file_unreadable'
+  /**
+   * The WebAssembly geometry engine trapped at runtime on THIS thread — a Rust
+   * panic, a failed `assert!` or an allocator abort, all of which reach JS
+   * identically as `RuntimeError: unreachable` (`panic = "abort"`). Distinct
+   * from `geometry_worker_crash`, which is the same class of failure inside a
+   * worker: there the worker dies and is replaced, here the trap surfaces
+   * straight to the caller. Also covers the `WASM_RUNTIME_UNRECOVERABLE`
+   * marker, which the engine raises when it trapped while initializing and
+   * therefore cannot be rebuilt without a page reload (#1898).
+   */
+  | 'wasm_runtime_crashed'
   /** The user (or a superseding load) cancelled the operation. */
   | 'cancelled'
+  /**
+   * A fetch failed at the transport layer and the browser told us nothing else
+   * (the per-engine wordings are enumerated on `BARE_TRANSPORT_FAILURE`, in
+   * ./cancelled-and-network-errors.ts).
+   * The connection dropped, went offline, or was killed mid-flight. Nothing in
+   * the app is broken, so this is deliberately the LAST bucket checked: any
+   * failure that identified itself keeps its own kind.
+   */
+  | 'network_unavailable'
+  /**
+   * The browser refused a WebGL context: to the location minimap (#2354) or to
+   * either `/mcp` three.js scene (#2458). Not a load failure and never reaches
+   * `formatLoadError`; classified so the family gets ONE fingerprint instead of
+   * one issue per deploy and per wording. Membership is by MESSAGE, not by who
+   * caught it, and both libraries' wordings live together in
+   * ./webgl-unavailable.ts — anchored, so an error that merely MENTIONS one of
+   * the phrases keeps its own identity and its `error` severity.
+   */
+  | 'webgl_unavailable'
   /** Anything else. */
   | 'unknown';
 
@@ -63,7 +104,8 @@ function errorNameOf(err: unknown): string {
   return typeof name === 'string' ? name : '';
 }
 
-function messageOf(err: unknown): string {
+/** Exported for ./load-error-message.ts, which needs the same stringification. */
+export function messageOf(err: unknown): string {
   if (err instanceof Error) return err.message;
   if (typeof err === 'string') return err;
   return String(err);
@@ -155,8 +197,30 @@ function isGeometryWorkerCrashError(message: string): boolean {
   return /geometry worker (?:failed|error|crashed|terminated)/i.test(message);
 }
 
-function isCancelledError(message: string): boolean {
-  return /\bcancel(?:led|ed)?\b|aborterror|the operation was aborted/i.test(message);
+/**
+ * A bare WebAssembly trap that reached us on this thread (#1898). Before this
+ * bucket existed such a trap fell through to `unknown`, so the user was shown
+ * the raw engine text and error tracking could not group the family at all —
+ * which is exactly how the reported occurrence was recorded (`error_kind:
+ * unknown`, message = an internal sentence about recreating a worker process).
+ *
+ * Matched ONLY on hard identity: the error's `.name`, which the spec fixes to
+ * `RuntimeError` for every wasm trap and which survives a cross-realm hop where
+ * `instanceof` does not, or the engine's explicit unrecoverable marker.
+ *
+ * Deliberately NOT matched on trap phrasing in the message. Issue #1196 settled
+ * that a bare "unreachable" / "RuntimeError: …" *string* must stay `unknown`:
+ * on the analytics path (`analytics-scrub`) all we ever have is stringified
+ * text, and the viewer runs other wasm (space-plate, parquet) whose traps would
+ * then be swept into this family's single issue fingerprint. A live error
+ * object carries its `.name`, so nothing real is lost. Checked AFTER the worker
+ * bucket so a worker-attributed trap keeps its own bucket.
+ */
+export const WASM_RUNTIME_UNRECOVERABLE_MARKER = 'WASM_RUNTIME_UNRECOVERABLE'; // == @ifc-lite/geometry's WASM_RUNTIME_UNRECOVERABLE_CODE
+function isWasmRuntimeCrashError(err: unknown, message: string): boolean {
+  return (
+    errorNameOf(err) === 'RuntimeError' || message.includes(WASM_RUNTIME_UNRECOVERABLE_MARKER)
+  );
 }
 
 /** Classify a load failure into a stable analytics bucket. */
@@ -168,62 +232,63 @@ export function classifyLoadError(err: unknown): LoadErrorKind {
   // The `.name` check catches the live DOMException regardless of how the
   // browser worded `.message`; the message match covers the analytics path,
   // where all we have is the already-stringified value.
-  if (errorNameOf(err) === 'NotReadableError' || isFileUnreadableError(message)) {
+  const name = errorNameOf(err);
+  if (name === 'NotReadableError' || isFileUnreadableError(message)) {
     return 'file_unreadable';
   }
+  // Same stable-`.name` argument as NotReadableError above: an aborted fetch
+  // rejects with a DOMException whose `.message` is engine-specific prose that
+  // need not contain the word "abort" at all (WebKit: "Fetch is aborted",
+  // Chromium: "The user aborted a request."). Only `.name` is guaranteed.
+  if (name === 'AbortError') return 'cancelled';
+  // BEFORE the memory/network buckets: MapLibre's failure carries the driver's
+  // own `statusMessage`, vendor prose we do not control and free to contain the
+  // words those matchers key on ("allocation failed"). Safe to claim first —
+  // every arm of it is anchored or structural (see ./webgl-unavailable.ts).
+  if (isWebglUnavailable(err, message)) return 'webgl_unavailable';
   if (isWasmEngineLoadError(message)) return 'wasm_engine_load';
   // Explicit memory-exhaustion signals win over the worker-crash bucket so a
   // worker that died with a clear OOM message is grouped as out_of_memory.
   if (isOutOfMemoryError(message)) return 'out_of_memory';
   if (isStreamStalledError(message)) return 'geometry_stream_stalled';
   if (isGeometryWorkerCrashError(message)) return 'geometry_worker_crash';
+  if (isWasmRuntimeCrashError(err, message)) return 'wasm_runtime_crashed';
   if (isCancelledError(message)) return 'cancelled';
+  // Last of the recognised buckets — see `network_unavailable`'s doc comment.
+  if (isNetworkUnavailableError(message)) return 'network_unavailable';
   return 'unknown';
 }
 
 /**
- * Produce a user-facing message for a load failure. Known failure modes get
- * actionable guidance; everything else falls back to the raw error text so we
- * never hide useful detail.
+ * The discriminating properties every `captureException` call site should send
+ * alongside its `context` (issue #1903).
  *
- * @param fileName Optional file name to attribute the failure to.
+ * SPREAD FLAT onto the event — posthog-js takes the second argument as the
+ * event's properties, so nesting these under a wrapper key would bury them in
+ * a blob that cannot be filtered or broken down on.
+ *
+ * Key naming is load-bearing: `scrubProperties` in ./analytics-scrub.ts deletes
+ * any key containing a `_`-delimited `name`, `url`, `path`, `message`, … word,
+ * so this is `error_type`, never `error_name`, and no URL is ever attached.
+ *
+ * - `error_kind`  the classified family (see {@link classifyLoadError}); drives
+ *                 `$exception_fingerprint` grouping and the severity downgrade.
+ * - `error_type`  the throwable's own identity — a DOMException's stable
+ *                 `.name`, else the constructor name. The one property that
+ *                 survives when the message is two words and the stack empty.
+ * - `online`      `navigator.onLine` at capture time, so a user-side outage can
+ *                 be told apart from a failure of ours. Omitted where the
+ *                 browser doesn't expose it (Node tests).
  */
-export function formatLoadError(err: unknown, fileName?: string): string {
-  const kind = classifyLoadError(err);
-  const subject = fileName ? `"${fileName}"` : 'the model';
-  switch (kind) {
-    case 'wasm_engine_load':
-      return (
-        `Couldn't load the 3D geometry engine — a required file failed to download. ` +
-        `This usually means the app updated in the background, or a proxy/antivirus blocked it. ` +
-        `Please reload the page (Ctrl/Cmd+Shift+R). If it persists, check your network or extensions.`
-      );
-    case 'out_of_memory':
-      return (
-        `Ran out of memory while processing ${subject}. ` +
-        `Try closing other tabs, or load fewer/smaller models at once.`
-      );
-    case 'geometry_worker_crash':
-      return (
-        `A geometry worker stopped unexpectedly while processing ${subject}. ` +
-        `This usually means the model is too large for this device's available memory. ` +
-        `Try closing other tabs, or load fewer/smaller models at once.`
-      );
-    case 'geometry_stream_stalled':
-      return (
-        `Processing ${subject} stalled and was stopped. ` +
-        `The model may be too large or complex for this device. ` +
-        `Try closing other tabs, or load fewer/smaller models at once.`
-      );
-    case 'file_unreadable':
-      return (
-        `Couldn't read ${subject} — the file is no longer available to the browser. ` +
-        `It may have been moved, renamed, deleted, or unloaded by a cloud-sync client ` +
-        `(OneDrive/Dropbox/iCloud) since you picked it. Please select the file again.`
-      );
-    case 'cancelled':
-      return `Loading ${subject} was cancelled.`;
-    default:
-      return `Failed to load ${subject}: ${messageOf(err)}`;
-  }
+export function errorCaptureProps(err: unknown): Record<string, unknown> {
+  const name = errorNameOf(err);
+  const props: Record<string, unknown> = {
+    error_kind: classifyLoadError(err),
+    // `name` is set on every Error and DOMException; the constructor fallback
+    // covers a thrown non-Error (posthog stringifies those, losing even this).
+    error_type: name || (err as { constructor?: { name?: string } })?.constructor?.name || typeof err,
+  };
+  const nav = (globalThis as { navigator?: { onLine?: unknown } }).navigator;
+  if (typeof nav?.onLine === 'boolean') props.online = nav.onLine;
+  return props;
 }
