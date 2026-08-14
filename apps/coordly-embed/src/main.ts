@@ -61,12 +61,16 @@ export function initCoordly3DViewer(config: BimConfig): BimInstance {
   window.bimHelpers = {
     fitToView: () => engine.fitToView(),
     // Árvore espacial e propriedades: dados do MESMO artefato da geometria.
-    hasDataModel: () => engine.hasDataModel(),
-    getSpatialTree: () => engine.getSpatialTree(),
-    getEntityProperties: (expressId: number) => engine.getEntityProperties(expressId),
-    getEntityLabels: (expressIds: number[]) => engine.getEntityLabels(expressIds),
+    // `modelIndex` opcional: na federação cada modelo tem o seu data model, e é
+    // esse índice (o mesmo que a seleção reporta) que diz de qual deles ler.
+    hasDataModel: (modelIndex?: number) => engine.hasDataModel(modelIndex),
+    getSpatialTree: (modelIndex?: number) => engine.getSpatialTree(modelIndex),
+    getEntityProperties: (expressId: number, modelIndex?: number) =>
+      engine.getEntityProperties(expressId, modelIndex),
+    getEntityLabels: (expressIds: number[], modelIndex?: number) =>
+      engine.getEntityLabels(expressIds, modelIndex),
     // Seleção da árvore → 3D (o inverso já sai por 'bim-selection-changed').
-    select: (expressId: number | null, opts?: { frame?: boolean; additive?: boolean }) =>
+    select: (expressId: number | null, opts?: { frame?: boolean; additive?: boolean; modelIndex?: number }) =>
       engine.selectEntity(expressId, opts ?? {}),
     clearSelection: () => engine.clearSelection(),
     // Modo "adicionar à seleção" (o botão da toolbar); Ctrl/Shift no clique
@@ -75,7 +79,7 @@ export function initCoordly3DViewer(config: BimConfig): BimInstance {
     // X-Ray: o não-selecionado fica translúcido. Ligado sozinho no duplo clique.
     setGhostMode: (enabled: boolean) => engine.setGhostMode(enabled),
     focusSelection: () => engine.focusSelection(),
-    frameEntities: (expressIds: number[]) => engine.frameEntities(expressIds),
+    frameEntities: (expressIds: number[], modelIndex?: number) => engine.frameEntities(expressIds, modelIndex),
     isolate: (expressIds: number[] | null) => engine.isolate(expressIds),
     hide: (expressIds: number[]) => engine.hide(expressIds),
     show: (expressIds: number[]) => engine.show(expressIds),
@@ -133,16 +137,19 @@ declare global {
     bimExec: (cmd: string, args?: unknown) => void;
     bimHelpers: {
       fitToView(): void;
-      hasDataModel(): boolean;
-      getSpatialTree(): BimTreeNode[];
-      getEntityProperties(expressId: number): BimEntityProperties | null;
-      getEntityLabels(expressIds: number[]): { expressId: number; name: string }[];
-      select(expressId: number | null, opts?: { frame?: boolean; additive?: boolean }): void;
+      hasDataModel(modelIndex?: number): boolean;
+      getSpatialTree(modelIndex?: number): BimTreeNode[];
+      getEntityProperties(expressId: number, modelIndex?: number): BimEntityProperties | null;
+      getEntityLabels(
+        expressIds: number[],
+        modelIndex?: number,
+      ): { expressId: number; name: string }[];
+      select(expressId: number | null, opts?: { frame?: boolean; additive?: boolean; modelIndex?: number }): void;
       clearSelection(): void;
       setMultiSelect(enabled: boolean): void;
       setGhostMode(enabled: boolean): void;
       focusSelection(): void;
-      frameEntities(expressIds: number[]): void;
+      frameEntities(expressIds: number[], modelIndex?: number): void;
       isolate(expressIds: number[] | null): void;
       hide(expressIds: number[]): void;
       show(expressIds: number[]): void;

@@ -52,7 +52,9 @@ interface EngineEvents {
   }): void;
   // Árvore espacial e propriedades ficam disponíveis; chega depois do render
   // porque o data model é buscado sem bloquear a geometria.
-  onDataModel(detail: { available: boolean }): void;
+  // `modelIndex` presente = data model de UM modelo federado; ausente = viewer
+  // de arquivo unico. E assim que o app sabe a qual modelo a arvore pertence.
+  onDataModel(detail: { available: boolean; modelIndex?: number; modelId?: string }): void;
   /** Modo + lista completa a cada mudança (criar, remover, limpar, sair). */
   onMeasure(detail: { mode: MeasureMode; measurements: Measurement[] }): void;
 }
@@ -83,10 +85,19 @@ const MODEL_ID_STEP = 50_000_000;
 const localExpressId = (expressId: number): number => expressId % MODEL_ID_STEP;
 
 interface FederatedModel {
+  /** Id que o app usa (no Coordly, o urn) — volta nos eventos do data model. */
+  id: string;
   index: number;
   idOffset: number;
   /** Ids (já deslocados) que este modelo pôs na cena — o que `removeModel` tira. */
   ids: Set<number>;
+  /**
+   * Data model DESTE modelo. Na federação cada arquivo tem a sua hierarquia e
+   * as suas propriedades: um store só (o campo `dataStore` do motor, usado no
+   * viewer de arquivo único) seria sobrescrito a cada modelo carregado e o
+   * último venceria.
+   */
+  dataStore: ModelDataStore | null;
 }
 
 // Tipos que o viewer de referência esconde por padrão — espelha
@@ -699,12 +710,19 @@ export class ViewerEngine {
    * de viewer: o modelo continua na tela, só sem árvore/propriedades — por isso
    * não emite `onError` (que dispararia o fallback pro Autodesk).
    */
-  private async loadDataModel(hash: string, serverUrl: string, ifc?: Blob): Promise<void> {
+  private async loadDataModel(
+    hash: string,
+    serverUrl: string,
+    ifc?: Blob,
+    // Modelo federado dono deste data model. Ausente = viewer de arquivo único,
+    // e o store decodificado vai para o campo do motor.
+    target?: FederatedModel,
+  ): Promise<void> {
     const cacheKey = `${hash}-${DEFAULT_OPENING_FILTER}`;
 
     // Rodada curta: se a geometria acabou de ser parseada, o data model está
     // sendo escrito agora e chega em segundos.
-    if (await this.pollDataModel(cacheKey, serverUrl, DATA_MODEL_POLL.quickAttempts)) { return; }
+    if (await this.pollDataModel(cacheKey, serverUrl, DATA_MODEL_POLL.quickAttempts, target)) { return; }
     if (this.disposed) { return; }
 
     // Continuou 202 = cache LEGADO. Todo MISS hoje passa pelo `parquet-stream`,
@@ -716,20 +734,20 @@ export class ViewerEngine {
     // esse cache e abandonamos a resposta (a geometria já está na tela).
     if (!ifc) {
       console.warn('[coordly-embed] data model ausente e sem o .ifc em mãos pra gerar');
-      this.events.onDataModel({ available: false });
+      this.events.onDataModel({ available: false, modelIndex: target?.index, modelId: target?.id });
       return;
     }
 
     console.log('[coordly-embed] data model ausente no cache; disparando extração no server…');
     if (!await this.requestDataModelFill(ifc, serverUrl)) {
-      this.events.onDataModel({ available: false });
+      this.events.onDataModel({ available: false, modelIndex: target?.index, modelId: target?.id });
       return;
     }
 
-    if (await this.pollDataModel(cacheKey, serverUrl, DATA_MODEL_POLL.attempts)) { return; }
+    if (await this.pollDataModel(cacheKey, serverUrl, DATA_MODEL_POLL.attempts, target)) { return; }
     if (this.disposed) { return; }
     console.warn('[coordly-embed] data model não ficou pronto a tempo');
-    this.events.onDataModel({ available: false });
+    this.events.onDataModel({ available: false, modelIndex: target?.index, modelId: target?.id });
   }
 
   /** Devolve `true` quando o data model chegou e foi decodificado. */
@@ -737,6 +755,7 @@ export class ViewerEngine {
     cacheKey: string,
     serverUrl: string,
     attempts: number,
+    target?: FederatedModel,
   ): Promise<boolean> {
     const url = this.serverEndpoint(serverUrl, `api/v1/parse/data-model/${cacheKey}`);
 
@@ -753,10 +772,11 @@ export class ViewerEngine {
 
         const buffer = await res.arrayBuffer();
         if (this.disposed) { return false; }
-        this.dataStore = await ModelDataStore.decode(buffer);
+        const store = await ModelDataStore.decode(buffer);
         if (this.disposed) { return false; }
+        if (target) { target.dataStore = store; } else { this.dataStore = store; }
         console.log(`[coordly-embed] data model pronto (${(buffer.byteLength / 1024 / 1024).toFixed(1)}MB)`);
-        this.events.onDataModel({ available: true });
+        this.events.onDataModel({ available: true, modelIndex: target?.index, modelId: target?.id });
         return true;
       } catch (err: any) {
         if (this.disposed || err?.name === 'AbortError') { return false; }
@@ -898,9 +918,11 @@ export class ViewerEngine {
     if (this.disposed || this.models.has(modelId)) { return; }
     const slot = this.nextModelSlot++;
     const model: FederatedModel = {
+      id: modelId,
       index: slot,
       idOffset: slot * MODEL_ID_STEP,
       ids: new Set<number>(),
+      dataStore: null,
     };
     this.models.set(modelId, model);
 
@@ -910,6 +932,12 @@ export class ViewerEngine {
       const hash = await this.hashBlob(ifcBlob);
       if (this.disposed) { return; }
       await this.renderFromServer(ifcBlob, hash, serverUrl, { additive: true, model });
+      if (this.disposed) { return; }
+
+      // Depois do render, como no viewer de arquivo único: árvore e propriedades
+      // não podem atrasar o primeiro paint. Sem isto o federado renderizava a
+      // geometria e nunca tinha data model — clicar num elemento não trazia nada.
+      void this.loadDataModel(hash, serverUrl, ifcBlob, model);
     } catch (err: any) {
       this.models.delete(modelId); // o modelo não entrou na cena
       if (this.disposed || err?.name === 'AbortError') { return; }
@@ -1015,9 +1043,11 @@ export class ViewerEngine {
     const slot = this.nextModelSlot++;
     const modelIndex = slot;
     const model: FederatedModel = {
+      id: modelId,
       index: slot,
       idOffset: slot * MODEL_ID_STEP,
       ids: new Set<number>(),
+      dataStore: null,
     };
     this.models.set(modelId, model);
     const isFirst = slot === 0;
@@ -1113,20 +1143,41 @@ export class ViewerEngine {
   // Árvore espacial e propriedades (data model)
   // ---------------------------------------------------------------------------
 
-  hasDataModel(): boolean {
-    return this.dataStore !== null;
+  /**
+   * Store do modelo pedido. Os ids que cruzam a ponte são LOCAIS (veja
+   * `emitSelection`), então quem identifica o modelo é o `modelIndex` — o mesmo
+   * que a seleção reporta. Sem índice, é o viewer de arquivo único.
+   */
+  private storeFor(modelIndex?: number): ModelDataStore | null {
+    if (modelIndex === undefined) { return this.dataStore; }
+    for (const model of this.models.values()) {
+      if (model.index === modelIndex) { return model.dataStore; }
+    }
+    return this.dataStore;
   }
 
-  getSpatialTree(): BimTreeNode[] {
-    return this.dataStore?.getSpatialTree() ?? [];
+  hasDataModel(modelIndex?: number): boolean {
+    if (modelIndex !== undefined) { return this.storeFor(modelIndex) !== null; }
+    if (this.dataStore !== null) { return true; }
+    for (const model of this.models.values()) {
+      if (model.dataStore) { return true; }
+    }
+    return false;
   }
 
-  getEntityProperties(expressId: number): BimEntityProperties | null {
-    return this.dataStore?.getEntityProperties(expressId) ?? null;
+  getSpatialTree(modelIndex?: number): BimTreeNode[] {
+    return this.storeFor(modelIndex)?.getSpatialTree() ?? [];
   }
 
-  getEntityLabels(expressIds: number[]): { expressId: number; name: string }[] {
-    return this.dataStore?.getEntityLabels(expressIds) ?? [];
+  getEntityProperties(expressId: number, modelIndex?: number): BimEntityProperties | null {
+    return this.storeFor(modelIndex)?.getEntityProperties(expressId) ?? null;
+  }
+
+  getEntityLabels(
+    expressIds: number[],
+    modelIndex?: number,
+  ): { expressId: number; name: string }[] {
+    return this.storeFor(modelIndex)?.getEntityLabels(expressIds) ?? [];
   }
 
   // ---------------------------------------------------------------------------
@@ -1140,7 +1191,7 @@ export class ViewerEngine {
    */
   selectEntity(
     expressId: number | null,
-    opts: { frame?: boolean; additive?: boolean } = {},
+    opts: { frame?: boolean; additive?: boolean; modelIndex?: number } = {},
   ): void {
     if (this.disposed || !this.renderer) { return; }
 
@@ -1149,7 +1200,7 @@ export class ViewerEngine {
     // Vem do app (árvore) com id do arquivo; o highlight compara id da cena.
     const sceneId = this.models.size === 0
       ? expressId
-      : this.sceneIds([expressId])[0] ?? expressId;
+      : this.sceneIds([expressId], opts.modelIndex)[0] ?? expressId;
 
     if (opts.additive || this.multiSelect) {
       if (this.selectedIds.has(sceneId)) { this.selectedIds.delete(sceneId); }
@@ -1159,11 +1210,13 @@ export class ViewerEngine {
       this.selectedIds.add(sceneId);
     }
     this.selectedId = this.selectedIds.has(sceneId) ? sceneId : null;
-    // Seleção externa não sabe de modelIndex; deixar undefined faz o highlight
-    // do caminho flat não filtrar por modelo (o mesmo motivo do pick).
-    this.selectedModelIndex = undefined;
+    // Sem `modelIndex` (viewer de arquivo único, ou app que não informa) fica
+    // undefined, e o highlight do caminho flat não filtra por modelo — mesmo
+    // motivo do pick. Com ele, a seleção reporta o modelo certo, e é isso que
+    // faz as propriedades saírem do data model do arquivo clicado.
+    this.selectedModelIndex = opts.modelIndex;
 
-    if (opts.frame) { this.frameEntities([expressId]); }
+    if (opts.frame) { this.frameEntities([expressId], opts.modelIndex); }
     this.renderer.requestRender();
     this.emitSelection();
   }
@@ -1216,12 +1269,14 @@ export class ViewerEngine {
   }
 
   /** Enquadra a união dos bounding boxes das entidades (zoom-to-selection). */
-  frameEntities(localIds: number[]): void {
+  frameEntities(localIds: number[], modelIndex?: number): void {
     if (this.disposed || !this.renderer || localIds.length === 0) { return; }
     const scene = this.renderer.getScene();
     // Aceita id do arquivo OU da cena: `frameEntities` é chamada tanto pelo app
     // (árvore) quanto internamente pelo foco, que já trabalha com id da cena.
-    const expressIds = this.models.size === 0 ? localIds : this.sceneIds(localIds).concat(localIds);
+    const expressIds = this.models.size === 0
+      ? localIds
+      : this.sceneIds(localIds, modelIndex).concat(localIds);
 
     let min = { x: Infinity, y: Infinity, z: Infinity };
     let max = { x: -Infinity, y: -Infinity, z: -Infinity };
@@ -1247,11 +1302,15 @@ export class ViewerEngine {
    * federado). Single-model não tem offset, então é identidade; no federado um
    * mesmo id pode existir em várias disciplinas e todas entram.
    */
-  private sceneIds(localIds: number[]): number[] {
+  private sceneIds(localIds: number[], modelIndex?: number): number[] {
     if (this.models.size === 0) { return localIds; }
     const out: number[] = [];
     for (const local of localIds) {
       for (const model of this.models.values()) {
+        // Com `modelIndex`, só o modelo pedido. É o que a árvore federada usa:
+        // ela sabe de qual arquivo é o nó, e sem o filtro um id repetido em
+        // outra disciplina entraria junto — destacando o elemento errado.
+        if (modelIndex !== undefined && model.index !== modelIndex) { continue; }
         const sceneId = local + model.idOffset;
         if (model.ids.has(sceneId)) { out.push(sceneId); }
       }
