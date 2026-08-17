@@ -109,6 +109,16 @@ export function getEntityBounds(
     return null;
   }
 
+  return boundsFromMeshes(matchingMeshes);
+}
+
+/**
+ * Aggregate a bounding box across an entity's already-collected submeshes.
+ * Shared by `getEntityBounds` (single id, one `.filter()` pass) and
+ * `unionEntityBounds`'s indexed path (many ids, one shared index) — the
+ * vertex-aggregation loop used to live only in `getEntityBounds`.
+ */
+function boundsFromMeshes(meshes: MeshData[]): BoundingBox3D | null {
   let minX = Infinity,
     minY = Infinity,
     minZ = Infinity;
@@ -118,7 +128,7 @@ export function getEntityBounds(
 
   // Aggregate bounds across all submeshes
   // Filter out corrupted/unshifted vertices (> 10km from origin)
-  for (const mesh of matchingMeshes) {
+  for (const mesh of meshes) {
     // world = origin + position (per-element local frame; absent → absolute).
     const ox = mesh.origin ? mesh.origin[0] : 0;
     const oy = mesh.origin ? mesh.origin[1] : 0;
@@ -148,6 +158,83 @@ export function getEntityBounds(
   return {
     min: { x: minX, y: minY, z: minZ },
     max: { x: maxX, y: maxY, z: maxZ },
+  };
+}
+
+/**
+ * Bucket a flat mesh list by `expressId`, keeping only the meshes
+ * `getEntityBounds` would have kept (`positions.length >= 3`).
+ *
+ * One pass over the array, so a caller that needs bounds for many ids pays
+ * O(meshes + N) instead of the O(N x meshes) of one `getEntityBounds` filter
+ * per id.
+ */
+export function indexMeshesByEntity(geometry: MeshData[]): Map<number, MeshData[]> {
+  const index = new Map<number, MeshData[]>();
+  for (const mesh of geometry) {
+    if (mesh.positions.length < 3) continue;
+    const list = index.get(mesh.expressId);
+    if (list) list.push(mesh);
+    else index.set(mesh.expressId, [mesh]);
+  }
+  return index;
+}
+
+/**
+ * The indexed equivalent of `getEntityBounds` — identical result, no scan.
+ */
+export function boundsFromIndex(
+  index: Map<number, MeshData[]>,
+  entityId: number,
+): BoundingBox3D | null {
+  const meshes = index.get(entityId);
+  return meshes ? boundsFromMeshes(meshes) : null;
+}
+
+/**
+ * Number of unindexed lookups a `createEntityBoundsLookup` reader gets before
+ * it switches to the shared index. A handful of ids (a row click, a clash
+ * pair) is cheaper to answer with one `.filter()` pass each than by building a
+ * Map over the whole mesh array; past that the unindexed cost dominates.
+ */
+const INDEX_AFTER_LOOKUPS = 4;
+
+/**
+ * A bounds reader over a flat mesh list that indexes itself once the caller
+ * asks about more than a handful of ids.
+ *
+ * Every reader returns exactly what `getEntityBounds(geometry, id)` returns —
+ * the index is a lookup strategy, not a different answer. Use this instead of
+ * calling `getEntityBounds` in a loop: an unindexed loop over N ids is
+ * O(N x meshes), which on a large isolate/frame set (the Filter tab's
+ * "Isolate in 3D" #2532, or an assembly whose parts are resolved one by one)
+ * stalls the main thread for seconds.
+ *
+ * Does NOT memoise per id — that stays the caller's job, since callers that
+ * also need the renderer's instanced-occurrence fallback must cache the
+ * combined answer, not this one.
+ *
+ * @param geometry flat mesh list, or null once streaming released it
+ * @param expectedLookups how many ids the caller already knows it will ask
+ *   about, when it knows up front (`unionEntityBounds` has the id array).
+ *   Above the threshold the index is built on the FIRST lookup rather than
+ *   after a few unindexed ones. Callers that discover ids as they go (the
+ *   viewport's aggregation expansion, where one assembly id can turn into
+ *   hundreds of parts) omit it and let the reader index itself.
+ */
+export function createEntityBoundsLookup(
+  geometry: MeshData[] | null,
+  expectedLookups?: number,
+): (entityId: number) => BoundingBox3D | null {
+  const indexUpFront = (expectedLookups ?? 0) > INDEX_AFTER_LOOKUPS;
+  let index: Map<number, MeshData[]> | null = null;
+  let lookups = 0;
+  return (entityId: number) => {
+    if (!geometry) return null;
+    if (!index && (indexUpFront || ++lookups > INDEX_AFTER_LOOKUPS)) {
+      index = indexMeshesByEntity(geometry);
+    }
+    return index ? boundsFromIndex(index, entityId) : getEntityBounds(geometry, entityId);
   };
 }
 
@@ -404,8 +491,15 @@ export function unionEntityBounds(
 ): { min: Point3D; max: Point3D } | null {
   let min: Point3D | null = null;
   let max: Point3D | null = null;
+
+  // Self-indexing reader: past a handful of ids it buckets the mesh array by
+  // expressId ONCE rather than re-filtering the whole array per id, so this
+  // loop is O(meshes + N) instead of O(N × meshes). Shared with every other
+  // many-id bounds path (see `createEntityBoundsLookup`).
+  const meshBounds = createEntityBoundsLookup(geometry, ids.length);
+
   for (const id of ids) {
-    const b = getEntityBounds(geometry, id) ?? instancedBounds(id) ?? null;
+    const b = meshBounds(id) ?? instancedBounds(id) ?? null;
     if (!b) continue;
     if (!min || !max) {
       min = { x: b.min.x, y: b.min.y, z: b.min.z };
@@ -420,4 +514,37 @@ export function unionEntityBounds(
     }
   }
   return min && max ? { min, max } : null;
+}
+
+/**
+ * The subset of measurement-slice state that decides whether the animation
+ * loop's per-frame reprojection pass (`updateMeasurementScreenCoords`) needs
+ * to run at all. Kept as a plain shape (not imported from the store) so this
+ * stays a pure function callable from a test with a minimal fixture.
+ */
+export interface PendingMeasurementState {
+  measurements: { length: number };
+  activeMeasurement: unknown;
+  /** In-progress multi-click polyline sequence (#2199), or null. */
+  activePolyline: unknown;
+  /** Finished multi-click polylines (#2199) — their placed vertices still
+   *  need reprojecting on every camera move, same as drag measurements. */
+  polylineMeasurements: { length: number };
+}
+
+/**
+ * True when there is any measurement state whose screen coordinates could
+ * be stale after a camera move — drag-mode measurements/gesture, or
+ * polyline-mode sequences/finished polylines (#2641 review defect: this used
+ * to check only `measurements`/`activeMeasurement`, so with polyline-only
+ * state the reprojection pass never ran and placed points, segments and
+ * labels froze at their click-time screen position while orbiting).
+ */
+export function hasPendingMeasurementState(state: PendingMeasurementState): boolean {
+  return (
+    state.measurements.length > 0 ||
+    state.activeMeasurement !== null ||
+    state.activePolyline !== null ||
+    state.polylineMeasurements.length > 0
+  );
 }

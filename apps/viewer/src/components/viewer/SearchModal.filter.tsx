@@ -21,7 +21,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { Play, AlertCircle, Download, ListPlus } from 'lucide-react';
+import { Play, AlertCircle, Download, ListPlus, Equal } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { useViewerStore } from '@/store';
 import { toGlobalIdFromModels } from '@/store/globalId';
@@ -37,8 +37,14 @@ import { evaluateFilterRulesFederated } from '@/lib/search/filter-evaluate';
 import { runTier0Scan, type ScanModel } from '@/lib/search/tier0-scan';
 import { queryTier1Indexes, type Tier1Index } from '@/lib/search/tier1-index';
 import { downloadResult } from '@/lib/search/result-export';
+import {
+  collectFilterResultGlobalIds,
+  expandFilterRowsThroughAggregation,
+  scanFilterResultRows,
+} from '@/lib/search/isolate-filter-result';
 import { filterResultToSearchResults } from '@/lib/search/filter-result-to-search-results';
 import type { ListDefinition } from '@/lib/lists';
+import { toast } from '@/components/ui/toast';
 import { SearchModalFilterBuilder } from './SearchModal.filter.builder';
 
 /** Rows per virtualizer page — tuned for the result table row height. */
@@ -67,6 +73,10 @@ export function SearchModalFilter() {
     setSelectedEntity,
     setSelectedEntityId,
     setSelectedEntityIds,
+    isolateEntities,
+    isolatedEntities,
+    typeVisibility,
+    toggleTypeVisibility,
     enterVimCycle,
     cameraCallbacks,
     setPendingListDraft,
@@ -90,6 +100,10 @@ export function SearchModalFilter() {
       setSelectedEntity: s.setSelectedEntity,
       setSelectedEntityId: s.setSelectedEntityId,
       setSelectedEntityIds: s.setSelectedEntityIds,
+      isolateEntities: s.isolateEntities,
+      isolatedEntities: s.isolatedEntities,
+      typeVisibility: s.typeVisibility,
+      toggleTypeVisibility: s.toggleTypeVisibility,
       enterVimCycle: s.enterVimCycle,
       cameraCallbacks: s.cameraCallbacks,
       setPendingListDraft: s.setPendingListDraft,
@@ -343,6 +357,167 @@ export function SearchModalFilter() {
     downloadResult(searchFilterResult, format);
   }, [searchFilterResult]);
 
+  /** Isolate the filter result's elements in the 3D view — same store
+   *  channel (`isolateEntities` / `isolatedEntities`) HierarchyPanel uses
+   *  for type/material/group isolation, so undo rides the existing
+   *  "Clear type filter" ×  affordance for free. Federated results resolve
+   *  each row through ITS OWN model_id column (see
+   *  `collectFilterResultGlobalIds`), so a multi-model result isolates
+   *  correctly across every source model, not just the active one — and a
+   *  row whose model was unloaded after the run is skipped rather than
+   *  colliding with another model's id space (#2532 review). Geometry-less
+   *  assemblies are resolved to their geometry-bearing parts via
+   *  `cameraCallbacks.resolveHighlightIds` (#2531) before isolating, or a
+   *  result made of assemblies would blank the view. */
+  const handleIsolateResult = useCallback(() => {
+    const result = searchFilterResult;
+    if (!result || result.rows.length === 0) return;
+    const defaultModelId = activeModelId ?? 'default';
+
+    const globalIds = collectFilterResultGlobalIds(result, defaultModelId, (modelId, expressId) => {
+      const isSpecial = modelId === 'legacy' || modelId === 'default' || modelId === '__legacy__';
+      // toGlobalIdFromModels falls back to the raw expressId for an unknown
+      // modelId (store/globalId.ts:31-34) — fine for the single-model
+      // aliases, wrong for a federated row whose source model is no longer
+      // loaded, where that raw id can collide with a still-loaded model's
+      // id space. Skip those rows instead.
+      if (!isSpecial && !models.has(modelId)) return null;
+      return toGlobalIdFromModels(models, modelId, expressId);
+    });
+
+    if (globalIds.length === 0) {
+      toast.error('Nothing to isolate — every matched row belongs to a model that is no longer loaded.');
+      return;
+    }
+
+    // A geometry-less assembly (IfcElementAssembly, an IfcStair used as a
+    // container, …) owns no mesh: the renderer resolves `isolatedEntities`
+    // against mesh ids directly, so isolating its bare id blanks the view.
+    // Resolve through the same Viewport channel the Search tab's commit and
+    // frameSelection use (`resolveHighlightIds`, backed by
+    // expandToGeometryBearingIds — #2531): a geometry-bearing id passes
+    // through untouched and deduplicated, a geometry-less one is replaced by
+    // its geometry-bearing aggregated parts.
+    const resolved = cameraCallbacks.resolveHighlightIds?.(globalIds) ?? [];
+    let isolationIds = resolved;
+    let fallbackPartTypes: ReadonlySet<string> | null = null;
+    if (resolved.length === 0) {
+      // Nothing resolved: either the renderer has not registered its
+      // callbacks yet, or every matched row looks geometry-less to it. The
+      // resolver checks bounds against the type-visibility-FILTERED mesh
+      // list (Viewport gets ViewportContainer's `filteredGeometry`), so an
+      // assembly whose only parts are currently hidden types (IfcSpace,
+      // IfcOpeningElement, ...) lands here even though it IS renderable once
+      // those toggles flip (#2660 review). Expand through the aggregation
+      // graph directly -- data-store side, visibility-blind -- so those
+      // parts join the isolation set, and feed their types into the
+      // matchedTypes gate below so the toggles actually flip. The raw ids
+      // stay in the set: rows without aggregated parts keep their own mesh
+      // ids that way, and isolating an empty set would hide the ENTIRE
+      // model, which is strictly worse than the pre-resolution behaviour.
+      //
+      // Residual gap, documented rather than closed: when SOME rows resolve,
+      // hidden-type parts of the ones that do not are still dropped, and a
+      // second press after the toggles flipped recomputes a resolver-based
+      // set (so it re-isolates instead of clearing). Both need the resolver
+      // to see UNFILTERED geometry, which is Viewport plumbing shared with
+      // frameSelection and the Search tab -- out of scope here.
+      const expansion = expandFilterRowsThroughAggregation(result, defaultModelId, {
+        relationshipsFor: (modelId) => models.get(modelId)?.ifcDataStore?.relationships,
+        typeNameFor: (modelId, expressId) =>
+          models.get(modelId)?.ifcDataStore?.entities.getTypeName(expressId) ?? null,
+        toGlobalId: (modelId, expressId) =>
+          models.has(modelId) ? toGlobalIdFromModels(models, modelId, expressId) : null,
+      });
+      fallbackPartTypes = expansion.partTypes;
+      const merged = new Set(globalIds);
+      for (const id of expansion.partGlobalIds) merged.add(id);
+      isolationIds = [...merged];
+    }
+
+    // isolateEntities is a same-set TOGGLE (visibilitySlice.ts:176-194):
+    // pressing "Isolate in 3D" again on the identical result un-isolates
+    // rather than re-isolating. Detect that up front so the un-isolate press
+    // only clears — it must not also select/frame the id set and close the
+    // modal as if a fresh isolation had just landed (#2532 review). Compared
+    // against the RESOLVED ids, which are what the first press stored.
+    const alreadyIsolated = isolatedEntities !== null &&
+      isolatedEntities.size === isolationIds.length &&
+      isolationIds.every((id) => isolatedEntities.has(id));
+
+    if (alreadyIsolated) {
+      isolateEntities(isolationIds);
+      setSelectedEntityIds([]);
+      toast.info('Isolation cleared — showing the full model.');
+      setSearchModalOpen(false);
+      return;
+    }
+
+    // Sibling isolate paths (PropertiesPanel.handleIsolateGroupMembers,
+    // HierarchyPanel's group isolation) flip the relevant hidden-by-default
+    // type-visibility toggle BEFORE isolating, or the isolated set renders
+    // nothing (#1075 / PR #1094 review) — the renderer independently drops
+    // these types (store/constants.ts TYPE_VISIBILITY_SEMANTIC_DEFAULTS)
+    // regardless of what isolateEntities is given. The Filter tab can match
+    // any class, so apply the same gate here rather than blanking the view.
+    const matchedTypes = new Set<string>();
+    for (const row of scanFilterResultRows(result, defaultModelId)) {
+      if (row.ifcType) matchedTypes.add(row.ifcType);
+    }
+    // Aggregated parts pulled in by the fallback above are isolated too, so
+    // their types must clear the same gate -- a result of bare assemblies
+    // over hidden-type parts would otherwise flip nothing and still blank.
+    if (fallbackPartTypes) {
+      for (const partType of fallbackPartTypes) matchedTypes.add(partType);
+    }
+    if (matchedTypes.has('IfcSpace') && !typeVisibility.spaces) toggleTypeVisibility('spaces');
+    if (matchedTypes.has('IfcSpatialZone') && !typeVisibility.spatialZones) toggleTypeVisibility('spatialZones');
+    if (matchedTypes.has('IfcOpeningElement') && !typeVisibility.openings) toggleTypeVisibility('openings');
+    if (matchedTypes.has('IfcVirtualElement') && !typeVisibility.virtualElements) toggleTypeVisibility('virtualElements');
+
+    isolateEntities(isolationIds);
+    // Select the full isolated set (not just one row) so the frame below
+    // encloses every isolated element. A single `setSelectedEntityIds` call
+    // replaces both `selectedEntityIds` and `selectedEntityId` wholesale
+    // (selectionSlice.ts:160-163), so no leading clear is needed here. The
+    // MATCHED ids go last: `selectedEntityId` becomes the array's final
+    // element, so the primary selection (what the Properties panel shows via
+    // useModelSelection) stays a row the filter actually matched instead of
+    // whichever expanded part happened to come out of the resolver last --
+    // the same #1133 convention as SearchModal.text.tsx's commit
+    // (`[...renderableParts, globalId]`) and HierarchyPanel's group isolate
+    // (#2660 review). The Set dedups the overlap.
+    setSelectedEntityIds([...isolationIds, ...globalIds]);
+
+    if (limitHit !== null) {
+      toast.info(`Isolating the first ${limitHit.toLocaleString()} matches — the filter hit its row limit.`);
+    }
+
+    // frameEntities takes the explicit id set directly rather than reading it
+    // back off selection state, and — unlike frameSelection — guards against
+    // a degenerate/NaN bound (Viewport.tsx:1029-1033), so a non-geometric id
+    // in the mix can't fling the camera off-model.
+    if (cameraCallbacks.frameEntities) {
+      window.setTimeout(() => cameraCallbacks.frameEntities?.(isolationIds), 50);
+    }
+    // Close the modal so the framing is actually visible — same reasoning
+    // as handleRowClick above (dialog overlay is `fixed inset-0 bg-black/80`,
+    // ui/dialog.tsx:23; PR #2396 is the regression this guards against).
+    setSearchModalOpen(false);
+  }, [
+    searchFilterResult,
+    activeModelId,
+    models,
+    isolatedEntities,
+    typeVisibility,
+    toggleTypeVisibility,
+    limitHit,
+    setSelectedEntityIds,
+    isolateEntities,
+    cameraCallbacks,
+    setSearchModalOpen,
+  ]);
+
   /** Freeze the current filter result into a new list — a per-model snapshot
    *  of the matched express IDs — and open the list builder to configure
    *  columns. Keyed by model so federated results don't over-select when
@@ -350,22 +525,10 @@ export function SearchModalFilter() {
   const handleCreateList = useCallback(() => {
     const result = searchFilterResult;
     if (!result || result.rows.length === 0) return;
-    const idIdx = result.columns.indexOf('express_id');
-    if (idIdx < 0) return;
-    const modelIdx = result.columns.indexOf('model_id'); // only present for multi-model runs
 
     const byModel: Record<string, number[]> = {};
-    const seen = new Set<string>();
-    for (const row of result.rows) {
-      const id = Number(row[idIdx]);
-      if (!Number.isFinite(id) || id <= 0) continue;
-      const modelId = modelIdx >= 0 && typeof row[modelIdx] === 'string'
-        ? (row[modelIdx] as string)
-        : (activeModelId ?? 'default');
-      const key = `${modelId}:${id}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      (byModel[modelId] ??= []).push(id);
+    for (const row of scanFilterResultRows(result, activeModelId ?? 'default')) {
+      (byModel[row.modelId] ??= []).push(row.expressId);
     }
     const total = Object.values(byModel).reduce((n, ids) => n + ids.length, 0);
     if (total === 0) return;
@@ -493,6 +656,16 @@ export function SearchModalFilter() {
             title="Freeze these results into a new list"
           >
             <ListPlus className="h-3 w-3" /> Create list
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            disabled={!searchFilterResult || searchFilterResult.rows.length === 0}
+            onClick={handleIsolateResult}
+            className="h-7 gap-1 text-xs"
+            title="Isolate these results in the 3D view"
+          >
+            <Equal className="h-3 w-3" /> Isolate in 3D
           </Button>
           <DropdownMenu>
             <DropdownMenuTrigger asChild>

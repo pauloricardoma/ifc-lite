@@ -7,6 +7,8 @@ import { createClashEngine } from '../engine.js';
 import { TsKernel } from './ts-kernel.js';
 import { makeExclusionSet, qualifiedKey } from '../exclude.js';
 import { fromPositions } from '../math/aabb.js';
+import { classifyRuleCoverage, ruleHadNoMatch } from '../analysis.js';
+import { disciplineMatrixRules } from '../disciplines.js';
 import type { ClashElement, ClashRule, Vec3 } from '../types.js';
 
 /** Axis-aligned cube as a triangle mesh (12 triangles). */
@@ -234,6 +236,42 @@ describe('TsClashEngine', () => {
     expect(result.clashes[0].severity).toBe('critical');
   });
 
+  it('reports rule coverage so an all-empty discipline matrix is distinguishable from a real clean run (#2536)', async () => {
+    // Reproduces the reported defect at engine scale: an infrastructure-shaped
+    // model (structural elements only, no MEP/HVAC/electrical/fire anywhere)
+    // run through the full built-in CLASH_RULE_PRESETS matrix. Every preset's
+    // selectorA is MEP-shaped, so it matches nothing here — the matrix reports
+    // 0 clashes, and previously that was indistinguishable from "checked and
+    // found nothing".
+    const infraElements = [
+      boxElement('A', 'IfcBeam', [0, 0, 0]),
+      boxElement('B', 'IfcColumn', [0.5, 0, 0]), // overlaps A — a real clash exists,
+      boxElement('C', 'IfcSlab', [10, 0, 0]),    // just not one any preset's rule.a covers.
+    ];
+    const rules = disciplineMatrixRules('hard');
+    const result = await engine.run(infraElements, rules);
+
+    expect(result.summary.total).toBe(0); // the reported symptom: zero clashes
+    expect(result.ruleCoverage).toHaveLength(rules.length);
+    expect(classifyRuleCoverage(result)).toBe('no-match'); // the fix: distinguishable as "never ran"
+    for (const c of result.ruleCoverage!) {
+      expect(ruleHadNoMatch(c)).toBe(true);
+    }
+
+    // Control: the same matrix against a model that DOES contain MEP elements
+    // is unaffected — it still reports the real clash and coverage reads clean.
+    const mepElements = [
+      boxElement('P', 'IfcPipeSegment', [0, 0, 0]),
+      boxElement('S', 'IfcBeam', [0.4, 0, 0]),
+    ];
+    const mepResult = await engine.run(mepElements, rules);
+    // IfcPipeSegment matches both the MEPxSTR and FIRExSTR presets, so this
+    // legitimately reports on more than one rule — the point is only that it's
+    // non-zero and the coverage reads as having actually run.
+    expect(mepResult.summary.total).toBeGreaterThan(0);
+    expect(classifyRuleCoverage(mepResult)).not.toBe('no-match');
+  });
+
   it('produces deterministic, stable clash ids and ordering', async () => {
     const build = () => [
       boxElement('B', 'IfcDuct', [0.5, 0, 0]),
@@ -432,29 +470,39 @@ describe('TsClashEngine: false-positive + bounds regressions (#1362 / #1402)', (
   });
 });
 
-describe('TsClashEngine: contained-pair penetration depth (#1866)', () => {
-  it('reports the mesh-level depth, not the AABB gap, for a contained crossing pair', async () => {
+describe('TsClashEngine: contained-pair penetration depth, non-box fallback (#1866)', () => {
+  // #1866 was originally fixed by `maxPenetrationInto` — a nearest-crossing-
+  // vertex probe held (PR #2536) for being a sampling artifact that converges
+  // to 0 under retessellation instead of to the true depth (see `obb.ts`,
+  // `obb.test.ts`). Its replacement, the box-box SAT depth, cannot certify a
+  // concave L-prism (it is not a box), so BOTH fixtures below now report the
+  // pre-#1866 AABB estimate — honestly labelled `'estimate'`, not silently
+  // mislabelled `'mesh'` the way the old probe was. Extending exact
+  // measurement to non-box shapes is future work (PR #2536 hold comment,
+  // "landing conditions").
+  it('falls back to the labelled AABB estimate for a contained crossing pair', async () => {
     // Box in the L's notch, AABB-contained in the L's AABB, dipping past the
-    // notch wall at x=1 into the solid. True mesh penetration = 1 - xMin.
+    // notch wall at x=1 into the solid.
     const wall = lPrismElement('A', 'IfcWall');
     const duct = boxElementHxyz('B', 'IfcDuct', [1.2, 1.4, 0.5], [0.25, 0.2, 0.2]);
     const result = await engine.run([wall, duct], [hard()]);
     expect(result.summary.total).toBe(1);
     const clash = result.clashes[0];
     expect(clash.status).toBe('hard');
-    const expected = 1 - duct.bounds.min[0]; // ~0.05, f32-exact from the mesh
-    expect(expected).toBeGreaterThan(0.049);
-    expect(expected).toBeLessThan(0.051);
-    expect(Math.abs(-clash.distance - expected)).toBeLessThan(1e-9);
-    // The old AABB signed-gap depth for this pair was 0.7 (the contained box's
-    // own smallest-axis overlap), 14x the real penetration.
-    expect(-clash.distance).toBeLessThan(0.1);
+    expect(clash.distanceKind).toBe('estimate');
+    // The AABB estimate here is the duct's own y/z cross-section (0.4), not
+    // the true ~0.05 m mesh penetration a box-exact metric can't see for a
+    // non-box element.
+    expect(-clash.distance).toBeCloseTo(0.4, 6);
   });
 
-  it('reports a micrometre-scale depth for a designed face contact (issue corpus scale)', async () => {
+  it('falls back to the same AABB estimate for a designed face contact (issue corpus scale)', async () => {
     // Same layout, but the box crosses the notch wall by ~1e-6 m: a designed
-    // face contact as in the #1866 corpus (true worst depth 7.39e-6 m). The
-    // reported depth must sit inside the touching band, not at the AABB gap.
+    // face contact as in the #1866 corpus (true worst depth 7.39e-6 m). A
+    // box-exact metric would need a box; the L-prism isn't one, so the
+    // reported depth is the SAME AABB cross-section estimate as the case
+    // above, not the true micrometre-scale depth — the known residual of
+    // narrowing the metric to boxes only.
     const wall = lPrismElement('A', 'IfcWall');
     const xMinTarget = 0.999999;
     const duct = boxElementHxyz(
@@ -465,13 +513,38 @@ describe('TsClashEngine: contained-pair penetration depth (#1866)', () => {
     );
     const xMin = duct.bounds.min[0]; // f32-rounded, slightly below 1
     expect(xMin).toBeLessThan(1);
-    const expected = 1 - xMin; // ~1e-6
-    expect(expected).toBeGreaterThan(0);
-    expect(expected).toBeLessThan(1e-4); // inside TOUCHING_EPSILON
     const result = await engine.run([wall, duct], [hard()]);
     expect(result.summary.total).toBe(1);
     const clash = result.clashes[0];
     expect(clash.status).toBe('hard');
-    expect(Math.abs(-clash.distance - expected)).toBeLessThan(1e-12);
+    expect(clash.distanceKind).toBe('estimate');
+    expect(-clash.distance).toBeCloseTo(0.4, 6);
+  });
+});
+
+describe('TsClashEngine: penetrating-pair depth is mesh-level, not AABB min-axis', () => {
+  it('reports how far a bar is buried in a block, not the bar thickness', async () => {
+    // Block A: the cube [-1,1]^3. Bar B: x in [0.5, 3], y and z in [-0.1, 0.1];
+    // it enters through A's x = 1 face and stops 0.5 short of A's centre.
+    //
+    // True penetration depth = 0.5: the bar's buried end cap sits at x = 0.5,
+    // and the nearest point of A's surface to that cap is A's x = 1 face,
+    // 0.5 away (the y/z faces are 0.9 away).
+    //
+    // The AABB min-axis overlap for this pair is 0.2 — the bar's own
+    // cross-section thickness (X overlap 0.5, Y overlap 0.2, Z overlap 0.2) —
+    // which is a dimension of the bar, not a depth. Neither AABB contains the
+    // other (the bar runs out to x = 3), so this is an ordinary penetrating
+    // pair, not the contained case of #1866.
+    const block = boxElementHxyz('A', 'IfcWall', [0, 0, 0], [1, 1, 1]);
+    const bar = boxElementHxyz('B', 'IfcDuct', [1.75, 0, 0], [1.25, 0.1, 0.1]);
+    expect(bar.bounds.min[0]).toBeCloseTo(0.5, 12);
+    expect(bar.bounds.max[0]).toBeCloseTo(3, 12);
+
+    const result = await engine.run([block, bar], [hard()]);
+    expect(result.summary.total).toBe(1);
+    const clash = result.clashes[0];
+    expect(clash.status).toBe('hard');
+    expect(-clash.distance).toBeCloseTo(0.5, 9);
   });
 });

@@ -3,8 +3,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import { describe, expect, it } from 'vitest';
-import { isTouching, penetrationDepth, sortClashes, TOUCHING_EPSILON } from './analysis.js';
-import type { AABB, Clash, ClashElementRef, ClashSeverity, ClashStatus, Vec3 } from './types.js';
+import { classifyRuleCoverage, isTouching, penetrationDepth, ruleHadNoMatch, sortClashes, TOUCHING_EPSILON } from './analysis.js';
+import type { AABB, Clash, ClashElementRef, ClashRuleCoverage, ClashSeverity, ClashStatus, Vec3 } from './types.js';
 
 function ref(key: string, tag: string): ClashElementRef {
   return { key, ref: 1, model: 'm', tag };
@@ -148,10 +148,77 @@ describe('sortClashes', () => {
     expect(sortClashes(list, 'distance').map((c) => c.id)).toEqual(['deep', 'touch', 'gap']);
   });
 
+  it('breaks a full tie by clash id, in every sort mode', () => {
+    // Every other fixture in this block has distinct primary keys, so the
+    // `|| cmpId(a, b)` fallback is never reached and deleting it from all three
+    // branches leaves the suite green. That fallback is not a rare edge: a
+    // clearance run reports positive distances, `penetrationDepth` returns 0 for
+    // ALL of them, and if the rule also fixes the severity then id decides the
+    // entire order of the panel (`ClashPanel.tsx` sorts thousands of rows).
+    //
+    // Input order is deliberately the reverse of id order. `Array.prototype.sort`
+    // is stable by specification, so an equal-comparing comparator would return
+    // the input untouched — only an id comparison can reorder it. Size is
+    // irrelevant here (unlike the >22-element TimSort fixture in
+    // duplicates.test.ts, which needs a run long enough for a comparator that
+    // answers NaN to corrupt the merge); this comparator stays a valid total
+    // order under the mutation, it just stops discriminating.
+    const clearance = (id: string) => clash(id, 0.5, 'major', 'clearance');
+    const gaps = [clearance('c'), clearance('b'), clearance('a')];
+    expect(sortClashes(gaps, 'severity').map((c) => c.id)).toEqual(['a', 'b', 'c']);
+    expect(sortClashes(gaps, 'depth').map((c) => c.id)).toEqual(['a', 'b', 'c']);
+    expect(sortClashes(gaps, 'distance').map((c) => c.id)).toEqual(['a', 'b', 'c']);
+
+    // And for the severity branch specifically: equal severity AND equal depth,
+    // so both of its leading terms are exhausted before the id is consulted.
+    const hard = [clash('h2', -0.3, 'critical'), clash('h1', -0.3, 'critical')];
+    expect(sortClashes(hard, 'severity').map((c) => c.id)).toEqual(['h1', 'h2']);
+  });
+
   it('does not mutate the input', () => {
     const list = [clash('b', -0.1, 'info'), clash('a', -0.2, 'info')];
     const before = list.map((c) => c.id);
     sortClashes(list, 'depth');
     expect(list.map((c) => c.id)).toEqual(before);
+  });
+});
+
+describe('ruleHadNoMatch', () => {
+  it('is true when side A matched nothing', () => {
+    expect(ruleHadNoMatch({ rule: 'r', matchedA: 0, matchedB: 5 })).toBe(true);
+  });
+
+  it('is true when side B matched nothing', () => {
+    expect(ruleHadNoMatch({ rule: 'r', matchedA: 5, matchedB: 0 })).toBe(true);
+  });
+
+  it('is false when both sides matched, and for a self-clash rule (matchedB null)', () => {
+    expect(ruleHadNoMatch({ rule: 'r', matchedA: 5, matchedB: 5 })).toBe(false);
+    expect(ruleHadNoMatch({ rule: 'r', matchedA: 5, matchedB: null })).toBe(false);
+  });
+});
+
+describe('classifyRuleCoverage', () => {
+  const covered = (matchedA: number, matchedB: number | null): ClashRuleCoverage => ({
+    rule: 'r',
+    matchedA,
+    matchedB,
+  });
+
+  it('is "unknown" when no coverage data is present (older/hand-built results)', () => {
+    expect(classifyRuleCoverage({})).toBe('unknown');
+    expect(classifyRuleCoverage({ ruleCoverage: [] })).toBe('unknown');
+  });
+
+  it('is "clean" when every rule matched on both sides — a real zero-clash result', () => {
+    expect(classifyRuleCoverage({ ruleCoverage: [covered(3, 4), covered(1, 1)] })).toBe('clean');
+  });
+
+  it('is "no-match" when EVERY rule matched nothing — the matrix never ran (the reported bug)', () => {
+    expect(classifyRuleCoverage({ ruleCoverage: [covered(0, 4), covered(5, 0)] })).toBe('no-match');
+  });
+
+  it('is "partial" when some rules matched and others did not', () => {
+    expect(classifyRuleCoverage({ ruleCoverage: [covered(3, 4), covered(0, 4)] })).toBe('partial');
   });
 });

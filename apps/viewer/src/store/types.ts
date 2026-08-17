@@ -32,6 +32,38 @@ export interface ActiveMeasurement {
   distance: number;
 }
 
+// ============================================================================
+// Polyline Measurement Types (multi-click accumulate mode, issue #2199)
+// ============================================================================
+
+/**
+ * Which gesture the Measure tool is currently listening for. `'drag'` is the
+ * original mousedown→mouseup distance measurement (unchanged by this mode).
+ * `'polyline'` accumulates points via successive clicks instead; the two are
+ * mutually exclusive so a sequence started in one can never leak state into
+ * the other (see `setMeasureMode` in measurementSlice.ts).
+ */
+export type MeasureMode = 'drag' | 'polyline';
+
+/** A multi-click sequence in progress, not yet finished or cancelled. */
+export interface ActivePolyline {
+  points: MeasurePoint[];
+}
+
+/**
+ * A finished multi-click measurement. `closed` is the basis for `length` and
+ * must always be read alongside it (never assumed): for an open polyline,
+ * `length` is the sum of the placed segments; for a closed loop it is the
+ * perimeter, i.e. the same sum PLUS the closing segment back to the first
+ * point. The tool never blends the two under one unlabelled number.
+ */
+export interface PolylineMeasurement {
+  id: string;
+  points: MeasurePoint[];
+  closed: boolean;
+  length: number;
+}
+
 /** Orthogonal constraint axis type */
 export type OrthogonalAxis = 'axis1' | 'axis2' | 'axis3';
 
@@ -254,6 +286,17 @@ export interface CameraCallbacks {
   /** Rotate the camera exactly 90° around the vertical axis. */
   rotateRight?: () => void;
   frameSelection?: () => void;
+  /**
+   * Resolve ids to what the 3D renderer can actually highlight, expanding a
+   * geometry-less `IfcRelAggregates` assembly (own id has no mesh) to its
+   * geometry-bearing parts — the same resolution `frameSelection` applies to
+   * decide what to frame. For a selection entry point that assigns
+   * `selectedEntityId`/`selectedEntityIds` directly (search modal, programmatic
+   * select) rather than a 3D pick, calling this before setting the selection
+   * keeps "camera moved here" and "this is highlighted" in agreement. Returns
+   * `[]` for an id with neither geometry nor renderable parts.
+   */
+  resolveHighlightIds?: (ids: number[]) => number[];
   /**
    * Frame the camera on the bounds of an explicit id set, keeping the current
    * view direction. Ids are federated GLOBAL ids — the id space the scene
