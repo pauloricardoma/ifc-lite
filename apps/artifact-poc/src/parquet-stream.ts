@@ -73,8 +73,42 @@ export async function* decodeStdParquetStreaming(
   const idxLen = await readU32LE(source, idxLenPos);
   const idxBlob = source.slice(idxLenPos + 4, idxLenPos + 4 + idxLen);
 
+  yield* streamMeshes(
+    await ParquetFile.fromFile(meshBlob),
+    await ParquetFile.fromFile(vtxBlob),
+    await ParquetFile.fromFile(idxBlob),
+    batchSize,
+  );
+}
+
+/**
+ * Mesma decodificação, mas com as 3 seções servidas como ARQUIVOS SEPARADOS:
+ * cada row group vira range request no CDN e o arquivo nunca é baixado inteiro.
+ * É o que o container concatenado impede — não existe URL que aponte pro meio
+ * dele, então `fromUrl` só funciona com o split (o corte é feito no ingest).
+ * @param urls URLs das 3 seções (assinadas; precisam servir Range + CORS).
+ */
+export async function* decodeSplitParquetStreaming(
+  urls: { mesh: string; vertex: string; index: string },
+  batchSize = 4000,
+): AsyncGenerator<StreamMesh[]> {
+  await ensureInit();
+  const [meshPf, vtxPf, idxPf] = await Promise.all([
+    ParquetFile.fromUrl(urls.mesh),
+    ParquetFile.fromUrl(urls.vertex),
+    ParquetFile.fromUrl(urls.index),
+  ]);
+  yield* streamMeshes(meshPf, vtxPf, idxPf, batchSize);
+}
+
+/** Miolo comum: idêntico nos dois caminhos — só muda de onde vêm os bytes. */
+async function* streamMeshes(
+  meshPf: ParquetFile,
+  vtxPf: ParquetFile,
+  idxPf: ParquetFile,
+  batchSize: number,
+): AsyncGenerator<StreamMesh[]> {
   // Tabela mesh inteira (minúscula: 1 linha por malha, só ranges + cor/id).
-  const meshPf = await ParquetFile.fromFile(meshBlob);
   const M: any = arrow.tableFromIPC((await meshPf.read()).intoIPCStream());
   const expressIds = M.getChild('express_id').toArray() as Uint32Array;
   const ifcTypes = M.getChild('ifc_type');
@@ -88,8 +122,6 @@ export async function* decodeStdParquetStreaming(
   const colorA = M.getChild('color_a').toArray() as Float32Array;
   const meshCount = expressIds.length;
 
-  const vtxPf = await ParquetFile.fromFile(vtxBlob);
-  const idxPf = await ParquetFile.fromFile(idxBlob);
   const vMeta: any = vtxPf.metadata();
   const iMeta: any = idxPf.metadata();
   const vNrg = vMeta.numRowGroups();

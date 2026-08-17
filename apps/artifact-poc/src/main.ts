@@ -3,7 +3,7 @@
 // Prova o caminho quente do next_04 (Blob/CDN → decoder → renderer).
 import { Renderer, DEFAULT_CHUNK_CELL_SIZE } from '@ifc-lite/renderer';
 import { decodeOptimizedParquetGeometry } from '@ifc-lite/server-client';
-import { decodeStdParquetStreaming } from './parquet-stream.js';
+import { decodeStdParquetStreaming, decodeSplitParquetStreaming } from './parquet-stream.js';
 import { GeometryProcessor, decodeInstancedShard } from '@ifc-lite/geometry';
 
 // Residência/LOD do upstream #1682. Espelha os defaults do apps/viewer
@@ -64,6 +64,30 @@ async function artifactUrl(key: string): Promise<string> {
   }
   if (!r.ok) throw new Error(`sign ${key} → ${r.status}`);
   return (await r.json()).url;
+}
+
+// Contrato do §5 do next_10: a API devolve status + as 6 URLs assinadas de uma
+// vez, e o client decide o que baixar e quando. Em prod quem assina é o
+// /api/file-info (R2 hoje, Azure Blob amanhã); em dev, o middleware do Vite
+// devolve o mesmo shape apontando pro /artifacts/ local.
+interface FileInfo {
+  status: 'uploaded' | 'parsing' | 'ready' | 'failed';
+  artifacts?: { mesh: string; vertex: string; index: string; metadata: string; dataModel: string; symbolic: string };
+  expiresAt?: string;
+}
+async function fileInfo(model: string): Promise<FileInfo> {
+  if (PROD && !accessCode) {
+    accessCode = (window.prompt('Código de acesso:') || '').trim();
+    sessionStorage.setItem('poc_code', accessCode);
+  }
+  const q = `model=${encodeURIComponent(model)}${PROD ? `&code=${encodeURIComponent(accessCode)}` : ''}`;
+  const r = await fetch(`/api/file-info?${q}`);
+  if (r.status === 403) {
+    accessCode = ''; sessionStorage.removeItem('poc_code');
+    throw new Error('código de acesso inválido');
+  }
+  if (!r.ok) throw new Error(`file-info ${model} → ${r.status}`);
+  return r.json();
 }
 
 // Qualquer erro não tratado (inclui rejeição de top-level await) vai pra tela.
@@ -433,6 +457,50 @@ async function loadDor(kind: 'std' | 'opt' | 'fast' | 'opaque') {
     say(`DOR ${DOR_LABEL[kind]} ✓\n${meshCount} malhas · ${(tris / 1e6).toFixed(1)}M tri · ${((performance.now() - t0) / 1000).toFixed(1)}s · RAM ~${mb(mem())} MB`);
   } catch (e: any) { say(`DOR ${kind} FALHOU: ${e.message}`, true); }
 }
+// O ingest grava em {sha256}/v4/ (content-addressed, como vai ser no Azure). No
+// R2 da POC as mesmas 6 chaves vivem em dor/v4/, porque o /api/sign e o
+// /api/file-info só assinam ^(federated|dor)/.
+const DOR_V4_MODEL = PROD
+  ? 'dor/v4'
+  : 'ea4791c54d3fd38a8a919e5933559b0232840bdefd267cddb9fd70080358d9ed/v4';
+
+/**
+ * Caminho de produção: file-info → tier 1 (mesh + metadata inteiros, vertex e
+ * index só por range request). Diferença pro loadDor('std'): lá o container de
+ * 1.3GB é baixado inteiro antes do primeiro triângulo; aqui o mesh tem 0.7MB e
+ * o resto vem row group a row group conforme desenha.
+ */
+async function loadDorV4() {
+  clearScene();
+  const t0 = performance.now();
+  say('DOR v4: pedindo file-info…');
+  try {
+    const info = await fileInfo(DOR_V4_MODEL);
+    if (info.status !== 'ready' || !info.artifacts) throw new Error(`status=${info.status}`);
+    const a = info.artifacts;
+
+    const meta = await fetch(a.metadata).then((r) => r.json());
+    const expected = meta?.stats?.total_meshes ?? 0;
+    say(`DOR v4: ${expected} malhas · streaming por range request…`);
+
+    let meshCount = 0, tris = 0, ttfp = 0, framed = false;
+    for await (const chunk of decodeSplitParquetStreaming({ mesh: a.mesh, vertex: a.vertex, index: a.index })) {
+      renderer.addMeshes(chunk as any, true);
+      meshCount += chunk.length;
+      for (const m of chunk) tris += (m.indices?.length ?? 0) / 3;
+      renderer.requestRender();
+      if (!framed && meshCount > 0) {
+        renderer.fitToView(); framed = true;
+        ttfp = performance.now() - t0; // é ESTE número que o split existe pra derrubar
+        say(`DOR v4: primeiro paint em ${(ttfp / 1000).toFixed(1)}s · seguindo…`);
+      }
+    }
+    renderer.fitToView();
+    renderer.requestRender();
+    say(`DOR v4 ✓\n${meshCount}/${expected} malhas · ${(tris / 1e6).toFixed(1)}M tri · 1º paint ${(ttfp / 1000).toFixed(1)}s · total ${((performance.now() - t0) / 1000).toFixed(1)}s · RAM ~${mb(mem())} MB`);
+  } catch (e: any) { say(`DOR v4 FALHOU: ${e.message}`, true); }
+}
+(document.getElementById('dor-v4') as HTMLButtonElement).addEventListener('click', () => loadDorV4());
 (document.getElementById('dor-std') as HTMLButtonElement).addEventListener('click', () => loadDor('std'));
 (document.getElementById('dor-opt') as HTMLButtonElement).addEventListener('click', () => loadDor('opt'));
 (document.getElementById('dor-fast') as HTMLButtonElement).addEventListener('click', () => loadDor('fast'));

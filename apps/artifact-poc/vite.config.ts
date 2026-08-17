@@ -35,16 +35,55 @@ function serveOutputArtifacts() {
           res.end(JSON.stringify({ ok: true, bytes: buf.length, path: file }));
         });
       });
-      // GET /artifacts/<path> → serve de ifc-files/output/ (simula CDN)
+      // GET /api/file-info?model=<path> → mesmo shape do serverless da Vercel
+      // (que é o shape do GetFileInfo do .NET), mas apontando pro /artifacts/
+      // local. Assim o client roda IDÊNTICO em dev e em prod.
+      server.middlewares.use((req: any, res: any, next: any) => {
+        if (!req.url?.startsWith('/api/file-info')) return next();
+        const model = new URL(req.url, 'http://localhost').searchParams.get('model')?.replace(/\/+$/, '');
+        if (!model || !safe(model)) { res.statusCode = 400; return res.end(); }
+        const url = (f: string) => `/artifacts/${model}/${f}`;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({
+          status: 'ready',
+          artifacts: {
+            mesh: url('mesh.parquet'), vertex: url('vertex.parquet'), index: url('index.parquet'),
+            metadata: url('metadata.json'), dataModel: url('datamodel.parquet'), symbolic: url('symbolic.json'),
+          },
+          expiresAt: new Date(Date.now() + 3600e3).toISOString(),
+        }));
+      });
+      // GET /artifacts/<path> → serve de ifc-files/output/ (simula CDN).
+      // Com suporte a Range: o ParquetFile.fromUrl lê o footer com `bytes=-N` e
+      // depois um row group por vez. Sem 206 aqui, o dev baixaria o arquivo
+      // inteiro a cada leitura e o teste de streaming seria falso.
       server.middlewares.use((req: any, res: any, next: any) => {
         if (!req.url?.startsWith('/artifacts/')) return next();
         const file = safe(decodeURIComponent(req.url.slice('/artifacts/'.length).split('?')[0]));
         if (!file) { res.statusCode = 403; return res.end(); }
-        fs.readFile(file, (err, buf) => {
+        fs.stat(file, (err, st) => {
           if (err) return next(); // não achou em output/ → deixa o public/ tentar
           if (file.endsWith('.json')) res.setHeader('Content-Type', 'application/json');
           res.setHeader('Cache-Control', 'no-store');
-          res.end(buf);
+          res.setHeader('Accept-Ranges', 'bytes');
+
+          // `bytes=a-b`, `bytes=a-` e o sufixo `bytes=-n` (últimos n bytes).
+          const m = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range ?? '');
+          if (!m || (!m[1] && !m[2])) {
+            res.setHeader('Content-Length', st.size);
+            return fs.createReadStream(file).pipe(res);
+          }
+          const start = m[1] ? Number(m[1]) : Math.max(0, st.size - Number(m[2]));
+          const end = m[1] ? (m[2] ? Math.min(Number(m[2]), st.size - 1) : st.size - 1) : st.size - 1;
+          if (start > end || start >= st.size) {
+            res.statusCode = 416;
+            res.setHeader('Content-Range', `bytes */${st.size}`);
+            return res.end();
+          }
+          res.statusCode = 206;
+          res.setHeader('Content-Range', `bytes ${start}-${end}/${st.size}`);
+          res.setHeader('Content-Length', end - start + 1);
+          fs.createReadStream(file, { start, end }).pipe(res);
         });
       });
     }
