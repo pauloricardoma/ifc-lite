@@ -165,6 +165,7 @@ export async function* decodeSplitParquetStreaming(
   urls: { mesh: string; vertex: string; index: string },
   batchSize = 4000,
   onPhase?: (label: string, ms: number) => void,
+  skipTypes?: ReadonlySet<string>,
 ): AsyncGenerator<StreamMesh[]> {
   const t0 = performance.now();
   const mark = (label: string) => onPhase?.(label, performance.now() - t0);
@@ -185,7 +186,7 @@ export async function* decodeSplitParquetStreaming(
   ]);
   mark('footers');
 
-  yield* streamMeshes(meshPf, vtxReader, idxReader, batchSize, mark);
+  yield* streamMeshes(meshPf, vtxReader, idxReader, batchSize, mark, skipTypes);
 }
 
 /** Miolo comum: idêntico nos dois caminhos — só muda de onde vêm os bytes. */
@@ -195,6 +196,7 @@ async function* streamMeshes(
   idx: RgReader,
   batchSize: number,
   mark: (label: string) => void = () => {},
+  skipTypes?: ReadonlySet<string>,
 ): AsyncGenerator<StreamMesh[]> {
   // Tabela mesh inteira (minúscula: 1 linha por malha, só ranges + cor/id).
   const M: any = arrow.tableFromIPC((await meshPf.read()).intoIPCStream());
@@ -257,9 +259,25 @@ async function* streamMeshes(
     }
   };
 
+  // Avança a janela do cache: libera row groups totalmente atrás do início da
+  // PRÓXIMA malha (as faixas são monotônicas) e adianta os seguintes.
+  const advanceWindow = (i: number) => {
+    if (i + 1 >= meshCount) return;
+    const keepV = rgOf(vStart, vertexStarts[i + 1]);
+    for (const k of Array.from(vCache.keys())) if (k < keepV) vCache.delete(k);
+    const keepI = rgOf(iStart, indexStarts[i + 1] / 3);
+    for (const k of Array.from(iCache.keys())) if (k < keepI) iCache.delete(k);
+    prefetch(keepV, keepI);
+  };
+
   let batch: StreamMesh[] = [];
   let nextBatch = Math.min(FIRST_BATCH, batchSize);
   for (let i = 0; i < meshCount; i++) {
+    // Tipos que nenhum viewer desenha por padrão (IfcSpace é o volume do
+    // ambiente, IfcOpeningElement é o vazio do vão). Descartar aqui, antes de
+    // tocar em vertex/index, também poupa os row groups deles.
+    if (skipTypes?.has((ifcTypes?.get(i) as string) ?? '')) { advanceWindow(i); continue; }
+
     const vS = vertexStarts[i], vC = vertexCounts[i];
     const iS = indexStarts[i], iC = indexCounts[i];
     if (vS + vC > totalVerts || iS % 3 !== 0 || iC % 3 !== 0 || (iS + iC) / 3 > totalTris) {
@@ -306,14 +324,7 @@ async function* streamMeshes(
       color: [colorR[i], colorG[i], colorB[i], colorA[i]],
     });
 
-    // Libera row groups totalmente atrás do início da PRÓXIMA malha (faixas monotônicas).
-    if (i + 1 < meshCount) {
-      const keepV = rgOf(vStart, vertexStarts[i + 1]);
-      for (const k of Array.from(vCache.keys())) if (k < keepV) vCache.delete(k);
-      const keepI = rgOf(iStart, indexStarts[i + 1] / 3);
-      for (const k of Array.from(iCache.keys())) if (k < keepI) iCache.delete(k);
-      prefetch(keepV, keepI);
-    }
+    advanceWindow(i);
 
     if (batch.length >= nextBatch) {
       if (i < nextBatch * 2) mark(`1o batch (${batch.length} malhas)`);

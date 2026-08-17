@@ -464,6 +464,16 @@ const DOR_V4_MODEL = PROD
   ? 'dor/v4'
   : 'ea4791c54d3fd38a8a919e5933559b0232840bdefd267cddb9fd70080358d9ed/v4';
 
+// Volume do ambiente e vazio do vão: existem no IFC como dados, não como coisa
+// a desenhar — o viewer da Autodesk esconde os dois por padrão. No DOR são 869
+// caixas turquesa (alpha 0.30) e 1506 laranjas (0.40) na frente das paredes.
+// `?spaces=1` traz eles de volta; `?opaco=1` força alpha 1 em tudo (diagnóstico:
+// separa "geometria faltando" de "transparência demais").
+const SKIP_TYPES = new Set(['IfcSpace', 'IfcOpeningElement']);
+const qs = new URLSearchParams(location.search);
+const showSpaces = qs.get('spaces') === '1';
+const forceOpaque = qs.get('opaco') === '1';
+
 /**
  * Caminho de produção: file-info → tier 1 (mesh + metadata inteiros, vertex e
  * index só por range request). Diferença pro loadDor('std'): lá o container de
@@ -489,7 +499,11 @@ async function loadDorV4() {
       phases.push(`${label} ${(ms / 1000).toFixed(1)}s`);
       console.log(`[poc] fase: ${label} @ ${(ms / 1000).toFixed(1)}s`);
     };
-    for await (const chunk of decodeSplitParquetStreaming({ mesh: a.mesh, vertex: a.vertex, index: a.index }, 4000, onPhase)) {
+    for await (const chunk of decodeSplitParquetStreaming(
+      { mesh: a.mesh, vertex: a.vertex, index: a.index },
+      4000, onPhase, showSpaces ? undefined : SKIP_TYPES,
+    )) {
+      if (forceOpaque) for (const m of chunk) m.color[3] = 1;
       renderer.addMeshes(chunk as any, true);
       meshCount += chunk.length;
       for (const m of chunk) tris += (m.indices?.length ?? 0) / 3;
@@ -504,7 +518,8 @@ async function loadDorV4() {
     renderer.requestRender();
     const total = (performance.now() - t0) / 1000;
     const bytes = 1330; // mesh+vertex+index do DOR, pra ver se ja bateu no teto do link
-    say(`DOR v4 ✓\n${meshCount}/${expected} malhas · ${(tris / 1e6).toFixed(1)}M tri · 1º paint ${(ttfp / 1000).toFixed(1)}s · total ${total.toFixed(1)}s (~${(bytes / total).toFixed(0)} MB/s) · RAM ~${mb(mem())} MB\n${phases.join(' · ')}`);
+    const flags = [showSpaces ? 'spaces' : 'sem IfcSpace/Opening', forceOpaque ? 'OPACO' : ''].filter(Boolean).join(' · ');
+    say(`DOR v4 ✓ (${flags})\n${meshCount}/${expected} malhas · ${(tris / 1e6).toFixed(1)}M tri · 1º paint ${(ttfp / 1000).toFixed(1)}s · total ${total.toFixed(1)}s (~${(bytes / total).toFixed(0)} MB/s) · RAM ~${mb(mem())} MB\n${phases.join(' · ')}`);
   } catch (e: any) { say(`DOR v4 FALHOU: ${e.message}`, true); }
 }
 (document.getElementById('dor-v4') as HTMLButtonElement).addEventListener('click', () => loadDorV4());
