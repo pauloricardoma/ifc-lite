@@ -49,6 +49,29 @@ function rgOf(starts: number[], pos: number): number {
   return lo;
 }
 
+// Quantos row groups buscar à frente do que está sendo reconstruído. 2 mantém a
+// rede ocupada sem inflar o residente (~11MB por RG de vertex).
+const READ_AHEAD = 2;
+// Primeiro batch pequeno: o tempo até o 1º triângulo é o que o split existe pra
+// derrubar, e esperar 4000 malhas obriga a baixar ~10% do modelo antes de pintar.
+// Dobra até `batchSize` pra não perder throughput no resto.
+const FIRST_BATCH = 128;
+
+/**
+ * Fila serial: garante UMA leitura ativa por ParquetFile. O parquet-wasm roda em
+ * wasm single-thread e dois `read()` concorrentes no mesmo objeto podem colidir
+ * no borrow interno. A leitura antecipada continua valendo — ela só entra na
+ * fila mais cedo, e começa assim que a anterior termina em vez de esperar a CPU.
+ */
+function serializer() {
+  let last: Promise<unknown> = Promise.resolve();
+  return <T>(fn: () => Promise<T>): Promise<T> => {
+    const run = last.then(fn, fn);
+    last = run.then(() => {}, () => {});
+    return run;
+  };
+}
+
 interface VtxRG { x: Float32Array; y: Float32Array; z: Float32Array; nx: Float32Array; ny: Float32Array; nz: Float32Array; }
 interface IdxRG { i0: Uint32Array; i1: Uint32Array; i2: Uint32Array; }
 
@@ -131,29 +154,51 @@ async function* streamMeshes(
   const totalVerts = vStart[vNrg];
   const totalTris = iStart[iNrg];
 
-  const vCache = new Map<number, VtxRG>();
-  const iCache = new Map<number, IdxRG>();
-  const getVtxRG = async (k: number): Promise<VtxRG> => {
-    let c = vCache.get(k);
-    if (!c) {
-      const t: any = arrow.tableFromIPC((await vtxPf.read({ rowGroups: [k] })).intoIPCStream());
-      c = { x: t.getChild('x').toArray(), y: t.getChild('y').toArray(), z: t.getChild('z').toArray(),
-            nx: t.getChild('nx').toArray(), ny: t.getChild('ny').toArray(), nz: t.getChild('nz').toArray() };
-      vCache.set(k, c);
+  // Cache de PROMESSA, não de valor: com leitura antecipada duas chamadas podem
+  // pedir o mesmo row group antes da primeira terminar, e guardar a promessa
+  // dedupa a busca. O `.catch` vazio é só pra um prefetch que ninguém aguardou
+  // ainda não virar unhandledrejection — quem der await recebe o erro igual.
+  const vCache = new Map<number, Promise<VtxRG>>();
+  const iCache = new Map<number, Promise<IdxRG>>();
+  const serialV = serializer();
+  const serialI = serializer();
+  const getVtxRG = (k: number): Promise<VtxRG> => {
+    let p = vCache.get(k);
+    if (!p) {
+      p = serialV(async () => {
+        const t: any = arrow.tableFromIPC((await vtxPf.read({ rowGroups: [k] })).intoIPCStream());
+        return { x: t.getChild('x').toArray(), y: t.getChild('y').toArray(), z: t.getChild('z').toArray(),
+                 nx: t.getChild('nx').toArray(), ny: t.getChild('ny').toArray(), nz: t.getChild('nz').toArray() };
+      });
+      p.catch(() => {});
+      vCache.set(k, p);
     }
-    return c;
+    return p;
   };
-  const getIdxRG = async (k: number): Promise<IdxRG> => {
-    let c = iCache.get(k);
-    if (!c) {
-      const t: any = arrow.tableFromIPC((await idxPf.read({ rowGroups: [k] })).intoIPCStream());
-      c = { i0: t.getChild('i0').toArray(), i1: t.getChild('i1').toArray(), i2: t.getChild('i2').toArray() };
-      iCache.set(k, c);
+  const getIdxRG = (k: number): Promise<IdxRG> => {
+    let p = iCache.get(k);
+    if (!p) {
+      p = serialI(async () => {
+        const t: any = arrow.tableFromIPC((await idxPf.read({ rowGroups: [k] })).intoIPCStream());
+        return { i0: t.getChild('i0').toArray(), i1: t.getChild('i1').toArray(), i2: t.getChild('i2').toArray() };
+      });
+      p.catch(() => {});
+      iCache.set(k, p);
     }
-    return c;
+    return p;
+  };
+  // Dispara os próximos row groups sem esperar: a rede busca o k+1 enquanto a
+  // CPU reconstrói as malhas do k. Sem isso, rede e CPU se revezam ociosas e o
+  // total vira a SOMA dos round trips (era o que deixava tudo lento).
+  const prefetch = (vk: number, ik: number) => {
+    for (let d = 1; d <= READ_AHEAD; d++) {
+      if (vk + d < vNrg) getVtxRG(vk + d);
+      if (ik + d < iNrg) getIdxRG(ik + d);
+    }
   };
 
   let batch: StreamMesh[] = [];
+  let nextBatch = Math.min(FIRST_BATCH, batchSize);
   for (let i = 0; i < meshCount; i++) {
     const vS = vertexStarts[i], vC = vertexCounts[i];
     const iS = indexStarts[i], iC = indexCounts[i];
@@ -207,9 +252,14 @@ async function* streamMeshes(
       for (const k of Array.from(vCache.keys())) if (k < keepV) vCache.delete(k);
       const keepI = rgOf(iStart, indexStarts[i + 1] / 3);
       for (const k of Array.from(iCache.keys())) if (k < keepI) iCache.delete(k);
+      prefetch(keepV, keepI);
     }
 
-    if (batch.length >= batchSize) { yield batch; batch = []; }
+    if (batch.length >= nextBatch) {
+      yield batch;
+      batch = [];
+      nextBatch = Math.min(nextBatch * 2, batchSize);
+    }
   }
   if (batch.length > 0) yield batch;
 }
