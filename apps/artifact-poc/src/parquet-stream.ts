@@ -53,7 +53,7 @@ function rgOf(starts: number[], pos: number): number {
 // vez (wasm single-thread), então a única forma de ter N row groups em voo é ter
 // N instâncias. É o que tira o gargalo de latência: com 1 em voo, o tempo total
 // vira a soma dos round trips, e medimos 11.4 MB/s num link que faz mais.
-const POOL = 4;
+const POOL = 8;
 // Buscar à frente o suficiente pra manter o pool cheio.
 const READ_AHEAD = POOL;
 // Primeiro batch pequeno: o tempo até o 1º triângulo é o que o split existe pra
@@ -88,6 +88,31 @@ function poolReader(files: ParquetFile[]): RgReader {
   const queues = files.map(() => serializer());
   return {
     meta: files[0].metadata(),
+    read: (k: number) => {
+      const s = k % files.length;
+      return queues[s](async () =>
+        arrow.tableFromIPC((await files[s].read({ rowGroups: [k] })).intoIPCStream()));
+    },
+  };
+}
+
+/**
+ * Pool por URL que começa a servir com UM leitor e cresce em segundo plano.
+ * Abrir os N de uma vez custava ~1.6s antes do primeiro byte útil (cada
+ * `fromUrl` busca o próprio footer) — e esse tempo entrava inteiro no primeiro
+ * paint. Aqui o streaming arranca com o primeiro e o pool enche em paralelo.
+ */
+async function urlPoolReader(url: string, n: number): Promise<RgReader> {
+  const first = await ParquetFile.fromUrl(url);
+  const files = [first];
+  const queues = [serializer()];
+  for (let i = 1; i < n; i++) {
+    ParquetFile.fromUrl(url)
+      .then((f) => { files.push(f); queues.push(serializer()); })
+      .catch(() => {}); // pool menor só custa vazão, não quebra a leitura
+  }
+  return {
+    meta: first.metadata(),
     read: (k: number) => {
       const s = k % files.length;
       return queues[s](async () =>
@@ -154,11 +179,13 @@ export async function* decodeSplitParquetStreaming(
   const meshPf = await ParquetFile.fromFile(meshBlob);
   mark('mesh baixado');
 
-  const pool = (url: string) => Promise.all(Array.from({ length: POOL }, () => ParquetFile.fromUrl(url)));
-  const [vtxFiles, idxFiles] = await Promise.all([pool(urls.vertex), pool(urls.index)]);
+  const [vtxReader, idxReader] = await Promise.all([
+    urlPoolReader(urls.vertex, POOL),
+    urlPoolReader(urls.index, POOL),
+  ]);
   mark('footers');
 
-  yield* streamMeshes(meshPf, poolReader(vtxFiles), poolReader(idxFiles), batchSize, mark);
+  yield* streamMeshes(meshPf, vtxReader, idxReader, batchSize, mark);
 }
 
 /** Miolo comum: idêntico nos dois caminhos — só muda de onde vêm os bytes. */
