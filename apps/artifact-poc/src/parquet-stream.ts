@@ -139,15 +139,26 @@ export async function* decodeStdParquetStreaming(
 export async function* decodeSplitParquetStreaming(
   urls: { mesh: string; vertex: string; index: string },
   batchSize = 4000,
+  onPhase?: (label: string, ms: number) => void,
 ): AsyncGenerator<StreamMesh[]> {
+  const t0 = performance.now();
+  const mark = (label: string) => onPhase?.(label, performance.now() - t0);
+
   await ensureInit();
+  mark('wasm init');
+
+  // mesh vem numa requisição só, NÃO por fromUrl: são 0.7MB em ~50 row groups, e
+  // ler a tabela inteira por range vira dezenas de round trips em sequência —
+  // era isso que segurava o primeiro paint, não o vertex/index.
+  const meshBlob = await fetch(urls.mesh).then((r) => r.blob());
+  const meshPf = await ParquetFile.fromFile(meshBlob);
+  mark('mesh baixado');
+
   const pool = (url: string) => Promise.all(Array.from({ length: POOL }, () => ParquetFile.fromUrl(url)));
-  const [meshPf, vtxFiles, idxFiles] = await Promise.all([
-    ParquetFile.fromUrl(urls.mesh),
-    pool(urls.vertex),
-    pool(urls.index),
-  ]);
-  yield* streamMeshes(meshPf, poolReader(vtxFiles), poolReader(idxFiles), batchSize);
+  const [vtxFiles, idxFiles] = await Promise.all([pool(urls.vertex), pool(urls.index)]);
+  mark('footers');
+
+  yield* streamMeshes(meshPf, poolReader(vtxFiles), poolReader(idxFiles), batchSize, mark);
 }
 
 /** Miolo comum: idêntico nos dois caminhos — só muda de onde vêm os bytes. */
@@ -156,6 +167,7 @@ async function* streamMeshes(
   vtx: RgReader,
   idx: RgReader,
   batchSize: number,
+  mark: (label: string) => void = () => {},
 ): AsyncGenerator<StreamMesh[]> {
   // Tabela mesh inteira (minúscula: 1 linha por malha, só ranges + cor/id).
   const M: any = arrow.tableFromIPC((await meshPf.read()).intoIPCStream());
@@ -170,6 +182,7 @@ async function* streamMeshes(
   const colorB = M.getChild('color_b').toArray() as Float32Array;
   const colorA = M.getChild('color_a').toArray() as Float32Array;
   const meshCount = expressIds.length;
+  mark('tabela mesh decodificada');
 
   const vMeta: any = vtx.meta;
   const iMeta: any = idx.meta;
@@ -276,6 +289,7 @@ async function* streamMeshes(
     }
 
     if (batch.length >= nextBatch) {
+      if (i < nextBatch * 2) mark(`1o batch (${batch.length} malhas)`);
       yield batch;
       batch = [];
       nextBatch = Math.min(nextBatch * 2, batchSize);

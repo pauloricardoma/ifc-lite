@@ -484,7 +484,12 @@ async function loadDorV4() {
     say(`DOR v4: ${expected} malhas · streaming por range request…`);
 
     let meshCount = 0, tris = 0, ttfp = 0, framed = false;
-    for await (const chunk of decodeSplitParquetStreaming({ mesh: a.mesh, vertex: a.vertex, index: a.index })) {
+    const phases: string[] = [];
+    const onPhase = (label: string, ms: number) => {
+      phases.push(`${label} ${(ms / 1000).toFixed(1)}s`);
+      console.log(`[poc] fase: ${label} @ ${(ms / 1000).toFixed(1)}s`);
+    };
+    for await (const chunk of decodeSplitParquetStreaming({ mesh: a.mesh, vertex: a.vertex, index: a.index }, 4000, onPhase)) {
       renderer.addMeshes(chunk as any, true);
       meshCount += chunk.length;
       for (const m of chunk) tris += (m.indices?.length ?? 0) / 3;
@@ -497,7 +502,9 @@ async function loadDorV4() {
     }
     renderer.fitToView();
     renderer.requestRender();
-    say(`DOR v4 ✓\n${meshCount}/${expected} malhas · ${(tris / 1e6).toFixed(1)}M tri · 1º paint ${(ttfp / 1000).toFixed(1)}s · total ${((performance.now() - t0) / 1000).toFixed(1)}s · RAM ~${mb(mem())} MB`);
+    const total = (performance.now() - t0) / 1000;
+    const bytes = 1330; // mesh+vertex+index do DOR, pra ver se ja bateu no teto do link
+    say(`DOR v4 ✓\n${meshCount}/${expected} malhas · ${(tris / 1e6).toFixed(1)}M tri · 1º paint ${(ttfp / 1000).toFixed(1)}s · total ${total.toFixed(1)}s (~${(bytes / total).toFixed(0)} MB/s) · RAM ~${mb(mem())} MB\n${phases.join(' · ')}`);
   } catch (e: any) { say(`DOR v4 FALHOU: ${e.message}`, true); }
 }
 (document.getElementById('dor-v4') as HTMLButtonElement).addEventListener('click', () => loadDorV4());
