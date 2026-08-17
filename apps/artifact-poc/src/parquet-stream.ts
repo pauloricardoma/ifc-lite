@@ -23,6 +23,10 @@ export interface StreamMesh {
   normals: Float32Array;
   indices: Uint32Array;
   color: [number, number, number, number];
+  /** Origem local: as posições são RELATIVAS a ela (world = origin + position).
+   *  No DOR só 636 paredes usam, com deslocamento de até 187m — ignorar isso
+   *  desenha essas paredes longe do lugar e parecem sumidas. */
+  origin?: [number, number, number];
 }
 
 let ready: Promise<unknown> | null = null;
@@ -210,6 +214,9 @@ async function* streamMeshes(
   const colorG = M.getChild('color_g').toArray() as Float32Array;
   const colorB = M.getChild('color_b').toArray() as Float32Array;
   const colorA = M.getChild('color_a').toArray() as Float32Array;
+  const originX = M.getChild('origin_x').toArray() as Float64Array;
+  const originY = M.getChild('origin_y').toArray() as Float64Array;
+  const originZ = M.getChild('origin_z').toArray() as Float64Array;
   const meshCount = expressIds.length;
   mark('tabela mesh decodificada');
 
@@ -317,11 +324,14 @@ async function* streamMeshes(
       }
     }
 
+    const ox = originX[i], oy = originY[i], oz = originZ[i];
     batch.push({
       expressId: expressIds[i],
       ifcType: (ifcTypes?.get(i) as string) ?? 'Unknown',
       positions, normals, indices,
       color: [colorR[i], colorG[i], colorB[i], colorA[i]],
+      // só quando existe: o renderer trata ausência como origem no mundo
+      ...(ox || oy || oz ? { origin: [ox, oy, oz] as [number, number, number] } : {}),
     });
 
     advanceWindow(i);
