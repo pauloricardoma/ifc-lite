@@ -49,9 +49,13 @@ function rgOf(starts: number[], pos: number): number {
   return lo;
 }
 
-// Quantos row groups buscar à frente do que está sendo reconstruído. 2 mantém a
-// rede ocupada sem inflar o residente (~11MB por RG de vertex).
-const READ_AHEAD = 2;
+// Leitores paralelos do MESMO arquivo. Um ParquetFile só aceita uma leitura por
+// vez (wasm single-thread), então a única forma de ter N row groups em voo é ter
+// N instâncias. É o que tira o gargalo de latência: com 1 em voo, o tempo total
+// vira a soma dos round trips, e medimos 11.4 MB/s num link que faz mais.
+const POOL = 4;
+// Buscar à frente o suficiente pra manter o pool cheio.
+const READ_AHEAD = POOL;
 // Primeiro batch pequeno: o tempo até o 1º triângulo é o que o split existe pra
 // derrubar, e esperar 4000 malhas obriga a baixar ~10% do modelo antes de pintar.
 // Dobra até `batchSize` pra não perder throughput no resto.
@@ -69,6 +73,26 @@ function serializer() {
     const run = last.then(fn, fn);
     last = run.then(() => {}, () => {});
     return run;
+  };
+}
+
+/** Acesso a row group de um arquivo, escondendo quantos leitores existem atrás. */
+interface RgReader { meta: any; read(k: number): Promise<any>; }
+
+/**
+ * Distribui os row groups entre N leitores do mesmo arquivo, cada um com sua
+ * fila serial. Row groups vizinhos caem em leitores diferentes (k % n), então a
+ * leitura antecipada ocupa o pool inteiro em vez de enfileirar num só.
+ */
+function poolReader(files: ParquetFile[]): RgReader {
+  const queues = files.map(() => serializer());
+  return {
+    meta: files[0].metadata(),
+    read: (k: number) => {
+      const s = k % files.length;
+      return queues[s](async () =>
+        arrow.tableFromIPC((await files[s].read({ rowGroups: [k] })).intoIPCStream()));
+    },
   };
 }
 
@@ -96,10 +120,11 @@ export async function* decodeStdParquetStreaming(
   const idxLen = await readU32LE(source, idxLenPos);
   const idxBlob = source.slice(idxLenPos + 4, idxLenPos + 4 + idxLen);
 
+  // Blob é disco local: sem latência de rede pra esconder, um leitor basta.
   yield* streamMeshes(
     await ParquetFile.fromFile(meshBlob),
-    await ParquetFile.fromFile(vtxBlob),
-    await ParquetFile.fromFile(idxBlob),
+    poolReader([await ParquetFile.fromFile(vtxBlob)]),
+    poolReader([await ParquetFile.fromFile(idxBlob)]),
     batchSize,
   );
 }
@@ -116,19 +141,20 @@ export async function* decodeSplitParquetStreaming(
   batchSize = 4000,
 ): AsyncGenerator<StreamMesh[]> {
   await ensureInit();
-  const [meshPf, vtxPf, idxPf] = await Promise.all([
+  const pool = (url: string) => Promise.all(Array.from({ length: POOL }, () => ParquetFile.fromUrl(url)));
+  const [meshPf, vtxFiles, idxFiles] = await Promise.all([
     ParquetFile.fromUrl(urls.mesh),
-    ParquetFile.fromUrl(urls.vertex),
-    ParquetFile.fromUrl(urls.index),
+    pool(urls.vertex),
+    pool(urls.index),
   ]);
-  yield* streamMeshes(meshPf, vtxPf, idxPf, batchSize);
+  yield* streamMeshes(meshPf, poolReader(vtxFiles), poolReader(idxFiles), batchSize);
 }
 
 /** Miolo comum: idêntico nos dois caminhos — só muda de onde vêm os bytes. */
 async function* streamMeshes(
   meshPf: ParquetFile,
-  vtxPf: ParquetFile,
-  idxPf: ParquetFile,
+  vtx: RgReader,
+  idx: RgReader,
   batchSize: number,
 ): AsyncGenerator<StreamMesh[]> {
   // Tabela mesh inteira (minúscula: 1 linha por malha, só ranges + cor/id).
@@ -145,8 +171,8 @@ async function* streamMeshes(
   const colorA = M.getChild('color_a').toArray() as Float32Array;
   const meshCount = expressIds.length;
 
-  const vMeta: any = vtxPf.metadata();
-  const iMeta: any = idxPf.metadata();
+  const vMeta: any = vtx.meta;
+  const iMeta: any = idx.meta;
   const vNrg = vMeta.numRowGroups();
   const iNrg = iMeta.numRowGroups();
   const vStart = prefixRows(vMeta, vNrg);
@@ -160,16 +186,12 @@ async function* streamMeshes(
   // ainda não virar unhandledrejection — quem der await recebe o erro igual.
   const vCache = new Map<number, Promise<VtxRG>>();
   const iCache = new Map<number, Promise<IdxRG>>();
-  const serialV = serializer();
-  const serialI = serializer();
   const getVtxRG = (k: number): Promise<VtxRG> => {
     let p = vCache.get(k);
     if (!p) {
-      p = serialV(async () => {
-        const t: any = arrow.tableFromIPC((await vtxPf.read({ rowGroups: [k] })).intoIPCStream());
-        return { x: t.getChild('x').toArray(), y: t.getChild('y').toArray(), z: t.getChild('z').toArray(),
-                 nx: t.getChild('nx').toArray(), ny: t.getChild('ny').toArray(), nz: t.getChild('nz').toArray() };
-      });
+      p = vtx.read(k).then((t: any) => (
+        { x: t.getChild('x').toArray(), y: t.getChild('y').toArray(), z: t.getChild('z').toArray(),
+          nx: t.getChild('nx').toArray(), ny: t.getChild('ny').toArray(), nz: t.getChild('nz').toArray() }));
       p.catch(() => {});
       vCache.set(k, p);
     }
@@ -178,10 +200,8 @@ async function* streamMeshes(
   const getIdxRG = (k: number): Promise<IdxRG> => {
     let p = iCache.get(k);
     if (!p) {
-      p = serialI(async () => {
-        const t: any = arrow.tableFromIPC((await idxPf.read({ rowGroups: [k] })).intoIPCStream());
-        return { i0: t.getChild('i0').toArray(), i1: t.getChild('i1').toArray(), i2: t.getChild('i2').toArray() };
-      });
+      p = idx.read(k).then((t: any) => (
+        { i0: t.getChild('i0').toArray(), i1: t.getChild('i1').toArray(), i2: t.getChild('i2').toArray() }));
       p.catch(() => {});
       iCache.set(k, p);
     }
