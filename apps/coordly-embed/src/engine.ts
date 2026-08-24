@@ -52,6 +52,12 @@ interface EngineEvents {
     modelIndex: number;
     /** Seleção completa (multi-seleção); `expressId` é o último clicado. */
     expressIds: number[];
+    /**
+     * Modelo de CADA id de `expressIds`, na mesma ordem. Na federação a seleção
+     * cruza modelos, e `modelIndex` acima é só o do último clicado: ler o resto
+     * com ele entrega o data model errado, com ids que colidem entre arquivos.
+     */
+    modelIndices: number[];
   }): void;
   // Árvore espacial e propriedades ficam disponíveis; chega depois do render
   // porque o data model é buscado sem bloquear a geometria.
@@ -86,6 +92,9 @@ const MODEL_ID_STEP = 50_000_000;
 
 /** Desfaz o offset: o mundo fora do engine só conhece o expressId do arquivo. */
 const localExpressId = (expressId: number): number => expressId % MODEL_ID_STEP;
+
+/** De qual modelo é este id da cena. Inverso de `idOffset = slot * MODEL_ID_STEP`. */
+const modelIndexOf = (expressId: number): number => Math.floor(expressId / MODEL_ID_STEP);
 
 interface FederatedModel {
   /** Id que o app usa (no Coordly, o urn) — volta nos eventos do data model. */
@@ -1288,11 +1297,12 @@ export class ViewerEngine {
   }
 
   private emitSelection(): void {
-    const ids = Array.from(this.selectedIds, localExpressId);
+    const sceneIds = Array.from(this.selectedIds);
     this.events.onSelect({
       expressId: this.selectedId === null ? null : localExpressId(this.selectedId),
       modelIndex: this.selectedModelIndex ?? 0,
-      expressIds: ids,
+      expressIds: sceneIds.map(localExpressId),
+      modelIndices: sceneIds.map(modelIndexOf),
     });
   }
 
