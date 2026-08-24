@@ -6,6 +6,19 @@ export type MeasureMode = 'none' | 'distance' | 'area';
 
 export interface Vec3 { x: number; y: number; z: number }
 
+/** O que o cursor pegou: quina, aresta, face ou o centro dela. */
+export type SnapKind = 'vertex' | 'midpoint' | 'edge' | 'face' | 'face-center';
+
+export interface SnapHint {
+  kind: SnapKind;
+}
+
+/** Ponto sob o cursor JÁ com snap aplicado, mais o alvo que o produziu (quando houve). */
+export interface RaycastHit {
+  point: Vec3;
+  snap?: SnapHint;
+}
+
 export interface Measurement {
   id: string;
   kind: 'distance' | 'area';

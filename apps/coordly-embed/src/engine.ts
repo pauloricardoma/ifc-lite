@@ -1,10 +1,10 @@
 import { Renderer, DEFAULT_CHUNK_CELL_SIZE } from '@ifc-lite/renderer';
-import type { SectionPlane } from '@ifc-lite/renderer';
+import type { SectionPlane, SnapTarget } from '@ifc-lite/renderer';
 import { GeometryProcessor, decodeInstancedShard } from '@ifc-lite/geometry';
 import type { TessellationQuality } from '@ifc-lite/geometry';
 import { decodeStdParquetStreaming } from './parquet-stream.js';
 import { MeasureTool } from './measure-tool.js';
-import type { Measurement, MeasureMode, Vec3 } from './measure.js';
+import type { Measurement, MeasureMode, RaycastHit, SnapHint, SnapKind, Vec3 } from './measure.js';
 import { ModelDataStore } from './data-model.js';
 import type { BimEntityProperties, BimTreeNode } from './data-model.js';
 import type { IfcArtifacts } from './types.js';
@@ -18,6 +18,9 @@ const DATA_MODEL_POLL = { intervalMs: 3000, quickAttempts: 3, attempts: 40 };
 // Nunca mandamos `opening_filter` nem `tessellation_quality` nas chamadas, então
 // o server resolve os defaults — `default` e `medium` (medium não gera sufixo).
 const DEFAULT_OPENING_FILTER = 'default';
+
+/** Raio (px de tela) em que o ponto na aresta é promovido pro MEIO dela. */
+const MIDPOINT_SNAP_PX = 14;
 
 
 const GPU_BUDGET_MB = 2048;
@@ -355,7 +358,7 @@ export class ViewerEngine {
   }
 
   /** Ponto de superfície sob o cursor, com snap a vértice/aresta/face. */
-  private raycastWorld(x: number, y: number): Vec3 | null {
+  private raycastWorld(x: number, y: number): RaycastHit | null {
     const hit = this.renderer?.raycastScene(x, y, {
       hiddenIds: this.hiddenIds,
       isolatedIds: this.isolatedIds,
@@ -364,7 +367,32 @@ export class ViewerEngine {
     if (!hit) { return null; }
     // O snap ganha do ponto cru: medir aresta a aresta é o caso comum, e sem ele
     // cada clique cai a alguns milímetros da quina.
-    return hit.snap?.position ?? hit.intersection?.point ?? null;
+    const point = hit.snap?.position ?? hit.intersection?.point;
+    if (!point) { return null; }
+    const snap = hit.snap && toSnapHint(hit.snap);
+    if (hit.snap && snap?.kind === 'edge') {
+      const mid = this.edgeMidpoint(hit.snap, point);
+      if (mid) { return { point: mid, snap: { kind: 'midpoint' } }; }
+    }
+    return { point, snap };
+  }
+
+  /**
+   * Meio da aresta, quando o ponto já snapado cai perto dele NA TELA. Em px e
+   * não em `t`: numa viga de 8 m qualquer fração fixa de `t` viraria uma zona de
+   * metros. A aresta aqui é um run reconstruído (`snap-edge-runs`), então este é
+   * o meio da aresta que se enxerga — não o de um fragmento de triângulo.
+   */
+  private edgeMidpoint(target: SnapTarget, snapped: Vec3): Vec3 | null {
+    const vertices = target.metadata?.vertices;
+    if (vertices?.length !== 2) { return null; }
+    const [v0, v1] = vertices;
+    const mid = { x: (v0.x + v1.x) / 2, y: (v0.y + v1.y) / 2, z: (v0.z + v1.z) / 2 };
+    const onScreen = this.projectToScreen(mid);
+    const snappedOnScreen = this.projectToScreen(snapped);
+    if (!onScreen || !snappedOnScreen) { return null; }
+    const gap = Math.hypot(onScreen.x - snappedOnScreen.x, onScreen.y - snappedOnScreen.y);
+    return gap <= MIDPOINT_SNAP_PX ? mid : null;
   }
 
   // Parse do .ifc no browser. Com cross-origin isolation vai pro caminho
@@ -1544,6 +1572,11 @@ export class ViewerEngine {
       if (button === 2 || e.shiftKey) { this.camera.pan(dx, dy); } else { this.camera.orbit(dx, dy); }
       this.renderer.requestRender();
     });
+    c.addEventListener('pointerleave', () => {
+      if (!this.measure?.isActive()) { return; }
+      this.measure.handleLeave();
+      this.renderer.requestRender();
+    });
     c.addEventListener('wheel', (e) => {
       e.preventDefault();
       this.camera.zoom(e.deltaY, false, e.offsetX, e.offsetY, c.width, c.height);
@@ -1556,3 +1589,20 @@ export class ViewerEngine {
     });
   }
 }
+
+const SNAP_KINDS: Record<string, SnapKind> = {
+  vertex: 'vertex',
+  edge: 'edge',
+  face: 'face',
+  face_center: 'face-center',
+};
+
+/**
+ * `SnapTarget` do renderer → o mínimo que o overlay desenha. `point_cloud` cai
+ * fora de propósito: não carregamos nuvem de pontos, e um tipo desconhecido vira
+ * "sem snap" em vez de um marcador que não sabemos desenhar.
+ */
+const toSnapHint = (target: SnapTarget): SnapHint | undefined => {
+  const kind = SNAP_KINDS[target.type];
+  return kind ? { kind } : undefined;
+};
