@@ -976,7 +976,11 @@ export class ViewerEngine {
       // geometria e nunca tinha data model — clicar num elemento não trazia nada.
       void this.loadDataModel(hash, serverUrl, ifcBlob, model);
     } catch (err: any) {
-      this.models.delete(modelId); // o modelo não entrou na cena
+      // A carga é PROGRESSIVA: quando o SSE morre no meio (server derrubado por
+      // OOM, gateway cortando), parte das malhas já está na cena. Só apagar o
+      // registro deixa essa geometria órfã — ninguém mais tem o `model.ids` que
+      // a identifica — e religar o urn empilha uma segunda cópia por cima.
+      this.discardModel(modelId);
       if (this.disposed || err?.name === 'AbortError') { return; }
       this.events.onError('server-parse-failed', String(err?.message ?? err));
     }
@@ -993,11 +997,14 @@ export class ViewerEngine {
     if (!model || !this.renderer) { return; }
 
     const scene = this.renderer.getScene();
-    scene.removeMeshesForEntities(model.ids);
-    // A remoção só marca os buckets; sem o rebuild a geometria continua na GPU
-    // e desenhando.
+    // A remoção só marca os buckets; sem device/pipeline ela não chega à GPU e
+    // a geometria continua desenhando. Como aqui a carga é SEMPRE por streaming
+    // e nunca chamamos `finalizeStreaming()`, o que está na GPU são os
+    // fragmentos — é a passagem do device que faz a cena perder o modelo certo,
+    // em vez de perder a cena inteira.
     const device = this.renderer.getGPUDevice();
     const pipeline = this.renderer.getPipeline();
+    scene.removeMeshesForEntities(model.ids, device ?? undefined, pipeline ?? undefined);
     if (device && pipeline) { scene.rebuildPendingBatches(device, pipeline); }
 
     let selectionChanged = false;
@@ -1026,6 +1033,15 @@ export class ViewerEngine {
 
   hasModel(modelId: string): boolean {
     return this.models.has(modelId);
+  }
+
+  /**
+   * Rollback de uma carga que falhou. Não é `removeModel` direto porque com o
+   * motor já descartado não há cena para mexer — aí só o registro sai.
+   */
+  private discardModel(modelId: string): void {
+    if (this.disposed || !this.renderer) { this.models.delete(modelId); return; }
+    this.removeModel(modelId);
   }
 
   // Modo server: geometria já tesselada vem do CDN. Streaming por row group é o
@@ -1148,7 +1164,7 @@ export class ViewerEngine {
       this.renderer.requestRender();
       this.events.onLoaded({ elementCount: meshCount });
     } catch (err: any) {
-      this.models.delete(modelId); // rollback do índice se este modelo falhou
+      this.discardModel(modelId); // tira da cena o que já tinha entrado
       if (this.disposed || err?.name === 'AbortError') { return; }
       this.events.onError('parse-failed', String(err?.message ?? err));
     }

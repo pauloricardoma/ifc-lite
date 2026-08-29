@@ -1291,15 +1291,32 @@ export class Scene {
       bucket.batchedMesh = batchedMesh;
     }
 
-    // Rebuild the flat render array from all buckets (148 max batches — not perf critical)
+    this.rebuildFlatBatchArray();
+
+    this.pendingBatchKeys.clear();
+  }
+
+  /**
+   * Rebuild the flat render array (148 max batches — not perf critical).
+   *
+   * The drawn set is buckets + streaming fragments: during streaming the
+   * buckets only accumulate meshData (`batchedMesh` stays null) and what is
+   * actually on the GPU are the fragments. Rebuilding from the buckets alone
+   * therefore DROPPED every fragment from the render array — a mid-stream
+   * rebuild (a removal, a recolour) emptied the canvas of geometry nobody had
+   * asked to remove. Fragments go last so an already-batched bucket draws
+   * under them, matching the order `createStreamingFragments` appends in.
+   */
+  private rebuildFlatBatchArray(): void {
     this.batchedMeshes = [];
     for (const bucket of this.buckets.values()) {
       if (bucket.batchedMesh) {
         this.batchedMeshes.push(bucket.batchedMesh);
       }
     }
-
-    this.pendingBatchKeys.clear();
+    for (const fragment of this.streamingFragments) {
+      this.batchedMeshes.push(fragment);
+    }
   }
 
   /**
@@ -1448,13 +1465,86 @@ export class Scene {
    * same bucket key once per entity in the common "split N walls"
    * batch. Returns the number of entities that had at least one
    * dedicated mesh removed.
+   *
+   * Pass `device`/`pipeline` to also remove the entities from the STREAMING
+   * fragments. The bucket bookkeeping above is CPU-side only: while streaming
+   * is live the geometry on the GPU is in the fragments, so without this the
+   * removed entities keep drawing (and the buckets, once batched, draw the
+   * survivors a second time on top of the fragments that still hold them).
+   * Callers that remove after `finalizeStreaming()` have no fragments and can
+   * keep omitting both.
    */
-  removeMeshesForEntities(expressIds: Iterable<number>): number {
+  removeMeshesForEntities(
+    expressIds: Iterable<number>,
+    device?: GPUDevice,
+    pipeline?: RenderPipeline
+  ): number {
+    const ids = expressIds instanceof Set ? expressIds : new Set(expressIds);
+    const pendingBefore = new Set(this.pendingBatchKeys);
     let count = 0;
-    for (const id of expressIds) {
+    for (const id of ids) {
       if (this.removeMeshesForEntity(id)) count++;
     }
+    if (count > 0 && device && pipeline) {
+      this.rebuildFragmentsAfterRemoval(ids, pendingBefore, device, pipeline);
+    }
     return count;
+  }
+
+  /**
+   * Streaming counterpart of `rebuildPendingBatches` for a removal: rebuild
+   * only the fragments that actually held a removed entity, from the pieces
+   * of their own `sourceMeshData` that survive.
+   *
+   * Why not just let `rebuildPendingBatches` handle it: the buckets the
+   * removal marked pending still hold the SURVIVING meshes, whose geometry is
+   * already on the GPU inside the fragments. Batching them mid-stream draws
+   * that geometry twice. So the pending set is restored to what it was before
+   * the removal — a later `finalizeStreaming()` re-groups every bucket from
+   * meshData anyway, so nothing is lost by not batching them now.
+   */
+  private rebuildFragmentsAfterRemoval(
+    removedIds: Set<number>,
+    pendingBefore: Set<string>,
+    device: GPUDevice,
+    pipeline: RenderPipeline
+  ): void {
+    // No CPU geometry left to rebuild a fragment from.
+    if (this.streamingFragments.length === 0 || this.geometryReleased) return;
+
+    const survivingFragments: BatchedMesh[] = [];
+    let changed = false;
+
+    for (const fragment of this.streamingFragments) {
+      if (!fragment.expressIds.some((id) => removedIds.has(id))) {
+        survivingFragments.push(fragment);
+        continue;
+      }
+      changed = true;
+
+      // Same rule `removeMeshesForEntity` applies to the buckets: a
+      // color-merged piece hosts many entities, so it stays — dropping it
+      // would take the neighbours' geometry with it.
+      const keptPieces = (fragment.sourceMeshData ?? []).filter((piece) => (
+        (piece.entityIds && piece.entityIds.length > 0) || !removedIds.has(piece.expressId)
+      ));
+
+      // The clones derived from this fragment are keyed by its batch id.
+      this.dropPartialCacheForBatch(fragment);
+      this.lastDrawnFrame.delete(fragment.id);
+      destroyGpuResources(fragment);
+
+      if (keptPieces.length === 0) continue;
+      survivingFragments.push(
+        this.createBatchedMesh(keptPieces, keptPieces[0].color, device, pipeline)
+      );
+    }
+
+    if (!changed) return;
+
+    this.streamingFragments = survivingFragments;
+    this.pendingBatchKeys = pendingBefore;
+    this.rebuildFlatBatchArray();
   }
 
   /**
