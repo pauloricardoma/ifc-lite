@@ -13,7 +13,10 @@ import { useViewerStore } from '@/store';
 import { fromGlobalIdFromModels, toGlobalIdFromModels } from '@/store/globalId';
 import { pointInPolygon } from '@/lib/polygon-clip';
 import { toast } from '@/components/ui/toast';
-import { raycastForPolylinePoint, isNearPolylineStart } from './measureHandlers.js';
+import { notifyWallSplit } from './wallSplitNotice.js';
+import { raycastForPolylinePoint, isNearPolylineStart,
+  isDuplicateClickPoint,
+} from './measureHandlers.js';
 
 /**
  * Handle click event for selection (single click and double click).
@@ -42,8 +45,13 @@ export async function handleSelectionClick(ctx: MouseHandlerContext, e: MouseEve
   // gesture that adds a point, which is what makes the two modes unable to
   // corrupt each other's state (see `setMeasureMode` in measurementSlice.ts).
   if (tool === 'measure') {
-    if (useViewerStore.getState().measureMode === 'polyline') {
+    const mode = useViewerStore.getState().measureMode;
+    if (mode === 'polyline') {
       handlePolylineClick(ctx, x, y);
+    } else if (mode === 'angle') {
+      handleAngleClick(ctx, x, y);
+    } else if (mode === 'radius') {
+      handleRadiusClick(ctx, x, y);
     }
     return;
   }
@@ -153,15 +161,13 @@ export async function handleSelectionClick(ctx: MouseHandlerContext, e: MouseEve
       if (wallTry.ok) {
         state.clearSplitHover();
         state.setSelectedEntityId(wallTry.right.globalId);
-        // Mention opening reassignment in the toast only when it
-        // happened — silence is preferable to "0 openings moved"
-        // for a wall with no doors / windows.
-        const op = wallTry.openings;
-        const opSummary =
-          op.toLeft + op.toRight > 0
-            ? ` (${op.toLeft + op.toRight} opening${op.toLeft + op.toRight === 1 ? '' : 's'} reassigned)`
-            : '';
-        toast.success(`Wall split${opSummary} — Ctrl+Z to undo`);
+        // Both wall-split commit paths — here and the Split tool's
+        // numeric-distance panel — announce the split through the same
+        // emitter (`wallSplitNotice.ts`), so a notice added to one cannot
+        // go missing from the other. That is exactly how `openings.skipped`
+        // stayed silent on the typed-distance path after #3023 taught this
+        // one to report it.
+        notifyWallSplit(wallTry.openings);
         return;
       }
       const linearTry = state.splitLinearElementAtDistance(
@@ -641,6 +647,138 @@ export function handlePolylineClick(ctx: MouseHandlerContext, x: number, y: numb
 }
 
 /**
+ * Handle a click landing on the scene while the Measure tool's radius mode
+ * is active (#2737 item 2). Same click state machine as
+ * {@link handlePolylineClick} minus the close-the-loop branch — radius has
+ * no "closed" concept, so a click only ever starts a sequence or extends it:
+ *
+ *   - no sequence in progress → start one at the clicked point.
+ *   - otherwise → append the clicked point.
+ *
+ * Finishing is double-click or Enter (`finishRadiusFromDoubleClick`'s call
+ * sites in useMouseControls.ts / useKeyboardShortcuts.ts), the same gesture
+ * polyline uses and for the same reason: with an unbounded pick count there
+ * is no "last pick" for the store to recognise and finish itself on, unlike
+ * angle's fixed count. A miss (no raycast hit) is a no-op.
+ */
+export function handleRadiusClick(ctx: MouseHandlerContext, x: number, y: number): void {
+  const picked = raycastForPolylinePoint(ctx, x, y);
+  if (!picked) return;
+
+  const state = useViewerStore.getState();
+  ctx.setSnapTarget(picked.snapTarget);
+
+  const active = state.activeRadius;
+  if (!active) {
+    state.startRadius(picked.point);
+    return;
+  }
+
+  state.addRadiusPoint(picked.point);
+}
+
+/**
+ * Click handler for angle mode (#2735).
+ *
+ * There is no finish gesture - every angle kind has a FIXED pick count and the
+ * store finishes the measurement itself on the last pick - so polyline's
+ * `fromDoubleClick` apparatus has no analogue here.
+ *
+ * But the duplicate-click DEFENCE still does, and an earlier version of this
+ * comment claimed otherwise on false grounds. It argued a stray second click
+ * "lands where the maths already classifies coincident picks as degenerate".
+ * Only APEX-coincidence is degenerate. Browsers fire `click, click, dblclick`,
+ * so a habitual double-click produces three distinct failures here:
+ *
+ *   1. double-clicking a DIRECTION point makes picks 2 and 3 coincide - a
+ *      recorded "0.0°", rendered as a real answer rather than an em dash;
+ *   2. double-clicking the THIRD pick finishes on the first click and the
+ *      second click starts a stray new sequence, so "1/3 picks · apex set"
+ *      appears unbidden;
+ *   3. double-clicking the APEX puts picks 1 and 2 a pixel or two apart - a
+ *      ray whose direction is cursor noise, and pick 3 then yields a
+ *      confident, wrong `angled` number.
+ *
+ * So the same `isDuplicateClickPoint` guard polyline uses applies: a click
+ * within {@link DUPLICATE_POINT_SCREEN_RADIUS_PX} of the previous pick is the
+ * second half of one physical double-click and is dropped. Dropping is safe
+ * because a genuinely intended pick that close is unmeasurable anyway.
+ *
+ * A miss is a no-op, matching polyline's contract.
+ *
+ * Only the `'points'` kind ships today; `'edges'` and `'faces'` are the later
+ * slices of #2735 and will need their own pick resolution (an edge run from
+ * `SnapTarget.metadata`, a camera-oriented face normal from the intersection),
+ * which is why the pick carries its `kind` rather than being a bare point.
+ */
+export function handleAngleClick(ctx: MouseHandlerContext, x: number, y: number): void {
+  const state = useViewerStore.getState();
+  const kind = state.angleKind;
+
+  // Faces need the surface normal, which only the raycast hit carries, so they
+  // take a different path from the two point-based kinds rather than sharing
+  // the snap-driven one. Snapping a face pick to a nearby VERTEX would move the
+  // point off the surface whose normal we just read.
+  if (kind === 'faces') {
+    const hit = ctx.renderer?.raycastScene(x, y, {
+      hiddenIds: ctx.hiddenEntitiesRef.current,
+      isolatedIds: ctx.isolatedEntitiesRef.current,
+    });
+    const n = hit?.intersection?.normal;
+    const p = hit?.intersection?.point;
+    if (!n || !p) return;
+
+    // Faces need the SAME double-click guard as the point-based kinds, which
+    // this early-return path was skipping. A face pair needs exactly two picks,
+    // so a physical double-click on one face recorded both halves instantly and
+    // completed a bogus measurement reading "Parallel" - a plausible-looking
+    // number for two picks the user never made.
+    //
+    // There is no shape boundary to exempt here, unlike edges: both face picks
+    // belong to one measurement, and two clicks in the same spot are always the
+    // same face.
+    const facePrior = state.activeAngle?.picks ?? [];
+    const facePrev = facePrior.length > 0 ? facePrior[facePrior.length - 1].point : null;
+    const facePoint = { x: p.x, y: p.y, z: p.z, screenX: x, screenY: y };
+    if (facePrev && isDuplicateClickPoint(facePrev, facePoint)) return;
+
+    state.addAnglePick({
+      kind: 'faces',
+      // screen coords are the click itself, which is what the overlay
+      // reprojects from; `updateMeasurementScreenCoords` refreshes them on
+      // camera move exactly as it does for the other kinds.
+      point: facePoint,
+      normal: { x: n.x, y: n.y, z: n.z },
+    });
+    return;
+  }
+
+  const picked = raycastForPolylinePoint(ctx, x, y);
+  if (!picked) return;
+
+  // Drop the second half of a physical double-click (see the note above), but
+  // only WITHIN a shape, never across the boundary between the two edges.
+  //
+  // The natural gesture for an edge pair is to trace edge A into a shared
+  // corner and edge B out of it, so picks 2 and 3 are the SAME point. Guarding
+  // across that boundary swallowed pick 3, the measurement never completed, and
+  // the only recourse was to click slightly off the corner - degrading the very
+  // direction being measured. Worse, the opposite pick order (corner first)
+  // survived, so the mode worked or did not depending on which end of edge A
+  // the user started from, which is not a distinction they can see.
+  //
+  // A shared vertex is NOT a degenerate edge: a zero-length second edge needs
+  // pick 4 to coincide with pick 3, and that is still caught below.
+  const prior = state.activeAngle?.picks ?? [];
+  const startsNewShape = kind === 'edges' && prior.length % 2 === 0;
+  const last = !startsNewShape && prior.length > 0 ? prior[prior.length - 1].point : null;
+  if (last && isDuplicateClickPoint(last, picked.point)) return;
+
+  ctx.setSnapTarget(picked.snapTarget);
+  state.addAnglePick({ kind, point: picked.point });
+}
+
+/**
  * The store side of the Measure tool's double-click finish (#2199), kept
  * beside {@link handlePolylineClick} because the two are one gesture family
  * and this one reads the store directly the same way.
@@ -662,6 +800,20 @@ export function finishPolylineFromDoubleClick(): boolean | null {
   const state = useViewerStore.getState();
   if (state.measureMode !== 'polyline' || !state.activePolyline) return null;
   return state.finishPolyline(false, { fromDoubleClick: true });
+}
+
+/**
+ * The store side of the Measure tool's radius double-click finish (#2737
+ * item 2) — same shape as {@link finishPolylineFromDoubleClick}, for the
+ * same reason (radius is the other unbounded, explicit-finish click
+ * sequence). Returns `null` when the gesture does not apply (not in radius
+ * mode, or no sequence in progress); otherwise whether a measurement was
+ * actually recorded.
+ */
+export function finishRadiusFromDoubleClick(): boolean | null {
+  const state = useViewerStore.getState();
+  if (state.measureMode !== 'radius' || !state.activeRadius) return null;
+  return state.finishRadius({ fromDoubleClick: true });
 }
 
 /**

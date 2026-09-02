@@ -13,6 +13,13 @@
 pub struct EntityScanner<'a> {
     bytes: &'a [u8],
     position: usize,
+    /// `line_start` of every record refused for an oversized instance name,
+    /// in scan order (so: strictly increasing). A `Vec` rather than a counter
+    /// because a SHARDED caller has to know WHERE a refusal happened before it
+    /// can tell a real one from one its speculative prefix invented — see
+    /// [`Self::skipped_oversized_id_starts`]. It never allocates on a file
+    /// with nothing to refuse, which is every real file.
+    skipped_oversized_id_starts: Vec<usize>,
 }
 
 impl<'a> EntityScanner<'a> {
@@ -30,6 +37,7 @@ impl<'a> EntityScanner<'a> {
         Self {
             bytes,
             position: data_section_start(bytes),
+            skipped_oversized_id_starts: Vec::new(),
         }
     }
 
@@ -52,12 +60,43 @@ impl<'a> EntityScanner<'a> {
         Self {
             bytes,
             position: clamped,
+            skipped_oversized_id_starts: Vec::new(),
         }
     }
 
     /// Current byte offset of the scanner (start of the next entity to scan).
     pub fn position(&self) -> usize {
         self.position
+    }
+
+    /// How many records this scanner has skipped because their instance name
+    /// does not fit `u32` (issue #3395).
+    ///
+    /// ISO 10303-21 puts no upper bound on `#<digits>`, but every express-id
+    /// column in this workspace is `u32` (`ColumnarIndex::ids`,
+    /// `MeshData::express_id`, the wasm `express_ids` buffers), so a wider id
+    /// cannot be represented — it used to wrap, making `#4294967297`
+    /// indistinguishable from `#1`. The record is dropped instead, and this
+    /// counter is the other half of that guard: callers report it rather than
+    /// letting the model come back quietly short.
+    pub fn skipped_oversized_ids(&self) -> usize {
+        self.skipped_oversized_id_starts.len()
+    }
+
+    /// The `line_start` byte offset of every record this scanner refused,
+    /// strictly increasing.
+    ///
+    /// A whole-file scan only needs the count above. A SHARDED scan needs the
+    /// offsets, and the difference is not cosmetic: shard `i > 0` starts at an
+    /// arbitrary byte, so it can begin inside a quoted value and parse a
+    /// string literal such as `'…#4294967297=IFCWALL(…'` as a record — and
+    /// refuse it. That refusal is an artefact of where the shard started, not
+    /// a record the file declares, so a count alone would let a file with
+    /// NOTHING oversized in it be reported as incomplete. The offset lets the
+    /// stitch keep only the refusals inside the byte region it actually
+    /// retained from that shard (issue #3395/#3430).
+    pub fn skipped_oversized_id_starts(&self) -> &[usize] {
+        &self.skipped_oversized_id_starts
     }
 
     /// Scan for the next entity
@@ -74,10 +113,20 @@ impl<'a> EntityScanner<'a> {
         //      up — `/* previous #12= IFCWALL */` was the canonical example
         //      where the original `#N=` shape check still false-positived).
         //   2. After comment-skipping locates a candidate '#', validate it
-        //      starts a real `#<digits>[ws]*=` pattern. Catches embedded
+        //      starts a real `#<trivia>=` pattern. Catches embedded
         //      references inside STEP strings (CATIA `'…\X0\2#.ifc'`) AND
         //      any comment-shaped tokens the comment skipper missed (mostly
         //      a fallback now — true `/* */` regions never reach this check).
+        //
+        // "Trivia", not whitespace: 10303-21 allows a comment wherever
+        // whitespace is allowed, INCLUDING inside a record, so
+        // `#1 /* was #7 */ = IFCWALL(…);` is a legal declaration and used to
+        // produce no record at all. The same rule governs the gap between the
+        // '=' and the type name, and `find_entity_end` skips a comment for it
+        // in the record body — otherwise a ';' written inside one ends the
+        // record early and the span handed to the decoder is truncated. The
+        // matched TypeScript half is `skipTrivia` in
+        // `packages/parser/src/step-lexing.ts`; change the two together.
         //
         // Both checks together keep `next_entity` aligned with
         // `build_entity_index` which is comment-blind today; if a stray
@@ -85,149 +134,187 @@ impl<'a> EntityScanner<'a> {
         // ignores it, so the entity decoder + scanner stay consistent.
         let bytes = self.bytes;
         let len = bytes.len();
-        let (line_start, id_end_validated) = loop {
-            // Step (1): jump past any `/* … */` comment that starts at or
-            // before the next candidate '#'. Use memchr2 so we look for
-            // '#' and '/' in one SIMD pass — whichever comes first
-            // decides the next move.
-            let remaining = &bytes[self.position..];
-            let next = memchr::memchr2(b'#', b'/', remaining)?;
-            let candidate = self.position + next;
-            let candidate_byte = bytes[candidate];
+        // Outer loop so a record this scanner refuses (an oversized
+        // instance name, below) is SKIPPED rather than ending the scan.
+        loop {
+            let (line_start, id_end_validated, eq_pos) = loop {
+                // Step (1): jump past any `/* … */` comment that starts at or
+                // before the next candidate '#'. Use memchr2 so we look for
+                // '#' and '/' in one SIMD pass — whichever comes first
+                // decides the next move.
+                let remaining = &bytes[self.position..];
+                let next = memchr::memchr2(b'#', b'/', remaining)?;
+                let candidate = self.position + next;
+                let candidate_byte = bytes[candidate];
 
-            if candidate_byte == b'/' {
-                // '/' might begin a STEP `/* … */` comment. If yes, jump
-                // past `*/`; if not, it's a STEP arithmetic '/' inside a
-                // value list (rare; just step past it).
-                if candidate + 1 < len && bytes[candidate + 1] == b'*' {
-                    let mut p = candidate + 2;
-                    while p + 1 < len {
-                        // Find next '*'; check if followed by '/'.
-                        let from = p;
-                        let star = match memchr::memchr(b'*', &bytes[from..]) {
-                            Some(off) => from + off,
-                            None => return None, // unterminated comment
-                        };
-                        if star + 1 < len && bytes[star + 1] == b'/' {
-                            self.position = star + 2;
-                            break;
-                        }
-                        p = star + 1;
+                if candidate_byte == b'/' {
+                    // '/' might begin a STEP `/* … */` comment. If yes, jump
+                    // past `*/`; if not, it's a STEP arithmetic '/' inside a
+                    // value list (rare; just step past it).
+                    if candidate + 1 < len && bytes[candidate + 1] == b'*' {
+                        // An unterminated `/*` here means corrupt input.
+                        // `skip_step_comment` refuses (returns `None`) rather
+                        // than silently consuming the rest of the file — see
+                        // its doc comment for why that's the right call for a
+                        // scanner (issue #3303).
+                        self.position = super::lexical::skip_step_comment(bytes, candidate)?;
+                        continue;
                     }
-                    if self.position <= candidate {
-                        // Comment never closed — refuse to scan further.
-                        return None;
-                    }
+                    // Lone '/' — not a comment. Skip past.
+                    self.position = candidate + 1;
                     continue;
                 }
-                // Lone '/' — not a comment. Skip past.
-                self.position = candidate + 1;
+
+                // candidate_byte == b'#'. Step (2): validate `#<digits>[ws]*=`.
+                let after = candidate + 1;
+                if after >= len || !bytes[after].is_ascii_digit() {
+                    self.position = after;
+                    continue;
+                }
+                // Walk the digit run.
+                let mut digit_end = after;
+                while digit_end < len && bytes[digit_end].is_ascii_digit() {
+                    digit_end += 1;
+                }
+                // Skip optional trivia and verify the next byte is '='.
+                // `None` means a comment opened here and never closes, which
+                // is not a declaration either — fall through to the rescan
+                // below, where the outer memchr2 finds the same '/*' and
+                // `skip_step_comment` ends the scan on it.
+                let probe = super::lexical::skip_step_trivia(bytes, digit_end).unwrap_or(len);
+                if probe < len && bytes[probe] == b'=' {
+                    break (candidate, digit_end, probe);
+                }
+                // '#<digits>' not followed by '=' — this is a comment or string
+                // reference, not an entity definition. Skip past the digits and
+                // keep searching.
+                self.position = digit_end;
+            };
+
+            // Find the end of the entity (semicolon) while respecting quoted strings
+            // IFC strings use single quotes and can contain semicolons
+            let line_content = &bytes[line_start..];
+            let end_offset = self.find_entity_end(line_content)?;
+            let line_end = line_start + end_offset + 1;
+
+            // Parse entity ID — digit range already validated in the candidate loop.
+            let id_start = line_start + 1;
+            let id_end = id_end_validated;
+            let Some(id) = self.parse_u32_fast(id_start, id_end) else {
+                // The instance name does not fit `u32` (issue #3395). SKIP
+                // the record and keep scanning: returning `None` here would
+                // end the whole scan at the first oversized id, silently
+                // truncating the model from that byte on. Per-record skip is
+                // what the rest of this scanner already does with malformed
+                // input, and the counter above is how the caller finds out.
+                self.skipped_oversized_id_starts.push(line_start);
+                self.position = line_end;
                 continue;
+            };
+
+            // `eq_pos` is the '=' the candidate loop validated, NOT the first
+            // '=' in the record. This used to `memchr` for one, which finds
+            // the one inside the comment in `#1 /* a=b */ = IFCWALL(…)` and
+            // reads `b` as the type name.
+            //
+            // Skip trivia between the '=' and the type name. The comments in
+            // this record all closed — `find_entity_end` above would have
+            // refused the record otherwise — so `None` is unreachable, and
+            // `line_end` is the conservative answer if it ever were not.
+            let type_start = super::lexical::skip_step_trivia(&self.bytes[..line_end], eq_pos + 1)
+                .unwrap_or(line_end);
+
+            // Find end of type name (at '(', whitespace, or a comment opener:
+            // `IFCWALL/* n */(…)` is legal and its type name is IFCWALL).
+            let mut type_end = type_start;
+            while type_end < line_end {
+                let b = self.bytes[type_end];
+                if b == b'(' || b.is_ascii_whitespace() {
+                    break;
+                }
+                if b == b'/' && self.bytes.get(type_end + 1) == Some(&b'*') {
+                    break;
+                }
+                type_end += 1;
             }
 
-            // candidate_byte == b'#'. Step (2): validate `#<digits>[ws]*=`.
-            let after = candidate + 1;
-            if after >= len || !bytes[after].is_ascii_digit() {
-                self.position = after;
-                continue;
-            }
-            // Walk the digit run.
-            let mut digit_end = after;
-            while digit_end < len && bytes[digit_end].is_ascii_digit() {
-                digit_end += 1;
-            }
-            // Skip optional whitespace and verify the next byte is '='.
-            let mut probe = digit_end;
-            while probe < len && bytes[probe].is_ascii_whitespace() {
-                probe += 1;
-            }
-            if probe < len && bytes[probe] == b'=' {
-                break (candidate, digit_end);
-            }
-            // '#<digits>' not followed by '=' — this is a comment or string
-            // reference, not an entity definition. Skip past the digits and
-            // keep searching.
-            self.position = digit_end;
-        };
+            // Use safe UTF-8 conversion - malformed input should not cause UB
+            let type_name = std::str::from_utf8(&self.bytes[type_start..type_end]).unwrap_or("UNKNOWN");
 
-        // Find the end of the entity (semicolon) while respecting quoted strings
-        // IFC strings use single quotes and can contain semicolons
-        let line_content = &bytes[line_start..];
-        let end_offset = self.find_entity_end(line_content)?;
-        let line_end = line_start + end_offset + 1;
+            // Move position past this entity
+            self.position = line_end;
 
-        // Parse entity ID — digit range already validated in the candidate loop.
-        let id_start = line_start + 1;
-        let id_end = id_end_validated;
-        let id = self.parse_u32_fast(id_start, id_end)?;
-
-        // Find '=' after ID using SIMD
-        let eq_search = &self.bytes[id_end..line_end];
-        let eq_offset = memchr::memchr(b'=', eq_search)?;
-        let mut type_start = id_end + eq_offset + 1;
-
-        // Skip whitespace (inline)
-        while type_start < line_end && self.bytes[type_start].is_ascii_whitespace() {
-            type_start += 1;
+            return Some((id, type_name, line_start, line_end));
         }
-
-        // Find end of type name (at '(' or whitespace)
-        let mut type_end = type_start;
-        while type_end < line_end {
-            let b = self.bytes[type_end];
-            if b == b'(' || b.is_ascii_whitespace() {
-                break;
-            }
-            type_end += 1;
-        }
-
-        // Use safe UTF-8 conversion - malformed input should not cause UB
-        let type_name = std::str::from_utf8(&self.bytes[type_start..type_end]).unwrap_or("UNKNOWN");
-
-        // Move position past this entity
-        self.position = line_end;
-
-        Some((id, type_name, line_start, line_end))
     }
 
-    /// Fast u32 parsing without string allocation
+    /// Fast u32 parsing without string allocation.
+    ///
+    /// `start..end` is a validated ASCII digit run (the candidate loop in
+    /// [`next_entity`](Self::next_entity) walks it with `is_ascii_digit`), so
+    /// `None` means exactly one thing: the value does not fit `u32`. It used to
+    /// be `wrapping_mul`/`wrapping_add`, which turned `#4294967297` into `1` —
+    /// a real entity's id, indistinguishable from it downstream (issue #3395).
+    ///
+    /// Delegates to [`crate::express_id::parse_express_id`], the single
+    /// checked accumulator shared with every `#<digits>` reference reader in
+    /// [`crate::fast_parse`] and [`crate::decoder`] (issue #3421) — the
+    /// definition and reference sides of an express id agree on the bound
+    /// because they call the same function, not two copies of the same rule.
     #[inline]
     fn parse_u32_fast(&self, start: usize, end: usize) -> Option<u32> {
-        let mut result: u32 = 0;
-        for i in start..end {
-            let digit = self.bytes[i].wrapping_sub(b'0');
-            if digit > 9 {
-                return None;
-            }
-            result = result.wrapping_mul(10).wrapping_add(digit as u32);
-        }
-        Some(result)
+        crate::express_id::parse_express_id(&self.bytes[start..end])
     }
 
     /// Find the terminating semicolon of an entity, skipping over quoted strings.
     /// IFC strings are enclosed in single quotes ('...') and can contain semicolons.
     /// Returns the offset of the semicolon from the start of the slice.
     ///
-    /// SIMD scan: instead of inspecting every byte, `memchr2` jumps straight to
-    /// the next quote or semicolon. The overwhelming majority of records are
-    /// string-free geometry primitives (`#7=IFCCARTESIANPOINT((1.,2.,3.));`), so
-    /// the common case resolves the terminator in a single vectorized hop rather
-    /// than a per-byte loop. Semantics are byte-identical to the scalar walk:
-    /// the first `;` outside a quoted string, with doubled `''` treated as an
-    /// escaped in-string quote per STEP (ISO 10303-21). This is the single
-    /// hottest structural-scan function and runs on every entity of every model
-    /// (native and wasm), through both `build_entity_index` and the processor
-    /// scan loop, which share this scanner.
+    /// A `/* ... */` comment is skipped whole, so a `;` written inside one does
+    /// not end the record — `#1=IFCWALL('a', /* pending; revise */ $);` is
+    /// legal 10303-21 and used to come back truncated at that inner `;`. The
+    /// two skips compose in one direction only, and the order below is what
+    /// fixes it: a quote is tested first, so a `/*` inside a string literal is
+    /// text; the comment is then consumed as a region, so a quote inside a
+    /// comment is text and cannot open a literal.
+    ///
+    /// SIMD scan: instead of inspecting every byte, `memchr3` jumps straight to
+    /// the next quote, comment opener or semicolon. The overwhelming majority
+    /// of records are string-free geometry primitives
+    /// (`#7=IFCCARTESIANPOINT((1.,2.,3.));`), so the common case resolves the
+    /// terminator in a single vectorized hop rather than a per-byte loop.
+    /// Widening `memchr2` to `memchr3` costs one more comparison per SIMD
+    /// block; on a comment-free file the only extra work beyond that is one
+    /// byte test per `'/'` that is not followed by `'*'` (STEP division), which
+    /// records essentially never contain. Semantics are otherwise unchanged:
+    /// the first `;` outside a quoted string and outside a comment, with
+    /// doubled `''` treated as an escaped in-string quote per STEP
+    /// (ISO 10303-21). This is the single hottest structural-scan function and
+    /// runs on every entity of every model (native and wasm), through both
+    /// `build_entity_index` and the processor scan loop, which share this
+    /// scanner.
     #[inline]
     fn find_entity_end(&self, content: &[u8]) -> Option<usize> {
         let mut pos = 0;
 
         loop {
-            // Outside a quoted string: jump to the next quote or the
-            // terminating semicolon in one SIMD pass.
-            pos += memchr::memchr2(b'\'', b';', &content[pos..])?;
+            // Outside a quoted string: jump to the next quote, comment opener
+            // or terminating semicolon in one SIMD pass.
+            pos += memchr::memchr3(b'\'', b';', b'/', &content[pos..])?;
             if content[pos] == b';' {
                 return Some(pos);
+            }
+            if content[pos] == b'/' {
+                if content.get(pos + 1) == Some(&b'*') {
+                    // Unterminated: the rest of the input is inside the
+                    // comment, so this record has no terminator. `None` drops
+                    // it and ends the scan rather than inventing an end.
+                    pos = super::lexical::skip_step_comment(content, pos)?;
+                } else {
+                    // A lone '/' is STEP division inside a value list.
+                    pos += 1;
+                }
+                continue;
             }
 
             // content[pos] == b'\'' : entered a quoted string. Scan to the
@@ -291,6 +378,7 @@ impl<'a> EntityScanner<'a> {
     /// Reset scanner to beginning (re-applies the HEADER skip).
     pub fn reset(&mut self) {
         self.position = data_section_start(self.bytes);
+        self.skipped_oversized_id_starts.clear();
     }
 
     /// Fast check if attribute at given index is non-null (not '$')
@@ -316,16 +404,15 @@ impl<'a> EntityScanner<'a> {
         // Helper to check if we're at target attribute and return result
         let check_target = |pos: usize, current_attr: usize, depth: usize| -> Option<bool> {
             if current_attr == attr_index && depth == 0 {
-                // Skip whitespace
-                let mut p = pos;
-                while p < content.len() && content[p].is_ascii_whitespace() {
-                    p += 1;
-                }
-                // Check if it's '$' (null)
-                if p < content.len() {
-                    return Some(content[p] != b'$');
-                }
-                return Some(false);
+                // Skip whitespace AND comments (`skip_step_trivia`, shared with
+                // the scanner's other trivia points): `/* c1 */ $` is still the
+                // null slot, not a non-null value starting with '/'. An
+                // unterminated comment leaves nothing certain after it, so
+                // treat the slot as absent rather than reading into the void.
+                return Some(match super::lexical::skip_step_trivia(content, pos) {
+                    Some(p) if p < content.len() => content[p] != b'$',
+                    _ => false,
+                });
             }
             None
         };
@@ -356,6 +443,19 @@ impl<'a> EntityScanner<'a> {
                     in_string = true;
                     pos += 1;
                 }
+                b'/' if content.get(pos + 1) == Some(&b'*') => {
+                    // A comment is consumed as a region -- the other half of
+                    // the rule the quote branch above gives in the opposite
+                    // direction. A ',', '(' or ')' inside it must not move
+                    // current_attr or depth, or `#1=IFCWALL($, /* a, b */ 'x');`
+                    // would count the comment's comma as an attribute
+                    // separator. Unterminated: nothing after it is certain, so
+                    // give up rather than guess.
+                    match super::lexical::skip_step_comment(content, pos) {
+                        Some(next) => pos = next,
+                        None => return false,
+                    }
+                }
                 b'(' => {
                     depth += 1;
                     pos += 1;
@@ -371,9 +471,11 @@ impl<'a> EntityScanner<'a> {
                 b',' if depth == 0 => {
                     current_attr += 1;
                     pos += 1;
-                    // Skip whitespace after comma
-                    while pos < content.len() && content[pos].is_ascii_whitespace() {
-                        pos += 1;
+                    // Skip whitespace and comments after the comma (same rule
+                    // as check_target's leading skip).
+                    match super::lexical::skip_step_trivia(content, pos) {
+                        Some(p) => pos = p,
+                        None => return false,
                     }
                     // Check if we're now at target attribute
                     if let Some(result) = check_target(pos, current_attr, depth) {
@@ -460,141 +562,5 @@ fn data_section_start(bytes: &[u8]) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_entity_scanner() {
-        let content = r#"
-#1=IFCPROJECT('guid',$,$,$,$,$,$,$,$);
-#2=IFCWALL('guid2',$,$,$,$,$,$,$);
-#3=IFCDOOR('guid3',$,$,$,$,$,$,$);
-#4=IFCWALL('guid4',$,$,$,$,$,$,$);
-"#;
-
-        let mut scanner = EntityScanner::new(content);
-
-        // Test next_entity
-        let (id, type_name, _, _) = scanner.next_entity().unwrap();
-        assert_eq!(id, 1);
-        assert_eq!(type_name, "IFCPROJECT");
-
-        // Test find_by_type
-        scanner.reset();
-        let walls = scanner.find_by_type("IFCWALL");
-        assert_eq!(walls.len(), 2);
-        assert_eq!(walls[0].0, 2);
-        assert_eq!(walls[1].0, 4);
-
-        // Test count_by_type
-        scanner.reset();
-        let counts = scanner.count_by_type();
-        assert_eq!(counts.get("IFCPROJECT"), Some(&1));
-        assert_eq!(counts.get("IFCWALL"), Some(&2));
-        assert_eq!(counts.get("IFCDOOR"), Some(&1));
-    }
-
-    /// Regression for issue #654: CATIA exports a FILE_NAME whose first
-    /// argument contains a literal `#` inside the quoted string (the encoded
-    /// filename `'…\X0\2#.ifc'`). The scanner used to latch onto that `#`,
-    /// flip `find_entity_end`'s quote parity at the closing `'`, and silently
-    /// drop every entity in the file.
-    #[test]
-    fn test_entity_scanner_hash_in_header_filename() {
-        let content = "ISO-10303-21;\nHEADER;\n\
-FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');\n\
-FILE_NAME('26-IFC\\X2\\00B1\\X0\\2#.ifc','2026-04-29T18:21:27',$,$,'CATIA','CATIA',$);\n\
-FILE_SCHEMA(('IFC4'));\nENDSEC;\n\
-DATA;\n\
-#1=IFCPROJECT('guid',$,$,$,$,$,$,$,$);\n\
-#2=IFCWALL('guid2',$,$,$,$,$,$,$);\n\
-ENDSEC;\nEND-ISO-10303-21;\n";
-
-        let mut scanner = EntityScanner::new(content);
-        let counts = scanner.count_by_type();
-        assert_eq!(counts.get("IFCPROJECT"), Some(&1));
-        assert_eq!(counts.get("IFCWALL"), Some(&1));
-    }
-
-    /// Files without a DATA; marker (partial fragments, test fixtures) must
-    /// still scan from offset 0 — the HEADER-skip is best-effort.
-    #[test]
-    fn test_entity_scanner_no_header() {
-        let content = "#1=IFCWALL('guid',$,$,$,$,$,$,$);\n";
-        let mut scanner = EntityScanner::new(content);
-        let (id, type_name, _, _) = scanner.next_entity().unwrap();
-        assert_eq!(id, 1);
-        assert_eq!(type_name, "IFCWALL");
-    }
-
-    /// HEADER fields are free-form strings — a description, comment, or
-    /// embedded filename could legally contain the literal text `DATA;`.
-    /// The seek must ignore matches inside quoted strings and land on the
-    /// real section marker.
-    #[test]
-    fn test_entity_scanner_data_marker_inside_header_string() {
-        let content = "ISO-10303-21;\nHEADER;\n\
-FILE_DESCRIPTION(('section DATA; in description'),'2;1');\n\
-FILE_NAME('weird DATA; name.ifc','2026-04-29T18:21:27',$,$,'a','b',$);\n\
-FILE_SCHEMA(('IFC4'));\nENDSEC;\n\
-DATA;\n\
-#1=IFCWALL('guid',$,$,$,$,$,$,$);\n\
-ENDSEC;\nEND-ISO-10303-21;\n";
-
-        let mut scanner = EntityScanner::new(content);
-        let counts = scanner.count_by_type();
-        assert_eq!(counts.get("IFCWALL"), Some(&1));
-        // Confirm we landed at the real DATA;, not the one in the description.
-        let pos = scanner.position();
-        assert!(pos == content.len() || pos > content.find("ENDSEC;").unwrap());
-    }
-
-    /// `count` / `entity_count` must agree with the number of entities the
-    /// scanner walks (and with the entity index), while allocating nothing per
-    /// entity. It shares `next_entity`, so it inherits the header-skip and the
-    /// quote/comment guards for free.
-    #[test]
-    fn test_entity_count_matches_scan() {
-        let content = "ISO-10303-21;\nHEADER;\n\
-FILE_DESCRIPTION(('has a #99 and DATA; inside'),'2;1');\n\
-FILE_NAME('26-IFC\\X2\\00B1\\X0\\2#.ifc','2026-04-29T18:21:27',$,$,'a','b',$);\n\
-FILE_SCHEMA(('IFC4'));\nENDSEC;\n\
-DATA;\n\
-#1=IFCPROJECT('guid',$,$,$,$,$,$,$,$);\n\
-/* a comment with #77= IFCWALL inside */\n\
-#2=IFCWALL('guid2',$,$,$,'name with ; semicolon',$,$,$);\n\
-#3=IFCDOOR('guid3',$,$,$,$,$,$,$);\n\
-ENDSEC;\nEND-ISO-10303-21;\n";
-
-        // Free function.
-        assert_eq!(entity_count(content), 3);
-        // Method, from a fresh scanner.
-        assert_eq!(EntityScanner::new(content).count(), 3);
-        // Agrees with the per-type tally (which walks the same entities).
-        let total: usize = EntityScanner::new(content).count_by_type().values().sum();
-        assert_eq!(total, 3);
-    }
-
-    /// An empty / header-only buffer counts zero, never panics.
-    #[test]
-    fn test_entity_count_empty() {
-        assert_eq!(entity_count(""), 0);
-        assert_eq!(entity_count("ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\nENDSEC;\n"), 0);
-    }
-
-    /// Escaped single quotes (`''`) keep the string open per ISO 10303-21.
-    #[test]
-    fn test_entity_scanner_escaped_quote_in_header() {
-        let content = "ISO-10303-21;\nHEADER;\n\
-FILE_DESCRIPTION(('it''s fine: DATA; inside'),'2;1');\n\
-FILE_NAME('a','b',$,$,'c','d',$);\n\
-FILE_SCHEMA(('IFC4'));\nENDSEC;\n\
-DATA;\n\
-#7=IFCDOOR('guid',$,$,$,$,$,$,$);\n\
-ENDSEC;\n";
-
-        let mut scanner = EntityScanner::new(content);
-        let counts = scanner.count_by_type();
-        assert_eq!(counts.get("IFCDOOR"), Some(&1));
-    }
-}
+#[path = "scanner_tests.rs"]
+mod scanner_tests;

@@ -78,10 +78,22 @@ pub fn try_export_glb_from_meshes(
     }
     // Every count is backed and every mesh's normals/indices are present, so the
     // infallible assembler's malformed-input `break` is unreachable and no mesh is dropped.
-    Ok(export_glb_from_meshes(
+    let (glb, stats) = export_glb_from_meshes(
         positions, normals, indices, vertex_counts, index_counts, colors, origins,
         express_ids, include_metadata, lit, emissive,
-    ))
+    );
+    // Zero visible meshes (empty input, or every declared mesh failing `view_ok` —
+    // e.g. a single-vertex/zero-index mesh) passes every count check above trivially
+    // and would otherwise return a "successful" GLB that glTF-Validator rejects:
+    // `accessors`/`bufferViews`/`meshes`/`nodes` are EMPTY_ENTITY (glTF schema
+    // `minItems: 1` when present) and `buffers[0].byteLength` is 0 (schema
+    // `minimum: 1`). `try_export_glb` (the from-bytes sibling, #1438/#1516) already
+    // fails closed here with `NoRenderGeometry`; this from-meshes entry point —
+    // reachable from the viewer's `exportGlbFromMeshes` — did not.
+    if stats.meshes == 0 {
+        return Err(ExportError::NoRenderGeometry);
+    }
+    Ok((glb, stats))
 }
 
 /// Assemble a GLB from already-produced meshes (the viewer's MeshData — **no re-meshing**).
@@ -111,6 +123,17 @@ pub fn export_glb_from_meshes(
     lit: bool,
     emissive: bool,
 ) -> (Vec<u8>, GltfStats) {
+    // Gate every float BEFORE any of it is read: a non-finite coordinate has no
+    // representation in glTF JSON (`serde_json` writes `null`, which is
+    // schema-invalid) and, left alone, propagates through the scene-centre
+    // subtraction into vertices that were fine. See `crate::mesh_input`.
+    let scrubbed = crate::mesh_input::scrub_nonfinite(positions, normals, colors, origins);
+    let (positions, normals, colors, origins) = (
+        &*scrubbed.positions,
+        &*scrubbed.normals,
+        &*scrubbed.colors,
+        &*scrubbed.origins,
+    );
     let n = vertex_counts.len();
     // The viewer's `MeshData` arrives pre-welded from the mesh source
     // (`ifc_lite_processing::element::build_mesh_data` welds every element via

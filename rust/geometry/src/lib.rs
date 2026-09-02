@@ -122,6 +122,9 @@ pub(crate) mod mesh_orient;
 pub(crate) mod processors;
 pub(crate) mod profile;
 pub(crate) mod profile_extractor;
+/// [`SkippedProfile`], split out of `profile_extractor` to keep it under
+/// its module-size ratchet.
+pub(crate) mod profile_skip;
 pub(crate) mod profiles;
 pub mod projection_outline;
 pub mod rect_fast;
@@ -148,6 +151,12 @@ pub(crate) mod router;
 /// vertex-clustering decimation, bounding-box collapse).
 pub mod simplify;
 pub(crate) mod tessellation;
+/// Test-harness helpers shared by the termination/deadlock suites (the
+/// receive-and-diagnose watchdog). Never present in a shipping build; the
+/// `test-support` feature exists so `ifc-lite-processing`'s integration tests
+/// can reach it as well.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod space_dcel;
 pub(crate) mod transform;
 pub(crate) mod triangulation;
@@ -201,7 +210,8 @@ pub use processors::{
 };
 pub use alignment::{AlignmentCurve, AlignmentFrame};
 pub use profile::{Profile2D, Profile2DWithVoids, ProfileType, VoidInfo};
-pub use profile_extractor::{extract_profiles, ExtractedProfile};
+pub use profile_extractor::{extract_profiles, extract_profiles_with_diagnostics, ExtractedProfile};
+pub use profile_skip::SkippedProfile;
 pub use profiles::ProfileProcessor;
 pub use router::take_bool2d_stats;
 pub use router::{take_prism_defers, take_prism_stats};

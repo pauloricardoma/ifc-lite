@@ -7,7 +7,8 @@ import assert from 'node:assert';
 import { Renderer } from './index.js';
 import { Picker } from './picker.js';
 import type { MeshData } from '@ifc-lite/geometry';
-import type { RenderOptions, BatchedMesh } from './types.js';
+import type { RenderOptions, BatchedMesh, Mesh } from './types.js';
+import type { Scene } from './scene.js';
 
 /**
  * Drives the REAL render() loop against a stub GPU so the frame-lifecycle
@@ -69,6 +70,12 @@ interface Harness {
          * lighting environment is rebound at group(1) after the sky pass).
          */
         commands: { op: string; index?: number }[];
+        /** label of every `beginRenderPass` in call order (so a test can assert
+         *  the sun shadow depth pass IS or is NOT encoded). */
+        passes: string[];
+        /** label of every texture whose `destroy()` fired (shadow depth-texture
+         *  release on toggle-off). */
+        destroyedTextures: string[];
     };
     knobs: {
         /** 'texture' = getCurrentTexture succeeds; 'null' = returns null */
@@ -101,7 +108,7 @@ interface Harness {
 }
 
 function makeHarness(): Harness {
-    const stats: Harness['stats'] = { push: 0, pop: 0, draws: [], createdBuffers: [], mapAsync: 0, writes: [], commands: [] };
+    const stats: Harness['stats'] = { push: 0, pop: 0, draws: [], createdBuffers: [], mapAsync: 0, writes: [], commands: [], passes: [], destroyedTextures: [] };
     const knobs: Harness['knobs'] = {
         textureMode: 'texture', encodeThrows: false, popRejects: false, gpuDead: false,
         deferMaps: false,
@@ -165,7 +172,8 @@ function makeHarness(): Harness {
     const encoder = new Proxy({} as Record<string | symbol, unknown>, {
         get(_t, prop) {
             if (prop === 'beginRenderPass') {
-                return () => {
+                return (desc?: { label?: string }) => {
+                    stats.passes.push(desc?.label ?? '');
                     if (knobs.encodeThrows) throw new Error('boom mid-encode');
                     return pass;
                 };
@@ -205,11 +213,11 @@ function makeHarness(): Harness {
                 case 'createCommandEncoder': return () => encoder;
                 case 'createBuffer': return (desc: { size: number }) => makeBuffer(desc);
                 case 'createBindGroup': return () => ({});
-                case 'createTexture': return (desc: { size: { width: number; height: number } }) => ({
+                case 'createTexture': return (desc: { label?: string; size: { width: number; height: number } }) => ({
                     width: desc.size.width,
                     height: desc.size.height,
                     createView: () => ({}),
-                    destroy() { /* no-op */ },
+                    destroy() { stats.destroyedTextures.push(desc.label ?? ''); },
                 });
                 // Picker builds real pipelines in its constructor and binds
                 // through the auto layout, so both arms must return objects.
@@ -292,6 +300,17 @@ function makeHarness(): Harness {
     };
 }
 
+/**
+ * The concrete `Scene`, not the narrowed `SceneContents` that `getScene()`
+ * publishes. These render-path tests reach for internals (`partialBatchCache`,
+ * `addMeshData`, `getTexturedMeshes`) that are deliberately absent from the
+ * published surface, the same way they already reach `renderer['device']` and
+ * `renderer['pipeline']`.
+ */
+function sceneOf(h: Harness): Scene {
+    return h.renderer['scene'];
+}
+
 function triangle(expressId: number, color: [number, number, number, number], modelIndex?: number): MeshData {
     return {
         expressId,
@@ -308,7 +327,7 @@ const RED: [number, number, number, number] = [0.8, 0.1, 0.1, 1];
 
 /** Build two real colour batches: grey {1, 2} and red {3}. */
 function seedBatches(h: Harness): { grey: BatchedMesh; red: BatchedMesh } {
-    const scene = h.renderer.getScene();
+    const scene = sceneOf(h);
     const device = h.renderer['device'].getDevice();
     const pipeline = h.renderer['pipeline'] as never;
     scene.appendToBatches([triangle(1, GREY), triangle(2, GREY), triangle(3, RED)], device, pipeline, false);
@@ -476,7 +495,7 @@ describe('visibility epoch drives the batched draw path', () => {
         assert.ok(!h.stats.draws.includes(grey.vertexBuffer),
             'partially hidden batch must not draw from its own buffers');
         assert.ok(h.stats.draws.includes(red.vertexBuffer), 'red batch is unaffected');
-        const scene = h.renderer.getScene();
+        const scene = sceneOf(h);
         assert.strictEqual(scene['partialBatchCache'].size, 1, 'a partial sub-batch was built');
 
         // Mutate in place again: id 2 hides too, the grey batch is now fully
@@ -514,7 +533,7 @@ describe('visibility epoch drives the batched draw path', () => {
     it('rapid hide -> show-all -> same set -> different set: partial caches drop and rebuild, buffers destroyed exactly once', () => {
         const h = makeHarness();
         seedBatches(h);
-        const scene = h.renderer.getScene();
+        const scene = sceneOf(h);
 
         h.render({ hiddenIds: new Set([1]) });
         assert.strictEqual(scene['partialBatchCache'].size, 1);
@@ -551,10 +570,71 @@ describe('visibility epoch drives the batched draw path', () => {
 });
 
 describe('hydrated selection meshes across renders', () => {
+    // #2985. Renderer.createMeshFromData is the only place a MeshData becomes an
+    // individual GPU Mesh, and it is what the GPU pick pass indexes into — so a
+    // representation item dropped HERE cannot be reported by any pick, however
+    // correct picker.ts is. Tested through the real render() + real Scene
+    // because the method needs a device; the rest of the pick contract lives in
+    // pick-item-id.test.ts.
+    it('hydration carries the source geometryItemId onto the individual mesh', () => {
+        const ITEM = 4638; // deliberately unlike the expressId below
+        const h = makeHarness();
+        const scene = sceneOf(h);
+        const device = h.renderer['device'].getDevice();
+        const withItem = { ...triangle(7, GREY), geometryItemId: ITEM } as MeshData;
+        scene.appendToBatches([withItem, triangle(8, RED)], device, h.renderer['pipeline'] as never, false);
+        for (const b of scene.getBatchedMeshes()) b.bounds = undefined;
+
+        h.render({ selectedId: 7 });
+        const hydrated = scene.getMeshes().filter((m) => m.hydrated && m.expressId === 7);
+        assert.strictEqual(hydrated.length, 1, 'selecting the entity hydrates its mesh');
+        assert.strictEqual(hydrated[0].geometryItemId, ITEM);
+
+        // And a piece with no item identity leaves the key readable as absent
+        // rather than as a plausible id.
+        h.render({ selectedId: 8 });
+        const plain = scene.getMeshes().filter((m) => m.hydrated && m.expressId === 8);
+        assert.strictEqual(plain.length, 1);
+        assert.strictEqual(plain[0].geometryItemId, undefined);
+    });
+
+    // A colour-merged piece's item id belongs to no single entity in it, so
+    // hydration must withhold it exactly as the CPU raycaster does — one click
+    // must not answer two ways either side of the pick-mesh budget (#2985).
+    //
+    // Called DIRECTLY, not through a render: both in-tree callers reach this
+    // method via Scene.getMeshDataPieces, which splits a merged piece per
+    // entity and — as a side effect of rebuilding the literal, not by any
+    // stated rule — carries neither entityIds nor geometryItemId forward. This
+    // method is public, so it owns the rule rather than inheriting that
+    // accident, and a raw merged MeshData is what tests the rule.
+    it('createMeshFromData withholds a colour-merged batch id, matching the CPU raycast', () => {
+        const ITEM = 4638;
+        const h = makeHarness();
+        const scene = sceneOf(h);
+        const merged = {
+            ...triangle(9, GREY),
+            geometryItemId: ITEM,
+            entityIds: new Uint32Array([9, 10, 10]),
+        } as MeshData;
+        h.renderer.createMeshFromData(merged);
+
+        const made = scene.getMeshes().filter((m) => m.expressId === 9);
+        assert.strictEqual(made.length, 1, 'the mesh was created');
+        assert.strictEqual(made[0].geometryItemId, undefined);
+
+        // Positive control: the same call on an UNMERGED piece does report it,
+        // so the assertion above is the merge rule and not a dead field.
+        h.renderer.createMeshFromData({ ...triangle(11, GREY), geometryItemId: ITEM } as MeshData);
+        const plainItem = scene.getMeshes().filter((m) => m.expressId === 11);
+        assert.strictEqual(plainItem.length, 1);
+        assert.strictEqual(plainItem[0].geometryItemId, ITEM);
+    });
+
     it('selection thrash: earlier selections are disposed, the current one is kept', () => {
         const h = makeHarness();
         seedBatches(h);
-        const scene = h.renderer.getScene();
+        const scene = sceneOf(h);
 
         const hydratedFor = (id: number) =>
             scene.getMeshes().filter((m) => m.hydrated && m.expressId === id);
@@ -583,7 +663,7 @@ describe('hydrated selection meshes across renders', () => {
     it('same express id in two federated models: switching models disposes the other model\'s mesh', () => {
         const h = makeHarness();
         seedBatches(h);
-        const scene = h.renderer.getScene();
+        const scene = sceneOf(h);
         // Two models share express id 42 (federation reuses local ids).
         scene.addMeshData(triangle(42, GREY, 0));
         scene.addMeshData(triangle(42, RED, 1));
@@ -899,6 +979,72 @@ describe('pick path survives the device dying mid-readback (#1901)', () => {
 });
 
 /**
+ * The other half of #2985's GPU route: `Picker.pick` is where a decoded texel
+ * becomes the `PickResult` a host sees, and every other test of that mapping
+ * stubs `picker.pick` and calls `resolvePickSample` directly. One
+ * unconditional call, so the exposure is far smaller than `Scene.raycast`'s —
+ * but the harness already runs a REAL `Picker` against the stub GPU, so
+ * closing it costs one test rather than a browser lane.
+ *
+ * The readback is seeded by hand: the stub's pick target is zero-filled, which
+ * decodes as "no hit" and returns before the mapping runs at all. Writing
+ * (index + 1) into the parked colour readback is what the pick pass would have
+ * written for a hit on mesh 0.
+ */
+describe('Picker.pick maps a real readback onto the picked item (#2985)', () => {
+    it('carries the hit mesh\'s geometryItemId out onto the PickResult', async () => {
+        const ITEM = 4638;
+        const h = makeHarness();
+        const picker = new Picker(h.renderer['device'], 256, 256);
+        const mesh = {
+            expressId: 7,
+            modelIndex: 2,
+            geometryItemId: ITEM,
+            vertexBuffer: {},
+            indexBuffer: {},
+            indexCount: 3,
+        } as unknown as Mesh;
+
+        const before = h.stats.createdBuffers.length;
+        h.knobs.deferMaps = true;
+        const inflight = picker.pick(4, 4, 256, 256, [mesh], new Float32Array(16));
+        for (let i = 0; i < 5; i++) await Promise.resolve();
+        assert.ok(h.pendingMaps() > 0, 'the pick must be parked on its readbacks');
+
+        // The colour readback is the pick's only 256-byte buffer (the depth one
+        // is a full image); `pick` reads texel 0 of it as a u32.
+        const colour = h.stats.createdBuffers.slice(before).filter((b) => b.size === 256);
+        assert.strictEqual(colour.length, 1, 'expected exactly one colour readback');
+        new Uint32Array(colour[0].getMappedRange())[0] = 1; // mesh 0, written as index + 1
+
+        h.settlePendingMaps();
+        const result = await inflight;
+        assert.strictEqual(result?.expressId, 7);
+        assert.strictEqual(result?.modelIndex, 2);
+        assert.strictEqual(result?.geometryItemId, ITEM, 'the pick collapsed to the product');
+    });
+
+    it('leaves the key absent for a mesh with no item identity', async () => {
+        const h = makeHarness();
+        const picker = new Picker(h.renderer['device'], 256, 256);
+        const mesh = {
+            expressId: 7, modelIndex: 2, vertexBuffer: {}, indexBuffer: {}, indexCount: 3,
+        } as unknown as Mesh;
+
+        const before = h.stats.createdBuffers.length;
+        h.knobs.deferMaps = true;
+        const inflight = picker.pick(4, 4, 256, 256, [mesh], new Float32Array(16));
+        for (let i = 0; i < 5; i++) await Promise.resolve();
+        const colour = h.stats.createdBuffers.slice(before).filter((b) => b.size === 256);
+        new Uint32Array(colour[0].getMappedRange())[0] = 1;
+
+        h.settlePendingMaps();
+        const result = await inflight;
+        assert.ok(result && !('geometryItemId' in result), 'expected the key to be absent');
+    });
+});
+
+/**
  * #1973 — the textured sub-pass must carry each mesh's per-element `origin` as
  * its model translation. It used to hoist `tpl[28..30] = 0` out of the loop,
  * which was right only for the orphan type-geometry path (absolute positions,
@@ -935,7 +1081,7 @@ describe('textured sub-pass carries the per-element origin (#1973)', () => {
     const ORIGIN: [number, number, number] = [12.5, 10.5, -3.25];
 
     function seedTextured(h: Harness, meshes: MeshData[]) {
-        const scene = h.renderer.getScene();
+        const scene = sceneOf(h);
         const device = h.renderer['device'].getDevice();
         const pipeline = h.renderer['pipeline'] as never;
         scene.appendToBatches(meshes, device, pipeline, false);
@@ -978,5 +1124,63 @@ describe('textured sub-pass carries the per-element origin (#1973)', () => {
 
         assert.deepStrictEqual(translationFor(h, textured[0].uniformBuffer), ORIGIN);
         assert.deepStrictEqual(translationFor(h, textured[1].uniformBuffer), other);
+    });
+});
+
+const UNIT_BOUNDS = { min: { x: -1, y: -1, z: -1 }, max: { x: 1, y: 1, z: 1 } };
+
+// The sun shadow depth pre-pass is opt-in (RenderOptions.sunShadows). These
+// drive the REAL render() loop and read the encoded pass labels, so "no shadow
+// pass was encoded" is actually observed rather than assumed — the gap the
+// #2670 review flagged (the label lived only in shadow-pass.ts, in no test).
+describe('sun shadow pass (#2670 review)', () => {
+    it('encodes no shadow-depth-pass on the default off path', () => {
+        const h = makeHarness();
+        seedBatches(h);
+        h.renderer.setModelBounds(UNIT_BOUNDS);
+        h.render(); // sunShadows absent → off
+        assert.ok(
+            !h.stats.passes.includes('shadow-depth-pass'),
+            'the zero-cost off path must not encode the depth pre-pass',
+        );
+        assert.strictEqual(h.renderer['shadowPass'], null, 'no ShadowPass constructed while off');
+    });
+
+    it('encodes exactly one shadow-depth-pass when enabled', () => {
+        const h = makeHarness();
+        seedBatches(h);
+        h.renderer.setModelBounds(UNIT_BOUNDS);
+        h.render({ sunShadows: { enabled: true } });
+        assert.strictEqual(
+            h.stats.passes.filter((l) => l === 'shadow-depth-pass').length,
+            1,
+            'enabling shadows must encode the depth pre-pass exactly once',
+        );
+    });
+
+    it('frees the depth texture and stops encoding the pass on toggle-off', () => {
+        const h = makeHarness();
+        seedBatches(h);
+        h.renderer.setModelBounds(UNIT_BOUNDS);
+        h.render({ sunShadows: { enabled: true } });
+        const freedBefore = h.stats.destroyedTextures.filter((l) => l === 'shadow-depth').length;
+
+        h.stats.passes.length = 0;
+        h.render({ sunShadows: { enabled: false } });
+
+        assert.ok(
+            !h.stats.passes.includes('shadow-depth-pass'),
+            'the toggle-off frame must not encode the depth pass',
+        );
+        assert.strictEqual(
+            h.stats.destroyedTextures.filter((l) => l === 'shadow-depth').length,
+            freedBefore + 1,
+            'toggle-off must release the depth texture, not hold it for the session',
+        );
+        assert.strictEqual(
+            h.renderer['shadowPass'],
+            null,
+            'ShadowPass is nulled so a later re-enable reconstructs it lazily',
+        );
     });
 });

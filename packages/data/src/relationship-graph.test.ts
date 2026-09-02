@@ -66,6 +66,8 @@ describe('RelationshipGraph', () => {
       [RelationshipType.FillsElement]: 'IfcRelFillsElement',
       [RelationshipType.ConnectsPathElements]: 'IfcRelConnectsPathElements',
       [RelationshipType.ConnectsElements]: 'IfcRelConnectsElements',
+      [RelationshipType.ConnectsPortToElement]: 'IfcRelConnectsPortToElement',
+      [RelationshipType.ConnectsPorts]: 'IfcRelConnectsPorts',
       [RelationshipType.SpaceBoundary]: 'IfcRelSpaceBoundary',
       [RelationshipType.AssignsToGroup]: 'IfcRelAssignsToGroup',
       [RelationshipType.AssignsToProduct]: 'IfcRelAssignsToProduct',
@@ -165,6 +167,40 @@ describe('buildCSR determinism and edge presence', () => {
     expect([...d.forward.offsets.entries()].sort((x, y) => x[0] - y[0])).toEqual(
       [...a.forward.offsets.entries()].sort((x, y) => x[0] - y[0]),
     );
+  });
+
+  // `edgeRelIds` is the express id of the IfcRel* entity, and NOTHING pinned
+  // it to a value: the round-trip test compares the column against another
+  // build of the same data (self-consistent either way), and the metadata test
+  // asserts only `type`/`typeName`. Scattering `keys[i]` (the SOURCE entity id)
+  // into `edgeRelIds` instead of `relIds[i]` passed the whole suite. These ids
+  // are deliberately disjoint from every source and target id in the fixture,
+  // so no substitution can look correct.
+  it('scatters the relationship express id, not the source or target id', () => {
+    const builder = new RelationshipGraphBuilder();
+    builder.addEdge(400, 41, RelationshipType.Aggregates, 7001);
+    builder.addEdge(200, 21, RelationshipType.Aggregates, 7002);
+    builder.addEdge(200, 22, RelationshipType.ContainsElements, 7003);
+    const g = builder.build();
+
+    expect(g.forward.getEdges(200)).toEqual([
+      { target: 21, type: RelationshipType.Aggregates, relationshipId: 7002 },
+      { target: 22, type: RelationshipType.ContainsElements, relationshipId: 7003 },
+    ]);
+    expect(g.forward.getEdges(400)).toEqual([
+      { target: 41, type: RelationshipType.Aggregates, relationshipId: 7001 },
+    ]);
+    // The inverse half carries the same relationship ids, keyed by target.
+    expect(g.inverse.getEdges(21)).toEqual([
+      { target: 200, type: RelationshipType.Aggregates, relationshipId: 7002 },
+    ]);
+    expect(g.getRelationshipsBetween(200, 22)).toEqual([
+      {
+        relationshipId: 7003,
+        type: RelationshipType.ContainsElements,
+        typeName: 'IfcRelContainedInSpatialStructure',
+      },
+    ]);
   });
 
   it('records the per-key edge count', () => {

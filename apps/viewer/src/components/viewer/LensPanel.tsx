@@ -36,6 +36,7 @@ import {
 } from './lens-editor-utils';
 import { importLensFile } from './lens-import';
 import { planLensHiddenSync, ruleIsolationOwnsChannel } from './lens-visibility-ownership';
+import { resolveIsolationIds } from '@/lib/isolation/resolveIsolationIds';
 import type { Lens, LensRule, LensCriteria, AutoColorSpec, AutoColorLegendEntry, DiscoveredLensData } from '@/store/slices/lensSlice';
 import {
   LENS_PALETTE, ENTITY_ATTRIBUTE_NAMES, AUTO_COLOR_SOURCES,
@@ -187,7 +188,17 @@ const AutoColorRow = memo(function AutoColorRow({
         className="w-3 h-3 rounded-sm flex-shrink-0 ring-1 ring-black/10 dark:ring-white/20"
         style={{ backgroundColor: entry.color }}
       />
-      <span className="flex-1 truncate font-medium text-zinc-900 dark:text-zinc-50">
+      <span
+        className={cn(
+          'flex-1 truncate font-medium text-zinc-900 dark:text-zinc-50',
+          // Absence buckets ("No classification", "Not in this system") are
+          // synthetic - not a value read off the model - so they're set in
+          // italics to read as a category rather than a classification code,
+          // while staying otherwise identical (same swatch shape, same
+          // clickable/isolate behavior) so they don't look broken or special.
+          entry.isAbsent && 'italic text-zinc-600 dark:text-zinc-300',
+        )}
+      >
         {entry.name}
       </span>
       {isIsolated && (
@@ -868,7 +879,7 @@ function LensEditor({
 
 // ─── Auto-color lens editor ─────────────────────────────────────────────────
 
-function AutoColorEditor({
+export function AutoColorEditor({
   initial,
   onSave,
   onCancel,
@@ -885,6 +896,13 @@ function AutoColorEditor({
   const [source, setSource] = useState<AutoColorSpec['source']>(initial.autoColor.source);
   const [psetName, setPsetName] = useState(initial.autoColor.psetName ?? '');
   const [propertyName, setPropertyName] = useState(initial.autoColor.propertyName ?? '');
+  // Opt-in "unclassified bucket" toggle (#unclassified-bucket) - meaningless
+  // outside `source: 'classification'`, so it's only rendered there. Not
+  // reset on source change like psetName/propertyName: if the user flips
+  // away from classification and back, restoring their choice is friendlier
+  // than silently discarding it, and the flag is dropped from the saved
+  // spec entirely when the source isn't classification (see handleSave).
+  const [includeUnclassified, setIncludeUnclassified] = useState(initial.autoColor.includeUnclassified ?? false);
 
   const needsPset = source === 'property' || source === 'quantity' || source === 'classification';
   const needsPropertyName = source === 'attribute' || source === 'property' || source === 'quantity';
@@ -926,6 +944,11 @@ function AutoColorEditor({
     const autoColor: AutoColorSpec = { source };
     if (needsPset) autoColor.psetName = psetName.trim();
     if (needsPropertyName) autoColor.propertyName = propertyName.trim();
+    // Only emitted when true, on a classification source: unset/false must
+    // reproduce the pre-existing ghosting behaviour exactly (see
+    // AutoColorSpec.includeUnclassified in @ifc-lite/lens), and the flag is
+    // meaningless on any other source.
+    if (source === 'classification' && includeUnclassified) autoColor.includeUnclassified = true;
 
     onSave(buildAutoColorLensToSave(
       initial,
@@ -1017,6 +1040,18 @@ function AutoColorEditor({
               />
             )}
           </div>
+        )}
+
+        {source === 'classification' && (
+          <label className="flex items-center justify-between gap-2 cursor-pointer pt-0.5">
+            <span className="text-[10px] uppercase tracking-wider text-zinc-500">Show unclassified</span>
+            <input
+              type="checkbox"
+              checked={includeUnclassified}
+              onChange={(e) => setIncludeUnclassified(e.target.checked)}
+              className="accent-primary"
+            />
+          </label>
         )}
       </div>
 
@@ -1335,41 +1370,35 @@ export function LensPanel({ onClose }: LensPanelProps) {
     // IfcRelAggregates parts, and the renderer resolves `isolatedEntities`
     // against mesh ids directly (viewportUtils' buildRenderOptions ->
     // `isolatedIds`). Isolating the bare matched id therefore blanks the view.
-    // Resolve through the Viewport channel #2531 added
-    // (`resolveHighlightIds`, backed by expandToGeometryBearingIds), exactly
-    // as SearchModal.text.tsx's commit and SearchModal.filter.tsx's "Isolate
-    // in 3D" (#2660) do: a geometry-bearing id passes through untouched and
-    // deduplicated, a geometry-less one is replaced by its geometry-bearing
-    // parts.
+    // Resolve through the Viewport channel #2531 added (`resolveHighlightIds`,
+    // backed by expandToGeometryBearingIds), exactly as SearchModal.text.tsx's
+    // commit and SearchModal.filter.tsx's "Isolate in 3D" (#2660) do: a
+    // geometry-bearing id passes through untouched and deduplicated, a
+    // geometry-less one is replaced by its geometry-bearing parts.
     //
-    // The resolved ids are APPENDED to the raw matches, never substituted for
-    // them (#2680). The resolver bounds-checks against the type-visibility
-    // FILTERED mesh list, and TYPE_VISIBILITY_SEMANTIC_DEFAULTS starts
-    // `spaces`, `spatialZones`, `openings` and `virtualElements` all OFF
-    // (store/constants.ts) -- so a rule matching walls AND spaces (colouring
-    // spaces by area is an ordinary lens) resolves the walls, returns
-    // non-empty, and the spaces would silently drop out of the isolation set
-    // under replace semantics. Nothing looks wrong at first, because those
-    // types are hidden anyway; it goes wrong when the user turns spaces back
-    // on with the isolation still active and they stay hidden with no way to
-    // tell why. Carrying an id that owns no mesh is free: it simply never
-    // matches the renderer's whitelist. That also subsumes the
-    // nothing-resolved case (renderer not registered yet, or the whole match
-    // geometry-less), where the raw ids are all that is left -- and isolating
-    // an empty set would hide the ENTIRE model.
+    // Resolved ids are APPENDED to the raw matches, never substituted (#2680),
+    // via `resolveIsolationIds`. The resolver bounds-checks against the
+    // type-visibility FILTERED mesh list -- TYPE_VISIBILITY_SEMANTIC_DEFAULTS
+    // starts `spaces`/`spatialZones`/`openings`/`virtualElements` OFF -- so a
+    // rule matching walls AND spaces resolves the walls, returns non-empty,
+    // and the spaces would silently drop under replace semantics; carrying an
+    // id that owns no mesh is free, it just never matches the whitelist.
     //
-    // #2660's second fallback -- walking IfcRelAggregates in the data store
-    // when the resolver comes back empty because the parts are HIDDEN types
-    // -- is deliberately not replicated here, and `expandFilterRowsThroughAggregation`
-    // does not fit anyway (it consumes filter-result rows, while a lens rule
-    // hands over globalIds). That fallback only pays off next to a
-    // type-visibility gate that flips the parts' toggles back on; the lens
-    // panel has no such gate, so isolating hidden-type parts would still
-    // render nothing. Adding one is a feature, not this fix.
-    const resolved = cameraCallbacks.resolveHighlightIds?.(matchingIds) ?? [];
-    const isolationIds = [...new Set([...resolved, ...matchingIds])];
+    // An empty resolve keeps the raw ids rather than isolating nothing: `[]`
+    // is also what a set hidden by a type toggle, or one whose meshes have
+    // not streamed in yet, answers, and isolating an empty set hides the
+    // ENTIRE model. See `resolveIsolationIds` for why the three cases cannot
+    // be told apart here.
+    //
+    // #2660's second fallback -- walking IfcRelAggregates when the resolver
+    // is empty because the parts are HIDDEN types -- is deliberately not
+    // replicated here: `expandFilterRowsThroughAggregation` consumes
+    // filter-result rows, not a lens rule's globalIds, and only pays off next
+    // to a type-visibility gate the lens panel doesn't have. Adding one is a
+    // feature, not this fix.
+    const isolationIds = resolveIsolationIds(cameraCallbacks.resolveHighlightIds, matchingIds);
 
-    // `isolateEntities` is a same-set TOGGLE (visibilitySlice.ts:176-194): if
+    // `isolateEntities` is a same-set TOGGLE (visibilitySlice.ts, `isolateEntities`): if
     // the channel already holds exactly these ids it CLEARS instead of
     // isolating. Switching from rule A to a rule B that lands on the SAME set
     // would therefore un-isolate the model while the record below claims B

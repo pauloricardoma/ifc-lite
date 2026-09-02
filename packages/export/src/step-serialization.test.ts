@@ -5,14 +5,15 @@
 import { describe, expect, it } from 'vitest';
 import { PropertyValueType } from '@ifc-lite/data';
 import {
-  serializePropertyValue,
   serializeAttributeValue,
   serializeStepValue,
   serializeTypedMarker,
   resolveExpressBase,
   tokenIsRealLiteral,
   toStepReal,
+  escapeStepString,
 } from './step-serialization.js';
+import { serializePropertyValue } from './property-value-serialization.js';
 import { toStepRealScaled } from './unit-normalize.js';
 
 describe('resolveExpressBase', () => {
@@ -192,5 +193,21 @@ describe('toStepRealScaled', () => {
     for (const v of [Number.MAX_VALUE, Number.MIN_VALUE, -1.5e-300, 1e-7, 123.456]) {
       expect(toStepRealScaled(v)).toMatch(STEP_REAL_RE);
     }
+  });
+});
+
+/**
+ * `escapeStepString` no longer has an implementation here (#3300): this
+ * package re-exports `@ifc-lite/data`'s. Full coverage -- non-ASCII `\X2\`/
+ * `\X4\` directives, one-space-per-control-char (#3284), and the vector
+ * comparison against `ifc_lite_export::step_text::escape` -- lives once, in
+ * `packages/data/src/step-serializers.test.ts`. This is a wiring check that
+ * the re-export resolves to a working function, not a second copy of that
+ * suite.
+ */
+describe('escapeStepString (re-exported from @ifc-lite/data, #3300)', () => {
+  it('escapes quotes, backslashes and non-ASCII the way @ifc-lite/data does', () => {
+    expect(escapeStepString("O'Brien\\x")).toBe("O''Brien\\\\x");
+    expect(escapeStepString('\u00C4')).toBe('\\X2\\00C4\\X0\\');
   });
 });

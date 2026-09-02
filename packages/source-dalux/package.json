@@ -1,6 +1,6 @@
 {
   "name": "@ifc-lite/source-dalux",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "description": "Dalux Build (Box) file-source provider for ifc-lite",
   "type": "module",
   "main": "./dist/index.js",
@@ -24,7 +24,7 @@
   "devDependencies": {
     "@ifc-lite/source-fixture": "workspace:^",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.9"
+    "vitest": "^4.1.11"
   },
   "license": "MPL-2.0",
   "author": "Louis True",

@@ -9,9 +9,11 @@ import path from 'path';
 import fs from 'fs';
 import { cesiumStaticAssets } from './vite-plugins/cesium-assets';
 import { oauthCallbackRoutes } from './vite-plugins/oauth-callback';
+// Same allowlist the production relay uses, so dev and prod cannot disagree
+// about which Dalux node a request reaches (#2792).
+import { daluxRelayRoute } from './vite-plugins/dalux-relay';
 
 // --- Build-time changelog parser ---
-
 interface ReleaseHighlight {
   type: 'feature' | 'fix' | 'perf';
   text: string;
@@ -37,12 +39,10 @@ const SKIP_BOLD_LOWER = new Set([
   'renderer fixes', 'parser fixes', 'viewer integration', 'fixes', 'features',
   'breaking', 'minor changes', 'patch changes', 'dependencies',
 ]);
-
 function isInternalName(text: string): boolean {
   // Skip PascalCase single-word class names like "PolygonalFaceSetProcessor"
   return /^[A-Z][a-zA-Z]+$/.test(text) && !text.includes(' ');
 }
-
 function categorizeHighlight(text: string): 'feature' | 'fix' | 'perf' {
   const lower = text.toLowerCase();
   if (lower.startsWith('fixed ') || lower.startsWith('fix ')) return 'fix';
@@ -243,6 +243,10 @@ export default defineConfig({
     topLevelAwait(),
     cesiumStaticAssets(),
     oauthCallbackRoutes(),
+    // Dalux's API sends no CORS headers, so it must go through a same-origin
+    // relay. Dev runs the SAME handler production does (#2792), rather than a
+    // second proxy config that can drift from it.
+    daluxRelayRoute(),
   ],
   define: {
     __APP_VERSION__: JSON.stringify(appVersion),
@@ -276,6 +280,8 @@ export default defineConfig({
       '@ifc-lite/lens': path.resolve(__dirname, '../../packages/lens/src'),
       '@ifc-lite/mutations': path.resolve(__dirname, '../../packages/mutations/src'),
       '@ifc-lite/bcf': path.resolve(__dirname, '../../packages/bcf/src'),
+      '@ifc-lite/bcf-api': path.resolve(__dirname, '../../packages/bcf-api/src'),
+      '@ifc-lite/oauth-pkce': path.resolve(__dirname, '../../packages/oauth-pkce/src'),
       '@ifc-lite/drawing-2d': path.resolve(__dirname, '../../packages/drawing-2d/src'),
       '@ifc-lite/encoding': path.resolve(__dirname, '../../packages/encoding/src'),
       '@ifc-lite/ids': path.resolve(__dirname, '../../packages/ids/src'),
@@ -298,14 +304,6 @@ export default defineConfig({
         // For local dev, run `pnpm dev:api` from repo root.
         target: 'http://localhost:3001',
         changeOrigin: true,
-      },
-      '/api/dalux': {
-        // Dalux Build's API sends no CORS headers, so browser requests must
-        // go through this same-origin relay (mirrors /api/bsdd below, and
-        // vercel.json's rewrite in production).
-        target: 'https://node1.field.dalux.com',
-        changeOrigin: true,
-        rewrite: (p) => p.replace(/^\/api\/dalux/, '/service/api'),
       },
       '/api/bsdd': {
         target: 'https://api.bsdd.buildingsmart.org',
@@ -349,6 +347,7 @@ export default defineConfig({
           if (id.includes('/packages/sandbox/')) return 'sandbox';
           if (id.includes('/packages/export/')) return 'exporters';
           if (id.includes('/packages/server-client/')) return 'server-client';
+          if (id.includes('/packages/bcf-api/')) return 'bcf-api';
           if (id.includes('/packages/bcf/')) return 'bcf';
           if (id.includes('/packages/ids/')) return 'ids';
           if (id.includes('/packages/lens/')) return 'lens';

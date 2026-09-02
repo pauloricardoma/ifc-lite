@@ -8,6 +8,7 @@ import { getModelForRef, type ModelLike } from './model-compat.js';
 import { collectSpatialSubtreeElementsWithIfcSpace } from '../../store/basketVisibleSet.js';
 import { toGlobalIdForRef, toGlobalIdFromModels } from '../../store/globalId.js';
 import type { AggregationRelationships } from '../../utils/aggregation.js';
+import { resolveIsolationIds } from '../../lib/isolation/resolveIsolationIds.js';
 import { isSpaceLikeSpatialTypeName, isSpatialStructureTypeName, type SpatialNode } from '@ifc-lite/data';
 
 function findDescendantNode(root: SpatialNode, expressId: number): SpatialNode | null {
@@ -91,7 +92,18 @@ export function createVisibilityAdapter(store: StoreApi): VisibilityBackendMetho
         }
       }
       if (globalIds.length > 0) {
-        state.isolateEntities?.(globalIds);
+        // #3338: this is a selection/isolation channel like LensPanel,
+        // PropertiesPanel and both SearchModal isolate paths, so it must
+        // resolve the same way they do — a geometry-less `IfcElementAssembly`
+        // ref (spatial expansion above leaves it untouched) has to become its
+        // geometry-bearing `IfcRelAggregates` parts, or the viewport isolates
+        // an id with nothing to render and shows an empty scene.
+        //
+        // #3382's union policy, now via the shared `resolveIsolationIds` so
+        // `check-isolate-expansion-routing.mjs` can require every channel to
+        // use the same one: the resolved ids are unioned with the raw ids, and
+        // an empty resolve keeps the raw ids rather than isolating nothing.
+        state.isolateEntities?.(resolveIsolationIds(state.cameraCallbacks.resolveHighlightIds, globalIds));
       }
       return undefined;
     },

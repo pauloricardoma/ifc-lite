@@ -25,7 +25,6 @@ import { WorkerParser } from '@ifc-lite/parser/browser';
 import { memoryAccounting } from '../lib/perf/memoryAccounting.js';
 import {
   GeometryProcessor,
-  GeometryQuality,
   geometryAabbAt,
   geometryVolumeAt,
   getGeometryStreamWatchdogMs as getGeometryStreamWatchdogMsImpl,
@@ -154,6 +153,51 @@ function getGeometryStreamWatchdogMs(
  * (where no frame ever arrives), not to cut a real frame short. (#2385)
  */
 const COMPLETE_FRAME_WAIT_MS = 1000;
+
+/**
+ * Re-home, in place, every express id one flat mesh carries onto the
+ * federation's global id space: **every express id on a mesh is global once
+ * this has run.**
+ *
+ * Why the whole mesh must move together. Resolving a global id back to
+ * (model, expressId) is RANGE-based (`modelSlice.resolveGlobalIdFromModels`,
+ * `FederationRegistry.fromGlobalId` / `getModelForGlobalId`), so an id left
+ * unshifted does not resolve to nothing — it lands in whichever model's range
+ * contains the raw local number, which for a small item id in a model loaded at
+ * offset 1,000,000 is the PRIMARY model. A real entity in the wrong model is a
+ * plausible answer, and nothing downstream can tell it from a correct one.
+ *
+ * The ids: `expressId` (the element); `textureRef.textureId`, an express id too
+ * (#1781), or model B's texture `#34` samples model A's image out of the
+ * renderer's shared registry; `geometryItemId`, the `IfcRepresentationItem` the
+ * mesh was tessellated from (#2985/#3199) — `Scene.getInstancedMeshDataPieces`
+ * is already called with a GLOBAL id (`useZoneGeometrySplit`,
+ * `useZoneApportionment`), so an unshifted item id beside a shifted `expressId`
+ * on one mesh is exactly the mixed-space case above.
+ *
+ * `materialId`, the other #3199 source id, is an `IfcMaterial` express id from
+ * the same file as `expressId`, so it moves with it too: every TS-side
+ * consumer only copies it (census: PR #3525; #3211's Rust lookups differ).
+ *
+ * Absence must stay absence: `geometryItemId` is legitimately absent, and both
+ * naive shifts are wrong in a way a "the number changed" test accepts —
+ * `undefined + idOffset` is `NaN`, `(x ?? 0) + idOffset` invents the bare
+ * offset, itself a resolvable wrong answer — while a truthiness guard would
+ * drop a real `0`. Hence `typeof === 'number'`.
+ *
+ * The instanced half is `applyFederationOffsetToShard` in
+ * `useGeometryStreaming.ts`; a `MeshData` and a `DecodedInstance` are different
+ * shapes, so they are two functions, tested together so they cannot drift.
+ */
+export function applyFederationOffsetToMesh(mesh: MeshData, idOffset: number): void {
+  if (idOffset <= 0) return;
+  mesh.expressId = mesh.expressId + idOffset;
+  if (mesh.textureRef) {
+    mesh.textureRef = { ...mesh.textureRef, textureId: mesh.textureRef.textureId + idOffset };
+  }
+  if (typeof mesh.geometryItemId === 'number') mesh.geometryItemId = mesh.geometryItemId + idOffset;
+  if (typeof mesh.materialId === 'number') mesh.materialId = mesh.materialId + idOffset;
+}
 
 /**
  * Hook providing file loading operations for single-model path
@@ -493,6 +537,14 @@ export function useIfcLoader() {
         geometryResult: GeometryResult | null,
         schemaVersion: 'IFC2X3' | 'IFC4' | 'IFC4X3' | 'IFC5',
         patch?: { loadState?: 'pending' | 'streaming-geometry' | 'hydrating-metadata' | 'complete' | 'error'; cacheState?: 'none' | 'hit' | 'miss' | 'writing'; loadError?: string | null; pointCloudHandleId?: number },
+        // GPU-instancing shard bytes (#1912), forwarded explicitly rather than
+        // closed over: the WASM streaming section's `allInstancedShards` is
+        // declared ~800 lines below this closure, so a plain closure read would
+        // hit its TDZ on every non-WASM format (GLB/IFCX/point-cloud), whose
+        // finalizeModel calls all happen before that declaration executes.
+        // Those formats have no instancing concept, so the correct value on
+        // their path is simply "none" — the default below.
+        instancedShards: ArrayBuffer[] = [],
       ): Promise<void> => {
         // Ordering notice (issue #1804): alignment is baked into a scan at
         // ITS load time (an f64 decode-time offset — it cannot be applied
@@ -539,6 +591,19 @@ export function useIfcLoader() {
             setProgress({ phase: 'Aligning georeferenced model', percent: 90 });
             preAlignment = capturePreAlignment(geometryResult);
             const status = await alignGeometryToReference(geometryResult, parsedGeoref, referenceGeoref);
+            // Stale-guard-after-await sweep: `alignGeometryToReference` is real
+            // reprojection work — the only await in the federated branch (every
+            // write below it, registerModelOffset/addModel/buildSpatialIndex-
+            // ForModel/appendInstancedShards/relabelPointCloudAsset, is
+            // synchronous, so one check here covers the whole branch). Nothing
+            // has been acquired yet at this point — no offset registered, no
+            // model added, no spatial index built, no renderer asset relabeled
+            // — so, exactly like the IFCX branch above, there is nothing to
+            // unwind: write nothing and return.
+            if (loadSessionRef.current !== currentSession) {
+              console.warn(`[useIfc] federated finalize ABORTED after alignment: stale session (mine=${currentSession}, current=${loadSessionRef.current}) — alignment result discarded`);
+              return;
+            }
             federationAlignmentStatus = status;
             if (status === 'reprojected') {
               toast.info(
@@ -561,15 +626,12 @@ export function useIfcLoader() {
           const maxExpressId = getMaxExpressId(dataStore, geometryResult.meshes);
           const idOffset = registerModelOffset(modelId, maxExpressId);
           if (idOffset > 0) {
+            // Every express id the mesh carries — the element, its texture ref
+            // (#1781) and its source representation item (#2985) — moves to the
+            // global space together. See `applyFederationOffsetToMesh` for why a
+            // partly-shifted mesh resolves to a WRONG entity rather than to none.
             for (const mesh of geometryResult.meshes) {
-              mesh.expressId = mesh.expressId + idOffset;
-              // #1781: textureId is an express id too — offset it with the same
-              // shift so two federated models can't collide in the renderer's
-              // shared-texture registry (model B's texture #34 must never sample
-              // model A's image).
-              if (mesh.textureRef) {
-                mesh.textureRef = { ...mesh.textureRef, textureId: mesh.textureRef.textureId + idOffset };
-              }
+              applyFederationOffsetToMesh(mesh, idOffset);
             }
             for (const asset of geometryResult.pointClouds ?? []) asset.expressId = asset.expressId + idOffset;
             // #924/#1912: instanced-ONLY entities (no flat mesh, so the loop
@@ -629,16 +691,16 @@ export function useIfcLoader() {
           // renderer-side modelId → modelIndex / idOffset lookups
           // (Viewport.tsx's `modelIdToIndex` / `modelIdToOffset`) already see
           // this model when the drain effect runs.
-          if (allInstancedShards.length > 0) {
-            appendInstancedShards(modelId, allInstancedShards);
+          if (instancedShards.length > 0) {
+            appendInstancedShards(modelId, instancedShards);
           }
           return;
         }
 
-        // PRIMARY — unchanged from the former finalizePrimaryModel.
+        // PRIMARY. Registration needs only `geometryResult`, not `dataStore` (a primary GLB keeps `dataStore: null`).
         let idOffset = 0;
         let maxExpressId = 0;
-        if (dataStore && geometryResult) {
+        if (geometryResult) {
           maxExpressId = getMaxExpressId(dataStore, geometryResult.meshes);
           idOffset = registerModelOffset(modelId, maxExpressId);
         }
@@ -920,6 +982,19 @@ export function useIfcLoader() {
 
         try {
           const result = await parseIfcxViewerModel(buffer, setProgress);
+          // Stale-guard-after-await sweep: `parseIfcxViewerModel` is a real
+          // (client-side) parse — the only await in this branch — and a
+          // newer load (or model removal) may have superseded this one while
+          // it ran. The point-cloud branch immediately above unwinds
+          // cleanly on the same check (renderer asset removed, counts
+          // cleared); IFCX acquires no renderer/registry resource before
+          // this point, so there is nothing to unwind — write nothing,
+          // exactly like the cache branch's `if (cacheOutcome === 'stale')
+          // return;`.
+          if (loadSessionRef.current !== currentSession) {
+            console.warn(`[useIfc] IFCX finalize ABORTED: stale session (mine=${currentSession}, current=${loadSessionRef.current}) — result discarded`);
+            return;
+          }
           if (target.kind === 'primary') {
             setGeometryResult(result.geometryResult);
             setIfcDataStore(result.dataStore);
@@ -931,6 +1006,13 @@ export function useIfcLoader() {
           setLoading(false);
           return;
         } catch (err: unknown) {
+          // Same guard on the error path (#stale-guard sweep): a superseded
+          // load's OWN parse failure must not clobber the newer load's model
+          // record with an `error` state it never had.
+          if (loadSessionRef.current !== currentSession) {
+            console.warn(`[useIfc] IFCX parse failed on an already-stale session (mine=${currentSession}, current=${loadSessionRef.current}) — error discarded:`, err);
+            return;
+          }
           if (err instanceof Error && err.message === 'overlay-only-ifcx') {
             console.warn(`[useIfc] IFCX file "${file.name}" has no geometry - this appears to be an overlay file that adds properties to a base model.`);
             console.warn('[useIfc] To use this file, load it together with a base IFCX file (select both files at once).');
@@ -1226,7 +1308,6 @@ export function useIfcLoader() {
       // Reuses the merge-layers snapshot taken above for the cache key so the
       // key and the WASM tessellation always agree (issues #540, #1107).
       const geometryProcessor = new GeometryProcessor({
-        quality: GeometryQuality.Balanced,
         // Auto-low vertex density for heavy models (or `?geomTier=` override);
         // `undefined` keeps the engine default (medium, full-density curves).
         // Must match the tier folded into `cacheKey` above so the cached bytes
@@ -1527,10 +1608,10 @@ export function useIfcLoader() {
               // worker so it skips a duplicate ~10 s WASM scan. Safe even
               // when the parser falls back to main-thread (instance is
               // null then; the callback no-ops).
-              onEntityIndex: (ids, starts, lengths) => {
-                if (workerParserInstance) {
-                  workerParserInstance.setEntityIndex(ids, starts, lengths);
-                }
+              // #3395: the refusal count travels with the columns, because a
+              // refused record is not IN them.
+              onEntityIndex: (ids, starts, lengths, oversizedIdCount) => {
+                workerParserInstance?.setEntityIndex(ids, starts, lengths, oversizedIdCount);
               },
               // `?geomWorkers=N` A/B knob — overrides the cores/memory worker-
               // count heuristic so the host's thermal sweet spot can be measured.
@@ -1882,7 +1963,7 @@ export function useIfcLoader() {
                   };
                   await finalizeModel(dataStore, federatedGeometry, getSchemaVersion(dataStore), {
                     loadState: 'complete',
-                  });
+                  }, allInstancedShards);
                   return;
                 }
 
@@ -1891,7 +1972,7 @@ export function useIfcLoader() {
                   // Only show "writing" when this file will actually be cached
                   // under the current plan (respects the size bands + kill switch).
                   cacheState: cachePlan.shouldCache ? 'writing' : 'none',
-                });
+                }, allInstancedShards);
                 // Build spatial index from meshes in time-sliced chunks (non-blocking).
                 // Previously this was synchronous inside requestIdleCallback, blocking
                 // the main thread for seconds on 200K+ mesh models (190M+ float reads

@@ -12,7 +12,7 @@
  */
 
 import { readFile } from 'node:fs/promises';
-import { parseIDS, validateIDS, type IFCDataAccessor } from '@ifc-lite/ids';
+import { parseIDS, validateIDS, createTranslationService, type IDSValidationReport, type IFCDataAccessor, type SupportedLocale } from '@ifc-lite/ids';
 import { IFC_ENTITY_NAMES } from '@ifc-lite/data';
 import { getInheritanceChainAcrossSchemas } from '@ifc-lite/parser';
 import { foldedTypeCounts, pendingMutationsField, pendingOverlay } from '../overlay.js';
@@ -45,17 +45,18 @@ const idsValidate: Tool = {
 
     const idsDoc = parseIDS(xml);
     const accessor = buildIdsAccessor(m.store) as IFCDataAccessor;
+    const locale = (input.locale as SupportedLocale | undefined) ?? 'en';
     const report = await validateIDS(
       idsDoc,
       accessor,
       { modelId: m.id, schemaVersion: m.store.schemaVersion, entityCount: m.store.entityCount },
       {
+        translator: createTranslationService(locale),
         onProgress: (p) => {
           ctx.progress.report(p.percentage / 100, `Validating ${p.phase} (${p.specificationIndex + 1}/${p.totalSpecifications})`, 100);
         },
       },
     );
-    void input.locale;
 
     const summary = summarizeIdsReport(report);
     return okResult(
@@ -87,36 +88,41 @@ async function loadIdsXml(
   });
 }
 
-function summarizeIdsReport(report: unknown): {
+/**
+ * Project the validator's own `report.summary` into the shape this tool
+ * has always returned, instead of re-deriving pass/fail counts from
+ * `specificationResults`.
+ *
+ * A prior version recomputed everything from `entityResults`, treated
+ * `report` as an `unknown` cast to a hand-written minimal interface, and
+ * used `entityResults.length > 0` as the pass condition for a
+ * specification — so a specification that legitimately passes while
+ * matching zero entities (`minOccurs="0"`, or a prohibited spec that
+ * correctly matches nothing) was reported as failed. Because the report
+ * is typed as the real `IDSValidationReport` here, `report.summary` is
+ * the only field this function can read for these numbers — there is no
+ * `entityResults` shape left to drift back onto.
+ */
+function summarizeIdsReport(report: IDSValidationReport): {
   totalSpecifications: number;
   passedSpecifications: number;
   failedSpecifications: number;
+  notApplicableSpecifications: number;
   totalEntities: number;
   passedEntities: number;
   failedEntities: number;
+  overallPassRate: number;
 } {
-  const r = report as { specificationResults?: Array<{ entityResults?: Array<{ passed: boolean }> }> };
-  const specs = r.specificationResults ?? [];
-  let totalEntities = 0;
-  let passedEntities = 0;
-  let passedSpecifications = 0;
-  for (const spec of specs) {
-    const ents = spec.entityResults ?? [];
-    let specPassed = ents.length > 0;
-    for (const e of ents) {
-      totalEntities++;
-      if (e.passed) passedEntities++;
-      else specPassed = false;
-    }
-    if (specPassed) passedSpecifications++;
-  }
+  const s = report.summary;
   return {
-    totalSpecifications: specs.length,
-    passedSpecifications,
-    failedSpecifications: specs.length - passedSpecifications,
-    totalEntities,
-    passedEntities,
-    failedEntities: totalEntities - passedEntities,
+    totalSpecifications: s.totalSpecifications,
+    passedSpecifications: s.passedSpecifications,
+    failedSpecifications: s.failedSpecifications,
+    notApplicableSpecifications: s.totalSpecifications - s.passedSpecifications - s.failedSpecifications,
+    totalEntities: s.totalEntitiesChecked,
+    passedEntities: s.totalEntitiesPassed,
+    failedEntities: s.totalEntitiesFailed,
+    overallPassRate: s.overallPassRate,
   };
 }
 

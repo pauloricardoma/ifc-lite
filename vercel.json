@@ -18,8 +18,16 @@
       "destination": "/api/dalux?path=:path*"
     },
     {
+      "source": "/oauth/dropbox/callback",
+      "destination": "/oauth/dropbox/callback.html"
+    },
+    {
       "source": "/oauth/msgraph/callback",
       "destination": "/oauth/msgraph/callback.html"
+    },
+    {
+      "source": "/oauth/bcf/callback",
+      "destination": "/oauth/bcf/callback.html"
     },
     {
       "source": "/mcp",

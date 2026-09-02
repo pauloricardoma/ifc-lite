@@ -1,6 +1,6 @@
 {
   "name": "@ifc-lite/ifcx",
-  "version": "2.3.6",
+  "version": "3.0.1",
   "description": "IFC5 (IFCX) parser for IFC-Lite",
   "type": "module",
   "main": "./dist/index.js",
@@ -22,7 +22,7 @@
     "@ifc-lite/data": "workspace:^",
     "@ifc-lite/mutations": "workspace:^",
     "@ifc-lite/pointcloud": "workspace:^",
-    "@noble/hashes": "^2.3.0"
+    "@noble/hashes": "^2.4.0"
   },
   "devDependencies": {
     "tsx": "^4.23.12",

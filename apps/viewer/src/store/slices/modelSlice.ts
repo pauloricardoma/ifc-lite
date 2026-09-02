@@ -12,25 +12,20 @@
  */
 
 import type { StateCreator } from 'zustand';
-import type { EntityRef, FederatedModel } from '../types.js';
-import { stringToEntityRef } from '../types.js';
-import type { IfcDataStore } from '@ifc-lite/parser';
-import type { GeometryResult } from '@ifc-lite/geometry';
+import type { FederatedModel } from '../types.js';
 import { federationRegistry, type GlobalIdLookup } from '@ifc-lite/renderer';
+import type { ViewerState } from '../index.js';
+import { localIdInParseRange, localIdInOverlay } from '../globalId.js';
+import { viewerTeardown } from '../teardown-registry.js';
+import { modelRemovedScope } from '../teardown-scope.js';
+import {
+  endIdsRowFocusPresentation,
+  type IDSRowFocusPresentation,
+} from '../../lib/ids/visibility-ownership.js';
 import {
   endClashScenePresentation,
   type ClashSceneTeardown,
 } from '@/lib/clash/visibility-ownership';
-
-/**
- * Cross-slice fields the model actions write to. `ifcDataStore` and
- * `geometryResult` are owned by `dataSlice` but `modelSlice`'s set()
- * calls need to keep them in sync with the active model.
- */
-export interface ModelCrossSliceState {
-  ifcDataStore: IfcDataStore | null;
-  geometryResult: GeometryResult | null;
-}
 
 export interface ModelSlice {
   // State
@@ -102,7 +97,9 @@ export interface ModelSlice {
    * It shares the range and overlay predicates with the unscoped resolver
    * above, so the two cannot drift — a private range check in a caller is how
    * this codebase produced two resolvers that disagreed about the same id space
-   * (#2697).
+   * (#2697). Those predicates (`localIdInParseRange` / `localIdInOverlay`) live
+   * in `store/globalId.ts`, the same functions `teardown-scope.ts`'s
+   * `modelRemovedScope` calls for its survivor check (#3343).
    *
    * Not the only spelling in the repo, and this doc must not claim otherwise:
    * `store/globalId.ts` `fromGlobalIdFromModels` holds an independent copy that
@@ -116,35 +113,12 @@ export interface ModelSlice {
 }
 
 /**
- * Parse-time ownership: a model owns `[idOffset, idOffset + maxExpressId]` from
- * the original parse. Returns the LOCAL express id, or `null`.
- *
- * `model.idOffset` bare, no `?? 0`: it is a required `number` on
- * `FederatedModel` (`store/types.ts`), and the unscoped resolver this is
- * extracted from has always read it bare. `null` is returned for a miss, so a
- * caller must test `!== null` — local id `0` is a legitimate answer and a
- * truthiness test would drop it.
+ * `localIdInParseRange` / `localIdInOverlay` live in `store/globalId.ts` now
+ * (#3343) — that is the cycle-free home for the "does a surviving model own
+ * this global id" rule shared with `teardown-scope.ts`'s `modelRemovedScope`.
+ * They used to be defined here; keep this pointer so a reader who remembers
+ * that lands in the right file.
  */
-function localIdInParseRange(model: FederatedModel, globalId: number): number | null {
-  const localId = globalId - model.idOffset;
-  return localId >= 0 && localId <= model.maxExpressId ? localId : null;
-}
-
-/**
- * Overlay ownership: duplicates / scripted adds through StoreEditor land ABOVE
- * the model's parse-time `maxExpressId`, so `localIdInParseRange` cannot see
- * them; the model's mutation view can. Returns the LOCAL express id, or `null`.
- */
-function localIdInOverlay(
-  model: FederatedModel,
-  globalId: number,
-  view: { getNewEntity: (id: number) => unknown } | undefined,
-): number | null {
-  if (!view) return null;
-  const localId = globalId - model.idOffset;
-  if (localId <= model.maxExpressId) return null; // parse-range's business
-  return view.getNewEntity(localId) !== null ? localId : null;
-}
 
 /** The mutation views registered on the store, if the owning slice is present. */
 function mutationViewsOf(
@@ -153,7 +127,24 @@ function mutationViewsOf(
   return (state as { mutationViews?: Map<string, { getNewEntity: (id: number) => unknown }> }).mutationViews;
 }
 
-export const createModelSlice: StateCreator<ModelSlice & ModelCrossSliceState, [], [], ModelSlice> = (set, get) => ({
+/**
+ * The model slice, typed over the WHOLE store.
+ *
+ * There used to be a `ModelCrossSliceState` here: sixteen fields owned by
+ * `dataSlice`, `selectionSlice`, `visibilitySlice`, `pinboardSlice` and
+ * `addElementSlice`, declared on this slice purely so `removeModel` and
+ * `clearAllModels` could type-check their reach into all five. Teardown no
+ * longer reaches: it returns a patch composed by the owning slices
+ * (`store/teardown-registry.ts`), so the interface is gone.
+ *
+ * What is left is real and is not teardown: `addModel`, `upsertModel`,
+ * `updateModel` and `setActiveModel` keep `dataSlice`'s `ifcDataStore` /
+ * `geometryResult` pointed at the ACTIVE model, in the same `set` that moves
+ * the model map. `ViewerState` — the same generic `collabSlice` uses — is how
+ * that is declared now: the store's own type, not a hand-listed shadow of five
+ * other slices that could silently drift from them.
+ */
+export const createModelSlice: StateCreator<ViewerState, [], [], ModelSlice> = (set, get) => ({
   // Initial state
   models: new Map(),
   activeModelId: null,
@@ -237,6 +228,8 @@ export const createModelSlice: StateCreator<ModelSlice & ModelCrossSliceState, [
       idsValidationReport?: { modelInfo: { modelId: string } } | null;
       clearIdsValidationReport?: () => void;
       removeSourceTag?: (id: string) => void;
+      pointCloudDeviationComputed?: boolean;
+      setPointCloudDeviationComputed?: (computed: boolean) => void;
     };
     cross.clearMutations?.(modelId);
     cross.clearMutationView?.(modelId);
@@ -244,6 +237,17 @@ export const createModelSlice: StateCreator<ModelSlice & ModelCrossSliceState, [
     // sources UI stops offering "Sync from source" for a model that no
     // longer exists and the tag map cannot grow without bound.
     cross.removeSourceTag?.(modelId);
+    // A computed BIM<->scan deviation heatmap (`DeviationPanel`) is built from
+    // a BVH over EVERY triangle in the scene (`DeviationComputer.compute`,
+    // packages/renderer) -- not scoped to this model -- so removing any
+    // federated model invalidates it exactly like the clash focus and IDS
+    // report above. `pointCloudDeviationComputed` gates the panel's own
+    // auto-recompute effect, so leaving it `true` here would leave the
+    // slider/legend presenting a heatmap computed against a triangle set that
+    // no longer exists, with nothing left to trigger a rebuild.
+    if (cross.pointCloudDeviationComputed) {
+      cross.setPointCloudDeviationComputed?.(false);
+    }
 
     // Drop the focused-clash PRESENTATION — the A/B pair tint, the contact
     // marker (lines + AABB box) and the on-demand intersection solid, all of
@@ -256,9 +260,9 @@ export const createModelSlice: StateCreator<ModelSlice & ModelCrossSliceState, [
     // Unconditional, not "only if the
     // focused clash names this model": a clash id is `${ruleId} ${lo} ${hi}`
     // with `lo`/`hi` themselves `model:expressId`, and parsing it here would be
-    // a third, subtly different reading of a key format — the exact hazard the
-    // selection purge below calls out and routes through `stringToEntityRef`
-    // to avoid. Losing a highlight on an unrelated model's removal is cheap;
+    // a third, subtly different reading of a key format — the exact hazard
+    // `slices/selectionSlice.teardown.ts` calls out and routes through
+    // `stringToEntityRef` to avoid. Losing a highlight on an unrelated model's removal is cheap;
     // an orphaned opaque solid over the survivors is not.
     //
     // The clash RESULT is deliberately kept: it is a list the user is reading,
@@ -280,6 +284,25 @@ export const createModelSlice: StateCreator<ModelSlice & ModelCrossSliceState, [
     // — verified against `mutationSlice.clearMutations` — but that is a
     // property of today's implementations, not of this call site.
     endClashScenePresentation(() => get() as unknown as ClashSceneTeardown, 'model-removed');
+
+    // The IDS per-row focus (#2867) owns the same two shared channels clash
+    // does — `focusEntity` installs the activated row's element into
+    // `isolatedEntities` or `ghostExceptEntities` — and a row isolation left
+    // standing over a federation that just changed is the same blank viewport
+    // #2654 describes, with nothing on screen to explain it. Released by
+    // IDS's OWN record, so a presentation belonging to clash, the spaces
+    // X-ray or IDS's set-level isolate buttons survives untouched. The row
+    // focus's colour marker goes with it — both channels it wrote.
+    //
+    // CORRECTION (review of #2867): an earlier revision of this comment
+    // claimed this "must also precede the IDS clears below, which drop the
+    // record". It does not. The only clear below is
+    // `clearIdsValidationReport`, which releases through this same helper
+    // BEFORE nulling the record — moving this call after it passes the whole
+    // suite (verified). The order here is not load-bearing and is not
+    // asserted; what IS load-bearing is the release-before-null order INSIDE
+    // `clearIdsValidationReport` (idsSlice), where it is asserted.
+    endIdsRowFocusPresentation(get() as unknown as IDSRowFocusPresentation);
 
     // If the removed model is the one the current IDS report describes, that
     // report is stale by definition — its results reference a model that no
@@ -306,83 +329,54 @@ export const createModelSlice: StateCreator<ModelSlice & ModelCrossSliceState, [
       cross.clearIdsValidationReport?.();
     }
 
-    set((state) => {
-      const newModels = new Map(state.models);
-      newModels.delete(modelId);
+    // A published compare result (compareSlice) names its base/head models by
+    // id and its `excludedHiddenIds` / `diff` entries carry federation GLOBAL
+    // ids computed against those two models' offsets. If the removed model
+    // was either side of that comparison, the result no longer describes a
+    // pairing that exists — same dangling-reference shape as the IDS report
+    // above, one slice over. Left alone it merely dangles here (removeModel
+    // never resets `federationRegistry`'s offset counter, so no later model
+    // can be re-assigned these same ids) but `clearAllModels` below does not
+    // have that guarantee, so this call site exists for symmetry and so a
+    // partial federation edit (remove one side of a compare, add a
+    // replacement) can't leave a comparison silently describing the old
+    // pairing while a new one of the same shape loads.
+    const compareCross = get() as unknown as {
+      compareResult?: { baseModelId: string; headModelId: string } | null;
+      clearCompare?: () => void;
+    };
+    if (
+      compareCross.compareResult &&
+      (compareCross.compareResult.baseModelId === modelId || compareCross.compareResult.headModelId === modelId)
+    ) {
+      compareCross.clearCompare?.();
+    }
 
-      // Unregister from federation registry
-      federationRegistry.unregisterModel(modelId);
+    // Unregister from the federation registry. This used to sit INSIDE the
+    // `set` updater below; it is a side effect on a singleton rather than
+    // state, and nothing between here and the `set` reads it — the survivor
+    // predicate is computed from `models`, not from the registry. Partial
+    // removal BURNS the freed offset range instead of reclaiming it
+    // (`federation-registry.ts`), which is why a teardown may purge THIS
+    // model's global ids and leave every survivor's alone.
+    federationRegistry.unregisterModel(modelId);
 
-      // Update activeModelId if removed model was active
-      let newActiveId = state.activeModelId;
-      if (state.activeModelId === modelId) {
-        const remaining = Array.from(newModels.keys());
-        newActiveId = remaining.length > 0 ? remaining[0] : null;
-      }
-
-      const activeModel = newActiveId ? newModels.get(newActiveId) : null;
-
-      // Selection state keys off modelId, so anything pointing at the removed
-      // model is now dangling: `models.get(selectedEntity.modelId)` returns
-      // undefined and the properties panel silently renders nothing rather
-      // than re-resolving, leaving a ghost selection until the user clicks
-      // elsewhere. `activeStorey` likewise stays pinned to a storey in a model
-      // that no longer exists, which the Solo level display and floorplan read.
-      //
-      // `syncSourceModel`'s purgeStaleReferences already does exactly this for
-      // the same-modelId resync path; full removal needed the same treatment
-      // and never got it. Entries belonging to OTHER models are preserved —
-      // clearing wholesale would drop a federated sibling's live selection.
-      // Selection lives on selectionSlice; reached through a narrow cast the
-      // same way the mutation/IDS/source-tag actions above are reached via
-      // `cross`, since a slice's own StateCreator is typed to its own fields.
-      // Every field is optional here, not just cast: `modelSlice.test.ts`
-      // drives this action through a harness that stubs `set`/`get` with the
-      // model slice alone, so selection fields are genuinely absent there. A
-      // slice reaching across must tolerate that rather than assume the
-      // combined store.
-      const sel = state as unknown as Partial<{
-        selectedEntity: EntityRef | null;
-        activeStorey: EntityRef | null;
-        selectedEntities: EntityRef[];
-        selectedEntitiesSet: Set<string>;
-        selectedModelId: string | null;
-      }>;
-      const priorEntities = sel.selectedEntities ?? [];
-      const priorSet = sel.selectedEntitiesSet ?? new Set<string>();
-      const keptEntities = priorEntities.filter((e) => e.modelId !== modelId);
-      const selectionTouchedRemoved =
-        sel.selectedEntity?.modelId === modelId ||
-        sel.activeStorey?.modelId === modelId ||
-        keptEntities.length !== priorEntities.length;
-
-      return {
-        models: newModels,
-        activeModelId: newActiveId,
-        ifcDataStore: activeModel?.ifcDataStore ?? null,
-        geometryResult: activeModel?.geometryResult ?? null,
-        ...(selectionTouchedRemoved
-          ? {
-              selectedEntity:
-                sel.selectedEntity?.modelId === modelId ? null : sel.selectedEntity,
-              activeStorey: sel.activeStorey?.modelId === modelId ? null : sel.activeStorey,
-              selectedEntities: keptEntities,
-              // Parsed with the shared helper rather than a `${modelId}:`
-              // prefix test: `stringToEntityRef` splits on the FIRST colon, so
-              // a prefix match would also strip a sibling model whose id
-              // merely starts with this one's id plus a colon. Using the same
-              // parse every other consumer uses keeps this filter from
-              // becoming a third, subtly different reading of the same key.
-              selectedEntitiesSet: new Set(
-                [...priorSet].filter(
-                  (k) => stringToEntityRef(k).modelId !== modelId
-                )
-              ),
-              selectedModelId: sel.selectedModelId === modelId ? null : (sel.selectedModelId ?? null),
-            }
-          : {}),
-      };
-    });
+    // One composed patch, built by the slices that own the fields
+    // (`store/teardown-registry.ts`) — including `dataSlice`'s scoped purge of
+    // the mesh-colour backup, which used to be computed here.
+    // `modelRemovedScope` carries the survivor-range predicate every
+    // global-id-keyed slice filters on: the loop that used to live in this
+    // function AND, verbatim, in `syncSourceModel`'s second purge.
+    //
+    // Read the state ONCE and hand the same object to both: the scope's
+    // survivor set and the contributions that filter against it must not be
+    // computed off two different snapshots.
+    //
+    // Applied through the slice's own `set`, which is the store's wrapped
+    // setter, so the shared isolate / ghost channels this can null still go
+    // through `withVisibilityOwnershipInvalidation`.
+    const state = get();
+    set(viewerTeardown(modelRemovedScope(state, modelId), state));
   },
 
   clearAllModels: () => {
@@ -392,9 +386,15 @@ export const createModelSlice: StateCreator<ModelSlice & ModelCrossSliceState, [
     const crossClear = get() as unknown as {
       clearIdsValidationReport?: () => void;
       clearSourceTags?: () => void;
+      pointCloudDeviationComputed?: boolean;
+      setPointCloudDeviationComputed?: (computed: boolean) => void;
     };
     crossClear.clearIdsValidationReport?.();
     crossClear.clearSourceTags?.();
+    // Same staleness as `removeModel` above, for the full-teardown path.
+    if (crossClear.pointCloudDeviationComputed) {
+      crossClear.setPointCloudDeviationComputed?.(false);
+    }
     // A clash run describes pairs of elements in models that are all about to
     // be gone, and the on-demand intersection SOLID is a mesh drawn into the
     // live scene — `Viewport`'s draw gate reads `clashSelectedId` +
@@ -407,14 +407,114 @@ export const createModelSlice: StateCreator<ModelSlice & ModelCrossSliceState, [
     // nothing left for either to refer to, and `resetViewerState`
     // (store/index.ts) has always nulled the visibility fields here.
     endClashScenePresentation(() => get() as unknown as ClashSceneTeardown, 'federation-cleared');
+    // Same claim, released the same way: with every model gone the clash
+    // helper above has already cleared both channels outright, so this
+    // normally just drops the record — which it must, because a record that
+    // outlives its presentation re-matches as soon as any other owner
+    // installs equal content (#2654 fourth review).
+    endIdsRowFocusPresentation(get() as unknown as IDSRowFocusPresentation);
     // Clear the federation registry
     federationRegistry.clear();
-    return set({
-      models: new Map(),
-      activeModelId: null,
-      ifcDataStore: null,
-      geometryResult: null,
-    });
+    // Same dangling reference as `removeModel`'s `addElementModelId` cleanup,
+    // just for every model at once: with `models` about to become empty there
+    // is no federated model left for the AddElement panel's pin to name, so it
+    // and the model-local storey id go too. Same for every global-id set
+    // `removeModel` purges by range (selection, hidden, isolated, ghost, class
+    // filter, and the per-model maps): with zero survivors every id in them is
+    // stale by definition, so the composed teardown at the end of this function
+    // clears them unconditionally rather than repeating the range check for an
+    // always-true answer. `isolatedEntities`/`ghostExceptEntities` clear to
+    // `null` (not an empty `Set`) for the same reason `removeModel` does — an
+    // empty-but-set isolate would hide the very next model loaded, until it
+    // does. Each of those clears now lives with the slice that owns the field;
+    // this note stays here because it is the reason the OVERLAY call below is
+    // unconditional too.
+    // `federationRegistry.clear()` above resets the offset counter to 0, so
+    // the very next model registered can be handed the exact global ids a
+    // still-registered overlay layer's `hiddenIds`/`colorOverrides` name.
+    // `overlaySlice.overlayLayers` stores each layer's contribution as
+    // already-translated GLOBAL ids — `useConstructionSequence.ts` converts
+    // via `toGlobalIdFromModels` at REGISTRATION time, not at read time
+    // (store/globalId.ts) — so a layer registered before this clear keeps
+    // naming those exact numbers afterward. That hook's registration effect
+    // deps (`[animationEnabled, playbackTime, scheduleData,
+    // activeWorkScheduleId, animationSettings]`) exclude `models`, and
+    // `scheduleData` is untouched by `clearAllModels`, so a PAUSED animation
+    // (no `playbackTime` advance to re-trigger the effect) leaves the
+    // 'animation' layer registered with its pre-clear ids indefinitely.
+    // `useOverlayCompositor.ts` applies `computeCompositeOverlay()`'s output
+    // straight to `hideEntities`/`setPendingColorUpdates` by global id with
+    // no re-resolution, so a recycled offset lands the stale hide/colour on
+    // whatever live entity the reloaded federation assigns that number to —
+    // same offset-reuse-misresolution shape as `compareResult` / the lens
+    // (#2854). Unconditional, like those: with every model gone there is no
+    // federation left for any layer to describe correctly either way.
+    //
+    // `removeModel` deliberately does NOT get the equivalent guarded call:
+    // `unregisterModel` BURNS the freed offset range instead of reclaiming
+    // it (`federation-registry.ts`), so a layer left registered after a
+    // partial removal cannot ever be handed to a new model — it dangles
+    // harmlessly, same as the `compareResult` non-participant case in
+    // `removeModel-compare-stale.test.ts`, and the same reasoning
+    // `clearAllModels-overlay-stale.test.ts`'s negative control proves.
+    (get() as unknown as { clearOverlayLayers?: () => void }).clearOverlayLayers?.();
+    // Same offset-reuse hazard as the overlay layer above, on the compare
+    // channel: the very next model registered can be handed the exact
+    // offsets any surviving compare result's `excludedHiddenIds` / `diff` global ids
+    // describe (see `removeModel-compare-stale.test.ts`: a georef-triggered
+    // reload calls `clearAllModels()` then reloads every model, and the
+    // first one back gets offset 0 again). Unconditional, unlike
+    // `removeModel`'s guarded version above — with every model gone there is
+    // no pairing left for a compare result to describe either way, and here
+    // the offset-reuse hazard makes leaving it behind actively dangerous
+    // rather than merely stale.
+    (get() as unknown as { clearCompare?: () => void }).clearCompare?.();
+    // Same offset-reuse hazard, on the lens channel: `useLens.ts`'s effect
+    // deps are `[activeLensId, activeLens]`, NOT `models` — a model
+    // add/remove never re-evaluates the active lens, so `lensColorMap`,
+    // `lensHiddenIds`, `lensAppliedColors`, `lensRuleCounts` and
+    // `lensRuleEntityIds` keep naming whatever global ids they were last
+    // computed against. `resetViewerState` (store/index.ts) already
+    // deactivates the lens and clears these on every ordinary file load; the
+    // gap is the same one `compareResult` had above — the georef-reload path
+    // (`GeoreferencingPanel.tsx`'s `reloadModelsForAlignment`) calls only
+    // `clearAllModels()`, never `resetViewerState()`, and the reload that
+    // follows can hand the first model back offset 0. A lens still "active"
+    // across that reload would then apply its stale hide/colour ids to
+    // whatever entities the new federation assigned those same global ids —
+    // hiding or tinting elements the user never touched. Guarded on
+    // `activeLensId` so a clear with no lens ever active is a no-op, same
+    // shape as `removeModel`'s `compareCross` guard above.
+    const lensCross = get() as unknown as {
+      activeLensId?: string | null;
+      setActiveLens?: (id: string | null) => void;
+      setLensColorMap?: (m: Map<number, string>) => void;
+      setLensAppliedColors?: (m: Map<number, [number, number, number, number]> | null) => void;
+      setLensHiddenIds?: (s: Set<number>) => void;
+      setLensAppliedHiddenIds?: (ids: number[]) => void;
+      setLensRuleIsolation?: (v: { ruleId: string; entityIds: number[] } | null) => void;
+      setLensRuleCounts?: (m: Map<string, number>) => void;
+      setLensRuleEntityIds?: (m: Map<string, number[]>) => void;
+      setLensAutoColorLegend?: (legend: unknown[]) => void;
+    };
+    if (lensCross.activeLensId != null) {
+      lensCross.setActiveLens?.(null);
+      lensCross.setLensColorMap?.(new Map());
+      lensCross.setLensAppliedColors?.(null);
+      lensCross.setLensHiddenIds?.(new Set());
+      lensCross.setLensAppliedHiddenIds?.([]);
+      lensCross.setLensRuleIsolation?.(null);
+      lensCross.setLensRuleCounts?.(new Map());
+      lensCross.setLensRuleEntityIds?.(new Map());
+      lensCross.setLensAutoColorLegend?.([]);
+    }
+    // One composed patch, built by the slices that own the fields
+    // (`store/teardown-registry.ts`). Every 'all-models-cleared' arm clears
+    // unconditionally rather than range-checking: `federationRegistry.clear()`
+    // above restarts the offset counter at 0, so with zero survivors every
+    // stored global id is stale by definition AND the very next model loaded
+    // can be handed those exact numbers back.
+    set(viewerTeardown({ kind: 'all-models-cleared' }, get()));
   },
 
   setActiveModel: (modelId) => set((state) => {

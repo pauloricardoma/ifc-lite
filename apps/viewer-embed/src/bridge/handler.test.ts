@@ -12,7 +12,7 @@
  * silent relaxation of the boundary fails the suite.
  */
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi, expectTypeOf } from 'vitest';
 
 // The bridge only needs one value from the viewer store barrel; importing the
 // real barrel would drag in zustand + renderer + wasm. Mirror the real
@@ -30,7 +30,9 @@ vi.mock('@/store/index.js', () => ({
   },
 }));
 
-import { EMBED_SOURCE, PROTOCOL_VERSION } from '@ifc-lite/embed-protocol';
+import { EMBED_SOURCE, PROTOCOL_VERSION, TYPE_VISIBILITY_FLAG_KEYS } from '@ifc-lite/embed-protocol';
+import { TYPE_VISIBILITY_SEMANTIC_DEFAULTS } from '@/store/constants.js';
+import type { TypeVisibility } from '@/store/types.js';
 import { initBridge, destroyBridge, emitEvent, emitToParent } from './handler.js';
 
 // ---------------------------------------------------------------------------
@@ -146,13 +148,19 @@ function makeState() {
     entities,
     calls,
     sectionPlane: { enabled: false, flipped: false },
-    typeVisibility: { spaces: true, openings: false, site: true },
+    // All seven store toggles, not the three the protocol used to name: a
+    // handler that reads only three has to be visibly wrong here.
+    typeVisibility: {
+      spaces: true, spatialZones: false, openings: false, virtualElements: true,
+      site: true, ifcAnnotations: false, ifcGrid: true,
+    },
     cameraCallbacks: {
       frameSelection: rec('frameSelection'),
       fitAll: rec('fitAll'),
       setPresetView: rec('setPresetView'),
     },
     setTheme: rec('setTheme'),
+    setInteractionMode: rec('setInteractionMode'),
     // Mirrors the real implementation's Map.delete semantics exactly
     // (apps/viewer/src/store/slices/modelSlice.ts ~147-213): deleting an
     // absent key is a silent no-op, no throw. The bridge is responsible for
@@ -169,6 +177,7 @@ function makeState() {
     showAllInAllModels: rec('showAllInAllModels'),
     updateMeshColors: rec('updateMeshColors'),
     clearPendingColorUpdates: rec('clearPendingColorUpdates'),
+    resetMeshColors: rec('resetMeshColors'),
     setCameraRotation: rec('setCameraRotation'),
     setSectionPlaneAxis: rec('setSectionPlaneAxis'),
     setSectionPlanePosition: rec('setSectionPlanePosition'),
@@ -199,6 +208,8 @@ function makeCtx(state: any, overrides: Partial<Record<string, any>> = {}) {
     // override that does.
     addModelFromUrl: overrides.addModelFromUrl
       ?? vi.fn(async () => ({ modelId: 'default-added-id', entities: 10, triangles: 20, vertices: 30 })),
+    setBackgroundColor: overrides.setBackgroundColor ?? vi.fn(),
+    setOverlays: overrides.setOverlays ?? vi.fn(),
   };
 }
 
@@ -531,6 +542,39 @@ describe('INIT', () => {
     expect(called(state, 'setTheme')).toBe(false);
   });
 
+  // #2934 follow-up: INIT's `config` is the published `EmbedConfig` type
+  // (packages/embed-protocol), and only `.theme` ever reached an actuator.
+  // `.bg`, `.controls`, `.hideAxis`, `.hideScale` and `.hideTypes` were
+  // declared and silently dropped for a host driving the postMessage
+  // protocol directly. Each now reuses the same actuator its `?param=` URL
+  // equivalent already calls.
+  it('applies config.bg via the same setBackgroundColor actuator SET_THEME uses', async () => {
+    const ctx = makeCtx(state);
+    initBridge(ctx);
+    await send(fw, cmd('INIT', { config: { bg: 'ff0000' } }, 'r1'));
+    expect(ctx.setBackgroundColor).toHaveBeenCalledWith('ff0000');
+  });
+
+  it('applies config.controls via the same setInteractionMode actuator ?controls= uses', async () => {
+    initBridge(makeCtx(state));
+    await send(fw, cmd('INIT', { config: { controls: 'none' } }, 'r1'));
+    expect(argsOf(state, 'setInteractionMode')).toEqual(['none']);
+  });
+
+  it('applies config.hideAxis/.hideScale/.hideTypes via the merged setOverlays actuator', async () => {
+    const ctx = makeCtx(state);
+    initBridge(ctx);
+    await send(fw, cmd('INIT', { config: { hideAxis: true, hideScale: true, hideTypes: ['IfcSpace'] } }, 'r1'));
+    expect(ctx.setOverlays).toHaveBeenCalledWith({ hideAxis: true, hideScale: true, hideTypes: ['IfcSpace'] });
+  });
+
+  it('does not call setOverlays when config has none of the three overlay fields', async () => {
+    const ctx = makeCtx(state);
+    initBridge(ctx);
+    await send(fw, cmd('INIT', { config: { theme: 'dark' } }, 'r1'));
+    expect(ctx.setOverlays).not.toHaveBeenCalled();
+  });
+
   it('rejects a token mismatch without applying config or ACKing', async () => {
     initBridge(makeCtx(state), { initToken: 'secret' });
     await send(fw, cmd('INIT', { token: 'wrong', config: { theme: 'dark' } }, 'r1'));
@@ -638,6 +682,20 @@ describe('command dispatch', () => {
     });
   });
 
+  it('ADD_MODEL forwards the optional name to addModelFromUrl (not dropped)', async () => {
+    const addModelFromUrl = vi.fn(async () => ({ modelId: 'new-id', entities: 1, triangles: 2, vertices: 3 }));
+    initBridge(makeCtx(state, { addModelFromUrl }));
+    await send(fw, cmd('ADD_MODEL', { url: 'https://x.test/a.ifc', name: 'Custom Name.ifc' }, 'r1'));
+    expect(addModelFromUrl).toHaveBeenCalledWith('https://x.test/a.ifc', 'Custom Name.ifc');
+  });
+
+  it('ADD_MODEL without a name still calls addModelFromUrl (name undefined)', async () => {
+    const addModelFromUrl = vi.fn(async () => ({ modelId: 'new-id', entities: 1, triangles: 2, vertices: 3 }));
+    initBridge(makeCtx(state, { addModelFromUrl }));
+    await send(fw, cmd('ADD_MODEL', { url: 'https://x.test/a.ifc' }, 'r1'));
+    expect(addModelFromUrl).toHaveBeenCalledWith('https://x.test/a.ifc', undefined);
+  });
+
   it('REMOVE_MODEL forwards the modelId', async () => {
     initBridge(makeCtx(state));
     await send(fw, cmd('REMOVE_MODEL', { modelId: 'm1' }, 'r1'));
@@ -688,7 +746,7 @@ describe('command dispatch', () => {
     initBridge(makeCtx(state, { addModelFromUrl }));
     await send(fw, cmd('ADD_MODEL', { url: 'https://x.test/b.ifc' }, 'r1'));
 
-    expect(addModelFromUrl).toHaveBeenCalledWith('https://x.test/b.ifc');
+    expect(addModelFromUrl).toHaveBeenCalledWith('https://x.test/b.ifc', undefined);
     // The pre-existing model must survive the add — this is the registry-level
     // assertion, not just "the call resolved".
     expect(state.models.has('m1')).toBe(true);
@@ -805,6 +863,52 @@ describe('selection and visibility commands', () => {
     expect(fw.posted.at(-1)!.msg.responseId).toBe('r1');
   });
 
+  /**
+   * #3338: `expandToGeometryBearingIds` (a geometry-less `IfcElementAssembly`
+   * → its `IfcRelAggregates` parts) has one shared implementation, reached
+   * through `cameraCallbacks.resolveHighlightIds` — the same channel
+   * LensPanel, PropertiesPanel, SearchModal and the SDK visibility adapter
+   * (#3382) route isolation through. This embed bridge shares `apps/viewer`'s
+   * store and Viewport (`vite.config.ts`'s `@` alias), so the resolver is
+   * reachable here too; before this fix ISOLATE forwarded the parent's raw
+   * ids straight to `isolateEntities`, so isolating an assembly by id over
+   * postMessage blanked the embed exactly like #2532 did for the Filter tab.
+   */
+  it('ISOLATE resolves a geometry-less assembly id to its geometry-bearing parts via resolveHighlightIds', async () => {
+    const resolveHighlightIds = (ids: number[]) =>
+      ids.flatMap((id) => (id === 1005 ? [9001, 9002] : [id]));
+    state.cameraCallbacks.resolveHighlightIds = resolveHighlightIds;
+    initBridge(makeCtx(state));
+    await send(fw, cmd('ISOLATE', { ids: [1005] }, 'r1'));
+    // The resolved parts are unioned with the raw (pre-resolution) id,
+    // matching every other isolation channel -- harmless here since the
+    // raw assembly id has no geometry of its own.
+    expect(argsOf(state, 'isolateEntities')).toEqual([[9001, 9002, 1005]]);
+  });
+
+  it('ISOLATE falls back to the raw ids when no renderer has registered resolveHighlightIds yet', async () => {
+    // Mirrors every other channel's fallback (LensPanel, PropertiesPanel,
+    // SearchModal, the SDK adapter): the default test state's
+    // `cameraCallbacks` carries no `resolveHighlightIds` at all.
+    initBridge(makeCtx(state));
+    await send(fw, cmd('ISOLATE', { ids: [1005] }, 'r1'));
+    expect(argsOf(state, 'isolateEntities')).toEqual([[1005]]);
+  });
+
+  it('ISOLATE keeps the raw ids when the resolver resolves to [] (#3389)', async () => {
+    // `[]` is not "geometry is in and nothing renders": the resolver
+    // bounds-checks against the type-visibility FILTERED mesh list, so an
+    // IfcSpace at the shipped `spaces: false` default -- and a mesh that has
+    // not streamed in yet -- answers `[]` too. Dropping the isolate there
+    // makes an ISOLATE of a space a silent no-op over postMessage; keeping
+    // the raw ids costs nothing and starts showing the right thing as soon as
+    // the host flips the toggle or the batch lands.
+    state.cameraCallbacks.resolveHighlightIds = () => [];
+    initBridge(makeCtx(state));
+    await send(fw, cmd('ISOLATE', { ids: [1005] }, 'r1'));
+    expect(argsOf(state, 'isolateEntities')).toEqual([[1005]]);
+  });
+
   it('SHOW_ALL restores visibility across every model', async () => {
     initBridge(makeCtx(state));
     await send(fw, cmd('SHOW_ALL', undefined, 'r1'));
@@ -814,15 +918,24 @@ describe('selection and visibility commands', () => {
   it('SET_COLORS converts string keys to numeric entity ids', async () => {
     initBridge(makeCtx(state));
     await send(fw, cmd('SET_COLORS', { colorMap: { '12': [1, 0, 0, 1] } }, 'r1'));
-    const [updates] = argsOf(state, 'updateMeshColors') as [Map<number, unknown>];
+    const [updates, options] = argsOf(state, 'updateMeshColors') as [Map<number, unknown>, { override?: boolean }];
     expect([...updates.keys()]).toEqual([12]);
     expect(updates.get(12)).toEqual([1, 0, 0, 1]);
+    // Marked as an override so the displaced colors are captured and
+    // RESET_COLORS can put them back.
+    expect(options).toEqual({ override: true });
   });
 
-  it('RESET_COLORS clears pending updates', async () => {
+  it('RESET_COLORS undoes the SET_COLORS bake and leaves the overlay channel alone', async () => {
     initBridge(makeCtx(state));
     await send(fw, cmd('RESET_COLORS', undefined, 'r1'));
-    expect(called(state, 'clearPendingColorUpdates')).toBe(true);
+    // `resetMeshColors` restores what SET_COLORS baked into
+    // geometryResult.meshes[].color. `clearPendingColorUpdates` is the
+    // lens/IDS/clash overlay channel — a different subsystem's state, which
+    // this command must not touch (#2934). See handler.effects.test.ts for the
+    // same pair asserted on the real slices rather than on this double.
+    expect(called(state, 'resetMeshColors')).toBe(true);
+    expect(called(state, 'clearPendingColorUpdates')).toBe(false);
   });
 
   it('SET_TYPE_VISIBILITY toggles only the flags that actually differ', async () => {
@@ -841,10 +954,77 @@ describe('selection and visibility commands', () => {
     expect(called(state, 'toggleTypeVisibility')).toBe(false);
   });
 
+  it('SET_TYPE_VISIBILITY reaches every flag the protocol declares, not just spaces/openings/site', async () => {
+    // Fixture: spaces=true, spatialZones=false, openings=false,
+    // virtualElements=true, site=true, ifcAnnotations=false, ifcGrid=true.
+    // Every flag is sent INVERTED, so a correct handler toggles all seven.
+    // Kills: the three hardcoded `if (payload.spaces …)` branches this
+    // replaced — under them `toggled` was ['spaces', 'openings', 'site'] and
+    // the other four commands were accepted, answered OK, and dropped. Also
+    // kills a loop that iterates a shorter list than TYPE_VISIBILITY_FLAG_KEYS.
+    initBridge(makeCtx(state));
+    await send(fw, cmd('SET_TYPE_VISIBILITY', {
+      spaces: false, spatialZones: true, openings: true, virtualElements: false,
+      site: false, ifcAnnotations: true, ifcGrid: false,
+    }, 'r1'));
+    const toggled = state.calls
+      .filter(([n]: [string]) => n === 'toggleTypeVisibility')
+      .map(([, arg]: [string, string]) => arg);
+    expect([...toggled].sort()).toEqual([...TYPE_VISIBILITY_FLAG_KEYS].sort());
+  });
+
+  it('SET_TYPE_VISIBILITY leaves a matching flag alone on every key, not only the first three', async () => {
+    // Same seven flags, each sent at the value the fixture already holds.
+    // `toggleTypeVisibility` FLIPS, so a handler that called it unconditionally
+    // would invert all seven while looking like it "applied" the request.
+    // Kills: dropping the `state.typeVisibility[key] !== payload[key]` half of
+    // the guard, which the old three-branch code had and a naive loop loses.
+    initBridge(makeCtx(state));
+    await send(fw, cmd('SET_TYPE_VISIBILITY', {
+      spaces: true, spatialZones: false, openings: false, virtualElements: true,
+      site: true, ifcAnnotations: false, ifcGrid: true,
+    }, 'r1'));
+    expect(called(state, 'toggleTypeVisibility')).toBe(false);
+  });
+
+  it('the protocol flag list and the store TypeVisibility are the same set', () => {
+    // This is the check that stops defect 2 recurring. The protocol was written
+    // when the store had three toggles; four were added to the store later and
+    // nothing failed, so the embed silently exposed three of seven for months.
+    //
+    // Runtime half. Kills: adding a store toggle (a new key in
+    // TYPE_VISIBILITY_SEMANTIC_DEFAULTS) without adding the protocol key —
+    // the exact drift that produced this defect.
+    expect([...TYPE_VISIBILITY_FLAG_KEYS].sort())
+      .toEqual(Object.keys(TYPE_VISIBILITY_SEMANTIC_DEFAULTS).sort());
+
+    // Compile-time half, checked by scripts/typecheck-tests.mjs (#2457). Kills a
+    // protocol key the store lacks AND a store key the protocol lacks, in one
+    // assertion, because type equality is checked both ways. The set equality
+    // above already catches both at runtime. handler.ts is a third guard for the
+    // extra-protocol-key direction only, since it indexes TypeVisibility by the
+    // key; dropping a key the store has compiles there fine.
+    expectTypeOf<(typeof TYPE_VISIBILITY_FLAG_KEYS)[number]>().toEqualTypeOf<keyof TypeVisibility>();
+  });
+
   it('SET_THEME forwards the theme', async () => {
     initBridge(makeCtx(state));
     await send(fw, cmd('SET_THEME', { theme: 'dark' }, 'r1'));
     expect(argsOf(state, 'setTheme')).toEqual(['dark']);
+  });
+
+  it('SET_THEME forwards bg to setBackgroundColor (not dropped)', async () => {
+    const setBackgroundColor = vi.fn();
+    initBridge(makeCtx(state, { setBackgroundColor }));
+    await send(fw, cmd('SET_THEME', { theme: 'dark', bg: '000000' }, 'r1'));
+    expect(setBackgroundColor).toHaveBeenCalledWith('000000');
+  });
+
+  it('SET_THEME without bg does not touch the background (so a later call cannot clear it)', async () => {
+    const setBackgroundColor = vi.fn();
+    initBridge(makeCtx(state, { setBackgroundColor }));
+    await send(fw, cmd('SET_THEME', { theme: 'light' }, 'r1'));
+    expect(setBackgroundColor).not.toHaveBeenCalled();
   });
 });
 

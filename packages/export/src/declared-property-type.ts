@@ -39,6 +39,21 @@
  *    both from the same token — the source token is the more specific of the
  *    two and wins.
  *
+ *    **Unless the caller NAMED a member** ({@link NAMED_MEMBERS}, #3715). Gate 2
+ *    as written could not express `IfcLabel` → `IfcText`: both are STRING, so
+ *    "the two agree" and the source token won, silently discarding the request.
+ *    The information it was missing is whether the caller CHOSE the type or
+ *    merely echoed the shape the extractor derived — and that is already in the
+ *    `PropertyValueType`, because the two are different members of it.
+ *    `String` / `Real` are SHAPES, which is all the extractor can produce (it
+ *    collapses `IFCLABEL`, `IFCTEXT` and `IFCIDENTIFIER` to `String` and keeps
+ *    the token only in `dataType`); `Label` / `Identifier` / `Text` NAME one
+ *    `IfcValue` member each and no extraction path produces them, so one of
+ *    those can only have come from a caller who asked for it. A named member is
+ *    therefore authoritative over the source token; a shape keeps gate 2's
+ *    precedence, which is what stops a value-only edit — the UI passes `String`
+ *    — from rewriting a neighbouring `IFCTEXT` as `IFCLABEL` all over again.
+ *
  * 3. **The VALUE must be representable in that base.** `serializeTypedMarker`
  *    coerces, so without this an `IFCLENGTHMEASURE` carrying a non-numeric
  *    value would be written as `IFCLENGTHMEASURE(NaN)`, where the shape-derived
@@ -50,7 +65,7 @@
  *    display string in a measure token.
  *
  * 4. **The VALUE must satisfy the member's own EXPRESS domain.** The base is not
- *    the whole type: six `IfcValue` members are CONSTRAINED defined types whose
+ *    the whole type: eight `IfcValue` members are CONSTRAINED defined types whose
  *    WHERE rule narrows the primitive they resolve to. `-1` is a fine REAL and
  *    not a fine `IfcPositiveLengthMeasure`; `2` is a fine REAL and not a fine
  *    `IfcNormalisedRatioMeasure`. Since `setProperty` performs no schema
@@ -60,22 +75,33 @@
  *    a valid `IFCREAL(-1.)`. A gate whose purpose is to stop the exporter
  *    writing a type it cannot justify must not itself write one.
  *
- *    A violating value does not fall all the way back to the shape-derived
- *    primitive. It RELAXES to the nearest ancestor that is itself an `IfcValue`
- *    member over the same base and carries no constraint —
+ *    A violating value RELAXES, where it can, to the nearest ancestor that is
+ *    itself an `IfcValue` member over the same base and carries no constraint —
  *    `IfcPositiveLengthMeasure` → `IfcLengthMeasure` — resolved from the
  *    registry's alias chain, not listed. `IFCLENGTHMEASURE(-1.)` is schema-valid
  *    AND keeps the unit semantics, which is the whole thing #2482 is about;
  *    dropping to `IFCREAL(-1.)` would re-inflict this PR's own defect on exactly
  *    the properties whose value went out of range.
  *
+ *    Two members have no such ancestor: `IfcPHMeasure` and
+ *    `IfcHeatingValueMeasure` are declared directly as `REAL`, so their alias
+ *    chain leaves `IfcValue` in one step. For those the relaxation returns
+ *    `null` and the shape-derived `IFCREAL` is the answer — schema-valid, and
+ *    the only valid one available. The relaxation target of every constrained
+ *    member is named in `declared-nominal-value-type.test.ts`, so which of the
+ *    two outcomes each takes is asserted rather than assumed.
+ *
  *    **Where the constraints come from.** `SCHEMA_REGISTRY.types` is a
  *    `name -> underlying type` alias map (plus STRING widths); the generator
- *    does not carry WHERE rules, so there is nothing to read. The six are
+ *    does not carry WHERE rules, so there is nothing to read. The eight are
  *    therefore written out below, which is tolerable only because the set is
- *    CLOSED and small: they are every constrained member of `IfcValue`'s 106
- *    defined-type leaves, and a test walks the live registry to fail if a schema
- *    bump adds one this table has not heard of. String widths, which the
+ *    CLOSED and small: they are every constrained member of `IfcValue`'s
+ *    defined-type leaves, and a test derives that set from the bundled
+ *    `packages/codegen/schemas/*.exp` — the WHERE rules themselves — to fail if
+ *    a schema bump adds one this table has not heard of. That test used to ask
+ *    the question by NAME (`/Positive|NonNegative|Normalised/`), which is how
+ *    `IfcPHMeasure` and `IfcHeatingValueMeasure` sat outside the table for as
+ *    long as they did (#3268). String widths, which the
  *    registry DOES carry (`IfcLabel: 'STRING(255)'`), are deliberately not
  *    gated: every fallback for a string shape is itself `IFCLABEL` /
  *    `IFCIDENTIFIER`, so rejecting an over-long label would emit the identical
@@ -90,10 +116,32 @@
 import { PropertyValueType } from '@ifc-lite/data';
 import { SCHEMA_REGISTRY } from '@ifc-lite/parser';
 import { getSelectDefinedLeaves } from './select-qualification.js';
-import { serializePropertyValue, serializeTypedMarker } from './step-serialization.js';
+import { serializeTypedMarker } from './step-serialization.js';
+import { serializePropertyValue } from './property-value-serialization.js';
 
 /** The SELECT `IfcPropertySingleValue.NominalValue` is declared as. */
 const NOMINAL_VALUE_SELECT = 'IfcValue';
+
+/**
+ * The `IfcValue` member each `PropertyValueType` NAMES OUTRIGHT — as opposed to
+ * the shapes (`String`, `Real`, `Integer`, …) an extractor collapses a source
+ * token into. See gate 2 in the module docstring: this map is what lets a caller
+ * change a property's declared type WITHIN one EXPRESS base (#3715), which the
+ * base-agreement rule alone made unexpressible.
+ *
+ * Only the string family appears, and that is not an omission: these three are
+ * the only `PropertyValueType` members that name exactly one `IfcValue` member.
+ * There is deliberately no entry for `Real` or `Integer` — `IfcLengthMeasure`,
+ * `IfcReal` and every other numeric leaf all collapse to `Real`, so it names
+ * nothing and must keep gate 2's "source token wins", which is #2482's whole
+ * point. `Enum`, `Reference` and `List` are property CLASSES rather than
+ * `NominalValue` tokens and are handled by {@link serializePropertyValue}.
+ */
+const NAMED_MEMBERS: ReadonlyMap<PropertyValueType, string> = new Map([
+  [PropertyValueType.Label, 'IfcLabel'],
+  [PropertyValueType.Identifier, 'IfcIdentifier'],
+  [PropertyValueType.Text, 'IfcText'],
+]);
 
 /** UPPERCASE STEP token → `[schema-cased type name, EXPRESS base]`. */
 let nominalValueLeaves: Map<string, readonly [string, string]> | null = null;
@@ -175,6 +223,16 @@ const CONSTRAINED_MEMBERS: ReadonlyMap<string, (value: number) => boolean> = new
   ['IfcNormalisedRatioMeasure', (v: number) => v >= 0 && v <= 1],
   ['IfcPositivePlaneAngleMeasure', (v: number) => v > 0],
   ['IfcPositiveInteger', (v: number) => v > 0],
+  // The two the name-shaped alarm could not see (#3268). Neither carries
+  // `Positive` / `NonNegative` / `Normalised` in its name, so the drift test
+  // that was supposed to keep this table closed stayed green while the
+  // exporter re-declared `IFCPHMEASURE(99.)` and
+  // `IFCHEATINGVALUEMEASURE(-5.)` — schema-invalid lines that a source file
+  // could never have contained, written by the gate whose whole purpose is to
+  // refuse a type it cannot justify. The drift test now derives the set from
+  // the bundled EXPRESS schemas instead of guessing it from names.
+  ['IfcPHMeasure', (v: number) => v >= 0 && v <= 14],
+  ['IfcHeatingValueMeasure', (v: number) => v > 0],
 ]);
 
 /**
@@ -216,6 +274,13 @@ export function declaredNominalValueType(
   dataType: string | undefined,
 ): string | null {
   if (value === null || value === undefined) return null;
+  // The caller NAMED a member rather than echoing a shape (#3715), so it
+  // outranks the source token even inside one EXPRESS base — see gate 2.
+  // A non-string value is left exactly where it was: `valueFitsBase` would
+  // have rejected it below, and `serializePropertyValue` writes the same
+  // token for these three anyway, so this branch changes nothing for it.
+  const named = NAMED_MEMBERS.get(type);
+  if (named !== undefined) return typeof value === 'string' ? named : null;
   if (!dataType) return null;
   const leaf = lookupNominalValueLeaf(dataType.trim().toUpperCase());
   if (!leaf) return null;

@@ -89,9 +89,11 @@ interface IdsShape {
     totalSpecifications: number;
     passedSpecifications: number;
     failedSpecifications: number;
+    notApplicableSpecifications: number;
     totalEntities: number;
     passedEntities: number;
     failedEntities: number;
+    overallPassRate: number;
   };
 }
 
@@ -206,7 +208,48 @@ const IDS_MATCHING_WALLS = `<?xml version="1.0" encoding="utf-8"?>
   </specifications>
 </ids>`;
 
+/**
+ * `minOccurs="0"` opts a specification out of the IDS 1.0 default
+ * (REQUIRED — at least one match). No IFCFURNITURE exists in
+ * `warning-only.ifc`, so this legitimately matches zero entities and
+ * must be reported as a pass, not a fail — the case the buggy
+ * `entityResults.length > 0` rule got backwards.
+ */
+const IDS_OPTIONAL_MATCHING_NOTHING = `<?xml version="1.0" encoding="utf-8"?>
+<ids xmlns="http://standards.buildingsmart.org/IDS"
+     xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <info><title>Optional furniture</title></info>
+  <specifications>
+    <specification name="Furniture, if present, must be named" ifcVersion="IFC4">
+      <applicability minOccurs="0" maxOccurs="unbounded">
+        <entity><name><simpleValue>IFCFURNITURE</simpleValue></name></entity>
+      </applicability>
+      <requirements>
+        <attribute><name><simpleValue>Name</simpleValue></name></attribute>
+      </requirements>
+    </specification>
+  </specifications>
+</ids>`;
+
 describe('ids_validate summary', () => {
+  it('counts a minOccurs="0" specification that matched no entity as passed, not failed', async () => {
+    // Counter-example to the vacuous-fail test below: an explicit
+    // `minOccurs="0"` makes zero matches a legitimate pass. The old
+    // `summarizeIdsReport` derived `specPassed = entityResults.length > 0`
+    // and ignored `spec.status` entirely, so it reported this as failed
+    // regardless of cardinality — indistinguishable from the required-spec
+    // case. Reading `report.summary` (which honours `spec.status`) is the
+    // only way to tell the two apart.
+    const out = (await run('warning-only.ifc', 'ids_validate', {
+      ids_xml: IDS_OPTIONAL_MATCHING_NOTHING,
+    })).structuredContent as unknown as IdsShape;
+    expect(out.summary.totalSpecifications).toBe(1);
+    expect(out.summary.totalEntities).toBe(0);
+    expect(out.summary.passedSpecifications).toBe(1);
+    expect(out.summary.failedSpecifications).toBe(0);
+  });
+
+
   it('does not count a specification that matched no entity as passed', async () => {
     // The vacuous-pass rule. A spec whose applicability selects nothing has an
     // empty `entityResults`; counting it as passed is how an IDS typo turns
@@ -242,6 +285,36 @@ describe('ids_validate summary', () => {
     expect(out.summary.failedEntities).toBe(1);
     expect(out.summary.passedEntities).toBe(1);
     expect(out.summary.passedSpecifications).toBe(0);
+  });
+});
+
+describe('ids_validate locale', () => {
+  it('translates failureReason text into the requested locale, instead of ignoring the field', async () => {
+    // `unnamed.ifc` has one wall with no Name, so this spec fails for it and
+    // produces a failureReason string — the thing a translator rewrites.
+    const en = (await run('unnamed.ifc', 'ids_validate', {
+      ids_xml: IDS_MATCHING_WALLS, locale: 'en',
+    })).structuredContent as unknown as IdsShape & {
+      report: { specificationResults: Array<{ entityResults: Array<{ requirementResults?: Array<{ failureReason?: string }> }> }> };
+    };
+    const de = (await run('unnamed.ifc', 'ids_validate', {
+      ids_xml: IDS_MATCHING_WALLS, locale: 'de',
+    })).structuredContent as unknown as typeof en;
+
+    const enReasons = en.report.specificationResults[0].entityResults
+      .flatMap((e) => e.requirementResults ?? [])
+      .map((r) => r.failureReason)
+      .filter((r): r is string => r !== undefined);
+    const deReasons = de.report.specificationResults[0].entityResults
+      .flatMap((e) => e.requirementResults ?? [])
+      .map((r) => r.failureReason)
+      .filter((r): r is string => r !== undefined);
+
+    expect(enReasons.length).toBeGreaterThan(0);
+    // Before the fix, `locale` was read into a variable and immediately
+    // discarded (`void input.locale`) — no translator was ever built, so
+    // every locale produced byte-identical English text.
+    expect(deReasons).not.toEqual(enReasons);
   });
 });
 

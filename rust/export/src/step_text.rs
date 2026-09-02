@@ -1,18 +1,61 @@
 // SPDX-License-Identifier: MPL-2.0
 //! STEP text-level primitives shared by the STEP exporter (`step.rs`): string
-//! escaping, header `FILE_SCHEMA` detection, `#ref` scanning, and the
-//! attribute-list splitting used to apply root-attribute mutations.
+//! escaping, `#ref` scanning, and the attribute-list splitting used to apply
+//! root-attribute mutations.
+//!
+//! Header `FILE_SCHEMA` detection used to live here and is now `schema_detect`.
+//! It left because it is not a text EDIT: it reads one fact out of raw bytes
+//! before anything is parsed, and unlike everything here it runs on whole
+//! uncapped attacker-supplied files.
 //!
 //! Split out of `step.rs` to keep that file under the module-size ratchet
 //! (`rust/processing/tests/module_size_ratchet.rs`). These are self-contained
 //! line/string utilities with no dependency on the DATA-section emission
 //! orchestration that stays in `step.rs`.
 
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+
+/// The edits that apply to one record, where a caller's attribute mutation and
+/// a copy-on-write repointing can both land on it. The repointing wins: it was
+/// computed from the caller's value rather than instead of it.
+pub(crate) fn merge_edits<'a>(
+    muts: Option<&'a BTreeMap<usize, String>>,
+    repointed: Option<&'a BTreeMap<usize, String>>,
+) -> Option<Cow<'a, BTreeMap<usize, String>>> {
+    match (muts, repointed) {
+        (None, None) => None,
+        (Some(edits), None) | (None, Some(edits)) => Some(Cow::Borrowed(edits)),
+        (Some(muts), Some(repointed)) => {
+            let mut merged = muts.clone();
+            merged.extend(repointed.iter().map(|(i, v)| (*i, v.clone())));
+            Some(Cow::Owned(merged))
+        }
+    }
+}
+
 /// Escape a STEP string literal body: double the apostrophe and reverse
-/// solidus, and map every ASCII control character (the C0 range plus DEL) to
-/// a space, since ISO 10303-21 restricts a literal's plain-text bytes to the
-/// basic graphic range 32-126.
-pub(crate) fn escape(s: &str) -> String {
+/// solidus, map every ASCII control character (the C0 range plus DEL) to a
+/// space, and encode any character outside the basic graphic range as its
+/// `\X2\`/`\X4\` control directive — never a raw byte — since ISO 10303-21
+/// 6.3.3.4 restricts a literal's plain-text bytes to 32-126. buildingSMART's
+/// IFC string-encoding guidance states the same for IFC2X3/IFC4/IFC4X3: a
+/// character outside decimal 32-126 "has to be encoded" (e.g. 'Ä' as
+/// `\X2\00C4\X0\`). A reader that treats the file's bytes as ISO-8859-1 — the
+/// byte encoding the base standard and most real consumers assume — turns a
+/// raw UTF-8 multi-byte sequence into mojibake or a broken parse; this exact
+/// writer shape is a reported, reproduced defect in real IFC tooling
+/// (IfcOpenShell#699/#1016; files rejected by Solibri).
+///
+/// `pub`, and re-exported from the crate root as `escape_step_string`, so the
+/// integration-test binary `tests/step_escape_parity.rs` can pin it to the
+/// shared vectors in `tests/fixtures/step_escape_vectors.json` — the same
+/// vectors the TypeScript `escapeStepString` is held to, since the two
+/// implementations cannot share code (#3300). Only this one function is
+/// re-exported, not the whole module, so the rest of `step_text` stays
+/// crate-private and the public surface widens by exactly one symbol —
+/// narrower than the `pub mod csv_cell` the CSV parity pin already relies on.
+pub fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -22,82 +65,18 @@ pub(crate) fn escape(s: &str) -> String {
             '\'' => out.push_str("''"),
             '\\' => out.push_str("\\\\"),
             '\0'..='\u{1F}' | '\u{7F}' => out.push(' '),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-/// Find the first occurrence of `needle` in `haystack` that is *not* inside a
-/// STEP single-quoted string literal — i.e. skip matches that fall within a
-/// header field's string value. Quote state is tracked by toggling on every
-/// `'` byte; a literal apostrophe inside a string is escaped by doubling
-/// (`''` per ISO 10303-21 6.3.2.4), so a doubled pair toggles the state twice
-/// and correctly nets to a no-op, the same technique `refs_in_line` already
-/// uses above for `#`-reference scanning. Linear in `haystack.len()` — no
-/// backtracking, no regex.
-fn find_unquoted(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return None;
-    }
-    let mut in_quote = false;
-    let mut i = 0;
-    let last_start = haystack.len() - needle.len();
-    while i < haystack.len() {
-        if haystack[i] == b'\'' {
-            in_quote = !in_quote;
-            i += 1;
-            continue;
-        }
-        if !in_quote && i <= last_start && haystack[i..i + needle.len()] == *needle {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Detect the source `FILE_SCHEMA` label (e.g. `IFC2X3`); defaults to `IFC4`.
-pub(crate) fn detect_schema(content: &[u8]) -> String {
-    // Only look in the header region: from the start through the HEADER
-    // section's closing `ENDSEC;`. A fixed byte cutoff is not safe here —
-    // an earlier header field (e.g. a long DESCRIPTION or AUTHOR string)
-    // can push FILE_SCHEMA past any fixed budget, silently falling back to
-    // the IFC4 default and applying the wrong schema conversion. Scan for
-    // the actual section terminator instead; if it's missing (malformed
-    // input), fall back to scanning the whole buffer.
-    //
-    // Both this ENDSEC; search and the FILE_SCHEMA search below must be
-    // quote-aware: a header field's plain-text string VALUE (e.g. a
-    // DESCRIPTION or AUTHOR carrying the literal text "ENDSEC;" or
-    // "FILE_SCHEMA") is not the section terminator or the schema entry, and
-    // a raw byte search cannot tell the difference.
-    let head_len = find_unquoted(content, b"ENDSEC;")
-        .map(|idx| idx + b"ENDSEC;".len())
-        .unwrap_or(content.len());
-    let head = &content[..head_len];
-    if let Some(idx) = find_unquoted(head, b"FILE_SCHEMA") {
-        let rest = String::from_utf8_lossy(&head[idx..]);
-        if let Some(q1) = rest.find('\'') {
-            if let Some(q2) = rest[q1 + 1..].find('\'') {
-                let label = &rest[q1 + 1..q1 + 1 + q2];
-                if !label.is_empty() {
-                    // `label` is the RAW, still-STEP-escaped slice between
-                    // the quotes. Both call sites (`step.rs`'s
-                    // `source_schema` fallback and `merged.rs`) feed this
-                    // straight into `escape()` when the header is
-                    // re-written, which doubles `\` again -- un-double it
-                    // here first so a schema label carrying a literal `\`
-                    // round-trips instead of being re-escaped on top of
-                    // its own escaping. A no-op for every real schema
-                    // label (IFC2X3, IFC4, IFC4X3_ADD2, ...), none of
-                    // which contain a backslash.
-                    return label.replace("\\\\", "\\");
+            '\u{20}'..='\u{7E}' => out.push(c),
+            _ => {
+                let cp = c as u32;
+                if cp <= 0xFFFF {
+                    out.push_str(&format!("\\X2\\{cp:04X}\\X0\\"));
+                } else {
+                    out.push_str(&format!("\\X4\\{cp:08X}\\X0\\"));
                 }
             }
         }
     }
-    "IFC4".to_string()
+    out
 }
 
 /// Collect outgoing `#<digits>` references in a STEP entity line, skipping the
@@ -138,17 +117,20 @@ fn split_top_level_args(attrs: &str) -> Vec<String> {
     let mut depth = 0i32;
     let mut in_string = false;
     let mut current = String::new();
-    let bytes = attrs.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let ch = bytes[i] as char;
+    // Over chars, not bytes. `bytes[i] as char` reads a UTF-8 continuation byte
+    // as a Latin-1 character and re-encodes it, so a property name like
+    // `Größe` came back as `GrÃ¶ÃŸe` in any record this rewrote. Every
+    // delimiter STEP cares about is ASCII, so iterating chars costs nothing and
+    // leaves the rest of the text alone.
+    let mut chars = attrs.chars().peekable();
+    while let Some(ch) = chars.next() {
         if ch == '\'' && !in_string {
             in_string = true;
             current.push(ch);
         } else if ch == '\'' && in_string {
-            if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+            if chars.peek() == Some(&'\'') {
                 current.push_str("''");
-                i += 2;
+                chars.next();
                 continue;
             }
             in_string = false;
@@ -166,7 +148,6 @@ fn split_top_level_args(attrs: &str) -> Vec<String> {
         } else {
             current.push(ch);
         }
-        i += 1;
     }
     out.push(current);
     out
@@ -174,7 +155,7 @@ fn split_top_level_args(attrs: &str) -> Vec<String> {
 
 /// Apply root-attribute edits to a `#id=TYPE(attrs);` line. Returns the line unchanged
 /// when it cannot be parsed.
-pub(crate) fn apply_attr_mutations(line: &str, muts: &[(usize, String)]) -> String {
+pub(crate) fn apply_attr_mutations(line: &str, muts: &BTreeMap<usize, String>) -> String {
     let trimmed = line.trim_end();
     let body = trimmed.strip_suffix(';').unwrap_or(trimmed);
     let eq = match body.find('=') {
@@ -204,3 +185,90 @@ pub(crate) fn apply_attr_mutations(line: &str, muts: &[(usize, String)]) -> Stri
 #[cfg(test)]
 #[path = "step_text_tests.rs"]
 mod tests;
+
+/// Rewrite a record's own id, leaving everything after the `=` untouched.
+///
+/// For a copy-on-write copy: the body is the original's, byte for byte, with
+/// one attribute already replaced, and only the number in front changes.
+pub(crate) fn renumber(line: &str, new_id: u32) -> String {
+    let trimmed = line.trim_end();
+    match trimmed.find('=') {
+        Some(eq) => format!("#{new_id}{}", &trimmed[eq..]),
+        None => line.to_string(),
+    }
+}
+
+/// One attribute of a `#id=TYPE(args);` line, by position.
+///
+/// Split from the substitution below so a caller applying two edits to the
+/// same attribute can feed the first result into the second, rather than
+/// computing both from the original and losing one.
+pub(crate) fn attribute_of(line: &str, index: usize) -> Option<String> {
+    let trimmed = line.trim_end();
+    let body = trimmed.strip_suffix(';').unwrap_or(trimmed);
+    let eq = body.find('=')?;
+    let after = &body[eq + 1..];
+    let popen = after.find('(')?;
+    let aclose = after.rfind(')').filter(|c| *c > popen)?;
+    split_top_level_args(&after[popen + 1..aclose])
+        .into_iter()
+        .nth(index)
+}
+
+/// Replace references inside one attribute, leaving its neighbours alone.
+///
+/// Rewrites every unquoted `#from` in the attribute to `#to`. Returns the
+/// rewritten attribute, or `None` when the attribute does not hold that
+/// reference. The caller is expected to treat `None` as "this edit cannot be
+/// made" rather than proceeding, because a copy nothing points at is an orphan
+/// and a reference to a filtered record is a dangling one.
+///
+/// A list keeps its order and its other entries: repointing one element of a
+/// property set's `HasProperties` must not disturb the rest, or the diff
+/// against the source stops being small.
+///
+/// Text is left alone. A property value reading `'lot #41'` is a sentence, and
+/// rewriting inside it would change what the file says rather than what it
+/// points at.
+pub(crate) fn substitute_ref_in_attr(attr: &str, from: u32, to: u32) -> Option<String> {
+    let old = format!("#{from}");
+    let new = format!("#{to}");
+    let mut out = String::with_capacity(attr.len());
+    let mut replaced = false;
+    let mut in_string = false;
+    let mut rest = attr;
+    while let Some(ch) = rest.chars().next() {
+        if in_string {
+            if ch == '\'' {
+                if rest[ch.len_utf8()..].starts_with('\'') {
+                    out.push_str("''");
+                    rest = &rest[ch.len_utf8() * 2..];
+                    continue;
+                }
+                in_string = false;
+            }
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+            continue;
+        }
+        if ch == '\'' {
+            in_string = true;
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+            continue;
+        }
+        if ch == '#' && rest.starts_with(old.as_str()) {
+            let after = &rest[old.len()..];
+            // `#4` must not match inside `#41`.
+            if !after.starts_with(|c: char| c.is_ascii_digit()) {
+                out.push_str(&new);
+                rest = after;
+                replaced = true;
+                continue;
+            }
+        }
+        out.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    replaced.then_some(out)
+}

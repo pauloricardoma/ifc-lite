@@ -234,12 +234,72 @@ describe('effective georeferencing', () => {
     it('leaves siteLocation georef untouched', () => {
       assert.strictEqual(resolveEpsetMapUnitScale('siteLocation', undefined, 0.001), undefined);
     });
+
+    /**
+     * `getEffectiveGeoreference` calls `mergeProjectedCRS` then
+     * `resolveEpsetMapUnitScale` in sequence (this file's `getEffectiveGeoreference`,
+     * around the `resolveEpsetMapUnitScale(original?.source, ...)` call). Every
+     * consumer that builds its CRS this way -- ViewportContainer, BasepointOverlay,
+     * FederationAlignmentControls, federationAlign.ts, useAnchorGeoreference.ts --
+     * gets the corrected scale.
+     *
+     * `GeoreferencingPanel.tsx` used to call `mergeProjectedCRS` ALONE (its
+     * `georef` prop comes from `ModelMetadataPanel.tsx`'s own
+     * `extractGeoreferencingOnDemand` call, not `getEffectiveGeoreference`), so
+     * for an ePSet_MapConversion IFC2x3 file with no explicit ePset MapUnit its
+     * `mergedCRS.mapUnitScale` stayed `undefined` -- which
+     * `resolveMapUnitToMetreScale` reads as "treat offsets as metres" (scale 1)
+     * instead of the project length-unit scale. For a millimetre project that
+     * fed `detectDoubleGeoreference` an easting/northing 1000x too large.
+     * Pinning the two-step composition here so a regression in either function
+     * -- or a caller that goes back to calling `mergeProjectedCRS` alone --
+     * shows up.
+     */
+    it('mergeProjectedCRS + resolveEpsetMapUnitScale composition matches getEffectiveGeoreference (GeoreferencingPanel parity)', () => {
+      const original: ProjectedCRS = {
+        id: 1,
+        name: 'RD_New',
+        mapUnit: undefined,
+        mapUnitScale: undefined,
+      };
+      const lengthUnitScale = 0.001; // millimetre project
+
+      const merged = mergeProjectedCRS(original, undefined, lengthUnitScale);
+      const scaleWithoutFix = resolveMapUnitToMetreScale(merged?.mapUnitScale, lengthUnitScale);
+      assert.strictEqual(scaleWithoutFix, 1, 'sanity: mergeProjectedCRS alone leaves the ePSet gap open');
+
+      const correctedMapUnitScale = resolveEpsetMapUnitScale('ePSetMapConversion', merged?.mapUnitScale, lengthUnitScale);
+      const scaleWithFix = resolveMapUnitToMetreScale(correctedMapUnitScale, lengthUnitScale);
+      assert.strictEqual(scaleWithFix, lengthUnitScale, 'the composed scale must match every other consumer');
+    });
   });
 
   it('infers common IFC map unit names', () => {
     assert.strictEqual(inferMapUnitScale('FOOT'), 0.3048);
     assert.strictEqual(inferMapUnitScale('METRE'), 1);
     assert.strictEqual(inferMapUnitScale('MILLIMETRE'), 0.001);
+  });
+
+  it('infers the SI prefixes between milli and kilo, and keeps them apart', () => {
+    // CENTI, DECI and KILO were the three branches no assertion reached: each
+    // could return any other branch's factor with the suite still green. They
+    // are one `includes` apart from each other and from MILLIMETRE, so a
+    // mis-ordered or mistyped prefix lands on a neighbour rather than failing.
+    assert.strictEqual(inferMapUnitScale('CENTIMETRE'), 0.01);
+    assert.strictEqual(inferMapUnitScale('DECIMETRE'), 0.1);
+    assert.strictEqual(inferMapUnitScale('KILOMETRE'), 1000);
+    // Every prefixed name also contains METRE, so the bare-METRE branch must
+    // stay LAST; if it moved up, all four of these would collapse to 1.
+    assert.notStrictEqual(inferMapUnitScale('KILOMETRE'), 1);
+  });
+
+  it('keeps the US survey foot distinct from the international foot', () => {
+    // The survey-foot branch is tested before FOOT because 'US SURVEY FOOT'
+    // matches both; reversing the two makes it 0.3048 and moves a state-plane
+    // site by ~2 ppm, which is metres over a survey grid.
+    assert.strictEqual(inferMapUnitScale('US SURVEY FOOT'), 0.3048006096);
+    assert.strictEqual(inferMapUnitScale('FTUS'), 0.3048006096);
+    assert.notStrictEqual(inferMapUnitScale('US SURVEY FOOT'), inferMapUnitScale('FOOT'));
   });
 
   describe('getEffectiveHorizontalScale (issue #595)', () => {
@@ -351,6 +411,29 @@ describe('effective georeferencing', () => {
       const m = detectScaleUnitMismatch(2, 1, 1);
       assert.ok(m);
       assert.strictEqual(m!.effectiveScale, 2);
+      assert.strictEqual(m!.compensated, false);
+    });
+
+    it('reports a deviation just OUTSIDE the 0.5% band, not just tolerates one inside', () => {
+      // The noise test above pins 1.004 and 0.996 as null, so the band cannot be
+      // TIGHTENED without failing -- but nothing failed when it was widened, and
+      // at 5% it still passed every test in this file. A band is two-sided: pin
+      // the first value that must be reported, or only one direction is guarded.
+      assert.strictEqual(detectScaleUnitMismatch(1.004, 1, 1), null);
+      const over = detectScaleUnitMismatch(1.006, 1, 1);
+      assert.ok(over, '0.6% off unity must be reported, not swallowed by the band');
+      const under = detectScaleUnitMismatch(0.994, 1, 1);
+      assert.ok(under, '-0.6% off unity must be reported too');
+    });
+
+    it('does not call a small genuine mis-scaling compensated', () => {
+      // Every other `compensated` fixture sits at exactly 1 (heuristic fired) or
+      // far away (2, 1e6), so the 0.5% width of that band was never load-bearing:
+      // it could be widened a hundredfold unnoticed. Scale=1.2 is applied for
+      // real and is small enough to fall inside a sloppy band.
+      const m = detectScaleUnitMismatch(1.2, 1, 1);
+      assert.ok(m);
+      assert.strictEqual(m!.effectiveScale, 1.2);
       assert.strictEqual(m!.compensated, false);
     });
   });

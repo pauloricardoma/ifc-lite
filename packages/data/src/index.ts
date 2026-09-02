@@ -9,8 +9,11 @@
 export { IFCX_VERSION } from './ifcx-version.js';
 export { StringTable } from './string-table.js';
 export { EntityTableBuilder, entityTableFromColumns, entityTableToColumns } from './entity-table.js';
+export { exactTypeName, exactNameOfRow } from './exact-type-name.js';
+export type { ExactTypeNameSource } from './exact-type-name.js';
 export type { EntityTable, EntityTableColumns } from './entity-table.js';
 export { PropertyTableBuilder, propertyTableFromColumns, propertyTableToColumns, comparePropertyValues } from './property-table.js';
+export { groupPropertySetsByInstance } from './group-property-sets.js';
 export type { PropertyTable, PropertyTableColumns, PropertySet, Property, PropertyValue } from './property-table.js';
 export { QuantityTableBuilder, quantityTableFromColumns, quantityTableToColumns } from './quantity-table.js';
 export type { QuantityTable, QuantityTableColumns, QuantitySet, Quantity } from './quantity-table.js';
@@ -41,6 +44,9 @@ export {
   findStoreyByElevation,
 } from './storey-elevation.js';
 export type { IfcStoreBase, IfcSourceHeader } from './data-store.js';
+export { getAggregatedChildren, collectAggregatedDescendants } from './decomposition.js';
+export type { DecompositionRelationships } from './decomposition.js';
+export { linearToSrgb } from './color.js';
 // Schema-agnostic STEP serialization primitives — the single source of truth
 // re-exported by the per-schema serializer bundles (parser runtime + codegen).
 export {
@@ -54,6 +60,7 @@ export {
   generateHeader,
   generateStepFileWithRegistry,
   parseStepValue,
+  escapeStepString,
 } from './step-serializers.js';
 export type {
   StepValue,

@@ -65,10 +65,12 @@
 pub mod columnar_index;
 pub mod decoder;
 pub mod error;
+pub(crate) mod express_id;
 pub mod fast_parse;
 pub mod generated;
 pub mod georef;
 pub mod legacy_entities;
+pub mod limits;
 pub mod model_bounds;
 pub mod parser;
 pub mod project_units;
@@ -76,6 +78,7 @@ pub mod schema_gen;
 pub(crate) mod schema_helpers;
 pub mod step_encoding;
 pub mod streaming;
+pub(crate) mod unit_labels;
 pub mod units;
 
 pub use columnar_index::ColumnarEntityIndex;
@@ -88,11 +91,16 @@ pub use fast_parse::{
 };
 pub use generated::{IfcType, IFC_TYPES};
 pub use georef::{GeoRefExtractor, GeoRefSource, GeoReference, RtcOffset};
+pub use limits::{MAX_MAPPED_ITEM_DEPTH, MAX_PLACEMENT_DEPTH};
 pub use legacy_entities::{
     get_legacy_entity_info, is_legacy_entity, map_legacy_to_base_type, LegacyEntityInfo,
+    LEGACY_ENTITY_NAMES,
 };
 pub use model_bounds::{scan_model_bounds, scan_placement_bounds, ModelBounds};
-pub use parser::{entity_count, parse_entity, EntityScanner, Token};
+pub use parser::{
+    entity_count, oversized_id_report, parse_entity, report_oversized_ids, set_report_sink,
+    skip_step_comment, EntityScanner, Token,
+};
 pub use project_units::{
     measure::{measure_unit, MeasureUnit},
     resolve_unit_by_ref, ProjectUnits, ResolvedUnit,
@@ -100,7 +108,8 @@ pub use project_units::{
 pub use schema_gen::{AttributeValue, DecodedEntity, GeometryCategory, IfcSchema, ProfileCategory};
 pub use schema_helpers::{
     has_geometry_by_name, is_representationless_spatial_container_by_name, is_simple_geometry_type,
-    legacy_aware_ifc_type, nth_attribute_is_present,
+    legacy_aware_ifc_type, legacy_aware_ifc_type_from_record, nth_attribute_is_present,
+    type_product_ifc_type,
 };
 pub use step_encoding::{decode_ifc_string, encode_ifc_string};
 pub use streaming::{parse_stream, ParseEvent, StreamConfig};

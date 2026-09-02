@@ -115,7 +115,13 @@ fn building_bears_geometry() {
 fn legacy_ifc2x3_distribution_names_have_geometry() {
     // Routed through legacy_entities now (was an inline match arm).
     assert!(has_geometry_by_name("IFCEQUIPMENTELEMENT"));
-    assert!(has_geometry_by_name("IFCELECTRICALDISTRIBUTIONPOINT"));
+    assert!(has_geometry_by_name("IFCELECTRICDISTRIBUTIONPOINT"));
+    // The name this line carried until #3172 was `IFCELECTRICALDISTRIBUTIONPOINT`,
+    // which is not an IFC2X3 entity — the real one has no "AL". The assertion
+    // was green because the table it read carried the same misspelling, so the
+    // pair certified each other and neither described a file. Pinned as a
+    // negative so a respelling cannot quietly come back.
+    assert!(!has_geometry_by_name("IFCELECTRICALDISTRIBUTIONPOINT"));
 }
 
 #[test]
@@ -310,3 +316,313 @@ fn nth_attribute_reversed_boundary_is_false() {
     assert!(!nth_attribute_is_present(b")(", 0));
     assert!(!nth_attribute_is_present(b"garbage)stuff(more", 0));
 }
+
+/// Every key in `legacy_entities.rs`, derived rather than copied.
+///
+/// Two tests assert OPPOSITE directions about these names, and a hand-written
+/// list would let each of them silently under-cover:
+/// `every_legacy_arm_maps_onto_a_known_product` says each maps to a known base
+/// type; `every_legacy_key_is_unknown_to_the_generated_enum` says none of them
+/// is a name `IfcType::from_str` already knows.
+///
+/// This used to be a 26-entry copy of the arm keys, and a copy answers only
+/// for the names someone remembered to add to it. A 27th arm reached neither
+/// test -- measured, not assumed: an arm added with `has_geometry: true` and a
+/// base type that is not an `IfcProduct`, the exact thing
+/// `every_legacy_arm_maps_onto_a_known_product` exists to refuse, passed both
+/// the Rust suite and `scripts/check-legacy-entity-coverage.mjs`.
+///
+/// `LEGACY_ENTITY_NAMES` is the list to borrow because it is already held to
+/// the arms in BOTH directions by that lint, which reads the arm keys out of
+/// `legacy_entities.rs` and fails on a name in either set and not the other.
+/// So an arm that never reaches this loop cannot exist without that gate going
+/// red first, and no new mechanism -- and no `include_str!` of a sibling
+/// module, which AGENTS.md bans -- is needed here.
+const LEGACY_KEYS: &[&str] = crate::legacy_entities::LEGACY_ENTITY_NAMES;
+
+/// The borrowed list must not be empty, or both loops below iterate nothing
+/// and report success over a table they never read. The floor is deliberately
+/// far under the current count: this asks whether the const is populated, not
+/// whether it has a particular size, and a floor that tracks the exact count
+/// would have to be edited by the same hand that adds an arm.
+#[test]
+fn the_legacy_key_list_is_not_empty() {
+    assert!(
+        LEGACY_KEYS.len() >= 20,
+        "LEGACY_KEYS came back with {} names; the two loops that read it would pass vacuously",
+        LEGACY_KEYS.len()
+    );
+}
+
+/// The six IFC2X3 products #3172 added to `legacy_entities.rs`.
+///
+/// Each one is CONCRETE and carries both `ObjectPlacement` and
+/// `Representation` in `@ifc-lite/data`'s IFC2X3 table, and each one resolved
+/// to `IfcType::Unknown` before the fix. `Unknown` is a subtype of nothing,
+/// so an IFC2X3 file containing them lost them from the attribute export
+/// (`rust/export/src/model.rs` keeps only `is_subtype_of(IfcProduct)`) AND
+/// from meshing (`has_geometry_by_name` refuses `Unknown`) — the two passes
+/// agreed, on dropping the entity from both.
+///
+/// The mapping targets are asserted, not just "is a product": a mapping that
+/// resolved every one of them to `IfcBuildingElementProxy` would satisfy the
+/// product check while throwing the semantics away.
+#[test]
+fn legacy_ifc2x3_products_resolve_to_their_own_supertype() {
+    for (name, expected) in [
+        ("IFCELECTRICALELEMENT", IfcType::IfcElement),
+        ("IFCELECTRICDISTRIBUTIONPOINT", IfcType::IfcFlowController),
+        ("IFCCHAMFEREDGEFEATURE", IfcType::IfcFeatureElementSubtraction),
+        ("IFCROUNDEDEDGEFEATURE", IfcType::IfcFeatureElementSubtraction),
+        (
+            "IFCSTRUCTURALLINEARACTIONVARYING",
+            IfcType::IfcStructuralLinearAction,
+        ),
+        (
+            "IFCSTRUCTURALPLANARACTIONVARYING",
+            IfcType::IfcStructuralPlanarAction,
+        ),
+    ] {
+        let resolved = legacy_aware_ifc_type(name);
+        assert_eq!(resolved, expected, "{name} resolved to {resolved:?}");
+        assert!(
+            resolved.is_subtype_of(IfcType::IfcProduct),
+            "{name} must reach IfcProduct or the attribute exporter drops it"
+        );
+        assert!(
+            has_geometry_by_name(name),
+            "{name} must reach the geometry pass"
+        );
+    }
+}
+
+/// `IfcFlowController` replaced the misspelt arm's `IfcDistributionElement`,
+/// and the comment in `legacy_entities.rs` claims that is a NARROWING rather
+/// than a change of answer. Claimed is not measured, so it is measured here:
+/// anything keying on the old target still sees the same verdict.
+#[test]
+fn the_electric_distribution_point_remap_only_narrows() {
+    let t = legacy_aware_ifc_type("IFCELECTRICDISTRIBUTIONPOINT");
+    assert_eq!(t, IfcType::IfcFlowController);
+    assert!(
+        t.is_subtype_of(IfcType::IfcDistributionElement),
+        "the arm used to answer IfcDistributionElement; IfcFlowController must still be one"
+    );
+}
+
+/// The two edge features are subtraction operands, and that has to survive the
+/// mapping: `IfcFeatureElementSubtraction` keeps them OUT of the void/CSG path
+/// (which matches `IfcType::IfcOpeningElement` exactly, not by inheritance)
+/// while keeping them out of construction-projection profiles, which gate on
+/// `is_subtype_of(IfcFeatureElement)` (#979). Mapping them to
+/// `IfcOpeningElement` would have satisfied every assertion above and fed two
+/// unrelated entities to the boolean cutter.
+#[test]
+fn edge_features_are_subtraction_operands_not_openings() {
+    for name in ["IFCCHAMFEREDGEFEATURE", "IFCROUNDEDEDGEFEATURE"] {
+        let t = legacy_aware_ifc_type(name);
+        assert!(t.is_subtype_of(IfcType::IfcFeatureElement), "{name}");
+        assert_ne!(t, IfcType::IfcOpeningElement, "{name}");
+        assert!(!t.is_subtype_of(IfcType::IfcOpeningElement), "{name}");
+    }
+}
+
+/// Every arm in `legacy_entities.rs` must map onto a type the generated
+/// IFC4X3 enum actually has, and an arm flagged `has_geometry` must reach
+/// `IfcProduct`. A mapping to `Unknown` would leave the entity exactly as
+/// dropped as having no arm at all, while looking handled in the table.
+#[test]
+fn every_legacy_arm_maps_onto_a_known_product() {
+    for &name in LEGACY_KEYS {
+        let info = crate::legacy_entities::get_legacy_entity_info(name)
+            .unwrap_or_else(|| panic!("{name} has no arm in legacy_entities.rs"));
+        assert!(
+            !matches!(info.base_type, IfcType::Unknown(_)),
+            "{name} maps to Unknown, which is the same as not being in the table"
+        );
+        if info.has_geometry {
+            assert!(
+                info.base_type.is_subtype_of(IfcType::IfcProduct),
+                "{name} claims geometry but its base type is not an IfcProduct"
+            );
+        }
+    }
+}
+
+/// `legacy_aware_ifc_type_from_record` — the resolution the wasm mesh batch
+/// needs and did not have (#3179).
+///
+/// The browser path holds a `DecodedEntity` whose `ifc_type` came from a bare
+/// `from_str`, plus the raw record. For a legacy keyword that field is
+/// `Unknown`, and `Unknown` stores a CRC32 hash rather than the name, so the
+/// keyword survives only in the record.
+///
+/// The keywords here all predate #3172, which has since landed and wrote six
+/// arms, one of them replacing a misspelling (the table went 21 -> 26). They
+/// are kept because what this test exercises is the WIRE-UP --
+/// that a record reaches `legacy_entities.rs` at all -- not the table's
+/// contents, which `legacy_ifc2x3_products_resolve_to_their_own_supertype`
+/// above covers directly. Choosing rows that do not move keeps the two tests
+/// from failing together for one cause.
+#[test]
+fn a_legacy_record_resolves_where_the_decoded_type_cannot() {
+    // What the decoder produces for these, and what the browser was emitting.
+    //
+    // The SPACED forms are not padding. STEP permits whitespace around `=` and
+    // buildingSMART's own `column-straight-rectangle-tessellation.ifc` writes
+    // `#71= IFCCOLUMN(` on all 26 of its entity lines. The first draft of this
+    // test used only the tight form, passed, and the end-to-end wasm check then
+    // failed on the real fixture -- `extract_entity_type_name` was returning
+    // `" IFCCOLUMN"` untrimmed and every entity in such a file resolved to
+    // `Unknown`. A hand-written record is a weaker fixture than a real one.
+    for (record, expected) in [
+        (&b"#12=IFCPROXY('guid',$,$,$,$,$,$,$,$);"[..], IfcType::IfcBuildingElementProxy),
+        (&b"#13=IFCSLABSTANDARDCASE('guid',$,$,$,$,$,$,$,$);"[..], IfcType::IfcSlab),
+        (&b"#14=IFCDOORSTANDARDCASE('guid',$,$,$,$,$,$,$,$);"[..], IfcType::IfcDoor),
+        (&b"#15=IFCSOLIDSTRATUM('guid',$,$,$,$,$,$,$,$);"[..], IfcType::IfcGeotechnicalStratum),
+        // Whitespace around `=`, both sides, as real exporters emit it.
+        (&b"#16= IFCPROXY('guid',$,$,$,$,$,$,$,$);"[..], IfcType::IfcBuildingElementProxy),
+        (&b"#17 = IFCSLABSTANDARDCASE('guid',$,$);"[..], IfcType::IfcSlab),
+        (&b"#18=\tIFCDOORSTANDARDCASE('guid',$,$);"[..], IfcType::IfcDoor),
+    ] {
+        let name = crate::fast_parse::extract_entity_type_name(record).unwrap();
+        let decoded = IfcType::from_str(name);
+        assert!(
+            matches!(decoded, IfcType::Unknown(_)),
+            "{name} must be Unknown to the bare decoder, or this test proves nothing"
+        );
+        assert_eq!(legacy_aware_ifc_type_from_record(decoded, record), expected, "{name}");
+    }
+}
+
+/// A type the decoder already knows is returned UNCHANGED and without a scan,
+/// so the cost falls only on the entities that need it -- and, more to the
+/// point, so a malformed record cannot relabel a known entity.
+#[test]
+fn a_known_type_is_returned_untouched_whatever_the_record_says() {
+    let wall = IfcType::from_str("IFCWALL");
+    assert!(!matches!(wall, IfcType::Unknown(_)));
+    // Record deliberately disagrees with the decoded type; the decoded type wins.
+    assert_eq!(
+        legacy_aware_ifc_type_from_record(wall, b"#1=IFCSLABSTANDARDCASE('g');"),
+        IfcType::IfcWall
+    );
+}
+
+/// An unreadable record leaves the answer exactly as the decoder had it, rather
+/// than inventing one. `Unknown` in, `Unknown` out -- the entity is no worse off
+/// than before this function existed.
+#[test]
+fn an_unreadable_record_changes_nothing() {
+    let unknown = IfcType::from_str("IFCNOTAREALENTITY");
+    assert!(matches!(unknown, IfcType::Unknown(_)));
+    for record in [&b""[..], &b"garbage with no equals or paren"[..], &b"#1="[..], &b"#1=("[..]] {
+        assert_eq!(legacy_aware_ifc_type_from_record(unknown, record), unknown);
+    }
+}
+
+/// #3187 -- the COMPLETE set of keywords whose type-product classification the
+/// legacy-aware predicate changes, enumerated rather than sampled.
+///
+/// `type_product_ifc_type` replaced a bare
+/// `IfcType::from_str(kw).is_subtype_of(IfcTypeProduct)` at six gates at once,
+/// so the honest question is not "does IfcDoorStyle work now" but "what ELSE
+/// did those gates start admitting". Sweeping the whole generated catalog plus
+/// the whole legacy table answers it: the two expressions agree everywhere
+/// except the three IFC2X3 type products IFC4X3 dropped. `legacy_aware_ifc_type`
+/// falls through to `from_str` for anything the legacy table does not name, so
+/// a schema entity's answer cannot change; only a legacy keyword's can.
+#[test]
+fn the_legacy_aware_type_product_gate_widens_by_exactly_three_keywords() {
+    const EXPECTED_NEW: [(&str, IfcType); 3] = [
+        ("IFCDOORSTYLE", IfcType::IfcDoorType),
+        ("IFCWINDOWSTYLE", IfcType::IfcWindowType),
+        ("IFCBUILDINGELEMENTTYPE", IfcType::IfcBuiltElementType),
+    ];
+
+    // The pre-fix expression, kept verbatim so the two can be compared.
+    fn bare_gate(kw: &str) -> bool {
+        (kw.ends_with("TYPE") || kw.ends_with("STYLE"))
+            && IfcType::from_str(kw).is_subtype_of(IfcType::IfcTypeProduct)
+    }
+
+    // The whole legacy table, walked -- not a hand-copy of it. A hand-copied
+    // list can only assert the cheap direction (every listed name is legacy)
+    // and stays green when the table grows a name the list omits, which is
+    // exactly the case that widens these six gates without anyone noticing.
+    // `LEGACY_ENTITY_NAMES` is re-derived from the match arms by
+    // `legacy_entities::legacy_entity_name_tests::legacy_entity_names_match_the_lookup_arms`,
+    // so a new arm reaches this sweep and, if it is a `TYPE`/`STYLE` name,
+    // reds the widening-set assertion below.
+    let legacy = crate::LEGACY_ENTITY_NAMES.iter().copied();
+
+    let mut widened: Vec<(&str, IfcType)> = Vec::new();
+    let names: Vec<String> = crate::IFC_TYPES
+        .iter()
+        .map(|t: &IfcType| t.name().to_uppercase())
+        .collect();
+    for kw in names.iter().map(String::as_str).chain(legacy) {
+        match (bare_gate(kw), type_product_ifc_type(kw)) {
+            (false, Some(ty)) => widened.push((kw, ty)),
+            (true, Some(ty)) => assert_eq!(
+                ty,
+                IfcType::from_str(kw),
+                "{kw} was already admitted; its resolved type must not have moved"
+            ),
+            (true, None) => panic!("{kw}: the legacy-aware gate NARROWED, dropping geometry"),
+            (false, None) => {}
+        }
+    }
+
+    // Compared as sets (both sides sorted): the sweep's order follows
+    // `LEGACY_ENTITY_NAMES`, and reordering that const is not a defect.
+    widened.sort_by_key(|&(kw, _)| kw);
+    let mut expected = EXPECTED_NEW.to_vec();
+    expected.sort_by_key(|&(kw, _)| kw);
+    assert_eq!(widened, expected, "unexpected widening set");
+
+    for (kw, _) in EXPECTED_NEW {
+        // No double-render: none of the three is also an ordinary geometry job.
+        assert!(!has_geometry_by_name(kw), "{kw} would render twice");
+        // Nor an ordinary product row in the attribute export's pass 2.
+        assert!(
+            !legacy_aware_ifc_type(kw).is_subtype_of(IfcType::IfcProduct),
+            "{kw} would get both a product row and a type-product row"
+        );
+    }
+}
+
+/// The unstated invariant `legacy_aware_ifc_type_from_record` rests on.
+///
+/// That function short-circuits on `!matches!(decoded, IfcType::Unknown(_))`,
+/// which is only equivalent to `legacy_aware_ifc_type` while every key in the
+/// legacy table is a name the generated enum does NOT know. If a schema
+/// regeneration ever emits an arm for one of these keys -- and several are real
+/// IFC2x3/IFC4 entities, `IFCPRESENTATIONSTYLEASSIGNMENT` among them --
+/// `from_str` stops returning `Unknown`, the early return fires, and the wasm
+/// path silently returns the raw variant while the native path still remaps it.
+/// That is exactly the wasm-vs-native divergence #3179 was filed for, and it
+/// would come back in a form no other test here observes.
+///
+/// `every_legacy_arm_maps_onto_a_known_product` asserts the BASE TYPE is known.
+/// This asserts the KEY is not: the opposite direction, and the one the
+/// short-circuit depends on.
+///
+/// This is the BEHAVIOURAL half -- it calls `from_str` for real, where
+/// `scripts/check-legacy-entity-coverage.mjs` compares the two sets as source
+/// text. Coverage is not this test's own doing either way: `LEGACY_KEYS` is
+/// `LEGACY_ENTITY_NAMES`, which that lint holds equal to the match arms in
+/// both directions, so a 27th arm reaches this loop or the lint goes red.
+/// It did neither while this list was a hand-written copy.
+#[test]
+fn every_legacy_key_is_unknown_to_the_generated_enum() {
+    for &key in LEGACY_KEYS {
+        assert!(
+            matches!(IfcType::from_str(key), IfcType::Unknown(_)),
+            "{key} is now known to `IfcType::from_str`, so the `Unknown` \
+             short-circuit in `legacy_aware_ifc_type_from_record` skips its \
+             legacy remap and the browser diverges from the native path again"
+        );
+    }
+}
+

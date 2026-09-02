@@ -1,6 +1,6 @@
 {
   "name": "ifc-lite-collab-3d-demo",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "private": true,
   "type": "module",
   "license": "MPL-2.0",
@@ -16,7 +16,7 @@
   "devDependencies": {
     "@types/three": "^0.185.4",
     "typescript": "^6.0.3",
-    "vite": "^8.2.1",
+    "vite": "^8.2.2",
     "vite-plugin-top-level-await": "^1.5.0",
     "vite-plugin-wasm": "^3.6.0"
   }

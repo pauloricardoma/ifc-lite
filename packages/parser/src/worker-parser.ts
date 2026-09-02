@@ -59,6 +59,7 @@ export class WorkerParser {
     ids: Uint32Array;
     starts: Uint32Array;
     lengths: Uint32Array;
+    oversizedIdCount?: number;
   } | null = null;
 
   /**
@@ -215,6 +216,7 @@ export class WorkerParser {
             ids: queued.ids,
             starts: queued.starts,
             lengths: queued.lengths,
+            oversizedIdCount: queued.oversizedIdCount,
           });
         } catch (err) {
           console.warn('[WorkerParser] queued setEntityIndex failed:', err);
@@ -229,7 +231,21 @@ export class WorkerParser {
         deferPropertyAtomIndex: options.deferPropertyAtomIndex,
         waitForEntityIndex: options.waitForEntityIndex,
       };
-      worker.postMessage(input);
+      try {
+        worker.postMessage(input);
+      } catch (err) {
+        // postMessage can itself throw (e.g. a DataCloneError from structured
+        // clone). It's called after the worker is spawned, assigned to
+        // `this.worker`, and its handlers attached, so without this catch the
+        // Promise executor's synchronous throw auto-rejects the returned
+        // promise while nothing ever calls settle() — the worker thread is
+        // left running (and `this.worker` left pointing at it) forever.
+        settle(() => {
+          worker.terminate();
+          this.worker = null;
+        });
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
     });
   }
 
@@ -238,10 +254,20 @@ export class WorkerParser {
    * geometry pre-pass). May be called before or after `parseColumnar` —
    * if before, the payload is queued and posted as soon as the worker is
    * spawned. The parser worker uses the index to skip its WASM scan.
+   *
+   * `oversizedIdCount` is how many records the pre-pass refused for an express
+   * id above the u32 bound (#3395). Pass it: the columns cannot carry a record
+   * that was refused, so a caller that drops the number leaves the parse
+   * reporting a clean load that is short by exactly that many entities.
    */
-  setEntityIndex(ids: Uint32Array, starts: Uint32Array, lengths: Uint32Array): void {
+  setEntityIndex(
+    ids: Uint32Array,
+    starts: Uint32Array,
+    lengths: Uint32Array,
+    oversizedIdCount?: number,
+  ): void {
     if (!this.worker) {
-      this.queuedEntityIndex = { ids, starts, lengths };
+      this.queuedEntityIndex = { ids, starts, lengths, oversizedIdCount };
       return;
     }
     try {
@@ -250,6 +276,7 @@ export class WorkerParser {
         ids,
         starts,
         lengths,
+        oversizedIdCount,
       });
     } catch (err) {
       console.warn('[WorkerParser] setEntityIndex postMessage failed:', err);

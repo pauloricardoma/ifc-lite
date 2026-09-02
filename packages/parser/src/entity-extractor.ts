@@ -8,6 +8,8 @@
 
 import { createLogger } from '@ifc-lite/data';
 import { decodeIfcString } from '@ifc-lite/encoding';
+import { isIndexableExpressId } from './express-id.js';
+import { StepTextScan } from './step-lexing.js';
 import type { IfcEntity, EntityRef } from './types.js';
 import { asSourceBytes, type IfcSourceBytes } from './source-bytes.js';
 
@@ -74,7 +76,13 @@ export class EntityExtractor {
       const match = entityText.match(/^#(\d+)\s*=\s*(\w+)\(([\s\S]*)\)/);
       if (!match) return null;
 
+      // `\d+` guarantees this is not NaN, but not that the id fits the 32-bit
+      // express-id columns every store below keys on: ids above 2^32 truncate
+      // mod 2^32 and collide with a real low id, and ids past 2^53 collide with
+      // each other while still accumulating. Refuse the record either way; see
+      // express-id.ts (#3395).
       const expressId = parseInt(match[1], 10);
+      if (!isIndexableExpressId(expressId)) return null;
       const type = match[2];
       const paramsText = match[3];
 
@@ -116,9 +124,29 @@ export class EntityExtractor {
     let depth = 0;
     let current = '';
     let inString = false;
+    // Shared with source-header.ts's HEADER prescan: one comment-skip rule for
+    // decoded STEP text, not a fourth hand-rolled copy of it (#3673's
+    // follow-up). A comment's ',', "'", '(' or ')' must not be read as
+    // structure -- `#1=IFCWALL('a', /* rev; b */ $)` is one attribute pair,
+    // not a truncated one polluted with the comment's own text.
+    const trivia = new StepTextScan(paramsText);
 
     for (let i = 0; i < paramsText.length; i++) {
       const char = paramsText[i];
+
+      if (!inString && char === '/' && paramsText[i + 1] === '*') {
+        const end = trivia.skipLexicalAt(i);
+        if (end > i) {
+          // A comment is trivia, collapsed to one separator like whitespace --
+          // not omitted outright, so two tokens a comment sits between
+          // (`5/* c */6`) don't get spliced into one (`56`).
+          current += ' ';
+          i = end - 1;
+          continue;
+        }
+        // Unterminated: not a comment, per StepTextScan -- falls through and
+        // the lone '/' is read as ordinary text below.
+      }
 
       if (char === "'") {
         if (inString) {
@@ -204,9 +232,21 @@ export class EntityExtractor {
       let parenDepth = 0;
       let current = '';
       let inString = false;
+      // Same rule as parseAttributes above: a comment nested inside a list is
+      // trivia too, e.g. `(#1, /* skip */ #2)`.
+      const listTrivia = new StepTextScan(listContent);
 
       for (let i = 0; i < listContent.length; i++) {
         const char = listContent[i];
+
+        if (!inString && char === '/' && listContent[i + 1] === '*') {
+          const end = listTrivia.skipLexicalAt(i);
+          if (end > i) {
+            current += ' ';
+            i = end - 1;
+            continue;
+          }
+        }
 
         if (char === "'") {
           if (inString) {
@@ -252,7 +292,11 @@ export class EntityExtractor {
     // Reference: #123
     if (value.startsWith('#')) {
       const id = parseInt(value.substring(1), 10);
-      return isNaN(id) ? null : id;
+      // An out-of-contract reference is a dangling reference, not a number to
+      // carry: `Infinity` names no entity, two ids past 2^53 accumulate to the
+      // same double and would resolve to the same wrong entity, and an id above
+      // 2^32 can never be indexed at all (express-id.ts, #3395).
+      return isIndexableExpressId(id) ? id : null;
     }
 
     // String: 'text'
@@ -263,13 +307,39 @@ export class EntityExtractor {
       return decodeIfcString(raw);
     }
 
-    // Number
+    // Number.
+    //
+    // Number.isFinite, not !isNaN: a STEP real whose exponent overflows the
+    // IEEE-754 double range (`1.0E400`) parses to `Infinity`, and
+    // `isNaN(Infinity)` is `false`, so the old guard admitted it. From the
+    // property table a non-finite number reaches every writer, where
+    // `JSON.stringify(Infinity)` is `null` — the file loses the value with no
+    // diagnostic anywhere along the way.
+    //
+    // Falling through preserves the literal as the raw token (the branch
+    // below), which is what this function already does for every other token
+    // it cannot represent as a number. That keeps the data the file actually
+    // contained — a reader can still see `1.0E400`. Rejecting the attribute
+    // outright would drop data the file did contain; clamping would invent a
+    // value.
+    //
+    // This is NOT by itself enough to say "nothing is silently dropped".
+    // Preserving the string only helps consumers whose value type admits a
+    // string — the property table's `PropertyValue` union does. A consumer
+    // whose field is typed `number` sees the preserved string fail its
+    // `typeof x === 'number'` test and falls back to whatever default it has,
+    // which is how `quantity-collect` and `georef-extractor` turned an
+    // unreadable value into a plausible `0`. Absence is detectable; a zero
+    // easting is a coordinate. Both now refuse and warn instead of
+    // substituting — see `isOverflowingNumericLiteral` in
+    // `attribute-helpers.ts` and its two call sites. Any NEW `number`-typed
+    // consumer of this function's output owes the same decision.
     const num = parseFloat(value);
-    if (!isNaN(num)) {
+    if (Number.isFinite(num)) {
       return num;
     }
 
-    // Enumeration or other identifier
+    // Enumeration, non-finite numeric literal, or other identifier: the raw token.
     return value;
   }
 }

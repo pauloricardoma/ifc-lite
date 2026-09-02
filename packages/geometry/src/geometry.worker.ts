@@ -274,6 +274,9 @@ export interface GeometryWorkerShardResultMessage {
   /** Per-record prepass class (PREPASS_CLASS_*; 4 = IfcStyledItem). */
   classes: Uint8Array;
   handoff: number;
+  /** Global starts of records this shard refused above the u32 express-id bound
+   * (#3395); `shard-stitch.ts` attributes them. Absent on an older wasm. */
+  oversizedIdStarts?: Uint32Array;
 }
 
 /**
@@ -1003,9 +1006,9 @@ function collectMeshes(
           ...(origin ? { origin } : {}),
           ...(localBounds ? { localBounds } : {}),
           ...(localToWorld ? { localToWorld } : {}),
-          // Provenance for the Model/Types switch (0=occurrence, 1=orphan type,
-          // 2=instanced type). Older wasm bundles lack the getter → default 0.
-          geometryClass: mesh.geometryClass ?? 0,
+          geometryClass: mesh.geometryClass ?? 0, // 0=occurrence 1=orphan type 2=instanced type; older wasm lacks all three getters here
+          ...(mesh.geometryItemId !== undefined ? { geometryItemId: mesh.geometryItemId } : {}), // #3199: two DISJOINT ids, TWO
+          ...(mesh.materialId !== undefined ? { materialId: mesh.materialId } : {}), // spreads as in convertMeshCollectionToBatch
         };
         session.pendingTransfers.push(positions.buffer, normals.buffer, indices.buffer);
         session.cumulativeMeshBytes += positions.byteLength + normals.byteLength + indices.byteLength;
@@ -1518,7 +1521,7 @@ async function handleMessage(e: MessageEvent<GeometryWorkerRequest>): Promise<vo
           data: Uint8Array,
           rangeStart: number,
           rangeEnd: number,
-        ) => { ids: Uint32Array; starts: Uint32Array; lengths: Uint32Array; classes: Uint8Array; handoff: number };
+        ) => { ids: Uint32Array; starts: Uint32Array; lengths: Uint32Array; classes: Uint8Array; handoff: number; oversizedIdStarts?: Uint32Array };
       });
       let shard;
       try {
@@ -1537,9 +1540,9 @@ async function handleMessage(e: MessageEvent<GeometryWorkerRequest>): Promise<vo
           starts: shard.starts,
           lengths: shard.lengths,
           classes: shard.classes,
-          handoff: shard.handoff,
+          handoff: shard.handoff, oversizedIdStarts: shard.oversizedIdStarts,
         } as GeometryWorkerShardResultMessage,
-        [shard.ids.buffer, shard.starts.buffer, shard.lengths.buffer, shard.classes.buffer],
+        [shard.ids.buffer, shard.starts.buffer, shard.lengths.buffer, shard.classes.buffer, ...(shard.oversizedIdStarts ? [shard.oversizedIdStarts.buffer] : [])],
       );
       return;
     }

@@ -19,9 +19,9 @@
  */
 
 import { useEffect, useRef, type MutableRefObject } from 'react';
-import type { Renderer, Scene } from '@ifc-lite/renderer';
-import type { MeshData, CoordinateInfo } from '@ifc-lite/geometry';
-import { decodeInstancedShard } from '@ifc-lite/geometry';
+import type { Renderer, SceneContents } from '@ifc-lite/renderer';
+import type { MeshData, CoordinateInfo, DecodedInstance } from '@ifc-lite/geometry';
+import { decodeInstancedShard, NORMAL_COORD_THRESHOLD_M } from '@ifc-lite/geometry';
 import { toast } from '../ui/toast.js';
 import { runGpuUpload } from './gpu-upload-guard';
 import { createRobustFitBoundsAccumulator } from './robustFitBoundsAccumulator.js';
@@ -31,6 +31,32 @@ import { createRobustFitBoundsAccumulator } from './robustFitBoundsAccumulator.j
 // in component state because federation re-mounts the streaming hook on
 // every model load — a useRef wouldn't survive.
 let linearFitHintShown = false;
+
+/**
+ * The instanced half of "every express id is global": re-home, in place, the
+ * ids each occurrence of a decoded IFNS shard carries onto its owning model's
+ * global id space. The flat half, `applyFederationOffsetToMesh` in
+ * `hooks/useIfcLoader.ts`, carries the reasoning and the absence rules; the two
+ * must move together because `Scene.getInstancedMeshDataPieces` materializes an
+ * occurrence into a `MeshData` and stamps `itemId` onto its `geometryItemId`,
+ * so a shard left in local space feeds the flat field a local number.
+ *
+ * Typed to the one field it touches rather than to `DecodedInstancedShard`, so
+ * a header field added to the wire format does not become part of this
+ * function's contract, or of every fixture that exercises it.
+ */
+export function applyFederationOffsetToShard(
+  shard: { instances: DecodedInstance[] },
+  idOffset: number,
+): void {
+  if (idOffset <= 0) return;
+  for (const instance of shard.instances) {
+    instance.entityId = instance.entityId + idOffset;
+    if (typeof instance.itemId === 'number') {
+      instance.itemId = instance.itemId + idOffset;
+    }
+  }
+}
 
 export interface UseGeometryStreamingParams {
   rendererRef: MutableRefObject<Renderer | null>;
@@ -136,7 +162,10 @@ const DEFAULT_BOUNDS = {
   max: { x: 100, y: 100, z: 100 },
 };
 
-const MAX_VALID_COORD = 10000;
+// The per-vertex corruption filter `computeBounds` applies before fitting the
+// camera. Shared with `CoordinateHandler`, `localParsingUtils` and
+// `viewportUtils` — see `NORMAL_COORD_THRESHOLD_M`.
+const MAX_VALID_COORD = NORMAL_COORD_THRESHOLD_M;
 
 // Outlier-robust camera-fit bounds (issue #1394). A handful of far-flung
 // meshes (a stray covering 600 m off, a detached out-building) blow the raw
@@ -170,7 +199,7 @@ const DEFAULT_PRESENT_INSTANCED_MODEL_INDICES: ReadonlySet<number> = new Set([0]
  * `presentInstancedModelIndices` param doc for the full rationale.
  */
 function reshapeSceneKeepingPresentInstanced(
-  scene: Scene,
+  scene: SceneContents,
   presentInstancedModelIndices: ReadonlySet<number> | undefined,
 ): void {
   scene.clearFlatGeometry();
@@ -808,12 +837,7 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
         try {
           const shard = decodeInstancedShard(new Uint8Array(bytes));
           if (!shard) continue;
-          const idOffset = modelIdToOffset?.get(modelId) ?? 0;
-          if (idOffset > 0) {
-            for (const instance of shard.instances) {
-              instance.entityId += idOffset;
-            }
-          }
+          applyFederationOffsetToShard(shard, modelIdToOffset?.get(modelId) ?? 0);
           const modelIndex = modelIdToIndex?.get(modelId) ?? 0;
           scene.addInstancedShard(device, shard, modelIndex);
         } catch (err) {

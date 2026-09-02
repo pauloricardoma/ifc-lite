@@ -152,6 +152,24 @@ describe('decodeIfcString', () => {
     expect(decodeIfcString('\\PA\\Hello')).toBe('Hello');
   });
 
+  it('maps \\S\\ through a non-default \\P?\\ code page instead of hardcoding ISO 8859-1 (ISO 10303-21 6.4.3)', () => {
+    // \PE\ selects ISO 8859-5 (Cyrillic). 0x50('P')+128=0xD0, which is
+    // U+0430 (CYRILLIC SMALL LETTER A) in ISO 8859-5, not U+00D0 (LATIN
+    // CAPITAL LETTER ETH) the default page gives for the same byte.
+    expect(decodeIfcString('\\PE\\\\S\\P')).toBe('а');
+    // The selected page persists across every \S\ in the string, not just
+    // the next one, until another \P?\ directive switches it.
+    expect(decodeIfcString('\\PE\\\\S\\P\\S\\Q')).toBe('аб');
+    expect(decodeIfcString('\\PE\\\\S\\P\\PA\\\\S\\P')).toBe('аÐ');
+  });
+
+  it('falls back to the raw byte for a code position the selected page leaves unassigned', () => {
+    // ISO 8859-6 (Arabic, \PF\) leaves byte 0xB0 unassigned. ISO 10303-21
+    // does not define decoder behaviour there; this decoder answers with the
+    // raw code point (identity, same as the default page) rather than U+FFFD.
+    expect(decodeIfcString('\\PF\\\\S\\0')).toBe('°');
+  });
+
   it('decodes mixed encodings in one string', () => {
     expect(decodeIfcString('Br\\X2\\00FC\\X0\\cke')).toBe('Brücke');
   });
@@ -164,6 +182,35 @@ describe('encodeIfcString', () => {
 
   it('encodes 8-bit latin chars as \\X\\HH', () => {
     expect(encodeIfcString('Ä')).toBe('\\X\\C4');
+  });
+
+  it('encodes a literal reverse solidus as \\X\\5C instead of passing it through raw', () => {
+    // A raw backslash falls inside the printable-ASCII range (32-126), so the
+    // range check alone would keep it as-is. But an unescaped '\' in the
+    // output is exactly what a STEP reader (see step-string-literal.ts's
+    // "writer's half of the contract") would misread as the start of a
+    // directive or an unterminated pair — the encoder must route it through
+    // the \X\HH directive form instead, same as any other 8-bit value.
+    expect(encodeIfcString('\\')).toBe('\\X\\5C');
+    expect(decodeIfcString(encodeIfcString('\\'))).toBe('\\');
+  });
+
+  it('does NOT double the apostrophe (pins current behaviour, issue #3445)', () => {
+    // The apostrophe is code point 39, printable ASCII, so unlike the raw
+    // backslash above it passes straight through the range check untouched.
+    // The comment on the reverse-solidus test just above makes exactly the
+    // argument that transfers here: an unescaped `'` in output destined for a
+    // STEP literal terminates the literal early (`O'Brien` -> `'O'Brien'`).
+    // But that argument does NOT make this a bug in isolation, because
+    // `encodeIfcString` never claimed to be literal-safe once its doc is
+    // corrected — only that it emits directive escapes. Whether apostrophe
+    // doubling belongs here or in the caller (`escapeStepString` in
+    // `@ifc-lite/data` already does it) is an open question for #3445, not
+    // decided by this repo yet. This test pins TODAY'S behaviour so any
+    // change is a deliberate decision, not a silent one — it is not an
+    // assertion that the behaviour is correct.
+    expect(encodeIfcString("'")).toBe("'");
+    expect(encodeIfcString("O'Brien")).toBe("O'Brien");
   });
 
   it('encodes BMP chars as \\X2\\....\\X0\\', () => {

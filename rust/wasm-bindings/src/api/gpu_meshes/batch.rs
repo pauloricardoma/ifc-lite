@@ -2,6 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+use super::batch_partition::{
+    is_instancing_candidate, meets_instance_threshold, tallyable_rep, INSTANCE_MIN_OCCURRENCES,
+};
 use super::void_index::reconstruct_void_index;
 use crate::api::IfcAPI;
 use crate::zero_copy::{GeometryFingerprint, MeshCollection, MeshDataJs};
@@ -275,22 +278,10 @@ impl IfcAPI {
                     std::sync::Arc::clone(arc)
                 }
                 _ => {
-                    let mut colors: rustc_hash::FxHashMap<u32, [f32; 4]> =
-                        rustc_hash::FxHashMap::with_capacity_and_hasher(sig_len, Default::default());
-                    for (i, &style_id) in style_ids.iter().enumerate() {
-                        let base = i * 4;
-                        if base + 3 < style_colors.len() {
-                            colors.insert(
-                                style_id,
-                                [
-                                    style_colors[base] as f32 / 255.0,
-                                    style_colors[base + 1] as f32 / 255.0,
-                                    style_colors[base + 2] as f32 / 255.0,
-                                    style_colors[base + 3] as f32 / 255.0,
-                                ],
-                            );
-                        }
-                    }
+                    let colors = super::batch_partition::style_colors_from_wire(
+                        style_ids,
+                        style_colors,
+                    );
                     let index: rustc_hash::FxHashMap<u32, GeometryStyleInfo> = colors
                         .iter()
                         .map(|(&id, &c)| (id, GeometryStyleInfo::from_color(c)))
@@ -408,7 +399,38 @@ impl IfcAPI {
             let Ok(entity) = decoder.decode_and_cache(id, start, end) else {
                 continue;
             };
-            let ifc_type = entity.ifc_type;
+            // LEGACY-AWARE, like the native pre-pass at
+            // `processing/src/processor/mod.rs:711`. Without this, a legacy
+            // keyword reaching this path arrived as `ifcType: "Unknown"` with
+            // the Unknown default colour, while the CLI and exporters labelled
+            // the same entity correctly (#3179).
+            //
+            // Not every dropped keyword reaches this line: the four arms with
+            // `has_geometry: false` are refused by `has_geometry_by_name` in
+            // all three element producers, so this fix misses them. #3187 has
+            // the trace, including the type-geometry gate that would make
+            // THREE of the four eligible -- eligible, not certain.
+            //
+            // Recomputed from the SOURCE KEYWORD rather than recovered from
+            // `entity.ifc_type` -- why it cannot be recovered is on
+            // `legacy_aware_ifc_type_from_record` itself. What is specific to
+            // HERE: the bytes are already in hand -- `content[start..end]` is
+            // the span THIS JOB carries, so this is a ~20-byte scan to the
+            // first `(`, not a re-read. Note it is the job's span, not
+            // necessarily what `decode_and_cache` parsed: on a cache hit
+            // (`core/src/decoder.rs:443`) it returns the cached `Arc` without
+            // reading `start`/`end` at all, so only the miss path bounds-checks
+            // them. `content.get(..)` is fail-soft for that reason -- an
+            // out-of-range span yields an empty slice and `decoded` is returned
+            // unchanged.
+            //
+            // Cheaper than widening the jobs wire, which is 3 u32 per job
+            // across Rust and TS and would have paid marshalling cost on every
+            // job to fix the few that are legacy.
+            let ifc_type = ifc_lite_core::legacy_aware_ifc_type_from_record(
+                entity.ifc_type,
+                content.get(start..end).unwrap_or_default(),
+            );
 
             // Resolve the element-level colour inline (folded from the deleted
             // pre-pass) so the entity is decoded exactly once.
@@ -542,10 +564,9 @@ impl IfcAPI {
                     if let Some(im) = m.instance.as_ref() {
                         if im.instanceable {
                             // Shard-eligible = the partition's candidate gate: opaque,
-                            // untextured, ordinary-occurrence (class 0) geometry.
-                            let eligible = m.color[3] >= INSTANCED_ALPHA_CUTOFF
-                                && m.texture.is_none()
-                                && m.geometry_class == 0;
+                            // untextured, ordinary-occurrence (class 0) geometry. The
+                            // SAME function the partition calls, so the two cannot drift.
+                            let eligible = is_instancing_candidate(m);
                             template_by_rep
                                 .entry(im.rep_identity)
                                 .or_insert(super::instancing::TemplateInfo { eligible });
@@ -734,6 +755,9 @@ impl IfcAPI {
                 instance_meta: m.instance.as_ref(),
                 entity_id: m.express_id,
                 color: m.color,
+                // #2985: the originating representation item, so a host can drill
+                // from an instanced piece back to the source entity.
+                item_id: m.geometry_item_id,
             })
             .collect();
         // min_group = 2: instance any repeat; singletons + non-instanceable flat.
@@ -817,16 +841,12 @@ impl IfcAPI {
             // Taken BEFORE the meshes are moved out of `out` below.
             let fingerprint = out.fingerprint();
             for mesh_data in out.meshes {
-                let opaque = mesh_data.color[3] >= INSTANCED_ALPHA_CUTOFF;
-                let untextured = mesh_data.texture.is_none();
-                if opaque && untextured && mesh_data.geometry_class == 0 {
+                if is_instancing_candidate(&mesh_data) {
                     // Count only instanceable metas — mirror collate_refs's match arm:
                     // a None meta or instanceable==false (void-cut walls, multi-item
                     // merges) can never instance, so it must not inflate a count.
-                    if let Some(im) = mesh_data.instance.as_ref() {
-                        if im.instanceable {
-                            *counts.entry(im.rep_identity).or_insert(0) += 1;
-                        }
+                    if let Some(rep) = tallyable_rep(&mesh_data) {
+                        *counts.entry(rep).or_insert(0) += 1;
                     }
                     candidates.push(mesh_data);
                 } else {
@@ -850,12 +870,7 @@ impl IfcAPI {
         }
         let mut instanced: Vec<ifc_lite_processing::MeshData> = Vec::new();
         for mesh_data in candidates {
-            let instance_it = mesh_data.instance.as_ref().is_some_and(|im| {
-                im.instanceable
-                    && counts.get(&im.rep_identity).copied().unwrap_or(0)
-                        >= INSTANCE_MIN_OCCURRENCES
-            });
-            if instance_it {
+            if meets_instance_threshold(&mesh_data, &counts) {
                 instanced.push(mesh_data);
             } else {
                 mesh_collection.add(MeshDataJs::from_mesh_data(mesh_data));
@@ -891,6 +906,9 @@ impl IfcAPI {
                 instance_meta: m.instance.as_ref(),
                 entity_id: m.express_id,
                 color: m.color,
+                // #2985: the TEMPLATE's own representation item — it rides the
+                // shard, not the flat MeshCollection, so this is its only route.
+                item_id: m.geometry_item_id,
             })
             .collect();
         for (o, meta) in shard_occurrences.iter().zip(occ_metas.iter()) {
@@ -902,6 +920,8 @@ impl IfcAPI {
                 instance_meta: Some(meta),
                 entity_id: o.entity_id,
                 color: o.color,
+                // #2985: a don't-bake occurrence has no MeshData to read it from.
+                item_id: o.geometry_item_id,
             });
         }
         // min_group == the routing threshold so collate_refs never re-flattens a group
@@ -920,25 +940,6 @@ impl IfcAPI {
         }
     }
 }
-
-/// Opaque-alpha cutoff for the instanced-only partition. Mirrors the renderer's
-/// `OPAQUE_ALPHA_CUTOFF` (overlay-routing.ts) so the wasm partition and the
-/// renderer's flat opaque/transparent split agree: alpha >= this is opaque.
-const INSTANCED_ALPHA_CUTOFF: f32 = 0.99;
-
-/// Minimum per-batch occurrence count for a rep_identity group to be GPU-instanced.
-/// Below this, geometry rides the flat (consolidated, frustum-culled) path instead —
-/// one drawIndexed per template only pays off when amortized over many instances, and
-/// the saved upload/memory is negligible at low counts. Tuned for the draw-vs-memory
-/// tradeoff: 8 kills the singleton/low-count tail that defeated flat consolidation
-/// (the orbit-FPS regression) while leaving genuinely-repeated families (mullions,
-/// fasteners, identical steel parts — co-located by affinity routing, so dozens-to-
-/// hundreds per batch) instanced. Counting is PER-BATCH; a globally-repeated geometry
-/// thinly split across batches may fall below the gate and render flat — a benign
-/// missed optimization, never a correctness/FPS regression (flat IS the fast path for
-/// low counts). Lower to 4 if a large model's memory regresses; raise to 16 if orbit
-/// still drags.
-const INSTANCE_MIN_OCCURRENCES: u32 = 8;
 
 /// Result of [`IfcAPI::process_geometry_batch_partitioned`]: the flat
 /// MeshCollection (transparent + type geometry) and the instanced IFNS shard
@@ -974,3 +975,7 @@ impl PartitionedBatch {
         self.instanced_occurrences
     }
 }
+
+#[cfg(test)]
+#[path = "batch_tests.rs"]
+mod tests;

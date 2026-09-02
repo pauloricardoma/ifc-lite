@@ -166,6 +166,116 @@ fn resolves_millimetre_map_unit_scale() {
     assert_eq!(geo.map_zone.as_deref(), Some("32N"));
 }
 
+/// Foot MapUnit, written exactly the way ifc-lite's own exporter writes it
+/// (packages/export/src/step-georeferencing.ts): an `IfcConversionBasedUnit`
+/// naming FOOT with an `IfcMeasureWithUnit` conversion factor.
+///
+/// `MapUnit` is an `IfcNamedUnit`, so it is EITHER an `IfcSIUnit` or an
+/// `IfcConversionBasedUnit` — and attribute 2 is `Prefix` on the first but
+/// `Name` on the second. Reading slot 2 as a prefix unconditionally meant
+/// 'FOOT' matched no prefix and the unit read back as metres at scale 1: a
+/// 3.28x error on every coordinate, silently. No fixture had ever authored a
+/// non-metre MapUnit here or in the TS twin. Mirrors
+/// packages/parser/test/georef-extractor.test.ts.
+const FOOT_MAPUNIT_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('georef foot fixture'),'2;1');
+FILE_NAME('georef-foot.ifc','2026-06-12T00:00:00',(''),(''),'','','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#2=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#5,$);
+#4=IFCCARTESIANPOINT((0.,0.,0.));
+#5=IFCAXIS2PLACEMENT3D(#4,$,$);
+#6=IFCDIMENSIONALEXPONENTS(1,0,0,0,0,0,0);
+#7=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#8=IFCMEASUREWITHUNIT(IFCLENGTHMEASURE(0.3048),#7);
+#9=IFCCONVERSIONBASEDUNIT(#6,.LENGTHUNIT.,'FOOT',#8);
+#10=IFCPROJECTEDCRS('EPSG:2264',$,'NAD83',$,'LCC','3200',#9);
+#11=IFCMAPCONVERSION(#2,#10,2000000.,700000.,0.,1.,0.,1.0);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+#[test]
+fn resolves_conversion_based_foot_map_unit_scale() {
+    let geo = extract_georeferencing(FOOT_MAPUNIT_IFC).expect("georef");
+    assert_eq!(geo.map_unit.as_deref(), Some("FOOT"));
+    assert_eq!(geo.map_unit_scale, Some(0.3048));
+}
+
+/// The US survey foot is 1200/3937 m, not 0.3048 — 2 ppm apart, which is
+/// metres of drift across a State Plane coordinate, precisely where survey
+/// feet are used. The exporter writes this name too.
+const SURVEY_FOOT_MAPUNIT_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('georef survey foot fixture'),'2;1');
+FILE_NAME('georef-usft.ifc','2026-06-12T00:00:00',(''),(''),'','','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#2=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#5,$);
+#4=IFCCARTESIANPOINT((0.,0.,0.));
+#5=IFCAXIS2PLACEMENT3D(#4,$,$);
+#6=IFCDIMENSIONALEXPONENTS(1,0,0,0,0,0,0);
+#7=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#8=IFCMEASUREWITHUNIT(IFCLENGTHMEASURE(0.30480060960121924),#7);
+#9=IFCCONVERSIONBASEDUNIT(#6,.LENGTHUNIT.,'US SURVEY FOOT',#8);
+#10=IFCPROJECTEDCRS('EPSG:2264',$,'NAD83',$,'LCC','3200',#9);
+#11=IFCMAPCONVERSION(#2,#10,2000000.,700000.,0.,1.,0.,1.0);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+#[test]
+fn distinguishes_us_survey_foot_from_international_foot_map_unit() {
+    let geo = extract_georeferencing(SURVEY_FOOT_MAPUNIT_IFC).expect("georef");
+    assert_eq!(geo.map_unit.as_deref(), Some("US SURVEY FOOT"));
+    let scale = geo.map_unit_scale.expect("map unit scale");
+    assert!(
+        (scale - 1200.0 / 3937.0).abs() < 1e-12,
+        "expected the survey foot ratio, got {scale}"
+    );
+    assert!(
+        (scale - 0.3048).abs() > 1e-9,
+        "survey foot must not collapse onto the international foot"
+    );
+}
+
+/// A vendor unit name the table does not know must still scale from the
+/// file's own declared factor — and the declared value is expressed IN the
+/// measure's unit component, so a prefixed SI component multiplies it.
+const VENDOR_MAPUNIT_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('georef vendor unit fixture'),'2;1');
+FILE_NAME('georef-vendor.ifc','2026-06-12T00:00:00',(''),(''),'','','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#2=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#5,$);
+#4=IFCCARTESIANPOINT((0.,0.,0.));
+#5=IFCAXIS2PLACEMENT3D(#4,$,$);
+#6=IFCDIMENSIONALEXPONENTS(1,0,0,0,0,0,0);
+#7=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#8=IFCMEASUREWITHUNIT(IFCLENGTHMEASURE(25.4),#7);
+#9=IFCCONVERSIONBASEDUNIT(#6,.LENGTHUNIT.,'VENDOR UNIT',#8);
+#10=IFCPROJECTEDCRS('EPSG:1234',$,$,$,$,$,#9);
+#11=IFCMAPCONVERSION(#2,#10,0.,0.,0.,1.,0.,1.0);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+#[test]
+fn falls_back_to_declared_conversion_factor_for_unknown_map_unit_name() {
+    let geo = extract_georeferencing(VENDOR_MAPUNIT_IFC).expect("georef");
+    assert_eq!(geo.map_unit.as_deref(), Some("VENDOR UNIT"));
+    let scale = geo.map_unit_scale.expect("map unit scale");
+    assert!(
+        (scale - 0.0254).abs() < 1e-12,
+        "25.4 mm is 0.0254 m; the component prefix must be applied, got {scale}"
+    );
+}
+
 /// An empty `ePset_ProjectedCRS.Name` must not block the `TargetCRS`
 /// fallback — otherwise `crs_name` stays "" and the viewer gate (which
 /// requires a truthy name) silently drops the model to EPSG:4326.
@@ -370,4 +480,53 @@ fn the_passed_index_is_the_one_consulted() {
         extract_georeferencing_with_index(content, &empty).is_none(),
         "an empty index was ignored, so the function built one of its own",
     );
+}
+
+/// IFC4X3's `IfcMapConversionScaled` — a concrete subtype of
+/// `IfcMapConversion` whose first eight attributes ARE its supertype's, with
+/// FactorX/FactorY/FactorZ appended. The scanner classifies by the RAW STEP
+/// type name, so matching only the supertype spelling found nothing here and
+/// the extractor fell through to the ePSet / legacy-IfcSite chain: no map
+/// conversion, hence no transform, for a file that plainly carries one. Same
+/// widening as the TS reader's `MAP_CONVERSION_TYPE_NAMES`
+/// (packages/parser/src/georef-extractor.ts). Byte-for-byte `GEOREF_IFC`
+/// except for line #11.
+const SCALED_MAP_CONVERSION_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('georef scaled fixture'),'2;1');
+FILE_NAME('georef-scaled.ifc','2026-08-25T00:00:00',(''),(''),'','','');
+FILE_SCHEMA(('IFC4X3_ADD2'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0$ScRe4drECQ4DMSqUjd6d',$,'P',$,$,$,$,(#2),#3);
+#2=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#5,$);
+#3=IFCUNITASSIGNMENT((#6));
+#4=IFCCARTESIANPOINT((0.,0.,0.));
+#5=IFCAXIS2PLACEMENT3D(#4,$,$);
+#6=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#10=IFCPROJECTEDCRS('EPSG:32632','WGS84 / UTM zone 32N','WGS84',$,'UTM','32N',$);
+#11=IFCMAPCONVERSIONSCALED(#2,#10,1000.5,2000.25,42.0,0.866025,0.5,1.0,1.0,1.0,1.0);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+#[test]
+fn reads_ifc4x3_scaled_map_conversion_as_a_map_conversion() {
+    let scaled = extract_georeferencing(SCALED_MAP_CONVERSION_IFC)
+        .expect("IFCMAPCONVERSIONSCALED must yield a georeference");
+    let plain = extract_georeferencing(GEOREF_IFC).expect("control fixture must be georeferenced");
+
+    // Pinned against the control, so a regression breaking BOTH spellings
+    // cannot pass by making them equally empty.
+    assert!(
+        (plain.eastings - 1000.5).abs() < 1e-6,
+        "control fixture drifted"
+    );
+    assert!((scaled.eastings - plain.eastings).abs() < 1e-9);
+    assert!((scaled.northings - plain.northings).abs() < 1e-9);
+    assert!((scaled.orthogonal_height - plain.orthogonal_height).abs() < 1e-9);
+    assert_eq!(scaled.crs_name, plain.crs_name);
+    // The fallback chain must not be what answered.
+    assert_eq!(scaled.source.as_deref(), Some("mapConversion"));
+    assert_eq!(scaled.source, plain.source);
 }

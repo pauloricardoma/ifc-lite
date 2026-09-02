@@ -21,7 +21,7 @@
 import { describe, it, expect } from 'vitest';
 import { ENTITIES_IFC2X3, ENTITIES_IFC4, ENTITIES_IFC4X3, IFC_DATA_TYPES } from '@ifc-lite/data';
 import { SCHEMA_REGISTRY, getEntityMetadata } from '../src/generated/schema-registry.js';
-import { isKnownType, normalizeIfcTypeName } from '../src/ifc-schema.js';
+import { isKnownType, normalizeIfcTypeName, getInheritanceChain } from '../src/ifc-schema.js';
 
 /**
  * The six EXPRESS TYPEs the IDS-derived `IFC_DATA_TYPES` table omits but the
@@ -144,6 +144,43 @@ describe('isKnownType across the bundled schema union (#2003)', () => {
     }
   });
 
+  it('rejects Object.prototype member names', () => {
+    // The union lookup is a `Map`, but the pin fallback (`isKnownEntity`) used
+    // `name in SCHEMA_REGISTRY.entities` — and `in` walks the prototype chain,
+    // so every member of `Object.prototype` answered `true`. `ofType()` and
+    // `addEntity` both key on this predicate, so a query for `'constructor'`
+    // passed the guard and silently returned the Unknown bucket.
+    //
+    // Structural, not a denylist: the fix is `Object.hasOwn` in the codegen
+    // template (#3063/#3069, not this branch), so this list is a sample of the
+    // class of names, not the definition of it - and these cases only pass
+    // once #3069 has landed. `NotAThing` rides along as the control — a plain unknown name has always been
+    // rejected, and must stay rejected.
+    for (const type of [
+      'constructor',
+      'toString',
+      'valueOf',
+      'hasOwnProperty',
+      '__proto__',
+      'isPrototypeOf',
+      'propertyIsEnumerable',
+      'toLocaleString',
+      'NotAThing',
+    ]) {
+      expect(isKnownType(type), type).toBe(false);
+    }
+  });
+
+  it('does not hand back an Object.prototype member as entity metadata', () => {
+    // `getEntityMetadata` indexed the same object literal, so `'toString'`
+    // resolved to `Object.prototype.toString` — a `Function` returned under
+    // the `EntityMetadata` type. Fixed in #3069; pinned here because this is
+    // the package whose exported guards the defect reached.
+    for (const type of ['constructor', 'toString', 'valueOf', 'hasOwnProperty', 'isPrototypeOf']) {
+      expect(getEntityMetadata(type), type).toBeUndefined();
+    }
+  });
+
   it('rejects EXPRESS defined types that ride along in the bundled entity tables', () => {
     // The `ENTITIES_*` tables carry `IfcLengthMeasure`, `IfcBoolean` and 130
     // other defined types as rows. They are not instantiable, the pin has
@@ -188,10 +225,13 @@ describe('isKnownType across the bundled schema union (#2003)', () => {
   it('answers known-ness, not instantiability: abstract classes stay accepted (#2035)', () => {
     // Pre-existing and deliberately unchanged here. `main` accepts 123 abstract
     // classes through the pin; the union adds 19 more. Rejecting them is a
-    // different predicate, belongs at the authoring boundary rather than in a
-    // name-registry check, and is tracked separately — this test exists so the
-    // split is a recorded decision rather than an oversight, and it fails the
-    // day someone changes it without changing the contract.
+    // different predicate and belongs at the authoring boundary rather than in
+    // a name-registry check — and that is where it now lives: #2035 was closed
+    // by `isInstantiable` in `ifc-schema.ts` plus the `addEntity` guard in
+    // `packages/sdk/src/namespaces/store.ts`, which throws on an abstract type.
+    // So this is not deferred work: the split is settled, and this test exists
+    // so it stays a recorded decision rather than an oversight — it fails the
+    // day someone makes `isKnownType` answer instantiability instead.
     for (const type of ['IfcProduct', 'IfcRoot', 'IfcRelationship', 'IfcObjectDefinition']) {
       expect(getEntityMetadata(type)?.isAbstract, type).toBe(true);
       expect(isKnownType(type), type).toBe(true);
@@ -249,5 +289,25 @@ describe('normalizeIfcTypeName across the bundled schema union (#2003)', () => {
     for (const type of ['IfcSolidStratum', 'IfcVoidStratum', 'IfcWaterStratum']) {
       expect(normalizeIfcTypeName(type), type).toBe(type);
     }
+  });
+
+  it('resolves the IFC2X3 distribution-point leaf, and only under the name IFC2X3 gives it', () => {
+    // This test asserted on `IfcElectricalDistributionPoint` until #3172, on
+    // the stated premise that it was "real, deprecated IFC2X3 syntax". It is
+    // not: the IFC2X3 entity has no "AL". The name came from a misspelt arm in
+    // `rust/core/src/legacy_entities.rs`, was mirrored into
+    // `ENTITY_NAME_ALIASES` to make the two sides agree, and this assertion
+    // then passed by reading the mirror -- three artifacts agreeing with each
+    // other about an entity that does not exist.
+    //
+    // The correctly spelled leaf IS in `ENTITIES_IFC2X3`, so it needs no alias
+    // at all; the chain below comes straight from the bundled table and matches
+    // what `legacy_aware_ifc_type` answers in Rust.
+    expect(getInheritanceChain('IfcElectricDistributionPoint')).toContain('IfcFlowController');
+    expect(getInheritanceChain('IfcElectricDistributionPoint')).toContain('IfcDistributionElement');
+    // And the misspelling resolves to nothing, which is the correct answer for
+    // a name no schema carries. Pinned so a future "fix" cannot restore the
+    // alias and make the pair agree again.
+    expect(getInheritanceChain('IfcElectricalDistributionPoint')).toEqual([]);
   });
 });

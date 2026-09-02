@@ -44,13 +44,19 @@ use ifc_lite_geometry::{
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeMap;
 
-use crate::processor::{convert_mesh_to_site_local, get_refs_from_list};
+use crate::processor::convert_mesh_to_site_local;
 
 /// The f32-collapse degenerate backstop, its per-element tally, and the reason
 /// that tally now gates the closure verdict. A CHILD module: it exists only to
 /// serve this file's produce/emit cycle.
 #[path = "element_degenerate.rs"]
 mod degenerate;
+mod element_color;
+use element_color::{find_indexed_colour_for_element, infer_opening_subpart_material_name};
+// Re-exported because these two have callers outside this module:
+// `find_geometry_item_color` from processor/color_layer.rs, and
+// `resolve_color_for_representation_map` from processor/jobs.rs.
+pub(crate) use element_color::{find_geometry_item_color, resolve_color_for_representation_map};
 
 /// Element-level metadata stamped on every produced [`MeshData`]. The native
 /// pipeline resolves these during its metadata phase; the browser passes
@@ -455,6 +461,7 @@ fn produce_inner(
                         color.to_array(),
                         None,
                         Some(geometry_id),
+                        false,
                         0,
                         ctx,
                         None,
@@ -474,7 +481,7 @@ fn produce_inner(
         h.add_oriented_mesh(&mesh.positions, &mesh.indices, mesh.origin, verdict);
     }
     (
-        vec![build_mesh_data(job, mesh, element_color, None, None, 0, ctx, None)],
+        vec![build_mesh_data(job, mesh, element_color, None, None, false, 0, ctx, None)],
         Vec::new(),
     )
 }
@@ -495,6 +502,9 @@ fn emit_sub_meshes(
     // wall renders as one solid) but the 2D/section cut consumes.
     slice_class: u8,
 ) -> (Vec<MeshData>, Vec<RawInstanceOccurrence>) {
+    // Read ONCE, before the loop consumes the collection: what the ids MEAN is
+    // a property of the collection, not of any individual sub-mesh (#3199).
+    let ids_are_materials = sub_meshes.ids_are_materials;
     let mut out: Vec<MeshData> = Vec::with_capacity(sub_meshes.len());
     let mut occurrences: Vec<RawInstanceOccurrence> = Vec::new();
     // Material colours for this element, used when a sub-mesh has no direct
@@ -533,6 +543,10 @@ fn emit_sub_meshes(
                     color,
                     rep_identity: im.rep_identity,
                     world_transform: compose_instance_world_row_major(im),
+                    // #2985: the id `build_mesh_data` would have stamped had this
+                    // sub-mesh materialized. ONE home for the #3199 discriminator and the
+                    // 0-filter — two spellings drift invisibly ("no item id" reads as "no item").
+                    geometry_item_id: MeshData::style_geometry_item_id(Some(sub.geometry_id), ids_are_materials),
                 });
             }
             continue;
@@ -580,6 +594,7 @@ fn emit_sub_meshes(
                     color,
                     material_name,
                     Some(sub.geometry_id),
+                    ids_are_materials,
                     slice_class,
                     ctx,
                     Some(uvs),
@@ -606,6 +621,7 @@ fn emit_sub_meshes(
                         rgba.to_array(),
                         None,
                         Some(sub.geometry_id),
+                        ids_are_materials,
                         slice_class,
                         ctx,
                         None,
@@ -621,6 +637,7 @@ fn emit_sub_meshes(
             color,
             material_name,
             Some(sub.geometry_id),
+            ids_are_materials,
             slice_class,
             ctx,
             None,
@@ -680,7 +697,7 @@ fn produce_type_geometry(
             // `None` and get the full position+normal weld.
             let part_uvs = if texture.is_some() { Some(uvs) } else { None };
             let mut mesh_data =
-                build_mesh_data(job, mesh, color, None, None, geometry_class, ctx, part_uvs);
+                build_mesh_data(job, mesh, color, None, None, false, geometry_class, ctx, part_uvs);
             if let Some(tex) = texture {
                 // UVs were already welded onto `mesh_data`; attach only the
                 // texture (decoded image or #1781 external reference) here.
@@ -703,7 +720,10 @@ fn build_mesh_data(
     mut mesh: Mesh,
     color: [f32; 4],
     material_name: Option<String>,
-    geometry_item_id: Option<u32>,
+    // The sub-mesh's source id, plus WHAT IT IS. Routed to `geometry_item_id`
+    // or `material_id` by `with_style_metadata`, never both (#3199).
+    source_id: Option<u32>,
+    id_is_material: bool,
     geometry_class: u8,
     ctx: &MeshProductionContext<'_>,
     // Per-vertex texture coordinates (2 per vertex, 1:1 with `mesh.positions`),
@@ -776,8 +796,9 @@ fn build_mesh_data(
             )
             .with_properties(meta.space_zone_properties.clone());
     }
-    if material_name.is_some() || geometry_item_id.is_some() {
-        mesh_data = mesh_data.with_style_metadata(material_name, geometry_item_id);
+    if material_name.is_some() || source_id.is_some() {
+        mesh_data =
+            mesh_data.with_style_metadata(material_name, source_id, id_is_material);
     }
     if geometry_class != 0 {
         mesh_data = mesh_data.with_geometry_class(geometry_class);
@@ -788,121 +809,6 @@ fn build_mesh_data(
     mesh_data.uvs = welded_uvs;
     convert_mesh_to_site_local(&mut mesh_data, ctx.site_local_rotation);
     mesh_data
-}
-
-/// Resolve a geometry item's authored colour: direct style on the item, else
-/// chase `IfcMappedItem → IfcRepresentationMap → MappedRepresentation.Items`
-/// recursively (#913 §2.7 — mapped sub-geometry inherits its underlying
-/// item's style).
-pub(crate) fn find_geometry_item_color(
-    geometry_id: u32,
-    geometry_styles: &FxHashMap<u32, GeometryStyleInfo>,
-    decoder: &mut EntityDecoder,
-) -> Option<[f32; 4]> {
-    // Direct style on this exact geometry item wins.
-    if let Some(style) = geometry_styles.get(&geometry_id) {
-        return Some(style.color);
-    }
-
-    // Otherwise, if it's a mapped item, chase the mapping to the underlying
-    // geometry and resolve there (recursing handles nested mapped items).
-    let geom = decoder.decode_by_id(geometry_id).ok()?;
-    if geom.ifc_type != IfcType::IfcMappedItem {
-        return None;
-    }
-    // IfcMappedItem.MappingSource (attr 0) → IfcRepresentationMap.
-    let mapping_source_id = geom.get_ref(0)?;
-    // IfcRepresentationMap.MappedRepresentation (attr 1) → IfcShapeRepresentation.
-    let representation_map = decoder.decode_by_id(mapping_source_id).ok()?;
-    let mapped_representation_id = representation_map.get_ref(1)?;
-    let mapped_representation = decoder.decode_by_id(mapped_representation_id).ok()?;
-    // IfcShapeRepresentation.Items (attr 3).
-    let items = get_refs_from_list(&mapped_representation, 3)?;
-    for underlying in items {
-        if let Some(color) = find_geometry_item_color(underlying, geometry_styles, decoder) {
-            return Some(color);
-        }
-    }
-    None
-}
-
-/// Resolve the authored colour for a type's `IfcRepresentationMap` (#957) by
-/// looking up its mapped geometry items in the styled-item index — the same
-/// index that colours ordinary products. `None` ⇒ caller falls back to the
-/// type's default colour.
-pub(crate) fn resolve_color_for_representation_map(
-    rep_map_id: u32,
-    geometry_style_index: &FxHashMap<u32, GeometryStyleInfo>,
-    decoder: &mut EntityDecoder,
-) -> Option<[f32; 4]> {
-    let rep_map = decoder.decode_by_id(rep_map_id).ok()?;
-    // IfcRepresentationMap.MappedRepresentation = attr 1.
-    let mapped_rep_id = rep_map.get_ref(1)?;
-    let mapped_rep = decoder.decode_by_id(mapped_rep_id).ok()?;
-    // IfcShapeRepresentation.Items = attr 3.
-    let item_ids = get_refs_from_list(&mapped_rep, 3)?;
-    for item_id in item_ids {
-        if let Some(style) = geometry_style_index.get(&item_id) {
-            return Some(style.color);
-        }
-        if let Some(color) = find_geometry_item_color(item_id, geometry_style_index, decoder) {
-            return Some(color);
-        }
-    }
-    None
-}
-
-/// Find the first representation item of `entity` that carries a full
-/// `IfcIndexedColourMap` (#858). Drives the element-level palette split on
-/// the single-mesh fallback path.
-pub(crate) fn find_indexed_colour_for_element<'a>(
-    entity: &DecodedEntity,
-    indexed_colour_full: &'a FxHashMap<u32, FullIndexedColourMap>,
-    decoder: &mut EntityDecoder,
-) -> Option<&'a FullIndexedColourMap> {
-    let pds_id = entity.get_ref(6)?;
-    let pds = decoder.decode_by_id(pds_id).ok()?;
-    let repr_ids = get_refs_from_list(&pds, 2)?;
-    for repr_id in repr_ids {
-        if let Ok(repr) = decoder.decode_by_id(repr_id) {
-            if let Some(items) = get_refs_from_list(&repr, 3) {
-                for item_id in items {
-                    if let Some(full) = indexed_colour_full.get(&item_id) {
-                        return Some(full);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-fn is_opening_with_subparts(ifc_type: &IfcType) -> bool {
-    matches!(ifc_type, IfcType::IfcWindow | IfcType::IfcDoor)
-}
-
-/// Synthesize a material name for window/door sub-parts that carry no
-/// authored style: transparency is a practical proxy for glazing in many BIM
-/// exports.
-pub(crate) fn infer_opening_subpart_material_name(
-    ifc_type: &IfcType,
-    color: [f32; 4],
-    geometry_id: u32,
-) -> Option<String> {
-    if !is_opening_with_subparts(ifc_type) {
-        return None;
-    }
-
-    let prefix = match ifc_type {
-        IfcType::IfcDoor => "Door",
-        _ => "Window",
-    };
-
-    if color[3] <= 0.65 {
-        return Some(format!("{}_Glass", prefix));
-    }
-
-    Some(format!("{}_Frame_{}", prefix, geometry_id))
 }
 
 #[cfg(test)]

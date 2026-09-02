@@ -39,11 +39,15 @@ export interface ActiveMeasurement {
 /**
  * Which gesture the Measure tool is currently listening for. `'drag'` is the
  * original mousedown→mouseup distance measurement (unchanged by this mode).
- * `'polyline'` accumulates points via successive clicks instead; the two are
+ * `'polyline'` accumulates points via successive clicks instead; `'angle'`
+ * (#2735) accumulates a FIXED number of clicks and finishes itself. `'radius'`
+ * (#2737 item 2) accumulates an UNBOUNDED number of clicks (three minimum)
+ * and finishes on the same gesture polyline uses — double-click or Enter —
+ * because there is no natural "last pick" the way angle has one. All four are
  * mutually exclusive so a sequence started in one can never leak state into
- * the other (see `setMeasureMode` in measurementSlice.ts).
+ * another (see `setMeasureMode` in measurementSlice.ts).
  */
-export type MeasureMode = 'drag' | 'polyline';
+export type MeasureMode = 'drag' | 'polyline' | 'angle' | 'radius';
 
 /** A multi-click sequence in progress, not yet finished or cancelled. */
 export interface ActivePolyline {
@@ -62,6 +66,95 @@ export interface PolylineMeasurement {
   points: MeasurePoint[];
   closed: boolean;
   length: number;
+}
+
+// ============================================================================
+// Angle Measurement Types (issue #2735, split from #2199 §4)
+// ============================================================================
+
+/**
+ * Which angle the tool is measuring. Only `'points'` ships today; the edge and
+ * face kinds are the later slices of #2735 and are named here so the store
+ * shape does not have to change when they land.
+ */
+export type AngleKind = 'points' | 'edges' | 'faces';
+
+/** How many picks each kind needs before the measurement finishes itself. */
+export const ANGLE_REQUIRED_PICKS: Record<AngleKind, number> = {
+  points: 3,
+  // FOUR, not two. `SnapTarget.metadata.vertices` yields tessellation
+  // segments rather than topological edges - one straight 2.000 m slab edge
+  // reported as four collinear pieces on #2199 - so two picks cannot identify
+  // two edges. #2735 sanctions the alternative directly: "scope itself to
+  // explicitly-picked point pairs". Each edge is two picks the user places,
+  // so the direction measured is the one they chose.
+  edges: 4,
+  faces: 2,
+};
+
+/** One pick in an angle sequence. */
+export interface AnglePick {
+  kind: AngleKind;
+  point: MeasurePoint;
+  /**
+   * Surface normal at the pick, for `'faces'` only.
+   *
+   * Carried on the pick rather than derived later because it is only knowable
+   * at pick time: it comes from the raycast hit, and the stored point alone
+   * cannot recover which face was under the cursor.
+   */
+  normal?: { x: number; y: number; z: number };
+}
+
+/** A fixed-length sequence in progress, not yet complete or cancelled. */
+export interface ActiveAngle {
+  kind: AngleKind;
+  picks: AnglePick[];
+}
+
+/**
+ * A finished angle measurement.
+ *
+ * Only the PICKS are stored, never the resulting degrees - the readout is
+ * derived on render by `threePointAngle`. That follows `inclination.ts` rather
+ * than `PolylineMeasurement` (which does store its `length`): an angle's value
+ * is pure maths over its picks, so deriving it means a correction to the maths
+ * retroactively fixes every measurement already on screen, and there is no
+ * second copy of the answer to fall out of step with the picks.
+ */
+export interface AngleMeasurement {
+  id: string;
+  kind: AngleKind;
+  picks: AnglePick[];
+}
+
+// ============================================================================
+// Radius Measurement Types (issue #2737 item 2, split from #2199 §3)
+// ============================================================================
+
+/**
+ * A radius/diameter click sequence in progress, not yet finished or
+ * cancelled. Unbounded, like {@link ActivePolyline} rather than
+ * {@link ActiveAngle}: `fitRadius` (measure-modes/radius.ts) takes three or
+ * more picks and there is no fixed count at which the measurement finishes
+ * itself, so the same explicit finish gesture polyline uses (double-click or
+ * Enter) applies here too.
+ */
+export interface ActiveRadius {
+  points: MeasurePoint[];
+}
+
+/**
+ * A finished radius measurement. Only the PICKS are stored, never the fitted
+ * radius/diameter — mirrors {@link AngleMeasurement}: the fit (including
+ * which refusal reason, if any) is derived on render by `fitRadius`, so a
+ * correction to the maths retroactively fixes every measurement already
+ * listed rather than leaving a second, independently-stale copy of the
+ * answer.
+ */
+export interface RadiusMeasurement {
+  id: string;
+  points: MeasurePoint[];
 }
 
 /** Orthogonal constraint axis type */
@@ -123,6 +216,10 @@ export type SectionPlaneAxis = 'down' | 'front' | 'side';
 // pattern only requires editing `packages/renderer/src/section-cap-style.ts`.
 export type { HatchPatternId as SectionCapHatchId, SectionCapStyle } from '@ifc-lite/renderer';
 import type { SectionCapStyle } from '@ifc-lite/renderer';
+// Same reasoning: the embed `controls` param (#2934) restricts orbit/pan/zoom
+// at the renderer's `Camera`, so the store shares the renderer's own type.
+export type { InteractionMode as ControlsMode } from '@ifc-lite/renderer';
+import type { InteractionMode as ControlsMode } from '@ifc-lite/renderer';
 
 /**
  * Custom (face-picked) plane override. When present, the renderer uses
@@ -329,6 +426,21 @@ export interface CameraCallbacks {
    */
   frameClashRegion?: (min: { x: number; y: number; z: number }, max: { x: number; y: number; z: number }) => void;
   orbit?: (deltaX: number, deltaY: number) => void;
+  /**
+   * Place the camera at an ABSOLUTE orientation (degrees, same convention as
+   * `cameraRotation` and the renderer's `Camera.getRotation`), keeping the
+   * current target and orbit distance.
+   *
+   * Every other orientation callback here is relative (`orbit`, `rotateLeft`,
+   * `rotateRight`) or names a direction (`setPresetView`), so a caller holding
+   * an angle pair — the embed API's `SET_CAMERA` — had nothing to call and the
+   * store write went nowhere (#2934). Driven from `setCameraRotation` in
+   * cameraSlice, mirroring how `setProjectionMode` drives its own callback.
+   */
+  setCameraRotation?: (rotation: CameraRotation) => void;
+  /** Restrict interactive orbit/pan/zoom (embed `?controls=`, #2934). Does
+   *  not gate programmatic moves — `setCameraRotation`/`setPresetView`/etc. */
+  setInteractionMode?: (mode: ControlsMode) => void;
   projectToScreen?: (worldPos: { x: number; y: number; z: number }) => { x: number; y: number } | null;
   /**
    * Unproject a screen pixel onto the horizontal plane at the

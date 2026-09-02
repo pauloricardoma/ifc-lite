@@ -401,8 +401,9 @@ const edited = new StepExporter(dataStore, mutationView)
 ```
 
 For quick scripts there is also `exportToStep(dataStore, options?)`, which
-returns the STEP text as a string (defaults to `schema: 'IFC4'`; prefer
-`StepExporter` and its `Uint8Array` output for very large files).
+returns the STEP text as a string (defaults `schema` to the source model's own
+schema, so a round-trip preserves it; pass `schema` explicitly to convert.
+Prefer `StepExporter` and its `Uint8Array` output for very large files).
 
 ### Visible-Only Export
 
@@ -478,6 +479,42 @@ instance of that container type. `'by-name'` requires a Name match with no
 single-instance fallback. All three fields are optional; omitting one keeps
 the pre-existing combined heuristic for that container type.
 
+#### Dropping empty containers
+
+Matching decides which containers *are the same*; it says nothing about the ones
+that end up holding nothing. `dropEmptyContainers` is the recipe's other step:
+
+```typescript
+import { MergedExporter } from '@ifc-lite/export';
+
+const exporter = new MergedExporter([
+  { id: 'arch', name: 'Architecture', dataStore: store1 },
+  { id: 'struct', name: 'Structure', dataStore: store2 },
+]);
+
+const result = exporter.export({ schema: 'IFC4', dropEmptyContainers: true });
+console.log(result.stats.droppedContainerCount);
+```
+
+An `IfcSite` / `IfcBuilding` / `IfcBuildingStorey` / `IfcSpace` is empty when it
+contains no surviving element (`IfcRelContainedInSpatialStructure`), directly
+aggregates no surviving non-spatial object, and transitively aggregates no
+non-empty spatial child. `IfcProject` is never a candidate. Note this makes a
+room with no element inside it a candidate: spaces are usually contained by a
+storey, not by their own contents.
+
+Emptiness is judged on the **merged** model, after visibility filtering and
+spatial unification — a container that only a later model fills is kept. The
+dropped containers are excluded from the merge plan rather than deleted
+afterwards, so nothing is ever written referencing them: a relationship that
+named one is narrowed, and one left with no subject is dropped with it. A
+dropped container's own placement / representation entities are left behind
+unreferenced (valid STEP, just inert). The flag is off by default, and a merge
+with nothing to drop produces byte-identical output either way.
+
+The CLI exposes the same step as `ifc-lite merge … --drop-empty-containers`, and
+the native (Rust) merge as `MergedOptions::drop_empty_containers`.
+
 `'normalize'` rescales all `IfcCartesianPoint`/`IfcCartesianPointList` coordinates,
 scalar lengths (extrusion depths, profile dimensions, radii, thicknesses, storey
 elevations, `IfcVector.Magnitude`, CSG primitive sizes), `IfcLengthMeasure`
@@ -486,6 +523,74 @@ own declared `AREAUNIT`/`VOLUMEUNIT` ratio. Angles, ratios, counts, unit
 definitions and georeferencing offsets are left untouched. Length attributes
 specific to IFC4X3 (alignment / linear referencing) may not be rescaled — a
 `stats.warnings` advisory flags this.
+
+### Anonymized Isolated Export
+
+Some parsing or geometry bugs only reproduce on a client's actual model, which
+cannot be shared for debugging. The anonymized isolated export picks the
+offending object(s), expands the selection to the context a reproduction
+needs (host wall, openings/fillers, the storey/building/site/project chain,
+type objects, materials, aggregate parents/children), and exports **only**
+that subset with every project-identifying signal removed — while keeping
+the geometry-relevant local transformations (placement rotations,
+non-orthogonal cuts) so the bug still reproduces:
+
+```typescript
+import { collectRelatedEntities, exportAnonymizedSubset } from '@ifc-lite/export';
+
+// Seed selection: e.g. the window an offending model fails to parse around.
+const seeds = new Set([312]); // expressId(s) of the seed entity/entities
+
+// Expand by relationship context: host, openings/fillers, type, materials,
+// and the spatial containment chain up to IfcProject (all on by default).
+const related = collectRelatedEntities(store, seeds);
+
+// Export exactly that subset, anonymized.
+const result = exportAnonymizedSubset(store, related.all);
+await saveFile('anonymized.ifc', result.content);
+
+// Old GlobalId -> regenerated GlobalId, kept OUT of the exported file itself.
+console.log(result.guidMap.size, result.stats.warnings);
+```
+
+`RelatedEntityOptions` toggles which relationship kinds `collectRelatedEntities`
+expands (`IfcRelVoidsElement`, `IfcRelFillsElement`, `IfcRelAggregates`,
+`IfcRelNests`, `IfcRelDefinesByType`, `IfcRelAssociatesMaterial`,
+`IfcRelContainedInSpatialStructure`, `IfcRelDefinesByProperties`, and a
+bounded `IfcRelConnectsPathElementsDepth`) and how far; `IfcProject` is
+always included regardless of any toggle. `AnonymizeOptions` toggles what
+`exportAnonymizedSubset` scrubs — every field defaults to the
+maximally-scrubbed direction, so the call above with no options is the
+intended common case:
+
+| Kept by default | Removed/replaced by default |
+|---|---|
+| `PredefinedType`, enum-valued attributes | `Name`/`LongName`/`Description`/`Tag` on `IfcRoot` → `<IfcType>-<n>` pseudonym (`pseudonymizeNames`) |
+| Materials, representation, styles (their geometry/colour values) | `ObjectType`, `IfcTypeObject.ApplicableOccurrence`, `IfcElementType.ElementType`, `IfcProject.Phase`, and quoted `Name`/`LongName`/`Description`/`ProfileName`/`LayerSetName`/`Category` on non-`IfcRoot` entities — surface styles, materials, layers, profiles, colours (`pseudonymizeAllNames`) |
+| Units, geometric contexts, `RepresentationIdentifier` (`Body`, `Axis`) | `GlobalId` (regenerated; old→new in `result.guidMap`, never in the file) |
+| `preprocessor_version` (ifc-lite) | `IfcPropertySet`/`IfcElementQuantity` (unless `keepPropertySets`) |
+| `IfcApplication.ApplicationFullName` / `ApplicationIdentifier` | Root placement translation (rotation/`Axis`/`RefDirection` kept) |
+| Only the storeys/buildings the selection actually sits in (siblings are not pulled in) | `IfcMapConversion*`/`IfcProjectedCRS`, `IfcSite`/`IfcBuilding` address & georeferencing fields |
+| | `IfcPerson`/`IfcOrganization` fields, `IfcOwnerHistory` dates (`CreationDate` → 0, `LastModifiedDate` → `$`), `IfcApplication.Version`, STEP header author/organization/authorization/`originating_system` (`scrubOwnerHistory`) |
+| | `IfcMonetaryUnit.Currency` → USD (`neutralizeCurrency`) |
+
+The authoring tool's *name* is kept by decision (it is debugging signal) but
+its version/build string is not — vendors embed the licence region there
+(`26.0.0 NOR FULL`). Property/quantity *names* are kept whenever
+`keepPropertySets` is on; property/quantity *values* are never scrubbed,
+whether the pset is kept or dropped — a kept pset carries them exactly as
+authored, and a dropped one takes its values out of the file with it. The
+tool name and a kept pset's values are the residual leak surface; review a
+file before sharing it externally, and never name the download after the
+source model.
+
+The `IfcPropertySet`/`IfcElementQuantity` drop holds for `includedIds`
+regardless of how it was built — `collectRelatedEntities`'s
+`IfcRelDefinesByProperties` walk, or an id set assembled by hand — not only
+the CLI's `--keep-psets` and the viewer's "Property sets" toggle, which
+couple the same option to their own selection step. A dropped id is reported
+in `result.stats.droppedPropertySetIds`. The CLI equivalent is
+`ifc-lite anonymize` (see the [CLI guide](cli.md)).
 
 ## IFC5 (IFCX) Export
 

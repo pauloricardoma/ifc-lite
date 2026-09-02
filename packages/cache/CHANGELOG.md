@@ -1,5 +1,87 @@
 # @ifc-lite/cache
 
+## 3.1.0
+
+### Minor Changes
+
+- [#3210](https://github.com/LTplus-AG/ifc-lite/pull/3210) [`50895fb`](https://github.com/LTplus-AG/ifc-lite/commit/50895fb5b3d57c95e00daccc1e560f5b619c535d) Thanks [@louistrue](https://github.com/louistrue)! - Carry representation-item identity across the wasm boundary, and stop delivering material ids in the same field.
+  
+  `MeshData` gains two DISJOINT fields. `geometryItemId` is always the `IfcRepresentationItem` a mesh was tessellated from, so a host can drill from a rendered piece into an `IfcWindow`'s pane or frame and navigate to that entity in source. `materialId` is always the `IfcMaterial` whose layer a mesh slices. Never both — a consumer that ignores the distinction still cannot read one as the other.
+  
+  The router already kept each item's STEP id and it already reached the server REST payload; `MeshDataJs::from_mesh_data` did not copy it, so the browser never saw it. And for material-layered walls and slabs the same field carried the layer's `IfcMaterial` id, so following it to source landed on the wrong entity with nothing to warn the caller.
+  
+  `geometryClass === 3` cannot discriminate the two: it is stamped from a static material-index check made before the geometry runs, while the layered path can bail at runtime and emit representation-item submeshes under that class. The discriminator therefore lives on `SubMeshCollection`, set where the layered slabs are built.
+  
+  Neither field is ever `0`. `IfcMaterialLayer.Material` is optional, so an air gap reaches the mesher as `material_id 0` — that is the decoder's "no reference" sentinel, not an entity, and STEP instance names start at `[#1](https://github.com/LTplus-AG/ifc-lite/issues/1)`. Twelve slabs of `duplex.ifc` reported `IfcMaterial #0` before this was filtered at the setter. An air-gap slab is still meshed; it simply reports no material.
+  
+  Both fields cross the boundary, both wasm converters carry them, the REST wire shape and `convertServerMesh` carry them, and the cache format gains them at v14 — without that, a cache-restored session silently lost the identity.
+  
+  BREAKING FOR THE RUST CRATE, and this changeset cannot express it. `ifc-lite-processing` is published to crates.io (`scripts/release-crates.mjs`), `MeshData` gains a public field, and `with_style_metadata(self, material_name, geometry_item_id)` becomes `with_style_metadata(self, material_name, source_id, id_is_material)` — two caller-supplied arguments to three. Both break downstream, and both are demonstrated in-repo: the added field broke the `MeshData` struct literal in `rust/export/src/usd/tests.rs`, and the new argument broke the call in `rust/processing/src/element.rs`. `scripts/sync-versions.js` derives the Cargo workspace version from the highest npm package version, so a `minor` here ships 6.0.1 → 6.1.0 and a consumer pinned to `ifc-lite-processing = "6"` breaks on `cargo update`. This was ungated when the paragraph was written and is not any more. `scripts/check-rust-semver.mjs` ([#3216](https://github.com/LTplus-AG/ifc-lite/issues/3216)) asks `cargo-semver-checks` what bump each crate's API change requires, compares it with the bump the derived version actually carries over the crate's latest crates.io release, and fails when the version is the smaller of the two — and its lint set recognises BOTH breaks named above, a field added to a `pub` struct that callers construct literally and a changed argument count. It runs as the `Rust crate semver` lane on PRs and again before the crates.io publish. The remedy it leaves for a break like this one is `rust-major-offset.json`, which advances the Rust major without inventing an npm major.
+
+### Patch Changes
+
+- [#3320](https://github.com/LTplus-AG/ifc-lite/pull/3320) [`4e6ebb1`](https://github.com/LTplus-AG/ifc-lite/commit/4e6ebb1ef176f99c0c50129f8fe74c4be10068e4) Thanks [@BIMvoice](https://github.com/BIMvoice)! - A cache load no longer renames an element to "Unknown" when its IFC class has no `IfcTypeEnum` member.
+  
+  `EntityTable` carries a `rawTypeName` string column so `getTypeName()` can name a class the hand-maintained `IfcTypeEnum` does not cover — 101 of the 157 concrete `IfcProduct` subtypes in the bundled IFC4 registry, `IfcPump`, `IfcValve`, `IfcAirTerminal`, `IfcBoiler` and `IfcSurfaceFeature` among them. The cache writer never serialized that column and the reader's hand-rolled `EntityTable` had no fallback for it, so every such element came back from a cache hit as "Unknown" while the same model parsed from source named it correctly.
+  
+  The column is now written (cache format v15, appended after the type-range triples so a v14 section stays readable and version-gated on the way in), and `readEntities` builds its table through `entityTableFromColumns` — the same constructor the parser path uses — instead of keeping a second copy of the accessor closures. That duplicate is what let the fallback go missing on one side only.
+- Updated dependencies [[`36350e8`](https://github.com/LTplus-AG/ifc-lite/commit/36350e8439af3c52d62d8bb3f6e2daa7bb8d4fa2), [`329008d`](https://github.com/LTplus-AG/ifc-lite/commit/329008d2324204ff39d2ac4a0423add6a60e8907), [`302121a`](https://github.com/LTplus-AG/ifc-lite/commit/302121ac7bc9312b1073738b3bbe0956ce452cf4), [`5e236e2`](https://github.com/LTplus-AG/ifc-lite/commit/5e236e26a33bfc5e41d82ccd742351e743131293), [`50895fb`](https://github.com/LTplus-AG/ifc-lite/commit/50895fb5b3d57c95e00daccc1e560f5b619c535d), [`c2885ef`](https://github.com/LTplus-AG/ifc-lite/commit/c2885ef575fe57d9bc8e1960bb0ea31cb02f0665)]:
+  - @ifc-lite/data@3.5.0
+  - @ifc-lite/geometry@4.1.0
+
+## 3.0.6
+
+### Patch Changes
+
+- [#3120](https://github.com/LTplus-AG/ifc-lite/pull/3120) [`3bef19b`](https://github.com/LTplus-AG/ifc-lite/commit/3bef19b13d303029b87e862660e3730c06852687) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Derive `EntityTable.typeRanges` from the type column when hydrating a cache, instead of trusting the serialized triples.
+  
+  `typeRanges` changed meaning from `start + count` to a `[firstRow, lastRow + 1]` span. `FORMAT_VERSION` was not bumped, and correctly so — `readHeader` throws only on `version > FORMAT_VERSION`, so caches at the current version are accepted by design and a bump would change nothing for them. The consequence is that the stored triples carry either meaning with nothing to tell them apart, and `readEntities` passed them straight to the public `EntityTable.typeRanges`. For a type whose rows are interleaved with another's — the ordinary case in IFC — the old form named a range that stopped short of the type's own later rows; the two forms coincide only when a type happens to be contiguous, which is what kept the divergence out of sight.
+  
+  `readEntities` already built per-type index arrays for `getByType()`, which is why that path was never affected. The spans are now derived from those same arrays, so one structure feeds both. The serialized field is still written, and still read to keep the byte layout unchanged, but its value no longer reaches the table.
+  
+  This closes the window for caches already on disk rather than fixing a regression: the mixed meaning existed before the semantics changed and is not damage that change caused.
+- Updated dependencies [[`9359bc4`](https://github.com/LTplus-AG/ifc-lite/commit/9359bc488173585b2b90e124cc66dcf8292c4be9), [`8571d70`](https://github.com/LTplus-AG/ifc-lite/commit/8571d70270d072170fc4e204e8b0d11a424d2330), [`f6febcc`](https://github.com/LTplus-AG/ifc-lite/commit/f6febcc2d4986e79b3c44d63853bb72a16475c65), [`74a55a9`](https://github.com/LTplus-AG/ifc-lite/commit/74a55a999117b4e21aa58d0435473073f35c1e81), [`74a55a9`](https://github.com/LTplus-AG/ifc-lite/commit/74a55a999117b4e21aa58d0435473073f35c1e81), [`74a55a9`](https://github.com/LTplus-AG/ifc-lite/commit/74a55a999117b4e21aa58d0435473073f35c1e81), [`063a140`](https://github.com/LTplus-AG/ifc-lite/commit/063a1408e4c54ebc874618f8d68fe298ed3f3a6f), [`74a55a9`](https://github.com/LTplus-AG/ifc-lite/commit/74a55a999117b4e21aa58d0435473073f35c1e81), [`f76c805`](https://github.com/LTplus-AG/ifc-lite/commit/f76c80511dce5ffc1756365b786042c4bc64808d), [`932f043`](https://github.com/LTplus-AG/ifc-lite/commit/932f0439fc1625419aae3cf2d9f81a614fb2273c), [`754837b`](https://github.com/LTplus-AG/ifc-lite/commit/754837b066172dad8afcdf1a0104f1a021b5f6e5), [`2273a73`](https://github.com/LTplus-AG/ifc-lite/commit/2273a73127d03ec36d667544da6237479737881a), [`fdd6121`](https://github.com/LTplus-AG/ifc-lite/commit/fdd61211e41d3e563a7604ac5e0630a9daae2de1), [`00f6e79`](https://github.com/LTplus-AG/ifc-lite/commit/00f6e79c22641ff59bfb3327d910b04f9a164d8b), [`116a3e9`](https://github.com/LTplus-AG/ifc-lite/commit/116a3e94de753b95fa94b2d6c41a0171cd254729)]:
+  - @ifc-lite/data@3.4.1
+  - @ifc-lite/geometry@4.0.0
+
+## 3.0.5
+
+### Patch Changes
+
+- [#2784](https://github.com/LTplus-AG/ifc-lite/pull/2784) [`7b3617f`](https://github.com/LTplus-AG/ifc-lite/commit/7b3617f2ec9a6e9e8a57127d2ec61f9c33cadf3a) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Pin the reject path of `decodeGeometryChunk`'s consumed-bytes guard.
+  
+  `decodeGeometryChunk` (v13 chunked geometry) ends with
+  `if (reader.position !== raw.byteLength) throw ...` — it requires a chunk's
+  mesh records to consume exactly the decoded buffer. Mutation testing showed
+  this guard was unpinned: deleting it left the full suite green, even though
+  the sibling `uncompressedLength` mismatch guard immediately above it already
+  had a dedicated test.
+  
+  The gap is structural, not incidental: `meshCount` and `uncompressedLength`
+  are directory-level fields and can both be truthful while a mesh record's
+  *own* `vertexCount` field disagrees with how many vertices were actually
+  written for it (truncation or corruption mid record). That desync doesn't
+  move the chunk's overall decoded length or its declared mesh count, so
+  neither of the two checks that run before this guard can catch it —
+  `readMeshRecord` simply under-reads, and only the consumed-bytes check
+  notices the reader stopped short of the chunk's end.
+  
+  The new test builds one real chunk, then corrupts only the lone mesh
+  record's `vertexCount` field (leaving the directory's `meshCount` and
+  `uncompressedLength` untouched and correct) so the record under-consumes by
+  exactly the bytes two shortened arrays account for. It fails when the guard
+  is removed and passes with it restored; a control decode with the field
+  restored round-trips fine, confirming the corruption — not an unrelated
+  fixture bug — is what triggers the throw.
+  
+  As a calibration check, the analogous mutation on the neighbouring
+  `validateGeometryDirectory` `headLength` guard (`geometry-directory.ts:32-36`)
+  was confirmed to fail exactly one existing test, showing the harness and
+  build are sound and the new test's win is real.
+- Updated dependencies [[`c688a12`](https://github.com/LTplus-AG/ifc-lite/commit/c688a1272ec72d575e8ecf78072e0a0084b517ca), [`be6b43c`](https://github.com/LTplus-AG/ifc-lite/commit/be6b43c2b334811422c1cbfbea5d6e6d1b9a401d), [`989ee2c`](https://github.com/LTplus-AG/ifc-lite/commit/989ee2c4e396575529488c17b73e1a884e4e8b9d), [`1cda2d0`](https://github.com/LTplus-AG/ifc-lite/commit/1cda2d04dc66542892dd0181768c027b3d1b4e6f), [`105eb31`](https://github.com/LTplus-AG/ifc-lite/commit/105eb31e7ccdd697f74db3bc9fac41396cdc6faa), [`6ce17fa`](https://github.com/LTplus-AG/ifc-lite/commit/6ce17fa903d38ab8ee3e6ebaf6da8453726d3ce2)]:
+  - @ifc-lite/geometry@3.8.4
+  - @ifc-lite/data@3.4.0
+
 ## 3.0.4
 
 ### Patch Changes

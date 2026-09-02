@@ -34,10 +34,12 @@ import {
   guid,
   legacyScheduleModel,
   model,
+  quantityModel,
   railTypeModel,
   scheduleModel,
   typeTagModel,
 } from '../../../cli/src/commands/diff-test-helpers.js';
+import { UNIT_SCALE_MILLIMETRE_MODEL } from '../../../cli/src/commands/diff-unit-scale-fixtures.js';
 import type { CallToolResult } from '../protocol/index.js';
 import type { ToolContext } from '../context.js';
 import { DEFAULT_CONFIG, InMemoryModelRegistry, NOOP_PROGRESS, SILENT_LOGGER } from '../context.js';
@@ -99,6 +101,8 @@ beforeAll(async () => {
   await load('walls', model(guid('OLDA'), guid('OLDB')));
   await load('type-tags', typeTagModel());
   await load('rail-types', railTypeModel());
+  await load('qty-mm', quantityModel('MILLIMETRE', 2000));
+  await load('unit-scale', UNIT_SCALE_MILLIMETRE_MODEL);
 }, 60_000);
 
 afterAll(async () => {
@@ -188,7 +192,7 @@ describe('fingerprint parity with the CLI copy', () => {
   // codegen pin silently reads no Tag at all while every IFC2X3 and IFC4
   // fixture above still agrees. Without this row, fixing one copy's attribute
   // lookup and not the other's would pass.
-  it.each(['legacy-base', 'sched', 'walls', 'type-tags', 'rail-types'])(
+  it.each(['legacy-base', 'sched', 'walls', 'type-tags', 'rail-types', 'qty-mm', 'unit-scale'])(
     'answers as the CLI does on %s',
     (id) => {
       const mcp = new Map(

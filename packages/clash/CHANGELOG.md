@@ -1,5 +1,196 @@
 # @ifc-lite/clash
 
+## 1.9.2
+
+### Patch Changes
+
+- [#3257](https://github.com/LTplus-AG/ifc-lite/pull/3257) [`dcf3838`](https://github.com/LTplus-AG/ifc-lite/commit/dcf383831c7f3ec671360a39f6357b51821f2648) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Clash detection no longer reports a void against the element it cuts.
+  
+  The non-clashable filter listed `IfcOpeningElement` and `IfcOpeningStandardCase` by hand — one branch of the subtraction family in its IFC4 spelling. `IfcVoidingFeature` (IFC4) and `IfcEarthworksCut` (IFC4.3) are `IfcFeatureElementSubtraction` subtypes too, are meshed like any other product, and were becoming clash candidates, so every such void collided with its host. Subtraction features are now derived from the bundled schema union instead of enumerated, so a class a later schema adds is covered without another edit.
+  
+  Addition features stay clashable: `IfcProjectionElement` and `IfcSurfaceFeature` are physical material, so a clash against them is a real coordination problem.
+- Updated dependencies [[`b456e27`](https://github.com/LTplus-AG/ifc-lite/commit/b456e279831dbde5b2889b788aada9bd06ff32b8), [`8092522`](https://github.com/LTplus-AG/ifc-lite/commit/80925228ec72aca31d7e9fa3ab4466895c4b1f66), [`98828c4`](https://github.com/LTplus-AG/ifc-lite/commit/98828c4b004506b6d31546ce93b533fa26e808ea), [`98828c4`](https://github.com/LTplus-AG/ifc-lite/commit/98828c4b004506b6d31546ce93b533fa26e808ea), [`c658213`](https://github.com/LTplus-AG/ifc-lite/commit/c658213bfa5c17a767c8534e68f2416bac780979), [`da266c1`](https://github.com/LTplus-AG/ifc-lite/commit/da266c1138767208f193083eb8b39d48e34b9a5d), [`c1490aa`](https://github.com/LTplus-AG/ifc-lite/commit/c1490aa48037c396d014f1dcb9647934fc16e43d), [`38460bd`](https://github.com/LTplus-AG/ifc-lite/commit/38460bd543d6c869db15f867b129db6f965695da), [`e2c67f0`](https://github.com/LTplus-AG/ifc-lite/commit/e2c67f084bfca20ff82460ae54aa80a383fcb39a), [`302121a`](https://github.com/LTplus-AG/ifc-lite/commit/302121ac7bc9312b1073738b3bbe0956ce452cf4), [`08cbf72`](https://github.com/LTplus-AG/ifc-lite/commit/08cbf72dbb3e375d20f703c8c813d4cd873657c1), [`5e236e2`](https://github.com/LTplus-AG/ifc-lite/commit/5e236e26a33bfc5e41d82ccd742351e743131293), [`8dd8a9d`](https://github.com/LTplus-AG/ifc-lite/commit/8dd8a9db10a2b2388a4e92f92f0835468ee58a69), [`c8049a0`](https://github.com/LTplus-AG/ifc-lite/commit/c8049a0bf464cd1fec7a4cd2aad2f08326e04737), [`50895fb`](https://github.com/LTplus-AG/ifc-lite/commit/50895fb5b3d57c95e00daccc1e560f5b619c535d), [`24c7abc`](https://github.com/LTplus-AG/ifc-lite/commit/24c7abc6510f2e469992c0e76554471bf1cfe296), [`d470d76`](https://github.com/LTplus-AG/ifc-lite/commit/d470d768cea3eb18dbb9c1138e128bc23ebfca68), [`ffe80a7`](https://github.com/LTplus-AG/ifc-lite/commit/ffe80a76ab269b6ce8abe52a9ebc7bd16c184db5), [`bb3fc2c`](https://github.com/LTplus-AG/ifc-lite/commit/bb3fc2c5af754a120b98b545e186303de0fb4951)]:
+  - @ifc-lite/parser@4.3.2
+  - @ifc-lite/ifcx@3.0.1
+  - @ifc-lite/wasm@6.1.0
+  - @ifc-lite/geometry@4.1.0
+
+## 1.9.1
+
+### Patch Changes
+
+- [#3041](https://github.com/LTplus-AG/ifc-lite/pull/3041) [`5ea5f99`](https://github.com/LTplus-AG/ifc-lite/commit/5ea5f9969f3a4a3f8b21eb2a90a1df2be48eb7b0) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Drop the no-op dedup `Set` from `queryMeshCross`, removing a quadratic allocation and an uncapped `Set` from contact clustering's inner loop.
+  
+  `queryMeshCross` funnelled its candidate triangle pairs through a `Set` keyed `` `${iA}|${iB}` ``, described in its own comment as "belt-and-braces" because BVH leaves partition the triangle set. That reasoning holds, and the set removed nothing: `buildNode` splits a node's indices into disjoint, covering halves and a leaf keeps exactly its own slice, so every triangle lives in exactly one leaf; and `crossNode` reaches any node pair by a single route, descending both sides together while both are internal and only the internal side once the other is a leaf. Each leaf pair is therefore visited once and each `(iA, iB)` emitted at most once.
+  
+  What it did cost was one key string and one `Set` entry per emitted pair — O(triangles_A × triangles_B) in the worst case, for a single element pair, with no cap. `Set` shares V8's hard 2^24-entry ceiling, and 4096 × 4096 = 2^24, so two roughly 4k-triangle elements whose AABB filter passes nearly everything sit exactly on it.
+  
+  Output is unchanged, in content and in order. New tests pin the emitted pair list against a brute-force ground truth across leaf sizes, triangle counts, epsilons and lopsided trees, and check the leaf partition directly; deliberately breaking either the partition or the traversal's single-visit property makes them fail.
+- Updated dependencies [[`93b450c`](https://github.com/LTplus-AG/ifc-lite/commit/93b450c1cc0c3cee811625989edb82cf522c70c4), [`ddf9f1d`](https://github.com/LTplus-AG/ifc-lite/commit/ddf9f1da830cef5f941ea09e8aee19624e9def3a), [`f7e26e4`](https://github.com/LTplus-AG/ifc-lite/commit/f7e26e4200e1475728d4976142b49cb408400a8e), [`e19aa0e`](https://github.com/LTplus-AG/ifc-lite/commit/e19aa0ef271eccc7f2f6862b8580e9f98dbd1a66), [`0ea7167`](https://github.com/LTplus-AG/ifc-lite/commit/0ea7167a6bd96d5b5e12e7e5a8c5615ab0b7c3b2), [`e6caf11`](https://github.com/LTplus-AG/ifc-lite/commit/e6caf11a8f8d9d8634a6811b6705ab3367cd02e0), [`7ff31ba`](https://github.com/LTplus-AG/ifc-lite/commit/7ff31ba854671a9ca3ebbf30b15e928e1b52a8b9), [`8ba612f`](https://github.com/LTplus-AG/ifc-lite/commit/8ba612f90d3bb0ad41f756d6fdef6b3250e8d330), [`8571d70`](https://github.com/LTplus-AG/ifc-lite/commit/8571d70270d072170fc4e204e8b0d11a424d2330), [`5781e5c`](https://github.com/LTplus-AG/ifc-lite/commit/5781e5c2998111926683419d27f8efa3519de7c6), [`74a55a9`](https://github.com/LTplus-AG/ifc-lite/commit/74a55a999117b4e21aa58d0435473073f35c1e81), [`74a55a9`](https://github.com/LTplus-AG/ifc-lite/commit/74a55a999117b4e21aa58d0435473073f35c1e81), [`74a55a9`](https://github.com/LTplus-AG/ifc-lite/commit/74a55a999117b4e21aa58d0435473073f35c1e81), [`063a140`](https://github.com/LTplus-AG/ifc-lite/commit/063a1408e4c54ebc874618f8d68fe298ed3f3a6f), [`74a55a9`](https://github.com/LTplus-AG/ifc-lite/commit/74a55a999117b4e21aa58d0435473073f35c1e81), [`f7e26e4`](https://github.com/LTplus-AG/ifc-lite/commit/f7e26e4200e1475728d4976142b49cb408400a8e), [`f76c805`](https://github.com/LTplus-AG/ifc-lite/commit/f76c80511dce5ffc1756365b786042c4bc64808d), [`75867a7`](https://github.com/LTplus-AG/ifc-lite/commit/75867a7e6ebf51b2da47cab14242bcd71787ba3b), [`4a8fe77`](https://github.com/LTplus-AG/ifc-lite/commit/4a8fe77707127d251702610490f53430610e4ef7), [`f7e26e4`](https://github.com/LTplus-AG/ifc-lite/commit/f7e26e4200e1475728d4976142b49cb408400a8e), [`f449776`](https://github.com/LTplus-AG/ifc-lite/commit/f4497765cb4e17828ff6ca6b52fb8a96caa2f81f), [`dec0708`](https://github.com/LTplus-AG/ifc-lite/commit/dec0708ef841c88abea6ec91404419fd7a3d93c6), [`dec0708`](https://github.com/LTplus-AG/ifc-lite/commit/dec0708ef841c88abea6ec91404419fd7a3d93c6), [`dec0708`](https://github.com/LTplus-AG/ifc-lite/commit/dec0708ef841c88abea6ec91404419fd7a3d93c6), [`932f043`](https://github.com/LTplus-AG/ifc-lite/commit/932f0439fc1625419aae3cf2d9f81a614fb2273c), [`754837b`](https://github.com/LTplus-AG/ifc-lite/commit/754837b066172dad8afcdf1a0104f1a021b5f6e5), [`2273a73`](https://github.com/LTplus-AG/ifc-lite/commit/2273a73127d03ec36d667544da6237479737881a), [`131e3dc`](https://github.com/LTplus-AG/ifc-lite/commit/131e3dc84244d9dd24859a5923ef0aef4d6119c4), [`fdd6121`](https://github.com/LTplus-AG/ifc-lite/commit/fdd61211e41d3e563a7604ac5e0630a9daae2de1), [`78d85dc`](https://github.com/LTplus-AG/ifc-lite/commit/78d85dcd4c59ee5b3b3b7857a454113c4911bc36), [`147693a`](https://github.com/LTplus-AG/ifc-lite/commit/147693a7a8fd0778ddb71839199b75bf1d622327), [`bea50bd`](https://github.com/LTplus-AG/ifc-lite/commit/bea50bd7bca7fdf69f01076ebb96a31b8e797a46), [`74a55a9`](https://github.com/LTplus-AG/ifc-lite/commit/74a55a999117b4e21aa58d0435473073f35c1e81), [`74a55a9`](https://github.com/LTplus-AG/ifc-lite/commit/74a55a999117b4e21aa58d0435473073f35c1e81), [`00f6e79`](https://github.com/LTplus-AG/ifc-lite/commit/00f6e79c22641ff59bfb3327d910b04f9a164d8b), [`e43582b`](https://github.com/LTplus-AG/ifc-lite/commit/e43582b069007c6c2c932f6981743a80630fe217), [`043e06a`](https://github.com/LTplus-AG/ifc-lite/commit/043e06a05c6625fef91bb17d84e3a3447f1379e3)]:
+  - @ifc-lite/bcf@2.0.0
+  - @ifc-lite/parser@4.3.0
+  - @ifc-lite/wasm@6.0.0
+  - @ifc-lite/ifcx@3.0.0
+  - @ifc-lite/geometry@4.0.0
+  - @ifc-lite/query@2.0.0
+  - @ifc-lite/spatial@1.14.15
+
+## 1.9.0
+
+### Minor Changes
+
+- [#2805](https://github.com/LTplus-AG/ifc-lite/pull/2805) [`0a10389`](https://github.com/LTplus-AG/ifc-lite/commit/0a1038972a72b27bda99c8793055efe39d623f10) Thanks [@louistrue](https://github.com/louistrue)! - Expose an exact minimum-distance query between two meshes, with witness points.
+  
+  `triTriDistance` already computed the exact triangle-to-triangle minimum
+  distance, but it lived under `math/`, which has no export subpath, so any
+  consumer outside the package hit `ERR_PACKAGE_PATH_NOT_EXPORTED`. What did not
+  exist anywhere was a traversal that can find the CLOSEST pair: every BVH query
+  in the package is an overlap predicate, so two disjoint meshes yield an empty
+  candidate set and there is nothing left to measure.
+  
+  Adds `minDistanceBetweenMeshes` / `minDistanceBetweenBvhs` (branch-and-bound
+  over the two BVHs, pruning on the exact AABB lower bound) and re-exports
+  `buildMeshBvh` / `queryMeshCross` from `@ifc-lite/clash/contact` so a caller
+  measuring one element against several can build each tree once. Additive: no
+  existing export changes.
+
+### Patch Changes
+
+- [#2819](https://github.com/LTplus-AG/ifc-lite/pull/2819) [`432fdb8`](https://github.com/LTplus-AG/ifc-lite/commit/432fdb8dd12dd90af17d1ca3ce24a2fd5b7168b0) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix two divergences between `@ifc-lite/clash`'s STEP and IFCX source adapters, found by comparing them side by side.
+  
+  `adapters/ifcx.ts` had no equivalent of `adapters/step.ts`'s [#1464](https://github.com/LTplus-AG/ifc-lite/issues/1464) non-clashable-tag filter: an IFCX-sourced model reproduced the same phantom-clash bug class (openings, spaces, and spatial containers with tessellated geometry becoming ordinary clash candidates) that [#1464](https://github.com/LTplus-AG/ifc-lite/issues/1464) fixed for STEP.
+  
+  `adapters/step.ts` had no equivalent of `adapters/ifcx.ts`'s per-entity mesh coalescing: an entity with more than one mesh representation (e.g. Body + Axis) produced one `ClashElement` per mesh instead of one per entity, and `buildStepExclusions`'s `byExpressId` map silently kept only the last mesh's geometry for that entity.
+  
+  Both the non-clashable-tag filter and the mesh-coalescing logic now live in one shared module (`adapters/shared.ts`) that both adapters call, instead of two copies that could (and did) drift apart. `elementsFromIfcx`'s `tag` is already the real IFC class code, spelled identically to STEP's `node.type`, so the filter applies verbatim; merged bounds are derived from the merged geometry, so the union is correct without a separate "combine bounds" step.
+  
+  No existing fixture's clash count changed: the affected code paths (IFCX openings/spaces/containers, STEP multi-mesh entities) had no prior test coverage to regress.
+
+- [#2704](https://github.com/LTplus-AG/ifc-lite/pull/2704) [`6a43522`](https://github.com/LTplus-AG/ifc-lite/commit/6a43522cdf3b0a9b0f7ce303b59f479dca2a2aca) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix clash element identity for federated models past the first.
+  
+  The viewer's loader shifts every `mesh.expressId` into the federated global id
+  space in place, while `IfcDataStore` keeps local express ids. `elementsFromStep`
+  used `mesh.expressId` to address the store anyway, so for any model with a
+  non-zero `idOffset` every lookup missed: `key` fell back to the synthetic
+  `expressid:N`, `tag` read `Unknown`, name and storey came back empty, and
+  `buildStepExclusions` found no relationships — so the void / host / assembly
+  exclusions silently stopped excluding, and a door in the opening it fills was
+  reported as a hard clash. `ref` was wrong in the other direction, with
+  `federation.toGlobalId` adding the offset a second time.
+  
+  `elementsFromStep` now takes `meshIdOffset`: the shift the host has already
+  applied to `mesh.expressId`. It subtracts that back out before touching the
+  store, so the store is addressed locally and the federation offset is applied
+  exactly once. Callers that pass local meshes (CLI, MCP, the playground) leave it
+  at its `0` default and are unaffected — it stays optional deliberately, since
+  `elementsFromStep` is published API and requiring it would break every external
+  caller. To keep a forgotten offset from being silent in any host, the adapter
+  now also warns once when every element in a model resolves to an empty GlobalId
+  *and the store does hold GlobalIds* — the signature of exactly this wiring
+  mistake. A model whose store has none (a GLB import, whose store carries
+  geometry and no IFC entities) is left alone: there, every element missing is the
+  normal state, not a defect.
+  
+  The synthetic key an element without a GlobalId falls back to is now scoped to
+  its model — `expressid:<encoded modelId>:<expressId>` rather than
+  `expressid:<expressId>`. Express ids are only unique within a model, and review
+  state and user element-pair exclusions are keyed on the element key alone
+  (deliberately, so they survive a reload), so in a federation the unqualified
+  form made two models' elements one identity: a review status or an exclusion set
+  on one model's element silently covered another model's element. Two federated
+  GLB models produced ONE review key where there should have been two.
+  
+  Migration: elements that have a GlobalId — nearly all of them, and every one
+  this fix restores — are unaffected; only the fallback changes shape. A review
+  status or an element-pair exclusion a previous session stored against the old
+  `expressid:N` string stops matching: the clash comes back as `open`, the
+  exclusion rule stays listed but suppresses nothing. Nothing is mis-applied, and
+  nothing else reads the string. In the viewer that fallback is per-load anyway
+  (the model id is a per-load uuid), which is the honest position for an element
+  that carries no durable identity of its own. Review status a pre-fix session
+  saved against a federated model past the first was likewise keyed on the old
+  fallback and no longer matches.
+
+- [#2878](https://github.com/LTplus-AG/ifc-lite/pull/2878) [`b699875`](https://github.com/LTplus-AG/ifc-lite/commit/b6998754039676def950735335147556afcb2977) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix clash detection silently skipping every GPU-instanced entity.
+  
+  `useClash` built its clash elements from `model.geometryResult.meshes` alone, which excludes every entity whose geometry was fully GPU-instanced — anything repeated 8 or more times (`INSTANCE_MIN_OCCURRENCES` in the wasm mesher). Doors, windows, columns, sprinklers, light fittings, and other repeated components vanished from clash detection with no error, no warning, and no count discrepancy: the report simply came back short.
+  
+  `gatherElements` now restores those entities with `withInstancedMeshes` — the same helper the glTF/IFC5 export path already uses ([#2558](https://github.com/LTplus-AG/ifc-lite/issues/2558)/[#2576](https://github.com/LTplus-AG/ifc-lite/issues/2576)) to reach instanced-only geometry through `Scene.getAllInstancedMeshData()`. This surfaces real triangles from the live renderer scene, not an AABB approximation, so a clash reported off an instanced entity is exactly as exact as one reported off a flat mesh.
+  
+  This also covers federated models. `withInstancedMeshes` used to gate on `isPrimary` and no-op for every non-primary model — correct when it was written, but GPU instancing stopped being primary-only once federated models got instanced shards too ([#2255](https://github.com/LTplus-AG/ifc-lite/issues/2255)), and the gate was never updated, so a federated model's own instanced entities were silently skipped for both clash and every glTF/IFC5/KMZ export call site. The helper now takes this model's `{ idOffset, maxExpressId }` id-range bracket instead of a boolean, scoping `getAllInstancedMeshData()`'s all-models output down to just this model's occurrences — restoring a federated model's own instanced entities without a federation of N models double-counting each other's.
+  
+  `elementsFromStep` (`@ifc-lite/clash`) now also keys an element's identity on `MeshData.occurrenceKey` when present, so distinct physical occurrences of one GPU-instanced expressId no longer collapse onto a single review/exclusion key, and a relationship-derived exclusion (void/host, assembly) fans out to every occurrence sharing that expressId instead of only the last one built.
+  
+  That per-occurrence `key` is one `ClashElement` per `MeshData`, so an entity with a mix of a flat submesh and an instanced occurrence (an ordinary shape once routing goes per-mesh, `rust/wasm-bindings/src/api/gpu_meshes/batch.rs:820-856`) now mints two elements with the SAME `ref` but DIFFERENT `key`s. The broad-phase self-clash guard only checked `key`, so that pair passed through as a false-positive self-clash — the entity clashing with itself. `candidatePairs`' guard (`@ifc-lite/clash`, `engine-ts/broad.ts`) now also treats a shared `ref` within the same model as the same entity.
+
+- [#2815](https://github.com/LTplus-AG/ifc-lite/pull/2815) [`b3a4d30`](https://github.com/LTplus-AG/ifc-lite/commit/b3a4d307c50c9b0a8b8bb0e29952c4a98e417c16) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `minDistanceBetweenMeshes`/`minDistanceBetweenBvhs` reporting a nonzero distance for a genuinely intersecting pair of triangles.
+  
+  `minDistanceBetweenBvhs` called `triTriDistance` unconditionally on every candidate leaf triangle pair, with no `triTriIntersect` gate. `triTriDistance`'s own contract says it is "only invoked for non-intersecting pairs" — intersecting triangles must be detected separately. For an axis-aligned box-overlap pair the missing gate happened not to matter (overlapping-box vertices/edges land exactly on the boundary features `triTriDistance` samples, so it returned 0 anyway), which is why the existing test suite did not catch it. A tilted, non-axis-aligned triangle pierced through another triangle's face interior has no such coincidence and returned a nonzero gap for two surfaces that actually overlap, contradicting `MeshDistance.distance`'s own documentation ("0 when they touch or overlap").
+  
+  The traversal now tests `triTriIntersect` before `triTriDistance` on each candidate leaf pair, the same order `engine-ts/narrow.ts` already uses for its per-pair test. Since 0 is the smallest distance this query can ever report, finding an intersecting pair now returns immediately rather than continuing to search the remaining frontier.
+
+- [#2818](https://github.com/LTplus-AG/ifc-lite/pull/2818) [`5334bd1`](https://github.com/LTplus-AG/ifc-lite/commit/5334bd1589acb1c4b81a1f255d1a9171530b1467) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix two clash-detection bugs.
+  
+  `matchesSelector` mishandled a selector made of only negated alternatives
+  (e.g. `!IfcWall|!IfcSlab`): the top-level `!` handling stripped only the
+  first leading `!` and negated the recursive match on the remainder, so the
+  second exclusion's type still matched. `matchesSelector('IfcSlab',
+  '!IfcWall|!IfcSlab')` returned `true` instead of `false`. A pure negation
+  list is now treated as an implicit AND of exclusions -- "match everything
+  except A and except B" -- rather than the literal (and useless, tautological
+  for any single input) OR-of-negations reading. Mixed positive/negative
+  selectors (e.g. `IfcWall|!IfcSlab`) are unaffected.
+  
+  `clusterSharedFaces`'s `classify` step relabeled a small-area coplanar
+  contact (area between `pointAreaM2` and `surfaceAreaM2`) as `kind: "line"`,
+  but such a cluster comes from `buildSurfaceCluster`, which always sets
+  `length_m: 0` -- contradicting the field's own documented invariant
+  ("line only -- 0 otherwise") and the viewer's contact overlay, which renders
+  `"line"` clusters as a 2-point segment rather than the polygon boundary a
+  surface cluster actually has. This band is now classified `"surface"`.
+
+- [#2839](https://github.com/LTplus-AG/ifc-lite/pull/2839) [`b1ac6be`](https://github.com/LTplus-AG/ifc-lite/commit/b1ac6be425cd89ff90eaab02636211f0d928b3e6) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Add direct tests for `runClash`'s shared orchestration (severity resolution, exclusions, dedup, sort ordering, summary tallies) and document a blind spot in `differential.test.ts` ([#2830](https://github.com/LTplus-AG/ifc-lite/issues/2830)).
+  
+  `engine-wasm/index.ts` calls the same `runClash` (`engine-ts/orchestrator.ts`) as `engine-ts/index.ts`, so the differential suite comparing the two backends can never catch a bug in that shared orchestration — only in the geometry kernel. Verified: constant-folding `inferClashSeverity` to always return `'info'` left all 16 differential tests passing.
+  
+  The suite's header now says so explicitly. `engine-ts/orchestrator.test.ts` (new) drives `runClash` directly through a fake kernel to cover severity resolution, exclusion gating, identity/dedup, and sort ordering on their own terms; `analysis.test.ts` gained direct coverage of `summarizeClashes`'s tallies. No behavior changes — tests only.
+
+- [#2816](https://github.com/LTplus-AG/ifc-lite/pull/2816) [`c233d48`](https://github.com/LTplus-AG/ifc-lite/commit/c233d48a935a70851271b61a305f43dd9261dcca) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Add frozen-output vectors that pin `uuidFromSeed`'s hard-coded expected UUIDs.
+  
+  Every existing test touching `uuidFromSeed` (in `bcf-bridge.test.ts`) either
+  compared two calls against each other within the same process, or checked
+  shape/regex/version-nibble — none asserted a fixed expected value. That is
+  the same shape as an encode/decode pair sharing a table: internally
+  consistent, free to drift. Confirmed by mutation: replacing all four salt
+  constants in `deterministic-uuid.ts` with different arbitrary values still
+  produced valid-shaped, self-consistent UUIDs, and the existing suite stayed
+  green.
+  
+  These are BCF topic guids: `bcf-bridge.ts` derives a topic's guid from
+  `uuidFromSeed(group.id)` so that re-running the same coordination produces
+  byte-identical topic guids and previously exported BCF topics keep
+  correlating with the clash they describe. A silent change to the salts, the
+  mixing/rotation order, or the version/variant nibble derivation would
+  silently detach every previously exported BCF topic from its clash.
+  
+  No behavior change — this is test-only. The new vectors are frozen output
+  captured from the current implementation, not values derived from any
+  specification (there is no external reference for this algorithm); the test
+  file documents this explicitly so a failing assertion is never "fixed" by
+  regenerating the expected value from the new code.
+
+- [#2820](https://github.com/LTplus-AG/ifc-lite/pull/2820) [`b28a629`](https://github.com/LTplus-AG/ifc-lite/commit/b28a629d49f279ce01537cb06ae4c28f32beb2bb) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Pin eight untested comparison-operator boundaries in the clash geometry kernel with exact-boundary fixtures found by mutation testing (flipping the operator killed zero tests): `contact/aabb.ts`'s `intersects()`, `contains()`, and `longestAxis()`; `contact/bvh.ts`'s and `contact/mesh-bvh.ts`'s inflated-bounds overlap checks; and `engine-ts/obb.ts`'s zero-thickness reject, noise-band skip, and through-penetration far-side check. No production logic changed — this is coverage-only.
+
+- [#2881](https://github.com/LTplus-AG/ifc-lite/pull/2881) [`1900a1a`](https://github.com/LTplus-AG/ifc-lite/commit/1900a1a9f8174ef874dddbd1541ccadd9a89415e) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Pin the `depthClashResult` f32-precision-floor comparison (`<=` at `engine-ts/depth.ts:195`) with a fixture whose box-box MTD lands exactly on the computed floor value, found by mutation testing (flipping the operator killed zero tests — the nearest existing fixtures sit a decade below and well above the boundary). No production logic changed — this is coverage-only, ported 1:1 from the equivalent Rust pin in `rust/clash/src/kernel_tests.rs`.
+- Updated dependencies [[`b9faf82`](https://github.com/LTplus-AG/ifc-lite/commit/b9faf8296f86943914c30550af8131fee250d4c8), [`8f89331`](https://github.com/LTplus-AG/ifc-lite/commit/8f893311b170a983e160737bd9479c3caf961911), [`bc179f6`](https://github.com/LTplus-AG/ifc-lite/commit/bc179f6a1091c8c307a07b31d8c30fbba140e4a9), [`b9faf82`](https://github.com/LTplus-AG/ifc-lite/commit/b9faf8296f86943914c30550af8131fee250d4c8), [`48b204b`](https://github.com/LTplus-AG/ifc-lite/commit/48b204b868016aad29b694b53ac8ace5e76a0542), [`c688a12`](https://github.com/LTplus-AG/ifc-lite/commit/c688a1272ec72d575e8ecf78072e0a0084b517ca), [`79322b6`](https://github.com/LTplus-AG/ifc-lite/commit/79322b6e76049be0df3b07149c711414bd80863e), [`2156528`](https://github.com/LTplus-AG/ifc-lite/commit/2156528c926114233c79ba74925c0c8656f1ea65), [`7869a90`](https://github.com/LTplus-AG/ifc-lite/commit/7869a90f35384ceba40b7ce4f3e9fadbe6990fa8), [`989ee2c`](https://github.com/LTplus-AG/ifc-lite/commit/989ee2c4e396575529488c17b73e1a884e4e8b9d), [`1cda2d0`](https://github.com/LTplus-AG/ifc-lite/commit/1cda2d04dc66542892dd0181768c027b3d1b4e6f), [`0ed2582`](https://github.com/LTplus-AG/ifc-lite/commit/0ed2582b71973fa6d16307999ed2ea59f7a2db3f), [`5a9ecfb`](https://github.com/LTplus-AG/ifc-lite/commit/5a9ecfb6bcd3190eae4463bd8926cf38a2143496), [`a29b040`](https://github.com/LTplus-AG/ifc-lite/commit/a29b04069fec3c6b726f49fc58054e535c255034), [`cc19a8d`](https://github.com/LTplus-AG/ifc-lite/commit/cc19a8d4a79a5e8563a90ab663b28e1b93ef9c18), [`36e4eca`](https://github.com/LTplus-AG/ifc-lite/commit/36e4eca3b19a2fe02f1679acc9a2a43cd90aa163), [`a7b8a20`](https://github.com/LTplus-AG/ifc-lite/commit/a7b8a201eaecd411a4246421893e887bf55aafd3), [`ad50aa9`](https://github.com/LTplus-AG/ifc-lite/commit/ad50aa9751c31f6895944e26ce19fe8cbbf3018e), [`105eb31`](https://github.com/LTplus-AG/ifc-lite/commit/105eb31e7ccdd697f74db3bc9fac41396cdc6faa), [`5254699`](https://github.com/LTplus-AG/ifc-lite/commit/52546994268440a468de81ce6ac0b385e6ef73d7), [`6ce17fa`](https://github.com/LTplus-AG/ifc-lite/commit/6ce17fa903d38ab8ee3e6ebaf6da8453726d3ce2), [`b7d2a11`](https://github.com/LTplus-AG/ifc-lite/commit/b7d2a11345add8acdf0926ade5d4c1ca19ccecf7), [`ae5a5ca`](https://github.com/LTplus-AG/ifc-lite/commit/ae5a5caa3e20304085ba14c0708cd026c1d4bf16)]:
+  - @ifc-lite/bcf@1.18.2
+  - @ifc-lite/geometry@3.8.4
+  - @ifc-lite/parser@4.2.0
+  - @ifc-lite/query@1.14.17
+  - @ifc-lite/wasm@5.0.0
+  - @ifc-lite/ifcx@2.3.7
+  - @ifc-lite/spatial@1.14.14
+
 ## 1.8.0
 
 ### Minor Changes

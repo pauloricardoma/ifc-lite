@@ -18,7 +18,8 @@
 //! Lengths are in metres (unit scale applied).
 
 use crate::profiles::ProfileProcessor;
-use crate::{Error, Point3, Result, TessellationQuality, Vector3};
+use crate::{profile_skip::SkippedProfile, Error, Point3, Result, TessellationQuality, Vector3};
+pub(crate) use ifc_lite_core::MAX_PLACEMENT_DEPTH;
 use ifc_lite_core::{
     build_entity_index, AttributeValue, DecodedEntity, EntityDecoder, EntityScanner, IfcSchema,
     IfcType,
@@ -77,15 +78,12 @@ pub struct ExtractedProfile {
 // PUBLIC ENTRY POINT
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Extract profiles for every building element in `content`.
-///
-/// Extracts `IfcExtrudedAreaSolid` representations, including those nested
-/// inside `IfcMappedItem` chains (up to 3 levels deep).
-/// Returns an empty `Vec` for models with no such elements.
-pub fn extract_profiles<T>(content: &T, model_index: u32) -> Vec<ExtractedProfile>
-where
-    T: AsRef<[u8]> + ?Sized,
-{
+/// Extract `IfcExtrudedAreaSolid` profiles (incl. nested `IfcMappedItem`) for every element in `content`. Drops are silent — see [`extract_profiles_with_diagnostics`].
+pub fn extract_profiles<T: AsRef<[u8]> + ?Sized>(content: &T, model_index: u32) -> Vec<ExtractedProfile> {
+    extract_profiles_with_diagnostics(content, model_index).0
+}
+/// Same as [`extract_profiles`], plus every [`SkippedProfile`] (default features — unlike `diag_debug!`).
+pub fn extract_profiles_with_diagnostics<T: AsRef<[u8]> + ?Sized>(content: &T, model_index: u32) -> (Vec<ExtractedProfile>, Vec<SkippedProfile>) {
     let content = content.as_ref();
     let entity_index = build_entity_index(content);
     let mut decoder = EntityDecoder::with_index(content, entity_index);
@@ -96,7 +94,7 @@ where
     let schema = IfcSchema::new();
     let profile_processor = ProfileProcessor::new(schema);
 
-    let mut results = Vec::new();
+    let (mut results, mut skipped) = (Vec::new(), Vec::new());
     let mut scanner = EntityScanner::new(content);
 
     while let Some((id, type_name, start, end)) = scanner.next_entity() {
@@ -110,13 +108,14 @@ where
         };
 
         // Issue #979: feature elements (IfcOpeningElement and the rest of the
-        // void/feature family) are boolean subtraction/addition operands, not
-        // building structure — they must never emit a construction-projection
-        // profile. `is_subtype_of` walks the supertype chain, so this single
-        // check covers Opening / Voiding / Earthworks / Projection / Surface
-        // features without touching IfcDoor/IfcWindow (which descend from
-        // IfcBuiltElement, not IfcFeatureElement).
-        if entity.ifc_type.is_subtype_of(IfcType::IfcFeatureElement) {
+        // void/feature family) are boolean operands, not building structure —
+        // they must never emit a construction-projection profile, and walking
+        // the supertype chain covers the whole family in one check. Resolved
+        // from `type_name`, NOT `entity.ifc_type`: the decoder sets that with a
+        // bare `from_str`, so a legacy keyword arrives as `Unknown` (a subtype
+        // of nothing) and `IFCOPENINGSTANDARDCASE` emitted a profile (#3172).
+        let resolved_type = ifc_lite_core::legacy_aware_ifc_type(type_name);
+        if resolved_type.is_subtype_of(IfcType::IfcFeatureElement) {
             continue;
         }
 
@@ -146,7 +145,7 @@ where
             Err(_) => continue,
         };
 
-        let ifc_type_name = entity.ifc_type.name().to_string();
+        let ifc_type_name = resolved_type.name().to_string();
 
         for shape_rep in representations {
             if shape_rep.ifc_type != IfcType::IfcShapeRepresentation {
@@ -191,6 +190,7 @@ where
                                     eprintln!("[profile_extractor] Skipping #{id} ({ifc_type_name}): {_e}");
                                 }
                             );
+                            skipped.push(SkippedProfile { express_id: id, ifc_type: ifc_type_name.clone(), reason: _e.to_string() });
                         }
                     }
                 } else if item.ifc_type == IfcType::IfcMappedItem {
@@ -204,14 +204,14 @@ where
                         &mut decoder,
                         model_index,
                         0,
-                        &mut results,
+                        &mut results, &mut skipped,
                     );
                 }
             }
         }
     }
 
-    results
+    (results, skipped)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -241,7 +241,7 @@ fn extract_mapped_item_profiles(
     decoder: &mut EntityDecoder,
     model_index: u32,
     depth: usize,
-    results: &mut Vec<ExtractedProfile>,
+    results: &mut Vec<ExtractedProfile>, skipped: &mut Vec<SkippedProfile>,
 ) {
     if depth > MAX_MAPPED_DEPTH {
         crate::diag::diag_debug!(
@@ -252,6 +252,7 @@ fn extract_mapped_item_profiles(
                 eprintln!("[profile_extractor] #{element_id} ({ifc_type}): max mapped item depth exceeded");
             }
         );
+        skipped.push(SkippedProfile { express_id: element_id, ifc_type: ifc_type.to_string(), reason: "max mapped item depth exceeded".to_string() });
         return;
     }
 
@@ -346,6 +347,7 @@ fn extract_mapped_item_profiles(
                             eprintln!("[profile_extractor] #{element_id} ({ifc_type}) mapped: {_e}");
                         }
                     );
+                    skipped.push(SkippedProfile { express_id: element_id, ifc_type: ifc_type.to_string(), reason: _e.to_string() });
                 }
             }
         } else if sub_item.ifc_type == IfcType::IfcMappedItem {
@@ -359,7 +361,7 @@ fn extract_mapped_item_profiles(
                 decoder,
                 model_index,
                 depth + 1,
-                results,
+                results, skipped,
             );
         }
     }
@@ -519,9 +521,8 @@ fn get_placement_transform(
     }
 }
 
-const MAX_PLACEMENT_DEPTH: usize = 100;
-
-fn get_placement_recursive(
+/// `pub(crate)` so the #2873 divergence test can drive this walk and the mesh path's.
+pub(crate) fn get_placement_recursive(
     placement: &DecodedEntity,
     decoder: &mut EntityDecoder,
     depth: usize,

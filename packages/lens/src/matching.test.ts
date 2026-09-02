@@ -62,6 +62,46 @@ describe('matchesCriteria — ifcType', () => {
   });
 });
 
+// IFC_SUBTYPE_TO_BASE only covered 4 of IFC4's 9 `*StandardCase` entities
+// (plus the two `*Flight` types) — Door/Member/Plate/Window/Opening were
+// hand-list omissions, so a rule on the base type silently failed to match
+// files exported with those StandardCase variants (issue: lens rule
+// matching does not close over the full StandardCase family).
+describe('matchesCriteria — ifcType subtype coverage (IFC_SUBTYPE_TO_BASE)', () => {
+  const provider = createMockProvider([
+    { id: 1, type: 'IfcDoorStandardCase' },
+    { id: 2, type: 'IfcWindowStandardCase' },
+    { id: 3, type: 'IfcMemberStandardCase' },
+    { id: 4, type: 'IfcPlateStandardCase' },
+    { id: 5, type: 'IfcOpeningStandardCase' },
+  ]);
+
+  it('IfcDoorStandardCase matches an IfcDoor rule', () => {
+    const c: LensCriteria = { type: 'ifcType', ifcType: 'IfcDoor' };
+    expect(matchesCriteria(c, 1, provider)).toBe(true);
+  });
+
+  it('IfcWindowStandardCase matches an IfcWindow rule', () => {
+    const c: LensCriteria = { type: 'ifcType', ifcType: 'IfcWindow' };
+    expect(matchesCriteria(c, 2, provider)).toBe(true);
+  });
+
+  it('IfcMemberStandardCase matches an IfcMember rule', () => {
+    const c: LensCriteria = { type: 'ifcType', ifcType: 'IfcMember' };
+    expect(matchesCriteria(c, 3, provider)).toBe(true);
+  });
+
+  it('IfcPlateStandardCase matches an IfcPlate rule', () => {
+    const c: LensCriteria = { type: 'ifcType', ifcType: 'IfcPlate' };
+    expect(matchesCriteria(c, 4, provider)).toBe(true);
+  });
+
+  it('IfcOpeningStandardCase matches an IfcOpeningElement rule', () => {
+    const c: LensCriteria = { type: 'ifcType', ifcType: 'IfcOpeningElement' };
+    expect(matchesCriteria(c, 5, provider)).toBe(true);
+  });
+});
+
 describe('matchesCriteria — group (#1075)', () => {
   // Spaces 1 & 2 belong to zone "Apt-01"; space 3 belongs to "Apt-02"; entity 4
   // belongs to no group.
@@ -602,6 +642,33 @@ describe('matchesCriteria — classification', () => {
     expect(matchesCriteria(c, 1, provider)).toBe(true);
   });
 
+  it('should not match when system matches but code does not', () => {
+    const c: LensCriteria = {
+      type: 'classification',
+      classificationSystem: 'uniclass',
+      classificationCode: 'Pr_99_99_99',
+    };
+    expect(matchesCriteria(c, 1, provider)).toBe(false);
+  });
+
+  it('should not match when code matches but system does not', () => {
+    const c: LensCriteria = {
+      type: 'classification',
+      classificationSystem: 'Omniclass',
+      classificationCode: 'Pr_60_10_32',
+    };
+    expect(matchesCriteria(c, 1, provider)).toBe(false);
+  });
+
+  it('should not match when neither system nor code matches', () => {
+    const c: LensCriteria = {
+      type: 'classification',
+      classificationSystem: 'Omniclass',
+      classificationCode: 'Pr_99_99_99',
+    };
+    expect(matchesCriteria(c, 1, provider)).toBe(false);
+  });
+
   it('should return false when neither system nor code specified', () => {
     expect(matchesCriteria({ type: 'classification' }, 1, provider)).toBe(false);
   });
@@ -609,6 +676,30 @@ describe('matchesCriteria — classification', () => {
   it('should return false when provider lacks getClassifications', () => {
     const basicProvider = createMockProvider([{ id: 1, type: 'IfcWall' }]);
     expect(matchesCriteria({ type: 'classification', classificationSystem: 'x' }, 1, basicProvider)).toBe(false);
+  });
+
+  it('requires system AND code together — a system-only or code-only hit on a DIFFERENT reference must not satisfy a combined filter', () => {
+    // id=3 has a classification whose system matches but whose code does not,
+    // and a separate classification whose code matches but whose system does
+    // not. Neither single reference satisfies BOTH constraints, so a combined
+    // system+code filter must reject it even though each half independently
+    // has a hit somewhere in the entity's classification list.
+    const combinedProvider = createMockProvider([{ id: 3, type: 'IfcWall' }]);
+    combinedProvider.getClassifications = (id: number) => {
+      if (id === 3) {
+        return [
+          { system: 'Uniclass', identification: 'Ss_25_10', name: 'Wrong code' },
+          { system: 'OtherSystem', identification: 'Pr_60_10_32', name: 'Wrong system' },
+        ];
+      }
+      return [];
+    };
+    const c: LensCriteria = {
+      type: 'classification',
+      classificationSystem: 'Uniclass',
+      classificationCode: 'Pr_60_10_32',
+    };
+    expect(matchesCriteria(c, 3, combinedProvider)).toBe(false);
   });
 });
 
@@ -1010,4 +1101,90 @@ describe('matchesCriteria — single-leaf compound ≡ plain leaf (bounding)', (
       expect(matchesCriteria(wrapped, miss, provider)).toBe(false);
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Absence vs. empty-string criteria value
+//
+// Reference semantics (pinned by `matchesQuantity`, which already guards
+// absence before any value comparison): a property/attribute/quantity that is
+// NOT PRESENT on an entity must never satisfy `equals`/`contains` with an
+// empty-string criteria value, exactly as it never satisfies a numeric
+// comparison or `ne`. `matchesProperty`/`matchesAttribute` checked
+// `contains`/`equals` before the absence guard, so `String(undefined ?? '')`
+// coerced an absent value to `''`, and `''.includes('')` / `'' === ''` made
+// an empty-string rule match entities that never had the field at all - the
+// one criteria type (`quantity`) that already guards absence first does not
+// have this hole, which is the reference this pins the other two to.
+// ---------------------------------------------------------------------------
+describe('matchesCriteria — absence never satisfies an empty-string value comparison', () => {
+  const provider = createMockProvider([
+    { id: 1, type: 'IfcWall', properties: { Pset_WallCommon: { FireRating: '60' } } },
+    { id: 2, type: 'IfcSlab' }, // no properties at all
+  ]);
+  provider.getEntityAttribute = (id: number, attrName: string) => {
+    if (id === 1 && attrName === 'Description') return 'Load-bearing';
+    return undefined; // id 2: attribute absent
+  };
+  provider.getQuantityValue = (id: number, qset: string, qname: string) => {
+    if (id === 1 && qset === 'Qto_WallBaseQuantities' && qname === 'Length') return 5.2;
+    return undefined; // id 2: quantity absent
+  };
+
+  it('property equals "" does not match an entity missing the property', () => {
+    const c: LensCriteria = {
+      type: 'property', propertySet: 'Pset_WallCommon', propertyName: 'FireRating',
+      operator: 'equals', propertyValue: '',
+    };
+    expect(matchesCriteria(c, 2, provider)).toBe(false);
+  });
+
+  it('property contains "" does not match an entity missing the property', () => {
+    const c: LensCriteria = {
+      type: 'property', propertySet: 'Pset_WallCommon', propertyName: 'FireRating',
+      operator: 'contains', propertyValue: '',
+    };
+    expect(matchesCriteria(c, 2, provider)).toBe(false);
+  });
+
+  it('attribute equals "" does not match an entity missing the attribute', () => {
+    const c: LensCriteria = {
+      type: 'attribute', attributeName: 'Description', operator: 'equals', attributeValue: '',
+    };
+    expect(matchesCriteria(c, 2, provider)).toBe(false);
+  });
+
+  it('attribute contains "" does not match an entity missing the attribute', () => {
+    const c: LensCriteria = {
+      type: 'attribute', attributeName: 'Description', operator: 'contains', attributeValue: '',
+    };
+    expect(matchesCriteria(c, 2, provider)).toBe(false);
+  });
+
+  it('quantity equals "" does not match an entity missing the quantity (the pre-existing, correct behaviour)', () => {
+    const c: LensCriteria = {
+      type: 'quantity', quantitySet: 'Qto_WallBaseQuantities', quantityName: 'Length',
+      operator: 'equals', quantityValue: '',
+    };
+    expect(matchesCriteria(c, 2, provider)).toBe(false);
+  });
+
+  it('quantity contains "" does not match an entity missing the quantity (the pre-existing, correct behaviour)', () => {
+    const c: LensCriteria = {
+      type: 'quantity', quantitySet: 'Qto_WallBaseQuantities', quantityName: 'Length',
+      operator: 'contains', quantityValue: '',
+    };
+    expect(matchesCriteria(c, 2, provider)).toBe(false);
+  });
+
+  it('a present property still matches equals "" only when its value truly is the empty string', () => {
+    const withEmpty = createMockProvider([
+      { id: 1, type: 'IfcWall', properties: { Pset_WallCommon: { Note: '' } } },
+    ]);
+    const c: LensCriteria = {
+      type: 'property', propertySet: 'Pset_WallCommon', propertyName: 'Note',
+      operator: 'equals', propertyValue: '',
+    };
+    expect(matchesCriteria(c, 1, withEmpty)).toBe(true);
+  });
 });

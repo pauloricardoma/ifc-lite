@@ -39,10 +39,15 @@ import { RelationshipType } from '@ifc-lite/data';
 import {
   EntityExtractor,
   extractAllEntityAttributes,
+  extractProjectUnits,
   extractPropertiesOnDemand,
   extractQuantitiesOnDemand,
   getAttributeNamesAcrossSchemas,
+  quantitySiScale,
+  roundToScale,
+  scaledPropertyValue,
   type IfcDataStore,
+  type ProjectUnits,
 } from '@ifc-lite/parser';
 import { comparableEntities, type RootAttributes } from './diff-scope.js';
 
@@ -71,9 +76,18 @@ export function modelIdentityOf(path: string, bytes: Uint8Array): ModelIdentity 
  * section of `docs/guide/model-diff.md`).
  */
 export function buildFileFingerprints(store: IfcDataStore): EntityFingerprint<DiffRef>[] {
+  // Resolved once per store, not per entity: the same `IFCUNITASSIGNMENT` walk
+  // every property in the file would otherwise repeat, and both `quantitySiScale`
+  // and `scaleMeasureValue` are pure over it. An IfcQuantityLength/Area/Volume
+  // is stored in the project's raw author unit, exactly like a measure-typed
+  // property, so both need the same base-SI conversion before hashing —
+  // otherwise a model re-authored in a different project length unit, with no
+  // physical quantity actually changed, reports every quantified/measured
+  // entity as `modified` (see `buildDataInput`'s scaling comment).
+  const units = extractProjectUnits(store.source, store.entityIndex);
   const fingerprints: EntityFingerprint<DiffRef>[] = [];
   for (const { expressId, globalId, ifcType, source, isTypeObject } of comparableEntities(store)) {
-    const input = buildDataInput(store, expressId, ifcType, source, isTypeObject);
+    const input = buildDataInput(store, expressId, ifcType, source, isTypeObject, units);
     fingerprints.push({
       key: globalId,
       ifcType,
@@ -103,6 +117,10 @@ function buildDataInput(
   source: RootAttributes | undefined,
   /** `IfcTypeObject` subtype? Gates `Tag` into the fingerprint (issue #2021). */
   isTypeObject: boolean,
+  /** The file's declared units, resolved once by {@link buildFileFingerprints},
+   *  for scaling Qto_ Length/Area/Volume quantities and measure-typed Pset
+   *  properties to base SI before hashing. */
+  units: ProjectUnits,
 ): DataFingerprintInput {
   const predefinedType = extractAllEntityAttributes(store, expressId).find(
     (attribute) => attribute.name === 'PredefinedType',
@@ -117,17 +135,22 @@ function buildDataInput(
 
   const propertySets = extractPropertiesOnDemand(store, expressId).map((set) => ({
     name: set.name,
-    properties: set.properties.map((property) => ({ name: property.name, value: property.value })),
+    properties: set.properties.map((property) => ({
+      name: property.name,
+      value: scaledPropertyValue(property.value, property.dataType, units),
+    })),
   }));
 
   const quantitySets = extractQuantitiesOnDemand(store, expressId).map((set) => ({
     name: set.name,
     quantities: set.quantities.map((quantity) => ({
       name: quantity.name,
-      // Rounded to 4 dp, matching the viewer: re-exporting a model with
-      // sub-tolerance float jitter must not flip the data hash on an otherwise
-      // identical element, which on this path would cost the pair its match.
-      value: roundQuantity(quantity.value),
+      // Scaled to base SI first (a Qto_ value is stored in the project's raw
+      // author unit, see `quantitySiScale`), then rounded to 4 dp, matching
+      // the viewer: re-exporting a model with sub-tolerance float jitter must
+      // not flip the data hash on an otherwise identical element, which on
+      // this path would cost the pair its match.
+      value: roundToScale(quantity.value * quantitySiScale(quantity, units)),
     })),
   }));
 
@@ -150,10 +173,6 @@ function buildDataInput(
     quantitySets,
     typeAssignments,
   };
-}
-
-function roundQuantity(value: number): number {
-  return Number.isFinite(value) ? Math.round(value * 1e4) / 1e4 : value;
 }
 
 /**

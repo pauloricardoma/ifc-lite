@@ -10,10 +10,13 @@ export { WebGPUDevice } from './device.js';
 export type { AdapterInfoSnapshot } from './device.js';
 export { RenderPipeline } from './pipeline.js';
 export { Camera } from './camera.js';
+// The MEASURED surface `getScene()` publishes — see its docs.
+export type { SceneContents } from './scene-contents.js';
 export type { ProjectionMode } from './camera-state.js';
+export type { InteractionMode } from './camera-controls.js';
 export { pickFitPolicy } from './camera-fit-policy.js';
 export type { FitPolicy, FitPolicyKind, Bounds3, PickFitPolicyOptions } from './camera-fit-policy.js';
-export { Scene } from './scene.js';
+// `Scene` is NOT exported: an exported class republishes every method `SceneContents` above just froze.
 export { Picker } from './picker.js';
 export { MathUtils } from './math.js';
 // The orthonormal camera basis `MathUtils.lookAt` renders through, exposed so
@@ -24,7 +27,7 @@ export { MathUtils } from './math.js';
 // is the same situation from outside it).
 export { viewBasis } from './math.js';
 export { SectionPlaneRenderer } from './section-plane.js';
-export { Section2DOverlayRenderer } from './section-2d-overlay.js';
+// `Section2DOverlayRenderer` is NOT exported: `Renderer.setLineOverlay` and the section cap drive it from inside. Its types below stay published.
 
 // IfcAnnotation overlay pipelines (3D world-space). Self-contained — caller
 // passes a GPUDevice + presentation format and invokes `.render(pass, viewProj)`
@@ -44,7 +47,8 @@ export { DEFAULT_CAP_STYLE, HATCH_PATTERN_IDS } from './section-cap-style.js';
 export type { SectionCapStyle, HatchPatternId } from './section-cap-style.js';
 export { planeBasis, nearestCardinalAxis } from './section-plane-basis.js';
 export type { PlaneBasis, Vec3Tuple } from './section-plane-basis.js';
-export type { Section2DOverlayOptions, Section2DOverlayCapStyle, CutPolygon2D, DrawingLine2D } from './section-2d-overlay.js';
+export type { Section2DOverlayOptions, Section2DOverlayCapStyle, CutPolygon2D, DrawingLine2D, LineOverlayChannel } from './section-2d-overlay.js';
+export { LINE_OVERLAY_CHANNELS } from './section-2d-overlay.js';
 export { Raycaster } from './raycaster.js';
 export { SnapDetector, SnapType } from './snap-detector.js';
 export { BVH } from './bvh.js';
@@ -61,8 +65,8 @@ export type { LightingEnvironment, ResolvedEnvironment, SkyGradient, Vec3Color }
 export type { Ray, Vec3, Intersection } from './raycaster.js';
 export type { SnapTarget, SnapOptions, EdgeLockInput, MagneticSnapResult } from './snap-detector.js';
 
-// Extracted manager classes
-export { PickingManager } from './picking-manager.js';
+// Extracted manager classes. `PickingManager` is NOT exported: its constructor
+// takes the now-internal `Scene`, so nobody outside could build one anyway.
 export type { PointPickProvider } from './picking-manager.js';
 export { resolveContributionThresholdPx, projectedAabbRadiusPx } from './contribution-cull.js';
 export type { ContributionCullOptions, CullCameraState } from './contribution-cull.js';
@@ -84,6 +88,18 @@ export { isEntityVisible } from './entity-visibility.js';
 export { DEFAULT_GHOST_ALPHA, OPAQUE_ALPHA_CUTOFF } from './overlay-routing.js';
 export { VisibilityEpochTracker } from './visibility-epoch.js';
 export type { FrameStats, ResidentGpuBytes } from './render-stats.js';
+// Frame/pass GPU timing (issue #2670 perf-verdict gate). Opt-in and NOT wired
+// into `Renderer` by default — a caller constructs `GpuFrameTimingRecorder`
+// itself and attaches its `timestampWrites` to the passes it wants measured;
+// see `frame-timing-gpu.ts`'s module doc for the usage pattern, and
+// `decideTimingMode` for choosing GPU queries vs. the CPU fallback vs. off.
+export { decideTimingMode, passDurationsMs, frameTotalMs, aggregateFrameTimings } from './frame-timing.js';
+export type { TimingMode, TimingModeRequest, PassTimingSample, FrameTimingReport } from './frame-timing.js';
+export { computeDurationStats, nsToMs, isNegativeDelta } from './frame-timing-stats.js';
+export type { DurationStats } from './frame-timing-stats.js';
+export { GpuFrameTimingRecorder, hasTimestampQueryFeature } from './frame-timing-gpu.js';
+export { createCpuFrameTicker } from './frame-timing-cpu.js';
+export type { CpuFrameTicker } from './frame-timing-cpu.js';
 export { RaycastEngine } from './raycast-engine.js';
 export type { RenderDegradationInfo } from './render-degradation.js';
 export { PointPicker, decodePickSample } from './point-picker.js';
@@ -110,8 +126,11 @@ import { WebGPUDevice, type AdapterInfoSnapshot } from './device.js';
 import { RenderPipeline } from './pipeline.js';
 import { Camera } from './camera.js';
 import { Scene, type InstancedTemplateGPU } from './scene.js';
+import type { SceneContents } from './scene-contents.js';
 import { Picker } from './picker.js';
+import { reportableItemId } from './pick-resolve.js';
 import { MathUtils, viewBasis } from './math.js';
+import type { Vec3 as Vec3Type } from './types.js';
 import { FrustumUtils } from '@ifc-lite/spatial';
 import type { MeshData } from '@ifc-lite/geometry';
 import type {
@@ -125,15 +144,15 @@ import type {
 } from './types.js';
 import { VisualEnhancementResolver } from './visual-enhancement.js';
 import { packClipBox } from './clip-box.js';
-import type { CutPolygon2D, DrawingLine2D } from './section-2d-overlay.js';
+import type { CutPolygon2D, DrawingLine2D, LineOverlayChannel } from './section-2d-overlay.js';
 import type {
   SymbolicFillInput,
   SymbolicTextInput,
 } from './symbolic-overlay-pipelines.js';
 import { RendererOverlays } from './renderer-overlays.js';
 import { resolveSectionPlaneFrame } from './render-section-plane.js';
-import { Raycaster, type Intersection } from './raycaster.js';
-import { SnapDetector, type SnapTarget, type SnapOptions, type EdgeLockInput, type MagneticSnapResult } from './snap-detector.js';
+import type { Intersection } from './raycaster.js';
+import type { SnapTarget, SnapOptions, EdgeLockInput, MagneticSnapResult } from './snap-detector.js';
 import { PickingManager } from './picking-manager.js';
 import { RaycastEngine } from './raycast-engine.js';
 import { RenderDegradationMonitor, type RenderDegradationInfo } from './render-degradation.js';
@@ -148,6 +167,9 @@ import { EdlPass } from './edl-pass.js';
 import { SkyPass } from './sky-pass.js';
 import { skyShaderSource } from './shaders/sky.wgsl.js';
 import { resolveEnvironment } from './environment.js';
+import { ShadowPass, resolveShadowMapResolution } from './shadow-pass.js';
+import { fitSunLightMatrix, cameraFrustumFocusCorners } from './shadow-light-matrix.js';
+import { collectShadowOccluders, classifyBatchVisibility, DEFAULT_MIN_CAST_ALPHA } from './shadow-occluders.js';
 import { shouldRouteMeshTransparent, shouldRouteBatchTransparent, splitVisibleIdsByPromotion, DEFAULT_GHOST_ALPHA } from './overlay-routing.js';
 import { colorSaltByte, packEntityLane } from './scene-geometry.js';
 import { PointCloudRenderer } from './pointcloud/point-cloud-renderer.js';
@@ -254,6 +276,14 @@ export class Renderer {
     // Procedural sky background — created lazily on the first frame that
     // enables it (most sessions never do).
     private skyPass: SkyPass | null = null;
+    // Sun shadow-map depth pre-pass (#2670, Phase 2) — created lazily on the
+    // first frame that enables `RenderOptions.sunShadows`. Off by default.
+    private shadowPass: ShadowPass | null = null;
+    // Whether the shadow map was wired into the environment bind group last
+    // frame — lets a toggle-off write `enabled = 0` and drop the depth view
+    // exactly once instead of every frame.
+    private shadowsWired = false;
+    private shadowScratch = new Float32Array(24); // lightViewProj(16) + params(4) + params2(4)
     private edlOptions: { enabled: boolean; strength: number; radiusPx: number; highQuality: boolean } = {
         enabled: false,
         strength: 1,
@@ -1269,6 +1299,89 @@ export class Renderer {
     }
 
     /**
+     * The batched occluders the sun shadow pass should cast, filtered to the same
+     * visibility the colour pass draws (#2670, Phase 2b). Without filtering every
+     * batch casts. With hide/isolate active a fully-hidden batch is dropped and a
+     * partially-hidden OPAQUE batch casts only its visible subset via the SAME
+     * cached partial sub-batch the colour pass renders (shared cache key
+     * `${colorKey}:${id}` + `_partialBatchEpoch`), so no extra clone memory and no
+     * phantom shadow from an individually-hidden element in a shared batch.
+     *
+     * Transparent (glass-like) partially-hidden parents are left to the collector's
+     * material-alpha filter — they don't cast at all, so building a visible subset
+     * for them would waste a clone (and diverge from the colour pass's promotion
+     * split keys). Fully-visible transparent batches pass through unchanged and the
+     * collector drops them.
+     */
+    private shadowOccluderBatches(
+        options: RenderOptions,
+        device: GPUDevice,
+        hasVisibilityFiltering: boolean,
+    ): BatchedMesh[] {
+        const all = this.scene.getBatchedMeshes();
+        if (!hasVisibilityFiltering) {
+            for (const batch of all) this.noteShadowOccluderResidency(batch);
+            return all;
+        }
+        const pipeline = this.pipeline;
+
+        const out: BatchedMesh[] = [];
+        for (const batch of all) {
+            const vis = classifyBatchVisibility(batch.expressIds, options.hiddenIds, options.isolatedIds);
+            if (vis.kind === 'none') continue; // fully hidden → does not cast
+            if (vis.kind === 'all') {
+                this.noteShadowOccluderResidency(batch);
+                out.push(batch); // fully visible → its own buffers
+                continue;
+            }
+            // Partially hidden. Transparent parents don't cast (collector's alpha
+            // filter) — skip rather than build a wasted, divergent-key clone.
+            if (batch.color[3] < DEFAULT_MIN_CAST_ALPHA) continue;
+            // The partial sub-batch is built from the PARENT's CPU meshData, so a
+            // cold parent yields nothing until it is restored. Queue that restore
+            // here too: the colour pass only queues it for parents inside its own
+            // frustum, but an up-sun occluder behind the camera still has to cast.
+            this.noteShadowOccluderResidency(batch);
+            // Opaque partial: reuse the colour pass's cached sub-batch. The key is
+            // visibility-content-independent; `_partialBatchEpoch` invalidates it on
+            // any hide/isolate or override change, so the clone is always current.
+            // Without a pipeline the renderer isn't drawing, so skip (the shadow
+            // pass won't run either); casting the whole parent would be wrong.
+            if (!pipeline) continue;
+            const sub = this.scene.getOrCreatePartialBatch(
+                `${batch.colorKey}:${batch.id}`,
+                batch.colorKey,
+                vis.visibleIds,
+                device,
+                pipeline,
+                this._partialBatchEpoch,
+            );
+            // A cold parent yields an empty partial (its residency restore is queued
+            // above); skip this frame — the collector drops zero-index draws anyway,
+            // and the subset casts once resident.
+            if (sub && sub.indexCount > 0) out.push(sub);
+        }
+        return out;
+    }
+
+    /**
+     * Keep a shadow occluder batch resident so it does not thin out silently on
+     * large models under the GPU residency budget (#2670 review). The depth pass
+     * reads these batches' buffers, but that read did not count as usage, so an
+     * up-sun occluder outside the colour frustum aged into an eviction candidate.
+     * Transparent batches never cast (the collector's alpha filter), so their
+     * residency is irrelevant here.
+     */
+    private noteShadowOccluderResidency(batch: BatchedMesh): void {
+        if (batch.color[3] < DEFAULT_MIN_CAST_ALPHA) return;
+        if (batch.gpuResident === false) {
+            this.scene.requestBatchResidency(batch);
+        } else {
+            this.scene.recordBatchDrawn(batch);
+        }
+    }
+
+    /**
      * Create a GPU Mesh from MeshData (lazy creation for selection highlighting)
      * This is called on-demand when a mesh is selected, avoiding 2x buffer creation during streaming
      */
@@ -1352,6 +1465,11 @@ export class Renderer {
         this.scene.addMesh({
             expressId: meshData.expressId,
             modelIndex: meshData.modelIndex,  // Preserve modelIndex for multi-model selection
+            // Source item, so a pick can report it (#2985) — via the shared rule,
+            // so this and the CPU raycaster cannot answer one click two ways.
+            // In-tree callers pre-split merged pieces (Scene.getMeshDataPieces
+            // drops the field incidentally); this is public, so it owns the rule.
+            geometryItemId: reportableItemId(meshData, meshData.expressId),
             vertexBuffer,
             indexBuffer,
             indexCount: meshData.indices.length,
@@ -1997,6 +2115,142 @@ export class Renderer {
 
             // Now record draw commands
             const encoder = device.createCommandEncoder();
+
+            // Sun shadow-map pass (#2670, Phase 2). Off unless the caller opts
+            // in; when off the hot path pays only this check and (once) an
+            // enabled=0 reset on toggle-off. Runs BEFORE the colour pass (its
+            // own complete depth-only sub-pass on the same encoder); the colour
+            // pass then samples the map via the environment bind group. Every
+            // geometry path both casts (collectShadowOccluders) and receives
+            // (the shared main-family shader), so no part of the model silently
+            // stops shadowing.
+            const shadowOpts = options.sunShadows;
+            let shadowsThisFrame = false;
+            if (shadowOpts?.enabled) {
+                const bounds = this.getModelBounds();
+                if (bounds) {
+                    // `resolution === 0` (or unset) means Auto: pick from the
+                    // device's texture limit. A manual value is clamped to that
+                    // limit so a 4096 request can't fail createTexture on a
+                    // 2048-max device (#2670 review).
+                    const resolution = resolveShadowMapResolution(
+                        shadowOpts.resolution,
+                        device.limits.maxTextureDimension2D,
+                    );
+                    if (!this.shadowPass) {
+                        this.shadowPass = new ShadowPass(device, resolution);
+                    } else {
+                        this.shadowPass.setResolution(resolution);
+                    }
+                    const boundsMin: [number, number, number] = [bounds.min.x, bounds.min.y, bounds.min.z];
+                    const boundsMax: [number, number, number] = [bounds.max.x, bounds.max.y, bounds.max.z];
+                    // Lateral shadow fit. AT REST: fit to the camera frustum
+                    // clipped to the model (maintainer #1) so a small building on
+                    // a large site keeps sharp shadows instead of spending the
+                    // map on distant terrain. DURING INTERACTION: fall back to a
+                    // whole-bounds fit — it is camera-INDEPENDENT, so orbiting or
+                    // scroll-zooming can't make the focus box breathe and drop
+                    // receivers off the map edge (which read as chunks of shadow
+                    // vanishing, #2670 follow-up). Depth always spans the whole
+                    // model so up-sun occluders keep casting.
+                    let focusCorners: readonly Vec3Type[] | undefined;
+                    if (!interacting) {
+                        const camEye = this.camera.getPosition();
+                        const camBasisFit = viewBasis(camEye, this.camera.getTarget(), this.camera.getUp());
+                        focusCorners = cameraFrustumFocusCorners({
+                            eye: camEye,
+                            forward: camBasisFit.forward,
+                            right: camBasisFit.right,
+                            up: camBasisFit.up,
+                            fovY: this.camera.getFOV(),
+                            aspect: this.canvas.height > 0 ? this.canvas.width / this.canvas.height : 1,
+                            ortho: this.camera.getProjectionMode() === 'orthographic',
+                            orthoHalfHeight: this.camera.getOrthoSize(),
+                            boundsMin,
+                            boundsMax,
+                        }) ?? undefined;
+                    }
+                    const sun = resolveEnvironment(options.environment).sunDirection;
+                    const fit = fitSunLightMatrix({ sunDirection: sun, boundsMin, boundsMax, focusCorners });
+                    const occluders = collectShadowOccluders(
+                        {
+                            // Cast from the same visibility the colour pass draws: a
+                            // fully-hidden batch is dropped and a partially-hidden one
+                            // casts only its visible subset (the same cached partial
+                            // sub-batch the colour pass renders), so an
+                            // individually-hidden element in a shared batch stops
+                            // casting instead of throwing a phantom shadow.
+                            batches: this.shadowOccluderBatches(options, device, hasVisibilityFiltering),
+                            instanced: this.scene.getInstancedTemplates(),
+                            textured: this.scene.getTexturedMeshes(),
+                            // Individual meshes cast too (Renderer.addMesh() /
+                            // no-batch fallback); the collector skips hydrated
+                            // selection copies so batched scenes don't double-cast.
+                            meshes: this.scene.getMeshes(),
+                        },
+                        { hiddenIds: options.hiddenIds, isolatedIds: options.isolatedIds ?? undefined },
+                    );
+                    // Cast the same cut the colour pass draws: geometry a
+                    // section plane / crop box removed from view must stop
+                    // casting too, or the sliced-off roof keeps shadowing the
+                    // floor it no longer covers. `sectionPlaneData` already
+                    // folds in the terrain clip, so that is covered as well.
+                    this.shadowPass.render(encoder, fit.lightViewProj, occluders, {
+                        section: sectionPlaneData?.enabled
+                            ? {
+                                normal: sectionPlaneData.normal,
+                                distance: sectionPlaneData.distance,
+                                flipped: options.sectionPlane?.flipped === true,
+                            }
+                            : null,
+                        box: options.clipBox?.enabled
+                            ? { min: options.clipBox.min, max: options.clipBox.max }
+                            : null,
+                    });
+
+                    // Shadow uniform: light matrix + sampling params. The kernel
+                    // width follows the sun's angular size (physical, ~0.53°
+                    // like Blender's Sun lamp). Bias scales with the kernel: a
+                    // wider penumbra samples farther, so the normal offset must
+                    // grow with it or the kernel edge self-shadows (the hardware
+                    // slope bias in ShadowPass handles the grazing-angle case).
+                    const texelWorld = (2 * fit.orthoHalfWidth) / resolution;
+                    const sunAngleDeg = shadowOpts.sunAngleDeg ?? 0.53;
+                    const pcfRadius = Math.min(Math.max(sunAngleDeg * 3.0, 0.75), 8.0);
+                    const normalBias = texelWorld * (2.0 + pcfRadius);
+                    const s = this.shadowScratch;
+                    s.set(fit.lightViewProj.m, 0);
+                    s[16] = 1 / resolution;  // texelSize
+                    s[17] = 1;               // enabled
+                    s[18] = normalBias;
+                    s[19] = pcfRadius;
+                    s[20] = 0.0006;          // depthBias (reverse-Z clip units)
+                    s[21] = 0; s[22] = 0; s[23] = 0;
+                    this.pipeline.updateShadowUniform(s);
+                    this.pipeline.setShadowDepthView(this.shadowPass.getDepthTextureView());
+                    this.shadowsWired = true;
+                    shadowsThisFrame = true;
+                }
+            }
+            if (!shadowsThisFrame && (this.shadowsWired || this.shadowPass)) {
+                // Toggle-off: disable sampling, release the depth view, and free
+                // the shadow pass itself so its depth texture (16.8 MB at 2048,
+                // 67 MB at 4096) is returned to the driver for the rest of the
+                // session instead of lingering unused. Re-enabling reconstructs
+                // it lazily on the next shadowed frame (see the `!this.shadowPass`
+                // guard above). The `|| this.shadowPass` arm also covers a pass
+                // that was allocated but never wired — an occluder-prep throw
+                // between `new ShadowPass` and `shadowsWired = true` would
+                // otherwise leak its texture until Renderer.destroy() (Greptile
+                // #3053). The uniform-unwire below is a no-op when never wired.
+                // #2670 review.
+                this.shadowScratch[17] = 0;
+                this.pipeline.updateShadowUniform(this.shadowScratch);
+                this.pipeline.setShadowDepthView(null);
+                this.shadowsWired = false;
+                this.shadowPass?.destroy();
+                this.shadowPass = null;
+            }
 
             // Set up MSAA rendering if enabled
             const msaaView = this.pipeline.getMultisampleTextureView();
@@ -3137,20 +3391,6 @@ export class Renderer {
     }
 
     /**
-     * Get the raycaster instance (for advanced usage)
-     */
-    getRaycaster(): Raycaster {
-        return this.raycastEngine.getRaycaster();
-    }
-
-    /**
-     * Get the snap detector instance (for advanced usage)
-     */
-    getSnapDetector(): SnapDetector {
-        return this.raycastEngine.getSnapDetector();
-    }
-
-    /**
      * Clear all caches (call when geometry changes)
      */
     clearCaches(): void {
@@ -3214,7 +3454,8 @@ export class Renderer {
         return this.camera;
     }
 
-    getScene(): Scene {
+    /** MEASURED external surface, not the 4400-line `Scene`: widening `SceneContents` is a published-API decision, not a detail — see `scene-contents.ts`. */
+    getScene(): SceneContents {
         return this.scene;
     }
 
@@ -3272,70 +3513,32 @@ export class Renderer {
     }
 
     /**
-     * Upload pre-lifted 3D line-list vertices for the standalone annotation
-     * overlay. Each segment is `[x1, y1, z1, x2, y2, z2]` in world space.
-     * The overlay is drawn regardless of whether a section plane is active.
-     * Pass an empty Float32Array to clear.
-     */
-    uploadAnnotationLines3D(vertices: Float32Array): void {
-        this.overlays.uploadAnnotationLines3D(vertices);
-    }
-
-    /**
-     * Clear the standalone annotation line overlay.
-     */
-    clearAnnotationLines3D(): void {
-        this.overlays.clearAnnotationLines3D();
-    }
-
-    /**
-     * Upload IfcAlignment centerline segments as a flat [x,y,z,x,y,z,...]
-     * line-list in world space. Rendered as thin lines (not a ribbon mesh)
-     * to match IfcGrid / IfcAnnotation. Pass an empty Float32Array to clear.
-     */
-    uploadAlignmentLines3D(vertices: Float32Array): void {
-        this.overlays.uploadAlignmentLines3D(vertices);
-    }
-
-    /** Clear the alignment centerline overlay. */
-    clearAlignmentLines3D(): void {
-        this.overlays.clearAlignmentLines3D();
-    }
-
-    /**
-     * Upload structural-grid (IfcGridAxis) segments as a flat [x,y,z,x,y,z,...]
-     * line-list in world space (issue #967). Rendered as thin lines, mirroring
-     * the alignment overlay. Pass an empty Float32Array to clear.
+     * Set one standalone 3D line overlay, or clear it by passing `null`.
      *
-     * Unlike alignment, grids do NOT expand model bounds: they're behind a
-     * visibility toggle, so toggling them on must not reframe the camera (and
-     * grid axes routinely extend past the model envelope).
+     * `vertices` is a flat world-space line-list — `[x1,y1,z1, x2,y2,z2, …]`,
+     * one segment per six floats. The vertices are already lifted to world
+     * space, so these overlays draw whether or not a section plane is active.
+     * A trailing partial segment is dropped rather than rejecting the array.
+     * An empty array clears too, but `null` skips building the pipelines.
+     *
+     * Every channel is an independent buffer with its own visibility, so
+     * setting one leaves the other three untouched. All four share the colour
+     * set by {@link setOverlayLineColor}; label colour is per-text via
+     * `SymbolicTextInput.color` on `uploadAnnotationTexts3D`.
+     *
+     * The channels differ in exactly one way — whether they grow the scene
+     * bounds. `annotation` (#653) and `alignment` DO: a file holding only them
+     * has no IfcProduct meshes to frame, so Home / fit-to-view would have
+     * nothing to aim at and the near/far range would clip the lines away.
+     * `grid` (IfcGridAxis, #967) and `dxf` (the DXF reference layer, #2043) do
+     * NOT: they are reference layers that routinely extend past the model
+     * envelope, so growing the bounds would reframe the camera whenever one
+     * was ticked on. The rule is "does this content DEFINE the model's
+     * extent", NOT "is it behind a visibility toggle" — annotations sit behind
+     * `ifcAnnotationsVisible` too.
      */
-    uploadGridLines3D(vertices: Float32Array): void {
-        this.overlays.uploadGridLines3D(vertices);
-    }
-
-    /** Clear the structural-grid overlay. */
-    clearGridLines3D(): void {
-        this.overlays.clearGridLines3D();
-    }
-
-    /**
-     * Upload the DXF reference-layer's line paths as a flat
-     * [x,y,z,x,y,z,...] line-list in world space (issue #2043, follow-up to
-     * the 2D-only DXF underlay from #1782/#1929). Mirrors
-     * `uploadGridLines3D`: a dedicated buffer so 3D DXF visibility is
-     * independent of the 2D underlay's own toggle, and does NOT expand
-     * model bounds/reframe the camera on upload — it's behind its own
-     * visibility toggle, like grid axes. Pass an empty Float32Array to clear.
-     */
-    uploadDxfLines3D(vertices: Float32Array): void {
-        this.overlays.uploadDxfLines3D(vertices);
-    }
-
-    /** Clear the 3D DXF reference-layer overlay. */
-    clearDxfLines3D(): void {
-        this.overlays.clearDxfLines3D();
+    setLineOverlay(channel: LineOverlayChannel, vertices: Float32Array | null): void {
+        this.overlays.setLineOverlay(channel, vertices);
     }
 
     /**
@@ -3402,7 +3605,10 @@ export class Renderer {
     }
 
     /**
-     * Get render pipeline (for batching)
+     * Get render pipeline (for batching). DELIBERATELY NOT NARROWED, unlike
+     * `getScene()`: the measurement found ZERO external
+     * `RenderPipeline` members — all 12 call sites pass the handle straight
+     * back into a `SceneContents` upload method typed for the real class.
      */
     getPipeline(): RenderPipeline | null {
         return this.pipeline;
@@ -3446,7 +3652,11 @@ export class Renderer {
      *
      * Returning null instead routes into the `if (!device) return` check that
      * every call site already has, so a lost device degrades to "stop
-     * uploading" rather than an uncaught throw. See `isDeviceLost()` /
+     * uploading" rather than an uncaught throw.
+     *
+     * DELIBERATELY NOT NARROWED, unlike `getScene()`: the one external
+     * `GPUDevice` member measured is `queue`; every other call site
+     * hands the device back to a `SceneContents` method. See `isDeviceLost()` /
      * `onDeviceLost()` for the recovery contract.
      */
     getGPUDevice(): GPUDevice | null {
@@ -3555,6 +3765,8 @@ export class Renderer {
         this.edlPass = null;
         this.skyPass?.destroy();
         this.skyPass = null;
+        this.shadowPass?.destroy();
+        this.shadowPass = null;
 
         // Section-plane gizmo, 2D section overlay and the symbolic annotation
         // pipelines — see RendererOverlays.destroy().

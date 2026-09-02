@@ -12,83 +12,38 @@
  * lazily and is cached per model source.
  */
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { DrawingLine2D } from '@ifc-lite/renderer';
 import { useViewerStore } from '@/store';
 import { useShallow } from 'zustand/react/shallow';
 import type { IfcDataStore } from '@ifc-lite/parser';
-import { hasEntityType } from './has-entity-type.js';
 import {
-  buildParseResult,
-  createEmptyParseResult,
   debugEnabled,
   type AnnotationFill2D,
   type AnnotationText2D,
   type AnnotationsForStorey,
-  type ParseResult,
 } from '../lib/overlay-parse/symbolic-parse.js';
-import { getWholeSourceForWorker, parseSymbolicFlat } from '../lib/overlay-parse/index.js';
+import { ensureParseFor, getParseFor, subscribeToParseCache } from './symbolic-parse-cache.js';
+import { useOverlayChannelGate } from './useOverlayChannelGate.js';
+import {
+  buildSymbolicLineChannels,
+  type SymbolicLineChannels,
+  type SymbolicLineChannelsEntry,
+} from './symbolic-line-channels.js';
+import {
+  buildSymbolicRichChannels,
+  EMPTY_RICH_CHANNELS,
+  type AnnotationFill3D,
+  type AnnotationText3D,
+  type SymbolicRichChannels,
+  type SymbolicRichChannelsEntry,
+} from './symbolic-rich-channels.js';
 
 // The parse walk itself lives in `lib/overlay-parse/symbolic-parse.ts` so a
 // worker can import it (a worker module cannot import this React hook file).
 // Re-exported here so existing consumers keep their import paths.
 export type { AnnotationsForStorey, AnnotationText2D, AnnotationFill2D };
 export { polylineToSegments, circleToSegments } from '../lib/overlay-parse/symbolic-parse.js';
-
-/**
- * Stable cache key for one parsed source.
- *
- * Was a sampled hash (head/middle/tail, 96 bytes) chosen to avoid walking the
- * whole file. `IfcSourceBytes.contentKey` is a full-content hash computed once
- * and cached on the source, so this is now both cheaper per call and stronger:
- * the sampled form could alias two files sharing a size and those windows,
- * which showed up as a federated model's annotations silently not rendering
- * because the parse effect skipped it as already cached (#2183).
- */
-function sourceKey(store: IfcDataStore | null | undefined): string | null {
-  return store?.source.contentKey ?? null;
-}
-
-/**
- * Parse one store's symbolic annotations.
- *
- * The WASM walk runs in the overlay worker (`lib/overlay-parse`); this
- * wrapper supplies the entity-index pre-filter, which needs
- * `store.entityIndex`, and reassembles the flat primitive stream into buckets
- * with the storey lookups, which never leave the main thread.
- */
-async function parseAnnotations(
-  store: IfcDataStore,
-): Promise<ParseResult> {
-  const source = store.source;
-  // Skip the full-source WASM scan only when the model has neither IfcAnnotation
-  // nor IfcGridAxis — this parse path ALSO feeds the grid buckets (gridByStorey /
-  // gridLoose*), so gating on IfcAnnotation alone would drop grid-only models.
-  // The scan copies the entire IFC source into the WASM heap on the main thread,
-  // so skipping it when there is nothing to find still matters.
-  //
-  if (source && source.byteLength > 0 && !hasEntityType(store, 'IfcAnnotation', 'IfcGridAxis')) {
-    if (debugEnabled()) console.log('[annotations] skip: no IfcAnnotation/IfcGridAxis entities');
-    return createEmptyParseResult();
-  }
-  if (!source || source.byteLength === 0) {
-    if (debugEnabled()) console.log('[annotations] skip: missing/empty source');
-    return createEmptyParseResult();
-  }
-
-  // The WASM walk runs in the overlay worker and is terminated afterwards;
-  // running it here grew a main-thread WASM heap that never shrinks, worth
-  // ~471 MB on a 342 MB model (#2183). Only the flat primitive stream crosses
-  // back — bucketing stays here, so the storey lookups never leave the main
-  // thread and `ensureBucket` keeps its exact semantics.
-  // `getWholeSourceForWorker` is the single seam for handing a model's bytes
-  // to a worker — see `lib/overlay-parse/source-handoff.ts`.
-  const flat = await parseSymbolicFlat(getWholeSourceForWorker(store), debugEnabled());
-  return buildParseResult(flat, {
-    elementToStorey: store.spatialHierarchy?.elementToStorey,
-    storeyElevations: store.spatialHierarchy?.storeyElevations,
-  });
-}
 
 /**
  * Lift 2D annotation lines (renderer XZ space) to a flat Float32Array of
@@ -115,7 +70,7 @@ export function liftTo3DLineList(
 /**
  * Returns IFC annotation segments as a single Float32Array of pre-lifted 3D
  * line-list vertices in world space, ready to feed
- * `renderer.uploadAnnotationLines3D`.
+ * `renderer.setLineOverlay('annotation', …)`.
  *
  * Each annotation is lifted to its containing storey's elevation. Annotations
  * with no resolvable storey fall back to `fallbackY` (typically the mid-Y of
@@ -130,44 +85,6 @@ export function liftTo3DLineList(
  * is turned on, and the result is cached per model source.
  */
 const EMPTY_F32 = new Float32Array(0);
-
-// ─── Shared parse cache ─────────────────────────────────────────────────────
-// Parsing the whole file's symbolic representations is not cheap (full WASM
-// walk over every product's representations). Cache results module-globally
-// so the line / text / fill hooks share one parse per model source instead
-// of triggering it once per hook.
-const PARSE_CACHE = new Map<string, ParseResult>();
-const PARSE_INFLIGHT = new Map<string, Promise<void>>();
-
-/** Subscribers that want to re-render when a new parse result lands. */
-type CacheListener = () => void;
-const CACHE_LISTENERS = new Set<CacheListener>();
-function notifyCacheChange(): void {
-  for (const fn of CACHE_LISTENERS) fn();
-}
-
-function ensureParseFor(stores: IfcDataStore[]): void {
-  for (const store of stores) {
-    const key = sourceKey(store);
-    if (!key) continue;
-    if (PARSE_CACHE.has(key)) continue;
-    if (PARSE_INFLIGHT.has(key)) continue;
-
-    const promise = (async () => {
-      try {
-        const result = await parseAnnotations(store);
-        PARSE_CACHE.set(key, result);
-        notifyCacheChange();
-      } catch (error) {
-        // eslint-disable-next-line no-console
-        console.warn('[useSymbolicAnnotations] parse failed:', error);
-      } finally {
-        PARSE_INFLIGHT.delete(key);
-      }
-    })();
-    PARSE_INFLIGHT.set(key, promise);
-  }
-}
 
 /** One active model's data store plus the identity needed to map a parsed
  *  primitive's LOCAL express id to the federated global id the visibility
@@ -203,11 +120,7 @@ function useAnnotationParseTrigger(enabled: boolean, stores: ActiveStore[]): num
   useEffect(() => {
     if (!enabled) return undefined;
     ensureParseFor(stores.map((s) => s.store));
-    const listener: CacheListener = () => setVersion((v) => v + 1);
-    CACHE_LISTENERS.add(listener);
-    return () => {
-      CACHE_LISTENERS.delete(listener);
-    };
+    return subscribeToParseCache(() => setVersion((v) => v + 1));
   }, [enabled, stores]);
 
   return version;
@@ -265,7 +178,7 @@ function makeHiddenOwnerPredicate(
  * fall back to the caller's `fallbackY` (typically the model's mid-Y). A
  * real ground floor at 0.0 keeps its authored 0 instead of being remapped.
  */
-function resolveBucketY(elevation: number | null, fallbackY: number): number {
+export function resolveBucketY(elevation: number | null, fallbackY: number): number {
   return elevation === null ? fallbackY : elevation;
 }
 
@@ -285,6 +198,25 @@ export interface SectionClipForGrid {
   axis: 'down' | 'front' | 'side';
 }
 
+// `buildSymbolicLineChannels` (the pure annotation/grid merge, issue #3359)
+// lives in `symbolic-line-channels.ts` — split out to keep this file under
+// budget and so it can be unit-tested with no React/store/WASM dependency.
+// Re-exported here so existing consumers keep this import path.
+export { buildSymbolicLineChannels, type SymbolicLineChannels, type SymbolicLineChannelsEntry };
+
+// `buildSymbolicRichChannels` (the pure text/fill merge) and the
+// `AnnotationText3D` / `AnnotationFill3D` shapes it produces live in
+// `symbolic-rich-channels.ts` — split out for the same two reasons as the line
+// channels above, and so the grid section-clip band it applies has a seam a
+// test can reach with no worker, no parse cache and no React (issue #3393).
+// Re-exported narrowly: `SymbolicRichChannels` names the return type of the
+// hook below, and `AnnotationText3D` / `AnnotationFill3D` keep this import
+// path working for the callers that already used it (today only
+// `useSymbolicAnnotations.gridBubbleExtent.test.tsx`; `Viewport.tsx` consumes
+// the shapes structurally without naming them). The builder and its entry type
+// have no consumer here and are imported from their own module instead.
+export { type AnnotationFill3D, type AnnotationText3D, type SymbolicRichChannels };
+
 export function useSymbolicAnnotations(params: {
   /** Enable IfcAnnotation lift (the existing default behaviour). */
   enabled: boolean;
@@ -299,9 +231,10 @@ export function useSymbolicAnnotations(params: {
   gridSectionClip?: SectionClipForGrid;
   /** World Y to use for annotations with no resolvable storey. Defaults to 0. */
   fallbackY?: number;
-}): Float32Array {
-  const { enabled, gridEnabled, gridSectionClip, fallbackY = 0 } = params;
-  const effectiveGridEnabled = gridEnabled ?? enabled;
+}): SymbolicLineChannels {
+  const { gridSectionClip, fallbackY = 0 } = params;
+  const { annotation: enabled, grid: effectiveGridEnabled } =
+    useOverlayChannelGate(params.enabled, params.gridEnabled ?? params.enabled);
   const stores = useActiveStores();
   const hiddenSets = useHiddenOwnerSets();
   // Trigger parse if EITHER subset is enabled — the parse pass is shared.
@@ -311,108 +244,29 @@ export function useSymbolicAnnotations(params: {
   const clipDepth = clipEnabled ? gridSectionClip!.viewDepth : 0;
 
   return useMemo(() => {
-    if (!enabled && !effectiveGridEnabled) return EMPTY_F32;
+    if (!enabled && !effectiveGridEnabled) return { annotation: EMPTY_F32, grid: EMPTY_F32 };
     void version; // depend on parse-completion ticks
 
-    const verts: number[] = [];
-    let storeIdx = 0;
+    // Per-entity hide: an annotation/grid owner hidden via the hierarchy, a
+    // lens, or a federated per-model hide drops its overlay primitives.
+    // Stores whose parse isn't cached yet drop out (logged below).
+    const entries: SymbolicLineChannelsEntry[] = [];
     for (const entry of stores) {
-      const key = sourceKey(entry.store);
-      if (!key) { storeIdx++; continue; }
-      const cached = PARSE_CACHE.get(key);
-      if (!cached) {
-        if (debugEnabled()) console.log(`[annotations] store ${storeIdx}: parse not yet ready for key=${key}`);
-        storeIdx++;
-        continue;
-      }
-      // Per-entity hide: an annotation/grid owner hidden via the hierarchy,
-      // a lens, or a federated per-model hide drops its overlay primitives.
-      const isHidden = makeHiddenOwnerPredicate(entry, hiddenSets);
-      if (debugEnabled()) {
-        console.log(
-          `[annotations] store ${storeIdx}: annotation buckets=${cached.byStorey.size}+${cached.loose.length}loose, grid buckets=${cached.gridByStorey.size}+${cached.gridLoose.length}loose (annot=${enabled}, grid=${effectiveGridEnabled}, clip=${clipEnabled})`,
-        );
-      }
-
-      if (enabled) {
-        for (const bucket of cached.byStorey.values()) {
-          liftTo3DLineList(bucket.lines, resolveBucketY(bucket.storeyElevation, fallbackY), verts, isHidden);
-        }
-        liftTo3DLineList(cached.loose, fallbackY, verts, isHidden);
-      }
-
-      if (effectiveGridEnabled) {
-        // Issue #862: section-clip grid buckets only — IfcAnnotation
-        // intentionally bypasses this per the feedback memory ("the
-        // user expects every storey's dimensions/grid bubbles to lift
-        // into the viewport when [the annotation toggle is] on, even
-        // while a section cut is active").
-        if (clipEnabled) {
-          const lo = clipPos - clipDepth;
-          const hi = clipPos + clipDepth;
-          for (const bucket of cached.gridByStorey.values()) {
-            const y = resolveBucketY(bucket.storeyElevation, fallbackY);
-            if (y < lo || y > hi) continue;
-            liftTo3DLineList(bucket.lines, y, verts, isHidden);
-          }
-          if (fallbackY >= lo && fallbackY <= hi) {
-            liftTo3DLineList(cached.gridLoose, fallbackY, verts, isHidden);
-          }
-        } else {
-          for (const bucket of cached.gridByStorey.values()) {
-            liftTo3DLineList(bucket.lines, resolveBucketY(bucket.storeyElevation, fallbackY), verts, isHidden);
-          }
-          liftTo3DLineList(cached.gridLoose, fallbackY, verts, isHidden);
-        }
-      }
-      storeIdx++;
+      const cached = getParseFor(entry.store);
+      if (cached) entries.push({ cached, isHidden: makeHiddenOwnerPredicate(entry, hiddenSets) });
+      else if (debugEnabled()) console.log(`[annotations] store not yet ready: ${entry.modelId}`);
     }
 
-    if (debugEnabled()) console.log(`[annotations] total 3D line vertices: ${verts.length / 3} from ${stores.length} stores`);
-    if (verts.length === 0) return EMPTY_F32;
-    return new Float32Array(verts);
+    return buildSymbolicLineChannels(entries, {
+      enabled,
+      effectiveGridEnabled,
+      clipEnabled,
+      clipPos,
+      clipDepth,
+      fallbackY,
+    });
   }, [enabled, effectiveGridEnabled, clipEnabled, clipPos, clipDepth, stores, hiddenSets, version, fallbackY]);
 }
-
-/**
- * A text annotation lifted into 3D world space.
- *
- * `worldPos[1]` is the storey Y the annotation belongs to (or `fallbackY` for
- * orphans). `dirX / dirZ` is the baseline direction in 3D (already mirrored
- * from the IFC frame to match the section overlay's coordinate handedness).
- * `height` is in world units.
- */
-export interface AnnotationText3D {
-  worldPos: [number, number, number];
-  dirX: number;
-  dirZ: number;
-  height: number;
-  content: string;
-  alignment: string;
-  /** True when the glyph quad should rebuild in camera-aligned basis (grid tags). */
-  billboard?: boolean;
-  /** sRGB straight-alpha tint, 0..1. */
-  color?: [number, number, number, number];
-  /** Per-instance target cap height in screen pixels. */
-  targetPx?: number;
-}
-
-/**
- * A filled region lifted into 3D world space. `points` is a flat
- * `[x, z, x, z, …]` ring buffer (Y is constant = `worldY`). Holes are tracked
- * via `holesOffsets` (vertex indices into `points`); the renderer triangulates.
- */
-export interface AnnotationFill3D {
-  points: Float32Array;
-  holesOffsets: Uint32Array;
-  worldY: number;
-  color: [number, number, number, number];
-  hatching?: AnnotationFill2D['hatching'];
-}
-
-/** Cheap stable empty arrays for the no-data path. */
-const EMPTY_TEXTS: readonly AnnotationText3D[] = Object.freeze([]);
-const EMPTY_FILLS: readonly AnnotationFill3D[] = Object.freeze([]);
 
 /**
  * Hook for the 2D Section panel: filters the shared parse cache to
@@ -554,9 +408,7 @@ export function useSymbolicAnnotationsForDrawing(params: {
       : (f: AnnotationFill2D) => fills.push(f);
 
     for (const entry of stores) {
-      const key = sourceKey(entry.store);
-      if (!key) continue;
-      const cached = PARSE_CACHE.get(key);
+      const cached = getParseFor(entry.store);
       if (!cached) continue;
 
       // Drawing-2D pulls BOTH annotation and grid buckets (issue #862
@@ -609,9 +461,10 @@ export function useSymbolicAnnotationsRichData(params: {
    *  [`useSymbolicAnnotations`]. */
   gridSectionClip?: SectionClipForGrid;
   fallbackY?: number;
-}): { texts: readonly AnnotationText3D[]; fills: readonly AnnotationFill3D[] } {
-  const { enabled, gridEnabled, gridSectionClip, fallbackY = 0 } = params;
-  const effectiveGridEnabled = gridEnabled ?? enabled;
+}): SymbolicRichChannels {
+  const { gridSectionClip, fallbackY = 0 } = params;
+  const { annotation: enabled, grid: effectiveGridEnabled } =
+    useOverlayChannelGate(params.enabled, params.gridEnabled ?? params.enabled);
   const stores = useActiveStores();
   const hiddenSets = useHiddenOwnerSets();
   const version = useAnnotationParseTrigger(enabled || effectiveGridEnabled, stores);
@@ -620,89 +473,24 @@ export function useSymbolicAnnotationsRichData(params: {
   const clipDepth = clipEnabled ? gridSectionClip!.viewDepth : 0;
 
   return useMemo(() => {
-    if (!enabled && !effectiveGridEnabled) return { texts: EMPTY_TEXTS, fills: EMPTY_FILLS };
-    void version;
+    if (!enabled && !effectiveGridEnabled) return EMPTY_RICH_CHANNELS;
+    void version; // depend on parse-completion ticks
 
-    const texts: AnnotationText3D[] = [];
-    const fills: AnnotationFill3D[] = [];
-
+    // Per-entity hide: drop text/fills whose owning annotation is hidden.
+    // Stores whose parse isn't cached yet drop out.
+    const entries: SymbolicRichChannelsEntry[] = [];
     for (const entry of stores) {
-      const key = sourceKey(entry.store);
-      if (!key) continue;
-      const cached = PARSE_CACHE.get(key);
-      if (!cached) continue;
-
-      // Per-entity hide: drop text/fills whose owning annotation is hidden.
-      const isHidden = makeHiddenOwnerPredicate(entry, hiddenSets);
-
-      const pushText = (t: AnnotationText2D, y: number) => {
-        if (isHidden && isHidden(t.ownerId)) return;
-        // lineYOffset stacks multi-line text downward in world-Y. Glyph
-        // upAxis is world-Y (see SymbolicTextPipeline), so subtracting
-        // here puts line 1 below line 0 on screen for any side/oblique
-        // 3D view of the floor plan.
-        texts.push({
-          worldPos: [t.x, y + (t.lineYOffset ?? 0), t.y],
-          dirX: t.dirX,
-          dirZ: t.dirY,
-          height: t.height,
-          content: t.content,
-          alignment: t.alignment,
-          billboard: t.billboard,
-          color: t.color,
-          targetPx: t.targetPx,
-        });
-      };
-      const pushFill = (f: AnnotationFill2D, y: number) => {
-        if (isHidden && isHidden(f.ownerId)) return;
-        fills.push({
-          points: f.points,
-          holesOffsets: f.holesOffsets,
-          worldY: y,
-          color: f.color,
-          hatching: f.hatching,
-        });
-      };
-
-      if (enabled) {
-        for (const bucket of cached.byStorey.values()) {
-          const y = resolveBucketY(bucket.storeyElevation, fallbackY);
-          for (const t of bucket.texts) pushText(t, y);
-          for (const f of bucket.fills) pushFill(f, y);
-        }
-        for (const t of cached.looseTexts) pushText(t, fallbackY);
-        for (const f of cached.looseFills) pushFill(f, fallbackY);
-      }
-
-      if (effectiveGridEnabled) {
-        if (clipEnabled) {
-          const lo = clipPos - clipDepth;
-          const hi = clipPos + clipDepth;
-          for (const bucket of cached.gridByStorey.values()) {
-            const y = resolveBucketY(bucket.storeyElevation, fallbackY);
-            if (y < lo || y > hi) continue;
-            for (const t of bucket.texts) pushText(t, y);
-            for (const f of bucket.fills) pushFill(f, y);
-          }
-          if (fallbackY >= lo && fallbackY <= hi) {
-            for (const t of cached.gridLooseTexts) pushText(t, fallbackY);
-            for (const f of cached.gridLooseFills) pushFill(f, fallbackY);
-          }
-        } else {
-          for (const bucket of cached.gridByStorey.values()) {
-            const y = resolveBucketY(bucket.storeyElevation, fallbackY);
-            for (const t of bucket.texts) pushText(t, y);
-            for (const f of bucket.fills) pushFill(f, y);
-          }
-          for (const t of cached.gridLooseTexts) pushText(t, fallbackY);
-          for (const f of cached.gridLooseFills) pushFill(f, fallbackY);
-        }
-      }
+      const cached = getParseFor(entry.store);
+      if (cached) entries.push({ cached, isHidden: makeHiddenOwnerPredicate(entry, hiddenSets) });
     }
 
-    return {
-      texts: texts.length ? texts : EMPTY_TEXTS,
-      fills: fills.length ? fills : EMPTY_FILLS,
-    };
+    return buildSymbolicRichChannels(entries, {
+      enabled,
+      effectiveGridEnabled,
+      clipEnabled,
+      clipPos,
+      clipDepth,
+      fallbackY,
+    });
   }, [enabled, effectiveGridEnabled, clipEnabled, clipPos, clipDepth, stores, hiddenSets, version, fallbackY]);
 }

@@ -6,8 +6,8 @@
  * PropertyTable serialization
  */
 
-import type { PropertyTable, PropertySet, PropertyValue, StringTable } from '@ifc-lite/data';
-import { comparePropertyValues, PropertyValueType } from '@ifc-lite/data';
+import type { PropertyTable, PropertyValue, StringTable } from '@ifc-lite/data';
+import { comparePropertyValues, groupPropertySetsByInstance, PropertyValueType } from '@ifc-lite/data';
 import { BufferWriter, BufferReader } from '../utils/buffer-utils.js';
 
 /**
@@ -88,9 +88,9 @@ export function readProperties(reader: BufferReader, strings: StringTable): Prop
   const valueBool = reader.readUint8Array(count);
   const unitId = reader.readInt32Array(count);
 
-  const entityIndex = readIndex(reader);
-  const psetIndex = readIndex(reader);
-  const propIndex = readIndex(reader);
+  const entityIndex = readIndex(reader, count, 'entityIndex');
+  const psetIndex = readIndex(reader, count, 'psetIndex');
+  const propIndex = readIndex(reader, count, 'propIndex');
 
   const getPropertyValue = (idx: number): PropertyValue => {
     const type = propType[idx];
@@ -154,31 +154,15 @@ export function readProperties(reader: BufferReader, strings: StringTable): Prop
 
     getForEntity: (id) => {
       const rowIndices = entityIndex.get(id) || [];
-      const psets = new Map<string, PropertySet>();
-
-      for (const idx of rowIndices) {
-        const psetNameStr = strings.get(psetName[idx]);
-        const psetGlobalIdStr = strings.get(psetGlobalId[idx]);
-
-        if (!psets.has(psetNameStr)) {
-          psets.set(psetNameStr, {
-            name: psetNameStr,
-            globalId: psetGlobalIdStr,
-            properties: [],
-          });
-        }
-
-        const pset = psets.get(psetNameStr)!;
-        const propNameStr = strings.get(propName[idx]);
-
-        pset.properties.push({
-          name: propNameStr,
-          type: propType[idx],
-          value: getPropertyValue(idx),
-        });
-      }
-
-      return Array.from(psets.values());
+      return groupPropertySetsByInstance(
+        rowIndices,
+        psetName,
+        psetGlobalId,
+        propName,
+        propType,
+        strings,
+        (idx) => getPropertyValue(idx),
+      );
     },
 
     getPropertyValue: (id, pset, prop) => {
@@ -231,7 +215,18 @@ function writeIndex(writer: BufferWriter, index: Map<number, number[]>): void {
   }
 }
 
-function readIndex(reader: BufferReader): Map<number, number[]> {
+/**
+ * Read a row-index table (entityIndex/psetIndex/propIndex): key -> row
+ * indices into the parallel column arrays. Each row index MUST be < rowCount
+ * — the column arrays (entityId, psetName, propType, valueString, ...) are
+ * fixed-size `Uint32Array`/`Float64Array`s, so an out-of-range read returns
+ * `undefined` instead of throwing (`arr[idx]` on a typed array never throws).
+ * A corrupt cache with an inflated row index would otherwise flow `undefined`
+ * names and types into `getForEntity` results silently instead of failing the
+ * cache load. Same defect shape, and same fix, as `entity-index.ts`'s
+ * `typeIndex` bounds check.
+ */
+function readIndex(reader: BufferReader, rowCount: number, name: string): Map<number, number[]> {
   const size = reader.readUint32();
   const index = new Map<number, number[]>();
   for (let i = 0; i < size; i++) {
@@ -239,7 +234,14 @@ function readIndex(reader: BufferReader): Map<number, number[]> {
     const valueCount = reader.readUint32();
     const values: number[] = [];
     for (let j = 0; j < valueCount; j++) {
-      values.push(reader.readUint32());
+      const rowIndex = reader.readUint32();
+      if (rowIndex >= rowCount) {
+        throw new Error(
+          `Corrupt cache PropertyTable ${name}: row index ${rowIndex} for key ${key} ` +
+            `exceeds row count ${rowCount}`,
+        );
+      }
+      values.push(rowIndex);
     }
     index.set(key, values);
   }

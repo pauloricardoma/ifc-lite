@@ -42,6 +42,7 @@ import {
   openIfcFilesWithHandles,
   handlesFromDataTransfer,
 } from '@/services/file-system-access';
+import { FILE_ACCEPT, isSupportedModelFile } from '@/services/supported-model-files';
 import {
   SOURCE_DOWNLOAD_EVENT,
   type SourceDownloadEvent,
@@ -60,7 +61,7 @@ import { createBlankIfcFile } from '@/utils/createBlankIfc';
 import type { MeshData, CoordinateInfo, GeometryResult, PointCloudAsset } from '@ifc-lite/geometry';
 import { type IfcDataStore, type MapConversion } from '@ifc-lite/parser';
 import { getEffectiveGeoreference } from '@/lib/geo/effective-georef';
-import { isMeshVisibleInViewMode, meshClassIsPlaced } from '@/lib/type-view-visibility';
+import { isMeshVisibleInViewMode, meshClassIsPlaced, meshIsNonOccurrence } from '@/lib/type-view-visibility';
 
 const ZERO_VEC3 = { x: 0, y: 0, z: 0 };
 const DEFAULT_COORDINATE_INFO: CoordinateInfo = {
@@ -486,12 +487,7 @@ export function ViewportContainer() {
     applyDragEvent('leave');
   }, [applyDragEvent]);
 
-  const isSupportedFile = useCallback((f: File) => {
-    const n = f.name.toLowerCase();
-    return n.endsWith('.ifc') || n.endsWith('.ifcx') || n.endsWith('.ifczip') || n.endsWith('.glb')
-      || n.endsWith('.las') || n.endsWith('.laz') || n.endsWith('.ply') || n.endsWith('.pcd')
-      || n.endsWith('.e57') || n.endsWith('.pts') || n.endsWith('.xyz');
-  }, []);
+  const isSupportedFile = isSupportedModelFile;
 
   // Single routing point for every ingestion path (picker / drop / input). The
   // optional `handles` array is positionally aligned with `files` and carries a
@@ -816,7 +812,7 @@ export function ViewportContainer() {
     }
     if (!sawTypeGeometryRef.current) {
       for (let i = typeGeoScanLenRef.current; i < meshes.length; i++) {
-        if ((meshes[i].geometryClass ?? 0) !== 0) { sawTypeGeometryRef.current = true; break; }
+        if (meshIsNonOccurrence(meshes[i])) { sawTypeGeometryRef.current = true; break; }
       }
     }
     typeGeoScanLenRef.current = meshes.length;
@@ -1091,7 +1087,7 @@ export function ViewportContainer() {
         <input
           ref={fileInputRef}
           type="file"
-          accept=".ifc,.ifcx,.ifczip,.glb,.las,.laz,.ply,.pcd,.e57,.pts,.xyz,.dxf"
+          accept={FILE_ACCEPT}
           multiple
           onChange={handleFileSelect}
           className="hidden"

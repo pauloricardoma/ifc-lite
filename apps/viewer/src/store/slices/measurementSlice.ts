@@ -20,10 +20,22 @@ import type {
   MeasureMode,
   ActivePolyline,
   PolylineMeasurement,
+  ActiveAngle,
+  AngleKind,
+  AngleMeasurement,
+  AnglePick,
+  ActiveRadius,
+  RadiusMeasurement,
 } from '../types.js';
+import { ANGLE_REQUIRED_PICKS } from '../types.js';
+import type {
+  REPROJECTED_MEASUREMENT_FIELDS,
+  ReprojectedMeasurementField,
+} from '../measurementReprojectionFields.js';
 import { EDGE_LOCK_DEFAULTS } from '../constants.js';
 import { polylineLength } from '@/components/viewer/tools/measure-modes/polyline.js';
 import { isDuplicateClickPoint } from '@/components/viewer/measureHandlers.js';
+import { MIN_RADIUS_POINTS } from '@/components/viewer/tools/measure-modes/radius.js';
 
 // Monotonic counter to prevent ID collisions under rapid measurement creation
 let measurementCounter = 0;
@@ -77,10 +89,22 @@ export interface MeasurementSlice {
   measureMode: MeasureMode;
   /** A polyline sequence in progress (points accumulated via clicks, not yet finished). */
   activePolyline: ActivePolyline | null;
+  /** Which angle the tool measures when `measureMode === 'angle'` (#2735). */
+  angleKind: AngleKind;
+  /** A fixed-length angle sequence in progress, or null. */
+  activeAngle: ActiveAngle | null;
+  /** Finished angle measurements. Picks only - degrees are derived on render. */
+  angleMeasurements: AngleMeasurement[];
   /** Finished polyline measurements — kept separate from `measurements`
    *  (distance-only) rather than folded in, since they carry an extra basis
    *  (open length vs. closed perimeter) that a drag measurement never has. */
   polylineMeasurements: PolylineMeasurement[];
+  /** A radius/diameter click sequence in progress when `measureMode ===
+   *  'radius'` (#2737 item 2), or null. */
+  activeRadius: ActiveRadius | null;
+  /** Finished radius measurements. Picks only — the fit (or refusal) is
+   *  derived on render by `fitRadius`. */
+  radiusMeasurements: RadiusMeasurement[];
 
   // Legacy measurement actions
   addMeasurePoint: (point: MeasurePoint) => void;
@@ -124,6 +148,17 @@ export interface MeasurementSlice {
    *  leaving 'polyline' discards any in-progress click sequence. A no-op if
    *  already in the requested mode (does not disturb in-progress state). */
   setMeasureMode: (mode: MeasureMode) => void;
+  /** Switch which angle is measured. Discards any in-progress sequence. */
+  setAngleKind: (kind: AngleKind) => void;
+  /**
+   * Append a pick. When the sequence reaches `ANGLE_REQUIRED_PICKS[kind]` it
+   * finishes ITSELF into `angleMeasurements` - there is no finish gesture, so
+   * unlike `finishPolyline` there is no double-click duplicate to defend
+   * against.
+   */
+  addAnglePick: (pick: AnglePick) => void;
+  cancelAngle: () => void;
+  deleteAngleMeasurement: (id: string) => void;
   /** Begin a polyline sequence at `point`. No-op if one is already active —
    *  use {@link addPolylinePoint} to extend it. */
   startPolyline: (point: MeasurePoint) => void;
@@ -150,6 +185,33 @@ export interface MeasurementSlice {
   /** Discard the in-progress polyline without recording a measurement. */
   cancelPolyline: () => void;
   deletePolylineMeasurement: (id: string) => void;
+
+  // Radius/diameter (multi-click, unbounded) measurement actions (#2737 item 2)
+  /** Begin a radius sequence at `point`. No-op if one is already active —
+   *  use {@link addRadiusPoint} to extend it. Mirrors `startPolyline`. */
+  startRadius: (point: MeasurePoint) => void;
+  /** Append a point to the in-progress radius sequence. No-op if none is
+   *  active. */
+  addRadiusPoint: (point: MeasurePoint) => void;
+  /**
+   * Finish the in-progress radius sequence and push it to
+   * `radiusMeasurements`. No-op below {@link MIN_RADIUS_POINTS} — `fitRadius`
+   * needs at least three picks to attempt anything, so recording fewer would
+   * only ever produce a stored "insufficient-points" readout, which is not a
+   * measurement.
+   *
+   * `fromDoubleClick` mirrors `finishPolyline`'s option of the same name: it
+   * opts into dropping the trailing near-duplicate point a physical
+   * double-click leaves behind (browsers dispatch click, click, dblclick),
+   * and belongs to exactly one call site the same way.
+   *
+   * Returns whether a measurement was actually recorded, so the Enter
+   * shortcut can tell "finished" apart from "did nothing register".
+   */
+  finishRadius: (options?: { fromDoubleClick?: boolean }) => boolean;
+  /** Discard the in-progress radius sequence without recording a measurement. */
+  cancelRadius: () => void;
+  deleteRadiusMeasurement: (id: string) => void;
 
   /**
    * Discard whatever measurement gesture is in progress — a drag mid-flight
@@ -199,6 +261,38 @@ const getDefaultEdgeLockState = (): EdgeLockState => ({
   cornerValence: 0,
 });
 
+/**
+ * The registered KIND of each reprojected field must match that field's real
+ * shape on the slice.
+ *
+ * The exhaustive `set()` payload below pins the field NAMES, and
+ * `PendingMeasurementState` turns a `nullable` field registered as `list`
+ * into a compile error (a `T | null` has no `length`). The opposite mistake
+ * is silent without this check: registering a LIST field as `nullable` maps
+ * it to `unknown`, which any array satisfies, so nothing fails to compile —
+ * and `hasPendingMeasurementState` then tests it with `!== null`, which an
+ * array never is. The gate would report "pending" forever and the
+ * per-frame reprojection pass would never stop running.
+ *
+ * VERIFIED BY RUNNING `tsc` before this was added: flipping
+ * `angleMeasurements` to `'nullable'` produced zero errors anywhere.
+ *
+ * Each entry resolves to `true` when the kind matches, and to a descriptive
+ * tuple when it does not — which fails the `Record<..., true>` constraint and
+ * names the offending field in the error.
+ */
+type RegisteredKindMatchesSliceShape = {
+  [K in ReprojectedMeasurementField]: (typeof REPROJECTED_MEASUREMENT_FIELDS)[K] extends 'list'
+    ? MeasurementSlice[K] extends readonly unknown[]
+      ? true
+      : ['registered as `list` but is not an array', K]
+    : null extends MeasurementSlice[K]
+      ? true
+      : ['registered as `nullable` but cannot be null', K];
+};
+type AssertAllTrue<T extends Record<ReprojectedMeasurementField, true>> = T;
+export type _ReprojectedKindsMatch = AssertAllTrue<RegisteredKindMatchesSliceShape>;
+
 export const createMeasurementSlice: StateCreator<MeasurementSlice, [], [], MeasurementSlice> = (set, get) => ({
   // Initial state
   measurements: [],
@@ -214,6 +308,11 @@ export const createMeasurementSlice: StateCreator<MeasurementSlice, [], [], Meas
   measureMode: 'drag',
   activePolyline: null,
   polylineMeasurements: [],
+  angleKind: 'points',
+  activeAngle: null,
+  angleMeasurements: [],
+  activeRadius: null,
+  radiusMeasurements: [],
 
   // Legacy measurement actions
   addMeasurePoint: (point) => set({ pendingMeasurePoint: point }),
@@ -304,6 +403,10 @@ export const createMeasurementSlice: StateCreator<MeasurementSlice, [], [], Meas
     // click-sequence left behind by "clear" would be a stale trap.
     activePolyline: null,
     polylineMeasurements: [],
+    activeAngle: null,
+    angleMeasurements: [],
+    activeRadius: null,
+    radiusMeasurements: [],
   }),
 
   updateMeasurementScreenCoords: (projectToScreen) => {
@@ -391,17 +494,62 @@ export const createMeasurementSlice: StateCreator<MeasurementSlice, [], [], Meas
       points: m.points.map(reprojectPoint),
     }));
 
+    // Angle picks (#2735) need the same treatment, and for the same reason the
+    // polyline comment above gives: the overlay draws its rays and label from
+    // `screenX/screenY`, so without reprojection every finished angle would
+    // stay frozen at its click-time pixel while the model orbits underneath.
+    // `reprojectPoint` sets `hasChanges` itself, so an angle moving is enough
+    // to defeat the early exit below even when nothing else changed.
+    let updatedActiveAngle = state.activeAngle;
+    if (state.activeAngle) {
+      updatedActiveAngle = {
+        ...state.activeAngle,
+        picks: state.activeAngle.picks.map((pick) => ({ ...pick, point: reprojectPoint(pick.point) })),
+      };
+    }
+
+    const updatedAngleMeasurements = state.angleMeasurements.map((m) => ({
+      ...m,
+      picks: m.picks.map((pick) => ({ ...pick, point: reprojectPoint(pick.point) })),
+    }));
+
+    // Radius picks (#2737 item 2) need the same treatment, for the same
+    // reason the angle comment above gives — the list panel re-derives the
+    // fit from these points on every render, and while the fit itself is
+    // frame-independent (world-space x/y/z, untouched here), the stored
+    // screenX/screenY would otherwise stay frozen at click time.
+    let updatedActiveRadius = state.activeRadius;
+    if (state.activeRadius) {
+      updatedActiveRadius = { points: state.activeRadius.points.map(reprojectPoint) };
+    }
+
+    const updatedRadiusMeasurements = state.radiusMeasurements.map((m) => ({
+      ...m,
+      points: m.points.map(reprojectPoint),
+    }));
+
     // Early exit if nothing changed
     if (!hasChanges) {
       return;
     }
 
-    set({
+    // Typed as an EXHAUSTIVE map over the shared field registry, which is the
+    // same registry `hasPendingMeasurementState` (utils/viewportUtils.ts)
+    // derives the gate deciding whether this pass runs at all. A registered
+    // field with no arm above is a missing-property error here; an arm for a
+    // field nobody registered is an excess-property error. Either way the
+    // divergence #2641 and #2735 each shipped stops being expressible.
+    const reprojected: { [K in ReprojectedMeasurementField]: MeasurementSlice[K] } = {
       measurements: updatedMeasurements,
       activeMeasurement: updatedActiveMeasurement,
       activePolyline: updatedActivePolyline,
       polylineMeasurements: updatedPolylineMeasurements,
-    });
+      activeAngle: updatedActiveAngle,
+      angleMeasurements: updatedAngleMeasurements,
+      activeRadius: updatedActiveRadius,
+      radiusMeasurements: updatedRadiusMeasurements,
+    };
+    set(reprojected);
   },
 
   // Snap actions
@@ -463,19 +611,57 @@ export const createMeasurementSlice: StateCreator<MeasurementSlice, [], [], Meas
   // Polyline (multi-click) measurement actions (#2199)
   setMeasureMode: (mode) => set((state) => {
     if (mode === state.measureMode) return {};
-    if (mode === 'polyline') {
-      // Entering polyline mode: cancel any in-progress drag so the two
-      // gestures can never both be "active" at once.
-      return {
-        measureMode: mode,
-        activeMeasurement: null,
-        snapTarget: null,
-        measurementConstraintEdge: null,
-      };
-    }
-    // Leaving polyline mode: discard any in-progress click sequence.
-    return { measureMode: mode, activePolyline: null };
+    // Symmetric: discard the state of the mode being LEFT, and cancel any
+    // in-progress drag when entering a click-driven mode. Written as spread
+    // arms over one object rather than per-mode early returns so adding a
+    // fourth mode cannot leave an arm behind - the regression this slice
+    // documents at `resetAllMeasurementState` was exactly a hand-maintained
+    // list that missed a newly added field.
+    const leaving = state.measureMode;
+    return {
+      measureMode: mode,
+      ...(leaving === 'polyline' ? { activePolyline: null } : {}),
+      ...(leaving === 'angle' ? { activeAngle: null } : {}),
+      ...(leaving === 'radius' ? { activeRadius: null } : {}),
+      ...(mode !== 'drag'
+        ? { activeMeasurement: null, snapTarget: null, measurementConstraintEdge: null }
+        : {}),
+    };
   }),
+
+  setAngleKind: (kind) => set((state) => {
+    if (kind === state.angleKind) return {};
+    // Switching kind mid-sequence discards it: picks already taken mean
+    // something different under the new kind.
+    return { angleKind: kind, activeAngle: null };
+  }),
+
+  addAnglePick: (pick) => set((state) => {
+    const kind = state.angleKind;
+    // Defence in depth: the handler filters by kind, but a mismatched pick
+    // reaching the store would produce an angle measured from the wrong sort
+    // of input, silently.
+    if (pick.kind !== kind) return {};
+    const prior = state.activeAngle?.kind === kind ? state.activeAngle.picks : [];
+    const picks = [...prior, pick];
+    if (picks.length < ANGLE_REQUIRED_PICKS[kind]) {
+      return { activeAngle: { kind, picks } };
+    }
+    measurementCounter++;
+    return {
+      activeAngle: null,
+      angleMeasurements: [
+        ...state.angleMeasurements,
+        { id: `ang-${Date.now()}-${measurementCounter}`, kind, picks },
+      ],
+    };
+  }),
+
+  cancelAngle: () => set({ activeAngle: null }),
+
+  deleteAngleMeasurement: (id) => set((state) => ({
+    angleMeasurements: state.angleMeasurements.filter((m) => m.id !== id),
+  })),
 
   startPolyline: (point) => set((state) => {
     if (state.activePolyline) return {}; // already accumulating — use addPolylinePoint
@@ -556,9 +742,57 @@ export const createMeasurementSlice: StateCreator<MeasurementSlice, [], [], Meas
     polylineMeasurements: state.polylineMeasurements.filter((m) => m.id !== id),
   })),
 
+  startRadius: (point) => set((state) => {
+    if (state.activeRadius) return {}; // already accumulating — use addRadiusPoint
+    return { activeRadius: { points: [point] } };
+  }),
+
+  addRadiusPoint: (point) => set((state) => {
+    if (!state.activeRadius) return {};
+    return { activeRadius: { points: [...state.activeRadius.points, point] } };
+  }),
+
+  finishRadius: (options) => {
+    // Mirrors `finishPolyline`'s recorded/no-op contract — see its comment
+    // for why the double-click duplicate drop is scoped to that one gesture.
+    let recorded = false;
+    set((state) => {
+      const active = state.activeRadius;
+      if (!active) return {};
+      let points = active.points;
+      if (
+        options?.fromDoubleClick &&
+        points.length >= 2 &&
+        isDuplicateClickPoint(points[points.length - 1], points[points.length - 2])
+      ) {
+        points = points.slice(0, -1);
+      }
+      if (points.length < MIN_RADIUS_POINTS) return {};
+      measurementCounter++;
+      const measurement: RadiusMeasurement = {
+        id: `rad-${Date.now()}-${measurementCounter}`,
+        points,
+      };
+      recorded = true;
+      return {
+        radiusMeasurements: [...state.radiusMeasurements, measurement],
+        activeRadius: null,
+      };
+    });
+    return recorded;
+  },
+
+  cancelRadius: () => set({ activeRadius: null }),
+
+  deleteRadiusMeasurement: (id) => set((state) => ({
+    radiusMeasurements: state.radiusMeasurements.filter((m) => m.id !== id),
+  })),
+
   resetMeasureGesture: () => set({
     activeMeasurement: null,
     activePolyline: null,
+    activeAngle: null,
+    activeRadius: null,
     snapTarget: null,
     measurementConstraintEdge: null,
   }),
@@ -577,5 +811,10 @@ export const createMeasurementSlice: StateCreator<MeasurementSlice, [], [], Meas
     measureMode: 'drag',
     activePolyline: null,
     polylineMeasurements: [],
+    angleKind: 'points',
+    activeAngle: null,
+    angleMeasurements: [],
+    activeRadius: null,
+    radiusMeasurements: [],
   }),
 });

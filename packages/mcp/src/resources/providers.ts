@@ -14,6 +14,7 @@ import { extractGeoreferencingOnDemand } from '@ifc-lite/parser';
 import { foldedEntityCount, pendingMutationsField, pendingOverlay } from '../overlay.js';
 import { buildSpatialTree } from '../spatial-tree.js';
 import { findByGlobalId } from '../tools/util.js';
+import { materialFallbackName } from '../material-naming.js';
 import type { ResourceContents, ResourceDefinition } from '../protocol/index.js';
 import type { LoadedModel, ToolContext } from '../context.js';
 import { modelAllowed } from '../auth/scope.js';
@@ -168,7 +169,7 @@ class MaterialsProvider implements ResourceProvider {
     for (const e of m.bim.query().toArray()) {
       const mat = m.bim.materials(e.ref);
       if (!mat) continue;
-      const key = mat.name ?? '(unnamed)';
+      const key = materialFallbackName(mat) ?? '(unnamed)';
       counts.set(key, (counts.get(key) ?? 0) + 1);
     }
     return [jsonContents(uri, {

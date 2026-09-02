@@ -14,7 +14,8 @@ import { SpatialHierarchyBuilder } from './spatial-hierarchy-builder.js';
 import { EntityExtractor } from './entity-extractor.js';
 import { extractLengthUnitScale } from './unit-extractor.js';
 import { getAttributeNames, getAttributeNamesAcrossSchemas, getInheritanceChain } from './ifc-schema.js';
-import { parsePropertyValue } from './on-demand-extractors.js';
+import { parsePropertyValueWithComplex } from './on-demand-extractors.js';
+import { readQuantitySet } from './quantity-collect.js';
 import { buildCompactEntityIndexAsync } from './compact-entity-index.js';
 import { yieldToEventLoop } from './yield-to-event-loop.js';
 import {
@@ -24,7 +25,6 @@ import {
     QuantityTableBuilder,
     RelationshipGraphBuilder,
     RelationshipType,
-    QuantityType,
 } from '@ifc-lite/data';
 import type { SpatialHierarchy, QuantityTable, PropertyValue, PropertySet, QuantitySet, IfcStoreBase, IfcEntity, IfcAttributeValue } from '@ifc-lite/data';
 import { BufferEntitySource } from './entity-source.js';
@@ -32,7 +32,6 @@ import { batchExtractGlobalIdAndName } from './columnar-parser-attributes.js';
 import {
     GEOMETRY_TYPES,
     REL_TYPE_MAP,
-    QUANTITY_TYPE_MAP,
     SPATIAL_TYPES,
     HIERARCHY_REL_TYPES,
     PROPERTY_REL_TYPES,
@@ -43,8 +42,7 @@ import {
     isIfcTypeLikeEntity,
 } from './columnar-parser-indexes.js';
 import { extractRelFast, extractPropertyRelFast } from './columnar-parser-relationships.js';
-import { safeUtf8Decode } from '@ifc-lite/data';
-import { parseSourceHeader } from './source-header.js';
+import { detectSchemaVersion, parseSourceHeader } from './source-header.js';
 
 import type { SpatialIndex, EntityByIdIndex } from './columnar-parser-indexes.js';
 
@@ -123,19 +121,6 @@ export interface IfcDataStore extends IfcStoreBase {
     lengthUnitScale?: number;
 }
 
-
-function detectSchemaVersion(buffer: Uint8Array): IfcDataStore['schemaVersion'] {
-    const headerEnd = Math.min(buffer.length, 2000);
-    const headerText = safeUtf8Decode(buffer, 0, headerEnd).toUpperCase();
-
-    if (headerText.includes('IFC5')) return 'IFC5';
-    if (headerText.includes('IFC4X3')) return 'IFC4X3';
-    if (headerText.includes('IFC4')) return 'IFC4';
-    if (headerText.includes('IFC2X3')) return 'IFC2X3';
-
-    return 'IFC4'; // Default fallback
-}
-
 export class ColumnarParser {
     /**
      * Parse IFC file into columnar data store
@@ -174,14 +159,16 @@ export class ColumnarParser {
 
         options.onProgress?.({ phase: 'building', percent: 0 });
 
-        // Detect schema version from FILE_SCHEMA header
-        const schemaVersion = detectSchemaVersion(uint8Buffer);
-
         // Capture verbatim HEADER fields so a round-trip export can reproduce
         // the source FILE_DESCRIPTION items + exact FILE_SCHEMA token instead
-        // of regenerating a fresh ifc-lite header. Cheap: only the header
-        // (first ~2 KB, already decoded above) is scanned.
+        // of regenerating a fresh ifc-lite header. Cheap: the scan stops at the
+        // header's ENDSEC, so the DATA section is never touched.
         const sourceHeader = parseSourceHeader(uint8Buffer);
+
+        // Schema version comes from that header's FILE_SCHEMA declaration, not
+        // from a substring scan of the raw bytes — exporter product names in
+        // FILE_NAME free text carry schema tokens too (issue #3278).
+        const schemaVersion = detectSchemaVersion(uint8Buffer, sourceHeader);
 
         // Initialize builders (entity table capacity set after categorization below)
         const strings = new StringTable();
@@ -354,7 +341,7 @@ export class ColumnarParser {
         const associationTargetIds = new Set<number>();
         for (const ref of associationRelRefs) {
             const result = extractPropertyRelFast(uint8Buffer, ref.byteOffset, ref.byteLength);
-            if (result) associationTargetIds.add(result.relatingDef);
+            if (result) for (const id of result.relatingDefs) associationTargetIds.add(id);
         }
 
         // Collect EntityRefs for association targets that aren't already categorised.
@@ -641,23 +628,29 @@ export class ColumnarParser {
             const ref = propertyRelRefs[pi];
             const result = extractPropertyRelFast(uint8Buffer, ref.byteOffset, ref.byteLength);
             if (result) {
-                const { relatedObjects, relatingDef } = result;
+                const { relatedObjects, relatingDefs } = result;
                 totalPropRelObjects += relatedObjects.length;
 
-                for (const objId of relatedObjects) {
-                    relationshipGraphBuilder.addEdge(relatingDef, objId, RelationshipType.DefinesByProperties, ref.expressId);
-                }
-
-                // Build on-demand property/quantity maps using pre-built Sets (O(1) vs binary search)
-                const isPropSet = propertySetIds.has(relatingDef);
-                const isQtySet = !isPropSet && quantitySetIds.has(relatingDef);
-
-                if (isPropSet || isQtySet) {
-                    const targetMap = isPropSet ? onDemandPropertyMap : onDemandQuantityMap;
+                // RelatingPropertyDefinition is IfcPropertySetDefinitionSelect, whose
+                // second alternative (IfcPropertySetDefinitionSet) is a SET of pset/
+                // qset definitions — `relatingDefs` has more than one entry for that
+                // case. Every entry in the group applies to every related object.
+                for (const relatingDef of relatingDefs) {
                     for (const objId of relatedObjects) {
-                        let list = targetMap.get(objId);
-                        if (!list) { list = []; targetMap.set(objId, list); }
-                        list.push(relatingDef);
+                        relationshipGraphBuilder.addEdge(relatingDef, objId, RelationshipType.DefinesByProperties, ref.expressId);
+                    }
+
+                    // Build on-demand property/quantity maps using pre-built Sets (O(1) vs binary search)
+                    const isPropSet = propertySetIds.has(relatingDef);
+                    const isQtySet = !isPropSet && quantitySetIds.has(relatingDef);
+
+                    if (isPropSet || isQtySet) {
+                        const targetMap = isPropSet ? onDemandPropertyMap : onDemandQuantityMap;
+                        for (const objId of relatedObjects) {
+                            let list = targetMap.get(objId);
+                            if (!list) { list = []; targetMap.set(objId, list); }
+                            list.push(relatingDef);
+                        }
                     }
                 }
             }
@@ -683,7 +676,12 @@ export class ColumnarParser {
             const ref = associationRelRefs[i];
             const result = extractPropertyRelFast(uint8Buffer, ref.byteOffset, ref.byteLength);
             if (result) {
-                const { relatedObjects, relatingDef: relatingRef } = result;
+                // IfcRelAssociates{Material,Classification,Document}'s Relating*
+                // selects are always single refs (unlike RelatingPropertyDefinition
+                // above, none of IfcMaterialSelect/IfcClassificationSelect/
+                // IfcDocumentSelect admit a SET alternative) — take the one entry.
+                const { relatedObjects, relatingDefs } = result;
+                const relatingRef = relatingDefs[0];
                 const typeUpper = getTypeUpper(ref.type);
 
                 if (typeUpper === 'IFCRELASSOCIATESCLASSIFICATION') {
@@ -797,7 +795,7 @@ export class ColumnarParser {
 
             const psetAttrs = psetEntity.attributes || [];
             const psetGlobalId = typeof psetAttrs[0] === 'string' ? psetAttrs[0] : undefined;
-            const psetName = typeof psetAttrs[2] === 'string' ? psetAttrs[2] : `PropertySet #${psetId}`;
+            const psetName = typeof psetAttrs[2] === 'string' ? psetAttrs[2] : ''; // not `PropertySet #<id>` (#3530)
             const hasProperties = psetAttrs[4];
 
             const properties: Array<{ name: string; type: number; value: PropertyValue; values?: string[]; dataType?: string }> = [];
@@ -816,7 +814,7 @@ export class ColumnarParser {
                     const propName = typeof propAttrs[0] === 'string' ? propAttrs[0] : '';
                     if (!propName) continue;
 
-                    const parsed = parsePropertyValue(propEntity);
+                    const parsed = parsePropertyValueWithComplex(store, extractor, propEntity);
                     const entry: { name: string; type: number; value: PropertyValue; values?: string[]; dataType?: string } = {
                         name: propName,
                         type: parsed.type,
@@ -862,43 +860,8 @@ export class ColumnarParser {
             const qsetRef = getEntityRefFromStore(store, qsetId);
             if (!qsetRef) continue;
 
-            const qsetEntity = extractor.extractEntity(qsetRef);
-            if (!qsetEntity) continue;
-
-            const qsetAttrs = qsetEntity.attributes || [];
-            const qsetName = typeof qsetAttrs[2] === 'string' ? qsetAttrs[2] : `QuantitySet #${qsetId}`;
-            const hasQuantities = qsetAttrs[5];
-
-            const quantities: Array<{ name: string; type: number; value: number }> = [];
-
-            if (Array.isArray(hasQuantities)) {
-                for (const qtyRef of hasQuantities) {
-                    if (typeof qtyRef !== 'number') continue;
-
-                    const qtyEntityRef = getEntityRefFromStore(store, qtyRef);
-                    if (!qtyEntityRef) continue;
-
-                    const qtyEntity = extractor.extractEntity(qtyEntityRef);
-                    if (!qtyEntity) continue;
-
-                    const qtyAttrs = qtyEntity.attributes || [];
-                    const qtyName = typeof qtyAttrs[0] === 'string' ? qtyAttrs[0] : '';
-                    if (!qtyName) continue;
-
-                    // Get quantity type from entity type
-                    const qtyTypeUpper = qtyEntity.type.toUpperCase();
-                    const qtyType = QUANTITY_TYPE_MAP[qtyTypeUpper] ?? QuantityType.Count;
-
-                    // Value is at index 3 for most quantity types
-                    const value = typeof qtyAttrs[3] === 'number' ? qtyAttrs[3] : 0;
-
-                    quantities.push({ name: qtyName, type: qtyType, value });
-                }
-            }
-
-            if (quantities.length > 0 || qsetName) {
-                result.push({ name: qsetName, quantities });
-            }
+            const qset = readQuantitySet(store, extractor, qsetRef);
+            if (qset) result.push(qset);
         }
 
         return result;

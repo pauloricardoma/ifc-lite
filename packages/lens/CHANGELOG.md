@@ -1,5 +1,54 @@
 # @ifc-lite/lens
 
+## 1.19.0
+
+### Minor Changes
+
+- [#2977](https://github.com/LTplus-AG/ifc-lite/pull/2977) [`40cd43c`](https://github.com/LTplus-AG/ifc-lite/commit/40cd43ce29cce6c71671e07abde00b41c8886e37) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Give unclassified elements a real legend entry in classification auto-color mode, instead of silently ghosting them.
+  
+  Previously, `evaluateAutoColorLens` pushed any entity whose `extractAutoColorValues` returned no values into `ghostIds` — a faint gray tint, no legend row, no count, no way to select or isolate it. For `source: "classification"` this meant every unclassified element (and, when a system filter was set, every element classified in a *different* system) disappeared into the ghost mass with no way to see how many there were.
+  
+  `AutoColorSpec` gains an opt-in `includeUnclassified` flag. When set on a `classification` source, value-less entities get real, clickable legend entries instead:
+  
+  - **"No classification"** — the entity has zero classification references.
+  - **"Not in this system"** — it has references, but none in the system named by `psetName`. This bucket only appears when `psetName` names a specific system; with no system filter there is nothing to be "not in", so everything collapses into the single "No classification" bucket.
+  
+  Both buckets get fixed, visually-neutral colors (not drawn from the rank-based palette), so they can never take the most-saturated color just because they're the largest group, and turning `includeUnclassified` on/off never shifts the colors already assigned to real classification values. Each `AutoColorLegendEntry` for one of these buckets carries `isAbsent: true` so a consumer can tell an absence bucket apart from a real classification code.
+  
+  The flag defaults to unset/`false`, which reproduces the exact pre-existing ghosting behavior — this is additive, not a new default, so an existing saved lens or SDK caller relying on unclassified elements being ghosted sees no change. An older `@ifc-lite/lens` build that doesn't know this field simply ignores it and keeps ghosting, which is also the safe fallback if the field is ever malformed on import.
+  
+  The viewer's lens editor now exposes this as a "Show unclassified" toggle, shown only when the auto-color source is set to Classification. It is off by default, matching the flag's default; turning it on persists into saved lenses and JSON export/import exactly like the rest of an auto-color spec.
+
+## 1.18.1
+
+### Patch Changes
+
+- [#2787](https://github.com/LTplus-AG/ifc-lite/pull/2787) [`4f01d5c`](https://github.com/LTplus-AG/ifc-lite/commit/4f01d5caf469c380c5e1a15d807a5ebb7f6de86e) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Pin `matchesClassification`'s `systemMatch && codeMatch` (`packages/lens/src/matching.ts:392`) with a truth table.
+  
+  Test-only; no production code changed. The only existing test supplying both
+  `classificationSystem` and `classificationCode` (`'should match classification
+  by system AND code'`) gives a case where both match, which passes under `&&`
+  and under `||` alike — mutating the `&&` to `||` left all 165 tests green.
+  Three cases now cover the remaining rows: system matches but code does not,
+  code matches but system does not, and neither matches — each asserting
+  `false`, discriminating AND from OR.
+  
+  Checked the sibling multi-field predicates in the same file
+  (`matchesProperty`, `matchesAttribute`, `matchesQuantity`, `matchesMaterial`)
+  for the same shape. None share it: each requires only one criteria field to be
+  present for its match logic (a `propertySet`/`propertyName` pair, a
+  `quantitySet`/`quantityName` pair, etc. are precondition guards, not two
+  independently-testable match outcomes ANDed together) — `matchesClassification`
+  is the only predicate here where two independently optional fields are both
+  matched and ANDed.
+  
+  Not fixed here, flagged for the maintainer: the `exists` operator's
+  empty-string handling is inconsistent across `matchesProperty` (`''` counts as
+  present), `matchesQuantity` (`''` counts as present), and `matchesAttribute`
+  (`''` counts as absent) — documented in code comments as intentional but not
+  exercised by any test. Whether that asymmetry is intended is the maintainer's
+  call; a prior sweep judged it low severity and did not pursue it.
+
 ## 1.18.0
 
 ### Minor Changes

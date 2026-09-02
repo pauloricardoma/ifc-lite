@@ -17,9 +17,8 @@ import type {
   BCFComponents,
   BCFComponent,
   BCFVisibility,
+  BCFViewSetupHints,
   BCFColoring,
-  BCFPerspectiveCamera,
-  BCFOrthogonalCamera,
   BCFLine,
   BCFClippingPlane,
   BCFBitmap,
@@ -29,6 +28,19 @@ import type {
   BCFDocumentReference,
   BCFHeaderFile,
 } from './types.js';
+import {
+  requireCameraChoice,
+  writeOrthogonalCamera,
+  writePerspectiveCamera,
+} from './writer-camera.js';
+import { xsdDouble, xsdInt, xsdPointElement } from './numeric.js';
+import { escapeXml } from './xml-text.js';
+import {
+  XML_WHITESPACE_ONLY,
+  xsdDateTime,
+  xsdOptionalDateTime,
+  xsdRequiredString,
+} from './xsd-required-string.js';
 import { generateUuid } from '@ifc-lite/encoding';
 
 /**
@@ -45,7 +57,7 @@ export async function writeBCF(project: BCFProject): Promise<Blob> {
 
   // Write project file (optional)
   if (project.projectId || project.name) {
-    writeProjectFile(zip, project);
+    writeProjectFile(zip, project, project.version);
   }
 
   // Write topics
@@ -65,9 +77,23 @@ export async function writeBCF(project: BCFProject): Promise<Blob> {
 /**
  * Write bcf.version file
  * Uses buildingSMART standard format with both xsi and xsd namespaces
+ *
+ * BCF 2.1's version.xsd declares `<DetailedVersion>` as an optional
+ * (minOccurs="0") child of `<Version>`. BCF 3.0's version.xsd redefines
+ * `<Version>` with ONLY a required `VersionId` attribute and no content
+ * model at all (empty content type) -- emitting `<DetailedVersion>` there,
+ * or even just the whitespace/newline of a non-self-closing `<Version>...
+ * </Version>` pair, produces "Character content is not allowed, because the
+ * content type is empty" (libxml2 treats incidental whitespace as character
+ * content against an empty content model). So for 3.0 the element must be
+ * self-closing with no child content at all, not merely omit DetailedVersion.
  */
 function writeVersionFile(zip: JSZip, version: '2.1' | '3.0'): void {
-  const content = `<?xml version="1.0" encoding="UTF-8"?>
+  const content =
+    version === '3.0'
+      ? `<?xml version="1.0" encoding="UTF-8"?>
+<Version xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" VersionId="${version}"/>`
+      : `<?xml version="1.0" encoding="UTF-8"?>
 <Version xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" VersionId="${version}">
   <DetailedVersion>${version}</DetailedVersion>
 </Version>`;
@@ -78,16 +104,38 @@ function writeVersionFile(zip: JSZip, version: '2.1' | '3.0'): void {
 /**
  * Write project.bcfp file
  * Uses buildingSMART standard format
+ *
+ * The root element is renamed between versions: 2.1's project.xsd declares
+ * root element `<ProjectExtension>` as the sequence `Project?`,
+ * `ExtensionSchema` -- where `ExtensionSchema` is an `xs:anyURI` with no
+ * `minOccurs`, so it is REQUIRED; 3.0's project.xsd instead declares root
+ * element `<ProjectInfo>` containing just a required `<Project>`, and has no
+ * `ProjectExtension`/`ExtensionSchema` concept at all. The inner
+ * `<Project ProjectId="...">`/`<Name>` shape is unchanged between versions.
+ *
+ * `<ExtensionSchema>` used to be omitted entirely, which made `project.bcfp`
+ * fail 2.1 validation ("Element 'ProjectExtension': Missing child element(s).
+ * Expected is ( ExtensionSchema )") in EVERY 2.1 archive this package writes
+ * -- 2.1 is the default version and `createBCFProject` always sets a project
+ * id, so the file is always present. It is now emitted empty. An empty
+ * `xs:anyURI` is a valid instance of the type (verified against the vendored
+ * schema), and it is the honest value here: this writer ships no
+ * `extensions.xsd`, and `BCFProject.extensions` is not serialized, so there is
+ * no extension schema to point at. Naming a file we do not write would trade
+ * the schema error for a dangling reference; omitting the element keeps the
+ * schema error. Empty does neither.
  */
-function writeProjectFile(zip: JSZip, project: BCFProject): void {
+function writeProjectFile(zip: JSZip, project: BCFProject, version: '2.1' | '3.0'): void {
   const projectId = project.projectId || generateUuid();
   const nameElement = project.name ? `\n    <Name>${escapeXml(project.name)}</Name>` : '';
+  const rootElement = version === '3.0' ? 'ProjectInfo' : 'ProjectExtension';
+  const extensionSchema = version === '3.0' ? '' : '\n  <ExtensionSchema/>';
 
   const content = `<?xml version="1.0" encoding="UTF-8"?>
-<ProjectExtension xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
-  <Project ProjectId="${projectId}">${nameElement}
-  </Project>
-</ProjectExtension>`;
+<${rootElement} xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <Project ProjectId="${escapeXml(projectId)}">${nameElement}
+  </Project>${extensionSchema}
+</${rootElement}>`;
 
   zip.file('project.bcfp', content);
 }
@@ -103,33 +151,17 @@ function shortGuidHash(guid: string): string {
 }
 
 /**
- * Sanitize a topic GUID for use as a zip folder name (zip-slip guard).
- *
- * A topic GUID is parsed unvalidated from untrusted markup XML on read, so it
- * can carry path separators or `..`. Using it verbatim as a zip path component
- * on a read-modify-save would let a crafted GUID (`../../evil`) write outside
- * the archive root. Restrict the name to safe filename characters and collapse
- * any dot-run so it can never traverse. The real GUID is still written verbatim
- * as the markup `<Topic Guid>` attribute, which is what readers key off.
- *
- * Sanitization is lossy, so two distinct GUIDs can map to one name (`a?b` and
- * `a:b` both give `a_b`), which would silently overwrite a topic folder. Any
- * name that sanitization changed gets a hash of the original GUID appended,
- * and `usedNames` catches the remaining collisions with a counter suffix.
- */
-function sanitizeTopicFolderName(guid: string, usedNames: Set<string>): string {
-  return sanitizeZipComponent(guid, usedNames, 'topic');
-}
-
-/**
  * Sanitize an arbitrary GUID for use as a zip path component (zip-slip guard).
  *
  * Shared by both the topic-folder name and the viewpoint file base name: a
  * viewpoint GUID is parsed just as unvalidated from untrusted markup XML on
  * read (reader.ts `parseViewpointContent`) as a topic GUID is, so it carries
- * the same path-traversal hazard. Restrict the name to safe filename
- * characters and collapse any dot-run so it can never traverse. `fallback` is
- * used when sanitization strips the name to nothing.
+ * the same path-traversal hazard (`../../evil` as a topic GUID would write
+ * outside the archive root). Restrict the name to safe filename characters and
+ * collapse any dot-run so it can never traverse. `fallback` is used when
+ * sanitization strips the name to nothing. The real GUID is still written
+ * verbatim as the markup `<Topic Guid>`/`<Viewpoint Guid>` attribute, which is
+ * what readers key off.
  *
  * Sanitization is lossy, so two distinct GUIDs can map to one name, which
  * would silently overwrite an entry. Any name that sanitization changed gets
@@ -153,16 +185,14 @@ function sanitizeZipComponent(raw: string, usedNames: Set<string>, fallback: str
   return candidate;
 }
 
-/**
- * Write a topic folder with all its contents
- */
+/** Write a topic folder with all its contents. */
 async function writeTopicFolder(
   zip: JSZip,
   topic: BCFTopic,
   version: '2.1' | '3.0',
   usedFolderNames: Set<string>,
 ): Promise<void> {
-  const folder = zip.folder(sanitizeTopicFolderName(topic.guid, usedFolderNames));
+  const folder = zip.folder(sanitizeZipComponent(topic.guid, usedFolderNames, 'topic'));
   if (!folder) return;
 
   // Sanitize each viewpoint GUID once, up front, so the markup <Viewpoint>
@@ -180,7 +210,7 @@ async function writeTopicFolder(
 
   // Write viewpoints
   for (let i = 0; i < topic.viewpoints.length; i++) {
-    await writeViewpointFiles(folder, topic.viewpoints[i], viewpointBaseNames[i]);
+    await writeViewpointFiles(folder, topic.viewpoints[i], viewpointBaseNames[i], version);
   }
 }
 
@@ -198,16 +228,35 @@ function snapshotExt(viewpoint: BCFViewpoint): 'png' | 'jpg' {
   return 'png';
 }
 
-/**
- * Write markup.bcf file
- * Uses buildingSMART standard format
- */
+/** Write markup.bcf -- buildingSMART standard format. */
 function writeMarkupFile(
   folder: JSZip,
   topic: BCFTopic,
   version: '2.1' | '3.0',
   viewpointBaseNames: string[],
 ): void {
+  // BCF 3.0's markup.xsd tightens `Topic/@TopicType` and `Topic/@TopicStatus`
+  // from optional (2.1) to `use="required"`. Omitting the attribute -
+  // which is what 2.1 output does when the value is unset - produces
+  // markup.bcf that fails 3.0 schema validation in every downstream tool.
+  // We refuse to invent a value (e.g. defaulting to "Open") because that
+  // would assert a topic status the user never chose; instead we fail the
+  // write so the caller supplies one.
+  if (version === '3.0') {
+    if (!topic.topicType || XML_WHITESPACE_ONLY.test(topic.topicType)) {
+      throw new Error(
+        `BCF 3.0 requires Topic/@TopicType (topic "${topic.guid}" has none). ` +
+          `Set topic.topicType before writing a 3.0 file.`
+      );
+    }
+    if (!topic.topicStatus || XML_WHITESPACE_ONLY.test(topic.topicStatus)) {
+      throw new Error(
+        `BCF 3.0 requires Topic/@TopicStatus (topic "${topic.guid}" has none). ` +
+          `Set topic.topicStatus before writing a 3.0 file.`
+      );
+    }
+  }
+
   let content = `<?xml version="1.0" encoding="UTF-8"?>
 <Markup xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">`;
 
@@ -220,30 +269,64 @@ function writeMarkupFile(
   <Topic Guid="${escapeXml(topic.guid)}"${topic.topicType ? ` TopicType="${escapeXml(topic.topicType)}"` : ''}${topic.topicStatus ? ` TopicStatus="${escapeXml(topic.topicStatus)}"` : ''}>
     <Title>${escapeXml(topic.title)}</Title>`;
 
-  if (topic.description) {
-    content += `\n    <Description>${escapeXml(topic.description)}</Description>`;
-  }
-
+  // Order below (Title, Priority, Index, Labels, CreationDate,
+  // CreationAuthor, ModifiedDate, ModifiedAuthor, DueDate, AssignedTo,
+  // Stage, Description, BimSnippet, ...) follows the Topic xs:sequence in
+  // BOTH buildingSMART/BCF-XML markup.xsd release_2_1 and release_3_0 --
+  // confirmed identical there and against release_3_0's own conformance
+  // fixture (Test Cases/v3.0/Visualization/Perspective camera/markup.bcf,
+  // which reads ModifiedAuthor then Description then DocumentReferences).
+  // Description and Labels were previously written out of this order
+  // (Description right after Title; Labels after Stage). Both Priority,
+  // Index, Labels, and Stage are optional and can be omitted, but
+  // CreationDate/CreationAuthor below are always emitted, so xs:sequence
+  // made the output schema-invalid whenever topic.description was set or
+  // topic.labels was non-empty -- not "regardless of content": an absent
+  // Description or empty Labels never appeared at all, so there was nothing
+  // to be out of order.
   if (topic.priority) {
     content += `\n    <Priority>${escapeXml(topic.priority)}</Priority>`;
   }
 
   if (topic.index !== undefined) {
-    content += `\n    <Index>${topic.index}</Index>`;
+    // `Index` is the writer's only xs:int; see xsdInt for what that excludes.
+    content += `\n    <Index>${xsdInt(topic.index, 'Topic/Index', `topic "${topic.guid}"`)}</Index>`;
   }
 
-  content += `\n    <CreationDate>${escapeXml(topic.creationDate)}</CreationDate>`;
-  content += `\n    <CreationAuthor>${escapeXml(topic.creationAuthor)}</CreationAuthor>`;
+  if (topic.labels && topic.labels.length > 0) {
+    // BCF 3.0's markup.xsd wraps labels in ONE `<Labels>` container holding
+    // repeated `<Label>` children (Labels -> Label*); repeating `<Labels>text
+    // </Labels>` once per label -- the 2.1 shape, where `<Labels>` itself is
+    // the repeated per-entry element with no `<Label>` child -- fails 3.0
+    // validation ("Character content other than whitespace is not allowed
+    // because the content type is 'element-only'"). 2.1 is left as-is.
+    if (version === '3.0') {
+      content += `\n    <Labels>`;
+      for (const label of topic.labels) {
+        content += `\n      <Label>${escapeXml(label)}</Label>`;
+      }
+      content += `\n    </Labels>`;
+    } else {
+      for (const label of topic.labels) {
+        content += `\n    <Labels>${escapeXml(label)}</Labels>`;
+      }
+    }
+  }
 
-  if (topic.modifiedDate) {
-    content += `\n    <ModifiedDate>${escapeXml(topic.modifiedDate)}</ModifiedDate>`;
+  content += `\n    <CreationDate>${xsdDateTime(topic.creationDate, 'Topic/CreationDate', `topic "${topic.guid}"`)}</CreationDate>`;
+  content += `\n    <CreationAuthor>${xsdRequiredString(topic.creationAuthor, 'Topic/CreationAuthor', `topic "${topic.guid}"`, version)}</CreationAuthor>`;
+
+  const topicModifiedDate = xsdOptionalDateTime(topic.modifiedDate);
+  if (topicModifiedDate) {
+    content += `\n    <ModifiedDate>${topicModifiedDate}</ModifiedDate>`;
     // BCF spec requires ModifiedAuthor when ModifiedDate is present
     const modifiedAuthor = topic.modifiedAuthor || topic.creationAuthor;
-    content += `\n    <ModifiedAuthor>${escapeXml(modifiedAuthor)}</ModifiedAuthor>`;
+    content += `\n    <ModifiedAuthor>${xsdRequiredString(modifiedAuthor, 'Topic/ModifiedAuthor', `topic "${topic.guid}"`, version)}</ModifiedAuthor>`;
   }
 
-  if (topic.dueDate) {
-    content += `\n    <DueDate>${escapeXml(topic.dueDate)}</DueDate>`;
+  const dueDate = xsdOptionalDateTime(topic.dueDate);
+  if (dueDate) {
+    content += `\n    <DueDate>${dueDate}</DueDate>`;
   }
 
   if (topic.assignedTo) {
@@ -254,10 +337,8 @@ function writeMarkupFile(
     content += `\n    <Stage>${escapeXml(topic.stage)}</Stage>`;
   }
 
-  if (topic.labels && topic.labels.length > 0) {
-    for (const label of topic.labels) {
-      content += `\n    <Labels>${escapeXml(label)}</Labels>`;
-    }
+  if (topic.description) {
+    content += `\n    <Description>${escapeXml(topic.description)}</Description>`;
   }
 
   // ReferenceSchema is required inside BimSnippet by the BCF XSD; only emit the
@@ -279,49 +360,93 @@ function writeMarkupFile(
   }
 
   if (topic.relatedTopics && topic.relatedTopics.length > 0) {
+    // Same containment split as DocumentReferences/Comments/Viewpoints
+    // elsewhere in this function: 3.0's markup.xsd groups entries under one
+    // <RelatedTopics> element, while 2.1 repeats <RelatedTopic> directly
+    // under <Topic>.
+    if (version === '3.0') content += `\n    <RelatedTopics>`;
     for (const relatedGuid of topic.relatedTopics) {
       content += `\n    <RelatedTopic Guid="${escapeXml(relatedGuid)}"/>`;
     }
+    if (version === '3.0') content += `\n    </RelatedTopics>`;
   }
 
-  content += `\n  </Topic>`;
+  // Render each <Comment Guid="..."> wrapper. Shared by both versions --
+  // the wrapper's own shape doesn't change, only where it's placed (see
+  // below).
+  const commentXml = (indent: string) =>
+    topic.comments
+      .map((comment) => {
+        let c = `\n${indent}<Comment Guid="${escapeXml(comment.guid)}">`;
+        c += `\n${indent}  <Date>${xsdDateTime(comment.date, 'Comment/Date', `comment "${comment.guid}"`)}</Date>`;
+        c += `\n${indent}  <Author>${xsdRequiredString(comment.author, 'Comment/Author', `comment "${comment.guid}"`, version)}</Author>`;
+        c += `\n${indent}  <Comment>${escapeXml(comment.comment)}</Comment>`;
+        if (comment.viewpointGuid) {
+          c += `\n${indent}  <Viewpoint Guid="${escapeXml(comment.viewpointGuid)}"/>`;
+        }
+        const commentModifiedDate = xsdOptionalDateTime(comment.modifiedDate);
+        if (commentModifiedDate) {
+          c += `\n${indent}  <ModifiedDate>${commentModifiedDate}</ModifiedDate>`;
+        }
+        if (comment.modifiedAuthor) {
+          c += `\n${indent}  <ModifiedAuthor>${escapeXml(comment.modifiedAuthor)}</ModifiedAuthor>`;
+        }
+        c += `\n${indent}</Comment>`;
+        return c;
+      })
+      .join('');
 
-  // Write viewpoint references
-  for (let i = 0; i < topic.viewpoints.length; i++) {
-    const viewpoint = topic.viewpoints[i];
-    // Use standard buildingSMART naming convention: Viewpoint_<guid>.bcfv,
-    // but the file name component is the sanitized base name (zip-slip
-    // guard) -- the SAME one writeViewpointFiles uses for the actual entry,
-    // so the markup reference and the archive agree. The real GUID is still
-    // written verbatim as the Guid attribute below.
-    const baseName = viewpointBaseNames[i];
-    const filename = `Viewpoint_${baseName}.bcfv`;
-    const snapshotName = `Snapshot_${baseName}.${snapshotExt(viewpoint)}`;
+  // Render each viewpoint reference. BCF 2.1 names the per-entry element
+  // <Viewpoints Guid="..."> (the wrapper IS the entry, repeated); BCF 3.0
+  // renamed the entry to singular <ViewPoint Guid="..."> (capital P) nested
+  // inside one shared <Viewpoints> wrapper (buildingSMART/BCF-XML
+  // markup.xsd, release_3_0 Topic.Viewpoints/ViewPoint -- confirmed against
+  // Test Cases/v3.0/Visualization/Perspective camera/unzipped/.../markup.bcf,
+  // which reads `<Viewpoints><ViewPoint Guid="f99eb1ed-...">`).
+  const viewpointEntryTag = version === '3.0' ? 'ViewPoint' : 'Viewpoints';
+  const viewpointXml = (indent: string) =>
+    topic.viewpoints
+      .map((viewpoint, i) => {
+        // Use standard buildingSMART naming convention: Viewpoint_<guid>.bcfv,
+        // but the file name component is the sanitized base name (zip-slip
+        // guard) -- the SAME one writeViewpointFiles uses for the actual entry,
+        // so the markup reference and the archive agree. The real GUID is still
+        // written verbatim as the Guid attribute below.
+        const baseName = viewpointBaseNames[i];
+        const filename = `Viewpoint_${baseName}.bcfv`;
+        const snapshotName = `Snapshot_${baseName}.${snapshotExt(viewpoint)}`;
 
-    content += `\n  <Viewpoints Guid="${escapeXml(viewpoint.guid)}">`;
-    content += `\n    <Viewpoint>${filename}</Viewpoint>`;
-    if (viewpoint.snapshot || viewpoint.snapshotData) {
-      content += `\n    <Snapshot>${snapshotName}</Snapshot>`;
-    }
-    content += `\n  </Viewpoints>`;
-  }
+        let v = `\n${indent}<${viewpointEntryTag} Guid="${escapeXml(viewpoint.guid)}">`;
+        v += `\n${indent}  <Viewpoint>${filename}</Viewpoint>`;
+        if (viewpoint.snapshot || viewpoint.snapshotData) {
+          v += `\n${indent}  <Snapshot>${snapshotName}</Snapshot>`;
+        }
+        v += `\n${indent}</${viewpointEntryTag}>`;
+        return v;
+      })
+      .join('');
 
-  // Write comments
-  for (const comment of topic.comments) {
-    content += `\n  <Comment Guid="${escapeXml(comment.guid)}">`;
-    content += `\n    <Date>${escapeXml(comment.date)}</Date>`;
-    content += `\n    <Author>${escapeXml(comment.author)}</Author>`;
-    content += `\n    <Comment>${escapeXml(comment.comment)}</Comment>`;
-    if (comment.viewpointGuid) {
-      content += `\n    <Viewpoint Guid="${escapeXml(comment.viewpointGuid)}"/>`;
+  if (version === '3.0') {
+    // BCF 3.0's markup.xsd moves Comments and Viewpoints INSIDE <Topic>
+    // (wrapped in their own plural containers), after RelatedTopics -- unlike
+    // 2.1, where they are top-level <Markup> siblings following </Topic>.
+    // Writing them as 2.1-shaped top-level siblings at version 3.0 produces
+    // markup a strict 3.0 consumer rejects outright (Comments/Viewpoints
+    // would not even be children of Topic, let alone in schema order).
+    if (topic.comments.length > 0) {
+      content += `\n    <Comments>${commentXml('      ')}\n    </Comments>`;
     }
-    if (comment.modifiedDate) {
-      content += `\n    <ModifiedDate>${escapeXml(comment.modifiedDate)}</ModifiedDate>`;
+    if (topic.viewpoints.length > 0) {
+      content += `\n    <Viewpoints>${viewpointXml('      ')}\n    </Viewpoints>`;
     }
-    if (comment.modifiedAuthor) {
-      content += `\n    <ModifiedAuthor>${escapeXml(comment.modifiedAuthor)}</ModifiedAuthor>`;
-    }
-    content += `\n  </Comment>`;
+    content += `\n  </Topic>`;
+  } else {
+    content += `\n  </Topic>`;
+    // 2.1's Markup sequence is Header, Topic, Comment*, Viewpoints*
+    // (buildingSMART/BCF-XML release_2_1 markup.xsd) -- Comment precedes
+    // Viewpoints, the reverse of the order written here previously.
+    content += commentXml('  ');
+    content += viewpointXml('  ');
   }
 
   content += `\n</Markup>`;
@@ -336,6 +461,7 @@ async function writeViewpointFiles(
   folder: JSZip,
   viewpoint: BCFViewpoint,
   baseName: string,
+  version: '2.1' | '3.0',
 ): Promise<void> {
   // Use standard buildingSMART naming convention: Viewpoint_<guid>.bcfv, but
   // the file name component is the sanitized base name (zip-slip guard) --
@@ -350,24 +476,31 @@ async function writeViewpointFiles(
 
   // Write components
   if (viewpoint.components) {
-    content += writeComponents(viewpoint.components);
+    content += writeComponents(viewpoint.components, version);
   }
 
-  // Write perspective camera
-  if (viewpoint.perspectiveCamera) {
-    content += writePerspectiveCamera(viewpoint.perspectiveCamera);
-  }
+  // Every number below reaches an XSD numeric type, so each goes through
+  // `numeric.ts`'s write-side guards; `where` is what puts the offending
+  // viewpoint's guid in the error, as the camera checks already do.
+  const where = `viewpoint "${viewpoint.guid}"`;
 
-  // Write orthogonal camera
+  // Write the cameras. ORTHOGONAL FIRST -- see requireCameraChoice for why the
+  // order is not free, and for the 3.0 cardinality rule enforced here.
+  requireCameraChoice(viewpoint, version);
+
   if (viewpoint.orthogonalCamera) {
-    content += writeOrthogonalCamera(viewpoint.orthogonalCamera);
+    content += writeOrthogonalCamera(viewpoint.orthogonalCamera, version, viewpoint.guid);
+  }
+
+  if (viewpoint.perspectiveCamera) {
+    content += writePerspectiveCamera(viewpoint.perspectiveCamera, version, viewpoint.guid);
   }
 
   // Write lines
   if (viewpoint.lines && viewpoint.lines.length > 0) {
     content += `\n  <Lines>`;
     for (const line of viewpoint.lines) {
-      content += writeLine(line);
+      content += writeLine(line, where);
     }
     content += `\n  </Lines>`;
   }
@@ -376,18 +509,31 @@ async function writeViewpointFiles(
   if (viewpoint.clippingPlanes && viewpoint.clippingPlanes.length > 0) {
     content += `\n  <ClippingPlanes>`;
     for (const plane of viewpoint.clippingPlanes) {
-      content += writeClippingPlane(plane);
+      content += writeClippingPlane(plane, where);
     }
     content += `\n  </ClippingPlanes>`;
   }
 
   // Write bitmaps
+  //
+  // The wrapper and inner shape both change between versions (v2_1/visinfo.xsd
+  // vs v3_0/visinfo.xsd):
+  // - 2.1: `<Bitmap>` entries sit DIRECTLY under `<VisualizationInfo>`, no
+  //   wrapping element (there is no `<Bitmaps>` in the 2.1 schema at all).
+  // - 3.0: entries are wrapped in a `<Bitmaps>` container.
+  // See {@link writeBitmap} for the further divergence inside each entry.
   if (viewpoint.bitmaps && viewpoint.bitmaps.length > 0) {
-    content += `\n  <Bitmaps>`;
-    for (const bitmap of viewpoint.bitmaps) {
-      content += writeBitmap(bitmap);
+    if (version === '3.0') {
+      content += `\n  <Bitmaps>`;
+      for (const bitmap of viewpoint.bitmaps) {
+        content += writeBitmap(bitmap, version, where);
+      }
+      content += `\n  </Bitmaps>`;
+    } else {
+      for (const bitmap of viewpoint.bitmaps) {
+        content += writeBitmap(bitmap, version, where);
+      }
     }
-    content += `\n  </Bitmaps>`;
   }
 
   content += `\n</VisualizationInfo>`;
@@ -425,23 +571,13 @@ async function writeViewpointFiles(
  * 3. Visibility (REQUIRED)
  * 4. Coloring (optional)
  */
-function writeComponents(components: BCFComponents): string {
+function writeComponents(components: BCFComponents, version: '2.1' | '3.0'): string {
   let content = `\n  <Components>`;
 
-  // 1. Write ViewSetupHints (if present in visibility)
-  if (components.visibility?.viewSetupHints) {
-    const hints = components.visibility.viewSetupHints;
-    content += `\n    <ViewSetupHints`;
-    if (hints.spacesVisible !== undefined) {
-      content += ` SpacesVisible="${hints.spacesVisible}"`;
-    }
-    if (hints.spaceBoundariesVisible !== undefined) {
-      content += ` SpaceBoundariesVisible="${hints.spaceBoundariesVisible}"`;
-    }
-    if (hints.openingsVisible !== undefined) {
-      content += ` OpeningsVisible="${hints.openingsVisible}"`;
-    }
-    content += `/>`;
+  // 1. Write ViewSetupHints (2.1 only -- see writeVisibility for the 3.0
+  // placement, which is inside <Visibility> instead of here).
+  if (version === '2.1' && components.visibility?.viewSetupHints) {
+    content += writeViewSetupHintsElement(components.visibility.viewSetupHints);
   }
 
   // 2. Write selection (before visibility per schema)
@@ -454,13 +590,13 @@ function writeComponents(components: BCFComponents): string {
   }
 
   // 3. Write visibility (REQUIRED by schema)
-  content += writeVisibility(components.visibility);
+  content += writeVisibility(components.visibility, version);
 
   // 4. Write coloring
   if (components.coloring && components.coloring.length > 0) {
     content += `\n    <Coloring>`;
     for (const coloring of components.coloring) {
-      content += writeColoringEntry(coloring);
+      content += writeColoringEntry(coloring, version);
     }
     content += `\n    </Coloring>`;
   }
@@ -469,20 +605,47 @@ function writeComponents(components: BCFComponents): string {
   return content;
 }
 
+/** Write the `<ViewSetupHints>` element itself (attributes only, no children). */
+function writeViewSetupHintsElement(hints: BCFViewSetupHints, indent = '    '): string {
+  let content = `\n${indent}<ViewSetupHints`;
+  if (hints.spacesVisible !== undefined) {
+    content += ` SpacesVisible="${hints.spacesVisible}"`;
+  }
+  if (hints.spaceBoundariesVisible !== undefined) {
+    content += ` SpaceBoundariesVisible="${hints.spaceBoundariesVisible}"`;
+  }
+  if (hints.openingsVisible !== undefined) {
+    content += ` OpeningsVisible="${hints.openingsVisible}"`;
+  }
+  content += `/>`;
+  return content;
+}
+
 /**
  * Write visibility XML
  *
- * Per BCF 2.1 schema:
+ * Per BCF 2.1 schema (v2_1/visinfo.xsd):
  * - Visibility is REQUIRED inside Components
  * - DefaultVisibility attribute defaults to false
  * - Exceptions contains Component elements (entities to show/hide opposite of default)
- * - ViewSetupHints is NOT inside Visibility (moved to Components level)
+ * - ViewSetupHints is NOT inside Visibility -- it is a sibling of Visibility
+ *   at Components level (written by {@link writeComponents} instead)
+ *
+ * BCF 3.0 moved it: v3_0/visinfo.xsd's `ComponentVisibility` complexType is a
+ * sequence of `ViewSetupHints` (optional) then `Exceptions` (optional), and
+ * 3.0's `Components` complexType only allows exactly Selection/Visibility/
+ * Coloring as children -- so for 3.0, ViewSetupHints must be the FIRST child
+ * of `<Visibility>`, not a Components-level sibling.
  */
-function writeVisibility(visibility: BCFVisibility | undefined): string {
+function writeVisibility(visibility: BCFVisibility | undefined, version: '2.1' | '3.0'): string {
   // Default visibility to true (show all) if not specified
   const defaultVis = visibility?.defaultVisibility ?? true;
 
   let content = `\n    <Visibility DefaultVisibility="${defaultVis}">`;
+
+  if (version === '3.0' && visibility?.viewSetupHints) {
+    content += writeViewSetupHintsElement(visibility.viewSetupHints, '      ');
+  }
 
   if (visibility?.exceptions && visibility.exceptions.length > 0) {
     content += `\n      <Exceptions>`;
@@ -531,123 +694,62 @@ function writeComponent(component: BCFComponent, indent = '      '): string {
 
 /**
  * Write coloring entry XML
+ *
+ * Containment differs between versions (v2_1/visinfo.xsd's `ComponentColoring`
+ * vs v3_0/visinfo.xsd's `ComponentColoring`): 2.1 nests `<Component>` entries
+ * directly under `<Color>`; 3.0 adds one more wrapping level, an inner
+ * `<Components>` element (distinct from the outer per-viewpoint `<Components>`
+ * written by {@link writeComponents}) holding the `<Component>` entries.
  */
-function writeColoringEntry(coloring: BCFColoring): string {
+function writeColoringEntry(coloring: BCFColoring, version: '2.1' | '3.0'): string {
   let content = `\n      <Color Color="${escapeXml(coloring.color)}">`;
+  if (version === '3.0') content += `\n        <Components>`;
   for (const component of coloring.components) {
-    content += writeComponent(component, '        ');
+    content += writeComponent(component, version === '3.0' ? '          ' : '        ');
   }
+  if (version === '3.0') content += `\n        </Components>`;
   content += `\n      </Color>`;
   return content;
 }
 
 /**
- * Write perspective camera XML
- */
-function writePerspectiveCamera(camera: BCFPerspectiveCamera): string {
-  return `\n  <PerspectiveCamera>
-    <CameraViewPoint>
-      <X>${camera.cameraViewPoint.x}</X>
-      <Y>${camera.cameraViewPoint.y}</Y>
-      <Z>${camera.cameraViewPoint.z}</Z>
-    </CameraViewPoint>
-    <CameraDirection>
-      <X>${camera.cameraDirection.x}</X>
-      <Y>${camera.cameraDirection.y}</Y>
-      <Z>${camera.cameraDirection.z}</Z>
-    </CameraDirection>
-    <CameraUpVector>
-      <X>${camera.cameraUpVector.x}</X>
-      <Y>${camera.cameraUpVector.y}</Y>
-      <Z>${camera.cameraUpVector.z}</Z>
-    </CameraUpVector>
-    <FieldOfView>${camera.fieldOfView}</FieldOfView>
-  </PerspectiveCamera>`;
-}
-
-/**
- * Write orthogonal camera XML
- */
-function writeOrthogonalCamera(camera: BCFOrthogonalCamera): string {
-  return `\n  <OrthogonalCamera>
-    <CameraViewPoint>
-      <X>${camera.cameraViewPoint.x}</X>
-      <Y>${camera.cameraViewPoint.y}</Y>
-      <Z>${camera.cameraViewPoint.z}</Z>
-    </CameraViewPoint>
-    <CameraDirection>
-      <X>${camera.cameraDirection.x}</X>
-      <Y>${camera.cameraDirection.y}</Y>
-      <Z>${camera.cameraDirection.z}</Z>
-    </CameraDirection>
-    <CameraUpVector>
-      <X>${camera.cameraUpVector.x}</X>
-      <Y>${camera.cameraUpVector.y}</Y>
-      <Z>${camera.cameraUpVector.z}</Z>
-    </CameraUpVector>
-    <ViewToWorldScale>${camera.viewToWorldScale}</ViewToWorldScale>
-  </OrthogonalCamera>`;
-}
-
-/**
  * Write line XML
  */
-function writeLine(line: BCFLine): string {
-  return `\n    <Line>
-      <StartPoint>
-        <X>${line.startPoint.x}</X>
-        <Y>${line.startPoint.y}</Y>
-        <Z>${line.startPoint.z}</Z>
-      </StartPoint>
-      <EndPoint>
-        <X>${line.endPoint.x}</X>
-        <Y>${line.endPoint.y}</Y>
-        <Z>${line.endPoint.z}</Z>
-      </EndPoint>
+function writeLine(line: BCFLine, where: string): string {
+  return `\n    <Line>${xsdPointElement('StartPoint', line.startPoint, '      ', where)}${xsdPointElement('EndPoint', line.endPoint, '      ', where)}
     </Line>`;
 }
 
 /**
  * Write clipping plane XML
  */
-function writeClippingPlane(plane: BCFClippingPlane): string {
-  return `\n    <ClippingPlane>
-      <Location>
-        <X>${plane.location.x}</X>
-        <Y>${plane.location.y}</Y>
-        <Z>${plane.location.z}</Z>
-      </Location>
-      <Direction>
-        <X>${plane.direction.x}</X>
-        <Y>${plane.direction.y}</Y>
-        <Z>${plane.direction.z}</Z>
-      </Direction>
+function writeClippingPlane(plane: BCFClippingPlane, where: string): string {
+  return `\n    <ClippingPlane>${xsdPointElement('Location', plane.location, '      ', where)}${xsdPointElement('Direction', plane.direction, '      ', where)}
     </ClippingPlane>`;
 }
 
 /**
  * Write bitmap XML
+ *
+ * Two more shape differences beyond the `<Bitmaps>` wrapper (see the call
+ * site in {@link writeViewpointFiles}), both against v2_1/visinfo.xsd vs
+ * v3_0/visinfo.xsd:
+ * - The format element's name changes: 2.1 nests it as `<Bitmap>` (same tag
+ *   name as the outer per-entry element -- `<Bitmap><Bitmap>PNG</Bitmap>...`);
+ *   3.0 renamed it `<Format>`.
+ * - The `BitmapFormat` enum's case changes: 2.1 is uppercase (`PNG`, `JPG`);
+ *   3.0's simpleType only accepts lowercase (`png`, `jpg`) -- validation
+ *   fails with "The value 'PNG' is not an element of the set {'png','jpg'}"
+ *   otherwise. `BCFBitmap.format` stays typed `'PNG' | 'JPG'`; we only
+ *   lowercase it on the wire for 3.0.
  */
-function writeBitmap(bitmap: BCFBitmap): string {
+function writeBitmap(bitmap: BCFBitmap, version: '2.1' | '3.0', where: string): string {
+  const formatTag = version === '3.0' ? 'Format' : 'Bitmap';
+  const formatValue = version === '3.0' ? bitmap.format.toLowerCase() : bitmap.format;
   return `\n    <Bitmap>
-      <Format>${bitmap.format}</Format>
-      <Reference>${escapeXml(bitmap.reference)}</Reference>
-      <Location>
-        <X>${bitmap.location.x}</X>
-        <Y>${bitmap.location.y}</Y>
-        <Z>${bitmap.location.z}</Z>
-      </Location>
-      <Normal>
-        <X>${bitmap.normal.x}</X>
-        <Y>${bitmap.normal.y}</Y>
-        <Z>${bitmap.normal.z}</Z>
-      </Normal>
-      <Up>
-        <X>${bitmap.up.x}</X>
-        <Y>${bitmap.up.y}</Y>
-        <Z>${bitmap.up.z}</Z>
-      </Up>
-      <Height>${bitmap.height}</Height>
+      <${formatTag}>${formatValue}</${formatTag}>
+      <Reference>${escapeXml(bitmap.reference)}</Reference>${xsdPointElement('Location', bitmap.location, '      ', where)}${xsdPointElement('Normal', bitmap.normal, '      ', where)}${xsdPointElement('Up', bitmap.up, '      ', where)}
+      <Height>${xsdDouble(bitmap.height, 'Bitmap/Height', where)}</Height>
     </Bitmap>`;
 }
 
@@ -689,8 +791,9 @@ function writeHeaderFile(file: BCFHeaderFile, indent: string, version: '2.1' | '
   if (file.filename) {
     content += `\n${indent}  <Filename>${escapeXml(file.filename)}</Filename>`;
   }
-  if (file.date) {
-    content += `\n${indent}  <Date>${escapeXml(file.date)}</Date>`;
+  const fileDate = xsdOptionalDateTime(file.date);
+  if (fileDate) {
+    content += `\n${indent}  <Date>${fileDate}</Date>`;
   }
   if (file.reference) {
     content += `\n${indent}  <Reference>${escapeXml(file.reference)}</Reference>`;
@@ -756,16 +859,4 @@ function writeDocumentReference(docRef: BCFDocumentReference, version: '2.1' | '
   }
   content += `\n    </DocumentReference>`;
   return content;
-}
-
-/**
- * Escape XML special characters
- */
-function escapeXml(str: string): string {
-  return str
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
 }

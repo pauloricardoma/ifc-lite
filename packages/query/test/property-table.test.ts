@@ -81,6 +81,25 @@ describe('PropertyTable', () => {
 
   // ── Multiple psets per entity ─────────────────────────────────
 
+  // getProperty stopped at the FIRST same-named pset and returned null even
+  // when the property lived in a later same-named pset (findEntities, right
+  // below, already scans every same-named pset for this exact shape). #2907
+  it('should find a property in a later same-named pset when an earlier one lacks it (#2907)', () => {
+    const table = makeTable();
+    table.addPropertySet(100, makePropSet('Pset_WallCommon', new Map([
+      ['IsExternal', { type: 'boolean', value: true }],
+    ])));
+    table.addPropertySet(101, makePropSet('Pset_WallCommon', new Map([
+      ['FireRating', { type: 'string', value: '2HR' }],
+    ])));
+    table.associatePropertySet(1, 100);
+    table.associatePropertySet(1, 101);
+
+    const result = table.getProperty(1, 'Pset_WallCommon', 'FireRating');
+    expect(result).not.toBeNull();
+    expect(result!.value).toBe('2HR');
+  });
+
   it('should support multiple property sets on a single entity', () => {
     const table = makeTable();
 
@@ -127,6 +146,35 @@ describe('PropertyTable', () => {
     const table = makeTable();
     const all = table.getProperties(999);
     expect(all.size).toBe(0);
+  });
+
+  // getProperties keys its result Map by pset NAME. Two IfcRelDefinesByProperties
+  // pointing at distinct IfcPropertySets that happen to share a name (the same
+  // shape #2907 fixed for getProperty, immediately above) collide on that key:
+  // the second same-named set silently overwrites the first instead of both
+  // being visible, so a real property is dropped from the result with no
+  // signal that anything went missing.
+  it('should not drop a property set when the entity carries two same-named psets (#2907 shape)', () => {
+    const table = makeTable();
+    table.addPropertySet(100, makePropSet('Pset_WallCommon', new Map([
+      ['IsExternal', { type: 'boolean', value: true }],
+    ])));
+    table.addPropertySet(101, makePropSet('Pset_WallCommon', new Map([
+      ['FireRating', { type: 'string', value: '2HR' }],
+    ])));
+    table.associatePropertySet(1, 100);
+    table.associatePropertySet(1, 101);
+
+    const all = table.getProperties(1);
+    // Both property sets are associated with the entity; the properties from
+    // BOTH must be reachable from the result, not just whichever set the
+    // dedup happened to keep.
+    const allProps = new Set<string>();
+    for (const pset of all.values()) {
+      for (const key of pset.properties.keys()) allProps.add(key);
+    }
+    expect(allProps.has('IsExternal')).toBe(true);
+    expect(allProps.has('FireRating')).toBe(true);
   });
 
   // ── findEntities ──────────────────────────────────────────────

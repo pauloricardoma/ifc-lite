@@ -882,6 +882,46 @@ describe('MergedExporter', () => {
       expect(findDanglingRefs(content)).toEqual([]);
     });
 
+    // Regression: NON_ROOTED_STRING_TYPES is a hand-maintained denylist of
+    // non-rooted types whose first attribute is a string. IfcMaterialProfileWithOffsets
+    // (IfcMaterialDefinition subtype — NOT an IfcRoot) leads with an optional
+    // `Name: IfcLabel` and was missing from the list, so a 22-char Name was
+    // misread as a GlobalId. A GENUINE GlobalId collision between two rooted
+    // IfcWall entities lives in the SAME fixture and must still be reconciled
+    // (kept once) — the fix must not break that feature while closing the hole.
+    it('does not mistake a 22-char material Name for a GlobalId, while still reconciling a real rooted collision', () => {
+      const matName = guid('MatProfName'); // 22 chars, valid GlobalId charset, NOT a GlobalId
+      const wallShared = guid('wallShared'); // genuine GlobalId shared by two ROOTED entities
+      const a = buildModel('a', 'Arch', [
+        [1, 'IFCPROJECT', `#1=IFCPROJECT('${guid('projA')}',$,'A',$,$,$,$,$,$);`],
+        [2, 'IFCWALL', `#2=IFCWALL('${wallShared}',$,'WA',$,$,$,$,$);`],
+        [3, 'IFCMATERIALPROFILEWITHOFFSETS', `#3=IFCMATERIALPROFILEWITHOFFSETS('${matName}',$,$,#1,$,$,(10.));`],
+        [4, 'IFCCOLUMN', `#4=IFCCOLUMN('${guid('colA')}',$,'CA',$,$,$,$,$);`],
+      ]);
+      const b = buildModel('b', 'Struct', [
+        [1, 'IFCPROJECT', `#1=IFCPROJECT('${guid('projB')}',$,'B',$,$,$,$,$,$);`],
+        [2, 'IFCWALL', `#2=IFCWALL('${wallShared}',$,'WB',$,$,$,$,$);`],
+        [3, 'IFCMATERIALPROFILEWITHOFFSETS', `#3=IFCMATERIALPROFILEWITHOFFSETS('${matName}',$,$,#1,$,$,(20.,30.));`],
+      ]);
+
+      const content = decode(new MergedExporter([a, b]).export({ schema: 'IFC4' }).content);
+
+      // Both material entities survive as distinct instances (their
+      // OffsetValues differ) — the Name is coincidence, not identity.
+      expect(content.match(/=IFCMATERIALPROFILEWITHOFFSETS\(/g)?.length).toBe(2);
+      expect(content).toContain('(10.)');
+      expect(content).toContain('(20.,30.)');
+      expect(content.match(new RegExp(matName, 'g'))?.length).toBe(2);
+
+      // The genuine rooted collision (two real IfcWall GlobalIds, same unit)
+      // is still reconciled: unified to a single instance, distinct from the
+      // material's surviving count (2) above so neither assertion can pass by
+      // coincidence.
+      expect(content.match(/=IFCWALL\(/g)?.length).toBe(1); // unified to one instance
+      expect(content.match(new RegExp(wallShared, 'g'))?.length).toBe(1);
+      expect(findDanglingRefs(content)).toEqual([]);
+    });
+
     // Regression (review of #1332): in a 3+ model merge, a unit-compatible model
     // must not be unified onto an entity emitted by a FEDERATED (different-unit)
     // model just because the GlobalId matches — that would reintroduce the
@@ -1091,6 +1131,30 @@ describe('MergedExporter', () => {
       expect(findDanglingRefs(content)).toEqual([]);
     });
 
+    // Regression: a prefixed SI area/volume unit must scale the prefix by the
+    // unit's dimension (area = prefix², volume = prefix³), matching both
+    // `rust/core/src/project_units/symbols.rs`'s `prefix_power` and
+    // `packages/parser/src/project-units.ts`'s `siUnitSymbolAndScale` — the two
+    // implementations this repo already cross-checks by parity test. A CENTI
+    // SQUARE_METRE unit is (10⁻²)² = 1e-4 m² per unit, not 1e-2.
+    it('scales a prefixed SI area unit by the prefix squared, not linearly', () => {
+      const secondary = buildModel('centi', 'Centi', [
+        [1, 'IFCPROJECT', `#1=IFCPROJECT('${guid('centiProj')}',$,'Centi',$,$,$,$,$,#2);`],
+        [2, 'IFCUNITASSIGNMENT', '#2=IFCUNITASSIGNMENT((#3,#4));'],
+        [3, 'IFCSIUNIT', '#3=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);'],
+        [4, 'IFCSIUNIT', '#4=IFCSIUNIT(*,.AREAUNIT.,.CENTI.,.SQUARE_METRE.);'],
+        [5, 'IFCELEMENTQUANTITY', `#5=IFCELEMENTQUANTITY('${guid('centiQto')}',$,'Q',$,$,(#6));`],
+        [6, 'IFCQUANTITYAREA', "#6=IFCQUANTITYAREA('Area',$,$,10.,$);"],
+      ]);
+      secondary.lengthUnitScale = 0.001;
+
+      const content = decode(new MergedExporter([metreModel(), secondary])
+        .export({ schema: 'IFC4', unitReconciliation: 'normalize' }).content);
+      // 10 centi-square-metre × (10⁻²)² m²/unit = 0.001 m².
+      expect(content).toContain("IFCQUANTITYAREA('Area',$,$,0.001,$)");
+      expect(findDanglingRefs(content)).toEqual([]);
+    });
+
     it('rescales in the other direction (metre model into a feet primary)', () => {
       const feet = buildModel('feet', 'Feet', [
         [1, 'IFCPROJECT', `#1=IFCPROJECT('${guid('ftProj')}',$,'Feet',$,$,$,$,$,#2);`],
@@ -1232,6 +1296,215 @@ describe('MergedExporter', () => {
       expect(content).toContain("'Wall A'");
       expect(content).toContain("'Wall B'");
       expect(findDanglingRefs(content)).toEqual([]);
+    });
+  });
+
+  // Cross-schema merge legality: merging an IFC4 model into an IFC2X3-targeted
+  // export must not silently paste IFC4-only entity types under an IFC2X3
+  // header. Before the `schema-untranslatable.ts` fix, `IfcTriangulatedFaceSet`
+  // (a tessellated-geometry representation item IFC2X3 never defined) survived
+  // `renderEntity`'s per-entity schema conversion unchanged — the merged file
+  // declared `FILE_SCHEMA(('IFC2X3'))` while its body contained a type from a
+  // schema that never had one.
+  describe('cross-schema merge legality', () => {
+    it('refuses rather than silently emitting an IFC4-only representation item under an IFC2X3 header', () => {
+      const wall = guid('crosswall');
+      const ifc4Model = buildModel('m1', 'A', [
+        [1, 'IFCWALL', `#1=IFCWALL('${wall}',$,'Wall',$,$,$,#2,$,$);`],
+        [2, 'IFCPRODUCTDEFINITIONSHAPE', '#2=IFCPRODUCTDEFINITIONSHAPE($,$,(#3));'],
+        [3, 'IFCSHAPEREPRESENTATION', "#3=IFCSHAPEREPRESENTATION($,'Body','Tessellation',(#4));"],
+        [4, 'IFCTRIANGULATEDFACESET', '#4=IFCTRIANGULATEDFACESET(#5,$,.F.,((1,2,3)),$);'],
+        [5, 'IFCCARTESIANPOINTLIST3D', '#5=IFCCARTESIANPOINTLIST3D(((0.,0.,0.),(1.,0.,0.),(0.,1.,0.)));'],
+      ]);
+
+      expect(() => new MergedExporter([ifc4Model]).export({ schema: 'IFC2X3' }))
+        .toThrow(/IFCTRIANGULATEDFACESET/);
+    });
+
+    it('control: the same model exports cleanly when the target schema stays IFC4', () => {
+      const wall = guid('crosswall2');
+      const ifc4Model = buildModel('m1', 'A', [
+        [1, 'IFCWALL', `#1=IFCWALL('${wall}',$,'Wall',$,$,$,#2,$,$);`],
+        [2, 'IFCPRODUCTDEFINITIONSHAPE', '#2=IFCPRODUCTDEFINITIONSHAPE($,$,(#3));'],
+        [3, 'IFCSHAPEREPRESENTATION', "#3=IFCSHAPEREPRESENTATION($,'Body','Tessellation',(#4));"],
+        [4, 'IFCTRIANGULATEDFACESET', '#4=IFCTRIANGULATEDFACESET(#5,$,.F.,((1,2,3)),$);'],
+        [5, 'IFCCARTESIANPOINTLIST3D', '#5=IFCCARTESIANPOINTLIST3D(((0.,0.,0.),(1.,0.,0.),(0.,1.,0.)));'],
+      ]);
+
+      const content = decode(new MergedExporter([ifc4Model]).export({ schema: 'IFC4' }).content);
+      expect(content).toContain('IFCTRIANGULATEDFACESET');
+      expect(content).toContain("FILE_SCHEMA(('IFC4'))");
+      expect(findDanglingRefs(content)).toEqual([]);
+    });
+  });
+
+  // Merge invariant lens pass 3, item 1: `IfcShapeRepresentation.ContextOfItems`
+  // must point at a SURVIVING sub-context of the right kind ('Body'/'Axis'), not
+  // at the wrong kind. `MergedExporter` deduplicates each unit-compatible
+  // model's IFCGEOMETRICREPRESENTATIONSUBCONTEXT entities against the primary
+  // model's by taking the two models' subcontext lists positionally
+  // (`thisIds[0]` unified onto `firstIds[0]`), with no check that the two
+  // subcontexts are the same kind (ContextIdentifier). Real exporters do not
+  // guarantee subcontext emission order, so a second model whose subcontexts
+  // happen to be ordered differently than the first model's gets its 'Body'
+  // subcontext silently unified onto the first model's 'Axis' subcontext (or
+  // vice versa) — every representation in that subcontext is now tagged with
+  // the wrong kind, which many viewers filter out entirely (geometry
+  // vanishes), a wrong result no dangling-ref check catches.
+  describe('sub-context kind matching', () => {
+    // Model1's subcontexts are ordered [Axis, Body] (#4, #5); Model2's are
+    // ordered [Body, Axis] (#4, #5) — the same two kinds, reversed order, a
+    // realistic case (exporters differ in subcontext emission order).
+    const model1 = () => buildModel('m1', 'Arch', [
+      [1, 'IFCPROJECT', `#1=IFCPROJECT('${guid('subctxProjA')}',$,'A',$,$,$,$,(#3),#2);`],
+      [2, 'IFCUNITASSIGNMENT', '#2=IFCUNITASSIGNMENT((#8));'],
+      [3, 'IFCGEOMETRICREPRESENTATIONCONTEXT', "#3=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-5,#9,$);"],
+      [4, 'IFCGEOMETRICREPRESENTATIONSUBCONTEXT', "#4=IFCGEOMETRICREPRESENTATIONSUBCONTEXT('Axis',$,*,*,*,*,#3,$,.MODEL_VIEW.,$);"],
+      [5, 'IFCGEOMETRICREPRESENTATIONSUBCONTEXT', "#5=IFCGEOMETRICREPRESENTATIONSUBCONTEXT('Body',$,*,*,*,*,#3,$,.MODEL_VIEW.,$);"],
+      [8, 'IFCSIUNIT', '#8=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);'],
+      [9, 'IFCCARTESIANPOINT', '#9=IFCCARTESIANPOINT((0.,0.,0.));'],
+    ]);
+
+    const model2 = () => buildModel('m2', 'Struct', [
+      [1, 'IFCPROJECT', `#1=IFCPROJECT('${guid('subctxProjB')}',$,'B',$,$,$,$,(#3),#2);`],
+      [2, 'IFCUNITASSIGNMENT', '#2=IFCUNITASSIGNMENT((#8));'],
+      [3, 'IFCGEOMETRICREPRESENTATIONCONTEXT', "#3=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-5,#9,$);"],
+      [4, 'IFCGEOMETRICREPRESENTATIONSUBCONTEXT', "#4=IFCGEOMETRICREPRESENTATIONSUBCONTEXT('Body',$,*,*,*,*,#3,$,.MODEL_VIEW.,$);"],
+      [5, 'IFCGEOMETRICREPRESENTATIONSUBCONTEXT', "#5=IFCGEOMETRICREPRESENTATIONSUBCONTEXT('Axis',$,*,*,*,*,#3,$,.MODEL_VIEW.,$);"],
+      [6, 'IFCWALL', `#6=IFCWALL('${guid('subctxWallB')}',$,'W',$,$,$,#7,$);`],
+      [7, 'IFCPRODUCTDEFINITIONSHAPE', '#7=IFCPRODUCTDEFINITIONSHAPE($,$,(#10));'],
+      // ContextOfItems (attr 0) = #4, this model's OWN 'Body' subcontext.
+      [10, 'IFCSHAPEREPRESENTATION', "#10=IFCSHAPEREPRESENTATION(#4,'Body','SweptSolid',$);"],
+      [8, 'IFCSIUNIT', '#8=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);'],
+      [9, 'IFCCARTESIANPOINT', '#9=IFCCARTESIANPOINT((0.,0.,0.));'],
+    ]);
+
+    it("keeps a unified IfcShapeRepresentation's ContextOfItems on a same-kind subcontext, never a differently-ordered one", () => {
+      const content = decode(new MergedExporter([model1(), model2()])
+        .export({ schema: 'IFC4' }).content);
+
+      expect(findDanglingRefs(content)).toEqual([]);
+
+      // Find #10's (model2's IFCSHAPEREPRESENTATION) final ContextOfItems ref.
+      const shapeRepMatch = content.match(/#(\d+)=IFCSHAPEREPRESENTATION\(#(\d+),'Body'/);
+      expect(shapeRepMatch).not.toBeNull();
+      const contextRef = shapeRepMatch![2];
+
+      // The referenced context's own defining line must be the 'Body' kind —
+      // never 'Axis' (model1's #4), which is what a positional (index-0)
+      // match would have wrongly unified it onto.
+      const contextDefRegex = new RegExp(`#${contextRef}=IFCGEOMETRICREPRESENTATIONSUBCONTEXT\\('([^']*)'`);
+      const contextDefMatch = content.match(contextDefRegex);
+      expect(contextDefMatch).not.toBeNull();
+      expect(contextDefMatch![1]).toBe('Body');
+    });
+
+    // Control: the pre-existing behaviour this fix must not regress — two
+    // models whose subcontexts share the SAME order still dedup down to one
+    // surviving subcontext per kind (kind matching, not merely "no longer
+    // positional", still performs the intended unification).
+    it('still dedups same-kind subcontexts when both models order them identically', () => {
+      const sameOrderModel2 = () => buildModel('m2', 'Struct', [
+        [1, 'IFCPROJECT', `#1=IFCPROJECT('${guid('subctxProjC')}',$,'C',$,$,$,$,(#3),#2);`],
+        [2, 'IFCUNITASSIGNMENT', '#2=IFCUNITASSIGNMENT((#8));'],
+        [3, 'IFCGEOMETRICREPRESENTATIONCONTEXT', "#3=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-5,#9,$);"],
+        [4, 'IFCGEOMETRICREPRESENTATIONSUBCONTEXT', "#4=IFCGEOMETRICREPRESENTATIONSUBCONTEXT('Axis',$,*,*,*,*,#3,$,.MODEL_VIEW.,$);"],
+        [5, 'IFCGEOMETRICREPRESENTATIONSUBCONTEXT', "#5=IFCGEOMETRICREPRESENTATIONSUBCONTEXT('Body',$,*,*,*,*,#3,$,.MODEL_VIEW.,$);"],
+        [6, 'IFCWALL', `#6=IFCWALL('${guid('subctxWallC')}',$,'W',$,$,$,#7,$);`],
+        [7, 'IFCPRODUCTDEFINITIONSHAPE', '#7=IFCPRODUCTDEFINITIONSHAPE($,$,(#10));'],
+        [10, 'IFCSHAPEREPRESENTATION', "#10=IFCSHAPEREPRESENTATION(#5,'Body','SweptSolid',$);"],
+        [8, 'IFCSIUNIT', '#8=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);'],
+        [9, 'IFCCARTESIANPOINT', '#9=IFCCARTESIANPOINT((0.,0.,0.));'],
+      ]);
+
+      const content = decode(new MergedExporter([model1(), sameOrderModel2()])
+        .export({ schema: 'IFC4' }).content);
+
+      expect(findDanglingRefs(content)).toEqual([]);
+      // Only ONE 'Axis' and ONE 'Body' subcontext should survive.
+      expect(content.match(/=IFCGEOMETRICREPRESENTATIONSUBCONTEXT\('Axis'/g)?.length).toBe(1);
+      expect(content.match(/=IFCGEOMETRICREPRESENTATIONSUBCONTEXT\('Body'/g)?.length).toBe(1);
+
+      const shapeRepMatch = content.match(/#(\d+)=IFCSHAPEREPRESENTATION\(#(\d+),'Body'/);
+      expect(shapeRepMatch).not.toBeNull();
+      const contextDefMatch = content.match(
+        new RegExp(`#${shapeRepMatch![2]}=IFCGEOMETRICREPRESENTATIONSUBCONTEXT\\('([^']*)'`),
+      );
+      expect(contextDefMatch).not.toBeNull();
+      expect(contextDefMatch![1]).toBe('Body');
+    });
+
+    // A second-model subcontext kind with NO counterpart in the primary model
+    // (e.g. 'FootPrint', which the primary never declares) must survive as
+    // its OWN subcontext, offset-only — never silently unified onto whatever
+    // happened to sit at that array index under the old positional pairing.
+    it("keeps a no-counterpart subcontext kind ('FootPrint') as its own entity, with its reference intact", () => {
+      const footprintModel2 = () => buildModel('m2', 'Struct', [
+        [1, 'IFCPROJECT', `#1=IFCPROJECT('${guid('subctxProjD')}',$,'D',$,$,$,$,(#3),#2);`],
+        [2, 'IFCUNITASSIGNMENT', '#2=IFCUNITASSIGNMENT((#8));'],
+        [3, 'IFCGEOMETRICREPRESENTATIONCONTEXT', "#3=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-5,#9,$);"],
+        [4, 'IFCGEOMETRICREPRESENTATIONSUBCONTEXT', "#4=IFCGEOMETRICREPRESENTATIONSUBCONTEXT('Body',$,*,*,*,*,#3,$,.MODEL_VIEW.,$);"],
+        [5, 'IFCGEOMETRICREPRESENTATIONSUBCONTEXT', "#5=IFCGEOMETRICREPRESENTATIONSUBCONTEXT('Axis',$,*,*,*,*,#3,$,.MODEL_VIEW.,$);"],
+        // 'FootPrint' — a kind the primary model (Axis/Body only) never declares.
+        [11, 'IFCGEOMETRICREPRESENTATIONSUBCONTEXT', "#11=IFCGEOMETRICREPRESENTATIONSUBCONTEXT('FootPrint',$,*,*,*,*,#3,$,.PLAN_VIEW.,$);"],
+        [6, 'IFCWALL', `#6=IFCWALL('${guid('subctxWallD')}',$,'W',$,$,$,#7,$);`],
+        [7, 'IFCPRODUCTDEFINITIONSHAPE', '#7=IFCPRODUCTDEFINITIONSHAPE($,$,(#10));'],
+        // ContextOfItems (attr 0) = #11, this model's own 'FootPrint' subcontext.
+        [10, 'IFCSHAPEREPRESENTATION', "#10=IFCSHAPEREPRESENTATION(#11,'FootPrint','GeometricCurveSet',$);"],
+        [8, 'IFCSIUNIT', '#8=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);'],
+        [9, 'IFCCARTESIANPOINT', '#9=IFCCARTESIANPOINT((0.,0.,0.));'],
+      ]);
+
+      const content = decode(new MergedExporter([model1(), footprintModel2()])
+        .export({ schema: 'IFC4' }).content);
+
+      expect(findDanglingRefs(content)).toEqual([]);
+
+      // The 'FootPrint' subcontext survives in the output (not dropped).
+      expect(content.match(/=IFCGEOMETRICREPRESENTATIONSUBCONTEXT\('FootPrint'/g)?.length).toBe(1);
+
+      // The representation naming it still resolves to that surviving 'FootPrint' subcontext.
+      const shapeRepMatch = content.match(/#(\d+)=IFCSHAPEREPRESENTATION\(#(\d+),'FootPrint'/);
+      expect(shapeRepMatch).not.toBeNull();
+      const contextDefMatch2 = content.match(
+        new RegExp(`#${shapeRepMatch![2]}=IFCGEOMETRICREPRESENTATIONSUBCONTEXT\\('([^']*)'`),
+      );
+      expect(contextDefMatch2).not.toBeNull();
+      expect(contextDefMatch2![1]).toBe('FootPrint');
+    });
+
+    it('keeps same-named subcontexts with different TargetView values separate', () => {
+      const planViewModel1 = () => buildModel('m1', 'Arch', [
+        [1, 'IFCPROJECT', `#1=IFCPROJECT('${guid('subctxTargetViewProjA')}',$,'A',$,$,$,$,(#3),#2);`],
+        [2, 'IFCUNITASSIGNMENT', '#2=IFCUNITASSIGNMENT((#8));'],
+        [3, 'IFCGEOMETRICREPRESENTATIONCONTEXT', "#3=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-5,#9,$);"],
+        [4, 'IFCGEOMETRICREPRESENTATIONSUBCONTEXT', "#4=IFCGEOMETRICREPRESENTATIONSUBCONTEXT('Body',$,*,*,*,*,#3,$,.MODEL_VIEW.,$);"],
+        [8, 'IFCSIUNIT', '#8=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);'],
+        [9, 'IFCCARTESIANPOINT', '#9=IFCCARTESIANPOINT((0.,0.,0.));'],
+      ]);
+      const planViewModel2 = () => buildModel('m2', 'Struct', [
+        [1, 'IFCPROJECT', `#1=IFCPROJECT('${guid('subctxTargetViewProjB')}',$,'B',$,$,$,$,(#3),#2);`],
+        [2, 'IFCUNITASSIGNMENT', '#2=IFCUNITASSIGNMENT((#8));'],
+        [3, 'IFCGEOMETRICREPRESENTATIONCONTEXT', "#3=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-5,#9,$);"],
+        [4, 'IFCGEOMETRICREPRESENTATIONSUBCONTEXT', "#4=IFCGEOMETRICREPRESENTATIONSUBCONTEXT('Body',$,*,*,*,*,#3,$,.PLAN_VIEW.,$);"],
+        [6, 'IFCWALL', `#6=IFCWALL('${guid('subctxTargetViewWall')}',$,'W',$,$,$,#7,$);`],
+        [7, 'IFCPRODUCTDEFINITIONSHAPE', '#7=IFCPRODUCTDEFINITIONSHAPE($,$,(#10));'],
+        [10, 'IFCSHAPEREPRESENTATION', "#10=IFCSHAPEREPRESENTATION(#4,'Body','GeometricCurveSet',$);"],
+        [8, 'IFCSIUNIT', '#8=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);'],
+        [9, 'IFCCARTESIANPOINT', '#9=IFCCARTESIANPOINT((0.,0.,0.));'],
+      ]);
+
+      const content = decode(new MergedExporter([planViewModel1(), planViewModel2()])
+        .export({ schema: 'IFC4' }).content);
+
+      expect(findDanglingRefs(content)).toEqual([]);
+      const shapeRepMatch = content.match(/#(\d+)=IFCSHAPEREPRESENTATION\(#(\d+),'Body','GeometricCurveSet'/);
+      expect(shapeRepMatch).not.toBeNull();
+      const contextDefMatch = content.match(
+        new RegExp(`#${shapeRepMatch![2]}=IFCGEOMETRICREPRESENTATIONSUBCONTEXT\\('Body',\\$,\\*,\\*,\\*,\\*,#\\d+,\\$,(\\.[A-Z_]+\\.)`),
+      );
+      expect(contextDefMatch).not.toBeNull();
+      expect(contextDefMatch![1]).toBe('.PLAN_VIEW.');
     });
   });
 });

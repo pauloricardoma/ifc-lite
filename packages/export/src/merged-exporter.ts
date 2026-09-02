@@ -11,7 +11,11 @@
  */
 
 import type { IfcDataStore, IfcSourceBytes } from '@ifc-lite/parser';
-import { generateHeader, deterministicGlobalId, IfcParser, asSourceBytes } from '@ifc-lite/parser';
+import {
+  generateHeader,
+  IfcParser,
+  asSourceBytes,
+} from '@ifc-lite/parser';
 import { decodeIfcString } from '@ifc-lite/encoding';
 import type { MutablePropertyView } from '@ifc-lite/mutations';
 import {
@@ -25,6 +29,19 @@ import { assembleStepBytes, assembleStepBlob } from './step-file-assembly.js';
 import { getCompleteEntityIndex, getMaxExpressId, type CompleteEntityIndex, type ExportEntityRef } from './entity-iteration.js';
 import { StepExporter } from './step-exporter.js';
 import { rescaleEntityLengths, computeNormalizeFactor } from './unit-normalize.js';
+import { groupSubContextsByKey, planInfrastructureUnify } from './merged-subcontext.js';
+import { remapEntityText } from './merged-remap.js';
+import {
+  extractGlobalIdFast,
+  mintUniqueGuid,
+  readLeadingGuid,
+  replaceGlobalId,
+} from './merged-guid.js';
+import {
+  planEmptyContainerDrops,
+  EMPTY_MODEL_VIEW,
+  type EmptyContainerModelView,
+} from './merged-empty-containers.js';
 
 /**
  * UTF-8 decode of `[start, end)` of a model's source, accepting either the raw
@@ -42,58 +59,6 @@ const SHARED_INFRASTRUCTURE_TYPES = new Set([
   'IFCUNITASSIGNMENT',
   'IFCGEOMETRICREPRESENTATIONCONTEXT',
   'IFCGEOMETRICREPRESENTATIONSUBCONTEXT',
-]);
-
-/**
- * An IfcGloballyUniqueId is exactly 22 characters of the buildingSMART base64
- * alphabet. We use this to recognise a rooted entity (IfcRoot subtype) by its
- * first attribute. Geometry/list entities never carry a string there, but some
- * non-rooted RESOURCE entities lead with a Name/Identifier string that can
- * legitimately be 22 charset chars (e.g. a coded property key). Those are
- * excluded by type ({@link NON_ROOTED_STRING_TYPES}) so their Name is never
- * mistaken for a GlobalId — otherwise the GlobalId reconciliation could drop or
- * rename them.
- */
-const GLOBAL_ID_RE = /^[0-9A-Za-z_$]{22}$/;
-
-/**
- * Non-IfcRoot entity types whose first attribute is (or can be) a quoted
- * Name/Identifier string. They must NOT be treated as rooted by GlobalId, even
- * when that string happens to be 22 charset characters. (IfcRoot property
- * containers like IFCPROPERTYSET / IFCELEMENTQUANTITY are deliberately absent —
- * they ARE rooted and carry a real GlobalId at attribute 0.)
- *
- * This is a best-effort denylist, not an exhaustive IfcRoot classifier — the
- * merge works off raw STEP text and has no schema table. It covers the resource
- * families that realistically appear in federated models; an unlisted
- * string-leading resource type is only ever a problem if two models share an
- * identical 22-char charset Name for it AND it collides, which is negligible. A
- * miss in the other direction (treating a real root as non-rooted) is safe — it
- * just skips one GlobalId reconciliation.
- */
-const NON_ROOTED_STRING_TYPES = new Set([
-  // IfcSimpleProperty / IfcComplexProperty (IfcPropertyAbstraction — not rooted)
-  'IFCPROPERTYSINGLEVALUE', 'IFCPROPERTYENUMERATEDVALUE', 'IFCPROPERTYLISTVALUE',
-  'IFCPROPERTYBOUNDEDVALUE', 'IFCPROPERTYTABLEVALUE', 'IFCPROPERTYREFERENCEVALUE',
-  'IFCCOMPLEXPROPERTY',
-  // IfcPhysicalQuantity (not rooted)
-  'IFCQUANTITYLENGTH', 'IFCQUANTITYAREA', 'IFCQUANTITYVOLUME', 'IFCQUANTITYCOUNT',
-  'IFCQUANTITYWEIGHT', 'IFCQUANTITYTIME', 'IFCQUANTITYNUMBER', 'IFCPHYSICALCOMPLEXQUANTITY',
-  // Materials & their constituents (IfcMaterialDefinition — not rooted; lead with a Name)
-  'IFCMATERIAL', 'IFCMATERIALPROFILE', 'IFCMATERIALPROFILESET',
-  'IFCMATERIALCONSTITUENT', 'IFCMATERIALCONSTITUENTSET',
-  // Classification, library & document refs (IfcExternalInformation/Reference)
-  'IFCCLASSIFICATION', 'IFCCLASSIFICATIONREFERENCE',
-  'IFCLIBRARYINFORMATION', 'IFCLIBRARYREFERENCE', 'IFCEXTERNALREFERENCE',
-  'IFCDOCUMENTINFORMATION', 'IFCDOCUMENTREFERENCE',
-  // Constraints & approvals (lead with a Name/Identifier)
-  'IFCMETRIC', 'IFCOBJECTIVE', 'IFCAPPROVAL', 'IFCTABLE',
-  // Actors (IfcPerson/IfcOrganization lead with an Identification string)
-  'IFCPERSON', 'IFCORGANIZATION',
-  // Presentation layers, styles & text literals (lead with a Name/Literal string)
-  'IFCPRESENTATIONLAYERASSIGNMENT', 'IFCPRESENTATIONLAYERWITHSTYLE',
-  'IFCSURFACESTYLE', 'IFCCURVESTYLE', 'IFCTEXTSTYLE', 'IFCFILLAREASTYLE',
-  'IFCTEXTLITERAL', 'IFCTEXTLITERALWITHEXTENT',
 ]);
 
 /** True for IfcRelationship subtypes (objectified relationships). */
@@ -132,6 +97,8 @@ interface MergeSetup {
   firstModelOffset: number;
   /** Infrastructure entities (units, contexts) of the primary model. */
   firstModelInfraMap: Map<string, number[]>;
+  /** Primary model's subcontexts grouped by matching key — see `merged-subcontext.ts`. */
+  firstModelSubContextsByKey: Map<string, number[]>;
   /** IfcProject express ids of the primary model. */
   firstProjectIds: number[];
   /** Spatial lookup built from the primary model. */
@@ -198,6 +165,9 @@ interface ModelMergePlan {
   guidRewrite: Map<number, string>;
   /** Local express id → original GlobalId (rooted entities only). */
   localGuids: Map<number, string>;
+  /** Empty spatial containers this model must not write (#3643); every line
+   *  naming one is narrowed, or withheld with it. */
+  droppedContainerIds?: ReadonlySet<number>;
 }
 
 /**
@@ -364,6 +334,17 @@ export interface MergeExportOptions {
    */
   mergeStoreys?: 'by-name' | 'by-elevation' | 'by-name-then-elevation';
 
+  /**
+   * Drop spatial containers (`IfcSite` / `IfcBuilding` / `IfcBuildingStorey` /
+   * `IfcSpace`) the merge leaves holding nothing — the "Merge Projects" recipe
+   * step the matching options above do not cover (#3643). Emptiness is judged on
+   * the MERGED model, after visibility filtering and spatial unification, so a
+   * container only a later model fills is kept; see
+   * `merged-empty-containers.ts` for the exact rule. Off by default: output is
+   * byte-identical to a merge that never asked for it.
+   */
+  dropEmptyContainers?: boolean;
+
   /** Apply visibility filtering to each model before merging */
   visibleOnly?: boolean;
   /** Hidden entity IDs per model (local expressIds) */
@@ -416,6 +397,12 @@ export interface MergeExportResult {
      * modes (or when every model already shared the first model's unit).
      */
     normalizedModelCount: number;
+    /**
+     * Spatial containers dropped for holding nothing, counted in the merged
+     * model (a container unified across three inputs counts once). Always 0
+     * unless {@link MergeExportOptions.dropEmptyContainers} is set.
+     */
+    droppedContainerCount: number;
     /**
      * Human-readable advisories about the merge (empty on a clean single-unit
      * merge). Notably flags when federation produced more than one IfcProject,
@@ -502,6 +489,7 @@ export class MergedExporter {
     }
     const models = withUsableSource(this.models);
     const setup = this.buildMergeSetup(options, models);
+    const containerDrops = this.planContainerDrops(options, models, setup);
 
     const allEntityLines: string[] = [];
     // Tracks every GlobalId already emitted → its final express id + unit scale,
@@ -527,6 +515,7 @@ export class MergedExporter {
       if (!isFirstModel && !mode.compatible) federatedModelCount++;
       if (mode.normalized) { normalizedModelCount++; this.collectNormalizeCaveats(model, normalizeWarnings); }
       const plan = this.planModel(model, completeIndex, isFirstModel, mode.compatible, mode.lengthFactor, setup, guidToFinalId);
+      this.applyContainerDrops(plan, containerDrops?.byModel.get(model.id));
 
       const sourceSchema = (model.dataStore.schemaVersion as IfcSchemaVersion) || 'IFC4';
       for (const [expressId, entityRef] of completeIndex) {
@@ -548,7 +537,7 @@ export class MergedExporter {
 
     return {
       content,
-      stats: this.buildStats(allEntityLines.length, content.byteLength, federatedModelCount, normalizedModelCount, normalizeWarnings),
+      stats: this.buildStats(allEntityLines.length, content.byteLength, federatedModelCount, normalizedModelCount, normalizeWarnings, containerDrops?.count ?? 0),
     };
   }
 
@@ -565,7 +554,7 @@ export class MergedExporter {
     }
     return {
       content,
-      stats: this.buildStats(doc.allEntityLines.length, content.byteLength, doc.federatedModelCount, doc.normalizedModelCount, doc.normalizeWarnings),
+      stats: this.buildStats(doc.allEntityLines.length, content.byteLength, doc.federatedModelCount, doc.normalizedModelCount, doc.normalizeWarnings, doc.droppedContainerCount),
     };
   }
 
@@ -587,7 +576,7 @@ export class MergedExporter {
     }
     return {
       content,
-      stats: this.buildStats(doc.allEntityLines.length, content.size, doc.federatedModelCount, doc.normalizedModelCount, doc.normalizeWarnings),
+      stats: this.buildStats(doc.allEntityLines.length, content.size, doc.federatedModelCount, doc.normalizedModelCount, doc.normalizeWarnings, doc.droppedContainerCount),
     };
   }
 
@@ -606,6 +595,7 @@ export class MergedExporter {
     federatedModelCount: number;
     normalizedModelCount: number;
     normalizeWarnings: Set<string>;
+    droppedContainerCount: number;
     totalEntities: number;
   }> {
     const onProgress = options.onProgress;
@@ -619,6 +609,7 @@ export class MergedExporter {
     // without edits pass through unchanged (no export/parse cost).
     const models = withUsableSource(await this.bakeMutatedModels());
     const setup = this.buildMergeSetup(options, models);
+    const containerDrops = this.planContainerDrops(options, models, setup);
 
     const allEntityLines: string[] = [];
     const guidToFinalId = new Map<string, GuidRecord>();
@@ -660,6 +651,7 @@ export class MergedExporter {
       if (!isFirstModel && !mode.compatible) federatedModelCount++;
       if (mode.normalized) { normalizedModelCount++; this.collectNormalizeCaveats(model, normalizeWarnings); }
       const plan = this.planModel(model, completeIndex, isFirstModel, mode.compatible, mode.lengthFactor, setup, guidToFinalId);
+      this.applyContainerDrops(plan, containerDrops?.byModel.get(model.id));
       const sourceSchema = (model.dataStore.schemaVersion as IfcSchemaVersion) || 'IFC4';
 
       let entityCount = 0;
@@ -700,7 +692,7 @@ export class MergedExporter {
     }
     await new Promise(r => setTimeout(r, 0));
 
-    return { header, allEntityLines, federatedModelCount, normalizedModelCount, normalizeWarnings, totalEntities };
+    return { header, allEntityLines, federatedModelCount, normalizedModelCount, normalizeWarnings, droppedContainerCount: containerDrops?.count ?? 0, totalEntities };
   }
 
   /**
@@ -756,6 +748,7 @@ export class MergedExporter {
     federatedModelCount: number,
     normalizedModelCount: number,
     normalizeWarnings: Set<string>,
+    droppedContainerCount: number,
   ): MergeExportResult['stats'] {
     const warnings: string[] = [];
     if (federatedModelCount > 0) {
@@ -769,7 +762,52 @@ export class MergedExporter {
       );
     }
     warnings.push(...normalizeWarnings);
-    return { modelCount: this.models.length, totalEntityCount, fileSize, federatedModelCount, normalizedModelCount, warnings };
+    return { modelCount: this.models.length, totalEntityCount, fileSize, federatedModelCount, normalizedModelCount, droppedContainerCount, warnings };
+  }
+
+  /**
+   * Plan the empty spatial containers of the whole merge (#3643), or `null` when
+   * the caller did not ask for the drop. Reproduces the same spatial unification
+   * {@link planModel} will, so emptiness is judged on the containers the merge
+   * actually keeps rather than on each file in isolation.
+   */
+  private planContainerDrops(
+    options: MergeExportOptions,
+    models: MergeModelInput[],
+    setup: MergeSetup,
+  ): { byModel: Map<string, Set<number>>; count: number } | null {
+    if (!options.dropEmptyContainers) return null;
+    const views: EmptyContainerModelView[] = models.map((model, index) => {
+      const source = model.dataStore.source;
+      if (!source || source.length === 0) return EMPTY_MODEL_VIEW;
+      const entities = getCompleteEntityIndex(model.dataStore);
+      const mode = this.resolveModelMode(model, index === 0, setup);
+      const sharedRemap = new Map<number, number>();
+      if (index > 0 && mode.compatible) {
+        this.unifySpatialEntities(model.dataStore, setup.spatialLookup, setup.firstModelOffset, mode.lengthFactor, sharedRemap, new Set(), setup);
+      }
+      return {
+        entities,
+        source: asSourceBytes(source),
+        included: this.computeIncludedEntityIds(model, options, entities, source)?.included ?? null,
+        sharedRemap,
+        offset: setup.modelOffsets.get(model.id)!,
+        compatible: mode.compatible,
+      };
+    });
+    const plan = planEmptyContainerDrops(views);
+    return {
+      byModel: new Map(models.map((model, index) => [model.id, plan.droppedByModel[index]])),
+      count: plan.droppedCount,
+    };
+  }
+
+  /** Fold a model's dropped containers into its plan: the container lines are
+   *  skipped outright, and {@link renderEntity} narrows every line naming one. */
+  private applyContainerDrops(plan: ModelMergePlan, dropped: ReadonlySet<number> | undefined): void {
+    if (dropped === undefined || dropped.size === 0) return;
+    plan.droppedContainerIds = dropped;
+    for (const id of dropped) plan.skipEntityIds.add(id);
   }
 
   /**
@@ -830,10 +868,12 @@ export class MergedExporter {
 
     const firstModel = models[0];
     const primaryScale = this.resolveUnitScale(firstModel);
+    const firstModelInfraMap = this.findInfrastructureEntities(firstModel.dataStore);
     return {
       modelOffsets,
       firstModelOffset: modelOffsets.get(firstModel.id)!,
-      firstModelInfraMap: this.findInfrastructureEntities(firstModel.dataStore),
+      firstModelInfraMap,
+      firstModelSubContextsByKey: groupSubContextsByKey(firstModel.dataStore, firstModelInfraMap.get('IFCGEOMETRICREPRESENTATIONSUBCONTEXT') ?? []),
       firstProjectIds: this.findEntitiesByType(firstModel.dataStore, 'IFCPROJECT'),
       spatialLookup: this.buildSpatialLookup(firstModel.dataStore),
       primaryScale,
@@ -892,8 +932,8 @@ export class MergedExporter {
    * Resolve a model's declared AREAUNIT / VOLUMEUNIT scale (SI m² / m³ per unit)
    * by walking IfcProject → IfcUnitAssignment. Falls back to the length-derived
    * unit (`lengthScale ** power`) when the model declares no explicit area/volume
-   * unit — the IFC default. A prefixed SI area/volume unit (rare) applies the
-   * prefix once (buildingSMART / IfcOpenShell convention).
+   * unit — the IFC default. A prefixed SI area/volume unit (rare) raises the
+   * prefix to `power` (area = prefix², volume = prefix³), matching `rust/core`.
    */
   private resolveDerivedUnitScale(
     dataStore: IfcDataStore,
@@ -924,8 +964,8 @@ export class MergedExporter {
         if (this.normalizeEnum(this.extractStepAttribute(uid, dataStore, 1)) !== wantType) continue;
         const prefixRaw = this.extractStepAttribute(uid, dataStore, 2);
         if (!prefixRaw || prefixRaw === '$' || prefixRaw === '*') return 1.0; // square/cubic metre
-        const mult = SI_PREFIX_MULTIPLIERS[this.normalizeEnum(prefixRaw)];
-        return mult !== undefined ? mult : 1.0;
+        const mult = SI_PREFIX_MULTIPLIERS[this.normalizeEnum(prefixRaw)]; // see doc: raised to `power`
+        return mult !== undefined ? Math.pow(mult, power) : 1.0;
       }
 
       if (utype === 'IFCCONVERSIONBASEDUNIT') {
@@ -983,8 +1023,9 @@ export class MergedExporter {
    *
    * Also returns `hiddenProductIds` (`null` alongside a `null` `included`):
    * `renderEntity` needs it to withhold-or-narrow a relationship's own OUTPUT
-   * line the same way `StepExporter` does (`isExcludedFromRelationshipRefs` /
-   * `step-exporter.ts:1181`,`:1486`) — `collectReferencedEntityIds` already
+   * line the same way `StepExporter` does (`isOmittedFromOutput`, consumed at
+   * its two `filterHiddenRefsFromRelationshipLine` call sites in
+   * `step-exporter.ts`) — `collectReferencedEntityIds` already
    * refuses to WALK INTO a relationship whose sole subject is hidden (#2548),
    * but that only keeps the closure from growing past it; a root's own bytes
    * are still copied to the output verbatim unless something narrows them
@@ -1041,7 +1082,7 @@ export class MergedExporter {
     // One cheap pass to read each rooted entity's GlobalId (first attribute).
     const localGuids = new Map<number, string>();
     for (const [id, ref] of completeIndex) {
-      const guid = this.extractGlobalIdFast(ref, source);
+      const guid = extractGlobalIdFast(ref, source);
       if (guid !== null) localGuids.set(id, guid);
     }
 
@@ -1055,15 +1096,8 @@ export class MergedExporter {
         }
       }
 
-      // Remap and skip duplicate infrastructure (units, contexts).
-      const modelInfra = this.findInfrastructureEntities(model.dataStore);
-      for (const [type, firstIds] of setup.firstModelInfraMap) {
-        const thisIds = modelInfra.get(type);
-        if (thisIds && firstIds.length > 0 && thisIds.length > 0) {
-          sharedRemap.set(thisIds[0], firstIds[0] + setup.firstModelOffset);
-          skipEntityIds.add(thisIds[0]);
-        }
-      }
+      // Remap and skip duplicate infrastructure (units, contexts) — subcontexts kind-matched, see merged-subcontext.ts.
+      planInfrastructureUnify(model.dataStore, this.findInfrastructureEntities(model.dataStore), setup.firstModelInfraMap, setup.firstModelSubContextsByKey, setup.firstModelOffset, sharedRemap, skipEntityIds);
 
       // Unify spatial hierarchy: match Site, Building, Storey to first model.
       // Under normalize, this model's raw elevations are in its own unit, so the
@@ -1098,7 +1132,7 @@ export class MergedExporter {
           sharedRemap.set(id, prior.finalId);
           skipEntityIds.add(id);
         } else {
-          guidRewrite.set(id, this.mintUniqueGuid(guid, model.id, guidToFinalId, pendingMinted));
+          guidRewrite.set(id, mintUniqueGuid(guid, model.id, guidToFinalId, pendingMinted));
         }
       }
     }
@@ -1131,7 +1165,12 @@ export class MergedExporter {
 
     // A `visibleOnly` export must narrow — or entirely withhold — a
     // relationship's own OUTPUT line the same way `StepExporter` does
-    // (`isExcludedFromRelationshipRefs`, `step-exporter.ts:1181`/`:1486`).
+    // (`isOmittedFromOutput`, consumed at its two
+    // `filterHiddenRefsFromRelationshipLine` call sites — named rather than
+    // cited by line number, which went stale the first time either file moved).
+    // NOTE the predicates are not identical: `StepExporter`'s also answers for
+    // an unreadable source ref and a geometry exclusion, which this one — a
+    // hidden product or an id absent from the complete index — does not.
     // `collectReferencedEntityIds` already refuses to WALK INTO a relationship
     // whose sole subject is hidden (#2548), but a root's own bytes are still
     // copied to the output verbatim unless narrowed here too — without this,
@@ -1147,18 +1186,27 @@ export class MergedExporter {
       entityText = filtered;
     }
 
+    // A dropped empty spatial container (#3643) is never written, so any line
+    // naming one is narrowed the same way — or withheld with it. Runs in LOCAL
+    // id space, before the remap below, like the visibility narrowing above.
+    if (plan.droppedContainerIds !== undefined) {
+      const kept = filterHiddenRefsFromRelationshipLine(entityText, id => plan.droppedContainerIds!.has(id));
+      if (kept === null) return null;
+      entityText = kept;
+    }
+
     // Remap ids. Fast path: the first model (offset 0, no remaps) is byte-identical.
     let finalText: string;
     if (offset === 0 && plan.sharedRemap.size === 0) {
       finalText = entityText;
     } else {
-      finalText = this.remapEntityText(entityText, offset, plan.sharedRemap);
+      finalText = remapEntityText(entityText, offset, plan.sharedRemap);
     }
 
     // Re-stamp the GlobalId for a federated entity whose id collides.
     const mintedGuid = plan.guidRewrite.get(localId);
     if (mintedGuid !== undefined) {
-      finalText = this.replaceGlobalId(finalText, mintedGuid);
+      finalText = replaceGlobalId(finalText, mintedGuid);
     }
 
     // Normalize units: rescale every length/area/volume-valued datum into the
@@ -1182,7 +1230,7 @@ export class MergedExporter {
     // Emitted entities are not sharedRemap keys, so their final id is
     // localId + offset.
     if (plan.localGuids.has(localId)) {
-      const emittedGuid = this.readLeadingGuid(finalText)
+      const emittedGuid = readLeadingGuid(finalText)
         ?? mintedGuid ?? plan.localGuids.get(localId);
       if (emittedGuid !== undefined) {
         guidToFinalId.set(emittedGuid, { finalId: localId + offset, scale: mode.effectiveScale });
@@ -1190,148 +1238,6 @@ export class MergedExporter {
     }
 
     return finalText;
-  }
-
-  /**
-   * Read the GlobalId (first quoted attribute) from an already-rendered STEP
-   * line. Used to register the id that was actually emitted, after any id
-   * remap, GlobalId re-stamp, or schema conversion. Returns null if the first
-   * quoted token is not a 22-char GlobalId.
-   */
-  private readLeadingGuid(entityText: string): string | null {
-    const open = entityText.indexOf('(');
-    if (open === -1) return null;
-    const q1 = entityText.indexOf("'", open + 1);
-    if (q1 === -1) return null;
-    const q2 = entityText.indexOf("'", q1 + 1);
-    if (q2 === -1) return null;
-    const raw = entityText.slice(q1 + 1, q2);
-    return GLOBAL_ID_RE.test(raw) ? raw : null;
-  }
-
-  /**
-   * Mint a fresh, deterministic, collision-free GlobalId for an entity whose id
-   * collides. Seeded from the original GlobalId and the model's stable id so the
-   * output is reproducible and does not churn when an unrelated earlier model
-   * changes size; checked against both already-emitted ids and the ids minted
-   * so far for this model.
-   */
-  private mintUniqueGuid(
-    original: string,
-    modelId: string,
-    guidToFinalId: Map<string, GuidRecord>,
-    pendingMinted: Set<string>,
-  ): string {
-    let candidate = deterministicGlobalId(`${original}#${modelId}`);
-    let n = 0;
-    while (guidToFinalId.has(candidate) || pendingMinted.has(candidate)) {
-      candidate = deterministicGlobalId(`${original}#${modelId}#${n++}`);
-    }
-    pendingMinted.add(candidate);
-    return candidate;
-  }
-
-  /**
-   * Read an entity's GlobalId (first attribute) by decoding only its head.
-   * Returns the 22-char id for a rooted entity, or `null` for any entity whose
-   * first attribute is not a GlobalId (geometry, lists, property atoms, …).
-   */
-  private extractGlobalIdFast(ref: ExportEntityRef, source: IfcSourceBytes): string | null {
-    // Non-rooted resource entities (property/quantity/material/style/actor …)
-    // lead with a Name string that can itself be 22 charset chars; never treat
-    // those as a GlobalId or reconciliation would drop/rename them.
-    if (NON_ROOTED_STRING_TYPES.has((ref.type ?? '').toUpperCase())) return null;
-    // 128 bytes comfortably spans `#<id>=<LONGEST_TYPE_NAME>('<22-char id>'`,
-    // so the GlobalId is always fully inside the window.
-    const end = Math.min(ref.byteOffset + 128, ref.byteOffset + ref.byteLength);
-    const head = decodeRange(source, ref.byteOffset, end);
-    const open = head.indexOf('(');
-    if (open === -1) return null;
-    let i = open + 1;
-    while (i < head.length && (head[i] === ' ' || head[i] === '\t' || head[i] === '\n' || head[i] === '\r')) i++;
-    if (head[i] !== "'") return null;
-    // A GlobalId never contains a quote (charset excludes it), so the next
-    // quote closes it.
-    const close = head.indexOf("'", i + 1);
-    if (close === -1) return null;
-    const raw = head.slice(i + 1, close);
-    return GLOBAL_ID_RE.test(raw) ? raw : null;
-  }
-
-  /**
-   * Replace an entity's GlobalId (first quoted attribute) with `newGuid`.
-   * `newGuid` is a 22-char IFC id (no quote in its charset), so this is safe.
-   */
-  private replaceGlobalId(entityText: string, newGuid: string): string {
-    const open = entityText.indexOf('(');
-    if (open === -1) return entityText;
-    const q1 = entityText.indexOf("'", open + 1);
-    if (q1 === -1) return entityText;
-    const q2 = entityText.indexOf("'", q1 + 1);
-    if (q2 === -1) return entityText;
-    return entityText.slice(0, q1 + 1) + newGuid + entityText.slice(q2);
-  }
-
-  /**
-   * Remap all #ID references in a STEP entity line.
-   * Applies offset to all IDs, then overrides with specific remappings.
-   *
-   * Only `#<digits>` tokens in code positions are rewritten; tokens inside
-   * single-quoted STEP strings (e.g. a 'Room #205' Name or a 'http://x#42'
-   * URL) are left untouched so string attribute values are not corrupted.
-   */
-  private remapEntityText(
-    entityText: string,
-    offset: number,
-    sharedRemap: Map<number, number>,
-  ): string {
-    const remapId = (originalId: number): string => {
-      // Check if this ID has a specific remap (project, shared infrastructure)
-      const remapped = sharedRemap.get(originalId);
-      if (remapped !== undefined) {
-        return `#${remapped}`;
-      }
-      // Apply offset
-      return `#${originalId + offset}`;
-    };
-
-    let out = '';
-    let inString = false;
-    for (let i = 0; i < entityText.length; i++) {
-      const char = entityText[i];
-
-      if (inString) {
-        out += char;
-        if (char === "'") {
-          // STEP escapes a literal quote by doubling it ('').
-          if (entityText[i + 1] === "'") {
-            out += entityText[i + 1];
-            i++;
-          } else {
-            inString = false;
-          }
-        }
-        continue;
-      }
-
-      if (char === "'") {
-        inString = true;
-        out += char;
-        continue;
-      }
-
-      if (char === '#' && entityText[i + 1] >= '0' && entityText[i + 1] <= '9') {
-        let j = i + 1;
-        while (j < entityText.length && entityText[j] >= '0' && entityText[j] <= '9') j++;
-        const originalId = parseInt(entityText.slice(i + 1, j), 10);
-        out += remapId(originalId);
-        i = j - 1;
-        continue;
-      }
-
-      out += char;
-    }
-    return out;
   }
 
   /**
@@ -1670,4 +1576,3 @@ export class MergedExporter {
   }
 
 }
-

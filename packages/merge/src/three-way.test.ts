@@ -136,7 +136,15 @@ describe('three-way decision matrix', () => {
     });
     expect(plan.autoOps).toEqual([]);
     expect(plan.conflicts).toHaveLength(1);
-    expect(plan.conflicts[0].kind).toBe('delete-vs-modify');
+    const conflict = plan.conflicts[0];
+    expect(conflict.kind).toBe('delete-vs-modify');
+    expect(conflict.path).toBe('wall-1');
+    // The conflict must record theirs' actual edit and ours' pre-tombstone
+    // state on the correct sides — swapping them would be unobservable if
+    // only `kind` were asserted.
+    expect(conflict.theirs?.attributes?.['pset:Pset_FireSafety']).toEqual({ [FIRE]: 'REI90' });
+    expect(conflict.ours?.attributes?.['pset:Pset_FireSafety']).toEqual({ [FIRE]: 'REI60' });
+    expect(conflict.base?.attributes?.['pset:Pset_FireSafety']).toEqual({ [FIRE]: 'REI60' });
   });
 
   it('changed vs tombstoned → conflict: modify-vs-delete', () => {
@@ -146,7 +154,14 @@ describe('three-way decision matrix', () => {
       theirs: [base, layer([{ path: 'wall-1', attributes: { [IFCLITE_ATTR.DELETED]: true } }], 'theirs')],
     });
     expect(plan.conflicts).toHaveLength(1);
-    expect(plan.conflicts[0].kind).toBe('modify-vs-delete');
+    const conflict = plan.conflicts[0];
+    expect(conflict.kind).toBe('modify-vs-delete');
+    expect(conflict.path).toBe('wall-1');
+    // Ours carries the actual edit, not the ancestor's stale value —
+    // swapping ours/base here would be unobservable if only `kind` were
+    // asserted.
+    expect(conflict.ours?.attributes?.['pset:Pset_FireSafety']).toEqual({ [FIRE]: 'REI90' });
+    expect(conflict.base?.attributes?.['pset:Pset_FireSafety']).toEqual({ [FIRE]: 'REI60' });
   });
 
   it('tombstoned vs tombstoned → fold (auto)', () => {
@@ -379,5 +394,108 @@ describe('partition fuzz: random op partitions never lose ops', () => {
         else expect(value).toBe('REI60');
       }
     }
+  });
+});
+
+/**
+ * `sharesAncestorPrefix` decides whether the 05 §5.7 projection fast path
+ * may skip re-reading the ancestor layers out of a side's stack. It accepts
+ * a layer either by REFERENCE equality or by content address, and the
+ * content-address arm is deliberately narrowed to ids in the `blake3:` form
+ * — an equal blake3 id is a proof of identical canonical bytes, an equal
+ * arbitrary id is not.
+ *
+ * Every other fixture in this package passes the very same `IfcxFile`
+ * OBJECT as both `ancestor[0]` and `ours[0]`/`theirs[0]`, so the reference
+ * arm alone decides and the id is never consulted. Mutation testing
+ * confirmed the narrowing is unobserved: relaxing the check to
+ * `if (stack[i].header.id === id) continue;` — dropping the `blake3:`
+ * requirement — left the whole `@ifc-lite/merge` suite green at 101/101.
+ * That is a silent-data-loss mutant, not a cosmetic one: the projection
+ * then folds the REAL ancestor while treating an imposter layer's content
+ * as if it were that ancestor, and everything the imposter changed
+ * disappears from the plan with no conflict raised.
+ */
+describe('ancestor-prefix detection is content-addressed, not id-string-matched', () => {
+  const CLASS = 'bsi::ifc::class';
+  const prefixBase = makeLayer(
+    [
+      {
+        path: 'wall-1',
+        attributes: { [CLASS]: { code: 'IfcWall', uri: 'u' }, [FIRE]: 'REI60', [EXTERNAL]: true },
+      },
+    ],
+    'not-a-content-address'
+  );
+  // Same id string, different bytes — exactly what a non-content-addressed
+  // id (a branch name, a counter, a test label) cannot rule out.
+  const imposter = makeLayer(
+    [
+      {
+        path: 'wall-1',
+        attributes: { [CLASS]: { code: 'IfcWall', uri: 'u' }, [FIRE]: 'REI30', [EXTERNAL]: true },
+      },
+    ],
+    'not-a-content-address'
+  );
+
+  it('a different document carrying the same NON-blake3 id is not accepted as the ancestor prefix', () => {
+    // Premise, pinned: the ids really are equal and the objects really are
+    // not — otherwise the test would prove nothing.
+    expect(imposter.header.id).toBe(prefixBase.header.id);
+    expect(imposter.header.id.startsWith('blake3:')).toBe(false);
+    expect(imposter).not.toBe(prefixBase);
+
+    const theirsDelta = layer([{ path: 'wall-1', attributes: { [EXTERNAL]: false } }], 'theirs');
+    const plan = planThreeWayMerge({
+      ancestor: [prefixBase],
+      ours: [prefixBase],
+      theirs: [imposter, theirsDelta],
+    });
+
+    expect(plan.conflicts).toEqual([]);
+    // The imposter's own divergence from the ancestor (REI60 → REI30) must
+    // reach the plan. Accepting it as the prefix projects only the suffix
+    // and this op vanishes entirely.
+    expect(plan.autoOps).toContainEqual({
+      op: 'set-component',
+      path: 'wall-1',
+      componentKey: 'pset:Pset_FireSafety',
+      attributes: { [FIRE]: 'REI30' },
+    });
+    // The suffix's own edit still lands, so the assertion above is about
+    // what the fast path DROPS, not about the merge failing wholesale.
+    expect(plan.autoOps).toContainEqual({
+      op: 'set-component',
+      path: 'wall-1',
+      componentKey: 'pset:Pset_WallCommon',
+      attributes: { [EXTERNAL]: false },
+    });
+
+    const merged = stateAfterMerge([prefixBase], plan.autoOps);
+    expect(merged.get('wall-1')?.components.get('pset:Pset_FireSafety')?.[FIRE]).toBe('REI30');
+    expect(merged.get('wall-1')?.components.get('pset:Pset_WallCommon')?.[EXTERNAL]).toBe(false);
+  });
+
+  it('control: the same suffix over the REAL ancestor layer emits only the suffix edit', () => {
+    // Same suffix, same expectations minus the imposter's divergence. This
+    // does not observe which path ran — it fixes the baseline the test
+    // above compares against, so the extra `REI30` op there is provably
+    // caused by the imposter and not by the fixture shape.
+    const theirsDelta = layer([{ path: 'wall-1', attributes: { [EXTERNAL]: false } }], 'theirs');
+    const plan = planThreeWayMerge({
+      ancestor: [prefixBase],
+      ours: [prefixBase],
+      theirs: [prefixBase, theirsDelta],
+    });
+    expect(plan.conflicts).toEqual([]);
+    expect(plan.autoOps).toEqual([
+      {
+        op: 'set-component',
+        path: 'wall-1',
+        componentKey: 'pset:Pset_WallCommon',
+        attributes: { [EXTERNAL]: false },
+      },
+    ]);
   });
 });

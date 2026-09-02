@@ -203,6 +203,55 @@ describe('prism volume on shapes a box cannot express', () => {
     assert.ok(Math.abs(volume - 0.4 * Math.SQRT2) < 1e-9, `diagonal band took ${volume}`);
   });
 
+  it('takes a trapezoid whose edges are NOT parallel, so the chord width varies with z', () => {
+    // Every other slanted fixture here is a PARALLELOGRAM (the diagonal band's
+    // two edges share a slope), which makes `bHi - bLo` zero and the far
+    // region's z-slope term vanish; the tiling case above asserts a + b = whole,
+    // an identity every divergence-1 field satisfies, so it cannot see the
+    // slope either. Between them the integrator's dependence on z was
+    // unobservable: `cz` could be forced to 0, or read off the Y component,
+    // with the whole suite still green.
+    //
+    // The box is deliberately 2 m tall and 1 m deep, rather than `wall()`, which
+    // is 1 x 1 in (y, z): a square end face has a diagonal triangulation
+    // symmetric under swapping y for z, which hides a `cz` that reads the Y
+    // component. Unequal extents make that swap observable too.
+    //
+    // The wedge has lo(z) = 1 and hi(z) = 2 + 2z, so bLo = 0 but bHi = 2 and the
+    // chord widens from 1 m at z = 0 to 3 m at z = 1. Its area is the trapezoid
+    // (1 + 3)/2 * 1 = 2, and it sits inside the box's x and z range, so the
+    // volume taken is 2 * the box's 2 m height = 4.
+    const tall = extrudeLoop([[0, 0], [6, 0], [6, 1], [0, 1]], 0, 2);
+    const wedge: FootprintPoint[] = [[1, 0], [2, 0], [4, 1], [1, 1]];
+    const traps = trapezoidsOfFootprint(wedge);
+    // Pin the asymmetry itself: if a future edit made this fixture a
+    // parallelogram again the assertion below would go quiet rather than fail.
+    assert.ok(
+      traps.some((t) => Math.abs(t.bHi - t.bLo) > 0.5),
+      `fixture must have non-parallel edges, got ${JSON.stringify(traps)}`,
+    );
+    const volume = clippedVolumeForPrism([tall], compilePrism(wedge, -1, 3));
+    assert.ok(Math.abs(volume - 4) < EPS, `wedge took ${volume}, expected 4`);
+  });
+
+  it('counts a face lying exactly on the hi(z) split plane ONCE', () => {
+    // The split at hi(z) hands a polygon to the inside branch or the far
+    // branch; a polygon lying exactly ON the plane satisfies both keep-tests, so
+    // a Sutherland-Hodgman split that kept it on each side would count that face
+    // twice. `accumulateTrapezoid` avoids that by testing `maxD <= 0` and
+    // `minD >= 0` before it ever splits -- and nothing pinned it, because no
+    // fixture put a face on a zone boundary at all, which is the ordinary case
+    // in a tiling plan rather than an edge case.
+    //
+    // This box ends exactly at x = 3 and the footprint's hi edge is x = 3, so
+    // the box's far face is coplanar with the split. The zone takes x in [1, 3]
+    // of a 3 x 2 x 1 m box: volume 4, and 8 if that face is counted twice.
+    const box = extrudeLoop([[0, 0], [3, 0], [3, 1], [0, 1]], 0, 2);
+    const flush: FootprintPoint[] = [[1, 0], [3, 0], [3, 1], [1, 1]];
+    const volume = clippedVolumeForPrism([box], compilePrism(flush, -1, 3));
+    assert.ok(Math.abs(volume - 4) < EPS, `flush face took ${volume}, expected 4`);
+  });
+
   it('sums to the whole across a footprint tiling, which is the invariant that matters', () => {
     // Two triangles that tile the wall's plan exactly, sharing the diagonal.
     const lower: FootprintPoint[] = [[-1, -1], [8, -1], [8, 2]];
@@ -231,5 +280,53 @@ describe('prism volume on shapes a box cannot express', () => {
   it('takes nothing from a prism whose vertical extent misses the element', () => {
     const over: FootprintPoint[] = [[-1, -1], [8, -1], [8, 2], [-1, 2]];
     assert.ok(Math.abs(clippedVolumeForPrism([wall()], compilePrism(over, 10, 12))) < 1e-12);
+  });
+});
+
+describe('a face all but coincident with a strip boundary (#1155 regime)', () => {
+  /** `n` ULPs away from `x`, toward +/-Infinity as `n` is signed. */
+  function ulps(x: number, n: number): number {
+    const buf = new Float64Array([x]);
+    const bits = new BigInt64Array(buf.buffer);
+    bits[0] += BigInt(n);
+    return buf[0];
+  }
+
+  // `clipPlane` used to carry a `t` clamp behind a `|da - db| > 1e-12`
+  // denominator guard, ported from the shape of the #1155 fix in
+  // `rust/geometry/src/csg/plane_eps.rs`. Nothing in this suite reached that
+  // guard: instrumenting the crossing branch over every fixture in
+  // `src/lib/zones/*.test.ts` gives 164 crossings whose smallest `|da - db|`
+  // is 1 -- twelve orders above the threshold. So the guard was removed, and
+  // this is the fixture that puts the suite INSIDE the regime it covered:
+  // the far face is tilted across the strip boundary by four ULPs, so
+  // twelve of the twenty-four crossings here run with `|da - db| = 3.6e-15`.
+  //
+  // Removing the guard is safe because `da` and `db` are strictly opposite in
+  // sign in that branch, so `t = da / (da - db)` is a positive quantity over a
+  // strictly larger one. The precondition is the BAND-FREE classification
+  // (`da >= 0`), and this test is what pins it: the box-vs-prism oracle above
+  // cannot -- it calls `clipPlane` against mirrored planes, for which any
+  // deterministic symmetric rule still tiles the polygon, so it accepts a
+  // constant `t` as readily as the real one.
+  const box = () => extrudeLoop([[0, 0], [ulps(3, 4), 0], [ulps(3, -4), 1], [0, 1]], 0, 1);
+  const flush: FootprintPoint[] = [[1, 0], [3, 0], [3, 1], [1, 1]];
+
+  it('stays finite and bounded by the element when the cut is ULPs from the face', () => {
+    const volume = clippedVolumeForPrism([box()], compilePrism(flush, -1, 2));
+    assert.ok(Number.isFinite(volume), `non-finite volume ${volume}`);
+    const whole = meshVolume([box()]);
+    assert.ok(
+      Math.abs(volume) <= Math.abs(whole) + EPS,
+      `took ${volume} of an element whose whole volume is ${whole}`,
+    );
+  });
+
+  it('still takes x in [1, 3] of it, so no vertex was reclassified across the plane', () => {
+    // An epsilon band in the classification -- the #1155 precondition -- puts
+    // the whole far face on the wrong side here and yields 4, more than the
+    // element holds. Exact answer: a 3 x 1 x 1 m box, x from 1 to 3.
+    const volume = clippedVolumeForPrism([box()], compilePrism(flush, -1, 2));
+    assert.ok(Math.abs(volume - 2) < 1e-12, `near-coincident cut took ${volume}, expected 2`);
   });
 });

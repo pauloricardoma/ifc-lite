@@ -226,11 +226,11 @@ export type { ColorRaster, ColorRasterOptions, RasterFit } from './color-raster.
 // ═══════════════════════════════════════════════════════════════════════════
 
 // Only the exporter facade is public. The low-level writer internals
-// (DxfWriter, sanitizeDxfLayerName, cssToAci, the linetype/justification
-// types) stay package-private: no external consumer exists, and an unused
-// public export is permanent semver liability (PR #1871 review).
+// (DxfWriter, sanitizeDxfLayerName, cssToAci, linetype/justification types)
+// stay package-private: an unused public export is permanent semver liability.
 export { DXFExporter, exportToDXF } from './dxf-exporter.js';
 export type { DXFExportOptions, DXFUnderlayOptions } from './dxf-exporter.js';
+export { encodeDxfCp1252, type Cp1252EncodeResult } from './dxf/encoding.js'; // public: $DWGCODEPAGE ANSI_1252, not UTF-8
 
 // ═══════════════════════════════════════════════════════════════════════════
 // GPU ACCELERATION
@@ -515,6 +515,7 @@ export {
   // Sheet utilities
   calculateViewportBounds,
   calculateDrawingTransform,
+  calculateDrawingTransformForAxis,
 
   // Scale stamp: the sheet's own record of the scale it was drawn at (#2042).
   // Grows the page around an EXISTING to-scale layout and returns its
@@ -524,8 +525,6 @@ export {
   // Sheet renderers
   renderFrame,
   renderTitleBlock,
-  renderScaleBar,
-  renderNorthArrow,
 } from './sheet/index.js';
 
 export type {
@@ -549,9 +548,6 @@ export type {
   TitleBlockConfig,
 
   // Scale bar types
-  ScaleBarStyle,
-  ScaleBarPosition,
-  ScaleBarUnits,
   ScaleBarConfig,
   NorthArrowStyle,
   NorthArrowConfig,
@@ -573,5 +569,4 @@ export type {
   FrameInnerBounds,
   TitleBlockRenderResult,
   TitleBlockExtras,
-  PositionMm,
 } from './sheet/index.js';

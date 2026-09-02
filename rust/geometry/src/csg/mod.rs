@@ -14,8 +14,11 @@ use smallvec::SmallVec;
 use std::cell::RefCell;
 
 mod consolidate;
+mod degenerate_check;
 mod normals;
 mod plane_eps;
+mod topology_diagnostic;
+mod union;
 
 pub use normals::calculate_normals;
 pub(crate) use consolidate::tri_is_needle;
@@ -279,7 +282,12 @@ impl ClippingProcessor {
     /// On any failure path the host is returned un-cut and a [`BoolFailure`]
     /// record is appended to the processor's failure log (drainable via
     /// [`Self::take_failures`]). An empty host returns an empty mesh without
-    /// recording a failure (it's a fast path, not a fallback).
+    /// recording a failure (it's a fast path, not a fallback). The accept path
+    /// also runs `record_topology_tear` (#3440 step 1): diagnostic only, never
+    /// gates, in every build. `topology_gate_reject` (#3440 step 2) runs the
+    /// same closure predicate but, ONLY when the crate is built with the
+    /// `csg_topology_gate` feature (off by default; no downstream crate turns
+    /// it on), rejects a torn result the same way `KernelOutputInvalid` does.
     pub fn subtract_mesh(&self, host_mesh: &Mesh, opening_mesh: &Mesh) -> Result<Mesh> {
         record_csg_op(0, host_mesh.triangle_count(), opening_mesh.triangle_count());
         if host_mesh.is_empty() {
@@ -329,7 +337,10 @@ impl ClippingProcessor {
             self.record_failure(BoolOp::Difference, BoolFailureReason::KernelOutputInvalid);
             return Ok(host_mesh.clone());
         }
-        Ok(result)
+        if self.topology_gate_reject(BoolOp::Difference, &result) {
+            return Ok(host_mesh.clone());
+        }
+        Ok(result).inspect(|m| self.record_topology_tear(BoolOp::Difference, m))
     }
 
     /// Subtract a GROUP of pairwise-disjoint opening cutters from the host in
@@ -402,36 +413,12 @@ impl ClippingProcessor {
                 self.record_failure(BoolOp::Difference, BoolFailureReason::KernelOutputInvalid);
                 return Ok(host_mesh.clone());
             }
+            if self.topology_gate_reject(BoolOp::Difference, &next) {
+                return Ok(host_mesh.clone());
+            }
             result = next;
         }
-        Ok(result)
-    }
-
-    /// Union two meshes together using CSG boolean operations on the
-    /// pure-Rust exact kernel.
-    ///
-    /// Empty operands are handled silently — they have a unique correct answer.
-    pub fn union_mesh(&self, mesh_a: &Mesh, mesh_b: &Mesh) -> Result<Mesh> {
-        record_csg_op(1, mesh_a.triangle_count(), mesh_b.triangle_count());
-        if mesh_a.is_empty() {
-            return Ok(mesh_b.clone());
-        }
-        if mesh_b.is_empty() {
-            return Ok(mesh_a.clone());
-        }
-
-        // Pure-Rust exact kernel. On an empty/invalid kernel result
-        // fall back to a plain merge (overlap not removed) + record the failure,
-        // preserving the legacy never-Err contract.
-        let raw_u = crate::kernel::mesh_bridge::union(mesh_a, mesh_b);
-        let result = Self::consolidate_coplanar(raw_u);
-        if result.is_empty() || !self.validate_mesh(&result) {
-            self.record_failure(BoolOp::Union, BoolFailureReason::KernelOutputInvalid);
-            let mut merged = mesh_a.clone();
-            merged.merge(mesh_b);
-            return Ok(merged);
-        }
-        Ok(result)
+        Ok(result).inspect(|m| self.record_topology_tear(BoolOp::Difference, m))
     }
 
     /// Intersect two meshes using CSG boolean operations on the pure-Rust
@@ -453,103 +440,10 @@ impl ClippingProcessor {
             self.record_failure(BoolOp::Intersection, BoolFailureReason::KernelOutputInvalid);
             return Ok(Mesh::new());
         }
-        Ok(result)
-    }
-
-    /// Union multiple meshes together
-    ///
-    /// Convenience method that sequentially unions all non-empty meshes.
-    /// Skips empty meshes to avoid unnecessary CSG operations.
-    pub fn union_meshes(&self, meshes: &[Mesh]) -> Result<Mesh> {
-        if meshes.is_empty() {
+        if self.topology_gate_reject(BoolOp::Intersection, &result) {
             return Ok(Mesh::new());
         }
-
-        if meshes.len() == 1 {
-            return Ok(meshes[0].clone());
-        }
-
-        // Start with first non-empty mesh
-        let mut result = Mesh::new();
-        let mut found_first = false;
-
-        for mesh in meshes {
-            if mesh.is_empty() {
-                continue;
-            }
-
-            if !found_first {
-                result = mesh.clone();
-                found_first = true;
-                continue;
-            }
-
-            result = self.union_mesh(&result, mesh)?;
-        }
-
-        Ok(result)
-    }
-
-    /// Heuristic: does this look like a botched CSG difference?
-    ///
-    /// Kernel-neutral check used by the boolean processor (e.g. the
-    /// polygonal-bounded half-space clip) to fall back to a robust
-    /// unbounded plane clip when a difference result looks collapsed
-    /// relative to its host. Historically this caught a Linux-specific
-    /// Manifold pathology where a wall body clipped by an
-    /// `IfcPolygonalBoundedHalfSpace` prism collapsed to a near-empty
-    /// result (1 triangle from a 12-triangle host box).
-    ///
-    /// Rules:
-    ///  * An empty result is a legit outcome (cutter contains host) —
-    ///    NOT degenerate.
-    ///  * A closed-volume result needs at least 4 triangles. Anything
-    ///    below that is structurally broken.
-    ///  * For hosts with >= 12 triangles (typical IFC solid input), the
-    ///    output should retain at least 25 % of the host's triangle
-    ///    count when the cutter is partial.
-    pub(crate) fn difference_result_looks_degenerate(host: &Mesh, result: &Mesh) -> bool {
-        let result_tris = result.indices.len() / 3;
-        if result_tris == 0 {
-            return false;
-        }
-        if result_tris < 4 {
-            return true;
-        }
-        let host_tris = host.indices.len() / 3;
-        if host_tris >= 12 && result_tris * 4 < host_tris {
-            return true;
-        }
-
-        // "Wrong piece" check: a difference result MUST be a subset of the
-        // host volume, so the result's bounding box has to sit inside the
-        // host's. When a malformed cutter (typical: IfcFacetedBrep with
-        // inward-pointing face normals) inverts the kernel's
-        // inside/outside test, Manifold returns the CUTTER mesh instead —
-        // which lives partially or wholly outside the host bbox. House.ifc
-        // wall #3448 (a 7 m extrusion clipped by a gable-shaped brep)
-        // rendered as the gable triangle alone before this guard.
-        let (host_min, host_max) = host.bounds();
-        let (res_min, res_max) = result.bounds();
-        // 1 % of the host's edge **per axis** — using a single tolerance
-        // derived from the longest dimension lets thin walls/plates pass
-        // a wrong-piece check on Y/Z that they shouldn't (CodeRabbit
-        // review on PR #861). With per-axis slack, a 5 m × 0.4 m × 7 m
-        // wall gets ±5 cm tolerance on X, ±4 mm on Y, ±7 cm on Z — so a
-        // result that pokes >4 mm past the wall's thickness face is
-        // correctly flagged even though it's well within 1 % of the X
-        // span.
-        let slack = (host_max - host_min).abs() * 0.01;
-        if res_min.x + slack.x < host_min.x
-            || res_min.y + slack.y < host_min.y
-            || res_min.z + slack.z < host_min.z
-            || res_max.x > host_max.x + slack.x
-            || res_max.y > host_max.y + slack.y
-            || res_max.z > host_max.z + slack.z
-        {
-            return true;
-        }
-        false
+        Ok(result).inspect(|m| self.record_topology_tear(BoolOp::Intersection, m))
     }
 
     /// Validate mesh for common issues
@@ -558,12 +452,10 @@ impl ClippingProcessor {
         if mesh.positions.iter().any(|v| !v.is_finite()) {
             return false;
         }
-
         // Check for NaN/Inf in normals
         if mesh.normals.iter().any(|v| !v.is_finite()) {
             return false;
         }
-
         // Check for valid triangle indices
         let vertex_count = mesh.vertex_count();
         for idx in &mesh.indices {

@@ -15,6 +15,7 @@ import { presetViewRotation } from '@/lib/preset-view-orientation';
 import { isGeometryLoadStreaming } from '@/lib/pick-gating';
 import { effectiveIsolatedIds } from '@/lib/effective-isolation';
 import { composeLightingEnvironment } from '@/lib/compose-environment';
+import { sunDirectionForTimeOfDay } from '@/lib/sun-time-of-day';
 import {
   useSelectionState,
   useVisibilityState,
@@ -53,7 +54,7 @@ import { RectSelectionOverlay, type RectSelectionRect } from './RectSelectionOve
 import { useTouchControls, type TouchState } from './useTouchControls.js';
 import { useKeyboardControls } from './useKeyboardControls.js';
 import { useSpaceMouseControls } from './useSpaceMouseControls.js';
-import { useAnimationLoop } from './useAnimationLoop.js';
+import { useAnimationLoop, type SunShadowSettings } from './useAnimationLoop.js';
 import { useGeometryStreaming } from './useGeometryStreaming.js';
 import { usePointCloudSync } from './usePointCloudSync.js';
 import { usePointCloudLifecycle } from './usePointCloudLifecycle.js';
@@ -64,7 +65,6 @@ import {
   type SectionClipForGrid,
 } from '../../hooks/useSymbolicAnnotations.js';
 import { useAlignmentLines3D } from '../../hooks/useAlignmentLines3D.js';
-import { useGridLines3D } from '../../hooks/useGridLines3D.js';
 import { useDxfUnderlays3DLines } from '../../hooks/useDxfUnderlay.js';
 import { uploadDxfLines3DGuarded } from './dxf-lines-3d-upload.js';
 import { subscribeViewportHealth } from './device-loss-report.js';
@@ -425,16 +425,24 @@ export function Viewport({
   const solarEnabledForEnv = useViewerStore((s) => s.solarEnabled);
   const solarSunDirection = useViewerStore((s) => s.solarSunDirection);
   const solarSunAltitude = useViewerStore((s) => s.solarSunInfo?.altitude);
+  const sunTimeEnabled = useViewerStore((s) => s.envSunTimeEnabled);
+  const sunTime = useViewerStore((s) => s.envSunTime);
 
   const environment = useMemo<LightingEnvironment>(() => {
     const preset = LIGHTING_PRESETS[envPreset].environment;
-    const solar = (solarEnabledForEnv && solarSunDirection)
-      ? {
-          sunDirection: solarSunDirection,
-          altitudeDeg: solarSunAltitude
-            ?? Math.asin(Math.max(-1, Math.min(1, solarSunDirection[1]))) * (180 / Math.PI),
-        }
-      : null;
+    // Sun override precedence: a real georeferenced solar study wins; else the
+    // manual "time of day" arc (#2670) for models without a site; else the
+    // preset's own fixed sun.
+    let solar: { sunDirection: [number, number, number]; altitudeDeg: number } | null = null;
+    if (solarEnabledForEnv && solarSunDirection) {
+      solar = {
+        sunDirection: solarSunDirection,
+        altitudeDeg: solarSunAltitude
+          ?? Math.asin(Math.max(-1, Math.min(1, solarSunDirection[1]))) * (180 / Math.PI),
+      };
+    } else if (sunTimeEnabled) {
+      solar = sunDirectionForTimeOfDay(sunTime);
+    }
     return composeLightingEnvironment(
       preset,
       { exposure: envExposure, hardness: envHardness, softness: envSoftness },
@@ -449,11 +457,28 @@ export function Viewport({
     solarEnabledForEnv,
     solarSunDirection,
     solarSunAltitude,
+    sunTimeEnabled,
+    sunTime,
   ]);
   const environmentRef = useLatestRef(environment);
   useEffect(() => {
     rendererRef.current?.requestRender();
   }, [environment]);
+
+  // Sun cast shadows (#2670) — driven by the Sun & Sky panel. Standalone
+  // WebGPU only: in world-context Cesium casts its own shadows, so pass null
+  // (the renderer then skips the depth pre-pass entirely).
+  const shadowsEnabled = useViewerStore((s) => s.envShadowsEnabled);
+  const shadowSunAngle = useViewerStore((s) => s.envSunAngle);
+  const shadowResolution = useViewerStore((s) => s.envShadowResolution);
+  const sunShadows = useMemo<SunShadowSettings | null>(() => {
+    if (cesiumActive || !shadowsEnabled) return null;
+    return { enabled: true, resolution: shadowResolution, sunAngleDeg: shadowSunAngle };
+  }, [cesiumActive, shadowsEnabled, shadowResolution, shadowSunAngle]);
+  const sunShadowsRef = useLatestRef(sunShadows);
+  useEffect(() => {
+    rendererRef.current?.requestRender();
+  }, [sunShadows]);
 
   // GPU-instancing is class-0 occurrence geometry (the Model view). Hide the
   // instanced pass in the Types view mode, where the flat path renders the
@@ -1049,6 +1074,18 @@ export function Viewport({
           renderCurrent();
           calculateScale();
         },
+        setInteractionMode: (mode) => {
+          camera.setInteractionMode(mode);
+        },
+        setCameraRotation: ({ azimuth, elevation }) => {
+          // Absolute counterpart to rotateLeft/rotateRight below (which step by
+          // 90° from wherever the camera already is). Snaps rather than
+          // animates: the caller is a host command that may arrive at slider
+          // rate, and a tween per message would queue up behind itself.
+          camera.setRotation(azimuth, elevation);
+          renderCurrent();
+          calculateScale();
+        },
         rotateLeft: () => {
           animateHorizontalRotation(-Math.PI / 2);
         },
@@ -1418,7 +1455,7 @@ export function Viewport({
     };
   }, [sectionPlane.enabled, sectionPlane.axis, sectionPlane.position, sectionRange]);
 
-  const annotationVertices3D = useSymbolicAnnotations({
+  const symbolicLineChannels = useSymbolicAnnotations({ // two buffers, not one (issue #3359)
     enabled: ifcAnnotationsVisible,
     gridEnabled: ifcGridVisible,
     gridSectionClip,
@@ -1433,12 +1470,9 @@ export function Viewport({
   useEffect(() => {
     const renderer = rendererRef.current;
     if (!renderer || !isInitialized) return;
-    if (annotationVertices3D.length === 0) {
-      renderer.clearAnnotationLines3D();
-    } else {
-      renderer.uploadAnnotationLines3D(annotationVertices3D);
-    }
-  }, [annotationVertices3D, isInitialized]);
+    const v = symbolicLineChannels.annotation;
+    renderer.setLineOverlay('annotation', v.length === 0 ? null : v);
+  }, [symbolicLineChannels.annotation, isInitialized]);
 
   // IfcAlignment centerlines render as thin lines (not a ribbon mesh), always
   // on — see useAlignmentLines3D. Upload/clear mirrors the annotation overlay;
@@ -1447,26 +1481,27 @@ export function Viewport({
   useEffect(() => {
     const renderer = rendererRef.current;
     if (!renderer || !isInitialized) return;
-    if (alignmentVertices3D.length === 0) {
-      renderer.clearAlignmentLines3D();
-    } else {
-      renderer.uploadAlignmentLines3D(alignmentVertices3D);
-    }
+    renderer.setLineOverlay(
+      'alignment',
+      alignmentVertices3D.length === 0 ? null : alignmentVertices3D,
+    );
   }, [alignmentVertices3D, isInitialized]);
 
-  // Structural-grid (IfcGridAxis) lines, gated by the `ifcGrid` type-visibility
-  // toggle (issue #967). Parsed once per source + cached; only the upload/clear
-  // is toggled so flipping visibility doesn't re-parse.
-  const gridVertices3D = useGridLines3D();
+  // Structural-grid (IfcGridAxis) lines draw ONLY from `useSymbolicAnnotations`
+  // (issue #3368: a second independent extractor, `useGridLines3D`, used to
+  // double-draw every axis, leave #862's section-clipping inert since it was
+  // unclipped, and go stale in elevation under a nonzero `originShift` since
+  // it skipped the TS-side rebase — see `useSymbolicAnnotations.ts`'s
+  // `effectiveGridEnabled` branch, which already clips and rebases). They
+  // upload to their OWN 'grid' channel rather than the 'annotation' buffer
+  // (issue #3359): `CHANNEL_EXPANDS_MODEL_BOUNDS.annotation` is `true` but
+  // `.grid` is `false` (grid axes extend past the model envelope, issue #967).
   useEffect(() => {
     const renderer = rendererRef.current;
     if (!renderer || !isInitialized) return;
-    if (!ifcGridVisible || gridVertices3D.length === 0) {
-      renderer.clearGridLines3D();
-    } else {
-      renderer.uploadGridLines3D(gridVertices3D);
-    }
-  }, [gridVertices3D, ifcGridVisible, isInitialized]);
+    const v = symbolicLineChannels.grid;
+    renderer.setLineOverlay('grid', !ifcGridVisible || v.length === 0 ? null : v);
+  }, [symbolicLineChannels.grid, ifcGridVisible, isInitialized]);
 
   // DXF reference-layer line paths in the 3D viewport (issue #2043,
   // follow-up to #1782/#1929's 2D-only DXF underlay). Gated by each
@@ -1494,32 +1529,18 @@ export function Viewport({
   useEffect(() => {
     const renderer = rendererRef.current;
     if (!renderer || !isInitialized) return;
-    renderer.uploadAnnotationFills3D(
-      annotationFills3D.map((f) => ({
-        points: f.points,
-        holesOffsets: f.holesOffsets,
-        worldY: f.worldY,
-        color: f.color,
-      })),
-    );
+    // Passed straight through: AnnotationFill3D is structurally assignable to
+    // SymbolicFillInput, and the renderer copies field by field, so a mapper
+    // here would only be a hand-written field list to forget `definesExtent`
+    // from. Required on the record, so the compiler catches an omission at the
+    // push site instead.
+    renderer.uploadAnnotationFills3D(annotationFills3D);
   }, [annotationFills3D, isInitialized]);
 
   useEffect(() => {
     const renderer = rendererRef.current;
     if (!renderer || !isInitialized) return;
-    renderer.uploadAnnotationTexts3D(
-      annotationTexts3D.map((t) => ({
-        worldPos: t.worldPos,
-        dirX: t.dirX,
-        dirZ: t.dirZ,
-        height: t.height,
-        content: t.content,
-        alignment: t.alignment,
-        billboard: t.billboard,
-        color: t.color,
-        targetPx: t.targetPx,
-      })),
-    );
+    renderer.uploadAnnotationTexts3D(annotationTexts3D);
   }, [annotationTexts3D, isInitialized]);
 
   // ===== Streaming progress =====
@@ -1675,6 +1696,7 @@ export function Viewport({
     modelBoundsRef,
     visualEnhancementRef,
     environmentRef,
+    sunShadowsRef,
     selectedEntityIdsRef,
     clashHighlightColorsRef,
     coordinateInfoRef,

@@ -55,6 +55,24 @@ describe('getStreamingBatchSize', () => {
     expect(getStreamingBatchSize(new Uint8Array(60 * 1024 * 1024), {})).toBe(300);
   });
 
+  // Regrowth guard for issue #2731: `DynamicBatchConfig` once advertised
+  // `initialBatchSize` / `maxBatchSize` ramp-up hints that nothing ever read.
+  // They are gone from the type; this pins the *behaviour* they claimed —
+  // extra fields on the config cannot move the batch size, so re-adding a
+  // field without also wiring it in is caught here rather than shipping as a
+  // second silent no-op. The cast is deliberate: the fields no longer typecheck.
+  it('ignores every config field except fileSizeMB', () => {
+    const withStrayFields = {
+      fileSizeMB: 60,
+      initialBatchSize: 50,
+      maxBatchSize: 200,
+    } as unknown as Parameters<typeof getStreamingBatchSize>[1];
+
+    // 60 MB alone → 300; neither stray field pulls it toward 50 or 200.
+    expect(getStreamingBatchSize(buffer, withStrayFields)).toBe(300);
+    expect(getStreamingBatchSize(buffer, { fileSizeMB: 60 })).toBe(300);
+  });
+
   it('treats a zero fileSizeMB as absent and measures the buffer', () => {
     // `fileSizeMB: 0` is falsy, so the buffer length decides: 200 MB → 500.
     expect(
@@ -275,6 +293,51 @@ describe('convertMeshCollectionToBatch', () => {
 
     expect(batch[0].geometryClass).toBe(0);
     expect(batch[1].geometryClass).toBe(1);
+  });
+
+  // #3199. These exist because deleting BOTH new spreads from
+  // `convertMeshCollectionToBatch` left this suite at 353/353 green: the
+  // converter is the only path by which the viewer's main thread sees the ids,
+  // and every other test added for #3199 reads the raw `MeshCollection`, which
+  // is upstream of it.
+  it('carries the representation-item id through to the batch', () => {
+    const batch = convertMeshCollectionToBatch(
+      asCollection(
+        fakeCollection([
+          fakeMesh({ expressId: 1, geometryItemId: 4242 } as never),
+          fakeMesh({ expressId: 2 }),
+        ])
+      )
+    );
+
+    expect(batch[0].geometryItemId).toBe(4242);
+    expect(batch[0].materialId).toBeUndefined();
+    // Absent stays ABSENT rather than becoming a key with `undefined`: the
+    // cache writer and the REST mirror both distinguish "no key" from a value,
+    // and a stamped `undefined` reads as present to `'x' in obj`.
+    expect('geometryItemId' in batch[1]).toBe(false);
+    expect('materialId' in batch[1]).toBe(false);
+  });
+
+  it('carries the material id through to the batch, disjoint from the item id', () => {
+    const batch = convertMeshCollectionToBatch(
+      asCollection(fakeCollection([fakeMesh({ expressId: 1, materialId: 3876 } as never)]))
+    );
+
+    expect(batch[0].materialId).toBe(3876);
+    expect('geometryItemId' in batch[0]).toBe(false);
+  });
+
+  it('does not truthiness-gate the ids: a 0 survives the converter', () => {
+    // The producer filters 0 (`#0` is not a STEP instance name), but this
+    // converter must not be the thing enforcing that -- a `? :` on the value
+    // instead of on `!== undefined` would drop a 0 silently, and the two
+    // failures look identical from the viewer.
+    const batch = convertMeshCollectionToBatch(
+      asCollection(fakeCollection([fakeMesh({ expressId: 1, geometryItemId: 0 } as never)]))
+    );
+
+    expect(batch[0].geometryItemId).toBe(0);
   });
 
   it('carries a four-component shading colour, and drops a mis-sized one', () => {

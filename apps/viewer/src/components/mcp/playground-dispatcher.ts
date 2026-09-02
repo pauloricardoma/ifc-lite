@@ -30,6 +30,7 @@
 import { IfcParser, type IfcDataStore, extractLengthUnitScale, extractProjectUnits } from '@ifc-lite/parser';
 import { QuantityType } from '@ifc-lite/data';
 import { formatQuantityUnit } from '@/lib/units/display';
+import { lensMaterialNames } from '@/lib/lens-material-names';
 import {
   BsddNamespace,
   createBimContext,
@@ -41,6 +42,7 @@ import {
   HeadlessLikeBackend,
   ToolErrorCode,
   ToolExecutionError,
+  firstNonBlank,
 } from '@ifc-lite/mcp/browser';
 import {
   addCommentToTopic,
@@ -584,13 +586,13 @@ const IMPLS: Record<string, ToolImpl> = {
       for (const e of m.bim.query().toArray()) {
         const node = new EntityNode(m.store, e.ref.expressId);
         const storey = node.storey();
-        const key = storey?.name ?? '(no storey)';
+        const key = firstNonBlank(storey?.name) ?? '(no storey)';
         counts.set(key, (counts.get(key) ?? 0) + 1);
       }
     } else if (groupBy === 'material') {
       for (const e of m.bim.query().toArray()) {
         const mat = m.bim.materials(e.ref);
-        const key = mat?.name ?? '(no material)';
+        const key = lensMaterialNames(mat)[0] ?? '(no material)';
         counts.set(key, (counts.get(key) ?? 0) + 1);
       }
     }
@@ -613,7 +615,7 @@ const IMPLS: Record<string, ToolImpl> = {
       });
     }
     return {
-      text: `${data.type} '${data.name ?? '(unnamed)'}' (#${data.ref.expressId})`,
+      text: `${data.type} '${firstNonBlank(data.name) ?? '(unnamed)'}' (#${data.ref.expressId})`,
       structured: data,
     };
   },
@@ -700,7 +702,7 @@ const IMPLS: Record<string, ToolImpl> = {
     for (const e of m.bim.query().toArray()) {
       const mat = m.bim.materials(e.ref);
       if (!mat) continue;
-      const key = mat.name ?? '(unnamed)';
+      const key = lensMaterialNames(mat)[0] ?? '(unnamed)';
       counts.set(key, (counts.get(key) ?? 0) + 1);
     }
     const list = Array.from(counts.entries()).sort((a, b) => b[1] - a[1]).map(([name, count]) => ({ name, count }));
@@ -1433,15 +1435,14 @@ const IMPLS: Record<string, ToolImpl> = {
   async viewer_set_section(_m, args, ctx) {
     const v = requireViewer(ctx);
     const axis = String(args.axis ?? '').toLowerCase();
-    if (axis !== 'x' && axis !== 'y' && axis !== 'z') {
-      throw new ToolExecutionError({ code: ToolErrorCode.INVALID_INPUT, message: 'axis must be "x", "y", or "z".' });
-    }
+    if (axis !== 'x' && axis !== 'y' && axis !== 'z') throw new ToolExecutionError({ code: ToolErrorCode.INVALID_INPUT, message: 'axis must be "x", "y", or "z".' });
     const position = Number(args.position ?? 0);
-    if (!Number.isFinite(position)) {
-      throw new ToolExecutionError({ code: ToolErrorCode.INVALID_INPUT, message: 'position must be a number.' });
-    }
-    v.setSection({ axis: axis as 'x' | 'y' | 'z', position });
-    return { text: `Section ${axis} = ${position.toFixed(2)}.`, structured: { axis, position } };
+    if (!Number.isFinite(position)) throw new ToolExecutionError({ code: ToolErrorCode.INVALID_INPUT, message: 'position must be a number.' });
+    const flipped = args.flipped === true;
+    const enabled = args.enabled !== false;
+    v.setSection({ axis: axis as 'x' | 'y' | 'z', position, flipped, enabled });
+    const suffix = `${flipped ? ' (flipped)' : ''}${enabled ? '' : ' (disabled)'}`;
+    return { text: `Section ${axis} = ${position.toFixed(2)}${suffix}.`, structured: { axis, position, flipped, enabled } };
   },
 
   async viewer_clear_section(_m, _args, ctx) {
@@ -1468,6 +1469,7 @@ const IMPLS: Record<string, ToolImpl> = {
       type,
       pset: psetName,
       property: propName,
+      missingColor: parseColorArg(args.missing_color ?? 'gray'),
       sample: (expressId) => {
         const ref: EntityRef = { modelId: m.id, expressId };
         return m.bim.property(ref, psetName, propName);
@@ -1523,7 +1525,7 @@ const IMPLS: Record<string, ToolImpl> = {
     const lines: string[] = [head];
     for (const e of enriched) {
       const data = e.entity as { type?: string; name?: string; globalId?: string } | null;
-      lines.push(`• ${data?.type ?? '?'} #${e.expressId} '${data?.name ?? '(unnamed)'}'`);
+      lines.push(`• ${data?.type ?? '?'} #${e.expressId} '${firstNonBlank(data?.name) ?? '(unnamed)'}'`);
       if (data?.globalId) lines.push(`  GlobalId: ${data.globalId}`);
       if (e.properties && e.properties.length > 0) {
         const psets = e.properties.map((p) => `${p.name} (${p.properties.length})`);
@@ -1875,14 +1877,11 @@ function makeIdsAccessor(m: LoadedPlaygroundModel): import('@ifc-lite/ids').IFCD
       }));
     },
     getMaterials(id) {
-      const mat = m.bim.materials(ref(id));
-      if (!mat) return [];
-      const layers = (mat as { layers?: Array<{ materialName?: string; name?: string }>; name?: string });
-      if (Array.isArray(layers.layers) && layers.layers.length > 0) {
-        return layers.layers.map((l) => ({ name: l.materialName ?? l.name ?? '' }));
-      }
-      if (layers.name) return [{ name: layers.name }];
-      return [];
+      // Every variant via the same #1366 lens collector the material
+      // filter/list panels use. Previously only `mat.layers` and the
+      // top-level `mat.name` were checked, so a profile set, constituent
+      // set, or material list was invisible to IDS material requirements.
+      return lensMaterialNames(m.bim.materials(ref(id))).map((name) => ({ name }));
     },
     getParent(id) {
       try {

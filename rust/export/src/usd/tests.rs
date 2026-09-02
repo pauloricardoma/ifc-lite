@@ -431,6 +431,7 @@ fn mesh_emittable_rejects_bad_index_and_origin() {
         color: [0.5, 0.5, 0.5, 1.0],
         material_name: None,
         geometry_item_id: None,
+        material_id: None,
         properties: None,
         uvs: None,
         texture: None,
@@ -849,6 +850,7 @@ fn emitted_matrix4d_roundtrips_usd_transform_rows() {
         template_express_id: 7,
         rep_identity: 0,
         transform: a,
+        geometry_item_id: None,
     };
     let mut origins = std::collections::HashMap::new();
     origins.insert(7u32, origin);

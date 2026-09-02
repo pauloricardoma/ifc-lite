@@ -13,7 +13,10 @@
 import { createHeadlessContext } from '../loader.js';
 import { printJson, getFlag, hasFlag, fatal, validateLimit } from '../output.js';
 import { STANDARD_QTO_MAP, sortEntities } from './query-aggregation.js';
-import { VALID_GROUP_BY_KEYS, outputCount, outputSum, outputAggregation, outputGroupBy, outputEntities } from './query-output.js';
+import { VALID_GROUP_BY_KEYS, outputCount, outputSum, outputAggregation, outputGroupBy, outputEntities, computeUniqueValues } from './query-output.js';
+import { applyWhereFilter, parseWhereFilter, compareValues, normalizeBooleanValue } from './where-filter.js';
+
+export { applyWhereFilter, parseWhereFilter, compareValues, normalizeBooleanValue };
 
 /**
  * B9/F6: Auto-prefix Ifc for --type if user omits it.
@@ -32,112 +35,22 @@ export function normalizeTypeName(typeStr: string): string {
   }).join(',');
 }
 
-/**
- * Parse a --where filter string into psetName, propName, operator, value.
- * Supported formats:
- *   PsetName.PropName=Value     (equals)
- *   PsetName.PropName!=Value    (not equals)
- *   PsetName.PropName>Value     (greater than)
- *   PsetName.PropName<Value     (less than)
- *   PsetName.PropName>=Value    (greater or equal)
- *   PsetName.PropName<=Value    (less or equal)
- *   PsetName.PropName~Value     (contains)
- *   PsetName.PropName           (exists)
- */
-export function parseWhereFilter(filter: string): { psetName: string; propName: string; operator: string; value?: string } {
-  const dotIdx = filter.indexOf('.');
-  if (dotIdx <= 0) {
-    fatal(`Invalid --where syntax: "${filter}". Expected: PsetName.PropName[=Value]`);
-  }
-
-  const psetName = filter.slice(0, dotIdx);
-  const rest = filter.slice(dotIdx + 1);
-
-  // Try multi-char operators first, then single-char
-  for (const op of ['!=', '>=', '<=', '>', '<', '=', '~']) {
-    const opIdx = rest.indexOf(op);
-    if (opIdx > 0) {
-      const propName = rest.slice(0, opIdx);
-      const value = rest.slice(opIdx + op.length);
-      const mappedOp = op === '~' ? 'contains' : op;
-      return { psetName, propName, operator: mappedOp, value };
-    }
-  }
-
-  // No operator found — exists check
-  return { psetName, propName: rest, operator: 'exists' };
-}
-
-/**
- * B3/F1: Apply --where filter to entities, searching both property sets AND quantity sets.
- * Falls back to quantity sets when a property set match is not found.
- */
-export function applyWhereFilter(entities: any[], parsed: ReturnType<typeof parseWhereFilter>, bim: any): any[] {
-  return entities.filter(e => {
-    // First try property sets
-    const props = bim.properties(e.ref);
-    const pset = props.find((p: any) => p.name === parsed.psetName);
-    if (pset) {
-      const prop = pset.properties.find((p: any) => p.name === parsed.propName);
-      if (prop) {
-        if (parsed.operator === 'exists') return true;
-        return compareValues(prop.value, parsed.operator, parsed.value);
-      }
-    }
-
-    // B3: Also search quantity sets
-    const qsets = bim.quantities(e.ref);
-    const qset = qsets.find((q: any) => q.name === parsed.psetName);
-    if (qset) {
-      const qty = qset.quantities.find((q: any) => q.name === parsed.propName);
-      if (qty) {
-        if (parsed.operator === 'exists') return true;
-        return compareValues(qty.value, parsed.operator, parsed.value);
-      }
-    }
-
-    return false;
-  });
-}
-
-export function compareValues(actual: any, operator: string, expected: string | undefined): boolean {
-  if (expected === undefined) return actual != null;
-  const normActual = normalizeBooleanValue(actual);
-  const normExpected = normalizeBooleanValue(expected);
-  switch (operator) {
-    case '=': return String(normActual) === String(normExpected);
-    case '!=': return String(normActual) !== String(normExpected);
-    case '>': return Number(normActual) > Number(normExpected);
-    case '<': return Number(normActual) < Number(normExpected);
-    case '>=': return Number(normActual) >= Number(normExpected);
-    case '<=': return Number(normActual) <= Number(normExpected);
-    case 'contains': return String(normActual).toLowerCase().includes(String(normExpected).toLowerCase());
-    default: return false;
-  }
-}
-
-export function normalizeBooleanValue(value: unknown): unknown {
-  if (value === true || value === '.T.' || value === 'true' || value === 'TRUE') return 'true';
-  if (value === false || value === '.F.' || value === 'false' || value === 'FALSE') return 'false';
-  return value;
-}
-
 export async function queryCommand(args: string[]): Promise<void> {
   const filePath = args.find(a => !a.startsWith('-'));
   if (!filePath) fatal('Usage: ifc-lite query <file.ifc> --type IfcWall [--props] [--limit N]');
 
   let type = getFlag(args, '--type');
   const limit = getFlag(args, '--limit');
-  // Validated once, up front, and reused by every branch below (plain,
-  // --where, and --group-by). Each branch used to do its own
-  // `limit ? parseInt(limit, 10) : undefined`, which is truthy for any
-  // non-empty garbage string; the parsed NaN was then either silently
-  // ignored (query builder / group-by paths, via a `> 0`-shaped guard
-  // downstream) or silently emptied the result (`slice(0, NaN)` in the
-  // --where path) -- either way a typo'd --limit exited 0 with a wrong
-  // answer instead of being rejected.
+  // Both validated once, up front, and reused by every branch below (plain,
+  // --where, --storey, --group-by). Each branch used to parse for itself,
+  // and `parseInt` is truthy for any non-empty garbage: a typo'd --limit was
+  // either ignored (`> 0`-shaped guards downstream) or silently emptied the
+  // result (`slice(0, NaN)`), while --offset reached three different wrong
+  // answers -- `slice(NaN)` inert, `slice(-2)` returning the LAST two entries
+  // instead of skipping two, and NaN reaching the backend guard as an
+  // uncaught TypeError. Every one of them exited 0 with a wrong answer.
   const rowLimit = validateLimit(limit);
-  const offset = getFlag(args, '--offset');
+  const offset = validateLimit(getFlag(args, '--offset'), '--offset');
   const propFilter = getFlag(args, '--where');
   const jsonOutput = hasFlag(args, '--json');
   const countOnly = hasFlag(args, '--count');
@@ -301,41 +214,7 @@ export async function queryCommand(args: string[]): Promise<void> {
     if (!targetType) fatal('--unique requires --type (e.g., --type IfcWall --unique material)');
 
     const entities = bim.query().byType(...targetType.split(',')).toArray();
-    const valueCounts = new Map<string, number>();
-
-    if (uniqueProp === 'material') {
-      // B6: Support --unique material
-      for (const e of entities) {
-        const mat = bim.materials(e.ref);
-        const first = mat?.materials?.[0];
-        const firstName = typeof first === 'string' ? first : first?.name;
-        const val = firstName ?? mat?.name ?? '(no material)';
-        valueCounts.set(val, (valueCounts.get(val) ?? 0) + 1);
-      }
-    } else if (uniqueProp === 'storey') {
-      for (const e of entities) {
-        const storey = bim.storey(e.ref);
-        const val = storey?.name ?? '(no storey)';
-        valueCounts.set(val, (valueCounts.get(val) ?? 0) + 1);
-      }
-    } else if (uniqueProp === 'type') {
-      for (const e of entities) {
-        valueCounts.set(e.type, (valueCounts.get(e.type) ?? 0) + 1);
-      }
-    } else {
-      const dotIdx = uniqueProp.indexOf('.');
-      if (dotIdx <= 0) fatal(`Invalid --unique path: "${uniqueProp}". Expected: PsetName.PropName, or one of: material, storey, type`);
-      const psetName = uniqueProp.slice(0, dotIdx);
-      const propName = uniqueProp.slice(dotIdx + 1);
-
-      for (const e of entities) {
-        const psets = bim.properties(e.ref);
-        const pset = psets.find((p: any) => p.name === psetName);
-        const prop = pset?.properties?.find((p: any) => p.name === propName);
-        const val = prop?.value != null ? String(prop.value) : '(no value)';
-        valueCounts.set(val, (valueCounts.get(val) ?? 0) + 1);
-      }
-    }
+    const valueCounts = computeUniqueValues(entities, uniqueProp, bim);
 
     if (jsonOutput) {
       const result: Record<string, number> = {};
@@ -468,6 +347,9 @@ export async function queryCommand(args: string[]): Promise<void> {
       outputGroupBy(storeyEntities, groupBy, undefined, bim, jsonOutput, rowLimit);
       return;
     }
+    // Same slice the --where branch applies; without it both flags were inert here.
+    if (offset) storeyEntities = storeyEntities.slice(offset);
+    if (rowLimit !== undefined) storeyEntities = storeyEntities.slice(0, rowLimit);
     if (countOnly) {
       outputCount(storeyEntities.length, jsonOutput);
       return;
@@ -514,10 +396,9 @@ export async function queryCommand(args: string[]): Promise<void> {
       outputAggregation(entities, maxQuantity, 'max', bim, jsonOutput);
       return;
     }
-    // Apply offset/limit only for non-aggregation, non-group paths.
-    // `rowLimit` is validated once, up front (see above) -- slice(0, NaN)
-    // used to silently empty the result on a garbage --limit.
-    if (offset) entities = entities.slice(parseInt(offset, 10));
+    // Non-aggregation, non-group paths only. `rowLimit` is validated up
+    // front -- slice(0, NaN) used to silently empty the result.
+    if (offset) entities = entities.slice(offset);
     if (rowLimit !== undefined) entities = entities.slice(0, rowLimit);
     if (countOnly) {
       outputCount(entities.length, jsonOutput);
@@ -530,12 +411,20 @@ export async function queryCommand(args: string[]): Promise<void> {
     return;
   }
 
-  // Validated, not parseInt'd -- the QueryBuilder forwards this to the
-  // headless backend's descriptor, which only honours it under a `> 0`
-  // check downstream; a garbage/NaN --limit was silently ignored there,
-  // returning every match instead of being rejected.
-  if (rowLimit !== undefined && !groupBy) q = q.limit(rowLimit);
-  if (offset) q = q.offset(parseInt(offset, 10));
+  // Detect aggregation quantity and mode up front: --sum/--avg/--min/--max
+  // must run over the FULL filtered set, matching the --where and --storey
+  // paths' explicit "no offset/limit" rule for aggregations -- a partial sum
+  // over a --limit-sliced set is a silently wrong total, not a preview.
+  const aggQuantity = sumQuantity ?? avgQuantity ?? minQuantity ?? maxQuantity;
+  const aggMode: 'sum' | 'avg' | 'min' | 'max' | undefined = sumQuantity ? 'sum' : avgQuantity ? 'avg' : minQuantity ? 'min' : maxQuantity ? 'max' : undefined;
+
+  // Validated, not parseInt'd -- the backend descriptor only honours the
+  // limit under a `> 0` check, so a NaN --limit returned every match.
+  // Both flags need both guards: !groupBy because the --where/--storey
+  // siblings never slice before grouping, and !aggQuantity (#3510) because
+  // an aggregation must run over the whole filtered set.
+  if (rowLimit !== undefined && !groupBy && !aggQuantity) q = q.limit(rowLimit);
+  if (offset && !groupBy && !aggQuantity) q = q.offset(offset);
 
   // B11: Validate --group-by key
   if (groupBy) {
@@ -543,10 +432,6 @@ export async function queryCommand(args: string[]): Promise<void> {
       fatal(`Unknown grouping "${groupBy}". Valid options: ${VALID_GROUP_BY_KEYS.join(', ')}, or PsetName.PropName`);
     }
   }
-
-  // Detect aggregation quantity and mode for --group-by combos
-  const aggQuantity = sumQuantity ?? avgQuantity ?? minQuantity ?? maxQuantity;
-  const aggMode: 'sum' | 'avg' | 'min' | 'max' | undefined = sumQuantity ? 'sum' : avgQuantity ? 'avg' : minQuantity ? 'min' : maxQuantity ? 'max' : undefined;
 
   // --group-by + aggregation combo: aggregate per group
   if (groupBy && aggQuantity) {

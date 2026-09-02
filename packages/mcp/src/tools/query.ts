@@ -15,6 +15,7 @@ import { extractGeoreferencingOnDemand, extractLengthUnitScale } from '@ifc-lite
 import type { ComparisonOp, EntityData, QueryFilter } from '@ifc-lite/sdk';
 import type { Tool } from './types.js';
 import { findByGlobalId, okResult, paginate, resolveGlobalIds, resolveModel } from './util.js';
+import { materialFallbackName } from '../material-naming.js';
 import { IFC_ENTITY_NAMES } from '@ifc-lite/data';
 import { foldedTypeCounts, pendingMutationsField, pendingOverlay } from '../overlay.js';
 import { expandTypes } from '../backend-query.js';
@@ -218,14 +219,12 @@ const countEntities: Tool = {
       const targets = typeFilter ? m.bim.query().byType(typeFilter).toArray() : m.bim.query().toArray();
       for (const e of targets) {
         const mat = m.bim.materials(e.ref);
-        const key = mat?.name ?? '(no material)';
+        const key = materialFallbackName(mat) ?? '(no material)';
         groups.set(key, (groups.get(key) ?? 0) + 1);
       }
     }
 
-    const sorted = Array.from(groups.entries())
-      .sort((a, b) => b[1] - a[1])
-      .map(([key, count]) => ({ key, count }));
+    const sorted = Array.from(groups.entries()).sort((a, b) => b[1] - a[1]).map(([key, count]) => ({ key, count }));
 
     return okResult(
       `Counted ${sorted.length} groups by ${groupBy}.`,
@@ -378,8 +377,7 @@ const getEntitiesBulk: Tool = {
     }
 
     const entities: Record<string, unknown> = {};
-    // Every live entity this call saw per GlobalId, so a key that names more
-    // than one can be reported instead of quietly resolved.
+    // Every live entity this call saw per GlobalId, so a key naming more than one is reported, not silently resolved.
     const byGlobalId = new Map<string, number[]>(
       [...carriers].map(([globalId, list]) => [globalId, [...list]]),
     );
@@ -396,7 +394,8 @@ const getEntitiesBulk: Tool = {
       else if (!known.includes(id)) known.push(id);
       // First write wins, and the first write is the resolved one.
       if (Object.prototype.hasOwnProperty.call(entities, data.globalId)) continue;
-      const e: Record<string, unknown> = { ...data };
+      const e: Record<string, unknown> = { ...data }; // identity only; attributes need their own call, like get_entity
+      if (include.has('attributes')) e.attributes = m.bim.attributes(ref);
       if (include.has('properties')) e.properties = m.bim.properties(ref);
       if (include.has('quantities')) e.quantities = m.bim.quantities(ref);
       if (include.has('classifications')) e.classifications = m.bim.classifications(ref);
@@ -549,7 +548,7 @@ const materialsList: Tool = {
     for (const e of m.bim.query().toArray()) {
       const mat = m.bim.materials(e.ref);
       if (!mat) continue;
-      const key = mat.name ?? '(unnamed)';
+      const key = materialFallbackName(mat) ?? '(unnamed)';
       counts.set(key, (counts.get(key) ?? 0) + 1);
     }
     const list = Array.from(counts.entries()).sort((a, b) => b[1] - a[1]).map(([name, count]) => ({ name, count }));

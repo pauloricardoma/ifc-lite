@@ -13,6 +13,9 @@
  */
 
 import type { PropertyTable, PropertySet, Property, QuantitySet, Quantity } from '@ifc-lite/data';
+import { findQuantityInBaseSets } from './base-qset-lookup.js';
+import { computeSetClaims, mutatedMembersForInstance } from './same-name-set-claims.js';
+import { encodeNonFiniteNumbers, decodeNonFiniteNumbers } from './nonfinite-json.js';
 import { PropertyValueType, QuantityType } from '@ifc-lite/data';
 import type { IfcAttributeValue, PropertyValue, PropertyMutation, QuantityMutation, AttributeMutation, EntityTypeMutation, Mutation, NewEntity, EffectiveChange } from './types.js';
 import { propertyKey, quantityKey, attributeKey, generateMutationId } from './types.js';
@@ -305,9 +308,16 @@ export class MutablePropertyView {
   getForEntity(entityId: number): PropertySet[] {
     const result: PropertySet[] = [];
     const seenPsets = new Set<string>();
-
     // First, add properties from base (on-demand or table) with mutations applied
     const basePsets = this.getBasePropertiesForEntity(entityId);
+
+    // Two base psets can share a name (type pset + occurrence pset); a
+    // mutation key has no per-instance identity, so figure out up front
+    // which instance an edit -- or a brand-new property -- is claimed by:
+    // decides both an EXISTING property's SET/DELETE and where a brand-new
+    // property lands. Same mechanism `getQuantitiesForEntity` below uses,
+    // via `same-name-set-claims.ts`.
+    const claims = computeSetClaims(basePsets, pset => pset.properties);
 
     for (const pset of basePsets) {
       // Skip deleted property sets
@@ -317,51 +327,29 @@ export class MutablePropertyView {
 
       seenPsets.add(pset.name);
 
-      // Apply property mutations
-      const mutatedProperties: Property[] = [];
-      for (const prop of pset.properties) {
-        const key = propertyKey(entityId, pset.name, prop.name);
-        const mutation = this.propertyMutations.get(key);
-
-        if (mutation) {
-          if (mutation.operation === 'DELETE') {
-            continue; // Skip deleted properties
-          }
-          // Apply SET mutation
-          mutatedProperties.push({
-            name: prop.name,
-            type: mutation.valueType ?? prop.type,
-            value: mutation.value ?? null,
-            unit: mutation.unit ?? prop.unit,
-            dataType: prop.dataType,
-          });
-        } else {
-          mutatedProperties.push(prop);
-        }
-      }
-
-      // Check for new properties added to this pset. Iterate the per-entity
-      // key set so this stays O(M_entity) instead of scanning every mutation
-      // in the model.
-      const entityPropKeys = this.propertyKeysByEntity.get(entityId);
-      if (entityPropKeys) {
-        const psetPrefix = `${entityId}:${pset.name}:`;
-        for (const key of entityPropKeys) {
-          if (!key.startsWith(psetPrefix)) continue;
-          const mutation = this.propertyMutations.get(key);
-          if (!mutation || mutation.operation !== 'SET') continue;
-          const propName = key.slice(psetPrefix.length);
-          // Only add if not already in the list
-          if (!mutatedProperties.some(p => p.name === propName)) {
-            mutatedProperties.push({
-              name: propName,
-              type: mutation.valueType ?? PropertyValueType.String,
-              value: mutation.value ?? null,
-              unit: mutation.unit,
-            });
-          }
-        }
-      }
+      const mutatedProperties = mutatedMembersForInstance<PropertySet, Property, PropertyMutation, Property>(
+        entityId,
+        pset,
+        pset.properties,
+        claims,
+        this.propertyMutations,
+        this.propertyKeysByEntity.get(entityId),
+        propertyKey,
+        (prop, mutation) => ({
+          name: prop.name,
+          type: mutation.valueType ?? prop.type,
+          value: mutation.value ?? null,
+          unit: mutation.unit ?? prop.unit,
+          dataType: prop.dataType,
+        }),
+        prop => prop,
+        (name, mutation) => ({
+          name,
+          type: mutation.valueType ?? PropertyValueType.String,
+          value: mutation.value ?? null,
+          unit: mutation.unit,
+        }),
+      );
 
       if (mutatedProperties.length > 0) {
         result.push({
@@ -412,14 +400,15 @@ export class MutablePropertyView {
       }
     }
 
-    // Fall back to on-demand extraction or base table
+    // Fall back to on-demand extraction or base table. Scan every same-named
+    // pset (an entity can carry two, e.g. type + occurrence), not just the
+    // first -- see findQuantityInBaseSets's doc for why this doesn't import
+    // @ifc-lite/query's version.
     const basePsets = this.getBasePropertiesForEntity(entityId);
-    const pset = basePsets.find(p => p.name === psetName);
-    if (pset) {
+    for (const pset of basePsets) {
+      if (pset.name !== psetName) continue;
       const prop = pset.properties.find(p => p.name === propName);
-      if (prop) {
-        return prop.value;
-      }
+      if (prop) return prop.value;
     }
 
     return null;
@@ -444,20 +433,45 @@ export class MutablePropertyView {
     // Get old value for undo
     const oldValue = this.getPropertyValue(entityId, psetName, propName);
 
-    // Whether the property already existed BEFORE this call — decided up front
-    // because the block below may insert it into `newPsets`. A null value does
-    // NOT mean absent (an unset Boolean is present-but-empty), so existence is
-    // "had a value OR already an in-session property" (issue #1107). This drives
-    // the CREATE vs UPDATE classification so undo reverts an unset edit instead
-    // of deleting the whole property.
-    const propExistedBefore =
-      oldValue !== null ||
-      !!this.newPsets.get(entityId)?.get(psetName)?.properties.some(p => p.name === propName);
-
     // Check if this pset exists in base
     const basePsets = this.getBasePropertiesForEntity(entityId);
     const psetExistsInBase = basePsets.some(p => p.name === psetName);
     const psetExistsInNew = this.newPsets.get(entityId)?.has(psetName);
+
+    // Whether the property already existed BEFORE this call — decided up front
+    // because the block below may insert it into `newPsets`. A null value does
+    // NOT mean absent (an unset Boolean is present-but-empty), so existence is
+    // "had a value OR already an in-session property OR already present in the
+    // base pset (even with a null value)" (issue #1107). This drives the CREATE
+    // vs UPDATE classification so undo reverts an unset edit instead of
+    // deleting the whole property.
+    //
+    // `oldValue !== null` alone under-detects: a base property that already
+    // carries a null value (e.g. an unset Boolean present in the source IFC
+    // file, exactly the #1107 shape) makes `getPropertyValue()` return null on
+    // the very first edit even though the property genuinely exists — mirrors
+    // the `propExistsInBase` check `deleteProperty` below already relies on.
+    //
+    // The base-pset disjunct is qualified by "not currently masked": once the
+    // user has deleted the property (a DELETE marker on this key) or its whole
+    // pset (`deletedPsets`), the base row is no longer visible in
+    // `getForEntity`, so re-setting it is a CREATE and its undo must remove the
+    // property again. Counting the masked base row as present would classify
+    // that re-set as an UPDATE with `oldValue: null`, and the viewer's undo
+    // handler (mutationSlice.ts, "decide by mutation TYPE") would then replay
+    // that null — resurrecting, as a present-but-unset row, the very property
+    // the user had deleted.
+    const maskedInSession =
+      this.deletedPsets.has(`${entityId}:${psetName}`) ||
+      this.propertyMutations.get(key)?.operation === 'DELETE';
+
+    const propExistedBefore =
+      oldValue !== null ||
+      (!maskedInSession &&
+        basePsets.some(
+          p => p.name === psetName && p.properties.some(prop => prop.name === propName),
+        )) ||
+      !!this.newPsets.get(entityId)?.get(psetName)?.properties.some(p => p.name === propName);
 
     // If pset doesn't exist anywhere, create it in newPsets
     if (!psetExistsInBase && !psetExistsInNew) {
@@ -681,17 +695,19 @@ export class MutablePropertyView {
       }
     }
 
-    // A DELETE marker in `deletedPsets` only earns its keep when it is
-    // masking a pset that genuinely exists in the base data — same argument
-    // as `deleteProperty` one level down (see the comment above its own
-    // base-existence check): a purely in-session pset (added via
+    // A DELETE marker in `deletedPsets` only earns its keep when it is masking
+    // a pset that genuinely exists in the base data — same argument as
+    // `deleteProperty` one level down. A purely in-session pset (added via
     // `createPropertySet`, never in the base file) has nothing to mask, so
-    // dropping the pset above already nets to nothing and there is no
-    // deletion to report. Recording it as deleted here told the export
-    // review a pset would be removed when the net change was zero.
+    // dropping it above already nets to nothing: recording a deletion here
+    // told the export review a pset would go when the net change was zero.
+    // EVERY same-named pset: `deletedPsets` masks by name so the panel hides
+    // both, but the DELETE markers the exporter reads are per PROPERTY —
+    // covering only the first left `getForEntity` and `getPropertyValue`
+    // disagreeing on whether the second still exists.
     const existingPsets = this.getBasePropertiesForEntity(entityId);
-    const pset = existingPsets.find(p => p.name === psetName);
-    if (pset) {
+    for (const pset of existingPsets) {
+      if (pset.name !== psetName) continue;
       this.deletedPsets.add(`${entityId}:${psetName}`);
       for (const prop of pset.properties) {
         const key = propertyKey(entityId, psetName, prop.name);
@@ -738,50 +754,38 @@ export class MutablePropertyView {
     const seenQsets = new Set<string>();
 
     const baseQsets = this.getBaseQuantitiesForEntity(entityId);
+    // Same name-only key, and the same claiming rule, as the property path
+    // above (`same-name-set-claims.ts`): an edit or a brand-new quantity
+    // lands on exactly one same-named qset instance.
+    const claims = computeSetClaims(baseQsets, qset => qset.quantities);
 
     for (const qset of baseQsets) {
       if (this.deletedQsets.has(`${entityId}:${qset.name}`)) continue;
 
       seenQsets.add(qset.name);
 
-      const mutatedQuantities: Quantity[] = [];
-      for (const q of qset.quantities) {
-        const key = quantityKey(entityId, qset.name, q.name);
-        const mutation = this.quantityMutations.get(key);
-
-        if (mutation) {
-          if (mutation.operation === 'DELETE') continue;
-          mutatedQuantities.push({
-            name: q.name,
-            type: mutation.quantityType ?? q.type,
-            value: mutation.value ?? q.value,
-            unit: mutation.unit ?? q.unit,
-          });
-        } else {
-          mutatedQuantities.push(q);
-        }
-      }
-
-      // Check for new quantities added to this qset (per-entity index — see
-      // the property-mutations site above for rationale).
-      const entityQtyKeys = this.quantityKeysByEntity.get(entityId);
-      if (entityQtyKeys) {
-        const qsetPrefix = `${entityId}:${qset.name}:`;
-        for (const key of entityQtyKeys) {
-          if (!key.startsWith(qsetPrefix)) continue;
-          const mutation = this.quantityMutations.get(key);
-          if (!mutation || mutation.operation !== 'SET') continue;
-          const quantName = key.slice(qsetPrefix.length);
-          if (!mutatedQuantities.some(q => q.name === quantName)) {
-            mutatedQuantities.push({
-              name: quantName,
-              type: mutation.quantityType ?? QuantityType.Count,
-              value: mutation.value ?? 0,
-              unit: mutation.unit,
-            });
-          }
-        }
-      }
+      const mutatedQuantities = mutatedMembersForInstance<QuantitySet, Quantity, QuantityMutation, Quantity>(
+        entityId,
+        qset,
+        qset.quantities,
+        claims,
+        this.quantityMutations,
+        this.quantityKeysByEntity.get(entityId),
+        quantityKey,
+        (q, mutation) => ({
+          name: q.name,
+          type: mutation.quantityType ?? q.type,
+          value: mutation.value ?? q.value,
+          unit: mutation.unit ?? q.unit,
+        }),
+        q => q,
+        (name, mutation) => ({
+          name,
+          type: mutation.quantityType ?? QuantityType.Count,
+          value: mutation.value ?? 0,
+          unit: mutation.unit,
+        }),
+      );
 
       if (mutatedQuantities.length > 0) {
         result.push({ name: qset.name, quantities: mutatedQuantities });
@@ -907,9 +911,7 @@ export class MutablePropertyView {
       oldValue = existingMutation.value ?? null;
       isUpdate = true;
     } else {
-      const baseQuantity = baseQsets
-        .find(q => q.name === qsetName)
-        ?.quantities.find(q => q.name === quantName);
+      const baseQuantity = findQuantityInBaseSets(baseQsets, qsetName, quantName);
       oldValue = baseQuantity ? baseQuantity.value : null;
       isUpdate = baseQuantity !== undefined;
     }
@@ -970,12 +972,10 @@ export class MutablePropertyView {
       }
     }
 
-    // A DELETE marker only earns its keep against a qset that genuinely exists
-    // in the base file - same argument as `deletePropertySet`'s. A purely
-    // in-session qset has nothing to mask, and recording one would tell the
-    // export review a set is being removed when the net change is zero.
-    const baseQset = this.getBaseQuantitiesForEntity(entityId).find(q => q.name === qsetName);
-    if (baseQset) {
+    // Only masks a qset that genuinely exists in the base file, and covers
+    // EVERY same-named one - both arguments as in `deletePropertySet` above.
+    for (const baseQset of this.getBaseQuantitiesForEntity(entityId)) {
+      if (baseQset.name !== qsetName) continue;
       this.deletedQsets.add(`${entityId}:${qsetName}`);
       for (const quantity of baseQset.quantities) {
         this.setQuantityMutation(entityId, quantityKey(entityId, qsetName, quantity.name), { operation: 'DELETE' });
@@ -2065,7 +2065,7 @@ export class MutablePropertyView {
       modelId: this.modelId,
       mutations: this.mutationHistory,
       exportedAt: Date.now(),
-    }, null, 2);
+    }, encodeNonFiniteNumbers, 2);
   }
 
   /**
@@ -2088,7 +2088,7 @@ export class MutablePropertyView {
    * fires.
    */
   importMutations(json: string): void {
-    const data = JSON.parse(json);
+    const data = JSON.parse(json, decodeNonFiniteNumbers);
     if (data.mutations && Array.isArray(data.mutations)) {
       this.applyMutations(data.mutations);
     }

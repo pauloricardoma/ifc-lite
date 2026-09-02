@@ -9,8 +9,9 @@
  * (and, since the sibling fix in this PR, by the `visibleOnly` closure) but
  * never consult `options.includeGeometry`. The source-iteration pass, and
  * the overlay new-entities pass, both separately skip a geometry-classified
- * entity when `includeGeometry === false` (`isGeometryEntity` checks at
- * step-exporter.ts:840 and :1004) — so a geometry entity carrying an
+ * entity when `includeGeometry === false` (the `isGeometryEntity` checks in
+ * `step-pass-builder.ts`'s `isGeometryExcluded` and in
+ * `step-overlay-entities.ts`) — so a geometry entity carrying an
  * attribute edit had its line dropped from `DATA` while the header still
  * counted it as a modification, the exact class of mismatch the rest of
  * this file guards.
@@ -89,5 +90,24 @@ describe('STEP header modification count vs includeGeometry:false', () => {
     expect(headerClaimedModifications(text)).toBe(
       result.stats.newEntityCount + result.stats.modifiedEntityCount,
     );
+  });
+
+  it('an overlay-created geometry-classified entity excluded by includeGeometry:false must not appear in DATA', async () => {
+    const store = await parseBase();
+    const view = new MutablePropertyView(null, 'test-model');
+    const editor = new StoreEditor(store, view);
+    // Created purely through the overlay (`getNewEntities()`), not by editing
+    // a source entity — this is the overlay-new-entities pass, the mirror of
+    // the source-iteration pass covered above. IFCSHAPEREPRESENTATION is on
+    // `isGeometryEntity`'s list, so it must be dropped the same way.
+    editor.addEntity('IfcShapeRepresentation', [null, 'Body', 'SweptSolid', [`#21`]]);
+
+    const result = new StepExporter(store, view).export({
+      schema: 'IFC4',
+      includeGeometry: false,
+    });
+    const text = new TextDecoder().decode(result.content);
+
+    expect(text).not.toContain('IFCSHAPEREPRESENTATION');
   });
 });

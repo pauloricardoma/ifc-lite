@@ -30,7 +30,7 @@ import {
   useState,
 } from 'react';
 import { modelSwapNotice, type SwapModelRef } from './playground-model-swap.js';
-import Anthropic from '@anthropic-ai/sdk';
+import { anthropicErrorMessage, createAnthropicClient, type AnthropicCredentials } from '@/lib/llm/anthropic-client';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { ArrowUp, Check, ChevronDown, ChevronRight, Download, KeyRound, Loader2, RefreshCcw, Wrench } from 'lucide-react';
@@ -43,6 +43,7 @@ import {
 } from '@/services/playground-model';
 import { getByokModelsForSource } from '@/lib/llm/models';
 import { ByokKeyModal } from '@/components/viewer/chat/ByokKeyModal';
+import { PLAYGROUND_REQUEST_SOURCE } from '@/components/viewer/chat/byok-audit-sources';
 import {
   anthropicToolDefinitions,
   dispatch,
@@ -52,11 +53,17 @@ import {
   type ToolDispatchResult,
 } from './playground-dispatcher';
 import { playgroundFiles, formatBytes as formatFileBytes } from './playground-files';
-import { playgroundUploads, usePlaygroundUploads, type UploadedFile } from './playground-uploads';
+import {
+  playgroundUploads,
+  usePlaygroundUploads,
+  mergeAttachmentNames,
+  resolveAttachments,
+  type UploadedFile,
+} from './playground-uploads';
 import { Paperclip, X } from 'lucide-react';
 
 const MAX_TOOL_CALLS = 25;
-const MAX_TOKENS = 4096;
+const MAX_TOKENS = 16_384; // Opus 5 thinks by default; 4096 truncated the tool loop. Under the SDK's non-streaming cap.
 const SYSTEM_PROMPT = `You are a BIM/IFC analyst driving @ifc-lite/mcp tools against a pre-loaded model. Be terse — the user is technical and time-pressed.
 
 Voice rules (strict):
@@ -138,10 +145,18 @@ export function PlaygroundChat({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [dragOver, setDragOver] = useState(false);
   // Files attached since the last send. They land in the playgroundUploads
-  // store (so the dispatcher can resolve them by name) AND get listed in
-  // a "to send" array we drain on each submit.
+  // store (so the dispatcher can resolve them by name); we track only the
+  // NAMES pending this turn and project them through the store's current
+  // contents on every render. That projection is what keeps the chip list
+  // structurally unable to disagree with the store: the store already
+  // collapses same-basename uploads to one entry (last-wins), so a name
+  // list can never show two chips — or stale content — for one basename.
   const uploads = usePlaygroundUploads();
-  const [pendingAttachments, setPendingAttachments] = useState<UploadedFile[]>([]);
+  const [pendingNames, setPendingNames] = useState<string[]>([]);
+  const pendingAttachments = useMemo(
+    () => resolveAttachments(uploads, pendingNames),
+    [uploads, pendingNames],
+  );
 
   // Swapping the loaded model invalidates every expressId already in the
   // transcript: they are unique inside ONE STEP file, not across files. The
@@ -214,20 +229,19 @@ export function PlaygroundChat({
       };
       setMessages((m) => [...m, userMessage, assistantMessage]);
 
+      const credentials = { apiKey: keys.anthropicKey, workspaceId: keys.anthropicWorkspaceId };
       try {
         await runConversation({
-          apiKey: keys.anthropicKey,
+          credentials,
           modelId: selectedModel,
           tools,
           history: [...messages, userMessage],
           model,
           assistantId: assistantMessage.id,
           getDispatchContext: dispatchContext ?? (() => ({})),
-          onUpdate: (patch) => {
-            setMessages((m) =>
-              m.map((msg) => (msg.id === assistantMessage.id ? { ...msg, ...patch } : msg)),
-            );
-          },
+          onUpdate: (patch) => setMessages((m) =>
+            m.map((msg) => (msg.id === assistantMessage.id ? { ...msg, ...patch } : msg)),
+          ),
         });
       } catch (err) {
         setMessages((m) =>
@@ -237,12 +251,12 @@ export function PlaygroundChat({
               : msg,
           ),
         );
-        setError(err instanceof Error ? err.message : String(err));
+        setError(anthropicErrorMessage(err, credentials.workspaceId));
       } finally {
         setStreaming(false);
       }
     },
-    [keys.anthropicKey, selectedModel, model, tools, messages, dispatchContext],
+    [keys.anthropicKey, keys.anthropicWorkspaceId, selectedModel, model, tools, messages, dispatchContext],
   );
 
   const onSubmit = (e: React.FormEvent) => {
@@ -251,7 +265,7 @@ export function PlaygroundChat({
     if ((!trimmed && pendingAttachments.length === 0) || isStreaming) return;
     const attachedThisTurn = pendingAttachments;
     setInput('');
-    setPendingAttachments([]);
+    setPendingNames([]);
     void send(trimmed || '(see attached file)', attachedThisTurn);
   };
 
@@ -270,7 +284,9 @@ export function PlaygroundChat({
         setError(`Failed to read ${f.name}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
-    if (list.length > 0) setPendingAttachments((prev) => [...prev, ...list]);
+    if (list.length > 0) {
+      setPendingNames((prev) => mergeAttachmentNames(prev, list.map((e) => e.name)));
+    }
   }, []);
 
   /** Per-kind system note so the agent knows what to do with the file
@@ -321,7 +337,7 @@ export function PlaygroundChat({
         anthropicModels={anthropicModels}
         onChangeModel={setPlaygroundModel}
       />
-      <ByokKeyModal open={keyModalOpen} onOpenChange={setKeyModalOpen} initialProvider="anthropic" />
+      <ByokKeyModal open={keyModalOpen} onOpenChange={setKeyModalOpen} initialProvider="anthropic" requestSource={PLAYGROUND_REQUEST_SOURCE} />
 
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-5 py-5">
         {messages.length === 0 ? (
@@ -370,7 +386,7 @@ export function PlaygroundChat({
                   type="button"
                   onClick={() => {
                     playgroundUploads.remove(f.name);
-                    setPendingAttachments((prev) => prev.filter((x) => x.name !== f.name));
+                    setPendingNames((prev) => prev.filter((n) => n !== f.name));
                   }}
                   className="ml-0.5 inline-flex h-3.5 w-3.5 items-center justify-center rounded-full text-white/50 hover:bg-white/10 hover:text-white"
                   aria-label={`Remove ${f.name}`}
@@ -745,7 +761,7 @@ interface AnthropicToolResultBlock {
 }
 
 interface RunOpts {
-  apiKey: string;
+  credentials: AnthropicCredentials;
   /** Anthropic model id (e.g. `claude-sonnet-4-6`, `claude-opus-4-7`). */
   modelId: string;
   tools: AnthropicToolDef[];
@@ -878,7 +894,7 @@ function assertToolUseShape(messages: ApiMessage[]): void {
 }
 
 async function runConversation(opts: RunOpts): Promise<void> {
-  const client = new Anthropic({ apiKey: opts.apiKey, dangerouslyAllowBrowser: true });
+  const client = createAnthropicClient(opts.credentials);
   const apiMessages = buildApiMessages(opts.history);
 
   // Compact, opt-in diagnostic logging. The previous version dumped the

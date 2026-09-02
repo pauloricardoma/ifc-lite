@@ -41,12 +41,12 @@ describe('extractProperties — typed records and internal carriers (#1031)', ()
     assert.strictEqual(fireRating.value, 'F30');
   });
 
-  it('skips ifclite:: carrier attributes entirely', () => {
+  it('skips ifclite:: internal carriers other than classifications', () => {
     const node = createNode('wall');
-    node.attributes.set('ifclite::classifications', [{ system: 'eBKP-H', code: 'C2.1' }]);
     node.attributes.set('ifclite::materials', [{ materialId: 'mat-1' }]);
     node.attributes.set('ifclite::geometryRef', 'geom-1');
     node.attributes.set('ifclite::deleted', false);
+    node.attributes.set('ifclite::meta', { createdBy: 'ada', createdAt: '2019-05-05T00:00:00Z' });
     node.attributes.set('bsi::ifc::v5a::Pset_WallCommon::IsExternal', {
       type: 'IfcBoolean',
       value: true,
@@ -56,6 +56,111 @@ describe('extractProperties — typed records and internal carriers (#1031)', ()
     assert.strictEqual(props.length, 1, 'only the real property surfaces');
     assert.strictEqual(props[0].name, 'IsExternal');
     assert.strictEqual(props[0].value, true);
+  });
+
+  it('unpacks ifclite::classifications into a per-system Classification pset (#3608)', () => {
+    const node = createNode('wall');
+    node.attributes.set('ifclite::classifications', [
+      { system: 'Uniclass 2015', code: 'Pr_20_93_47', uri: 'https://uniclass.thenbs.com/Pr_20_93_47' },
+      { system: 'eBKP-H', code: 'C2.1' },
+    ]);
+
+    const composed = new Map([[node.path, node]]);
+    const pathToId = new Map([[node.path, 1]]);
+    const table = extractProperties(composed, pathToId, new StringTable());
+    const psets = table.getForEntity(1);
+
+    const uniclass = psets.find((p) => p.name === 'Classification - Uniclass 2015');
+    assert.ok(uniclass, 'Uniclass pset present');
+    const uniclassCode = uniclass!.properties.find((p) => p.name === 'Code');
+    assert.strictEqual(uniclassCode?.value, 'Pr_20_93_47');
+    const uniclassUri = uniclass!.properties.find((p) => p.name === 'Uri');
+    assert.strictEqual(uniclassUri?.value, 'https://uniclass.thenbs.com/Pr_20_93_47');
+
+    const ebkp = psets.find((p) => p.name === 'Classification - eBKP-H');
+    assert.ok(ebkp, 'eBKP-H pset present');
+    const ebkpCode = ebkp!.properties.find((p) => p.name === 'Code');
+    assert.strictEqual(ebkpCode?.value, 'C2.1');
+  });
+
+  it('keeps two refs sharing a system separate, each with its own Code/Uri (#3608)', () => {
+    // Ordinary Uniclass practice: an element carries both a Systems code
+    // (with a URI) and a Products code (without one) under the same
+    // system name. `set()`-ing a single 'Code'/'Uri' pair per system would
+    // collapse these into one pset — dropping a code and pairing the
+    // survivor with the wrong URI.
+    const node = createNode('wall');
+    node.attributes.set('ifclite::classifications', [
+      { system: 'Uniclass 2015', code: 'Ss_25_10_30', uri: 'https://uniclass.thenbs.com/Ss_25_10_30' },
+      { system: 'Uniclass 2015', code: 'Pr_20_93_47' },
+    ]);
+
+    const composed = new Map([[node.path, node]]);
+    const pathToId = new Map([[node.path, 1]]);
+    const table = extractProperties(composed, pathToId, new StringTable());
+    const psets = table.getForEntity(1);
+
+    const systems = psets.find((p) => p.name === 'Classification - Uniclass 2015 - Ss_25_10_30');
+    assert.ok(systems, 'the Systems ref (Ss_25_10_30) has its own pset');
+    assert.strictEqual(systems!.properties.find((p) => p.name === 'Code')?.value, 'Ss_25_10_30');
+    assert.strictEqual(
+      systems!.properties.find((p) => p.name === 'Uri')?.value,
+      'https://uniclass.thenbs.com/Ss_25_10_30'
+    );
+
+    const products = psets.find((p) => p.name === 'Classification - Uniclass 2015 - Pr_20_93_47');
+    assert.ok(products, 'the Products ref (Pr_20_93_47) has its own pset');
+    assert.strictEqual(products!.properties.find((p) => p.name === 'Code')?.value, 'Pr_20_93_47');
+    // The Products ref carries no URI — it must not inherit the Systems
+    // ref's URI.
+    assert.strictEqual(products!.properties.find((p) => p.name === 'Uri'), undefined);
+  });
+
+  it('discriminates a constructed-name collision instead of overwriting (#3608)', () => {
+    // The constructed name space can collide: system "Acme" with codes A and B
+    // yields "Classification - Acme - A"/"... - B", and a system literally
+    // named "Acme - A" with single code C yields "Classification - Acme - A"
+    // too. Without a discriminator the C ref would overwrite the A ref's
+    // Code and pair it with the wrong Uri.
+    const node = createNode('wall');
+    node.attributes.set('ifclite::classifications', [
+      { system: 'Acme', code: 'A', uri: 'https://acme.example/A' },
+      { system: 'Acme', code: 'B' },
+      { system: 'Acme - A', code: 'C', uri: 'https://acme-a.example/C' },
+    ]);
+
+    const composed = new Map([[node.path, node]]);
+    const pathToId = new Map([[node.path, 1]]);
+    const table = extractProperties(composed, pathToId, new StringTable());
+    const psets = table.getForEntity(1);
+
+    const a = psets.find((p) => p.name === 'Classification - Acme - A');
+    assert.ok(a, 'the Acme/A ref keeps the plain constructed name');
+    assert.strictEqual(a!.properties.find((p) => p.name === 'Code')?.value, 'A');
+    assert.strictEqual(
+      a!.properties.find((p) => p.name === 'Uri')?.value,
+      'https://acme.example/A'
+    );
+
+    const b = psets.find((p) => p.name === 'Classification - Acme - B');
+    assert.ok(b, 'the Acme/B ref is untouched by the collision');
+    assert.strictEqual(b!.properties.find((p) => p.name === 'Code')?.value, 'B');
+
+    const c = psets.find((p) => p.name === 'Classification - Acme - A (2)');
+    assert.ok(c, 'the colliding "Acme - A" system ref gets a discriminator');
+    assert.strictEqual(c!.properties.find((p) => p.name === 'Code')?.value, 'C');
+    assert.strictEqual(
+      c!.properties.find((p) => p.name === 'Uri')?.value,
+      'https://acme-a.example/C'
+    );
+  });
+
+  it('skips a classification ref with no code', () => {
+    const node = createNode('wall');
+    node.attributes.set('ifclite::classifications', [{ system: 'Uniclass 2015' }]);
+
+    const props = extract(node);
+    assert.strictEqual(props.length, 0, 'a codeless ref surfaces nothing');
   });
 
   it('v5a properties keep the exact authored Pset name, not a display-formatted one', () => {
@@ -184,6 +289,37 @@ describe('extractProperties — typed records and internal carriers (#1031)', ()
     const netArea = all.find((q) => q.name === 'NetArea');
     assert.ok(netArea, `NetArea present in quantity table (got ${JSON.stringify(qsets)})`);
     assert.strictEqual(netArea.value, 12.5);
+  });
+
+  it('does not silently drop bsi::ifc::material (#PCERT real-world fixtures carry it)', () => {
+    // Real buildingSMART sample scenes (tests/models/ifc5/PCERT-Sample-Scene_*)
+    // author `bsi::ifc::material` as `{ code, uri }` on most physical
+    // elements — the only place IFCX carries which material an element is
+    // made of.
+    // `SKIP_ATTRIBUTES` treats it as a non-property attribute (like the
+    // graph-structural `bsi::ifc::class`/mesh/transform keys) with nothing
+    // else in the package ever reading it, so it vanished entirely: no
+    // property, no relationship. A STEP-sourced model surfaces the same data
+    // via `IfcRelAssociatesMaterial` (query engine, viewer Material tab).
+    const node = createNode('wall');
+    node.attributes.set('bsi::ifc::material', {
+      code: 'concrete_reinforced_in_situ',
+      uri: 'https://identifier.buildingsmart.org/uri/buildingsmart-community/materials-demo/1.0/class/concrete_reinforced_in_situ',
+    });
+
+    const props = extract(node);
+    const material = props.find((p) => p.name === 'Material');
+    assert.ok(
+      material,
+      `material code reaches the property table (got ${JSON.stringify(props)})`
+    );
+    assert.strictEqual(material?.value, 'concrete_reinforced_in_situ');
+    const uri = props.find((p) => p.name === 'Uri');
+    assert.ok(uri, `material uri reaches the property table (got ${JSON.stringify(props)})`);
+    assert.strictEqual(
+      uri?.value,
+      'https://identifier.buildingsmart.org/uri/buildingsmart-community/materials-demo/1.0/class/concrete_reinforced_in_situ'
+    );
   });
 });
 

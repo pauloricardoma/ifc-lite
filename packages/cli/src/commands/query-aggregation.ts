@@ -7,6 +7,8 @@
  * and standard QTO maps.
  */
 
+import { findPropertyInSets, findQuantityInSets } from '@ifc-lite/query';
+
 /**
  * Standard IFC quantity set definitions — maps entity type to its standard Qto_ sets
  * and the quantities within each set. Used for disambiguation warnings.
@@ -63,7 +65,18 @@ export function getQuantityValue(bim: any, ref: any, quantityName: string): numb
   const qsets = bim.quantities(ref);
   for (const qset of qsets) {
     for (const q of qset.quantities) {
-      if (q.name === quantityName) return Number(q.value) || 0;
+      if (q.name === quantityName) {
+        // `Number(x) || 0` only catches NaN (an unparseable value): an
+        // extreme STEP REAL literal (e.g. 1.0E400) parses to Infinity
+        // without erroring at the decode boundary, and `Number(Infinity) ||
+        // 0` stays Infinity because Infinity is truthy. Left uncaught, that
+        // one entity poisons every downstream sum/avg/min/max over the
+        // whole result set. Number.isFinite catches NaN and both infinities
+        // alike, so a present-but-non-finite value is treated the same as
+        // the existing present-but-unparseable case: substituted with 0.
+        const n = Number(q.value);
+        return Number.isFinite(n) ? n : 0;
+      }
     }
   }
   return null;
@@ -96,13 +109,11 @@ export function sortEntities(entities: any[], sortBy: string, descending: boolea
       const [psetName, propName] = sortBy.split('.', 2);
       const getVal = (e: any) => {
         const props = bim.properties(e.ref);
-        const pset = props.find((p: any) => p.name === psetName);
-        const prop = pset?.properties?.find((p: any) => p.name === propName);
+        const prop = findPropertyInSets<any>(props, psetName, propName);
         if (prop?.value != null) return prop.value;
         // Also check quantity sets
         const qsets = bim.quantities(e.ref);
-        const qset = qsets.find((q: any) => q.name === psetName);
-        const qty = qset?.quantities?.find((q: any) => q.name === propName);
+        const qty = findQuantityInSets<any>(qsets, psetName, propName);
         return qty?.value ?? null;
       };
       valA = getVal(a);

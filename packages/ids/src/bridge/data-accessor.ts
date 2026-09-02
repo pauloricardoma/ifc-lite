@@ -56,8 +56,9 @@ const PARTOF_REL_MAP: Record<PartOfRelation, readonly RelationshipType[]> = {
 /**
  * Bridge an `IfcDataStore` (produced by `@ifc-lite/parser`) into the
  * abstract `IFCDataAccessor` the IDS validator consumes. The single
- * canonical translation — viewer, MCP server, and the corpus-parity
- * harness all use this rather than re-implementing the projection.
+ * canonical translation: viewer, MCP server, and the buildingSMART corpus
+ * harness (`src/__corpus__/corpus.test.ts`) all use this rather than
+ * re-implementing the projection.
  *
  * Mirrors upstream `IfcOpenShell/ifctester` semantics: classification
  * sub-reference walking, IfcExternalReferenceRelationship for
@@ -173,6 +174,24 @@ export function createDataAccessor(store: IfcDataStore): IFCDataAccessor {
       );
     },
 
+    getSchemaVersion(): string | undefined {
+      return store.schemaVersion;
+    },
+
+    getTypeEntityType(expressId: number): string | undefined {
+      const typeIds =
+        store.relationships?.getRelated?.(
+          expressId,
+          RelationshipType.DefinesByType,
+          'inverse'
+        ) || [];
+      for (const typeId of typeIds) {
+        const t = accessor.getEntityType(typeId);
+        if (t) return t;
+      }
+      return undefined;
+    },
+
     getEntitiesByType(typeName: string): number[] {
       const ids = store.entityIndex?.byType?.get(typeName.toUpperCase());
       return ids ? Array.from(ids) : [];
@@ -282,7 +301,13 @@ export function createDataAccessor(store: IfcDataStore): IFCDataAccessor {
           return accessor.getDescription(expressId);
         case 'globalid':
           return accessor.getGlobalId(expressId);
-        case 'objecttype':
+        // `predefinedtype` deliberately resolves through
+        // `getObjectType` (the PredefinedType/USERDEFINED-name helper) —
+        // but `objecttype` must NOT: that would shadow the entity's
+        // actual `ObjectType` attribute with the PredefinedType enum
+        // whenever PredefinedType is a concrete, non-USERDEFINED,
+        // non-NOTDEFINED token. Let it fall through to the raw
+        // attribute extraction below, same as any other named attribute.
         case 'predefinedtype':
           return accessor.getObjectType(expressId);
         default: {

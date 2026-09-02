@@ -13,8 +13,13 @@ mod test_support;
 
 mod adjacency;
 mod collada;
+mod collada_fmt;
 mod constructions;
 mod csv;
+/// The single CSV cell escaper for this crate — RFC 4180 quoting plus the
+/// CWE-1236 formula-injection guard, pinned to the TypeScript half by
+/// `tests/csv_cell_parity.rs`.
+pub mod csv_cell;
 mod dfjson;
 mod error;
 mod frame;
@@ -26,6 +31,7 @@ mod json;
 mod jsonld;
 mod kmz;
 mod merged;
+mod mesh_input;
 mod model;
 mod obj;
 mod relationships;
@@ -33,11 +39,22 @@ mod openings;
 #[cfg(feature = "parquet-bos")]
 mod parquet_bos;
 mod rooms;
+pub mod rooted_type;
 mod schema_convert;
+mod schema_detect;
+mod schema_pad;
+pub use schema_pad::padded_type_universe;
 mod shades;
+pub mod source_header;
 mod step;
+mod step_cow;
+mod step_header;
+mod step_json;
 mod step_text;
 mod usd;
+
+/// The STEP string-literal escaper; `escape`'s docs say why it is public.
+pub use step_text::escape as escape_step_string;
 
 pub use collada::export_collada_from_meshes;
 pub use csv::{export_csv, CsvMode, CsvOptions};
@@ -68,6 +85,8 @@ pub use ifc_lite_core::{AttributeValue, DecodedEntity, IfcType};
 // can interpret them: those values are in the file's own units, unlike the
 // geometry exporters' output, which is normalised to metres.
 pub use ifc_lite_processing::prepass::UnitScales;
+// Named so a caller can pick a `GltfOptions::tessellation_quality`.
+pub use ifc_lite_processing::TessellationQuality;
 pub use ifc5::{export_ifc5, Ifc5Options};
 // Spatial and type relationships, which `EntityRow` cannot carry because IFC
 // models them as separate entities that are not products.
@@ -77,7 +96,11 @@ pub use jsonld::{export_jsonld, JsonLdOptions};
 pub use kmz::{
     export_kmz, export_kmz_collada_from_meshes, ifc_angle_to_kml_heading, AltitudeMode, KmzOptions,
 };
-pub use merged::{export_merged, export_merged_with_stats, MergedOptions, MergedStats};
+pub use merged::{
+    deterministic_global_id, export_merged, export_merged_models, export_merged_with_stats,
+    leading_rooted_global_id, ContainerMergeStrategy, MergedModel, MergedOptions, MergedStats,
+    StoreyMergeStrategy, UnitReconciliation,
+};
 pub use model::{
     build_export_model, build_export_model_with_options, stream_export_model,
     stream_export_model_with_index, stream_export_model_with_options, EntityRow, ExportModel,
@@ -87,9 +110,10 @@ pub use obj::{export_obj, export_obj_with_stats, ObjOptions, ObjStats};
 #[cfg(feature = "parquet-bos")]
 pub use parquet_bos::{export_bos, ParquetBosOptions};
 pub use step::{
-    export_step, export_step_json, export_step_with_stats, AttrMutation, PropMutation, StepOptions,
-    StepStats,
+    export_step, export_step_to_writer, export_step_with_stats, AttrMutation, CopyOnWriteMutation,
+    PropMutation, StepOptions, StepStats,
 };
+pub use step_json::export_step_json;
 pub use usd::{export_usd, UsdOptions};
 
 use ifc_lite_geometry::extract_profiles;

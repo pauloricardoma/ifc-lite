@@ -5,14 +5,13 @@
 /**
  * Camera and orbit controls
  *
- * Uses composition pattern: delegates to CameraControls (orbit/pan/zoom),
- * CameraAnimator (transitions/inertia/presets), and CameraProjection
- * (screen-world conversion/bounds fitting).
+ * Uses composition pattern: delegates to CameraControls (orbit/pan/zoom), CameraAnimator
+ * (transitions/inertia/presets), and CameraProjection (screen-world conversion/bounds fitting).
  */
 
 import type { Vec3, Mat4 } from './types.js';
 import { MathUtils } from './math.js';
-import { CameraControls } from './camera-controls.js';
+import { CameraControls, type InteractionMode } from './camera-controls.js';
 import type { CameraInternalState, ProjectionMode } from './camera-state.js';
 import { CameraAnimator } from './camera-animation.js';
 import { CameraProjection } from './camera-projection.js';
@@ -20,11 +19,13 @@ import { FirstPersonNavigator } from './camera-first-person.js';
 import { updateCameraMatrices } from './camera-matrices.js';
 import { pickFitPolicy, type Bounds3, type FitPolicy, type PickFitPolicyOptions } from './camera-fit-policy.js';
 import {
+  areFiniteNumbers,
   DEFAULT_ORTHO_SIZE,
   isUsableBounds,
   isUsableDistance,
   usableOrthoSize,
 } from './camera-guards.js';
+import { CAMERA_CONSTANTS } from './constants.js';
 
 export class Camera {
   private state: CameraInternalState;
@@ -139,14 +140,20 @@ export class Camera {
     this.controls.setOrbitCenter(center);
   }
 
+  /** Restrict interactive orbit/pan/zoom (embed `controls` param, #2934). */
+  setInteractionMode(mode: InteractionMode): void {
+    this.controls.setInteractionMode(mode);
+  }
+
   /**
    * Orbit camera around the current pivot (Y-up coordinate system).
    * If orbitCenter is set, both position and target rotate around it.
    * Otherwise, position rotates around target (standard orbit).
    */
   orbit(deltaX: number, deltaY: number, addVelocity = false): void {
+    // Gate both side effects on whether `orbit` applied, or a rejected gesture half-applies (#2934 review).
+    if (!this.controls.orbit(deltaX, deltaY)) return;
     this.animator.resetPresetTracking();
-    this.controls.orbit(deltaX, deltaY);
     if (addVelocity) {
       this.animator.addOrbitVelocity(deltaX, deltaY);
     }
@@ -157,14 +164,14 @@ export class Camera {
    */
   pan(deltaX: number, deltaY: number, addVelocity = false): void {
     // Pan speed depends on distance; compute before pan (pan preserves distance).
-    // `getDistance()` reports the pose verbatim, so a malformed one makes this
-    // NaN — and the inertia loop *latches* it: it spends velocity only while
-    // `Math.abs(velocity) > minVelocity`, which is false for NaN, so a NaN pan
-    // velocity is never applied and never decays. Pan inertia would stay dead
-    // for the rest of the session even after the pose is corrected (#2441).
-    // Skip the velocity rather than seed it with an invented speed.
+    // `getDistance()` reports the pose verbatim, so a malformed one makes this NaN —
+    // and the inertia loop *latches* it: it spends velocity only while
+    // `Math.abs(velocity) > minVelocity`, false for NaN, so a NaN pan velocity is
+    // never applied and never decays, staying dead for the rest of the session even
+    // after the pose is corrected (#2441). Skip it rather than seed an invented speed.
     const distance = this.getDistance();
-    this.controls.pan(deltaX, deltaY);
+    // Gate inertia on whether `pan` applied, same reason as `orbit` above (#2934 review).
+    if (!this.controls.pan(deltaX, deltaY)) return;
     if (addVelocity && isUsableDistance(distance, 0)) {
       this.animator.addPanVelocity(deltaX, deltaY, distance * 0.001);
     }
@@ -180,7 +187,8 @@ export class Camera {
    * @param canvasHeight - Canvas height
    */
   zoom(delta: number, addVelocity = false, mouseX?: number, mouseY?: number, canvasWidth?: number, canvasHeight?: number, fastZoom?: boolean): void {
-    this.controls.zoom(delta, mouseX, mouseY, canvasWidth, canvasHeight, fastZoom);
+    // Gate inertia on whether `zoom` applied, same reason as `orbit` above (#2934 review).
+    if (!this.controls.zoom(delta, mouseX, mouseY, canvasWidth, canvasHeight, fastZoom)) return;
     if (addVelocity) {
       const normalizedDelta = Math.sign(delta) * Math.min(Math.abs(delta) * 0.001, 0.1);
       this.animator.addZoomVelocity(normalizedDelta);
@@ -188,9 +196,8 @@ export class Camera {
   }
 
   /**
-   * Fit view to bounding box
-   * Sets camera to southeast isometric view (typical BIM starting view)
-   * Y-up coordinate system: Y is vertical
+   * Fit view to bounding box. Sets camera to southeast isometric view (typical
+   * BIM starting view). Y-up coordinate system: Y is vertical
    */
   fitToBounds(min: Vec3, max: Vec3): void {
     this.projection.fitToBounds(min, max);
@@ -456,6 +463,83 @@ export class Camera {
     }
 
     return { azimuth, elevation };
+  }
+
+  /**
+   * Place the camera at an ABSOLUTE orientation around its current target,
+   * in the same angle convention {@link getRotation} reports — the exact
+   * inverse of it, so `setRotation(a, e)` then `getRotation()` returns
+   * `{ azimuth: a, elevation: e }` (modulo the normalisation and pole clamp
+   * below).
+   *
+   * This is the only absolute-orientation entry point on the camera. Everything
+   * else is relative (`orbit`, and the viewer's 90° rotate steppers built on it)
+   * or names a direction rather than an angle (`setPresetView`), which is why a
+   * host command that says "go to azimuth 120°, elevation 30°" had nothing to
+   * call and silently did nothing (#2934).
+   *
+   * The orbit radius and the target are preserved — this rotates the camera on
+   * its current sphere, it does not reframe. `up` is reset to world Y, matching
+   * `orbit`, so the reported azimuth comes back through `getRotation`'s
+   * position-based branch.
+   *
+   * @param azimuth Horizontal angle in degrees; normalised into [0, 360).
+   * @param elevation Vertical angle in degrees, 0 = horizon. Clamped to just
+   *   inside ±90° (the same `MIN_PHI` margin `orbit` uses) — the exact poles
+   *   collapse `cross(forward, up)` and flip the model.
+   */
+  setRotation(azimuth: number, elevation: number): void {
+    // Angles are an input class of their own, and both of them reach the
+    // trigonometry below unguarded: a non-finite one writes a NaN position and
+    // destroys an otherwise valid pose. Same rejection `orbit` applies to its
+    // deltas — a rejected call changes nothing at all.
+    if (!areFiniteNumbers(azimuth, elevation)) return;
+
+    // An in-flight tween or leftover inertia writes position/target on the next
+    // `update()` and would erase this pose a frame later — a host that sends
+    // SET_VIEW (animated) and then SET_CAMERA would end up at the preset. An
+    // absolute placement supersedes whatever motion is still running, so cancel
+    // it; this also drops the preset-view rotation cycle, which is correct
+    // after the camera has been reoriented out from under it.
+    this.animator.reset();
+
+    const target = this.state.camera.target;
+    const dir = {
+      x: this.state.camera.position.x - target.x,
+      y: this.state.camera.position.y - target.y,
+      z: this.state.camera.position.z - target.z,
+    };
+    const current = Math.sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+    // A degenerate pose (position === target, or a non-finite one) has no orbit
+    // radius to preserve. Any positive radius yields a well-formed view matrix
+    // at the requested direction, which is strictly better than propagating the
+    // degeneracy — and leaves the caller's angles observable, which is the
+    // whole point of the command.
+    const distance = isUsableDistance(current, 1e-6) ? current : 1;
+
+    // The TARGET is the other unguarded input, and `isUsableDistance` above only
+    // rescues the radius. `setTarget` accepts non-finite coordinates, and every
+    // position component below is `target.<axis> + ...`, so one NaN there makes
+    // the whole pose NaN -- and this method's contract is that it RECOVERS a
+    // pose, so silently writing an unrecoverable one is worse than refusing.
+    // Same rejection shape as the angle guard at the top: change nothing.
+    if (!areFiniteNumbers(target.x, target.y, target.z)) return;
+
+    const theta = ((((azimuth % 360) + 360) % 360) * Math.PI) / 180;
+    const poleMargin = CAMERA_CONSTANTS.MIN_PHI;
+    const phi = Math.max(
+      poleMargin,
+      Math.min(Math.PI - poleMargin, ((90 - elevation) * Math.PI) / 180),
+    );
+    const sinPhi = Math.sin(phi);
+
+    this.state.camera.position = {
+      x: target.x + distance * sinPhi * Math.sin(theta),
+      y: target.y + distance * Math.cos(phi),
+      z: target.z + distance * sinPhi * Math.cos(theta),
+    };
+    this.state.camera.up = { x: 0, y: 1, z: 0 };
+    this.updateMatrices();
   }
 
   /**

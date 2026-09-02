@@ -1,6 +1,6 @@
 {
   "name": "@ifc-lite/encoding",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "IFC string encoding/decoding and property value parsing for IFC-Lite",
   "type": "module",
   "main": "./dist/index.js",
@@ -19,8 +19,9 @@
     "test": "vitest run"
   },
   "devDependencies": {
+    "@ifc-lite/timing-ladder": "workspace:^",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.11"
   },
   "license": "MPL-2.0",
   "author": "Louis True",

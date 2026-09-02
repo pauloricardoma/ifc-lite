@@ -113,6 +113,15 @@ WASM-specific structural cost (not in the native probe, by design):
 Encoded so a spike does not re-walk a dead end. History lives in the PRs cited.
 
 ### Shipped wins
+- **CSG topology diagnostic (#3442): no measurable pipeline regression.** The
+  record-not-gate closure audit adds a strict directed-edge hash sweep and only
+  runs the hairline sweep when strict closure fails. On `140a6d854` versus the
+  branch, five-iteration `perf_probe` runs were flat: FZK-Haus best total 9 ->
+  9 ms (geometry 5 -> 4 ms), CSG-heavy ISSUE_129 605 -> 604 ms (geometry 586
+  -> 586 ms). Mesh, vertex and triangle counts were identical; the only
+  intentional observable delta was ISSUE_129's new CSG diagnostic count, 1 ->
+  9. **Lesson:** keep this as an audit of the final result only — auditing
+  batch intermediates turns diagnostic volume into workload-dependent noise.
 - **Entity indexes built and never read** (`index_vs_scan.rs`): `relationships()`
   built a full parallel index and handed it to the decoder, but every decode in it
   is `decode_at_with_id` over the scanner's own spans and only `decode_by_id`
@@ -290,6 +299,30 @@ SHIPPED (landed with a PR), or RE-REFUTED / NOT SHIPPABLE. Do not read the secti
   low hundreds of faces), not a measured optimum.
 
 ### Measured feature costs (not levers — recorded so nobody re-measures)
+- **Local-frame void-cut origin preservation** (#3446, measured 2026-08-31,
+  base = `2edd144329`, arm64 native). This correctness fix keeps a rotated
+  local-frame cut's centre and nested origin out of absolute-world `f32`.
+  `probe.sh --iters 5 --json` found no performance signal: AC20-FZK-Haus best
+  total/geometry was 10/5 -> 9/5 ms (base totals 14,10,10,10,10; branch
+  11,10,9,9,9); ISSUE_129 was 623/604 -> 627/608 ms, inside the base's
+  623..633 ms spread. Mesh/vertex/triangle counts match on both fixtures
+  (AC20 285/35940/19456; ISSUE_129 1402/218346/132673). The branch intentionally
+  changes the far-field void corpus, so the pinned native/wasm manifests and
+  arm64 determinism harness are the stronger output evidence. Holter was not
+  measured: its fixture endpoint repeatedly served a SHA-256 mismatch.
+
+- **Legacy-site georeference negative-zero recovery (#3546 residual): no
+  measurable geometry-pipeline regression.** The localized raw-record scan runs
+  only while extracting `IfcSite.RefLatitude`/`RefLongitude`; it deliberately
+  leaves the shared integer tokenizer untouched. Interleaved five-round native
+  `perf_probe` A/B (`3d9ab0e30` -> `e81f41d66`, Apple Silicon) was below the
+  harness's noise threshold: FZK-Haus total 10 -> 10 ms (mesh/vertex/triangle
+  counts 285/35,940/19,456 on both); CSG-heavy ISSUE_129 total 608 -> 609 ms
+  (+0.16%, base spread 2.96%) and geometry 591 -> 592 ms (+0.17%, base spread
+  3.38%), with identical 1,402/218,346/132,673 output counts. **Lesson:** this
+  compatibility recovery is metadata-only and too rare/small for this coarse
+  end-to-end probe to distinguish from run noise; retain the behavioral fixtures
+  rather than treating the apparent one-millisecond movement as a regression.
 - **Geometry fingerprint pass: world AABB + volume + closure verdict**
   (#1891/#1988, PR #1993, measured 2026-08-02, base = merge-base `8f139a8e`).
   The pass gained a per-triangle tetra determinant and a six-way bounds update.
