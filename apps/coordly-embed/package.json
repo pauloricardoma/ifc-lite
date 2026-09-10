@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@ifc-lite/renderer": "workspace:*",
+    "@ifc-lite/bcf": "workspace:*",
     "@ifc-lite/geometry": "workspace:*",
     "@ifc-lite/server-client": "workspace:*",
     "apache-arrow": "^21.1.0",

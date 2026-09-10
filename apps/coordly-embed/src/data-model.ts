@@ -444,6 +444,47 @@ export class ModelDataStore {
     }));
   }
 
+  /**
+   * GlobalId de cada expressId. É a identidade que o BCF usa (`IfcGuid`) — a
+   * única que sobrevive a outro programa, a outra tradução do mesmo IFC e a uma
+   * revisão do arquivo. `expressId` é interno e não serve para isso.
+   *
+   * Elemento sem GlobalId no data model sai de fora, em vez de virar entrada com
+   * id vazio que o consumidor teria de filtrar.
+   */
+  getGlobalIds(expressIds: number[]): { expressId: number; globalId: string }[] {
+    const out: { expressId: number; globalId: string }[] = [];
+
+    for (const expressId of expressIds) {
+      const row = this.entities.rowOf(expressId);
+      if (row < 0) { continue; }
+
+      const globalId = this.entities.globalId[row];
+      if (globalId) { out.push({ expressId, globalId }); }
+    }
+
+    return out;
+  }
+
+  /**
+   * O caminho de volta, para restaurar seleção e visibilidade de um viewpoint.
+   * Percorre uma vez só: um viewpoint pode trazer milhares de GUIDs, e um
+   * `rowOf` por GUID seria uma busca binária para cada.
+   */
+  getExpressIds(globalIds: string[]): { globalId: string; expressId: number }[] {
+    const wanted = new Set(globalIds);
+    const out: { globalId: string; expressId: number }[] = [];
+
+    for (let row = 0; row < this.entities.globalId.length; row++) {
+      const globalId = this.entities.globalId[row];
+      if (!globalId || !wanted.has(globalId)) { continue; }
+
+      out.push({ globalId, expressId: this.entities.expressId[row] });
+    }
+
+    return out;
+  }
+
   getEntityProperties(expressId: number): BimEntityProperties | null {
     const row = this.entities.rowOf(expressId);
     if (row < 0) { return null; }

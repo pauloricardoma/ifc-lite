@@ -8,6 +8,13 @@ import type { Measurement, MeasureMode, RaycastHit, SnapHint, SnapKind, Vec3 } f
 import { ModelDataStore } from './data-model.js';
 import type { BimEntityProperties, BimTreeNode } from './data-model.js';
 import type { IfcArtifacts } from './types.js';
+import {
+  cameraToOrthogonal,
+  cameraToPerspective,
+  orthogonalToCamera,
+  perspectiveToCamera,
+} from '@ifc-lite/bcf';
+import type { BCFOrthogonalCamera, BCFPerspectiveCamera } from '@ifc-lite/bcf';
 
 // O data model é escrito no cache DEPOIS da geometria (o server responde o
 // parquet e grava o resto em background), então um 202 logo após o load é
@@ -1193,6 +1200,85 @@ export class ViewerEngine {
   }
 
   // ---------------------------------------------------------------------------
+  // Viewpoint (BCF)
+  //
+  // A conversão de espaço é do `@ifc-lite/bcf`: a cena é Y-up (a geometria vira
+  // de Z-up do IFC na importação) e o BCF é Z-up, então a troca de eixos não é
+  // opcional — sem ela a câmera volta deitada. Usar o pacote em vez de escrever
+  // a conta aqui evita que o embed e o resto do motor divirjam de convenção.
+  //
+  // Não há offset a desfazer no nosso caminho: o parquet do server já vem com
+  // coordenadas absolutas e Y-up aplicado (ver `addModelFromServerParse`). O
+  // `rtcOffset` só existe no parse client-side, que a produção não usa; se ele
+  // reaparecer, é aqui que entra.
+  // ---------------------------------------------------------------------------
+
+  /** Câmera atual no formato do BCF, em coordenada de mundo e metros. */
+  getBcfCamera(): BCFPerspectiveCamera | BCFOrthogonalCamera | null {
+    if (!this.camera) { return null; }
+
+    const state = {
+      position: this.camera.getPosition(),
+      target: this.camera.getTarget(),
+      up: this.camera.getUp(),
+      fov: this.camera.getFOV(),
+    };
+
+    // `getOrthoSize()` é meia-altura; o `ViewToWorldScale` do BCF é a altura da
+    // vista.
+    return this.camera.getProjectionMode?.() === 'orthographic'
+      ? cameraToOrthogonal(state, this.camera.getOrthoSize() * 2)
+      : cameraToPerspective(state);
+  }
+
+  /** Aplica uma câmera do BCF. `targetDistance` só posiciona o alvo/pivô. */
+  setBcfCamera(
+    camera: BCFPerspectiveCamera | BCFOrthogonalCamera,
+    targetDistance?: number,
+  ): void {
+    if (!this.camera) { return; }
+
+    const isOrthographic = 'viewToWorldScale' in camera;
+    const distance = targetDistance ?? this.camera.getDistance();
+    const state = isOrthographic
+      ? orthogonalToCamera(camera as BCFOrthogonalCamera, distance)
+      : perspectiveToCamera(camera as BCFPerspectiveCamera, distance);
+
+    this.camera.setProjectionMode?.(isOrthographic ? 'orthographic' : 'perspective');
+    this.camera.setPosition(state.position.x, state.position.y, state.position.z);
+    this.camera.setTarget(state.target.x, state.target.y, state.target.z);
+    this.camera.setUp(state.up.x, state.up.y, state.up.z);
+    if (Number.isFinite(state.fov)) { this.camera.setFOV(state.fov); }
+
+    if (isOrthographic) {
+      // De volta a meia-altura, o que a câmera guarda.
+      this.camera.setOrthoSize((camera as BCFOrthogonalCamera).viewToWorldScale / 2);
+    }
+
+    this.renderer?.requestRender();
+  }
+
+  /**
+   * PNG do que está na tela, como data URL.
+   *
+   * Diferente do WebGL, a canvas WebGPU preserva a última textura apresentada,
+   * então não é preciso `preserveDrawingBuffer` nem copiar a textura na mesma
+   * passada. Só é preciso esperar a GPU terminar o que foi submetido, senão o
+   * quadro sai pela metade.
+   */
+  async captureSnapshot(): Promise<string | null> {
+    if (!this.canvas) { return null; }
+
+    try {
+      await this.renderer?.getGPUDevice()?.queue.onSubmittedWorkDone();
+      return this.canvas.toDataURL('image/png');
+    } catch (error) {
+      console.error('[coordly-embed] falha ao capturar snapshot:', error);
+      return null;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Árvore espacial e propriedades (data model)
   // ---------------------------------------------------------------------------
 
@@ -1231,6 +1317,22 @@ export class ViewerEngine {
     modelIndex?: number,
   ): { expressId: number; name: string }[] {
     return this.storeFor(modelIndex)?.getEntityLabels(expressIds) ?? [];
+  }
+
+  /** GlobalId (o `IfcGuid` do BCF) de cada expressId, em lote. */
+  getGlobalIds(
+    expressIds: number[],
+    modelIndex?: number,
+  ): { expressId: number; globalId: string }[] {
+    return this.storeFor(modelIndex)?.getGlobalIds(expressIds) ?? [];
+  }
+
+  /** O caminho de volta, para restaurar seleção e visibilidade de um viewpoint. */
+  getExpressIds(
+    globalIds: string[],
+    modelIndex?: number,
+  ): { globalId: string; expressId: number }[] {
+    return this.storeFor(modelIndex)?.getExpressIds(globalIds) ?? [];
   }
 
   // ---------------------------------------------------------------------------

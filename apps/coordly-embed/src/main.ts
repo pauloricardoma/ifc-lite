@@ -1,4 +1,5 @@
 import { ViewerEngine, LoadPhase } from './engine.js';
+import type { BCFOrthogonalCamera, BCFPerspectiveCamera } from '@ifc-lite/bcf';
 import type { BimEntityProperties, BimTreeNode } from './data-model.js';
 import type { Measurement, MeasureMode } from './measure.js';
 import type { IfcArtifacts } from './types.js';
@@ -69,6 +70,19 @@ export function initCoordly3DViewer(config: BimConfig): BimInstance {
       engine.getEntityProperties(expressId, modelIndex),
     getEntityLabels: (expressIds: number[], modelIndex?: number) =>
       engine.getEntityLabels(expressIds, modelIndex),
+    // Viewpoint (BCF). A câmera atravessa a ponte JÁ no espaço do BCF — mundo do
+    // IFC, Z-up, metros — para o app não precisar saber que a cena é Y-up.
+    // A identidade de elemento é o GlobalId, não o expressId, que é interno.
+    getCamera: () => engine.getBcfCamera(),
+    setCamera: (
+      camera: BCFPerspectiveCamera | BCFOrthogonalCamera,
+      targetDistance?: number,
+    ) => engine.setBcfCamera(camera, targetDistance),
+    captureSnapshot: () => engine.captureSnapshot(),
+    getGlobalIds: (expressIds: number[], modelIndex?: number) =>
+      engine.getGlobalIds(expressIds, modelIndex),
+    getExpressIds: (globalIds: string[], modelIndex?: number) =>
+      engine.getExpressIds(globalIds, modelIndex),
     // Seleção da árvore → 3D (o inverso já sai por 'bim-selection-changed').
     select: (expressId: number | null, opts?: { frame?: boolean; additive?: boolean; modelIndex?: number }) =>
       engine.selectEntity(expressId, opts ?? {}),
@@ -144,6 +158,20 @@ declare global {
         expressIds: number[],
         modelIndex?: number,
       ): { expressId: number; name: string }[];
+      getCamera(): BCFPerspectiveCamera | BCFOrthogonalCamera | null;
+      setCamera(
+        camera: BCFPerspectiveCamera | BCFOrthogonalCamera,
+        targetDistance?: number,
+      ): void;
+      captureSnapshot(): Promise<string | null>;
+      getGlobalIds(
+        expressIds: number[],
+        modelIndex?: number,
+      ): { expressId: number; globalId: string }[];
+      getExpressIds(
+        globalIds: string[],
+        modelIndex?: number,
+      ): { globalId: string; expressId: number }[];
       select(expressId: number | null, opts?: { frame?: boolean; additive?: boolean; modelIndex?: number }): void;
       clearSelection(): void;
       setMultiSelect(enabled: boolean): void;
