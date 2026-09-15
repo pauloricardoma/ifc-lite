@@ -37,6 +37,37 @@ engine.init().then((ok) => {
     return;
   }
 
+  // `?artifacts=<pasta>` carrega os 6 artefatos de ifc-files/output/<pasta>/ pelo
+  // MESMO caminho do web/ com o backend: split + range request (o vite.config
+  // serve /artifacts/* com 206). `&federar=1` usa o load aditivo da federação.
+  const params = new URLSearchParams(location.search);
+  const artifactsDir = params.get('artifacts');
+  if (artifactsDir) {
+    const url = (f: string) => `/artifacts/${artifactsDir}/${f}`;
+    const artifacts = {
+      status: 'ready',
+      urls: {
+        geometry: {
+          layout: 'split' as const,
+          mesh: url('mesh.parquet'),
+          vertex: url('vertex.parquet'),
+          index: url('index.parquet'),
+        },
+        metadata: url('metadata.json'),
+        datamodel: url('datamodel.parquet'),
+      },
+    };
+    const t0 = performance.now();
+    console.log('[dev] modo ARTEFATOS:', artifactsDir);
+    const load = params.get('federar') === '1'
+      ? engine.addModelFromArtifacts(artifacts, artifactsDir)
+      : engine.loadFromArtifacts(artifacts);
+    void load.then(() => console.log(`[dev] artefatos carregados em ${Math.round(performance.now() - t0)}ms`));
+    (window as any).tree = () => engine.getSpatialTree();
+    (window as any).props = (id: number) => engine.getEntityProperties(id);
+    return;
+  }
+
   // `?server=<url>` roda o MESMO caminho do web/ (parse no server + data model),
   // que é o único que popula árvore e propriedades — o client-parse não busca
   // data model. Sem o param, segue no client-parse (federação).

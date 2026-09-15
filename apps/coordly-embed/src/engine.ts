@@ -2,7 +2,8 @@ import { Renderer, DEFAULT_CHUNK_CELL_SIZE } from '@ifc-lite/renderer';
 import type { SectionPlane, SnapTarget } from '@ifc-lite/renderer';
 import { GeometryProcessor, decodeInstancedShard } from '@ifc-lite/geometry';
 import type { TessellationQuality } from '@ifc-lite/geometry';
-import { decodeStdParquetStreaming } from './parquet-stream.js';
+import { decodeSplitParquetStreaming, decodeStdParquetStreaming, probeRangeSupport } from './parquet-stream.js';
+import type { DecodeOptions, StreamMesh } from './parquet-stream.js';
 import { MeasureTool } from './measure-tool.js';
 import type { Measurement, MeasureMode, RaycastHit, SnapHint, SnapKind, Vec3 } from './measure.js';
 import { ModelDataStore } from './data-model.js';
@@ -52,7 +53,16 @@ export type LoadPhase = 'download' | 'parse' | 'decode' | 'upload';
 
 interface EngineEvents {
   onProgress(phase: LoadPhase, done: number, total: number): void;
-  onLoaded(detail: { elementCount: number; schema?: string }): void;
+  onLoaded(detail: {
+    elementCount: number;
+    schema?: string;
+    /**
+     * Só no caminho split: o storage honrou Range com os headers expostos.
+     * `false` = CORS sem `ExposedHeaders` → o parquet-wasm baixa os arquivos
+     * inteiros, e o viewer fica lento sem erro nenhum.
+     */
+    rangeRequests?: boolean;
+  }): void;
   onError(code: string, message: string): void;
   onSelect(detail: {
     expressId: number | null;
@@ -265,6 +275,9 @@ export class ViewerEngine {
   // data model chegar (ou pra sempre, se o modelo veio por um caminho que não o
   // publica — o render nunca depende dele).
   private dataStore: ModelDataStore | null = null;
+  // Resultado da sonda de range do último load por artefatos split; sai no
+  // `onLoaded` pro app registrar. Undefined nos outros caminhos.
+  private rangeRequests: boolean | undefined;
   // Visibilidade e corte são estado do app, aplicados POR FRAME no render() —
   // mesmo contrato do selectedId. O renderer compara por conteúdo, então passar
   // o mesmo Set todo frame não invalida cache.
@@ -525,11 +538,35 @@ export class ViewerEngine {
     geometry: Blob,
     opts: { additive?: boolean; model?: FederatedModel } = {},
   ): Promise<void> {
+    await this.renderMeshStream(decodeStdParquetStreaming(geometry, this.decodeOptions()), opts);
+  }
+
+  /**
+   * O filtro de tipo entra NO decoder, não só depois dele: descartar antes de
+   * tocar em vertex/index poupa os row groups dessas malhas — no split, é rede.
+   */
+  private decodeOptions(): DecodeOptions {
+    return {
+      signal: this.aborter.signal,
+      skip: flag('filter')
+        ? (ifcType) => {
+          if (!isHiddenIfcType(ifcType)) { return false; }
+          hiddenMeshCount++;
+          return true;
+        }
+        : undefined,
+    };
+  }
+
+  private async renderMeshStream(
+    stream: AsyncGenerator<StreamMesh[]>,
+    opts: { additive?: boolean; model?: FederatedModel } = {},
+  ): Promise<void> {
     if (!opts.additive) { this.renderer.getScene().clear(); }
     let meshCount = 0;
     let framed = opts.additive === true; // federação: não reenquadra a cada modelo
 
-    for await (const chunk of decodeStdParquetStreaming(geometry)) {
+    for await (const chunk of stream) {
       if (this.disposed) { return; }
       const meshes = this.prepareMeshes(chunk, opts.model);
       this.renderer.addMeshes(meshes as any, true);
@@ -1051,45 +1088,113 @@ export class ViewerEngine {
     this.removeModel(modelId);
   }
 
-  // Modo server: geometria já tesselada vem do CDN. Streaming por row group é o
-  // caminho provado (1.3GB renderiza; 29 disciplinas em ~5GB).
+  /**
+   * Artefatos do backend (Blob Storage, URLs assinadas). O `split` é o caminho de
+   * produção: `mesh` inteiro + `vertex`/`index` por range request, pintando
+   * enquanto baixa. O `container` fica pelos artefatos antigos da POC.
+   */
   async loadFromArtifacts(artifacts: IfcArtifacts): Promise<void> {
-    const geometry = artifacts.urls?.geometry;
-    if (!geometry) { this.events.onError('artifacts-missing', 'sem geometria nos artefatos'); return; }
+    if (!artifacts.urls?.geometry) {
+      this.events.onError('artifacts-missing', 'sem geometria nos artefatos');
+      return;
+    }
 
     try {
-      this.events.onProgress('download', 0, 1);
-      const geometryUrl = geometry.layout === 'container' ? geometry.geometry : geometry.vertex;
-      const res = await fetch(geometryUrl, { signal: this.aborter.signal });
-      if (!res.ok) { throw new Error(`download da geometria → ${res.status}`); }
-      const blob = await res.blob();
+      await this.renderMeshStream(await this.artifactStream(artifacts));
       if (this.disposed) { return; }
-      this.events.onProgress('download', 1, 1);
-
-      await this.renderParquet(blob);
-      // Tier 2 do contrato de artefatos: quando o backend publicar o data model
-      // no CDN, a árvore e as propriedades saem do mesmo pacote da geometria.
-      if (artifacts.urls?.datamodel) { void this.loadDataModelFrom(artifacts.urls.datamodel); }
+      // Depois do render, nunca antes: árvore e propriedades não podem atrasar o
+      // primeiro paint. Vêm do MESMO pacote da geometria — o parser não é tocado.
+      if (artifacts.urls.datamodel) { void this.loadDataModelFrom(artifacts.urls.datamodel); }
+      else { this.events.onDataModel({ available: false }); }
     } catch (err: any) {
       if (this.disposed || err?.name === 'AbortError') { return; }
       this.events.onError('decode-failed', String(err?.message ?? err));
     }
   }
 
-  /** Data model por URL direta (CDN). Falhar aqui não derruba o viewer. */
-  private async loadDataModelFrom(url: string): Promise<void> {
+  /**
+   * Stream de malhas de um pacote de artefatos. A sonda de range corre em
+   * paralelo ao download do `mesh` e só alimenta diagnóstico — nunca segura o load.
+   */
+  private async artifactStream(artifacts: IfcArtifacts): Promise<AsyncGenerator<StreamMesh[]>> {
+    const geometry = artifacts.urls!.geometry;
+    const opts = this.decodeOptions();
+    this.events.onProgress('download', 0, 1);
+
+    if (geometry.layout === 'split') {
+      this.rangeRequests = undefined;
+      void probeRangeSupport(geometry.vertex, this.aborter.signal).then((ok) => {
+        this.rangeRequests = ok;
+        if (!ok) {
+          console.warn(
+            '[coordly-embed] o storage não devolveu 206 com Content-Range exposto — ' +
+            'vertex/index vão ser baixados inteiros (CORS ExposedHeaders?)',
+          );
+        }
+      });
+      return decodeSplitParquetStreaming(geometry, opts);
+    }
+
+    const res = await fetch(geometry.geometry, { signal: this.aborter.signal });
+    if (!res.ok) { throw new Error(`download da geometria → ${res.status}`); }
+    const blob = await res.blob();
+    this.events.onProgress('download', 1, 1);
+    return decodeStdParquetStreaming(blob, opts);
+  }
+
+  /** Data model por URL direta (storage). Falhar aqui não derruba o viewer. */
+  private async loadDataModelFrom(url: string, target?: FederatedModel): Promise<void> {
+    const report = (available: boolean) =>
+      this.events.onDataModel({ available, modelIndex: target?.index, modelId: target?.id });
+
     try {
       const res = await fetch(url, { signal: this.aborter.signal });
       if (!res.ok) { throw new Error(`data model → ${res.status}`); }
       const buffer = await res.arrayBuffer();
       if (this.disposed) { return; }
-      this.dataStore = await ModelDataStore.decode(buffer);
+      const store = await ModelDataStore.decode(buffer);
       if (this.disposed) { return; }
-      this.events.onDataModel({ available: true });
+      if (target) { target.dataStore = store; } else { this.dataStore = store; }
+      report(true);
     } catch (err: any) {
       if (this.disposed || err?.name === 'AbortError') { return; }
-      console.warn('[coordly-embed] data model do CDN indisponível:', err?.message ?? err);
-      this.events.onDataModel({ available: false });
+      console.warn('[coordly-embed] data model do storage indisponível:', err?.message ?? err);
+      report(false);
+    }
+  }
+
+  /**
+   * Federação a partir dos artefatos do backend: o mesmo que o
+   * `addModelFromServerParse`, mas a geometria vem do storage por range request
+   * e o parser não é tocado — nem para o data model.
+   */
+  async addModelFromArtifacts(artifacts: IfcArtifacts, modelId: string): Promise<void> {
+    if (this.disposed || this.models.has(modelId)) { return; }
+    if (!artifacts.urls?.geometry) {
+      this.events.onError('artifacts-missing', 'sem geometria nos artefatos');
+      return;
+    }
+    const slot = this.nextModelSlot++;
+    const model: FederatedModel = {
+      id: modelId,
+      index: slot,
+      idOffset: slot * MODEL_ID_STEP,
+      ids: new Set<number>(),
+      dataStore: null,
+    };
+    this.models.set(modelId, model);
+
+    try {
+      await this.renderMeshStream(await this.artifactStream(artifacts), { additive: true, model });
+      if (this.disposed) { return; }
+      if (artifacts.urls.datamodel) { void this.loadDataModelFrom(artifacts.urls.datamodel, model); }
+      else { this.events.onDataModel({ available: false, modelIndex: model.index, modelId }); }
+    } catch (err: any) {
+      // Carga progressiva: o que já entrou na cena precisa sair junto, senão fica
+      // geometria órfã e religar o switch empilha uma segunda cópia.
+      this.discardModel(modelId);
+      if (this.disposed || err?.name === 'AbortError') { return; }
+      this.events.onError('decode-failed', String(err?.message ?? err));
     }
   }
 
@@ -1597,7 +1702,7 @@ export class ViewerEngine {
     );
     this.renderer.fitToView();
     this.renderer.requestRender();
-    this.events.onLoaded({ elementCount: meshCount });
+    this.events.onLoaded({ elementCount: meshCount, rangeRequests: this.rangeRequests });
   }
 
 

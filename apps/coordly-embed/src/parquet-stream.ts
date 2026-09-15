@@ -1,17 +1,18 @@
-// Streaming decoder do parquet padrão (container [len][mesh][len][vertex][len][index])
-// POR ROW GROUP, usando parquet-wasm 0.7.2 (ParquetFile + Blob).
+// Streaming decoder do parquet padrão (mesh / vertex / index) POR ROW GROUP,
+// usando parquet-wasm 0.7.2. Dois formatos de entrada, o mesmo miolo:
 //
-// Por quê: decodificar as tabelas vertex/index INTEIRAS num readParquet
+//  - container concatenado [len][mesh][len][vertex][len][index] numa Blob
+//    (resposta do server / SSE);
+//  - split: as 3 seções como ARQUIVOS SEPARADOS no Blob Storage, lidas por range
+//    request (artefatos do backend). Provado no `apps/artifact-poc`.
+//
+// Por quê row group: decodificar as tabelas vertex/index INTEIRAS num readParquet
 // descomprime muito além dos ~4GB do wasm32 → trap "unreachable" nos modelos
 // grandes (DOR 1.3GB). Aqui decodificamos UM row group por vez (~11MB) e
 // reconstruímos as malhas cuja faixa cai na janela carregada. As faixas do mesh
 // são contíguas + monotônicas e cada malha ocupa < 1 row group, então um cache
 // deslizante pequeno (liberado conforme as malhas avançam) mantém WASM + heap
 // limitados, independente do tamanho do modelo.
-//
-// Blob (não ArrayBuffer): ParquetFile.fromFile lê só os bytes do row group via
-// range da Blob — não copia o arquivo inteiro pro WASM (a API 0.5.0 do
-// server-client copiava tudo a cada RG → ~2min; esta faz ~9s).
 import init, { ParquetFile } from 'parquet-wasm';
 import wasmUrl from 'parquet-wasm/esm/parquet_wasm_bg.wasm?url';
 import * as arrow from 'apache-arrow';
@@ -23,6 +24,24 @@ export interface StreamMesh {
   normals: Float32Array;
   indices: Uint32Array;
   color: [number, number, number, number];
+  /**
+   * Origem local: as posições são RELATIVAS a ela (world = origin + position).
+   * No DOR 636 paredes usam, com deslocamento de até 187m — ignorar isso desenha
+   * essas paredes longe do lugar e parece geometria faltando.
+   */
+  origin?: [number, number, number];
+}
+
+export interface DecodeOptions {
+  /** Malhas por batch emitido depois do primeiro (default 4000). */
+  batchSize?: number;
+  /**
+   * Malha a descartar ANTES de tocar em vertex/index — poupa os row groups dela.
+   * Recebe o `ifc_type` como veio do parquet.
+   */
+  skip?(ifcType: string): boolean;
+  /** Cancela o download do `mesh.parquet` (o único fetch cheio do split). */
+  signal?: AbortSignal;
 }
 
 let ready: Promise<unknown> | null = null;
@@ -47,10 +66,10 @@ async function magicAt(blob: Blob, pos: number): Promise<string> {
 }
 
 /**
- * Offset onde o container começa de verdade. O artefato do CDN começa direto no
- * `[u32 len][mesh…]`; a resposta de `/api/v1/parse/parquet` vem com um u32 de
- * tamanho total na frente. Em vez de adivinhar pela origem, procuramos o magic
- * `PAR1` logo após o u32 de comprimento — é o que distingue os dois sem ambiguidade.
+ * Offset onde o container começa de verdade. O corpo de `/cache/geometry` vem com
+ * um u32 de tamanho total na frente; o batch do SSE não. Em vez de adivinhar pela
+ * origem, procuramos o magic `PAR1` logo após o u32 de comprimento — é o que
+ * distingue os dois sem ambiguidade.
  */
 async function containerBase(source: Blob): Promise<number> {
   for (const base of [0, 4]) {
@@ -72,26 +91,96 @@ function rgOf(starts: number[], pos: number): number {
   return lo;
 }
 
-interface VtxRG { x: Float32Array; y: Float32Array; z: Float32Array; nx: Float32Array; ny: Float32Array; nz: Float32Array; }
-interface IdxRG { i0: Uint32Array; i1: Uint32Array; i2: Uint32Array; }
+// Leitores paralelos do MESMO arquivo. Um ParquetFile só aceita uma leitura por
+// vez (wasm single-thread), então a única forma de ter N row groups em voo é ter
+// N instâncias. Com 1 em voo o tempo total vira a soma dos round trips — na POC
+// isso deu 11.4 MB/s num link que fazia bem mais.
+const POOL = 8;
+// Buscar à frente o suficiente pra manter o pool cheio.
+const READ_AHEAD = POOL;
+// Primeiro batch pequeno: o tempo até o 1º triângulo é o que o split existe pra
+// derrubar, e esperar 4000 malhas obriga a baixar ~10% do modelo antes de pintar.
+// Dobra até `batchSize` pra não perder throughput no resto.
+const FIRST_BATCH = 128;
+const DEFAULT_BATCH = 4000;
 
 /**
- * Decodifica o parquet padrão em batches de malhas, streamando por row group.
+ * Fila serial: garante UMA leitura ativa por ParquetFile. Dois `read()`
+ * concorrentes no mesmo objeto podem colidir no borrow interno do wasm. A leitura
+ * antecipada continua valendo — só entra na fila mais cedo.
+ */
+function serializer() {
+  let last: Promise<unknown> = Promise.resolve();
+  return <T>(fn: () => Promise<T>): Promise<T> => {
+    const run = last.then(fn, fn);
+    last = run.then(() => {}, () => {});
+    return run;
+  };
+}
+
+/** Acesso a row group de um arquivo, escondendo quantos leitores existem atrás. */
+interface RgReader { meta: any; read(k: number): Promise<any>; }
+
+const readRowGroup = async (file: ParquetFile, k: number) =>
+  arrow.tableFromIPC((await file.read({ rowGroups: [k] })).intoIPCStream());
+
+/** Blob é disco local: sem latência de rede pra esconder, um leitor basta. */
+function blobReader(file: ParquetFile): RgReader {
+  const queue = serializer();
+  return { meta: file.metadata(), read: (k) => queue(() => readRowGroup(file, k)) };
+}
+
+/**
+ * Pool por URL que começa a servir com UM leitor e cresce em segundo plano.
+ * Abrir os N de uma vez custava ~1.6s antes do primeiro byte útil (cada
+ * `fromUrl` busca o próprio footer) — e esse tempo entrava inteiro no primeiro
+ * paint. Row groups vizinhos caem em leitores diferentes (k % n).
+ */
+async function urlPoolReader(url: string, n: number): Promise<RgReader> {
+  const first = await ParquetFile.fromUrl(url);
+  const files = [first];
+  const queues = [serializer()];
+  for (let i = 1; i < n; i++) {
+    ParquetFile.fromUrl(url)
+      .then((f) => { files.push(f); queues.push(serializer()); })
+      .catch(() => {}); // pool menor só custa vazão, não quebra a leitura
+  }
+  return {
+    meta: first.metadata(),
+    read: (k: number) => {
+      const s = k % files.length;
+      return queues[s](() => readRowGroup(files[s], k));
+    },
+  };
+}
+
+/**
+ * O Blob Storage honra Range E o CORS expõe os headers? Sem `ExposedHeaders`
+ * (`Content-Range`/`Content-Length`) o parquet-wasm não acha o footer e cai para
+ * o download inteiro — o viewer funciona, só que lento, sem erro nenhum. Esta
+ * sonda é o que torna esse modo de falha visível.
+ */
+export async function probeRangeSupport(url: string, signal?: AbortSignal): Promise<boolean> {
+  try {
+    const res = await fetch(url, { headers: { Range: 'bytes=0-3' }, signal });
+    const ok = res.status === 206 && !!res.headers.get('content-range');
+    await res.body?.cancel().catch(() => {});
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Container concatenado numa Blob (server / SSE).
  * @param source Blob do container (fetch(url).then(r => r.blob())).
- * @param batchSize malhas por batch emitido (default 4000).
  */
 export async function* decodeStdParquetStreaming(
   source: Blob,
-  batchSize = 4000,
+  opts: DecodeOptions = {},
 ): AsyncGenerator<StreamMesh[]> {
   await ensureInit();
 
-  // Parse do container via slices da Blob (sem ler tudo na memória).
-  //
-  // O endpoint /api/v1/parse/parquet prefixa o container com um u32 de tamanho
-  // TOTAL, que o artefato do CDN não tem. Detectamos pelo magic do parquet em vez
-  // de assumir um dos dois: onde estiver "PAR1" logo depois do u32 de comprimento,
-  // ali começa o container de verdade.
   const base = await containerBase(source);
   const meshLen = await readU32LE(source, base);
   const meshBlob = source.slice(base + 4, base + 4 + meshLen);
@@ -102,8 +191,54 @@ export async function* decodeStdParquetStreaming(
   const idxLen = await readU32LE(source, idxLenPos);
   const idxBlob = source.slice(idxLenPos + 4, idxLenPos + 4 + idxLen);
 
+  yield* streamMeshes(
+    await ParquetFile.fromFile(meshBlob),
+    blobReader(await ParquetFile.fromFile(vtxBlob)),
+    blobReader(await ParquetFile.fromFile(idxBlob)),
+    opts,
+  );
+}
+
+/**
+ * As 3 seções como ARQUIVOS SEPARADOS: cada row group de vertex/index vira range
+ * request e o arquivo nunca é baixado inteiro. O container concatenado impede
+ * isso — não existe URL que aponte pro meio dele.
+ * @param urls URLs das 3 seções (assinadas; precisam servir Range + CORS).
+ */
+export async function* decodeSplitParquetStreaming(
+  urls: { mesh: string; vertex: string; index: string },
+  opts: DecodeOptions = {},
+): AsyncGenerator<StreamMesh[]> {
+  await ensureInit();
+
+  // mesh vem numa requisição só, NÃO por fromUrl: são ~0.7MB em ~50 row groups,
+  // e ler a tabela inteira por range vira dezenas de round trips em sequência —
+  // era isso que segurava o primeiro paint na POC, não o vertex/index.
+  const meshRes = await fetch(urls.mesh, { signal: opts.signal });
+  if (!meshRes.ok) { throw new Error(`mesh.parquet → ${meshRes.status}`); }
+  const meshPf = await ParquetFile.fromFile(await meshRes.blob());
+
+  const [vtxReader, idxReader] = await Promise.all([
+    urlPoolReader(urls.vertex, POOL),
+    urlPoolReader(urls.index, POOL),
+  ]);
+
+  yield* streamMeshes(meshPf, vtxReader, idxReader, opts);
+}
+
+interface VtxRG { x: Float32Array; y: Float32Array; z: Float32Array; nx: Float32Array; ny: Float32Array; nz: Float32Array; }
+interface IdxRG { i0: Uint32Array; i1: Uint32Array; i2: Uint32Array; }
+
+/** Miolo comum: idêntico nos dois formatos — só muda de onde vêm os bytes. */
+async function* streamMeshes(
+  meshPf: ParquetFile,
+  vtx: RgReader,
+  idx: RgReader,
+  opts: DecodeOptions,
+): AsyncGenerator<StreamMesh[]> {
+  const batchSize = opts.batchSize ?? DEFAULT_BATCH;
+
   // Tabela mesh inteira (minúscula: 1 linha por malha, só ranges + cor/id).
-  const meshPf = await ParquetFile.fromFile(meshBlob);
   const M: any = arrow.tableFromIPC((await meshPf.read()).intoIPCStream());
   const expressIds = M.getChild('express_id').toArray() as Uint32Array;
   const ifcTypes = M.getChild('ifc_type');
@@ -115,12 +250,16 @@ export async function* decodeStdParquetStreaming(
   const colorG = M.getChild('color_g').toArray() as Float32Array;
   const colorB = M.getChild('color_b').toArray() as Float32Array;
   const colorA = M.getChild('color_a').toArray() as Float32Array;
+  // Opcionais: só existem a partir do server 4.2.0 (issue #1841). O batch do SSE
+  // de um server antigo vem sem elas, e aí todas as malhas são do mundo.
+  const originX = M.getChild('origin_x')?.toArray() as Float64Array | undefined;
+  const originY = M.getChild('origin_y')?.toArray() as Float64Array | undefined;
+  const originZ = M.getChild('origin_z')?.toArray() as Float64Array | undefined;
+  const hasOrigin = !!(originX && originY && originZ);
   const meshCount = expressIds.length;
 
-  const vtxPf = await ParquetFile.fromFile(vtxBlob);
-  const idxPf = await ParquetFile.fromFile(idxBlob);
-  const vMeta: any = vtxPf.metadata();
-  const iMeta: any = idxPf.metadata();
+  const vMeta: any = vtx.meta;
+  const iMeta: any = idx.meta;
   const vNrg = vMeta.numRowGroups();
   const iNrg = iMeta.numRowGroups();
   const vStart = prefixRows(vMeta, vNrg);
@@ -128,30 +267,59 @@ export async function* decodeStdParquetStreaming(
   const totalVerts = vStart[vNrg];
   const totalTris = iStart[iNrg];
 
-  const vCache = new Map<number, VtxRG>();
-  const iCache = new Map<number, IdxRG>();
-  const getVtxRG = async (k: number): Promise<VtxRG> => {
-    let c = vCache.get(k);
-    if (!c) {
-      const t: any = arrow.tableFromIPC((await vtxPf.read({ rowGroups: [k] })).intoIPCStream());
-      c = { x: t.getChild('x').toArray(), y: t.getChild('y').toArray(), z: t.getChild('z').toArray(),
-            nx: t.getChild('nx').toArray(), ny: t.getChild('ny').toArray(), nz: t.getChild('nz').toArray() };
-      vCache.set(k, c);
+  // Cache de PROMESSA, não de valor: com leitura antecipada duas chamadas podem
+  // pedir o mesmo row group antes da primeira terminar, e guardar a promessa
+  // dedupa a busca. O `.catch` vazio é só pra um prefetch que ninguém aguardou
+  // ainda não virar unhandledrejection — quem der await recebe o erro igual.
+  const vCache = new Map<number, Promise<VtxRG>>();
+  const iCache = new Map<number, Promise<IdxRG>>();
+  const getVtxRG = (k: number): Promise<VtxRG> => {
+    let p = vCache.get(k);
+    if (!p) {
+      p = vtx.read(k).then((t: any) => (
+        { x: t.getChild('x').toArray(), y: t.getChild('y').toArray(), z: t.getChild('z').toArray(),
+          nx: t.getChild('nx').toArray(), ny: t.getChild('ny').toArray(), nz: t.getChild('nz').toArray() }));
+      p.catch(() => {});
+      vCache.set(k, p);
     }
-    return c;
+    return p;
   };
-  const getIdxRG = async (k: number): Promise<IdxRG> => {
-    let c = iCache.get(k);
-    if (!c) {
-      const t: any = arrow.tableFromIPC((await idxPf.read({ rowGroups: [k] })).intoIPCStream());
-      c = { i0: t.getChild('i0').toArray(), i1: t.getChild('i1').toArray(), i2: t.getChild('i2').toArray() };
-      iCache.set(k, c);
+  const getIdxRG = (k: number): Promise<IdxRG> => {
+    let p = iCache.get(k);
+    if (!p) {
+      p = idx.read(k).then((t: any) => (
+        { i0: t.getChild('i0').toArray(), i1: t.getChild('i1').toArray(), i2: t.getChild('i2').toArray() }));
+      p.catch(() => {});
+      iCache.set(k, p);
     }
-    return c;
+    return p;
+  };
+  // Dispara os próximos row groups sem esperar: a rede busca o k+1 enquanto a
+  // CPU reconstrói as malhas do k. Sem isso, rede e CPU se revezam ociosas.
+  const prefetch = (vk: number, ik: number) => {
+    for (let d = 1; d <= READ_AHEAD; d++) {
+      if (vk + d < vNrg) getVtxRG(vk + d);
+      if (ik + d < iNrg) getIdxRG(ik + d);
+    }
+  };
+
+  // Libera row groups totalmente atrás do início da PRÓXIMA malha (as faixas são
+  // monotônicas) e adianta os seguintes.
+  const advanceWindow = (i: number) => {
+    if (i + 1 >= meshCount) return;
+    const keepV = rgOf(vStart, vertexStarts[i + 1]);
+    for (const k of Array.from(vCache.keys())) if (k < keepV) vCache.delete(k);
+    const keepI = rgOf(iStart, indexStarts[i + 1] / 3);
+    for (const k of Array.from(iCache.keys())) if (k < keepI) iCache.delete(k);
+    prefetch(keepV, keepI);
   };
 
   let batch: StreamMesh[] = [];
+  let nextBatch = Math.min(FIRST_BATCH, batchSize);
   for (let i = 0; i < meshCount; i++) {
+    const ifcType = (ifcTypes?.get(i) as string) ?? 'Unknown';
+    if (opts.skip?.(ifcType)) { advanceWindow(i); continue; }
+
     const vS = vertexStarts[i], vC = vertexCounts[i];
     const iS = indexStarts[i], iC = indexCounts[i];
     if (vS + vC > totalVerts || iS % 3 !== 0 || iC % 3 !== 0 || (iS + iC) / 3 > totalTris) {
@@ -191,22 +359,26 @@ export async function* decodeStdParquetStreaming(
       }
     }
 
-    batch.push({
+    const mesh: StreamMesh = {
       expressId: expressIds[i],
-      ifcType: (ifcTypes?.get(i) as string) ?? 'Unknown',
+      ifcType,
       positions, normals, indices,
       color: [colorR[i], colorG[i], colorB[i], colorA[i]],
-    });
-
-    // Libera row groups totalmente atrás do início da PRÓXIMA malha (faixas monotônicas).
-    if (i + 1 < meshCount) {
-      const keepV = rgOf(vStart, vertexStarts[i + 1]);
-      for (const k of Array.from(vCache.keys())) if (k < keepV) vCache.delete(k);
-      const keepI = rgOf(iStart, indexStarts[i + 1] / 3);
-      for (const k of Array.from(iCache.keys())) if (k < keepI) iCache.delete(k);
+    };
+    if (hasOrigin) {
+      const ox = originX![i], oy = originY![i], oz = originZ![i];
+      // Só quando existe: o renderer trata ausência como origem no mundo.
+      if (ox || oy || oz) { mesh.origin = [ox, oy, oz]; }
     }
+    batch.push(mesh);
 
-    if (batch.length >= batchSize) { yield batch; batch = []; }
+    advanceWindow(i);
+
+    if (batch.length >= nextBatch) {
+      yield batch;
+      batch = [];
+      nextBatch = Math.min(nextBatch * 2, batchSize);
+    }
   }
   if (batch.length > 0) yield batch;
 }

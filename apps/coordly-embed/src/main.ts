@@ -104,13 +104,15 @@ export function initCoordly3DViewer(config: BimConfig): BimInstance {
     setMeasureMode: (mode: MeasureMode) => engine.setMeasureMode(mode),
     clearMeasurements: () => engine.clearMeasurements(),
     deleteMeasurement: (id: string) => engine.deleteMeasurement(id),
-    // Federação segue a mesma regra do single: com server configurado, quem
-    // tessela é ele — o parse client-side perde geometria no single-thread.
-    addModel: (fileUrl: string, modelId: string) => (
-      config.serverUrl
-        ? engine.addModelFromServerParse(fileUrl, modelId, config.serverUrl)
-        : engine.addModelFromIfc(fileUrl, modelId)
-    ),
+    // Artefatos do backend são o caminho de produção. A string (`.ifc`) segue a
+    // regra antiga — server se configurado, senão cliente — pro harness e pra
+    // bundles do web anteriores ao backend.
+    addModel: (source: string | IfcArtifacts, modelId: string) => {
+      if (typeof source !== 'string') { return engine.addModelFromArtifacts(source, modelId); }
+      return config.serverUrl
+        ? engine.addModelFromServerParse(source, modelId, config.serverUrl)
+        : engine.addModelFromIfc(source, modelId);
+    },
     // Tira UM modelo da cena; os outros ficam como estão (sem re-parse).
     removeModel: (modelId: string) => engine.removeModel(modelId),
     hasModel: (modelId: string) => engine.hasModel(modelId),
@@ -186,7 +188,7 @@ declare global {
       setMeasureMode(mode: MeasureMode): void;
       clearMeasurements(): void;
       deleteMeasurement(id: string): void;
-      addModel(fileUrl: string, modelId: string): Promise<void>;
+      addModel(source: string | IfcArtifacts, modelId: string): Promise<void>;
       removeModel(modelId: string): void;
       hasModel(modelId: string): boolean;
       clearModels(): void;
