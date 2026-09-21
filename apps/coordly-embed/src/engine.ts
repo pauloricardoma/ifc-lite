@@ -262,6 +262,15 @@ export class ViewerEngine {
   // clique porque enquadrar um elemento cercado de paredes não adianta se elas
   // continuam opacas na frente dele.
   private ghost = false;
+  // Ghost pedido pelo usuário na toolbar — o do foco (duplo clique) não conta.
+  // Sobrevive a limpar a seleção: é um modo de visualização, não um destaque dela.
+  private ghostPinned = false;
+  // "Ghost na seleção": translúcido mas ainda clicável — é o que o separa de
+  // ocultar, que também desenha fantasma mas tira do pick.
+  private ghostedIds = new Set<number>();
+  // União ocultos + ghost na seleção, refeita só quando um dos dois muda: o
+  // render roda todo frame e o renderer compara o conjunto por conteúdo.
+  private ghostRender: Set<number> | null = null;
   // Federação: modelId → estado do modelo na cena. O 1º modelo fixa o frame de
   // coordenadas; os demais reusam via sharedRtcOffset pra ficarem alinhados.
   private models = new Map<string, FederatedModel>();
@@ -1062,7 +1071,8 @@ export class ViewerEngine {
     if (selectionChanged) { this.emitSelection(); }
     // Visibilidade guardada por id do modelo que saiu vira lixo que voltaria a
     // valer se a faixa fosse reusada.
-    for (const id of model.ids) { this.hiddenIds.delete(id); }
+    for (const id of model.ids) { this.hiddenIds.delete(id); this.ghostedIds.delete(id); }
+    this.ghostRender = null;
     if (this.isolatedIds) {
       for (const id of model.ids) { this.isolatedIds.delete(id); }
       if (this.isolatedIds.size === 0) { this.isolatedIds = null; }
@@ -1293,6 +1303,8 @@ export class ViewerEngine {
     // Visibilidade e corte são estado da CENA: sobreviver a um reset deixaria
     // elementos ocultos por ids que nem existem mais.
     this.hiddenIds.clear();
+    this.ghostedIds.clear();
+    this.ghostRender = null;
     this.isolatedIds = null;
     this.section = null;
     this.dataStore = null;
@@ -1485,9 +1497,9 @@ export class ViewerEngine {
     this.selectedIds.clear();
     this.selectedId = null;
     this.selectedModelIndex = undefined;
-    // O X-Ray existe pra destacar a seleção; sem seleção, ele só escureceria o
-    // modelo inteiro sem motivo.
-    this.ghost = false;
+    // O X-Ray do foco existe pra destacar a seleção e sai com ela. O ghost do
+    // modelo, pedido na toolbar, fica: é modo de visualização.
+    this.ghost = this.ghostPinned;
     this.renderer?.requestRender();
     this.emitSelection();
   }
@@ -1497,9 +1509,13 @@ export class ViewerEngine {
     this.multiSelect = enabled;
   }
 
-  /** X-Ray: o que não está selecionado fica translúcido. */
+  /**
+   * Ghost do modelo: tudo que não está selecionado fica translúcido — sem
+   * seleção, o modelo inteiro. Desligar também encerra o X-Ray do foco.
+   */
   setGhostMode(enabled: boolean): void {
-    this.ghost = enabled && this.selectedIds.size > 0;
+    this.ghost = enabled;
+    this.ghostPinned = enabled;
     this.renderer?.requestRender();
   }
 
@@ -1589,6 +1605,7 @@ export class ViewerEngine {
   hide(localIds: number[]): void {
     const expressIds = this.sceneIds(localIds);
     for (const id of expressIds) { this.hiddenIds.add(id); }
+    this.ghostRender = null;
     // Diagnóstico: "sumiu mais do que eu selecionei" quase sempre é o conjunto
     // pedido ser maior do que o usuário imagina (nó de árvore, multi-seleção) —
     // ou um expressId que responde por várias malhas do mesmo elemento IFC.
@@ -1601,13 +1618,33 @@ export class ViewerEngine {
 
   show(localIds: number[]): void {
     for (const id of this.sceneIds(localIds)) { this.hiddenIds.delete(id); }
+    this.ghostRender = null;
+    this.renderer?.requestRender();
+  }
+
+  /**
+   * Ghost na seleção: os elementos ficam translúcidos, mas continuam no pick —
+   * dá pra ver através deles e ainda clicar neles. "Mostrar tudo" desfaz.
+   */
+  ghostEntities(localIds: number[]): void {
+    for (const id of this.sceneIds(localIds)) { this.ghostedIds.add(id); }
+    this.ghostRender = null;
     this.renderer?.requestRender();
   }
 
   showAll(): void {
     this.hiddenIds.clear();
+    this.ghostedIds.clear();
+    this.ghostRender = null;
     this.isolatedIds = null;
     this.renderer?.requestRender();
+  }
+
+  private ghostRenderIds(): Set<number> {
+    if (this.ghostedIds.size === 0) { return this.hiddenIds; }
+    if (this.hiddenIds.size === 0) { return this.ghostedIds; }
+    if (!this.ghostRender) { this.ghostRender = new Set([...this.hiddenIds, ...this.ghostedIds]); }
+    return this.ghostRender;
   }
 
   /**
@@ -1746,11 +1783,13 @@ export class ViewerEngine {
         // Ocultar pelo olho da árvore não apaga o elemento: ele fica translúcido,
         // como o X-Ray. Sumir de vez tira a referência de onde a peça estava —
         // e é o isolamento que serve pra ficar só com o que interessa.
-        ghostIds: this.hiddenIds,
+        // "Ghost na seleção" entra no mesmo conjunto — só fica fora do pick.
+        ghostIds: this.ghostRenderIds(),
         isolatedIds: this.isolatedIds,
         sectionPlane: this.section ?? undefined,
-        // X-Ray: só o selecionado fica opaco; o resto vira contexto translúcido.
-        ghostExceptIds: this.ghost && this.selectedIds.size > 0 ? this.selectedIds : null
+        // X-Ray / ghost do modelo: só o selecionado fica opaco; o resto vira
+        // contexto translúcido. Sem seleção o conjunto vem vazio = modelo inteiro.
+        ghostExceptIds: this.ghost ? this.selectedIds : null
       });
       // Depois do render: o overlay é projeção da câmera DESTE frame.
       this.measure?.sync();

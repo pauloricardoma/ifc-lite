@@ -97,6 +97,8 @@ export function initCoordly3DViewer(config: BimConfig): BimInstance {
     isolate: (expressIds: number[] | null) => engine.isolate(expressIds),
     hide: (expressIds: number[]) => engine.hide(expressIds),
     show: (expressIds: number[]) => engine.show(expressIds),
+    // Ghost na seleção: translúcido, mas ainda clicável (ocultar tira do pick).
+    ghost: (expressIds: number[]) => engine.ghostEntities(expressIds),
     showAll: () => engine.showAll(),
     setSectionPlane: (section: SectionPlane | null) => engine.setSectionPlane(section),
     // Medição: com um modo ativo o clique vira ponto de medida, não seleção.
@@ -183,6 +185,7 @@ declare global {
       isolate(expressIds: number[] | null): void;
       hide(expressIds: number[]): void;
       show(expressIds: number[]): void;
+      ghost(expressIds: number[]): void;
       showAll(): void;
       setSectionPlane(section: SectionPlane | null): void;
       setMeasureMode(mode: MeasureMode): void;
