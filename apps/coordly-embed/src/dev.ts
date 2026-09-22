@@ -14,7 +14,8 @@ const engine = new ViewerEngine(canvas, {
   onError: (code, message) => console.error(`[dev] error ${code}: ${message}`),
   onSelect: log('select'),
   onDataModel: log('datamodel'),
-  onMeasure: log('measure')
+  onMeasure: log('measure'),
+  onViewReset: () => console.log('[dev] view-reset')
 });
 
 // ?diff=1 → não renderiza: roda o mesmo arquivo no single e no paralelo e

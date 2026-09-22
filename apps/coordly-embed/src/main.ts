@@ -52,7 +52,8 @@ export function initCoordly3DViewer(config: BimConfig): BimInstance {
     onError: (code, message) => emit('bim-load-error', { code, message }),
     onSelect: (detail) => emit('bim-selection-changed', detail),
     onDataModel: (detail) => emit('bim-datamodel-ready', detail),
-    onMeasure: (detail) => emit('bim-measure-changed', detail)
+    onMeasure: (detail) => emit('bim-measure-changed', detail),
+    onViewReset: () => emit('bim-view-reset', {})
   });
 
   window.bimExec = (cmd: string) => {
@@ -99,7 +100,11 @@ export function initCoordly3DViewer(config: BimConfig): BimInstance {
     show: (expressIds: number[]) => engine.show(expressIds),
     // Ghost na seleção: translúcido, mas ainda clicável (ocultar tira do pick).
     ghost: (expressIds: number[]) => engine.ghostEntities(expressIds),
+    // Desfaz só o fantasma; o que o olho da árvore escondeu continua escondido.
+    clearGhost: () => engine.clearGhost(),
     showAll: () => engine.showAll(),
+    // O mesmo que o Esc na cena: tudo à vista, nada selecionado, sem fantasma.
+    resetView: () => engine.resetView(),
     setSectionPlane: (section: SectionPlane | null) => engine.setSectionPlane(section),
     // Medição: com um modo ativo o clique vira ponto de medida, não seleção.
     // O resultado sai por 'bim-measure-changed', já com o rótulo formatado.
@@ -186,7 +191,9 @@ declare global {
       hide(expressIds: number[]): void;
       show(expressIds: number[]): void;
       ghost(expressIds: number[]): void;
+      clearGhost(): void;
       showAll(): void;
+      resetView(): void;
       setSectionPlane(section: SectionPlane | null): void;
       setMeasureMode(mode: MeasureMode): void;
       clearMeasurements(): void;

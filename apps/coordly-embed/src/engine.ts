@@ -83,6 +83,8 @@ interface EngineEvents {
   onDataModel(detail: { available: boolean; modelIndex?: number; modelId?: string }): void;
   /** Modo + lista completa a cada mudança (criar, remover, limpar, sair). */
   onMeasure(detail: { mode: MeasureMode; measurements: Measurement[] }): void;
+  /** A cena voltou ao padrão (Esc): o app espelha ocultos/isolamento e precisa zerar. */
+  onViewReset(): void;
 }
 
 // Clique = pointerdown→up sem passar deste deslocamento acumulado (CSS px).
@@ -318,7 +320,9 @@ export class ViewerEngine {
       this.renderer?.requestRender();
       return;
     }
-    if (this.selectedIds.size > 0) { this.clearSelection(); }
+    // Fora da medição, o Esc devolve a cena ao padrão: tudo à vista, nada
+    // selecionado, sem fantasma nem isolamento.
+    this.resetView();
   };
 
   // O motor de geometria (JS + WASM) cospe diagnóstico verboso do pipeline de
@@ -1632,12 +1636,41 @@ export class ViewerEngine {
     this.renderer?.requestRender();
   }
 
+  /** Desfaz só o fantasma (o do modelo e o da seleção); ocultos e isolamento ficam. */
+  clearGhost(): void {
+    this.ghostedIds.clear();
+    this.ghostRender = null;
+    this.ghost = false;
+    this.ghostPinned = false;
+    this.renderer?.requestRender();
+  }
+
   showAll(): void {
     this.hiddenIds.clear();
     this.ghostedIds.clear();
     this.ghostRender = null;
     this.isolatedIds = null;
     this.renderer?.requestRender();
+  }
+
+  /**
+   * Volta a cena ao padrão: tudo à vista, nada selecionado, sem fantasma nem
+   * isolamento. É o que o Esc faz — e o app precisa saber, porque ele espelha
+   * ocultos e isolamento para desenhar a árvore e a toolbar.
+   */
+  resetView(): void {
+    this.showAll();
+    this.clearGhost();
+    this.clearSelection();
+    this.events.onViewReset();
+  }
+
+  /** Seleção que o renderer destaca: o que está fantasma sai do destaque. */
+  private highlightIds(): Set<number> {
+    if (this.ghostedIds.size === 0 || this.selectedIds.size === 0) { return this.selectedIds; }
+    const ids = new Set<number>();
+    for (const id of this.selectedIds) { if (!this.ghostedIds.has(id)) { ids.add(id); } }
+    return ids;
   }
 
   private ghostRenderIds(): Set<number> {
@@ -1777,8 +1810,13 @@ export class ViewerEngine {
         clearColor: [0.10, 0.11, 0.13, 1],
         contributionCull: flag('cull') ? CONTRIB_CULL : undefined,
         lod: flag('lod') ? LOD : undefined,
-        selectedId: this.selectedId,
-        selectedIds: this.selectedIds,
+        // Fantasma vence o destaque: o renderer repinta opaco todo id em
+        // `selectedIds`, então dar ghost no que está selecionado não mudaria
+        // nada na tela. A seleção continua viva aqui (painel, isolar, ocultar).
+        selectedId: this.selectedId !== null && this.ghostedIds.has(this.selectedId)
+          ? null
+          : this.selectedId,
+        selectedIds: this.highlightIds(),
         selectedModelIndex: this.selectedModelIndex,
         // Ocultar pelo olho da árvore não apaga o elemento: ele fica translúcido,
         // como o X-Ray. Sumir de vez tira a referência de onde a peça estava —
@@ -1789,7 +1827,7 @@ export class ViewerEngine {
         sectionPlane: this.section ?? undefined,
         // X-Ray / ghost do modelo: só o selecionado fica opaco; o resto vira
         // contexto translúcido. Sem seleção o conjunto vem vazio = modelo inteiro.
-        ghostExceptIds: this.ghost ? this.selectedIds : null
+        ghostExceptIds: this.ghost ? this.highlightIds() : null
       });
       // Depois do render: o overlay é projeção da câmera DESTE frame.
       this.measure?.sync();
