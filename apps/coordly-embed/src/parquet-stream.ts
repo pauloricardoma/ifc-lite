@@ -172,6 +172,52 @@ export async function probeRangeSupport(url: string, signal?: AbortSignal): Prom
 }
 
 /**
+ * O parquet-wasm localiza o footer com SUFFIX RANGE (`Range: bytes=-8`, "os
+ * últimos 8 bytes"). O Azure Blob não suporta esse formato: em vez de 206 ou 416
+ * ele **ignora o header e devolve 200 com o blob inteiro**. Como cada leitor do
+ * pool abre o próprio `fromUrl`, isso virava 8 downloads completos de cada
+ * arquivo — 10GB no DOR. R2 e S3 suportam suffix range, e foi por isso que a POC
+ * nunca viu o problema.
+ *
+ * Reescrevemos para `bytes=<size-N>-<size-1>`, com o tamanho vindo de um HEAD
+ * cacheado por URL. Só requisições com suffix range são tocadas; qualquer falha
+ * cai no fetch original, que é o comportamento de hoje — nunca pior.
+ */
+let fetchPatched = false;
+export function patchSuffixRange(): void {
+  if (fetchPatched || typeof globalThis.fetch !== 'function') { return; }
+  fetchPatched = true;
+
+  const real = globalThis.fetch.bind(globalThis);
+  const sizes = new Map<string, Promise<number>>();
+  const sizeOf = (url: string): Promise<number> => {
+    let p = sizes.get(url);
+    if (!p) {
+      p = real(url, { method: 'HEAD' }).then((r) => Number(r.headers.get('content-length')));
+      p.catch(() => sizes.delete(url));
+      sizes.set(url, p);
+    }
+    return p;
+  };
+
+  globalThis.fetch = async (input: any, init?: any): Promise<Response> => {
+    try {
+      const req = new Request(input, init);
+      const suffix = /^bytes=-(\d+)$/.exec(req.headers.get('range') ?? '');
+      if (suffix) {
+        const size = await sizeOf(req.url);
+        if (Number.isFinite(size) && size > 0) {
+          const headers = new Headers(req.headers);
+          headers.set('Range', `bytes=${Math.max(0, size - Number(suffix[1]))}-${size - 1}`);
+          return await real(req.url, { method: req.method, headers, signal: req.signal });
+        }
+      }
+    } catch { /* qualquer imprevisto: segue pelo caminho original */ }
+    return real(input, init);
+  };
+}
+
+/**
  * Container concatenado numa Blob (server / SSE).
  * @param source Blob do container (fetch(url).then(r => r.blob())).
  */
@@ -210,6 +256,7 @@ export async function* decodeSplitParquetStreaming(
   opts: DecodeOptions = {},
 ): AsyncGenerator<StreamMesh[]> {
   await ensureInit();
+  patchSuffixRange();
 
   // mesh vem numa requisição só, NÃO por fromUrl: são ~0.7MB em ~50 row groups,
   // e ler a tabela inteira por range vira dezenas de round trips em sequência —
