@@ -151,6 +151,11 @@ async function boot() {
   say('renderer pronto ✓ — carregando modelo…');
 
   // 3) primeiro modelo
+  // `?shared=<prefixo>` carrega os 3 parquets do layout shared-shapes daquele
+  // prefixo (R2 em prod, /artifacts/ no dev). Ex.: ?shared=dor-shared-shapes
+  const shared = new URLSearchParams(location.search).get('shared');
+  if (shared) { await loadShared(shared); return; }
+
   const initial = new URLSearchParams(location.search).get('model') || modelInput.value;
   modelInput.value = initial;
   await load(initial);
@@ -532,3 +537,48 @@ loadBtn.addEventListener('click', () => load(modelInput.value.trim()));
 modelInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') load(modelInput.value.trim()); });
 
 boot().catch((e) => say(`boot falhou: ${e?.message ?? e}`, true));
+
+/**
+ * Layout `shared-shapes`: os mesmos 3 parquets do v4, mas com a geometria
+ * deduplicada por forma (48MB no DOR contra 1.3GB). O decoder detecta pelo
+ * `rot0` na tabela mesh — aqui não muda nada além de onde estão os arquivos.
+ */
+async function loadShared(prefix: string) {
+  clearScene();
+  const t0 = performance.now();
+  say(`shared-shapes: ${prefix} …`);
+  try {
+    const [mesh, vertex, index] = await Promise.all([
+      artifactUrl(`${prefix}/mesh.parquet`),
+      artifactUrl(`${prefix}/vertex.parquet`),
+      artifactUrl(`${prefix}/index.parquet`),
+    ]);
+    let meshCount = 0, tris = 0, ttfp = 0, framed = false;
+    const phases: string[] = [];
+    const onPhase = (label: string, ms: number) => {
+      phases.push(`${label} ${(ms / 1000).toFixed(1)}s`);
+      console.log(`[poc] fase: ${label} @ ${(ms / 1000).toFixed(1)}s`);
+    };
+    for await (const chunk of decodeSplitParquetStreaming(
+      { mesh, vertex, index }, 4000, onPhase, showSpaces ? undefined : SKIP_TYPES,
+    )) {
+      if (forceOpaque) for (const m of chunk) m.color[3] = 1;
+      renderer.addMeshes(chunk as any, true);
+      meshCount += chunk.length;
+      for (const m of chunk) tris += (m.indices?.length ?? 0) / 3;
+      renderer.requestRender();
+      if (!framed && meshCount > 0) {
+        renderer.fitToView(); framed = true;
+        ttfp = performance.now() - t0;
+        say(`${prefix}: primeiro paint em ${(ttfp / 1000).toFixed(1)}s · seguindo…`);
+      }
+    }
+    renderer.fitToView();
+    renderer.requestRender();
+    const total = (performance.now() - t0) / 1000;
+    say(`${prefix}: ${meshCount} malhas · ${(tris / 1e6).toFixed(1)}M tri · 1º paint ${(ttfp / 1000).toFixed(1)}s · total ${total.toFixed(1)}s`);
+  } catch (e: any) {
+    say(`erro em ${prefix}: ${e?.message ?? e}`);
+    console.error(e);
+  }
+}
