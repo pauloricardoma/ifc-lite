@@ -372,32 +372,52 @@ interface SharedShapeCols {
   rot: Float32Array[]; meshCount: number;
 }
 
-/** Concatena TODOS os row groups num conjunto de arrays planos. */
-async function loadAll(
-  r: RgReader,
-  cols: string[],
-  Ctor: new (n: number) => Float32Array | Uint32Array,
-): Promise<any> {
+const VTX_COLS = ['x', 'y', 'z', 'nx', 'ny', 'nz'];
+const IDX_COLS = ['i0', 'i1', 'i2'];
+
+/**
+ * Carrega row groups SOB DEMANDA em arrays planos do tamanho final, com leitura
+ * antecipada para nao serializar os round trips. Preenche por indice global.
+ */
+function progressiveLoader(r: RgReader, cols: string[], Ctor: any, ahead: number) {
   const nrg = r.meta.numRowGroups();
   const starts = prefixRows(r.meta, nrg);
-  const out: any = {};
-  for (const c of cols) { out[c] = new Ctor(starts[nrg]); }
-  for (let k = 0; k < nrg; k++) {
-    const t = await r.read(k);
-    for (const c of cols) { out[c].set(t.getChild(c).toArray(), starts[k]); }
-  }
-  return out;
+  const data: any = {};
+  for (const c of cols) { data[c] = new Ctor(starts[nrg]); }
+
+  const pending: Promise<any>[] = [];
+  const queue = (upTo: number) => {
+    while (pending.length <= Math.min(upTo + ahead, nrg - 1)) {
+      pending.push(r.read(pending.length));
+    }
+  };
+  let loadedRg = 0;
+
+  return {
+    data,
+    get loaded() { return starts[loadedRg]; },
+    get done() { return loadedRg >= nrg; },
+    async pull(): Promise<void> {
+      if (loadedRg >= nrg) { return; }
+      queue(loadedRg);
+      const t = await pending[loadedRg];
+      const base = starts[loadedRg];
+      for (const c of cols) { data[c].set(t.getChild(c).toArray(), base); }
+      loadedRg++;
+    },
+  };
 }
 
 /**
- * Miolo do layout shared-shapes. Duas diferencas em relacao ao v5, e a segunda e
- * a que torna este caminho MAIS simples, nao mais complexo:
+ * Miolo do layout shared-shapes. Tres diferencas em relacao ao v5:
  *
  *  1. cada ocorrencia aplica a propria rotacao: mundo = origin + R*p. O origin
  *     continua indo no StreamMesh (o renderer ja o soma), entao aqui so rotaciona.
- *  2. nao ha janela deslizante. As faixas repetem e voltam atras, o que quebraria
- *     o cache por row group — mas o artefato compartilhado e pequeno (48MB no DOR,
- *     contra 1,3GB do v5), entao vertex/index entram inteiros na memoria.
+ *  2. nao ha janela deslizante: as faixas repetem e voltam atras. Como o artefato
+ *     compartilhado e pequeno (48MB no DOR contra 1,3GB), o que chega fica.
+ *  3. as ocorrencias saem em ordem de FORMA, nao de arquivo. As formas sao
+ *     contiguas, entao assim que um row group chega ja da para emitir o que cabe
+ *     nele, em vez de esperar os 48MB inteiros (5,5s de tela preta no DOR).
  */
 async function* sharedShapeMeshes(
   c: SharedShapeCols,
@@ -407,35 +427,45 @@ async function* sharedShapeMeshes(
   mark: (label: string) => void,
   skipTypes?: ReadonlySet<string>,
 ): AsyncGenerator<StreamMesh[]> {
-  const [V, I] = await Promise.all([
-    loadAll(vtx, ['x', 'y', 'z', 'nx', 'ny', 'nz'], Float32Array) as Promise<VtxRG>,
-    loadAll(idx, ['i0', 'i1', 'i2'], Uint32Array) as Promise<IdxRG>,
-  ]);
-  mark('vertex+index carregados inteiros');
+  const V = progressiveLoader(vtx, VTX_COLS, Float32Array, READ_AHEAD);
+  const I = progressiveLoader(idx, IDX_COLS, Uint32Array, READ_AHEAD);
+
+  const order: number[] = [];
+  for (let i = 0; i < c.meshCount; i++) {
+    if (skipTypes?.has((c.ifcTypes?.get(i) as string) ?? 'Unknown')) { continue; }
+    order.push(i);
+  }
+  order.sort((p, q) =>
+    (c.vertexStarts[p] + c.vertexCounts[p]) - (c.vertexStarts[q] + c.vertexCounts[q]));
 
   let batch: StreamMesh[] = [];
   let nextBatch = Math.min(FIRST_BATCH, batchSize);
+  let primeiro = true;
 
-  for (let i = 0; i < c.meshCount; i++) {
-    const ifcType = (c.ifcTypes?.get(i) as string) ?? 'Unknown';
-    if (skipTypes?.has(ifcType)) { continue; }
-
+  for (const i of order) {
     const vS = c.vertexStarts[i], vC = c.vertexCounts[i];
     const iS = c.indexStarts[i], iC = c.indexCounts[i];
+    while (V.loaded < vS + vC && !V.done) { await V.pull(); }
+    while (I.loaded < (iS + iC) / 3 && !I.done) { await I.pull(); }
+    if (V.loaded < vS + vC || I.loaded < (iS + iC) / 3) {
+      throw new Error(`parquet malformado: malha ${i} fora de faixa`);
+    }
+    if (primeiro) { mark('primeira forma disponivel'); primeiro = false; }
+
     const r0 = c.rot[0][i], r1 = c.rot[1][i], r2 = c.rot[2][i];
     const r3 = c.rot[3][i], r4 = c.rot[4][i], r5 = c.rot[5][i];
     const r6 = c.rot[6][i], r7 = c.rot[7][i], r8 = c.rot[8][i];
+    const vx = V.data;
 
     const positions = new Float32Array(vC * 3);
     const normals = new Float32Array(vC * 3);
     for (let v = 0; v < vC; v++) {
       const g = vS + v, o = v * 3;
-      const x = V.x[g], y = V.y[g], z = V.z[g];
+      const x = vx.x[g], y = vx.y[g], z = vx.z[g];
       positions[o] = r0 * x + r1 * y + r2 * z;
       positions[o + 1] = r3 * x + r4 * y + r5 * z;
       positions[o + 2] = r6 * x + r7 * y + r8 * z;
-      // Rotacao ortonormal: serve para a normal sem inversa-transposta.
-      const nx = V.nx[g], ny = V.ny[g], nz = V.nz[g];
+      const nx = vx.nx[g], ny = vx.ny[g], nz = vx.nz[g];
       normals[o] = r0 * nx + r1 * ny + r2 * nz;
       normals[o + 1] = r3 * nx + r4 * ny + r5 * nz;
       normals[o + 2] = r6 * nx + r7 * ny + r8 * nz;
@@ -445,12 +475,12 @@ async function* sharedShapeMeshes(
     const indices = new Uint32Array(iC);
     for (let t = 0; t < triCount; t++) {
       const g = triStart + t, o = t * 3;
-      indices[o] = I.i0[g]; indices[o + 1] = I.i1[g]; indices[o + 2] = I.i2[g];
+      indices[o] = I.data.i0[g]; indices[o + 1] = I.data.i1[g]; indices[o + 2] = I.data.i2[g];
     }
 
     const mesh: StreamMesh = {
       expressId: c.expressIds[i],
-      ifcType,
+      ifcType: (c.ifcTypes?.get(i) as string) ?? 'Unknown',
       positions, normals, indices,
       color: [c.colorR[i], c.colorG[i], c.colorB[i], c.colorA[i]],
     };
