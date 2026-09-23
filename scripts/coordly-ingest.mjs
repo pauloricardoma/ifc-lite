@@ -19,7 +19,7 @@ import { createHash } from 'node:crypto';
 import { basename, resolve } from 'node:path';
 
 const args = process.argv.slice(2);
-const VALUE_FLAGS = ['server', 'out', 'token'];
+const VALUE_FLAGS = ['server', 'out', 'token', 'quality'];
 const flag = (name, fallback) => {
   const i = args.indexOf(`--${name}`);
   return i >= 0 ? args[i + 1] : fallback;
@@ -32,6 +32,8 @@ const file = args.find((a, i) => {
 const server = flag('server', 'http://localhost:8080').replace(/\/$/, '');
 const outRoot = resolve(flag('out', '../ifc-files/output'));
 const token = flag('token', process.env.IFC_SERVER_API_TOKEN || '');
+// lowest|low|medium|high|highest — entra na cache key, entao nao colide com outra qualidade
+const quality = flag('quality', '');
 
 if (!file) {
   console.error('uso: node scripts/coordly-ingest.mjs <arquivo.ifc> [--server URL] [--out DIR] [--token T]');
@@ -59,7 +61,8 @@ async function parseViaSse(path) {
   const form = new FormData();
   form.set('file', await openAsBlob(path), basename(path));
 
-  const res = await fetch(`${server}/api/v1/parse/parquet-stream`, {
+  const qs = quality ? `?tessellation_quality=${encodeURIComponent(quality)}` : '';
+  const res = await fetch(`${server}/api/v1/parse/parquet-stream${qs}`, {
     method: 'POST',
     headers: authHeaders,
     body: form,
