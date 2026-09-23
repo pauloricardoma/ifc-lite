@@ -22,8 +22,11 @@ export default async function handler(req, res) {
   }
 
   const key = String(req.query.key || '');
-  // trava path traversal e chaves fora do prefixo esperado
-  if (!key || key.includes('..') || !/^(federated|dor)\//.test(key)) {
+  // Trava path traversal e caracteres fora de [A-Za-z0-9._-], exigindo ao menos
+  // uma pasta. A allowlist antiga era `^(federated|dor)/`, o que barrava qualquer
+  // artefato novo (`dor-shared-shapes/` não casa com `^dor/`). O que protege o
+  // bucket é o code-gate acima mais ele ser privado, não a lista de prefixos.
+  if (!key || key.includes('..') || !/^[\w.-]+(\/[\w.-]+)+$/.test(key)) {
     return res.status(400).json({ error: 'invalid key' });
   }
   try {
