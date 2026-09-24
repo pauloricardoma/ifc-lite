@@ -31,7 +31,7 @@ export interface StreamMesh {
 
 let ready: Promise<unknown> | null = null;
 function ensureInit(): Promise<unknown> {
-  if (!ready) ready = init(wasmUrl);
+  if (!ready) ready = init({ module_or_path: wasmUrl });
   return ready;
 }
 
