@@ -153,8 +153,13 @@ async function boot() {
   // 3) primeiro modelo
   // `?shared=<prefixo>` carrega os 3 parquets do layout shared-shapes daquele
   // prefixo (R2 em prod, /artifacts/ no dev). Ex.: ?shared=dor-shared-shapes
+  // Vários prefixos separados por vírgula = federado (um modelIndex por modelo).
   const shared = new URLSearchParams(location.search).get('shared');
-  if (shared) { await loadShared(shared); return; }
+  if (shared) {
+    const prefixes = shared.split(',').map((p) => p.trim()).filter(Boolean);
+    for (const [i, prefix] of prefixes.entries()) await loadShared(prefix, i);
+    return;
+  }
 
   const initial = new URLSearchParams(location.search).get('model') || modelInput.value;
   modelInput.value = initial;
@@ -543,8 +548,8 @@ boot().catch((e) => say(`boot falhou: ${e?.message ?? e}`, true));
  * deduplicada por forma (48MB no DOR contra 1.3GB). O decoder detecta pelo
  * `rot0` na tabela mesh — aqui não muda nada além de onde estão os arquivos.
  */
-async function loadShared(prefix: string) {
-  clearScene();
+async function loadShared(prefix: string, modelIndex = 0) {
+  if (modelIndex === 0) clearScene();
   const t0 = performance.now();
   say(`shared-shapes: ${prefix} …`);
   try {
@@ -563,6 +568,7 @@ async function loadShared(prefix: string) {
       { mesh, vertex, index }, 4000, onPhase, showSpaces ? undefined : SKIP_TYPES,
     )) {
       if (forceOpaque) for (const m of chunk) m.color[3] = 1;
+      for (const m of chunk) (m as any).modelIndex = modelIndex;
       renderer.addMeshes(chunk as any, true);
       meshCount += chunk.length;
       for (const m of chunk) tris += (m.indices?.length ?? 0) / 3;
@@ -576,7 +582,9 @@ async function loadShared(prefix: string) {
     renderer.fitToView();
     renderer.requestRender();
     const total = (performance.now() - t0) / 1000;
-    say(`${prefix}: ${meshCount} malhas · ${(tris / 1e6).toFixed(1)}M tri · 1º paint ${(ttfp / 1000).toFixed(1)}s · total ${total.toFixed(1)}s`);
+    uploadModels = modelIndex + 1;
+    const fed = modelIndex > 0 ? ` · federado, ${uploadModels} modelos na cena` : '';
+    say(`${prefix}${fed}: ${meshCount} malhas · ${(tris / 1e6).toFixed(1)}M tri · 1º paint ${(ttfp / 1000).toFixed(1)}s · total ${total.toFixed(1)}s`);
   } catch (e: any) {
     say(`erro em ${prefix}: ${e?.message ?? e}`);
     console.error(e);

@@ -40,30 +40,39 @@ engine.init().then((ok) => {
 
   // `?artifacts=<pasta>` carrega os 6 artefatos de ifc-files/output/<pasta>/ pelo
   // MESMO caminho do web/ com o backend: split + range request (o vite.config
-  // serve /artifacts/* com 206). `&federar=1` usa o load aditivo da federação.
+  // serve /artifacts/* com 206). `&federar=1` usa o load aditivo da federação e
+  // aceita várias pastas separadas por vírgula (uma disciplina cada).
   const params = new URLSearchParams(location.search);
-  const artifactsDir = params.get('artifacts');
-  if (artifactsDir) {
-    const url = (f: string) => `/artifacts/${artifactsDir}/${f}`;
-    const artifacts = {
-      status: 'ready',
-      urls: {
-        geometry: {
-          layout: 'split' as const,
-          mesh: url('mesh.parquet'),
-          vertex: url('vertex.parquet'),
-          index: url('index.parquet'),
+  const artifactsParam = params.get('artifacts');
+  if (artifactsParam) {
+    const artifactsOf = (dir: string) => {
+      const url = (f: string) => `/artifacts/${dir}/${f}`;
+      return {
+        status: 'ready',
+        urls: {
+          geometry: {
+            layout: 'split' as const,
+            mesh: url('mesh.parquet'),
+            vertex: url('vertex.parquet'),
+            index: url('index.parquet'),
+          },
+          metadata: url('metadata.json'),
+          datamodel: url('datamodel.parquet'),
         },
-        metadata: url('metadata.json'),
-        datamodel: url('datamodel.parquet'),
-      },
+      };
     };
-    const t0 = performance.now();
-    console.log('[dev] modo ARTEFATOS:', artifactsDir);
-    const load = params.get('federar') === '1'
-      ? engine.addModelFromArtifacts(artifacts, artifactsDir)
-      : engine.loadFromArtifacts(artifacts);
-    void load.then(() => console.log(`[dev] artefatos carregados em ${Math.round(performance.now() - t0)}ms`));
+    const dirs = artifactsParam.split(',').map((d) => d.trim()).filter(Boolean);
+    const federar = params.get('federar') === '1';
+    console.log('[dev] modo ARTEFATOS:', dirs, federar ? '(federado)' : '');
+    void (async () => {
+      for (const dir of federar ? dirs : dirs.slice(0, 1)) {
+        const t0 = performance.now();
+        await (federar
+          ? engine.addModelFromArtifacts(artifactsOf(dir), dir)
+          : engine.loadFromArtifacts(artifactsOf(dir)));
+        console.log(`[dev] ${dir} carregado em ${Math.round(performance.now() - t0)}ms`);
+      }
+    })();
     (window as any).tree = () => engine.getSpatialTree();
     (window as any).props = (id: number) => engine.getEntityProperties(id);
     return;
