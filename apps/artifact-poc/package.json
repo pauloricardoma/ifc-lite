@@ -9,13 +9,13 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@ifc-lite/renderer": "workspace:*",
-    "@ifc-lite/server-client": "workspace:*",
-    "@ifc-lite/geometry": "workspace:*",
     "@aws-sdk/client-s3": "^3",
     "@aws-sdk/s3-request-presigner": "^3",
+    "@ifc-lite/geometry": "workspace:*",
+    "@ifc-lite/renderer": "workspace:*",
+    "@ifc-lite/server-client": "workspace:*",
     "apache-arrow": "^21.1.0",
-    "parquet-wasm": "^0.7.1"
+    "parquet-wasm": "^0.8.0"
   },
   "devDependencies": {
     "typescript": "^6.0.3",

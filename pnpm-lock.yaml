@@ -106,8 +106,8 @@ importers:
         specifier: ^21.1.0
         version: 21.2.0
       parquet-wasm:
-        specifier: ^0.7.1
-        version: 0.7.2
+        specifier: ^0.8.0
+        version: 0.8.0
     devDependencies:
       typescript:
         specifier: ^6.0.3
@@ -5059,6 +5059,9 @@ packages:
   parquet-wasm@0.7.2:
     resolution: {integrity: sha512-XfzVFW7REEYzt/MF5pG2fVjF0lyArXkk4x7m4wuE7R5OEoUfXq5wdI5DQi/UsB8wWW3ncx2z6xMjq5dM9qTYgg==}
 
+  parquet-wasm@0.8.0:
+    resolution: {integrity: sha512-AunZLpYYHPQCzDzeIKOO3e/p3Uqo8+DGyfEVofhlIIn/bk3EuOFJkDXlswSKDDSWOaZRv6bHrob/XynUDKmceg==}
+
   parse-entities@4.0.2:
     resolution: {integrity: sha512-GG2AQYWoLgL877gQIKeRPGO1xF9+eG1ujIb5soS5gPvLQ1y2o8FL90w2QWNdf9I361Mpp7726c+lj3U0qK1uGw==}
 
@@ -9328,6 +9331,8 @@ snapshots:
   parquet-wasm@0.5.0: {}
 
   parquet-wasm@0.7.2: {}
+
+  parquet-wasm@0.8.0: {}
 
   parse-entities@4.0.2:
     dependencies:
