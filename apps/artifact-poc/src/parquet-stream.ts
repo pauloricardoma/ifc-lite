@@ -150,10 +150,11 @@ export async function* decodeStdParquetStreaming(
   const idxBlob = source.slice(idxLenPos + 4, idxLenPos + 4 + idxLen);
 
   // Blob é disco local: sem latência de rede pra esconder, um leitor basta.
+  const vtxPf = await ParquetFile.fromFile(vtxBlob);
+  const idxPf = await ParquetFile.fromFile(idxBlob);
   yield* streamMeshes(
     await ParquetFile.fromFile(meshBlob),
-    poolReader([await ParquetFile.fromFile(vtxBlob)]),
-    poolReader([await ParquetFile.fromFile(idxBlob)]),
+    async () => [poolReader([vtxPf]), poolReader([idxPf])],
     batchSize,
   );
 }
@@ -184,20 +185,31 @@ export async function* decodeSplitParquetStreaming(
   const meshPf = await ParquetFile.fromFile(meshBlob);
   mark('mesh baixado');
 
-  const [vtxReader, idxReader] = await Promise.all([
-    urlPoolReader(urls.vertex, POOL),
-    urlPoolReader(urls.index, POOL),
-  ]);
-  mark('footers');
+  // O layout só se sabe pela tabela mesh, então os leitores abrem depois dela.
+  // No compartilhado o vertex/index entra inteiro na memória de qualquer jeito, e
+  // o server de stream grava um row group por lote: por range seriam centenas de
+  // round trips (204 no RDCOBT55, 30s para 15MB). Um GET por arquivo resolve.
+  const open = async (shared: boolean): Promise<[RgReader, RgReader]> => {
+    const readers = await Promise.all(shared
+      ? [wholeReader(urls.vertex), wholeReader(urls.index)]
+      : [urlPoolReader(urls.vertex, POOL), urlPoolReader(urls.index, POOL)]);
+    mark(shared ? 'vertex+index baixados (GET inteiro)' : 'footers');
+    return readers as [RgReader, RgReader];
+  };
 
-  yield* streamMeshes(meshPf, vtxReader, idxReader, batchSize, mark, skipTypes);
+  yield* streamMeshes(meshPf, open, batchSize, mark, skipTypes);
+}
+
+async function wholeReader(url: string): Promise<RgReader> {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${url.split('?')[0].split('/').pop()} → ${res.status}`);
+  return poolReader([await ParquetFile.fromFile(await res.blob())]);
 }
 
 /** Miolo comum: idêntico nos dois caminhos — só muda de onde vêm os bytes. */
 async function* streamMeshes(
   meshPf: ParquetFile,
-  vtx: RgReader,
-  idx: RgReader,
+  open: (shared: boolean) => Promise<[RgReader, RgReader]>,
   batchSize: number,
   mark: (label: string) => void = () => {},
   skipTypes?: ReadonlySet<string>,
@@ -226,6 +238,7 @@ async function* streamMeshes(
   const rot = M.getChild('rot0')
     ? Array.from({ length: 9 }, (_, k) => M.getChild(`rot${k}`).toArray() as Float32Array)
     : null;
+  const [vtx, idx] = await open(!!rot);
   if (rot) {
     mark('layout shared-shapes detectado');
     yield* sharedShapeMeshes(

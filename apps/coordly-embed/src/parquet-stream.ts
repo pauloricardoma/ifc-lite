@@ -237,10 +237,11 @@ export async function* decodeStdParquetStreaming(
   const idxLen = await readU32LE(source, idxLenPos);
   const idxBlob = source.slice(idxLenPos + 4, idxLenPos + 4 + idxLen);
 
+  const vtxPf = await ParquetFile.fromFile(vtxBlob);
+  const idxPf = await ParquetFile.fromFile(idxBlob);
   yield* streamMeshes(
     await ParquetFile.fromFile(meshBlob),
-    blobReader(await ParquetFile.fromFile(vtxBlob)),
-    blobReader(await ParquetFile.fromFile(idxBlob)),
+    async () => [blobReader(vtxPf), blobReader(idxPf)],
     opts,
   );
 }
@@ -265,12 +266,21 @@ export async function* decodeSplitParquetStreaming(
   if (!meshRes.ok) { throw new Error(`mesh.parquet → ${meshRes.status}`); }
   const meshPf = await ParquetFile.fromFile(await meshRes.blob());
 
-  const [vtxReader, idxReader] = await Promise.all([
-    urlPoolReader(urls.vertex, POOL),
-    urlPoolReader(urls.index, POOL),
-  ]);
+  // O layout só se sabe pela tabela mesh, então os leitores abrem depois dela.
+  // No compartilhado o vertex/index entra inteiro na memória de qualquer jeito, e
+  // o server de stream grava um row group por lote: por range seriam centenas de
+  // round trips (204 no RDCOBT55, 30s para 15MB). Um GET por arquivo resolve.
+  const open = async (shared: boolean): Promise<[RgReader, RgReader]> => shared
+    ? Promise.all([wholeReader(urls.vertex, opts.signal), wholeReader(urls.index, opts.signal)])
+    : Promise.all([urlPoolReader(urls.vertex, POOL), urlPoolReader(urls.index, POOL)]);
 
-  yield* streamMeshes(meshPf, vtxReader, idxReader, opts);
+  yield* streamMeshes(meshPf, open, opts);
+}
+
+async function wholeReader(url: string, signal?: AbortSignal): Promise<RgReader> {
+  const res = await fetch(url, { signal });
+  if (!res.ok) { throw new Error(`${url.split('?')[0].split('/').pop()} → ${res.status}`); }
+  return blobReader(await ParquetFile.fromFile(await res.blob()));
 }
 
 interface VtxRG { x: Float32Array; y: Float32Array; z: Float32Array; nx: Float32Array; ny: Float32Array; nz: Float32Array; }
@@ -279,8 +289,7 @@ interface IdxRG { i0: Uint32Array; i1: Uint32Array; i2: Uint32Array; }
 /** Miolo comum: idêntico nos dois formatos — só muda de onde vêm os bytes. */
 async function* streamMeshes(
   meshPf: ParquetFile,
-  vtx: RgReader,
-  idx: RgReader,
+  open: (shared: boolean) => Promise<[RgReader, RgReader]>,
   opts: DecodeOptions,
 ): AsyncGenerator<StreamMesh[]> {
   const batchSize = opts.batchSize ?? DEFAULT_BATCH;
@@ -312,6 +321,7 @@ async function* streamMeshes(
   const rot = M.getChild('rot0')
     ? Array.from({ length: 9 }, (_, k) => M.getChild(`rot${k}`).toArray() as Float32Array)
     : null;
+  const [vtx, idx] = await open(!!rot);
   if (rot) {
     yield* sharedShapeMeshes(
       { expressIds, ifcTypes, vertexStarts, vertexCounts, indexStarts, indexCounts,
