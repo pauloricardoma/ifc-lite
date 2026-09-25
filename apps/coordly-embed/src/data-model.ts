@@ -113,6 +113,25 @@ const cleanPropertyValue = (raw: string): string => {
   return cell ? unquote(cell[2].trim()) : raw;
 };
 
+/** Progresso do processamento, de 0 a 100. */
+export type DataModelProgress = (percent: number) => void;
+
+/** Ponto do progresso em que a árvore fica pronta; o resto é Psets/Qtos. */
+export const TREE_READY_AT = 40;
+
+/**
+ * Converte o avanço de um laço na faixa [from, to] do progresso total e só
+ * reporta quando o inteiro muda — o laço de propriedades roda milhões de vezes.
+ */
+const rangeReporter = (report: DataModelProgress | undefined, from: number, to: number) => {
+  let last = -1;
+  return (done: number, total: number) => {
+    if (!report || total === 0) { return; }
+    const percent = Math.floor(from + (to - from) * (done / total));
+    if (percent !== last) { last = percent; report(percent); }
+  };
+};
+
 const col = <T>(t: arrow.Table, name: string): T | undefined =>
   t.getChild(name)?.toArray() as T | undefined;
 
@@ -188,16 +207,28 @@ class EntityIndex {
  * propriedades de um elemento e rótulos em lote.
  */
 export class ModelDataStore {
+  private sets = new Map<number, BimPropertySet>();
+  /** elemento → ids de Pset/Qto (via IfcRelDefinesByProperties). */
+  private setsOf = new Map<number, number[]>();
+
+  /**
+   * Resolve quando Psets/Qtos estiverem prontos. É a parte pesada do data model
+   * (uma linha por propriedade) e só serve ao painel de propriedades — a árvore
+   * não depende dela, então sai antes. Quem lê propriedades espera isto.
+   */
+  propertiesReady: Promise<void> = Promise.resolve();
+
   private constructor(
     private readonly entities: EntityIndex,
-    private readonly sets: Map<number, BimPropertySet>,
-    /** elemento → ids de Pset/Qto (via IfcRelDefinesByProperties). */
-    private readonly setsOf: Map<number, number[]>,
     private readonly spatial: Map<number, RawSpatialNode>,
     private readonly roots: number[],
   ) {}
 
-  static async decode(buffer: ArrayBuffer): Promise<ModelDataStore> {
+  /**
+   * `onProgress` vai de 0 a 100: a árvore fica pronta em `TREE_READY_AT` e o
+   * resto é Psets/Qtos, que continuam depois de a promise resolver.
+   */
+  static async decode(buffer: ArrayBuffer, onProgress?: DataModelProgress): Promise<ModelDataStore> {
     await ensureInit();
 
     const view = new DataView(buffer);
@@ -211,12 +242,47 @@ export class ModelDataStore {
     [spatialData, pos] = section(buffer, view, pos);
     // As seções de classificação/material/documento vêm depois; não são usadas aqui.
 
+    const t0 = performance.now();
+    onProgress?.(0);
     const entities = ModelDataStore.readEntities(table(entitiesData));
-    const sets = ModelDataStore.readSets(table(propertiesData), table(quantitiesData));
-    const setsOf = ModelDataStore.readSetLinks(table(relationshipsData), sets);
+    onProgress?.(25);
     const { spatial, roots } = ModelDataStore.readSpatial(spatialData);
+    const store = new ModelDataStore(entities, spatial, roots);
+    const treeMs = Math.round(performance.now() - t0);
+    onProgress?.(TREE_READY_AT);
 
-    return new ModelDataStore(entities, sets, setsOf, spatial, roots);
+    // Fora do caminho da árvore: o `setTimeout` devolve o controle para quem
+    // chamou (o worker responde a árvore) antes de começar a parte pesada.
+    store.propertiesReady = new Promise<void>((resolve, reject) => {
+      setTimeout(() => {
+        try {
+          const t1 = performance.now();
+          const props = table(propertiesData);
+          onProgress?.(50);
+          const qtos = table(quantitiesData);
+          onProgress?.(55);
+          store.sets = ModelDataStore.readSets(props, qtos, rangeReporter(onProgress, 55, 90));
+          const relationships = table(relationshipsData);
+          onProgress?.(93);
+          store.setsOf = ModelDataStore.readSetLinks(
+            relationships, store.sets, rangeReporter(onProgress, 93, 100),
+          );
+          onProgress?.(100);
+          console.log(
+            `[coordly-embed] data model: árvore em ${treeMs}ms (${entities.count} entidades), `
+            + `propriedades em ${Math.round(performance.now() - t1)}ms (${store.sets.size} conjuntos)`,
+          );
+          resolve();
+        } catch (err) {
+          reject(err);
+        }
+      }, 0);
+    });
+    // Sem consumidor ainda, uma falha aqui viraria "unhandled rejection"; quem
+    // pedir propriedades recebe o erro pelo próprio await.
+    store.propertiesReady.catch(() => {});
+
+    return store;
   }
 
   private static readEntities(t: arrow.Table): EntityIndex {
@@ -235,7 +301,11 @@ export class ModelDataStore {
   }
 
   /** Psets e Qtos num mapa só — a UI os separa pelo `kind`. */
-  private static readSets(props: arrow.Table, qtos: arrow.Table): Map<number, BimPropertySet> {
+  private static readSets(
+    props: arrow.Table,
+    qtos: arrow.Table,
+    tick?: (done: number, total: number) => void,
+  ): Map<number, BimPropertySet> {
     const sets = new Map<number, BimPropertySet>();
 
     const psetIds = col<Uint32Array>(props, 'pset_id') ?? new Uint32Array(0);
@@ -243,7 +313,10 @@ export class ModelDataStore {
     const propNames = (col<string[]>(props, 'property_name') ?? []) as string[];
     const propValues = (col<string[]>(props, 'property_value') ?? []) as string[];
     const propTypes = (col<string[]>(props, 'property_type') ?? []) as string[];
+    const qsetCount = (col<Uint32Array>(qtos, 'qset_id') ?? new Uint32Array(0)).length;
+    const total = psetIds.length + qsetCount;
     for (let i = 0; i < psetIds.length; i++) {
+      tick?.(i, total);
       const id = psetIds[i];
       let set = sets.get(id);
       if (!set) {
@@ -263,6 +336,7 @@ export class ModelDataStore {
     const qValues = col<Float64Array>(qtos, 'quantity_value') ?? new Float64Array(0);
     const qTypes = (col<string[]>(qtos, 'quantity_type') ?? []) as string[];
     for (let i = 0; i < qsetIds.length; i++) {
+      tick?.(psetIds.length + i, total);
       const id = qsetIds[i];
       let set = sets.get(id);
       if (!set) {
@@ -288,6 +362,7 @@ export class ModelDataStore {
   private static readSetLinks(
     t: arrow.Table,
     sets: Map<number, BimPropertySet>,
+    tick?: (done: number, total: number) => void,
   ): Map<number, number[]> {
     const relTypes = (col<string[]>(t, 'rel_type') ?? []) as string[];
     const relating = col<Uint32Array>(t, 'relating_id') ?? new Uint32Array(0);
@@ -295,6 +370,7 @@ export class ModelDataStore {
 
     const links = new Map<number, number[]>();
     for (let i = 0; i < relating.length; i++) {
+      tick?.(i, relating.length);
       if ((relTypes[i] ?? '').toUpperCase() !== 'IFCRELDEFINESBYPROPERTIES') { continue; }
       const setId = relating[i];
       if (!sets.has(setId)) { continue; }

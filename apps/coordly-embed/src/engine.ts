@@ -6,7 +6,8 @@ import { decodeSplitParquetStreaming, decodeStdParquetStreaming, probeRangeSuppo
 import type { DecodeOptions, StreamMesh } from './parquet-stream.js';
 import { MeasureTool } from './measure-tool.js';
 import type { Measurement, MeasureMode, RaycastHit, SnapHint, SnapKind, Vec3 } from './measure.js';
-import { ModelDataStore } from './data-model.js';
+import { RemoteDataStore, warmUpDataModelWorker } from './data-model-client.js';
+import { TREE_READY_AT } from './data-model.js';
 import type { BimEntityProperties, BimTreeNode } from './data-model.js';
 import type { IfcArtifacts } from './types.js';
 import {
@@ -81,6 +82,16 @@ interface EngineEvents {
   // `modelIndex` presente = data model de UM modelo federado; ausente = viewer
   // de arquivo unico. E assim que o app sabe a qual modelo a arvore pertence.
   onDataModel(detail: { available: boolean; modelIndex?: number; modelId?: string }): void;
+  /**
+   * Andamento do data model em três etapas, uma de cada vez e cada uma de 0 a
+   * 100: `download`, `tree` (a árvore sai ao fim dela) e `properties`.
+   */
+  onDataModelProgress?(detail: {
+    phase: DataModelPhase;
+    percent: number;
+    modelIndex?: number;
+    modelId?: string;
+  }): void;
   /** Modo + lista completa a cada mudança (criar, remover, limpar, sair). */
   onMeasure(detail: { mode: MeasureMode; measurements: Measurement[] }): void;
   /** A cena voltou ao padrão (Esc): o app espelha ocultos/isolamento e precisa zerar. */
@@ -115,6 +126,8 @@ const localExpressId = (expressId: number): number => expressId % MODEL_ID_STEP;
 /** De qual modelo é este id da cena. Inverso de `idOffset = slot * MODEL_ID_STEP`. */
 const modelIndexOf = (expressId: number): number => Math.floor(expressId / MODEL_ID_STEP);
 
+export type DataModelPhase = 'download' | 'tree' | 'properties';
+
 interface FederatedModel {
   /** Id que o app usa (no Coordly, o urn) — volta nos eventos do data model. */
   id: string;
@@ -128,7 +141,7 @@ interface FederatedModel {
    * viewer de arquivo único) seria sobrescrito a cada modelo carregado e o
    * último venceria.
    */
-  dataStore: ModelDataStore | null;
+  dataStore: RemoteDataStore | null;
 }
 
 // Tipos que o viewer de referência esconde por padrão — espelha
@@ -285,7 +298,7 @@ export class ViewerEngine {
   // Atributos/Psets/Qtos/hierarquia do MESMO artefato da geometria. Null até o
   // data model chegar (ou pra sempre, se o modelo veio por um caminho que não o
   // publica — o render nunca depende dele).
-  private dataStore: ModelDataStore | null = null;
+  private dataStore: RemoteDataStore | null = null;
   // Resultado da sonda de range do último load por artefatos split; sai no
   // `onLoaded` pro app registrar. Undefined nos outros caminhos.
   private rangeRequests: boolean | undefined;
@@ -866,10 +879,12 @@ export class ViewerEngine {
 
         const buffer = await res.arrayBuffer();
         if (this.disposed) { return false; }
-        const store = await ModelDataStore.decode(buffer);
-        if (this.disposed) { return false; }
-        if (target) { target.dataStore = store; } else { this.dataStore = store; }
-        console.log(`[coordly-embed] data model pronto (${(buffer.byteLength / 1024 / 1024).toFixed(1)}MB)`);
+        // Lido antes do decode: o buffer é transferido ao worker e fica vazio aqui.
+        const sizeMb = (buffer.byteLength / 1024 / 1024).toFixed(1);
+        const store = await RemoteDataStore.decode(buffer);
+        if (this.disposed) { store.release(); return false; }
+        this.adoptDataStore(store, target);
+        console.log(`[coordly-embed] data model pronto (${sizeMb}MB)`);
         this.events.onDataModel({ available: true, modelIndex: target?.index, modelId: target?.id });
         return true;
       } catch (err: any) {
@@ -1082,6 +1097,7 @@ export class ViewerEngine {
       if (this.isolatedIds.size === 0) { this.isolatedIds = null; }
     }
 
+    model.dataStore?.release();
     this.models.delete(modelId);
     // O frame de coordenadas é do 1º modelo carregado; se ele saiu e a cena
     // esvaziou, o próximo a entrar refaz o rtc.
@@ -1162,13 +1178,33 @@ export class ViewerEngine {
       this.events.onDataModel({ available, modelIndex: target?.index, modelId: target?.id });
 
     try {
+      const progress = (phase: DataModelPhase, percent: number) =>
+        this.events.onDataModelProgress?.({ phase, percent, modelIndex: target?.index, modelId: target?.id });
+
+      const t0 = performance.now();
+      warmUpDataModelWorker();
       const res = await fetch(url, { signal: this.aborter.signal });
       if (!res.ok) { throw new Error(`data model → ${res.status}`); }
-      const buffer = await res.arrayBuffer();
+      const buffer = await this.readWithProgress(res, (percent) => progress('download', percent));
       if (this.disposed) { return; }
-      const store = await ModelDataStore.decode(buffer);
-      if (this.disposed) { return; }
-      if (target) { target.dataStore = store; } else { this.dataStore = store; }
+      const sizeMb = (buffer.byteLength / 1024 / 1024).toFixed(1);
+      const t1 = performance.now();
+      // O worker reporta o processamento inteiro de 0 a 100, com a árvore pronta
+      // em TREE_READY_AT; aqui vira duas etapas próprias, cada uma de 0 a 100.
+      const store = await RemoteDataStore.decode(buffer, (percent) => {
+        if (this.disposed) { return; }
+        if (percent < TREE_READY_AT) {
+          progress('tree', (percent / TREE_READY_AT) * 100);
+        } else {
+          progress('properties', ((percent - TREE_READY_AT) / (100 - TREE_READY_AT)) * 100);
+        }
+      });
+      if (this.disposed) { store.release(); return; }
+      this.adoptDataStore(store, target);
+      console.log(
+        `[coordly-embed] data model do storage: ${sizeMb}MB · download ${Math.round(t1 - t0)}ms · `
+        + `árvore pronta ${Math.round(performance.now() - t1)}ms depois`,
+      );
       report(true);
     } catch (err: any) {
       if (this.disposed || err?.name === 'AbortError') { return; }
@@ -1299,6 +1335,7 @@ export class ViewerEngine {
   // Reset da sessão federada (esvazia a cena e volta a poder escolher o motor).
   clearModels(): void {
     this.renderer?.getScene().clear();
+    this.releaseDataStores();
     this.models.clear();
     this.nextModelSlot = 0;
     this.federationRtc = undefined;
@@ -1408,7 +1445,7 @@ export class ViewerEngine {
    * `emitSelection`), então quem identifica o modelo é o `modelIndex` — o mesmo
    * que a seleção reporta. Sem índice, é o viewer de arquivo único.
    */
-  private storeFor(modelIndex?: number): ModelDataStore | null {
+  private storeFor(modelIndex?: number): RemoteDataStore | null {
     if (modelIndex === undefined) { return this.dataStore; }
     for (const model of this.models.values()) {
       if (model.index === modelIndex) { return model.dataStore; }
@@ -1429,31 +1466,119 @@ export class ViewerEngine {
     return this.storeFor(modelIndex)?.getSpatialTree() ?? [];
   }
 
-  getEntityProperties(expressId: number, modelIndex?: number): BimEntityProperties | null {
-    return this.storeFor(modelIndex)?.getEntityProperties(expressId) ?? null;
+  async getEntityProperties(expressId: number, modelIndex?: number): Promise<BimEntityProperties | null> {
+    const [entity] = await this.getEntitiesProperties([expressId], modelIndex);
+    return entity ?? null;
   }
 
-  getEntityLabels(
+  /** Propriedades da seleção inteira numa consulta só ao worker. */
+  async getEntitiesProperties(expressIds: number[], modelIndex?: number): Promise<BimEntityProperties[]> {
+    return (await this.storeFor(modelIndex)?.getEntitiesProperties(expressIds)) ?? [];
+  }
+
+  async getEntityLabels(
     expressIds: number[],
     modelIndex?: number,
-  ): { expressId: number; name: string }[] {
-    return this.storeFor(modelIndex)?.getEntityLabels(expressIds) ?? [];
+  ): Promise<{ expressId: number; name: string }[]> {
+    return (await this.storeFor(modelIndex)?.getEntityLabels(expressIds)) ?? [];
   }
 
   /** GlobalId (o `IfcGuid` do BCF) de cada expressId, em lote. */
-  getGlobalIds(
+  async getGlobalIds(
     expressIds: number[],
     modelIndex?: number,
-  ): { expressId: number; globalId: string }[] {
-    return this.storeFor(modelIndex)?.getGlobalIds(expressIds) ?? [];
+  ): Promise<{ expressId: number; globalId: string }[]> {
+    return (await this.storeFor(modelIndex)?.getGlobalIds(expressIds)) ?? [];
   }
 
   /** O caminho de volta, para restaurar seleção e visibilidade de um viewpoint. */
-  getExpressIds(
+  async getExpressIds(
     globalIds: string[],
     modelIndex?: number,
-  ): { globalId: string; expressId: number }[] {
-    return this.storeFor(modelIndex)?.getExpressIds(globalIds) ?? [];
+  ): Promise<{ globalId: string; expressId: number }[]> {
+    return (await this.storeFor(modelIndex)?.getExpressIds(globalIds)) ?? [];
+  }
+
+  /**
+   * Corpo inteiro num ArrayBuffer, reportando o download (0–100) pelo
+   * `Content-Length`. Sem o header não há como saber o total: reporta só o fim.
+   */
+  private async readWithProgress(res: Response, onProgress: (percent: number) => void): Promise<ArrayBuffer> {
+    const total = Number(res.headers.get('Content-Length')) || 0;
+    if (!res.body || total === 0) {
+      const buffer = await res.arrayBuffer();
+      onProgress(100);
+      return buffer;
+    }
+
+    const out = new Uint8Array(total);
+    const reader = res.body.getReader();
+    let received = 0;
+    let last = -1;
+    onProgress(0);
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) { break; }
+      // Content-Length do blob comprimido (gzip) é menor que o corpo lido: cresce
+      // em vez de estourar.
+      if (received + value.byteLength > out.byteLength) {
+        const grown = new Uint8Array(Math.max(out.byteLength * 2, received + value.byteLength));
+        grown.set(out.subarray(0, received));
+        return this.finishGrowing(reader, grown, received, value, onProgress);
+      }
+      out.set(value, received);
+      received += value.byteLength;
+      const percent = Math.min(99, Math.floor((received / total) * 100));
+      if (percent !== last) { last = percent; onProgress(percent); }
+    }
+    onProgress(100);
+    return received === out.byteLength ? out.buffer : out.slice(0, received).buffer;
+  }
+
+  /** Resto de um corpo maior que o `Content-Length` (encoding): sem percentual confiável. */
+  private async finishGrowing(
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    buffer: Uint8Array,
+    received: number,
+    first: Uint8Array,
+    onProgress: (percent: number) => void,
+  ): Promise<ArrayBuffer> {
+    let out = buffer;
+    let size = received;
+    let chunk: Uint8Array | undefined = first;
+    while (chunk) {
+      if (size + chunk.byteLength > out.byteLength) {
+        const grown = new Uint8Array(Math.max(out.byteLength * 2, size + chunk.byteLength));
+        grown.set(out.subarray(0, size));
+        out = grown;
+      }
+      out.set(chunk, size);
+      size += chunk.byteLength;
+      const { done, value } = await reader.read();
+      chunk = done ? undefined : value;
+    }
+    onProgress(100);
+    return out.slice(0, size).buffer;
+  }
+
+  /** Um load novo no mesmo alvo solta o store anterior no worker, em vez de vazá-lo. */
+  private adoptDataStore(store: RemoteDataStore, target?: FederatedModel): void {
+    if (target) {
+      target.dataStore?.release();
+      target.dataStore = store;
+    } else {
+      this.dataStore?.release();
+      this.dataStore = store;
+    }
+  }
+
+  private releaseDataStores(): void {
+    this.dataStore?.release();
+    this.dataStore = null;
+    for (const model of this.models.values()) {
+      model.dataStore?.release();
+      model.dataStore = null;
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1756,6 +1881,7 @@ export class ViewerEngine {
   dispose(): void {
     this.disposed = true;
     this.aborter.abort();
+    this.releaseDataStores();
     window.removeEventListener('keydown', this.onKeyDown);
     this.measure?.dispose();
     this.measure = null;

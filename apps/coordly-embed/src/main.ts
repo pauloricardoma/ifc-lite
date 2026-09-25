@@ -52,6 +52,7 @@ export function initCoordly3DViewer(config: BimConfig): BimInstance {
     onError: (code, message) => emit('bim-load-error', { code, message }),
     onSelect: (detail) => emit('bim-selection-changed', detail),
     onDataModel: (detail) => emit('bim-datamodel-ready', detail),
+    onDataModelProgress: (detail) => emit('bim-datamodel-progress', detail),
     onMeasure: (detail) => emit('bim-measure-changed', detail),
     onViewReset: () => emit('bim-view-reset', {})
   });
@@ -67,8 +68,12 @@ export function initCoordly3DViewer(config: BimConfig): BimInstance {
     // esse índice (o mesmo que a seleção reporta) que diz de qual deles ler.
     hasDataModel: (modelIndex?: number) => engine.hasDataModel(modelIndex),
     getSpatialTree: (modelIndex?: number) => engine.getSpatialTree(modelIndex),
+    // Consultas ao data model são assíncronas: o store mora num worker, para o
+    // decode (milhões de Psets num modelo grande) não travar a cena.
     getEntityProperties: (expressId: number, modelIndex?: number) =>
       engine.getEntityProperties(expressId, modelIndex),
+    getEntitiesProperties: (expressIds: number[], modelIndex?: number) =>
+      engine.getEntitiesProperties(expressIds, modelIndex),
     getEntityLabels: (expressIds: number[], modelIndex?: number) =>
       engine.getEntityLabels(expressIds, modelIndex),
     // Viewpoint (BCF). A câmera atravessa a ponte JÁ no espaço do BCF — mundo do
@@ -162,11 +167,12 @@ declare global {
       fitToView(): void;
       hasDataModel(modelIndex?: number): boolean;
       getSpatialTree(modelIndex?: number): BimTreeNode[];
-      getEntityProperties(expressId: number, modelIndex?: number): BimEntityProperties | null;
+      getEntityProperties(expressId: number, modelIndex?: number): Promise<BimEntityProperties | null>;
+      getEntitiesProperties(expressIds: number[], modelIndex?: number): Promise<BimEntityProperties[]>;
       getEntityLabels(
         expressIds: number[],
         modelIndex?: number,
-      ): { expressId: number; name: string }[];
+      ): Promise<{ expressId: number; name: string }[]>;
       getCamera(): BCFPerspectiveCamera | BCFOrthogonalCamera | null;
       setCamera(
         camera: BCFPerspectiveCamera | BCFOrthogonalCamera,
@@ -176,11 +182,11 @@ declare global {
       getGlobalIds(
         expressIds: number[],
         modelIndex?: number,
-      ): { expressId: number; globalId: string }[];
+      ): Promise<{ expressId: number; globalId: string }[]>;
       getExpressIds(
         globalIds: string[],
         modelIndex?: number,
-      ): { globalId: string; expressId: number }[];
+      ): Promise<{ globalId: string; expressId: number }[]>;
       select(expressId: number | null, opts?: { frame?: boolean; additive?: boolean; modelIndex?: number }): void;
       clearSelection(): void;
       setMultiSelect(enabled: boolean): void;
