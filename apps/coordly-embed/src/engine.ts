@@ -1883,6 +1883,7 @@ export class ViewerEngine {
     this.aborter.abort();
     this.releaseDataStores();
     window.removeEventListener('keydown', this.onKeyDown);
+    window.removeEventListener('resize', this.onWindowResize);
     this.measure?.dispose();
     this.measure = null;
     this.restoreConsole?.();
@@ -2018,12 +2019,15 @@ export class ViewerEngine {
       this.camera.zoom(e.deltaY, false, e.offsetX, e.offsetY, c.width, c.height);
       this.renderer.requestRender();
     }, { passive: false });
-    window.addEventListener('resize', () => {
-      this.fitCanvas();
-      this.renderer.resize(c.width, c.height);
-      this.renderer.requestRender();
-    });
+    window.addEventListener('resize', this.onWindowResize);
   }
+
+  private readonly onWindowResize = () => {
+    if (this.disposed) { return; }
+    this.fitCanvas();
+    this.renderer.resize(this.canvas.width, this.canvas.height);
+    this.renderer.requestRender();
+  };
 }
 
 const SNAP_KINDS: Record<string, SnapKind> = {

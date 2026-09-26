@@ -155,7 +155,16 @@ export function initCoordly3DViewer(config: BimConfig): BimInstance {
     emit('bim-load-error', { code: 'no-source', message: 'sem fileUrl nem artifacts' });
   }).catch((err) => emit('bim-load-error', { code: 'boot-failed', message: String(err?.message ?? err) }));
 
-  return { dispose: () => engine.dispose() };
+  // O canvas sai junto com o motor. Deixado no container, o próximo mount (o
+  // federado remonta a cena ao religar um modelo) empilhava um segundo canvas
+  // no mesmo div, e os dois se redimensionavam em laço — a cena "descia" e
+  // crescia sem parar.
+  const dispose = () => {
+    engine.dispose();
+    canvas.remove();
+  };
+  window.bimHelpers.dispose = dispose;
+  return { dispose };
 }
 
 (window as any).initCoordly3DViewer = initCoordly3DViewer;
