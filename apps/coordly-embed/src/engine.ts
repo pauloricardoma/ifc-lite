@@ -16,7 +16,8 @@ import {
   orthogonalToCamera,
   perspectiveToCamera,
 } from '@ifc-lite/bcf';
-import type { BCFOrthogonalCamera, BCFPerspectiveCamera } from '@ifc-lite/bcf';
+import type { BCFClippingPlane, BCFOrthogonalCamera, BCFPerspectiveCamera } from '@ifc-lite/bcf';
+import { bcfPlaneToSection, sectionToBcfPlane, withBoundsRange } from './section-bcf.js';
 
 // O data model é escrito no cache DEPOIS da geometria (o server responde o
 // parquet e grava o resto em background), então um 202 logo após o load é
@@ -101,6 +102,8 @@ interface EngineEvents {
    * dele. Sem isto a toolbar mostraria a projeção de antes do restore.
    */
   onProjection?(mode: ProjectionMode): void;
+  /** Corte trocado por um viewpoint restaurado (`null` = sem corte). */
+  onSection?(section: SectionPlane | null): void;
 }
 
 export type ProjectionMode = 'perspective' | 'orthographic';
@@ -1439,6 +1442,21 @@ export class ViewerEngine {
     this.renderer?.requestRender();
   }
 
+  /** Corte atual como plano do BCF (0 ou 1 — o motor tem um corte por vez). */
+  getBcfClippingPlanes(): BCFClippingPlane[] {
+    const bounds = this.renderer?.getModelBounds();
+    const plane = this.section && bounds ? sectionToBcfPlane(this.section, bounds) : null;
+    return plane ? [plane] : [];
+  }
+
+  /** Só o primeiro plano entra: o motor tem um corte, por eixo. Vazio desliga. */
+  setBcfClippingPlanes(planes: BCFClippingPlane[]): void {
+    const bounds = this.renderer?.getModelBounds();
+    const section = planes.length > 0 && bounds ? bcfPlaneToSection(planes[0], bounds) : null;
+    this.setSectionPlane(section);
+    this.events.onSection?.(section);
+  }
+
   /**
    * PNG do que está na tela, como data URL.
    *
@@ -1974,7 +1992,7 @@ export class ViewerEngine {
         // "Ghost na seleção" entra no mesmo conjunto — só fica fora do pick.
         ghostIds: this.ghostRenderIds(),
         isolatedIds: this.isolatedIds,
-        sectionPlane: this.section ?? undefined,
+        sectionPlane: this.section ? withBoundsRange(this.section, this.renderer.getModelBounds()) : undefined,
         // X-Ray / ghost do modelo: só o selecionado fica opaco; o resto vira
         // contexto translúcido. Sem seleção o conjunto vem vazio = modelo inteiro.
         ghostExceptIds: this.ghost ? this.highlightIds() : null

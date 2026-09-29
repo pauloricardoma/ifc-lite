@@ -1,5 +1,5 @@
 import { ViewerEngine, LoadPhase, ProjectionMode } from './engine.js';
-import type { BCFOrthogonalCamera, BCFPerspectiveCamera } from '@ifc-lite/bcf';
+import type { BCFClippingPlane, BCFOrthogonalCamera, BCFPerspectiveCamera } from '@ifc-lite/bcf';
 import type { BimEntityProperties, BimTreeNode } from './data-model.js';
 import type { Measurement, MeasureMode } from './measure.js';
 import type { IfcArtifacts } from './types.js';
@@ -55,7 +55,8 @@ export function initCoordly3DViewer(config: BimConfig): BimInstance {
     onDataModelProgress: (detail) => emit('bim-datamodel-progress', detail),
     onMeasure: (detail) => emit('bim-measure-changed', detail),
     onViewReset: () => emit('bim-view-reset', {}),
-    onProjection: (mode) => emit('bim-projection-changed', { mode })
+    onProjection: (mode) => emit('bim-projection-changed', { mode }),
+    onSection: (section) => emit('bim-section-changed', { section })
   });
 
   window.bimExec = (cmd: string) => {
@@ -87,6 +88,10 @@ export function initCoordly3DViewer(config: BimConfig): BimInstance {
     ) => engine.setBcfCamera(camera, targetDistance),
     getProjection: () => engine.getProjection(),
     setProjection: (mode: ProjectionMode) => engine.setProjection(mode),
+    // Corte no espaço do BCF, no mesmo referencial da câmera. Restaurar avisa
+    // por 'bim-section-changed' para o painel de corte acompanhar.
+    getClippingPlanes: () => engine.getBcfClippingPlanes(),
+    setClippingPlanes: (planes: BCFClippingPlane[]) => engine.setBcfClippingPlanes(planes),
     captureSnapshot: () => engine.captureSnapshot(),
     getGlobalIds: (expressIds: number[], modelIndex?: number) =>
       engine.getGlobalIds(expressIds, modelIndex),
@@ -192,6 +197,8 @@ declare global {
       ): void;
       getProjection(): ProjectionMode;
       setProjection(mode: ProjectionMode): void;
+      getClippingPlanes(): BCFClippingPlane[];
+      setClippingPlanes(planes: BCFClippingPlane[]): void;
       captureSnapshot(): Promise<string | null>;
       getGlobalIds(
         expressIds: number[],
