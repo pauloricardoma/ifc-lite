@@ -69,6 +69,17 @@ pub(super) fn extract_text_literal(
 
     let (wx, wy) = composed.transform_point(0.0, 0.0);
     let plan = rebase.plan(wx, wy);
+    // Same finiteness hazard as items.rs's polyline/curve paths and fill.rs's
+    // boundary rings: a malformed STEP REAL (e.g. `1.E400`) in the placement
+    // chain reaches here as Infinity/NaN. Unlike `tz` (which legitimately
+    // carries `f32::NAN` as the "unresolved placement" sentinel via
+    // `Transform2D::unresolved()`), `tx`/`ty` never do — identity leaves them
+    // at 0.0 — so a non-finite (x, y) here is genuine malformed data, not a
+    // sentinel, and the whole text item is dropped rather than emitted with
+    // a corrupt position.
+    if !plan.0.is_finite() || !plan.1.is_finite() {
+        return;
+    }
     let raw_scale = composed.scale();
     // Height keeps a ZERO scale (the glyph collapses exactly as the symbol does);
     // only a non-finite scale falls back. The direction below needs the stricter
@@ -80,9 +91,18 @@ pub(super) fn extract_text_literal(
     // readable (non-mirrored) under a mirroring transform, same as before
     // #1994: Axis1 is unaffected by an Axis2 mirror by construction, so this
     // is not a special case — it falls out of reading only the X column.
+    //
+    // Through `plan_direction` for the same reason the anchor goes through
+    // `plan`: the frame can carry a rotation (a site-local response removes
+    // the site's yaw from its meshes), and a baseline left in world axes
+    // would have the glyphs running across a wall that is no longer parallel
+    // to them (#4706). It applies the handedness flip this used to spell
+    // inline as the minus on `m10`.
     let dir = if raw_scale.is_finite() && raw_scale > 0.0 {
-        (composed.m00 / raw_scale, -composed.m10 / raw_scale)
+        rebase.plan_direction(composed.m00 / raw_scale, composed.m10 / raw_scale)
     } else {
+        // The degenerate-transform fallback is a RENDER-frame default ("read
+        // left to right"), not a world direction, so it is not re-based.
         (1.0, 0.0)
     };
     let color = resolve_color_via_styles(item.id, styled_items, decoder)

@@ -27,6 +27,7 @@ import {
   isoNowAt8,
   reconcileTaskTime,
   cloneExtraction,
+  resolveWorkScheduleFilter,
   resolveSingleModelId,
   resolveIdOffset,
 } from './schedule-edit-helpers.js';
@@ -414,8 +415,7 @@ export const createScheduleSlice: StateCreator<
         // Reset playback to the schedule's start when loading new data.
         playbackTime: range?.start ?? 0,
         playbackIsPlaying: false,
-        // Pick the first work schedule by default.
-        activeWorkScheduleId: scheduleData?.workSchedules[0]?.globalId ?? '',
+        activeWorkScheduleId: resolveWorkScheduleFilter(scheduleData),
         // Expand roots by default so the user sees something.
         expandedTaskGlobalIds: new Set(
           scheduleData?.tasks.filter(t => !t.parentGlobalId).map(t => t.globalId) ?? [],
@@ -436,8 +436,8 @@ export const createScheduleSlice: StateCreator<
 
   setGanttPanelVisible: (ganttPanelVisible) => set({ ganttPanelVisible }),
   toggleGanttPanel: () => set((s) => ({ ganttPanelVisible: !s.ganttPanelVisible })),
-
-  setActiveWorkScheduleId: (activeWorkScheduleId) => set({ activeWorkScheduleId }),
+  setActiveWorkScheduleId: (activeWorkScheduleId) =>
+    set(state => ({ activeWorkScheduleId: resolveWorkScheduleFilter(state.scheduleData, activeWorkScheduleId) })),
   setGanttTimeScale: (ganttTimeScale) => set({ ganttTimeScale }),
 
   setGenerateScheduleDialogOpen: (generateScheduleDialogOpen) => set({ generateScheduleDialogOpen }),
@@ -468,7 +468,7 @@ export const createScheduleSlice: StateCreator<
         scheduleSourceModelId: sourceModelId,
         playbackTime: range?.start ?? 0,
         playbackIsPlaying: false,
-        activeWorkScheduleId: data.workSchedules[0]?.globalId ?? '',
+        activeWorkScheduleId: resolveWorkScheduleFilter(data),
         expandedTaskGlobalIds: new Set(
           data.tasks.filter(t => !t.parentGlobalId).map(t => t.globalId),
         ),
@@ -515,8 +515,8 @@ export const createScheduleSlice: StateCreator<
         );
 
     const next: ScheduleExtraction = keptTasks.length === 0
-      ? { hasSchedule: false, workSchedules: [], tasks: [], sequences: [] }
-      : { hasSchedule: true, workSchedules: keptSchedules, tasks: keptTasks, sequences: keptSequences };
+      ? { hasSchedule: false, workSchedules: [], tasks: [], sequences: [], workCalendars: [] }
+      : { hasSchedule: true, workSchedules: keptSchedules, tasks: keptTasks, sequences: keptSequences, workCalendars: current.workCalendars ?? [] };
 
     const nextRange = computeScheduleRange(keptTasks.length === 0 ? null : next);
     const sourceModelId = get().scheduleSourceModelId;
@@ -805,7 +805,7 @@ export const createScheduleSlice: StateCreator<
     pushScheduleSnapshot(get, set, `Add task: ${name}`);
     const next = current
       ? cloneExtraction(current)
-      : { hasSchedule: true, workSchedules: [], sequences: [], tasks: [] } as ScheduleExtraction;
+      : { hasSchedule: true, workSchedules: [], sequences: [], tasks: [], workCalendars: [] } as ScheduleExtraction;
 
     // Derive default start: after the predecessor's finish when we have
     // one, otherwise the schedule range start, otherwise today at 08:00.
@@ -1250,8 +1250,8 @@ function taskMatchesScheduleFilter(
  * `scheduleStart > playbackTime`. Products with no controlling task are
  * always shown.
  *
- * `scheduleGlobalId` (optional) restricts evaluation to tasks controlled by
- * that IfcWorkSchedule / IfcWorkPlan. Pass `null`/`undefined`/`''` to treat
+ * `scheduleGlobalId` restricts evaluation to tasks controlled by an
+ * IfcWorkSchedule. Pass `null`/`undefined`/`''` to treat
  * all tasks as in-scope. Federation-aware ID translation is the caller's
  * responsibility — these selectors stay pure and return local expressIds.
  */

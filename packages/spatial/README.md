@@ -21,27 +21,42 @@ import { buildSpatialIndexAsync } from '@ifc-lite/spatial';
 const indexAsync = await buildSpatialIndexAsync(meshes);
 ```
 
+For precomputed boxes, `BVH.buildAsync(meshesWithBounds, budgetMs, yieldToEventLoop)`
+builds the same queryable index. `budgetMs` is an approximate time budget between
+checkpoints, not a hard maximum frame time. The caller supplies an async
+`yieldToEventLoop` callback that actually schedules a timer task (for example
+`new Promise(resolve => setTimeout(resolve, 0))`); an already-resolved promise
+does not give the browser a chance to paint. If the callback rejects,
+the build rejects and does not return a partial index. `buildSpatialIndexAsync`
+supplies its own browser scheduler and defaults to a 4 ms budget.
+
 ## Raycast (entity picking)
 
 ```typescript
+import { buildSpatialIndex } from '@ifc-lite/spatial';
+
+const index = buildSpatialIndex(meshes);
+
 const origin: [number, number, number] = [0, 5, 10];
 const direction: [number, number, number] = [0, -1, 0];
 
 const hits = index.raycast(origin, direction);
-// → expressIds of meshes the ray intersects, in hit order
+// → expressIds of meshes whose bounds intersect the ray; order is unspecified
 
-if (hits.length > 0) {
-  console.log(`First hit: expressId ${hits[0]}`);
-}
+console.log(`${hits.length} broad-phase candidates`);
 ```
 
 ## AABB query (region select)
 
 ```typescript
-const region = {
+import { buildSpatialIndex, type AABB } from '@ifc-lite/spatial';
+
+const index = buildSpatialIndex(meshes);
+
+const region: AABB = {
   min: [-5, 0, -5],
   max: [5, 3, 5],
-} as const;
+};
 
 const hits = index.queryAABB(region);
 // → expressIds of every mesh whose bounds intersect the box
@@ -52,9 +67,13 @@ console.log(`${hits.length} entities in region`);
 ## Frustum culling
 
 ```typescript
-import { FrustumUtils } from '@ifc-lite/spatial';
+import { buildSpatialIndex, FrustumUtils } from '@ifc-lite/spatial';
 
-// Build a frustum from a view-projection matrix (column-major 4×4)
+const index = buildSpatialIndex(meshes);
+
+// Your camera's view-projection matrix (column-major 4×4)
+declare const viewProjMatrix: Float32Array;
+
 const frustum = FrustumUtils.fromViewProjMatrix(viewProjMatrix);
 
 const visible = index.queryFrustum(frustum);

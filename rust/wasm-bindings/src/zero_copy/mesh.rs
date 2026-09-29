@@ -43,6 +43,9 @@ pub struct MeshDataJs {
     /// DiffuseColour (so the two would differ). Consumed by the GLB
     /// exporter's "Shading" colour-source option; renderers ignore it.
     shading_color: Option<[f32; 4]>,
+    /// IFC-authored metallic/roughness (#5582, see the getters below).
+    metallic: Option<f32>,
+    roughness: Option<f32>,
     /// Per-vertex texture coordinates (u, v pairs, 1:1 with positions),
     /// present only for textured meshes (#961). Empty otherwise.
     uvs: Vec<f32>,
@@ -106,6 +109,8 @@ impl Default for MeshDataJs {
             indices: Vec::new(),
             color: [0.0; 4],
             shading_color: None,
+            metallic: None,
+            roughness: None,
             uvs: Vec::new(),
             texture_rgba: Vec::new(),
             texture_width: 0,
@@ -169,6 +174,12 @@ impl MeshDataJs {
     pub fn shading_color(&self) -> Option<Vec<f32>> {
         self.shading_color.map(|c| c.to_vec())
     }
+
+    /// IFC-authored metallic/roughness (#5582). `undefined` when unauthored.
+    #[wasm_bindgen(getter)]
+    pub fn metallic(&self) -> Option<f32> { self.metallic }
+    #[wasm_bindgen(getter)]
+    pub fn roughness(&self) -> Option<f32> { self.roughness }
 
     /// Get vertex count
     #[wasm_bindgen(getter, js_name = vertexCount)]
@@ -287,10 +298,10 @@ impl MeshDataJs {
 impl MeshDataJs {
     /// Create new mesh data with IFC Z-up to WebGL Y-up conversion.
     ///
-    /// Performs coordinate conversion and winding order reversal in Rust
+    /// Performs coordinate conversion in Rust
     /// to avoid expensive per-vertex JS iteration (63.5M vertices for large files).
     /// IFC Z-up → WebGL Y-up: swap Y/Z, negate new Z for right-handedness.
-    /// Winding order reversed to compensate for the handedness flip.
+    /// This rotation has determinant +1, so triangle winding is preserved (#4056).
     pub fn new(express_id: u32, ifc_type: String, mut mesh: Mesh, color: [f32; 4]) -> Self {
         // Convert positions: IFC Z-up → WebGL Y-up
         for chunk in mesh.positions.chunks_exact_mut(3) {
@@ -306,13 +317,6 @@ impl MeshDataJs {
             let z = chunk[2];
             chunk[1] = z;
             chunk[2] = -y;
-        }
-
-        // Reverse winding order to compensate for handedness flip
-        let remainder = mesh.indices.len() % 3;
-        let end = mesh.indices.len() - remainder;
-        for i in (0..end).step_by(3) {
-            mesh.indices.swap(i + 1, i + 2);
         }
 
         // The per-element origin is a world-frame point and MUST undergo the
@@ -338,6 +342,8 @@ impl MeshDataJs {
             indices: mesh.indices,
             color,
             shading_color: None,
+            metallic: None,
+            roughness: None,
             uvs: Vec::new(),
             texture_rgba: Vec::new(),
             texture_width: 0,
@@ -379,10 +385,17 @@ impl MeshDataJs {
         self.shading_color = shading;
     }
 
+    /// Attach the IFC-authored metallic/roughness (#5582); the wasm batch stamps it
+    /// from `setStyleFinishes` by `geometry_item_id` (`MeshData` carries none).
+    pub fn set_material(&mut self, metallic: Option<f32>, roughness: Option<f32>) {
+        self.metallic = metallic;
+        self.roughness = roughness;
+    }
+
     /// Attach per-vertex UVs + a decoded RGBA8 texture (#961). UVs are 1:1 with
-    /// `positions` and need no coordinate flip (they are 2D); the winding
-    /// reversal in `new` swaps indices, not vertices, so per-vertex UVs stay
-    /// aligned. Call after `new`.
+    /// `positions` and need no coordinate flip (they are 2D). The rotation in
+    /// `new` preserves vertex and index order, so per-vertex UVs stay aligned.
+    /// Call after `new`.
     // Each arg is a distinct JS call parameter; a Rust struct would not reduce
     // arity for JS callers. Matches the 21 other sites in this crate.
     #[allow(clippy::too_many_arguments)]
@@ -425,7 +438,7 @@ impl MeshDataJs {
 
     /// Build from the canonical per-element producer's [`MeshData`]
     /// (`ifc_lite_processing::element`): wraps [`MeshDataJs::new`] (IFC Z-up →
-    /// WebGL Y-up + winding reversal), copies the `geometry_class` tag and the
+    /// WebGL Y-up rotation with preserved winding), copies the `geometry_class` tag and the
     /// optional texture/UVs. Element metadata the browser doesn't carry
     /// (global_id / name / presentation layer / material name / properties) is
     /// dropped — the viewer gets it from the parser worker instead.
@@ -446,6 +459,8 @@ impl MeshDataJs {
             // `new` applies the same Z-up→Y-up swap it applies to positions/origin.
             local_bounds: m.local_bounds,
             local_to_world: m.local_to_world,
+            welded_in_object_frame: false,
+            plane_tags: None,
         };
         let mut js = Self::new(m.express_id, m.ifc_type, mesh, m.color);
         js.set_geometry_class(m.geometry_class);
@@ -576,13 +591,12 @@ impl MeshCollection {
         self.rtc_offset_z
     }
 
-    /// Check if RTC offset is significant (>10km)
+    /// Check if an RTC offset was applied to these meshes (any non-zero
+    /// component). It can be inside 10 km: the placement-bounds fallback
+    /// re-bases on the bbox centre when a corner is past 10 km (#4643).
     #[wasm_bindgen(js_name = hasRtcOffset)]
     pub fn has_rtc_offset(&self) -> bool {
-        const THRESHOLD: f64 = 10000.0;
-        self.rtc_offset_x.abs() > THRESHOLD
-            || self.rtc_offset_y.abs() > THRESHOLD
-            || self.rtc_offset_z.abs() > THRESHOLD
+        self.rtc_offset_x != 0.0 || self.rtc_offset_y != 0.0 || self.rtc_offset_z != 0.0
     }
 
     /// Get building rotation angle in radians (from IfcSite placement)
@@ -701,21 +715,6 @@ impl MeshCollection {
     /// Set the building rotation angle in radians
     pub fn set_building_rotation(&mut self, rotation: Option<f64>) {
         self.building_rotation = rotation;
-    }
-
-    /// Apply RTC offset to all meshes (shift coordinates)
-    /// This is used when meshes are collected first and then shifted
-    pub fn apply_rtc_offset(&mut self, x: f64, y: f64, z: f64) {
-        self.rtc_offset_x = x;
-        self.rtc_offset_y = y;
-        self.rtc_offset_z = z;
-        for mesh in &mut self.meshes {
-            for chunk in mesh.positions.chunks_exact_mut(3) {
-                chunk[0] = (chunk[0] as f64 - x) as f32;
-                chunk[1] = (chunk[1] as f64 - y) as f32;
-                chunk[2] = (chunk[2] as f64 - z) as f32;
-            }
-        }
     }
 }
 

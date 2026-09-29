@@ -28,16 +28,22 @@ on:
     branches: [main]
     paths:
       - 'packages/bcf/**'
+      - 'packages/bcf-api/**'
+      - 'packages/cache/**'
       - 'packages/clash/**'
       - 'packages/cli/**'
+      - 'packages/codegen/**'
       - 'packages/collab/**'
       - 'packages/create/**'
       - 'packages/data/**'
       - 'packages/diff/**'
+      - 'packages/documents-api/**'
       - 'packages/drawing-2d/**'
       - 'packages/encoding/**'
       - 'packages/export/**'
       - 'packages/extensions/**'
+      - 'packages/flow/**'
+      - 'packages/flow-nodes/**'
       - 'packages/geometry/**'
       - 'packages/ids/**'
       - 'packages/ifcx/**'
@@ -46,16 +52,21 @@ on:
       - 'packages/mcp/**'
       - 'packages/merge/**'
       - 'packages/mutations/**'
+      - 'packages/opencde-foundation/**'
       - 'packages/parser/**'
       - 'packages/pointcloud/**'
       - 'packages/query/**'
+      - 'packages/rules/**'
+      - 'packages/regex-guard/**'
       - 'packages/sandbox/**'
       - 'packages/sdk/**'
       - 'packages/spatial/**'
       - 'packages/timing-ladder/**'
       - 'packages/viewer/**'
       - 'packages/wasm/**'
+      - 'packages/wasm-lifecycle/**'
       - 'packages/world-frame-fixtures/**'
+      - 'scripts/ci-run-sdk-canaries.mjs'
       - 'tests/extensions/canaries/**'
       - '.github/workflows/sdk-canary.yml'
 
@@ -72,7 +83,7 @@ env:
 jobs:
   canary:
     name: Run canary bundles
-    runs-on: ubuntu-latest
+    runs-on: ${{ (vars.SELF_HOSTED_CI == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'ci:hosted')))) && fromJSON('["self-hosted","linux","x64","ifclite"]') || 'ubuntu-latest' }}
     timeout-minutes: 15
 
     steps:
@@ -84,7 +95,7 @@ jobs:
       - name: Setup pnpm
         # v6 reads the pnpm version from the `packageManager` field in
         # package.json (`pnpm@10.8.1`); passing `with.version` would conflict.
-        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
 
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -99,6 +110,12 @@ jobs:
         uses: ./.github/actions/setup-wasm-build
         with:
           cache-prefix: sdk-canary
+          # This workflow runs on pull requests only, so nothing on main would
+          # ever seed its shared key; let the first PR write it and every later
+          # PR restore it. The write is skipped when the key already exists.
+          # Goes away when this job moves into test.yml on the build artifact
+          # (CI redesign, step 8).
+          save-if: 'true'
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -118,24 +135,4 @@ jobs:
       # tests/extensions/canaries/ is a bundle. We run the CLI's
       # `ext test` against every one; non-zero exit fails the job.
       - name: Run canary bundles
-        run: |
-          set -e
-          if [ ! -d tests/extensions/canaries ]; then
-            echo "No canary bundles in tests/extensions/canaries/; skipping."
-            exit 0
-          fi
-          failures=0
-          for dir in tests/extensions/canaries/*/; do
-            name=$(basename "$dir")
-            echo "::group::canary: $name"
-            if ! node packages/cli/dist/index.js ext test "$dir" --json; then
-              echo "::error::canary $name failed"
-              failures=$((failures+1))
-            fi
-            echo "::endgroup::"
-          done
-          if [ "$failures" -gt 0 ]; then
-            echo "$failures canary bundle(s) failed."
-            exit 1
-          fi
-          echo "All canary bundles passed."
+        run: node scripts/ci-run-sdk-canaries.mjs

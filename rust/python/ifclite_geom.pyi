@@ -4,7 +4,7 @@
 #
 # Type stubs for the ifclite-geom native extension.
 # Shipped next to the compiled module so editors and type checkers see the API.
-from typing import Any, Dict, List, Literal, Optional, TypedDict
+from typing import Any, Dict, List, Literal, Optional, Set, TypedDict, Union, overload
 
 Quality = Literal["lowest", "low", "medium", "high", "highest"]
 
@@ -22,6 +22,317 @@ class GeometryBuffers(TypedDict):
     rtc_offset: List[float]  # [x, y, z], already folded into vertices
     element_count: int
     elements: Dict[int, ElementBuffers]  # keyed by IFC STEP id
+
+class DirectrixLine(TypedDict):
+    type: Literal["line"]
+    start: List[float]
+    end: List[float]
+
+class DirectrixArc(TypedDict):
+    type: Literal["arc"]
+    center: List[float]
+    normal: List[float]
+    x_axis: List[float]
+    radius: float
+    start_angle: float
+    sweep_angle: float
+
+DirectrixSegment = Union[DirectrixLine, DirectrixArc]
+
+class CompleteDirectrix(TypedDict):
+    type: Literal["complete"]
+
+class UnsupportedDirectrix(TypedDict):
+    type: Literal["unsupported"]
+    reason: str
+
+DirectrixStatus = Union[CompleteDirectrix, UnsupportedDirectrix]
+
+class DirectrixSegmentMetrics(TypedDict):
+    segment_index: int  # index into Directrix
+    length: float  # world centreline metres
+    bend_angle: Optional[float]  # arc sweep magnitude in radians; None for lines
+
+class DirectrixMetrics(TypedDict):
+    total_length: float  # sum of segment centreline lengths in world metres
+    segments: List[DirectrixSegmentMetrics]
+
+class SweptDiskNominalQuantities(TypedDict):
+    cross_section_area: float  # m², outer disk minus an optional inner disk
+    nominal_volume: float  # m³, area × complete centreline length
+    outer_lateral_area: float  # m², outer circumference × length
+    inner_lateral_area: Optional[float]  # m² for a hollow section
+
+class SweptDiskOccurrence(TypedDict):
+    solid_id: int
+    directrix_id: int
+    Radius: float  # world radius when complete; authored radius in metres when unsupported
+    InnerRadius: Optional[float]  # same coordinate rule as Radius
+    Directrix: List[DirectrixSegment]  # IFC Z-up, absolute world metres
+    directrix_metrics: Optional[DirectrixMetrics]  # None when status is unsupported
+    nominal_quantities: Optional[SweptDiskNominalQuantities]  # uncut source estimate only
+    status: DirectrixStatus
+    mapping_path: List[int]
+    source_modified: bool  # source operand may differ from final boolean result
+
+class GeometryBuffersWithDirectrices(GeometryBuffers):
+    swept_disks: Dict[int, List[SweptDiskOccurrence]]
+    directrix_diagnostics: List[str]
+
+SweptDiskFindingCode = Literal[
+    "zero_length_segment", "consecutive_gap", "tangent_discontinuity",
+    "arc_radius_not_greater_than_disk_radius",
+]
+
+class SweptDiskCheckFinding(TypedDict):
+    code: SweptDiskFindingCode
+    segment_index: int  # index into the source Directrix
+    next_segment_index: Optional[int]  # populated for a join between segments
+    measured: float
+    threshold: float
+    units: str  # "m" or "rad"
+
+class SweptDiskCheckReport(TypedDict):
+    source_modified: bool  # source sweep may differ from the final CSG result
+    skipped_reason: Optional[str]  # unsupported analytic description
+    findings: List[SweptDiskCheckFinding]
+
+class SweptDiskCheckEntry(TypedDict):
+    occurrence_index: int  # index into this product's swept_disks list
+    solid_id: int
+    directrix_id: int
+    mapping_path: List[int]
+    report: SweptDiskCheckReport
+
+class SweptDiskChecks(TypedDict):
+    elements: Dict[int, List[SweptDiskCheckEntry]]  # occurrence STEP ID
+    diagnostics: List[str]  # representation traversal problems
+
+class SweptDiskSourceKey(TypedDict):
+    model_sha256: str
+    schema: Optional[str]
+    length_unit_scale_bits: str  # 16 hex digits; exact f64 bit pattern
+    context: Dict[str, Any]  # direct representation_id or mapped representation_map_path
+    solid_id: int
+
+class SweptDiskDefinition(TypedDict):
+    key: SweptDiskSourceKey
+    directrix_id: int
+    Radius: float  # raw IFC file length units
+    InnerRadius: Optional[float]  # raw IFC file length units
+    Directrix: List[DirectrixSegment]  # raw IFC file length units
+    status: DirectrixStatus
+
+class SweptDiskInstance(TypedDict):
+    ordinal: int
+    source: SweptDiskSourceKey
+    product_id: int
+    solid_id: int
+    mapping_path: List[int]
+    source_modified: bool
+    world_from_source: Optional[List[float]]  # column-major f64, file units to world metres
+    status: DirectrixStatus
+
+class SweptDiskDefinitions(TypedDict):
+    up_axis: str
+    source_units: str
+    world_units: str
+    coordinate_space: str
+    model_sha256: str
+    schema: Optional[str]
+    length_unit_scale: float
+    sources: List[SweptDiskDefinition]
+    instances: Dict[int, List[SweptDiskInstance]]
+    diagnostics: List[str]
+
+AnalyticSourceKey = SweptDiskSourceKey
+ExtrusionInstance = SweptDiskInstance
+
+class AnalyticProfileLoop(TypedDict):
+    kind: Literal["outer", "inner"]
+    segments: List[DirectrixSegment]
+    signed_area: float  # raw IFC file units squared
+    perimeter: float  # raw IFC file length units
+
+class AnalyticProfile(TypedDict):
+    profile_id: int
+    ifc_type_name: str
+    ProfileType: Optional[str]
+    Position: Optional[int]
+    profile_position: Optional[List[float]]  # column-major, raw file units
+    loops: List[AnalyticProfileLoop]
+    status: DirectrixStatus
+
+class AnalyticExtrusion(TypedDict):
+    solid_id: int
+    SweptArea: Optional[int]
+    profile: Optional[AnalyticProfile]
+    Position: Optional[int]
+    position_matrix: Optional[List[float]]  # column-major, raw file units
+    ExtrudedDirection: Optional[int]
+    DirectionRatios: Optional[List[float]]  # authored ratios, not normalized
+    axis_unit_vector: Optional[List[float]]
+    Depth: Optional[float]  # raw IFC file length units
+    status: DirectrixStatus
+
+class ExtrusionDefinition(TypedDict):
+    key: AnalyticSourceKey
+    source: AnalyticExtrusion
+    nominal_quantities: Optional[ExtrusionNominalQuantities]  # raw IFC file units
+
+class ExtrusionNominalQuantities(TypedDict):
+    profile_area: float  # squared IFC file-length units
+    projected_height: float  # IFC file-length units
+    nominal_volume: float  # cubed IFC file-length units
+
+class ExtrusionDefinitions(TypedDict):
+    up_axis: str
+    source_units: str
+    world_units: str
+    coordinate_space: str
+    model_sha256: str
+    schema: Optional[str]
+    length_unit_scale: float
+    sources: List[ExtrusionDefinition]
+    instances: Dict[int, List[ExtrusionInstance]]
+    diagnostics: List[str]
+
+class QuantityUnit(TypedDict):
+    symbol: str
+    si_scale: float
+    source: Literal["explicit", "project", "si_default", "dimensionless"]
+    unit_id: Optional[int]
+    UnitType: Optional[str]  # IFC IfcNamedUnit.UnitType token, if resolved
+
+class AuthoredQuantity(TypedDict):
+    set_name: str  # exact IfcElementQuantity.Name
+    quantity_name: str  # exact IfcPhysicalSimpleQuantity.Name
+    set_id: int
+    quantity_id: int
+    kind: Literal["IfcQuantityLength", "IfcQuantityArea", "IfcQuantityVolume", "IfcQuantityCount", "IfcQuantityNumber", "IfcQuantityWeight", "IfcQuantityTime"]
+    value: float  # authored value, never replaced by a derived estimate
+    origin: Literal["occurrence", "type"]
+    type_id: Optional[int]
+    unit: Optional[QuantityUnit]
+    unit_diagnostic: Optional[str]
+
+class QuantityConflict(TypedDict):
+    set_name: str
+    quantity_name: str
+    occurrence_quantity_ids: List[int]
+    type_quantity_ids: List[int]
+
+class ProductQuantities(TypedDict):
+    ifc_type: str
+    authored: List[AuthoredQuantity]
+    conflicts: List[QuantityConflict]
+
+class AuthoredQuantityAnalysis(TypedDict):
+    product_count: int  # IFC product entities, not physical bars or source solids
+    products: Dict[int, ProductQuantities]
+    diagnostics: List[str]
+
+class DerivedQuantity(TypedDict):
+    name: str
+    value: float
+    unit: str  # m/m2/m3 for disks; raw IFC file units for extrusions
+    formula: str
+    origin: Literal["derived", "authored_source_parameter"]
+    source_solid_ids: List[int]
+    limitation: str
+    status: Literal["complete", "source_modified", "unsupported"]
+
+class QuantitySourceOccurrence(TypedDict):
+    source_kind: Literal["IfcSweptDiskSolid", "IfcExtrudedAreaSolid"]
+    source: AnalyticSourceKey
+    ordinal: int
+    solid_id: int
+    mapping_path: List[int]
+    source_modified: bool
+    status: Literal["complete", "source_modified", "unsupported"]
+    status_reason: Optional[str]
+    quantities: List[DerivedQuantity]
+
+class ProductQuantityAnalysis(TypedDict):
+    ifc_type: str
+    authored: List[AuthoredQuantity]
+    conflicts: List[QuantityConflict]
+    source_occurrence_count: int
+    unique_source_count: int
+    sources: List[QuantitySourceOccurrence]
+    product_total: Optional[float]
+    aggregate_diagnostic: str
+
+class QuantityAnalysis(TypedDict):
+    product_count: int
+    source_occurrence_count: int
+    unique_source_count: int
+    products: Dict[int, ProductQuantityAnalysis]
+    diagnostics: List[str]
+
+class AuthoredRebarText(TypedDict):
+    kind: Literal["text"]
+    value: str
+
+class AuthoredRebarMeasure(TypedDict):
+    kind: Literal["measure"]
+    value_file_units: float
+    value_si: float
+    si_unit: Literal["m", "m2"]
+
+class AuthoredRebarAttribute(TypedDict):
+    source: Literal["occurrence", "type"]
+    source_id: int
+    value: Union[AuthoredRebarText, AuthoredRebarMeasure]
+
+class RebarSweepPreflightFields(TypedDict, total=False):
+    preflight: RebarPreflightReport
+
+class RebarSweep(RebarSweepPreflightFields):
+    occurrence_index: int
+    source: Optional[SweptDiskSourceKey]  # None when definition output budget was exhausted
+    solid_id: int
+    directrix_id: int
+    mapping_path: List[int]
+    source_modified: bool
+    status: DirectrixStatus
+    radius_m: float
+    inner_radius_m: Optional[float]
+    directrix_metrics: Optional[DirectrixMetrics]
+    checks: SweptDiskCheckReport
+
+class RebarPreflightComparison(TypedDict):
+    kind: Literal["inside_bend_radius", "straight_segment_length", "developed_centreline_length"]
+    segment_index: Optional[int]
+    measured_m: float
+    limit_m: float
+    passed: bool
+
+class RebarPreflightReport(TypedDict):
+    skipped_reason: Optional[str]
+    comparisons: Optional[List[RebarPreflightComparison]]
+    unassessed_reasons: List[str]
+
+class RebarRowPreflightFields(TypedDict, total=False):
+    preflight_skipped_reason: str
+
+class RebarScheduleRow(RebarRowPreflightFields):
+    GlobalId: Optional[str]
+    Name: Optional[str]
+    type_id: Optional[int]
+    authored: Dict[str, AuthoredRebarAttribute]  # exact EXPRESS names
+    sweeps: List[RebarSweep]
+    geometry_unavailable_reason: Optional[str]
+    diagnostics: List[str]
+
+class RebarSchedule(TypedDict):
+    units: Literal["m"]
+    coordinate_space: Literal["absolute_ifc_world"]
+    length_unit_scale: float
+    bar_entity_count: int
+    represented_sweep_count: int
+    rows: Dict[int, RebarScheduleRow]
+    diagnostics: List[str]
 
 class PropValue(TypedDict):
     name: str
@@ -66,8 +377,22 @@ class EntityData(TypedDict):
     entity_count: int
     entities: Dict[int, EntityRow]  # keyed by IFC STEP id, in file order
 
+@overload
 def geometry_data_buffers(
-    ifc_bytes: bytes, quality: Optional[Quality] = None
+    ifc_bytes: bytes,
+    quality: Optional[Quality] = None,
+    ids: Optional[Set[int]] = None,
+    *,
+    include_directrices: Literal[True],
+) -> GeometryBuffersWithDirectrices: ...
+
+@overload
+def geometry_data_buffers(
+    ifc_bytes: bytes,
+    quality: Optional[Quality] = None,
+    ids: Optional[Set[int]] = None,
+    *,
+    include_directrices: bool = False,
 ) -> GeometryBuffers:
     """Tessellate IFC bytes; return per-entity geometry with vertices/faces as
     raw little-endian byte buffers (f64 xyz triplets, u32 triangle indices) for
@@ -83,19 +408,41 @@ def geometry_data_buffers(
     is roughly a tenth of ``"medium"``'s triangle budget on curve-heavy
     elements such as reinforcing bars.
 
+    ``ids`` optionally restricts tessellation to those IFC STEP ids. ``None``
+    preserves the unfiltered behaviour; an empty set returns no elements, and
+    ids absent from the file are ignored. Relationship and representation
+    dependencies needed by selected products are still resolved.
+
+    ``include_directrices=True`` adds ``swept_disks`` (keyed by occurrence STEP
+    id) and ``directrix_diagnostics``. Each sweep preserves its IFC Radius,
+    InnerRadius, ordered analytic line/arc Directrix, and centreline lengths and
+    arc bend angles in ``directrix_metrics``. Lengths are world metres and bend
+    angles are positive radians; the signed arc ``sweep_angle`` retains travel
+    direction. Complete, unmodified source sweeps also have
+    ``nominal_quantities`` in m²/m³. Unsupported or boolean-modified sweeps
+    have ``directrix_metrics=None`` or ``nominal_quantities=None`` as applicable.
+
     Raises:
         RuntimeError: the geometry pipeline failed.
         ValueError: ``quality`` is not a recognised label.
     """
     ...
 
-def geometry_data_json(ifc_bytes: bytes, quality: Optional[Quality] = None) -> str:
+def geometry_data_json(
+    ifc_bytes: bytes,
+    quality: Optional[Quality] = None,
+    ids: Optional[Set[int]] = None,
+    *,
+    include_directrices: bool = False,
+) -> str:
     """Tessellate IFC bytes; return the ``ifc-lite-geometry-data`` JSON document
     as a string (call ``json.loads`` on it).
 
     Same geometry as :func:`geometry_data_buffers`, but vertices/faces are JSON
     arrays (no numpy needed) and each element also carries ``global_id`` and
-    ``name`` when present. ``quality`` is as documented there.
+    ``name`` when present. ``quality`` and ``ids`` are as documented there.
+    ``include_directrices=True`` adds the same swept-disk descriptions with
+    JSON object keys for occurrence STEP ids.
 
     Raises:
         RuntimeError: the geometry pipeline failed.
@@ -103,6 +450,102 @@ def geometry_data_json(ifc_bytes: bytes, quality: Optional[Quality] = None) -> s
             serialization failed.
     """
     ...
+
+def check_swept_disks(
+    ifc_bytes: bytes,
+    ids: Optional[Set[int]] = None,
+    *,
+    zero_length_tolerance_m: float = 1e-9,
+    gap_tolerance_m: float = 1e-6,
+    tangent_tolerance_rad: float = 1e-6,
+) -> SweptDiskChecks:
+    """Check exact authored swept-disk paths without tessellating.
+
+    Returns reports keyed by occurrence STEP id. Multiple sweeps in an
+    occurrence remain separate entries with their source solid, directrix and
+    mapped-item path. ``findings`` describe numerical path continuity in
+    absolute IFC world metres or radians, not fabrication compliance. A sweep
+    whose analytic description is unsupported has ``skipped_reason`` and no
+    partial findings. A CSG operand is checked as authored and carries
+    ``source_modified=True``; its final post-CSG body may differ.
+
+    ``ids`` filters product occurrences, as in ``geometry_data_buffers``. All
+    three tolerances must be finite and nonnegative, including for empty input.
+
+    Raises:
+        ValueError: invalid tolerance.
+        RuntimeError: extraction worker failed.
+    """
+    ...
+
+def swept_disk_definitions(
+    ifc_bytes: bytes,
+    ids: Optional[Set[int]] = None,
+) -> SweptDiskDefinitions:
+    """Extract reusable raw `IfcSweptDiskSolid` sources and f64 world instances.
+
+    `world_from_source` maps raw file-unit IFC Z-up coordinates to absolute
+    world metres; `None` means the transform was invalid. Nonuniform world
+    disks have unsupported instance status, while their source is preserved.
+    """
+    ...
+
+def extrusion_definitions(
+    ifc_bytes: bytes,
+    ids: Optional[Set[int]] = None,
+) -> ExtrusionDefinitions:
+    """Extract exact authored extrusion sources and f64 placed occurrences.
+
+    For a profile point, apply profile_position, then position_matrix, then
+    world_from_source. The last matrix maps raw IFC file units to absolute IFC
+    Z-up world metres. CSG operand sources carry source_modified=True because
+    their final body may differ. Unsupported sources retain an explicit status.
+    """
+    ...
+
+def quantity_analysis(
+    ifc_bytes: bytes,
+    ids: Optional[Set[int]] = None,
+) -> QuantityAnalysis:
+    """Join authored quantities and canonical analytic source occurrences.
+
+    Every derived value is nominal; product_total remains None with a reason.
+    Source counts and IFC product counts have distinct meanings.
+    """
+    ...
+
+def authored_quantity_analysis(
+    ifc_bytes: bytes,
+    ids: Optional[Set[int]] = None,
+) -> AuthoredQuantityAnalysis:
+    """Read exact authored IFC quantities per product STEP id without meshing.
+
+    Occurrence and type-inherited values remain separate; conflicts are explicit.
+    Unit failures are diagnostics, not guessed project-length conversions.
+    This view has no derived estimate, physical bar count or material takeoff.
+    """
+    ...
+
+def rebar_schedule(
+    ifc_bytes: bytes,
+    ids: Optional[Set[int]] = None,
+    *,
+    zero_length_tolerance_m: float = 1e-9,
+    gap_tolerance_m: float = 1e-6,
+    tangent_tolerance_rad: float = 1e-6,
+) -> RebarSchedule: ...
+
+def rebar_schedule_with_preflight(
+    ifc_bytes: bytes,
+    min_inside_bend_radius_m: float,
+    min_straight_segment_length_m: float,
+    ids: Optional[Set[int]] = None,
+    *,
+    max_developed_centreline_length_m: Optional[float] = None,
+    zero_length_tolerance_m: float = 1e-9,
+    gap_tolerance_m: float = 1e-6,
+    tangent_tolerance_rad: float = 1e-6,
+) -> RebarSchedule: ...
 
 def entity_data(
     ifc_bytes: bytes,

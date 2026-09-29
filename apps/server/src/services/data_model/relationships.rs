@@ -4,6 +4,7 @@
 
 //! Relationship extraction.
 
+use super::generated::{relationship_slots, RelationshipSlots};
 use super::types::{EntityJob, Relationship};
 use ifc_lite_core::{DecodedEntity, EntityDecoder};
 use rayon::prelude::*;
@@ -15,24 +16,18 @@ pub(super) fn extract_relationships(
     content: &Arc<Vec<u8>>,
     entity_index: &Arc<ifc_lite_core::EntityIndex>,
 ) -> Vec<Relationship> {
-    // Filter for relationship entities
-    let rel_types = [
-        "IFCRELCONTAINEDINSPATIALSTRUCTURE",
-        "IFCRELAGGREGATES",
-        "IFCRELDEFINESBYPROPERTIES",
-        "IFCRELDEFINESBYTYPE",
-        "IFCRELASSOCIATESMATERIAL",
-        "IFCRELASSOCIATESCLASSIFICATION",
-        "IFCRELASSOCIATESDOCUMENT",
-        "IFCRELVOIDSELEMENT",
-        "IFCRELFILLSELEMENT",
-    ];
-
+    // The schema-derived gate (issue #4205): a type is a relationship job iff
+    // the generated table (apps/server/.../generated/relationship_slots.rs,
+    // derived from @ifc-lite/parser's relationship-schema-slots.ts) has a
+    // slot plan for it. This replaces a hand-written 13-entry array that
+    // silently dropped every `IfcRelationship` subtype outside it — using the
+    // slot lookup itself as the gate means there is exactly one table to keep
+    // in sync with the schema, not two that can drift apart.
     let rel_jobs: Vec<_> = jobs
         .iter()
         .filter(|job| {
             let type_upper = job.type_name.to_uppercase();
-            rel_types.iter().any(|&rt| type_upper == rt)
+            relationship_slots(&type_upper).is_some()
         })
         .collect();
 
@@ -45,7 +40,7 @@ pub(super) fn extract_relationships(
                 EntityDecoder::with_arc_index(content.as_slice(), entity_index.clone());
             let entity = local_decoder.decode_at(job.start, job.end).ok()?;
 
-            extract_relationship(&entity, &job.type_name)
+            extract_relationship(&entity, &job.type_name, job.id)
         })
         .flatten()
         .collect();
@@ -98,6 +93,9 @@ fn extract_type_property_links(
                         if let Some(set_id) = set_ref.as_entity_ref() {
                             out.push(Relationship {
                                 rel_type: "TYPEHASPROPERTYSETS".to_string(),
+                                // Synthetic: read off IfcTypeObject.HasPropertySets,
+                                // so there is no IfcRel entity to name here.
+                                rel_id: 0,
                                 relating_id: set_id,
                                 related_id: type_id,
                             });
@@ -111,60 +109,66 @@ fn extract_type_property_links(
 }
 
 /// Extract relationship from entity (may return multiple if related[] has multiple items).
-fn extract_relationship(entity: &DecodedEntity, type_name: &str) -> Option<Vec<Relationship>> {
+fn extract_relationship(
+    entity: &DecodedEntity,
+    type_name: &str,
+    rel_id: u32,
+) -> Option<Vec<Relationship>> {
     let type_upper = type_name.to_uppercase();
 
-    // IfcRelVoidsElement / IfcRelFillsElement carry a SINGLE related ref, not a
-    // list, so the list-based path below would call `get_list(5)` on a single
-    // entity ref, get None, and silently drop the relationship. Read both refs
-    // directly. Attribute layout (IFC2X3/4/4X3, both extend IfcRelConnects):
-    //   IfcRelVoidsElement(RelatingBuildingElement=4, RelatedOpeningElement=5)
-    //   IfcRelFillsElement(RelatingOpeningElement=4, RelatedBuildingElement=5)
-    if type_upper == "IFCRELVOIDSELEMENT" || type_upper == "IFCRELFILLSELEMENT" {
-        let relating_id = entity.get_ref(4)?;
-        let related_id = entity.get_ref(5)?;
-        return Some(vec![Relationship {
-            rel_type: type_name.to_string(),
-            relating_id,
-            related_id,
-        }]);
-    }
+    // Schema-derived slot plan (issue #4205): the generated table already
+    // encodes ABSOLUTE attribute positions and whether `related` is a
+    // LIST/SET or a single reference — derived from the same
+    // relationship-schema-slots.ts the TS/WASM columnar parser uses, so this
+    // stays correct for every concrete `IfcRelationship` subtype without a
+    // per-type match here. `extract_relationships` already filtered `jobs`
+    // down to types this resolves, but re-check defensively (`?` below) in
+    // case of a future caller.
+    let slots: RelationshipSlots = relationship_slots(&type_upper)?;
 
-    let (relating_idx, related_idx) = match type_upper.as_str() {
-        "IFCRELDEFINESBYPROPERTIES" => (5, 4), // RelatingPropertyDefinition at 5, RelatedObjects at 4
-        // RelatingType (single ref) at 5, RelatedObjects (list) at 4 — same
-        // layout as DefinesByProperties. Without this arm it hit the `_`
-        // default `(4,5)`, and `get_ref(4)` on the RelatedObjects LIST returned
-        // None, silently dropping every type relationship (issue #1751).
-        "IFCRELDEFINESBYTYPE" => (5, 4),
-        "IFCRELCONTAINEDINSPATIALSTRUCTURE" => (5, 4), // RelatingStructure at 5, RelatedElements at 4
-        // IfcRelAssociates* family: RelatingX (Material/Classification/Document)
-        // is the single ref at attribute 5; RelatedObjects is the list at 4.
-        "IFCRELASSOCIATESMATERIAL"
-        | "IFCRELASSOCIATESCLASSIFICATION"
-        | "IFCRELASSOCIATESDOCUMENT" => (5, 4),
-        _ => (4, 5), // Standard: RelatingObject at 4, RelatedObjects at 5
+    // `relating` is schema-legally a grouped aggregate for exactly one
+    // concrete subtype (`IFCRELDEFINESBYPROPERTIES.RelatingPropertyDefinition`
+    // — see `relating_is_list`'s doc comment in the generated table).
+    // `get_ref` returns `None` for a list-valued attribute (it delegates to
+    // `AttributeValue::as_entity_ref`, which only recognises a bare
+    // reference), so calling it unconditionally silently dropped the WHOLE
+    // relationship for a grouped `IfcPropertySetDefinitionSet` — every
+    // related object lost all properties/quantities from that pset group.
+    // `get_refs` accepts both a bare ref and a list, mirroring the TS/WASM
+    // path's `readRefList` (`columnar-parser-relationships.ts`), which reads
+    // `RelatingPropertyDefinition` as a ref list unconditionally and applies
+    // EVERY entry in the group to EVERY related object — reproduced below as
+    // the same cross product, not just the first entry.
+    let relating_ids: Vec<u32> = if slots.relating_is_list {
+        entity.get_refs(slots.relating_idx as usize)?
+    } else {
+        vec![entity.get_ref(slots.relating_idx as usize)?]
     };
 
-    let relating_id = entity.get_ref(relating_idx)?;
-    let related_list = entity.get_list(related_idx)?;
+    let related_ids: Vec<u32> = if slots.related_is_list {
+        let related_list = entity.get_list(slots.related_idx as usize)?;
+        related_list
+            .iter()
+            .filter_map(|v| v.as_entity_ref())
+            .collect()
+    } else {
+        vec![entity.get_ref(slots.related_idx as usize)?]
+    };
 
-    let related_ids: Vec<u32> = related_list
-        .iter()
-        .filter_map(|v| v.as_entity_ref())
-        .collect();
-
-    if related_ids.is_empty() {
+    if relating_ids.is_empty() || related_ids.is_empty() {
         return None;
     }
 
     Some(
-        related_ids
+        relating_ids
             .into_iter()
-            .map(|related_id| Relationship {
-                rel_type: type_name.to_string(),
-                relating_id,
-                related_id,
+            .flat_map(|relating_id| {
+                related_ids.iter().map(move |&related_id| Relationship {
+                    rel_type: type_name.to_string(),
+                    rel_id,
+                    relating_id,
+                    related_id,
+                })
             })
             .collect(),
     )

@@ -101,19 +101,47 @@ if (WorkerParser.isSupported()) {
   new Uint8Array(sab).set(new Uint8Array(buffer));
 
   const parser = new WorkerParser();
-  const store = await parser.parseColumnar(sab, {
-    onProgress: ({ phase, percent }) => {
-      // Updates from worker thread
-      updateProgressUI(phase, percent);
+  const controller = new AbortController();
+  try {
+    const store = await parser.parseColumnar(sab, {
+      signal: controller.signal,
+      onProgress: ({ phase, percent }) => {
+        // Updates from worker thread
+        updateProgressUI(phase, percent);
+      }
+    });
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      // Cancelled — see below.
+    } else {
+      throw err;
     }
-  });
-  // The worker self-terminates after each parse; call parser.terminate()
-  // only to cancel an in-flight parse early.
+  }
+  // The worker self-terminates after each parse. To cancel an in-flight
+  // parse early, either abort `controller` or call `parser.terminate()`;
+  // both terminate the worker and reject the pending promise, so `await`
+  // never hangs. `controller.abort()` rejects with `signal.reason`: an
+  // `AbortError` by default, but a custom `controller.abort(reason)` rejects
+  // with that reason instead, so the `AbortError` check above won't match it.
+  // `parser.terminate()` always rejects with an `AbortError`. Each
+  // `parseColumnar` call has its own worker: aborting one call's signal
+  // cancels only that parse, while `terminate()` cancels every in-flight parse.
 } else {
   // Fall back to the in-process parser (no SAB / not cross-origin isolated)
   const store = await new IfcParser().parseColumnar(buffer);
 }
 ```
+
+For an integrated geometry/parser load, both `WorkerParser.parseColumnar` and
+`GeometryProcessor.processAdaptive` accept an optional `sourceFingerprint` cell.
+Use a fresh 16-byte `SharedArrayBuffer` for each immutable source and pass that
+same cell to both calls. Its four unsigned 32-bit words hold source length low
+and high halves, hash, and readiness; initialize only the two length words before
+starting either call. Never reuse a cell for another source or load. The existing
+prepass worker computes the full-source key when its WASM supports that operation;
+the parser uses it only if ready, otherwise it computes the same key itself without
+waiting. Omitting the cell retains ordinary parsing behavior. This optimization
+does not change partial/final source accessor identity or cache keys.
 
 ### Streaming Geometry
 
@@ -285,9 +313,19 @@ const result = await parseAuto(zipBuffer);
 const ifcBuffer = await unwrapIfcZip(zipBuffer);
 ```
 
-Referenced resources inside the archive (textures, documents) are not
-extracted — only the model file's bytes. An archive with zero or more than
-one `.ifc`/`.ifcxml` entry throws rather than guessing which one to load.
+`unwrapIfcZip` returns only model bytes. For textured archives, call
+`unwrapIfcZipWithResources`: its `resources` map resolves PNG/JPEG images by
+lowercased basename (first entry wins), while `originalResources` preserves
+each archive path using the same byte arrays. `modelPath` identifies the IFC
+entry; keep that path and the original image paths when repackaging a model
+whose texture references are relative. Non-zip input returns empty resource
+maps and no `modelPath`. Image extraction applies per-entry and aggregate
+size/count limits. `resourcesIncomplete` is true when those budgets omit at
+least one image; a portable exporter must report this rather than claim all
+resources were preserved. Other resource formats are not extracted.
+
+An archive with zero or more than one `.ifc`/`.ifcxml` entry throws rather
+than guessing which one to load.
 
 ### Direct IFCX Parsing
 
@@ -370,6 +408,11 @@ const path = result.idToPath.get(wallId);
 const id = result.pathToId.get(path);
 ```
 
+`spatialHierarchy.getContainingSpace(elementId)` reads the live canonical
+containment index. It resolves a directly contained element or aggregated
+descendant to its nearest containing space, and reflects authored containment
+changes and Undo without rebuilding the hierarchy.
+
 ## Server-Side Parsing
 
 For production deployments, use the server for parallel processing and caching:
@@ -393,6 +436,19 @@ await client.parseParquetStream(file, (batch) => {
 ```
 
 See the [Server Guide](server.md) for complete server documentation.
+
+### Native Rust decoder scratch buffers
+
+For repeated native decoding, caller-owned scratch vectors can be reused with
+`EntityDecoder::get_entity_ref_list_fast_into(entity_id, &mut ids)` and
+`get_polyloop_coords_cached_into(entity_id, &mut coords)`. Each replaces the
+buffer contents and returns `Some(())` on success or `None` with an empty buffer
+on failure. The reference-list helper preserves authored order and duplicates,
+dropping oversized references. The PolyLoop helper preserves coordinate order
+and rejects the whole loop for missing or oversized point references; points
+already resolved remain in the decoder's existing point cache even on failure.
+Both retain the behavior of their allocating convenience accessors. The caller
+controls scratch-vector lifetime; reuse does not promise physical memory release.
 
 ## Parse Options
 
@@ -468,10 +524,21 @@ interface IfcDataStore {
 }
 ```
 
+Source-empty server stores can provide `resolvedClassifications`, an optional map from entity express IDs to `ClassificationInfo[]`. `extractClassificationsOnDemand` combines the entity's rows with those inherited through `IfcRelDefinesByType`, using the relationship graph to confirm classification associations. The server derives classifications and relationships from the same immutable IFC input. Repeated relationships may produce multiple resolved rows for one deduplicated graph edge. When resolved rows are absent, the parser returns unresolved markers instead of certifying classification attributes. Source-bearing stores continue to decode classifications from their IFC bytes.
+
+### Native Rust owned index columns
+
+`ColumnarEntityIndex::from_owned_columns(ids, starts, lengths)` consumes three
+`Vec<u32>` columns. Like the borrowed `from_columns` constructor, it sorts when
+needed, keeps the last input occurrence of duplicate IDs, and returns an empty
+index for empty or mismatched columns. Already sorted, unique columns retain
+their existing allocations. Use `from_columns` when the caller must keep owning
+its input vectors.
+
 ## Spatial Hierarchy
 
 ```typescript
-import { IfcTypeEnum } from '@ifc-lite/data';
+import { IfcTypeEnum, type SpatialNode } from '@ifc-lite/data';
 
 // spatialHierarchy is optional on IfcDataStore; guard before use
 const hierarchy = store.spatialHierarchy;
@@ -480,20 +547,25 @@ if (!hierarchy) throw new Error('No spatial hierarchy in this model');
 // Project structure
 console.log(`Project: ${hierarchy.project.name}`);
 
+// Storeys are NOT direct children of the project: the tree is
+// Project -> Site -> Building -> Storey, so walk it rather than reading
+// `project.children` directly.
+function* storeysOf(node: SpatialNode): Generator<SpatialNode> {
+  if (node.type === IfcTypeEnum.IfcBuildingStorey) yield node;
+  for (const child of node.children ?? []) yield* storeysOf(child);
+}
+
 // Navigate storeys (SpatialNode.type is a numeric IfcTypeEnum)
-for (const child of hierarchy.project.children) {
-  if (child.type === IfcTypeEnum.IfcBuildingStorey) {
-    const storey = child;
-    console.log(`Storey: ${storey.name}`);
+for (const storey of storeysOf(hierarchy.project)) {
+  console.log(`Storey: ${storey.name}`);
 
-    // Get elements on this storey (byStorey is keyed by the storey express id)
-    const elements = hierarchy.byStorey.get(storey.expressId) ?? [];
-    console.log(`  Elements: ${elements.length}`);
+  // Get elements on this storey (byStorey is keyed by the storey express id)
+  const elements = hierarchy.byStorey.get(storey.expressId) ?? [];
+  console.log(`  Elements: ${elements.length}`);
 
-    // Get storey elevation
-    const elevation = hierarchy.storeyElevations.get(storey.expressId);
-    console.log(`  Elevation: ${elevation}m`);
-  }
+  // Get storey elevation
+  const elevation = hierarchy.storeyElevations.get(storey.expressId);
+  console.log(`  Elevation: ${elevation}m`);
 }
 
 // Find storey for an element
@@ -502,16 +574,24 @@ const storeyId = hierarchy.elementToStorey.get(wallId);
 
 ## Schema Support
 
-| Schema | Entities | Status |
-|--------|----------|--------|
-| IFC2X3 | - | :material-check: Supported |
-| IFC4 | 776 | :material-check: Full Support |
-| IFC4X3 | 876 | :material-check: Supported |
-| IFC5 (IFCX) | - | :material-check: Beta |
+IFC2X3, IFC4 and IFC4X3 are parsed with the same pipeline; the runtime schema
+registry itself is generated from IFC4. IFC5 (IFCX) support is a separate,
+beta code path (`@ifc-lite/ifcx`) not covered by the entity tables below.
 
-Entity counts are taken from the EXPRESS schemas the code generators consume
-(`IFC4_ADD2_TC1`, `IFC4X3`). IFC2X3 files are parsed with the same pipeline;
-the runtime schema registry itself is generated from IFC4.
+Per-entity support for IFC2X3/IFC4/IFC4X3 — whether each concrete class is
+in the schema registry at all, resolves to a real internal type instead of
+being dropped, is routed to a geometry processor, can be created by
+`@ifc-lite/create`, and converts across schema versions — is generated
+directly from source, not hand-maintained, in the
+[coverage ledger](../architecture/coverage-ledger.md).
+
+### Native Rust geometry classification
+
+`ifc_lite_core::geometry_flags_by_name(type_name)` returns
+`(has_geometry, is_representationless_spatial_container)`, using the same
+case normalization and legacy-type rules as the two individual predicates.
+These flags classify a type; they do not establish whether a particular record
+contains a usable representation.
 
 ### Schema Registry
 
@@ -676,3 +756,13 @@ When working with multiple IFC files (e.g., architectural, structural, and MEP m
 - [Query Guide](querying.md) - Query parsed data
 - [Federation Guide](federation.md) - Load and coordinate multiple models
 - [API Reference](../api/typescript.md) - Complete API docs
+
+### Borrowing compact entity columns
+
+`CompactEntityIndex.getColumns()` exposes the four numeric backing arrays (`expressIds`, `byteOffsets`, `byteLengths`, `typeIndices`) and a copy of the `typeStrings` list. This supports column-aware consumers such as binary cache serialization without creating a reference object for every entity.
+
+The numeric arrays are borrowed and must not be mutated. They remain valid until their owner detaches them. A transport may transfer the arrays when retiring the owning index; cache consumers must not detach them. Changing the returned string list does not change the index. Generic map-compatible indexes remain supported by the parser and cache interfaces.
+
+Parsed, worker-hydrated and server-loaded spatial hierarchies use the shared
+`spatialLookups` helper from `@ifc-lite/data`. `getPath` accepts both a spatial
+node and a contained object; containing-space queries follow live membership.

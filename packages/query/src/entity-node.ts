@@ -36,10 +36,12 @@ function coerceRaw(raw: IfcAttributeValue): string | number | boolean | null {
 }
 
 export function extractAllEntityAttributesFromEntity(
-  entity: IfcEntity
+  entity: IfcEntity,
+  schemaVersion?: IfcDataStore['schemaVersion'],
 ): Array<{ name: string; value: string | number | boolean }> {
   const result: Array<{ name: string; value: string | number | boolean }> = [];
-  for (const { name, raw } of getRawNamedAttributes(entity)) {
+  const registeredVersion = schemaVersion === 'IFC5' ? undefined : schemaVersion;
+  for (const { name, raw } of getRawNamedAttributes(entity, registeredVersion)) {
     const value = coerceRaw(raw);
     if (value !== null) result.push({ name, value });
   }
@@ -118,7 +120,7 @@ export class EntityNode {
   allAttributes(): Array<{ name: string; value: string | number | boolean }> {
     const entity = this.store.getEntity(this.expressId);
     if (entity) {
-      return extractAllEntityAttributesFromEntity(entity);
+      return extractAllEntityAttributesFromEntity(entity, this.store.schemaVersion);
     }
 
     // Fallback: return individually known attributes
@@ -141,10 +143,43 @@ export class EntityNode {
   }
   
   containedIn(): EntityNode | null {
-    const nodes = this.getRelated(RelationshipType.ContainsElements, 'inverse');
-    return nodes[0] ?? null;
+    const candidates = this.getRelated(RelationshipType.ContainsElements, 'inverse');
+    if (candidates.length < 2) return candidates[0] ?? null;
+    // #4314: more than one candidate - a malformed file naming this element
+    // in more than one IfcRelContainedInSpatialStructure edge (#4311).
+    // First-declared still wins, but only among containers that are actually
+    // reachable from IfcProject: a container with no IfcRelAggregates edge
+    // back to the project is a node `SpatialHierarchyBuilder.buildNode`
+    // never visits, so `elementToStorey` never lets it win a tie either
+    // (#4310) - returning it here is a dangling answer no caller can walk
+    // anywhere from, and one `elementToStorey` disagrees with.
+    //
+    // The set is not recomputed here: `SpatialHierarchyBuilder.build()`
+    // already runs `computeReachableSpatialNodes` once per parse and
+    // publishes the result on the hierarchy, and this reads THAT set - the
+    // one `elementToStorey`'s own tie-break was resolved against - so the
+    // two answers cannot drift apart. A store with no spatial hierarchy has
+    // no reachability information (and no `elementToStorey` to disagree
+    // with), and one where no candidate is reachable has no better answer;
+    // both fall back to the first-declared candidate, so this never turns a
+    // present answer into null.
+    const reachable = this.store.spatialHierarchy?.reachableSpatialNodes;
+    if (!reachable) return candidates[0];
+    return candidates.find((candidate) => reachable.has(candidate.expressId)) ?? candidates[0];
   }
-  
+
+  /**
+   * True when this element has more than one direct
+   * `IfcRelContainedInSpatialStructure` edge, i.e. `containedIn()`'s answer
+   * (first-declared wins) was a tie-break rather than the only candidate the
+   * source file declared (#4311). Duplicate edges naming the SAME structure
+   * collapse to one before either method ever sees them (relationship-graph
+   * dedupe), so this only fires on genuinely different candidates.
+   */
+  containedInAmbiguous(): boolean {
+    return this.getRelated(RelationshipType.ContainsElements, 'inverse').length > 1;
+  }
+
   // Aggregation
   decomposes(): EntityNode[] {
     return this.getRelated(RelationshipType.Aggregates, 'forward');

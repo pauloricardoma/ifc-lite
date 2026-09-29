@@ -22,7 +22,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { CheckCircle2, XCircle, Loader2, Trash2 } from 'lucide-react';
+import { CheckCircle2, XCircle, Trash2 } from 'lucide-react';
+import { Spinner } from '@/components/ui/spinner';
+import { useTranslation } from '@/i18n';
 
 interface SourceSettingsDialogProps {
   manifest: PluginManifest;
@@ -43,6 +45,7 @@ export function SourceSettingsDialog({
   onForget,
   initialValues = {},
 }: SourceSettingsDialogProps) {
+  const { t } = useTranslation();
   const [values, setValues] = useState<Record<string, string>>(initialValues);
   const [testResult, setTestResult] = useState<ConnectionTestResult | null>(null);
   const [testing, setTesting] = useState(false);
@@ -104,7 +107,7 @@ export function SourceSettingsDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-md">
         <DialogHeader>
-          <DialogTitle>{manifest.title} Settings</DialogTitle>
+          <DialogTitle>{t('sources.sourceSettingsDialog.title', { title: manifest.title })}</DialogTitle>
         </DialogHeader>
 
         <div className="flex flex-col gap-4 py-2">
@@ -120,8 +123,7 @@ export function SourceSettingsDialog({
           ))}
 
           <p className="text-xs text-muted-foreground">
-            Saved values are stored in this browser's local storage,
-            unencrypted. Treat them as revocable, not secret.
+            {t('sources.sourceSettingsDialog.localStorageNotice')}
           </p>
 
           {testResult && (
@@ -150,7 +152,7 @@ export function SourceSettingsDialog({
               onClick={handleForget}
             >
               <Trash2 className="mr-2 h-4 w-4" />
-              Forget saved values
+              {t('sources.sourceSettingsDialog.forgetSavedValues')}
             </Button>
           )}
           {onTestConnection && (
@@ -159,12 +161,12 @@ export function SourceSettingsDialog({
               onClick={handleTest}
               disabled={testing || requiredMissing}
             >
-              {testing && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-              Test connection
+              {testing && <Spinner size="md" className="mr-2" />}
+              {t('sources.sourceSettingsDialog.testConnection')}
             </Button>
           )}
           <Button onClick={handleSave} disabled={requiredMissing}>
-            Save
+            {t('sources.sourceSettingsDialog.save')}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -193,6 +195,7 @@ function PreferenceField({
   value: string;
   onChange: (value: string) => void;
 }) {
+  const { t } = useTranslation();
   const id = `pref-${pref.name}`;
   const labelId = `${id}-label`;
 
@@ -223,7 +226,7 @@ function PreferenceField({
           onValueChange={onChange}
         >
           <SelectTrigger id={id} aria-labelledby={labelId}>
-            <SelectValue placeholder="Select…" />
+            <SelectValue placeholder={t('sources.sourceSettingsDialog.selectPlaceholder')} />
           </SelectTrigger>
           <SelectContent>
             {(pref.options ?? []).map((option) => (

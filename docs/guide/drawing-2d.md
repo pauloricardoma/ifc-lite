@@ -2,6 +2,10 @@
 
 IFClite can generate 2D architectural drawings from 3D IFC models, including section cuts, floor plans, and elevations. The `@ifc-lite/drawing-2d` package produces vector SVG output with proper architectural conventions.
 
+Direct annotation fills with a matching 3D mesh render once in the viewer's
+registered plane. Their symbolic fill data remains available to 2D drawings;
+the 3D overlay routing does not delete or flatten the authored geometry.
+
 ## What It Generates
 
 From any 3D IFC model, you can produce:
@@ -20,6 +24,43 @@ Each drawing includes:
 | **Hatching** | Material-based fill patterns (concrete, masonry, insulation, etc.) |
 | **Architectural symbols** | Door swings, window frames, stair arrows |
 | **Annotations** | Dimensions and labels |
+
+## Drawings After Repositioning
+
+In the viewer, section cuts and construction projection use the model's current
+workspace placement. After [repositioning a model](federation.md#repositioning-models-and-pointclouds),
+the floor and ceiling limits used for construction projection refresh with its
+displayed geometry and storey membership.
+
+To compare the same floor plan before and after a vertical move, move the
+section plane by the same amount, or use the same section percentage for the
+same model bounds. Once drawing generation finishes, the equivalent cut keeps
+the same projection geometry and floor/ceiling bands. Moving only the model
+while keeping an absolute section elevation fixed produces a different cut.
+
+This is a viewer workspace adjustment: it does not rewrite the source IFC
+placements. Existing measurements retain their recorded workspace points and
+are marked stale after movement; remeasure them in the new arrangement.
+
+## Saved Sheet Setup
+
+The viewer remembers each model's sheet setup in this browser: paper size,
+frame, title-block fields and logo, revisions, drawing scale, scale bar, and
+north arrow. Reopening the same file restores its setup; switching between
+loaded models switches their sheets. File identity uses the complete file
+contents, so a renamed copy shares its saved setup and changed contents start
+with a separate setup.
+
+Saved sheet templates form a reusable library across models. Clearing the
+current sheet does not remove templates. Panel visibility and the sheet-enable
+toggle are not restored after a browser reload.
+
+The browser keeps the 20 most recently saved model setups; templates are not
+part of that limit. This is local browser storage, not a backup or an IFC file
+edit. Clearing site data removes it. Large embedded logos can exhaust browser
+storage: a failed save logs a warning and retains the previous saved version.
+Models without source bytes remain usable but cannot restore a sheet by file
+content.
 
 ## Quick Start
 
@@ -228,12 +269,20 @@ if (isGPUComputeAvailable()) {
 In the IFClite viewer:
 
 1. **Activate section plane** - Position a section plane in the 3D view
-2. **Open 2D panel** - The 2D drawing panel shows the section cut
+2. **Open the Drawing panel** - The section cut appears in the **Drawing** panel, docked in the bottom strip below the 3D view (it opens with the Section tool, or from **Analyze → Drawing**, the sidebar rail or the command palette). Like the other bottom panels it can be resized, floated, or popped out onto another screen
 3. **Toggle layers** - Show/hide cut lines, projection, hidden lines, hatching
 4. **Annotate** - Add measurements, polygon areas, text boxes, and revision clouds
 5. **Select & edit** - Click annotations to select, drag to move, Delete to remove
 6. **Graphic overrides** - Apply presets to change element appearance
 7. **Export** - Download the drawing as vector SVG, or as DXF R12 (plan sections are georeferenced to true world/map coordinates when the model carries an `IfcMapConversion`)
+
+The PDF export dialog lists visible drawing content its writer cannot include. A
+vector PDF omits drawing markups and DXF reference underlays; a sheet PDF
+includes the underlays in its rasterized sheet image but still omits markups.
+When a sheet is active, its scale governs the PDF and the dialog explains why
+the scale cannot be changed there. DXF export asks for confirmation before it
+omits visible markups or reference underlays. Exports with none of those items
+continue directly.
 
 ### Annotation Tools
 

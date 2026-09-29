@@ -17,7 +17,6 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-
 import {
   classifyPath,
   classifyDiff,
@@ -36,11 +35,13 @@ import {
   NO_TESTS,
   RUNNER_MISSING,
   UNPARSEABLE,
+  ALL_SKIPPED,
   OBSERVED,
   UNOBSERVED,
   INCONCLUSIVE,
   BASELINE_BROKEN,
 } from './revert-oracle.mjs';
+import { ciExitCode } from './revert-oracle-ci.mjs';
 
 // ---------------------------------------------------------------------------
 // Fixtures: real runner output
@@ -190,6 +191,30 @@ const VITEST_NO_FILES = `
  include: **/*.{test,spec}.?(c|m)[jt]s?(x)
 
 No test files found, exiting with code 1
+`;
+
+/**
+ * vitest 4's summary line for a file behind `describe.skipIf(true)` — every
+ * test collected, none executed. Constructed to match vitest 4's documented
+ * `Tests  N skipped (N)` summary shape (same format the real captures above
+ * use for `passed`/`failed`), and matches #4108's own quoted CI output:
+ * `packages/export (vitest) -> pass (pass 0, fail 0, total 2)`.
+ */
+const VITEST_ALL_SKIPPED = ` ↓ src/__probe/c.test.ts (2 tests | 2 skipped) 1ms
+
+ Test Files  1 passed (1)
+      Tests  2 skipped (2)
+   Start at  15:40:00
+   Duration  55ms
+`;
+
+/** Same shape, but only one of two tests was skipped: real evidence survives. */
+const VITEST_PARTIAL_SKIP = ` ✓ src/__probe/d.test.ts (2 tests | 1 skipped) 2ms
+
+ Test Files  1 passed (1)
+      Tests  1 passed | 1 skipped (2)
+   Start at  15:41:00
+   Duration  47ms
 `;
 
 const CARGO_PASS = `running 41 tests
@@ -393,6 +418,28 @@ Error: boom
 // classifyPath / classifyDiff
 // ---------------------------------------------------------------------------
 
+test('classifyPath: a test-support module that only registers assertions for a test entrypoint is a test (#4501)', () => {
+  // scripts/test-wasm-contract.mjs imports it and nothing else does; editing it
+  // changes what that suite asserts, so it must not read as production.
+  assert.equal(classifyPath('scripts/lib/shard-refusal-boundary.mjs'), 'test');
+  // Only the two source-text gate tests import this one; reverting it as
+  // production took both down at load time, an attribution gap (#4536).
+  assert.equal(classifyPath('scripts/lib/relocated-gate-source.mjs'), 'test');
+  // The allowlist is exact: its siblings are real tooling and stay production.
+  assert.equal(classifyPath('scripts/lib/revert-oracle.mjs'), 'production');
+});
+test('classifyPath: Playwright e2e specs and helpers are test files, not ignored (#4553, #6267)', () => {
+  // #4553 ignored tests/e2e/** because the oracle had no runner for it and
+  // ABORTed the lane. #6267 gave it one: the spec is a test the browser
+  // observer runs, and its helpers are support files.
+  assert.equal(classifyPath('tests/e2e/collab-share-seed.e2e.spec.ts'), 'test');
+  assert.equal(classifyPath('tests/e2e/collab/relay.ts'), 'test');
+  // The Playwright config is read by that same runner and nothing else (#5147).
+  assert.equal(classifyPath('playwright.config.ts'), 'ignored');
+  assert.equal(classifyPath('tests/integration.test.ts'), 'test');
+  assert.equal(classifyPath('tests/api/handlers.ts'), 'test');
+});
+
 test('classifyPath: production sources', () => {
   assert.equal(classifyPath('packages/renderer/src/device.ts'), 'production');
   assert.equal(classifyPath('apps/viewer/src/hooks/useSymbolicAnnotations.ts'), 'production');
@@ -410,6 +457,66 @@ test('classifyPath: test sources', () => {
   assert.equal(classifyPath('packages/core/src/__snapshots__/a.snap'), 'test');
 });
 
+// #4050: `TEST_FILE_RE` recognised only JS/TS suffixes and Rust `_tests.rs`, so
+// a real file in this repo -- tools/ifcopenshell_reference/test_harness.py --
+// was bucketed as PRODUCTION, making its coverage invisible to the oracle.
+test('classifyPath: Python `test_*.py` / `*_test.py` are tests, not production (#4050)', () => {
+  assert.equal(classifyPath('tools/ifcopenshell_reference/test_harness.py'), 'test');
+  assert.equal(classifyPath('tools/ifcopenshell_reference/test_validate_export.py'), 'test');
+  assert.equal(classifyPath('tools/ifcopenshell_reference/validate_export_test.py'), 'test');
+  assert.equal(classifyPath('a/b/c/test_deep.py'), 'test');
+});
+
+test('#4109: unsupported Go entrypoints stay tests so planning can expose a capability gap', () => {
+  assert.equal(classifyPath('cmd/widget_test.go'), 'test');
+});
+
+test('classifyPath: a Python module that merely CONTAINS "test" stays production', () => {
+  assert.equal(classifyPath('tools/ifcopenshell_reference/canonical.py'), 'production');
+  assert.equal(classifyPath('tools/ifcopenshell_reference/latest_export.py'), 'production');
+  assert.equal(classifyPath('tools/ifcopenshell_reference/testing_helpers.py'), 'production');
+});
+
+test('#4016: separate Rust sibling modules are tests; inline production stays production', () => {
+  for (const path of ['rust/geometry/src/router/processor_registry_tests.rs',
+    'rust/geometry/src/router/tests.rs', 'rust/core/src/parser/scanner_tests.rs']) {
+    assert.equal(classifyPath(path), 'test');
+  }
+  for (const path of ['rust/geometry/src/router/processor_registry.rs',
+    'rust/geometry/src/router/mod.rs', 'rust/core/src/parser/scanner.rs',
+    'rust/core/src/testing.rs', 'rust/core/src/test_utils.rs']) {
+    assert.equal(classifyPath(path), 'production');
+  }
+});
+
+// #4142: `packages/ids/src/__corpus__/` alone holds 334 of the repo's 367
+// tracked `.ifc` files, so a branch touching only IDS corpus fixtures was
+// classified as PRODUCTION with no accompanying test and false-aborted. The
+// repo-wide sweep done for #4142 found `__test__` (singular), bare `corpus`
+// (fuzz seed inputs) and `test-data` (hyphenated) in the same shape.
+test('classifyPath: #4142 sibling fixture directories are test, not production', () => {
+  assert.equal(classifyPath('packages/ids/src/__corpus__/IFC4/wall.ifc'), 'test');
+  assert.equal(classifyPath('apps/viewer/src/lib/__test__/stubs.ts'), 'test');
+  assert.equal(
+    classifyPath('rust/core/fuzz/corpus/parse_entity/seed_wall'),
+    'test',
+  );
+  assert.equal(classifyPath('packages/bcf/test-data/OrthogonalCamera.bcf'), 'test');
+});
+
+// The sweep also found directories that LOOK like the same shape but hold
+// real production code or shipped assets, not raw fixture data. Adding any
+// of these would be a regression in the other direction: a genuine
+// production change would stop requiring a test.
+test('classifyPath: #4142 sweep -- look-alike directories that stay production', () => {
+  assert.equal(classifyPath('packages/collab/src/snapshot/from-step.ts'), 'production');
+  assert.equal(classifyPath('packages/source-fixture/src/index.ts'), 'production');
+  assert.equal(classifyPath('packages/world-frame-fixtures/src/index.ts'), 'production');
+  assert.equal(classifyPath('scripts/fixtures/build-manifest.mjs'), 'production');
+  assert.equal(classifyPath('apps/viewer/public/samples/hello-wall.ifc'), 'production');
+  assert.equal(classifyPath('apps/landing/samples/hello-wall.ifc'), 'production');
+});
+
 test('classifyPath: a `test-utils.ts` is production, not a test', () => {
   // Distinct subject from the `test/` SEGMENT case below: a hyphenated
   // filename must not be swallowed by the directory rule.
@@ -421,8 +528,134 @@ test('classifyPath: ignored non-code', () => {
   assert.equal(classifyPath('.changeset/renderer-frame-timing.md'), 'ignored');
   assert.equal(classifyPath('README.md'), 'ignored');
   assert.equal(classifyPath('pnpm-lock.yaml'), 'ignored');
+  assert.equal(classifyPath('Cargo.lock'), 'ignored');
+  assert.equal(classifyPath('rust/python/Cargo.lock'), 'ignored');
+  assert.equal(classifyPath('rust/geometry/Cargo.lock'), 'production');
   assert.equal(classifyPath('.github/workflows/test.yml'), 'ignored');
   assert.equal(classifyPath('docs/guide/x.ts'), 'ignored');
+});
+
+// WHY DEPLOY CONFIG IS `ignored` (the rule these two tests pin).
+//
+// The oracle asks: if this branch's production hunks were reverted, would its
+// tests notice? For Vercel config the answer is structurally no — the files
+// are read by Vercel's build pipeline and imported by nothing in this repo,
+// so there is no test to run against them. Classifying them as production
+// made the oracle ABORT on every deploy-config PR with "changes production
+// code and adds/changes NO test file", which is a false positive, not a
+// finding.
+//
+// Ignoring them opens no miss: a gate cannot lose coverage it never had.
+// Verified when the rule was added — no test in the repo IMPORTS, EXECUTES, or
+// asserts on the BEHAVIOUR of `vercel.json`, `.vercelignore`, or any
+// `vercel-*.sh`, so the oracle never had a test to run against them. (The
+// cases below do name those paths, but only as classifier INPUT STRINGS: they
+// exercise this module, not the deploy files.)
+//
+// The rule is anchored on the BASENAME rather than a blanket `scripts/**` or
+// `*.sh`, because `scripts/lib/*.mjs` (this module included) is real, tested
+// logic that must stay production. THAT would have been the miss, which is
+// why the second test below exists.
+test('classifyPath: Vercel deploy config is ignored, not production', () => {
+  assert.equal(classifyPath('vercel.json'), 'ignored');
+  assert.equal(classifyPath('apps/landing/vercel.json'), 'ignored');
+  assert.equal(classifyPath('apps/viewer-embed/vercel.json'), 'ignored');
+  assert.equal(classifyPath('.vercelignore'), 'ignored');
+  assert.equal(classifyPath('scripts/vercel-build.sh'), 'ignored');
+  assert.equal(classifyPath('scripts/vercel-install.sh'), 'ignored');
+  assert.equal(classifyPath('scripts/vercel-ignore-build.sh'), 'ignored');
+  assert.equal(classifyPath('apps/landing/vercel-ignore.sh'), 'ignored');
+});
+
+test('classifyPath: the deploy-config rule does not swallow neighbouring code', () => {
+  // The rule is anchored on the basename, so a directory called `vercel` or a
+  // file merely mentioning it stays production. `scripts/lib/*.mjs` is real,
+  // tested logic and must never be ignored — that would be the miss.
+  assert.equal(classifyPath('scripts/lib/revert-oracle.mjs'), 'production');
+  assert.equal(classifyPath('scripts/build-wasm.sh'), 'production');
+  assert.equal(classifyPath('packages/core/src/vercel.ts'), 'production');
+  assert.equal(classifyPath('packages/core/src/vercel-client.ts'), 'production');
+  assert.equal(classifyPath('apps/viewer/src/vercel/deploy.ts'), 'production');
+  assert.equal(classifyPath('vercel.json.ts'), 'production');
+});
+
+// WHY "inert" IS ITS OWN KIND, NOT `ignored` (#4137).
+//
+// A changed file that no runner in this repo claims as a test AND no runner
+// compiles or executes as source has no observable behaviour at all: an
+// image's bytes, a font's glyphs, an archive's contents. Classifying such a
+// file as `production` made the oracle ABORT with "changes production code
+// and adds/changes NO test file" on branches like #4114 (five deleted PNGs)
+// and #4117 (an 87-file archive) — there is no test that could possibly
+// accompany a deleted PNG, so the ABORT was a false positive about the
+// classifier, not a finding about the branch.
+test('classifyPath: images, fonts, and other binaries are inert, not production', () => {
+  assert.equal(classifyPath('apps/viewer/public/favicon-192x192.png'), 'inert');
+  assert.equal(classifyPath('apps/viewer/public/favicon.ico'), 'inert');
+  assert.equal(classifyPath('apps/viewer/src/assets/logo.svg'), 'inert');
+  assert.equal(classifyPath('apps/landing/public/hero.webp'), 'inert');
+  assert.equal(classifyPath('apps/viewer/public/fonts/inter.woff2'), 'inert');
+  assert.equal(classifyPath('apps/viewer/public/fonts/inter.ttf'), 'inert');
+  assert.equal(classifyPath('scripts/perf/evidence/report.pdf'), 'inert');
+  assert.equal(classifyPath('scripts/perf/evidence/archive.zip'), 'inert');
+});
+
+test('classifyPath: .svg icon source stays inert even though vite.config.ts genuinely transforms it — the untested output is inert, the pipeline that produces it is not (#4140 follow-up)', () => {
+  // apps/viewer/vite.config.ts really does rewrite/optimize SVG bytes (string
+  // theming, then svgo.optimize()) for apps/viewer/src/icons/* — unlike every
+  // other extension on INERT_SUFFIXES, .svg is NOT inert for lack of a
+  // consumer. It stays inert only because node --test's
+  // vite-module-hooks-impl.mjs stubs every `~icons/*` import before a test
+  // observes that transform's output. Prove both halves of that claim stay
+  // true: the icon source itself classifies as inert, AND the pipeline file
+  // that actually runs the transform (vite.config.ts, under node/vite, not
+  // under the `test/` directory sweep) stays production. If vite.config.ts
+  // ever got swept into inert by a careless copy-paste of the .svg entry,
+  // this must fail.
+  assert.equal(classifyPath('apps/viewer/src/icons/menu.svg'), 'inert');
+  assert.equal(classifyPath('apps/viewer/vite.config.ts'), 'production');
+});
+
+test('classifyPath: inertness is about the file kind, not the operation — a deleted image is still inert', () => {
+  // classifyPath is purely path-based; classifyDiff carries the `status` field
+  // through unchanged. A pure deletion of an inert file must not become
+  // production just because the "operation" is a delete (must-not-regress in
+  // #4137: inertness is about the file kind, not about the operation).
+  const { production, inert } = classifyDiff(parseNameStatus('D\tapps/viewer/public/favicon.png'));
+  assert.deepEqual(production, []);
+  assert.deepEqual(inert.map((e) => e.path), ['apps/viewer/public/favicon.png']);
+});
+
+test('classifyPath: inertness must NOT cover anything a runner compiles or executes', () => {
+  // Extensions a runner in this repo actually builds/executes stay production
+  // even though they sound "asset-like" or are commonly bundled alongside
+  // assets — this is the narrowing #4137 must preserve.
+  assert.equal(classifyPath('packages/core/package.json'), 'production');
+  assert.equal(classifyPath('crates/ifc-lite-geom/src/walk.rs'), 'production');
+  assert.equal(classifyPath('packages/renderer/src/device.ts'), 'production');
+  assert.equal(classifyPath('tools/ifcopenshell_reference/canonical.py'), 'production');
+});
+
+test('classifyDiff: a mixed diff keeps inert files out of BOTH production and test, without giving the real change a free pass', () => {
+  const entries = parseNameStatus(
+    [
+      'M\tpackages/renderer/src/device.ts',
+      'A\tapps/viewer/public/favicon-512x512.png',
+    ].join('\n'),
+  );
+  const { production, test: tests, inert } = classifyDiff(entries);
+  assert.deepEqual(production.map((e) => e.path), ['packages/renderer/src/device.ts']);
+  assert.deepEqual(tests, []);
+  assert.deepEqual(inert.map((e) => e.path), ['apps/viewer/public/favicon-512x512.png']);
+});
+
+test('classifyDiff: a diff of ONLY inert files has no production entries (script-level effect: NOT APPLICABLE, same as #4024 for test-only diffs)', () => {
+  const entries = parseNameStatus(
+    ['D\tapps/viewer/public/favicon-192x192.png', 'D\tapps/viewer/public/favicon-512x512.png'].join('\n'),
+  );
+  const { production, inert } = classifyDiff(entries);
+  assert.deepEqual(production, []);
+  assert.equal(inert.length, 2);
 });
 
 test('classifyDiff splits a real branch shape and never puts a test in production', () => {
@@ -448,6 +681,12 @@ test('classifyDiff warns that a Rust revert takes `#[cfg(test)] mod tests` with 
   const { warnings } = classifyDiff(parseNameStatus('M\tcrates/ifc-lite-geom/src/walk.rs'));
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /cfg\(test\)/);
+});
+
+test('classifyDiff reports whether Cargo.lock changed (#4592)', () => {
+  const withLock = parseNameStatus('M\trust/geometry/Cargo.toml\nM\tCargo.lock');
+  assert.equal(classifyDiff(withLock).cargoLockChanged, true);
+  assert.equal(classifyDiff(parseNameStatus('M\trust/geometry/Cargo.toml')).cargoLockChanged, false);
 });
 
 test('parseNameStatus takes the NEW path of a rename', () => {
@@ -542,7 +781,7 @@ test('cargoRunner targets one crate and refuses an unnamed one', () => {
   assert.deepEqual(cargoRunner('ifc-lite-geom'), {
     family: 'cargo',
     bin: 'cargo',
-    args: ['test', '-p', 'ifc-lite-geom'],
+    args: ['test', '--no-fail-fast', '-p', 'ifc-lite-geom'],
   });
   assert.equal(cargoRunner(null), null);
 });
@@ -573,6 +812,13 @@ test('node --test: all green', () => {
   assert.equal(r.kind, PASS);
   assert.equal(r.total, 197);
   assert.equal(r.passed, 197);
+});
+
+test('#4109: a green summary cannot override nonzero, missing, or signalled process status', () => {
+  for (const processState of [{ exitCode: 9 }, { exitCode: null }, { exitCode: null, signal: 'SIGTERM' }]) {
+    const parsed = parseRunnerOutput({ family: 'node-test', stdout: NODE_ALL_PASS, stderr: '', ...processState });
+    assert.equal(parsed.kind, UNPARSEABLE);
+  }
 });
 
 test('node --test: zero collected tests is never a pass', () => {
@@ -608,6 +854,32 @@ test('vitest: all green', () => {
 test('vitest: "No test files found" is NO_TESTS, not a pass', () => {
   const r = parseRunnerOutput({ family: 'vitest', stdout: VITEST_NO_FILES, stderr: '', exitCode: 1 });
   assert.equal(r.kind, NO_TESTS);
+});
+
+test('#4108: a WHOLLY skipped vitest file is ALL_SKIPPED, not PASS', () => {
+  const r = parseRunnerOutput({ family: 'vitest', stdout: VITEST_ALL_SKIPPED, stderr: '', exitCode: 0 });
+  assert.equal(r.kind, ALL_SKIPPED);
+  assert.notEqual(r.kind, PASS);
+  assert.equal(r.total, 2);
+  assert.equal(r.passed, 0);
+  assert.equal(r.failed, 0);
+});
+
+test('#4108: a PARTIALLY skipped vitest file stays PASS — it still ran a real assertion', () => {
+  const r = parseRunnerOutput({ family: 'vitest', stdout: VITEST_PARTIAL_SKIP, stderr: '', exitCode: 0 });
+  assert.equal(r.kind, PASS);
+  assert.equal(r.passed, 1);
+  assert.equal(r.total, 2);
+});
+
+test('#4108: an all-skipped baseline is BASELINE-BROKEN, never a green baseline used to certify a change', () => {
+  const baseline = parseRunnerOutput({ family: 'vitest', stdout: VITEST_ALL_SKIPPED, stderr: '', exitCode: 0 });
+  // Reverting production changes nothing about a file that never executes.
+  const reverted = parseRunnerOutput({ family: 'vitest', stdout: VITEST_ALL_SKIPPED, stderr: '', exitCode: 0 });
+  const v = verdict({ baseline, reverted });
+  assert.equal(v.verdict, BASELINE_BROKEN);
+  assert.notEqual(v.verdict, UNOBSERVED, 'must not be reported as a finding about the author\'s tests');
+  assert.notEqual(v.exitCode, 0);
 });
 
 test('THE TRAP, VITE FORM: a removed export bound to undefined is NOT an assertion failure', () => {
@@ -777,7 +1049,7 @@ test('verdict: a baseline that collected nothing is INCONCLUSIVE, not OBSERVED',
 });
 
 test('verdict: every non-OBSERVED outcome exits non-zero', () => {
-  for (const kind of [LOAD_FAILURE, NO_TESTS, RUNNER_MISSING, UNPARSEABLE, PASS]) {
+  for (const kind of [LOAD_FAILURE, NO_TESTS, RUNNER_MISSING, UNPARSEABLE, PASS, ALL_SKIPPED]) {
     const v = verdict({ baseline: green, reverted: { kind, passed: 10, failed: 0, total: 10, evidence: ['x'] } });
     assert.notEqual(v.exitCode, 0, `${kind} must not exit 0`);
   }
@@ -786,6 +1058,13 @@ test('verdict: every non-OBSERVED outcome exits non-zero', () => {
 test('verdict: a missing run never reports clean', () => {
   assert.notEqual(verdict({ baseline: null, reverted: green }).exitCode, 0);
   assert.notEqual(verdict({ baseline: green, reverted: null }).exitCode, 0);
+});
+
+test('#4109: CI blocks misses, broken baselines, and oracle capability gaps', () => {
+  assert.equal(ciExitCode(OBSERVED), 0);
+  assert.equal(ciExitCode(UNOBSERVED), 1);
+  assert.notEqual(ciExitCode(INCONCLUSIVE), 0);
+  assert.notEqual(ciExitCode(BASELINE_BROKEN), 0);
 });
 
 // ---------------------------------------------------------------------------
@@ -817,6 +1096,101 @@ test('aggregate: an assertion failure alongside passes stays an assertion failur
   assert.equal(a.kind, ASSERTION_FAILURE);
   assert.equal(a.failed, 1);
   assert.equal(a.total, 8);
+});
+
+test('#4131 regression: aggregate: an all-skipped package no longer outranks a genuinely green one', () => {
+  // #4131's own fix for #4108 made this the false positive: an env-gated
+  // all-skip file (ifcopenshell absent on a TS-only PR) must not poison a run
+  // that also contains a package with real, executed evidence.
+  const a = aggregate([
+    { kind: PASS, passed: 5, failed: 0, total: 5, evidence: [] },
+    { kind: ALL_SKIPPED, passed: 0, failed: 0, total: 2, evidence: ['all skipped'] },
+  ]);
+  assert.equal(a.kind, PASS);
+  assert.equal(a.total, 7);
+  assert.equal(a.passed, 5);
+});
+
+test('#4131 regression: aggregate: an all-skipped package no longer outranks a real assertion failure', () => {
+  const a = aggregate([
+    { kind: ASSERTION_FAILURE, passed: 2, failed: 1, total: 3, evidence: ['assertion X failed'] },
+    { kind: ALL_SKIPPED, passed: 0, failed: 0, total: 2, evidence: ['all skipped'] },
+  ]);
+  assert.equal(a.kind, ASSERTION_FAILURE);
+  assert.equal(a.failed, 1);
+  assert.equal(a.total, 5);
+});
+
+test('#4131 regression: multi-package all-skipped-plus-evidence run does not block CI', () => {
+  // The end-to-end shape: a well-tested PR whose reverted run turns real
+  // assertions RED in one package while an unrelated env-gated file stays
+  // all-skipped in both the baseline and the reverted run.
+  const baseline = aggregate([
+    { kind: PASS, passed: 12, failed: 0, total: 12, evidence: [] },
+    { kind: ALL_SKIPPED, passed: 0, failed: 0, total: 2, evidence: ['all skipped'] },
+  ]);
+  const reverted = aggregate([
+    { kind: ASSERTION_FAILURE, passed: 10, failed: 2, total: 12, evidence: ['assertion X failed'] },
+    { kind: ALL_SKIPPED, passed: 0, failed: 0, total: 2, evidence: ['all skipped'] },
+  ]);
+  const v = verdict({ baseline, reverted });
+  assert.equal(v.verdict, OBSERVED);
+  assert.equal(v.exitCode, 0);
+});
+
+test('#4109: a green structured run may log load-error text as fixture data', () => {
+  const parsed = parseRunnerOutput({
+    family: 'node-test',
+    stdout: 'fixture caught: SyntaxError: expected\n# tests 120\n# pass 120\n# fail 0\n',
+    stderr: '',
+    exitCode: 0,
+  });
+  assert.equal(parsed.kind, 'pass');
+  assert.equal(parsed.total, 120);
+});
+
+test('#4109: incomplete execution cannot support a negative UNOBSERVED finding', () => {
+  const baseline = aggregate([
+    { kind: PASS, passed: 12, failed: 0, total: 12, evidence: [] },
+    { kind: ALL_SKIPPED, passed: 0, failed: 0, total: 2, evidence: ['all skipped'] },
+  ]);
+  const reverted = aggregate([
+    { kind: PASS, passed: 12, failed: 0, total: 12, evidence: [] },
+    { kind: ALL_SKIPPED, passed: 0, failed: 0, total: 2, evidence: ['all skipped'] },
+  ]);
+  const v = verdict({ baseline, reverted });
+  assert.equal(v.verdict, INCONCLUSIVE);
+  assert.match(v.reason, /cannot support an UNOBSERVED finding/);
+  assert.notEqual(ciExitCode(v.verdict), 0);
+});
+
+test('#4108 (still fixed): aggregate: a SINGLE all-skipped package is still ALL_SKIPPED and still blocks', () => {
+  // With no other package producing real evidence, an all-skipped package
+  // must still poison the run -- this is #4108's actual case and #4131's
+  // fix for it must not be weakened.
+  const results = [{ kind: ALL_SKIPPED, passed: 0, failed: 0, total: 2, evidence: ['all skipped'] }];
+  const baseline = aggregate(results);
+  const reverted = aggregate(results);
+  assert.equal(baseline.kind, ALL_SKIPPED);
+  const v = verdict({ baseline, reverted });
+  assert.equal(v.verdict, BASELINE_BROKEN);
+  assert.equal(v.exitCode, 3);
+});
+
+test('#4108 (still fixed): aggregate: EVERY package all-skipped is still ALL_SKIPPED and still blocks', () => {
+  // No package anywhere produced real evidence, so the "another package has
+  // evidence" exception must not apply -- this must not slip through as a pass.
+  const results = [
+    { kind: ALL_SKIPPED, passed: 0, failed: 0, total: 2, evidence: ['all skipped'] },
+    { kind: ALL_SKIPPED, passed: 0, failed: 0, total: 3, evidence: ['all skipped'] },
+  ];
+  const baseline = aggregate(results);
+  const reverted = aggregate(results);
+  assert.equal(baseline.kind, ALL_SKIPPED);
+  assert.equal(baseline.total, 5);
+  const v = verdict({ baseline, reverted });
+  assert.equal(v.verdict, BASELINE_BROKEN);
+  assert.equal(v.exitCode, 3);
 });
 
 test('aggregate: zero packages is UNPARSEABLE, never a pass', () => {

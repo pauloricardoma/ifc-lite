@@ -18,20 +18,21 @@
 import { useMemo } from 'react';
 import type { ResolvedToolbarContribution } from '@ifc-lite/extensions';
 import { evaluateWhen, parseWhen } from '@ifc-lite/extensions';
-import { Button } from '@/components/ui/button';
-import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { IconButton } from '@/components/ui/icon-button';
 import { toast } from '@/components/ui/toast';
 import { describeRunCommandError } from '@/services/extensions/runtime-errors';
 import { useSlotContributions } from '@/hooks/useSlotContributions';
 import { useOptionalExtensionHost } from '@/sdk/ExtensionHostProvider';
 import { useViewerStore } from '@/store';
 import { resolveExtensionIcon } from './icon-registry';
+import { useTranslation } from '@/i18n';
 
 interface ExtensionToolbarSlotProps {
   slot: 'toolbar.left' | 'toolbar.right' | 'toolbar.center';
 }
 
 export function ExtensionToolbarSlot({ slot }: ExtensionToolbarSlotProps) {
+  const { t } = useTranslation();
   const host = useOptionalExtensionHost();
   // Loader enriches the toolbar payload with the linked command's
   // `icon` + `title` — see manifestToContributions in loader.ts.
@@ -91,19 +92,14 @@ export function ExtensionToolbarSlot({ slot }: ExtensionToolbarSlotProps) {
         const title = c.payload.title ?? cmd;
         const Icon = resolveExtensionIcon(c.payload.icon);
         return (
-          <Tooltip key={`${c.extensionId}:${cmd}`}>
-            <TooltipTrigger asChild>
-              <Button
-                size="icon"
-                variant="ghost"
-                onClick={() => handleClick(cmd, c.extensionId)}
-                aria-label={`Run ${title}`}
-              >
-                <Icon className="h-4 w-4" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>{title}</TooltipContent>
-          </Tooltip>
+          <IconButton
+            key={`${c.extensionId}:${cmd}`}
+            label={t('extensionsFlavors.extensionToolbarSlot.runAriaLabel', { title })}
+            tooltip={title}
+            onClick={() => handleClick(cmd, c.extensionId)}
+          >
+            <Icon className="h-4 w-4" />
+          </IconButton>
         );
       })}
     </div>

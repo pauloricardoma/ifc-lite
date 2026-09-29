@@ -6,7 +6,7 @@
 //! the `_tests.rs` suffix convention.
 
 use super::*;
-use ifc_lite_core::EntityScanner;
+use ifc_lite_core::{express_id::parse_express_id, EntityScanner};
 
 fn scan_ids(step: &str) -> Vec<u32> {
     let bytes = step.as_bytes();
@@ -55,36 +55,7 @@ fn merge_two_models_unifies_project_and_offsets_ids() {
     );
 
     // No dangling references: every #ref resolves to a written id.
-    let idset: std::collections::HashSet<u32> = ids.into_iter().collect();
-    for line in merged.lines().filter(|l| l.starts_with('#')) {
-        // collect refs after the leading id
-        let body = &line[1..];
-        let after_eq = body.find('=').map(|e| &body[e..]).unwrap_or(body);
-        let mut i = 0;
-        let bytes = after_eq.as_bytes();
-        let mut in_str = false;
-        while i < bytes.len() {
-            let c = bytes[i];
-            if c == b'\'' {
-                in_str = !in_str;
-            } else if !in_str && c == b'#' {
-                let mut j = i + 1;
-                let mut n = 0u32;
-                let mut any = false;
-                while j < bytes.len() && bytes[j].is_ascii_digit() {
-                    n = n * 10 + (bytes[j] - b'0') as u32;
-                    j += 1;
-                    any = true;
-                }
-                if any {
-                    assert!(idset.contains(&n), "dangling ref #{n}");
-                    i = j;
-                    continue;
-                }
-            }
-            i += 1;
-        }
-    }
+    assert_no_dangling(&merged);
 }
 // `escape()` and `detect_schema()` are no longer private forks of this
 // module: `merged.rs` imports `escape` from `step_text.rs` and `detect_schema`
@@ -134,10 +105,12 @@ fn merge_ignores_file_schema_literal_text_inside_a_quoted_header_string() {
 
 /// Scenario from the maintainer's review: a header field carrying a raw C0
 /// control byte (outside the ISO 10303-21 basic graphic range 32-126) must
-/// be mapped to a space, not written raw into the STEP literal. Only \n \r
-/// \t were mapped before merged.rs picked up the shared `step_text::escape`.
+/// not be written raw into the STEP literal. Only \n \r \t were handled
+/// before merged.rs picked up the shared `step_text::escape`. The escape is
+/// the `\X2\` directive, not a space: a space kept the record on one line
+/// but lost the character.
 #[test]
-fn merge_maps_raw_control_bytes_in_header_fields_to_a_space() {
+fn merge_encodes_raw_control_bytes_in_header_fields_as_directives() {
     let opts = MergedOptions {
         schema: Some("IFC4".to_string()),
         description: "ViewDefinition [CoordinationView]".to_string(),
@@ -156,7 +129,7 @@ fn merge_maps_raw_control_bytes_in_header_fields_to_a_space() {
     );
     assert_eq!(
         file_name_line,
-        "FILE_NAME('','',(''),(''),'app bell vt','ifc-lite-export','');"
+        "FILE_NAME('','',(''),(''),'app\\X2\\0007\\X0\\bell\\X2\\000B\\X0\\vt','ifc-lite-export','');"
     );
 }
 
@@ -399,14 +372,22 @@ fn assert_no_dangling(step: &str) {
                 in_str = !in_str;
             } else if !in_str && c == b'#' {
                 let mut j = i + 1;
-                let mut n = 0u32;
-                let mut any = false;
                 while j < bytes.len() && bytes[j].is_ascii_digit() {
-                    n = n * 10 + (bytes[j] - b'0') as u32;
                     j += 1;
-                    any = true;
                 }
-                if any {
+                if j > i + 1 {
+                    // Through the shared express-id home, so the oracle holds the
+                    // same bound as the code it audits (#3421). A run past
+                    // u32::MAX is dangling by construction — no id column can
+                    // hold it — and `rewrite_refs` now emits such a run
+                    // verbatim, so this is the assertion that would see it. The
+                    // old `n * 10 + d` accumulator could not: it overflowed
+                    // (a debug panic) or wrapped onto a real written id and
+                    // passed.
+                    let digits = String::from_utf8_lossy(&bytes[i + 1..j]);
+                    let n = parse_express_id(&bytes[i + 1..j]).unwrap_or_else(|| {
+                        panic!("dangling ref #{digits} (above u32::MAX) in {line:?}")
+                    });
                     assert!(ids.contains(&n), "dangling ref #{n} in {line:?}");
                     i = j;
                     continue;
@@ -415,6 +396,27 @@ fn assert_no_dangling(step: &str) {
             i += 1;
         }
     }
+}
+
+#[test]
+#[should_panic(expected = "above u32::MAX")]
+fn the_dangling_oracle_reports_a_reference_past_the_id_space() {
+    // `rewrite_refs` now emits a reference above u32::MAX verbatim (#3421), so
+    // this oracle is the assertion that has to see it, and the 20-odd tests that
+    // call it are only as good as its bound. `#4294967297` is 2^32+1: the old
+    // `n * 10 + d` accumulator wrapped it onto the real, written `#1` and let the
+    // merged file pass as free of dangling references.
+    assert_no_dangling("#1=IFCPROJECT('g',$);\n#2=IFCSHAPEREPRESENTATION(#4294967297);\n");
+}
+
+#[test]
+fn the_dangling_oracle_resolves_a_reference_at_exactly_u32_max() {
+    // The other direction: u32::MAX is a legal express id on both sides, so a
+    // record written under it must satisfy a reference naming it rather than be
+    // reported as dangling.
+    assert_no_dangling(
+        "#4294967295=IFCPROJECT('g',$);\n#2=IFCSHAPEREPRESENTATION(#4294967295);\n",
+    );
 }
 
 /// Every `#N` reference in a line's attribute list (after `=`), skipping the
@@ -431,15 +433,15 @@ fn refs_in_line(line: &str) -> Vec<u32> {
             in_str = !in_str;
         } else if !in_str && c == b'#' {
             let mut j = i + 1;
-            let mut n = 0u32;
-            let mut any = false;
             while j < bytes.len() && bytes[j].is_ascii_digit() {
-                n = n * 10 + (bytes[j] - b'0') as u32;
                 j += 1;
-                any = true;
             }
-            if any {
-                out.push(n);
+            if j > i + 1 {
+                // Drops a run past u32::MAX, mirroring the production
+                // `step_text::refs_in_line` this helper stands in for (#3421).
+                if let Some(n) = parse_express_id(&bytes[i + 1..j]) {
+                    out.push(n);
+                }
                 i = j;
                 continue;
             }
@@ -608,6 +610,75 @@ ENDSEC;\nEND-ISO-10303-21;\n";
     assert_no_dangling(&merged);
 }
 
+/// RED for issue #3752: a filtered model whose root references an id above
+/// `u32::MAX` (issue #3421's own refusal) used to have that reference vanish
+/// from the closure with no trace anywhere in `MergedStats`. It must now be
+/// counted into `stats.warnings`.
+#[test]
+fn a_filtered_models_oversized_reference_is_reported_in_warnings() {
+    let content = "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
+#1=IFCWALL('WALL0000000000000000A',$,'W',$,$,#4294967297,$,$);\n\
+ENDSEC;\nEND-ISO-10303-21;\n";
+    let models =
+        [MergedModel { content: content.as_bytes(), id: "a".to_string(), included: Some(vec![1]) }];
+    let (_merged, stats) = export_merged_models(&models, &MergedOptions::default());
+
+    assert!(
+        stats.warnings.iter().any(|w| w.contains("u32 express-id bound")),
+        "an oversized reference must be reported in warnings, not silently dropped (#3752): {:?}",
+        stats.warnings
+    );
+    // Exactly one oversized reference exists in this model, and it must be
+    // counted once — not twice, from a stray prepass scan over model 0
+    // (CodeRabbit, PR #3766).
+    assert!(
+        stats.warnings.iter().any(|w| w.starts_with("1 reference(s)")),
+        "the single oversized reference must be counted exactly once, not double-counted: {:?}",
+        stats.warnings
+    );
+}
+
+/// RED for CodeRabbit (PR #3766): `resolve_included` returns `index.order`
+/// directly when `roots` is `None` (a full, unfiltered model — the common
+/// case, `MergedModel.included: None`) without ever walking any entity line,
+/// so an oversized reference anywhere in an unfiltered model was never
+/// counted or reported. A filtered model with the same reference (covered
+/// above) already worked; only the `None` path was blind.
+#[test]
+fn an_unfiltered_models_oversized_reference_is_reported_in_warnings() {
+    let content = "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
+#1=IFCWALL('WALL0000000000000000A',$,'W',$,$,#4294967297,$,$);\n\
+ENDSEC;\nEND-ISO-10303-21;\n";
+    let models =
+        [MergedModel { content: content.as_bytes(), id: "a".to_string(), included: None }];
+    let (_merged, stats) = export_merged_models(&models, &MergedOptions::default());
+
+    assert!(
+        stats.warnings.iter().any(|w| w.contains("u32 express-id bound")),
+        "an oversized reference in an unfiltered (included: None) model must be reported too: {:?}",
+        stats.warnings
+    );
+}
+
+/// Control: a filtered model whose root's references are all ordinary
+/// (`u32`-representable) reports no oversized-ref warning.
+#[test]
+fn an_ordinary_filtered_model_reports_no_oversized_ref_warning() {
+    let content = "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
+#1=IFCWALL('WALL0000000000000000A',$,'W',$,$,#2,$,$);\n\
+#2=IFCLOCALPLACEMENT($,$);\n\
+ENDSEC;\nEND-ISO-10303-21;\n";
+    let models =
+        [MergedModel { content: content.as_bytes(), id: "a".to_string(), included: Some(vec![1]) }];
+    let (_merged, stats) = export_merged_models(&models, &MergedOptions::default());
+
+    assert!(
+        stats.warnings.iter().all(|w| !w.contains("u32 express-id bound")),
+        "an ordinary reference must not trigger the oversized-ref warning: {:?}",
+        stats.warnings
+    );
+}
+
 #[test]
 fn converted_rooted_entity_keeps_source_globalid_for_later_unify() {
     // Two IFC4X3 models sharing one IfcAlignmentSegment (a rooted entity) GlobalId,
@@ -660,8 +731,11 @@ fn duplicate_globalids_are_reconciled_no_dupes() {
     assert_eq!(type_count(&merged, "=IFCSITE("), 1);
     assert_eq!(type_count(&merged, "=IFCBUILDINGSTOREY("), 1);
     assert_eq!(type_count(&merged, "=IFCWALL("), 1, "duplicate wall unified");
-    // The objectified relationship is re-stamped (kept), not dropped.
-    assert_eq!(type_count(&merged, "=IFCRELCONTAINEDINSPATIALSTRUCTURE("), 2);
+    // The second model's containment only restates the unified wall's, which
+    // `ContainedInStructure : SET [0:1]` allows once (#5923), so it is not
+    // written. Relationships are still never unified by GlobalId: see
+    // `within_model_duplicate_globalids_are_restamped`.
+    assert_eq!(type_count(&merged, "=IFCRELCONTAINEDINSPATIALSTRUCTURE("), 1);
     assert_eq!(stats.federated_model_count, 0);
     assert!(!stats.unit_rescale_required);
     assert_no_dangling(&merged);
@@ -1393,3 +1467,73 @@ fn dropping_containers_keeps_a_real_model_intact() {
     );
 }
 
+/// Export review finding H1: in an UNFILTERED model a reference to an id with
+/// no line (`#50` here; model A's last line is `#5`) is still moved by the
+/// offset, but `next_offset` bounded the id space by the last LINE, so model B
+/// was placed from `#6` and its 45th entity became `#50`: A's material
+/// relationship silently named B's wall. The filtered path already reserved
+/// the dangling id, and is the control. The reference must stay dangling.
+#[test]
+fn an_unfiltered_models_dangling_reference_is_not_retargeted_at_the_next_model() {
+    let a = "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
+#1=IFCPROJECT('PROJA0000000000000000A',$,'A',$,$,$,$,$,$);\n\
+#4=IFCWALL('WALLA0000000000000000A',$,'WA',$,$,$,$,$);\n\
+#5=IFCRELASSOCIATESMATERIAL('RELA00000000000000000A',$,$,$,(#4),#50);\n\
+ENDSEC;\nEND-ISO-10303-21;\n";
+    let mut b = String::from("ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n");
+    for i in 1..=60 {
+        b.push_str(&format!("#{i}=IFCWALL('WALLB{i:0>17}',$,'WB{i}',$,$,$,$,$);\n"));
+    }
+    b.push_str("ENDSEC;\nEND-ISO-10303-21;\n");
+    for included in [None, Some(vec![1, 4, 5])] {
+        let models = [
+            MergedModel { content: a.as_bytes(), id: "a".to_string(), included: included.clone() },
+            MergedModel { content: b.as_bytes(), id: "b".to_string(), included: None },
+        ];
+        let (merged, stats) = export_merged_models(&models, &MergedOptions::default());
+        assert_eq!(stats.unmerged_model_count, 0, "both models fit");
+        assert_eq!(type_count(&merged, "=IFCWALL("), 61, "every wall is emitted");
+        let rel = merged
+            .lines()
+            .find(|l| l.contains("=IFCRELASSOCIATESMATERIAL("))
+            .expect("model A's relationship is emitted");
+        let target = rel.rsplit('#').next().and_then(|t| t.trim_end_matches(");").parse::<u32>().ok());
+        let target = target.unwrap_or_else(|| panic!("a trailing #ref in {rel}"));
+        assert!(
+            !merged.lines().any(|l| l.starts_with(&format!("#{target}="))),
+            "included={included:?}: A's dangling #50 became #{target}, a real entity: {rel}"
+        );
+    }
+}
+
+
+/// #5937 end to end: the later storey whose only element unifies by GlobalId
+/// is dropped, its aggregation goes with it, and nothing dangles.
+#[test]
+fn drop_empty_containers_drops_a_storey_emptied_by_globalid_unification() {
+    let model = |tag: &str, storey: &str, elevation: &str| {
+        format!(
+            "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
+#1=IFCPROJECT('{tag}PROJ00000000000000000',$,'P',$,$,$,$,$,$);\n\
+#2=IFCSITE('{tag}SITE00000000000000000',$,'Site',$,$,$,$,$,$,$,$,$,$,$);\n\
+#3=IFCBUILDING('{tag}BLDG00000000000000000',$,'Building',$,$,$,$,$,$,$,$,$);\n\
+#4=IFCBUILDINGSTOREY('{tag}STOREY000000000000000',$,'{storey}',$,$,$,$,$,$,{elevation});\n\
+#6=IFCWALL('0aBcDeFgHiJkLmNoPqRsT1',$,'Wall',$,$,$,$,$,$);\n\
+#7=IFCRELAGGREGATES('{tag}R0000000000000000000',$,$,$,#1,(#2));\n\
+#8=IFCRELAGGREGATES('{tag}R1000000000000000000',$,$,$,#2,(#3));\n\
+#9=IFCRELAGGREGATES('{tag}R2000000000000000000',$,$,$,#3,(#4));\n\
+#10=IFCRELCONTAINEDINSPATIALSTRUCTURE('{tag}R300000000000000000',$,$,$,(#6),#4);\n\
+ENDSEC;\nEND-ISO-10303-21;\n"
+        )
+    };
+    let a = model("A", "Level 0", "0.");
+    let b = model("B", "Mezzanine", "7000.");
+    let opts = MergedOptions { drop_empty_containers: true, ..Default::default() };
+    let (merged, stats) = export_merged_with_stats(&[a.as_bytes(), b.as_bytes()], &opts);
+    assert!(merged.contains("ASTOREY"), "the first storey keeps its wall");
+    assert!(!merged.contains("BSTOREY"), "the later storey held only a unified wall:\n{merged}");
+    assert!(!merged.contains("BR2000000000000000000"), "its aggregation goes with it");
+    assert_eq!(type_count(&merged, "=IFCRELCONTAINEDINSPATIALSTRUCTURE("), 1);
+    assert_eq!(stats.dropped_container_count, 1);
+    assert_no_dangling(&merged);
+}

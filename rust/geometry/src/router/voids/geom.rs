@@ -285,7 +285,7 @@ pub(super) fn rotate_mesh_into_frame(mesh: &Mesh, rt: &Matrix3<f64>, center: &Po
         positions,
         // Frame-transformed cut intermediate — not an instanceable occurrence,
         // and pre-placement (issue #1474 fields don't apply here either).
-    instance_meta: None, local_bounds: None, local_to_world: None }
+    instance_meta: None, local_bounds: None, local_to_world: None, welded_in_object_frame: false, plane_tags: None }
 }
 
 /// Rotate a frame-F mesh into a LOCAL-FRAME world mesh: positions are `R·v_F` (small,
@@ -321,29 +321,61 @@ pub(super) fn rotate_mesh_from_frame(mesh: &Mesh, r: &Matrix3<f64>, center: &Poi
         origin: [center.x + o[0], center.y + o[1], center.z + o[2]],
         // Frame-transformed cut intermediate — not an instanceable occurrence,
         // and pre-placement (issue #1474 fields don't apply here either).
-    instance_meta: None, local_bounds: None, local_to_world: None }
+    instance_meta: None, local_bounds: None, local_to_world: None, welded_in_object_frame: false, plane_tags: None }
 }
 
-/// Signed volume of a (closed) triangle mesh via the divergence theorem. Used to
-/// reconcile a union of parametric boxes against the meshed opening solid by volume.
-pub(super) fn mesh_signed_volume(mesh: &Mesh) -> f64 {
-    let v = |i: u32| {
-        let b = i as usize * 3;
-        [
-            mesh.positions[b] as f64,
-            mesh.positions[b + 1] as f64,
-            mesh.positions[b + 2] as f64,
-        ]
-    };
+/// Signed volume of a (closed) triangle mesh via the divergence theorem, about
+/// [`volume_reference`] of the same mesh. Reads the f32 positions unsnapped; an
+/// out-of-range index panics. Used to reconcile a union of parametric boxes
+/// against the meshed opening solid by volume, and by the before/after cut gates.
+pub(crate) fn mesh_signed_volume(mesh: &Mesh) -> f64 {
+    mesh_signed_volume_about(mesh, &volume_reference(mesh))
+}
+
+/// The point [`mesh_signed_volume`] sums `mesh` about: the centre of its position
+/// bounds (the origin for an empty mesh). `kernel::signed_volume` uses the same
+/// rule over the vertices its triangles reference, so the two agree unless the
+/// buffer holds unreferenced positions. On native, positions are absolute, and an
+/// open surface's divergence sum grows with the distance to the reference point,
+/// so the point must lie within the operand's extent, not at the world origin.
+/// Read off `Mesh::bounds`, a linear scan of the position buffer, so the sum
+/// itself is the only index walk.
+pub(crate) fn volume_reference(mesh: &Mesh) -> [f64; 3] {
+    if mesh.is_empty() {
+        return [0.0; 3];
+    }
+    let (lo, hi) = mesh.bounds();
+    [
+        (f64::from(lo.x) + f64::from(hi.x)) * 0.5,
+        (f64::from(lo.y) + f64::from(hi.y)) * 0.5,
+        (f64::from(lo.z) + f64::from(hi.z)) * 0.5,
+    ]
+}
+
+/// [`mesh_signed_volume`] about a caller-chosen `o`, in one walk. A before/after
+/// difference over the same host must read both meshes about ONE point (the
+/// host's [`volume_reference`]): the flux of a crack the cut did not touch then
+/// cancels, where two per-mesh points would leave `(o_after − o_before)·N/6` of it
+/// in the removed volume (#4632).
+pub(crate) fn mesh_signed_volume_about(mesh: &Mesh, o: &[f64; 3]) -> f64 {
     mesh.indices
         .chunks_exact(3)
         .map(|t| {
-            let (a, b, c) = (v(t[0]), v(t[1]), v(t[2]));
-            a[0] * (b[1] * c[2] - b[2] * c[1]) + a[1] * (b[2] * c[0] - b[0] * c[2])
-                + a[2] * (b[0] * c[1] - b[1] * c[0])
+            let (a, b, c) = (mesh_vertex(mesh, t[0]), mesh_vertex(mesh, t[1]), mesh_vertex(mesh, t[2]));
+            crate::kernel::signed_volume::tetra_volume6(&a, &b, &c, o)
         })
         .sum::<f64>()
         / 6.0
+}
+
+#[inline]
+fn mesh_vertex(mesh: &Mesh, i: u32) -> [f64; 3] {
+    let b = i as usize * 3;
+    [
+        mesh.positions[b] as f64,
+        mesh.positions[b + 1] as f64,
+        mesh.positions[b + 2] as f64,
+    ]
 }
 
 /// Closed-2-manifold self-check (0.1 mm weld): every undirected edge shared by exactly
@@ -360,6 +392,14 @@ pub(super) fn mesh_signed_volume(mesh: &Mesh) -> f64 {
 /// here", ask [`point_inside_mesh_agreed`], which asks about the point rather
 /// than the topology and is tolerant of T-junctions.
 pub(super) fn param_cut_watertight(mesh: &Mesh) -> bool {
+    topology_defect_count(mesh) == 0
+}
+
+/// Number of 0.1 mm-welded undirected edges whose triangle multiplicity is not
+/// two. This is the same topology reading as [`param_cut_watertight`], exposed
+/// as a count so a composed route can detect a catastrophic increase without
+/// requiring an already imperfect IFC host to be perfectly closed.
+pub(super) fn topology_defect_count(mesh: &Mesh) -> usize {
     let key = |i: u32| -> (i64, i64, i64) {
         let b = i as usize * 3;
         let q = |v: f32| (v as f64 / 1.0e-4).round() as i64;
@@ -380,7 +420,10 @@ pub(super) fn param_cut_watertight(mesh: &Mesh) -> bool {
             *edges.entry(e).or_insert(0) += 1;
         }
     }
-    !edges.is_empty() && edges.values().all(|&c| c == 2)
+    if edges.is_empty() {
+        return usize::MAX;
+    }
+    edges.values().filter(|&&c| c != 2).count()
 }
 
 #[inline]
@@ -789,7 +832,9 @@ pub(super) fn infer_opening_frame(mesh: &Mesh, extrusion_dir: Option<&Vector3<f6
         .collect();
 
     if cross_candidates.len() < 2 {
-        return OpeningFrame::from_depth(depth);
+        let mut frame = OpeningFrame::from_depth(depth)?;
+        frame.depth_is_authored = extrusion_dir.is_some();
+        return Some(frame);
     }
 
     let mut cross_a = cross_candidates.remove(0);
@@ -803,80 +848,12 @@ pub(super) fn infer_opening_frame(mesh: &Mesh, extrusion_dir: Option<&Vector3<f6
         depth,
         cross_a,
         cross_b,
+        depth_is_authored: extrusion_dir.is_some(),
     })
 }
 
-/// Build a right-handed orthonormal wall frame `[len, up, depth]` from a
-/// (roughly horizontal) opening depth axis: `depth` is the wall-thickness /
-/// penetration axis, `up` is world +Z, `len` runs along the wall. Returns
-/// `None` if `depth` is degenerate or too close to vertical (not a plan-rotated
-/// wall). `len × up = depth`, so a box wound for world axes keeps its winding
-/// when mapped back. Issue #1167: cutting the openings in this frame makes the
-/// wall and its openings axis-aligned, where the exact subtract is clean — the
-/// world-space tilted cut at large coordinates fragments badly.
-pub(super) fn wall_frame_from_depth(depth: Vector3<f64>) -> Option<[Vector3<f64>; 3]> {
-    let d = depth.try_normalize(NORMALIZE_EPSILON)?;
-    if d.z.abs() > 0.2 {
-        return None; // roof/floor/sloped — not a plan-rotated wall
-    }
-    let up = Vector3::new(0.0, 0.0, 1.0);
-    let len = up.cross(&d).try_normalize(NORMALIZE_EPSILON)?;
-    let up = d.cross(&len).try_normalize(NORMALIZE_EPSILON)?; // re-orthogonalise
-    // [len, up, d] right-handed: len × up = d.
-    Some([len, up, d])
-}
-
-/// Express `mesh` in the orthonormal frame `axes = [a, b, c]` about `center`:
-/// `p' = [ (p-center)·a, (p-center)·b, (p-center)·c ]`. Centering keeps
-/// coordinates small (f32-precise) and the rotation makes a frame-oriented box
-/// axis-aligned. [`rotate_mesh_from_frame`] inverts it, returning the centre
-/// in [`Mesh::origin`] rather than in the coordinates.
-pub(super) fn mesh_to_frame(mesh: &Mesh, axes: &[Vector3<f64>; 3], center: Vector3<f64>) -> Mesh {
-    let mut positions = Vec::with_capacity(mesh.positions.len());
-    for ch in mesh.positions.chunks_exact(3) {
-        let p = Vector3::new(ch[0] as f64, ch[1] as f64, ch[2] as f64) - center;
-        positions.push(p.dot(&axes[0]) as f32);
-        positions.push(p.dot(&axes[1]) as f32);
-        positions.push(p.dot(&axes[2]) as f32);
-    }
-    let mut normals = Vec::with_capacity(mesh.normals.len());
-    for ch in mesh.normals.chunks_exact(3) {
-        let n = Vector3::new(ch[0] as f64, ch[1] as f64, ch[2] as f64);
-        normals.push(n.dot(&axes[0]) as f32);
-        normals.push(n.dot(&axes[1]) as f32);
-        normals.push(n.dot(&axes[2]) as f32);
-    }
-    Mesh {
-        positions,
-        normals,
-        indices: mesh.indices.clone(),
-        rtc_applied: mesh.rtc_applied,
-        origin: mesh.origin,
-        // Frame-transformed cut intermediate — not an instanceable occurrence.
-        instance_meta: None,
-        local_bounds: None,
-        local_to_world: None,
-    }
-}
-
-/// Axis-aligned bounds of `mesh` expressed in the frame `axes` about `center`.
-pub(super) fn project_aabb_in_frame(
-    mesh: &Mesh,
-    axes: &[Vector3<f64>; 3],
-    center: Vector3<f64>,
-) -> Option<(Point3<f64>, Point3<f64>)> {
-    let mut lo = [f64::INFINITY; 3];
-    let mut hi = [f64::NEG_INFINITY; 3];
-    for ch in mesh.positions.chunks_exact(3) {
-        let p = Vector3::new(ch[0] as f64, ch[1] as f64, ch[2] as f64) - center;
-        for k in 0..3 {
-            let v = p.dot(&axes[k]);
-            lo[k] = lo[k].min(v);
-            hi[k] = hi[k].max(v);
-        }
-    }
-    // Validate BOTH bounds: a +inf projection lands only in `hi`, so checking
-    // `lo` alone could return a non-finite AABB into the cutter path (#1259).
-    (lo.iter().all(|v| v.is_finite()) && hi.iter().all(|v| v.is_finite()))
-        .then(|| (Point3::new(lo[0], lo[1], lo[2]), Point3::new(hi[0], hi[1], hi[2])))
-}
+#[path = "frame_project.rs"]
+mod frame_project;
+pub(in crate::router::voids) use frame_project::{
+    mesh_to_frame, project_aabb_in_frame, wall_frame_from_depth,
+};

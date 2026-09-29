@@ -11,18 +11,23 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ifc_lite_core::{DecodedEntity, EntityDecoder, EntityIndex, EntityScanner, IfcType};
+use ifc_lite_core::{
+    keyword_eq, DecodedEntity, EntityDecoder, EntityIndex, EntityScanner, IfcType,
+    EXPORTER_STRATUM_ALIASES,
+};
 use ifc_lite_geometry::GeometryRouter;
 use ifc_lite_processing::element::{plan_type_geometry, TypeGeometryMode};
 use ifc_lite_processing::prepass::{resolve_unit_scales, UnitScales};
 use rustc_hash::FxHashSet;
+
+use crate::source_header::declared_schemas;
 
 #[path = "model_options.rs"]
 mod options;
 pub use options::{ModelOptions, Placement};
 
 #[path = "model_props.rs"]
-mod props;
+pub(crate) mod props;
 pub use props::fmt_num;
 use props::{opt_string, ref_list, render_attributes, resolve_pset_defs};
 
@@ -80,6 +85,12 @@ pub fn stream_export_model(content: &[u8], f: impl FnMut(EntityRow)) -> UnitScal
 struct TypeProductCandidate {
     express_id: u32,
     ifc_type: IfcType,
+    /// The raw STEP keyword (e.g. `"IFCDOORSTYLE"`), kept ONLY so a later
+    /// `render_attributes` call can look up a legacy entity's own attribute
+    /// names (#4203) — `ifc_type` above is already legacy-aware-resolved
+    /// (`IfcDoorType`, not `Unknown`) and is what every other consumer of
+    /// this candidate wants.
+    type_name: String,
     global_id: Option<String>,
     name: Option<String>,
     description: Option<String>,
@@ -92,7 +103,7 @@ struct TypeProductCandidate {
 }
 
 /// Like [`stream_export_model`] but reuses a pre-built entity index. A caller also
-/// running the geometry pass ([`crate::export_glb_with_stats_with_index`]) over the
+/// running the geometry pass ([`crate::try_export_glb_with_stats_with_index`]) over the
 /// same bytes builds the index once with [`build_entity_index`] and shares it across
 /// both, skipping the duplicate scan. `entity_index` MUST be built from the same
 /// `content`; output is identical to `stream_export_model`.
@@ -130,6 +141,14 @@ pub fn stream_export_model_with_options(
     opts: &ModelOptions,
     mut f: impl FnMut(EntityRow, Option<&DecodedEntity>),
 ) -> UnitScales {
+    // Attribute positions are schema-specific. Unlike STEP re-export, where
+    // IFC4 is an established fallback for a missing declaration, attribute
+    // export must fail closed rather than assign IFC4 names to unknown slots.
+    let source_schema = declared_schemas(content).into_iter().find(|schema| {
+        // IfcProject exists in every bundled registry, so this is a schema
+        // recognition probe rather than an entity-specific fallback.
+        ifc_lite_core::attribute_names_for_schema(schema, "IFCPROJECT").is_some()
+    });
     // Property resolution memoizes the shared `IfcPropertySet`/leaf entities for
     // speed. Cap that cache so it can't grow without bound across millions of
     // products; clearing only forces a re-decode of a shared set, never affects
@@ -137,8 +156,6 @@ pub fn stream_export_model_with_options(
     const PSET_CACHE_CAP: usize = 1 << 18; // 262_144 entries
 
     let mut decoder = EntityDecoder::with_arc_index(content, entity_index.clone());
-
-
 
     // Pass 1 — one scan that collects, uncached (each entity visited once here):
     //   • object → attached property/quantity definitions (IfcRelDefinesByProperties),
@@ -169,34 +186,32 @@ pub fn stream_export_model_with_options(
     {
         let mut scanner = EntityScanner::new(content);
         while let Some((id, type_name, start, end)) = scanner.next_entity() {
-            match type_name {
-                "IFCRELDEFINESBYPROPERTIES" => {
-                    let rel = match decoder.decode_at_uncached(start, end) {
-                        Ok(e) => e,
-                        Err(_) => continue,
-                    };
-                    let def_id = match rel.get(5).and_then(|a| a.as_entity_ref()) {
-                        Some(d) => d,
-                        None => continue,
-                    };
-                    if let Some(objs) = rel.get(4).and_then(|a| a.as_list()) {
-                        for o in objs {
-                            if let Some(oid) = o.as_entity_ref() {
-                                defs_by_object.entry(oid).or_default().push(def_id);
-                            }
+            if keyword_eq(type_name, "IFCRELDEFINESBYPROPERTIES") {
+                let rel = match decoder.decode_at_uncached(start, end) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                let def_id = match rel.get(5).and_then(|a| a.as_entity_ref()) {
+                    Some(d) => d,
+                    None => continue,
+                };
+                if let Some(objs) = rel.get(4).and_then(|a| a.as_list()) {
+                    for o in objs {
+                        if let Some(oid) = o.as_entity_ref() {
+                            defs_by_object.entry(oid).or_default().push(def_id);
                         }
                     }
                 }
+            } else if keyword_eq(type_name, "IFCMAPPEDITEM") {
                 // IfcMappedItem.MappingSource (attr 0) → the RepresentationMap an
                 // occurrence instances; such maps draw through the occurrence, so
                 // they are NOT orphan type geometry.
-                "IFCMAPPEDITEM" => {
-                    if let Ok(mi) = decoder.decode_at_uncached(start, end) {
-                        if let Some(src) = mi.get(0).and_then(|a| a.as_entity_ref()) {
-                            referenced_representation_maps.insert(src);
-                        }
+                if let Ok(mi) = decoder.decode_at_uncached(start, end) {
+                    if let Some(src) = mi.get(0).and_then(|a| a.as_entity_ref()) {
+                        referenced_representation_maps.insert(src);
                     }
                 }
+            } else if keyword_eq(type_name, "IFCRELDEFINESBYTYPE") {
                 // IfcRelDefinesByType.RelatingType (attr 5) → a type WITH occurrences;
                 // its geometry is drawn by those occurrences, never as orphan type
                 // geometry (the AC20/ArchiCAD duplicate-boxes guard).
@@ -206,62 +221,61 @@ pub fn stream_export_model_with_options(
                 // HasPropertySets reachable from the occurrence, and building the
                 // map costs an allocation per typed occurrence that the geometry
                 // bookkeeping above has no use for.
-                "IFCRELDEFINESBYTYPE" => {
-                    if let Ok(rel) = decoder.decode_at_uncached(start, end) {
-                        if let Some(tid) = rel.get(5).and_then(|a| a.as_entity_ref()) {
-                            instantiated_type_ids.insert(tid);
-                            if opts.inherit_type_properties {
-                                if let Some(objs) = rel.get(4).and_then(|a| a.as_list()) {
-                                    for o in objs {
-                                        if let Some(oid) = o.as_entity_ref() {
-                                            // FIRST relationship wins if a file
-                                            // types one object twice (a schema
-                                            // violation, but exports do it).
-                                            // `typeIds[0]` is what the TS
-                                            // extractor takes, and scan order
-                                            // here is file order, so the two
-                                            // pick the same type rather than
-                                            // disagreeing per engine.
-                                            type_by_object.entry(oid).or_insert(tid);
-                                        }
+                if let Ok(rel) = decoder.decode_at_uncached(start, end) {
+                    if let Some(tid) = rel.get(5).and_then(|a| a.as_entity_ref()) {
+                        instantiated_type_ids.insert(tid);
+                        if opts.inherit_type_properties {
+                            if let Some(objs) = rel.get(4).and_then(|a| a.as_list()) {
+                                for o in objs {
+                                    if let Some(oid) = o.as_entity_ref() {
+                                        // FIRST relationship wins if a file
+                                        // types one object twice (a schema
+                                        // violation, but exports do it).
+                                        // `typeIds[0]` is what the TS
+                                        // extractor takes, and scan order
+                                        // here is file order, so the two
+                                        // pick the same type rather than
+                                        // disagreeing per engine.
+                                        type_by_object.entry(oid).or_insert(tid);
                                     }
                                 }
                             }
                         }
                     }
                 }
-                "IFCPROJECT" => project_id = project_id.or(Some(id)),
+            } else if keyword_eq(type_name, "IFCPROJECT") {
+                project_id = project_id.or(Some(id));
+            } else {
                 // An IfcTypeProduct subtype carrying RepresentationMaps (attr 6).
                 // `type_product_ifc_type` keeps its own cheap suffix pre-filter, so
                 // the non-type majority still pays only that.
                 //
-                // Asked once, in the arm body rather than in a match guard: a guard
-                // cannot bind, so guarding on `.is_some()` forced a second identical
-                // call to get the value. Shares `type_product_ifc_type` with the
+                // Asked once, in the branch body rather than in its condition: a
+                // condition cannot bind, so testing `.is_some()` there forced a
+                // second identical call to get the value. Shares `type_product_ifc_type` with the
                 // processor's type-geometry gate, so this pass cannot admit a
                 // different set than the one that gets meshed (#1518, #3187).
-                _ => {
-                    let Some(type_ty) = ifc_lite_core::type_product_ifc_type(type_name) else {
-                        continue;
-                    };
-                    let t = match decoder.decode_at_uncached(start, end) {
-                        Ok(e) => e,
-                        Err(_) => continue,
-                    };
-                    let rep_map_ids = ref_list(t.get(6));
-                    if rep_map_ids.is_empty() {
-                        continue;
-                    }
-                    type_product_candidates.push(TypeProductCandidate {
-                        express_id: id,
-                        ifc_type: type_ty,
-                        global_id: opt_string(t.get(0)),
-                        name: opt_string(t.get(2)),
-                        description: opt_string(t.get(3)),
-                        rep_map_ids,
-                        pset_def_ids: ref_list(t.get(5)),
-                    });
+                let Some(type_ty) = ifc_lite_core::type_product_ifc_type(type_name) else {
+                    continue;
+                };
+                let t = match decoder.decode_at_uncached(start, end) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                let rep_map_ids = ref_list(t.get(6));
+                if rep_map_ids.is_empty() {
+                    continue;
                 }
+                type_product_candidates.push(TypeProductCandidate {
+                    express_id: id,
+                    ifc_type: type_ty,
+                    type_name: type_name.to_string(),
+                    global_id: opt_string(t.get(0)),
+                    name: opt_string(t.get(2)),
+                    description: opt_string(t.get(3)),
+                    rep_map_ids,
+                    pset_def_ids: ref_list(t.get(5)),
+                });
             }
         }
     }
@@ -278,6 +292,7 @@ pub fn stream_export_model_with_options(
     // they cannot forget to ask.
     let units = resolve_unit_scales(content, project_id, &mut decoder);
 
+    // Not drained: meshes nothing. Pinned by rust/geometry/tests/issue_3821_auxiliary_routers_mesh_nothing.rs.
     // Built with the file's scale, NOT `GeometryRouter::new()`: `new` defaults
     // `unit_scale` to 1.0 and `scale_transform` only scales when it was given
     // the real one, so the difference is silently-millimetre translations.
@@ -289,22 +304,25 @@ pub fn stream_export_model_with_options(
     // Pass 2 — emit a row per IfcProduct occurrence, resolving its property/quantity sets.
     let mut scanner = EntityScanner::new(content);
     while let Some((id, type_name, start, end)) = scanner.next_entity() {
-        // Filter on the STEP keyword *before* decoding, skipping the millions of
-        // non-product geometry primitives. `legacy_aware_ifc_type` (not a bare
-        // `from_str`) resolves removed/renamed keywords (IFCPROXY, IFCSOLIDSTRATUM,
-        // …) to their modern base type, matching what the geometry pass meshes —
-        // otherwise those products render as GLB nodes with no attribute row (#1496).
-        let ty = ifc_lite_core::legacy_aware_ifc_type(type_name);
-        if !ty.is_subtype_of(IfcType::IfcProduct) {
+        // Filter on the STEP keyword before decoding, skipping non-product geometry primitives. The three exporter-only stratum
+        // spellings are explicit product compatibility aliases: they keep their
+        // owned exact keyword rather than being relabelled as a nearby EXPRESS
+        // entity, while still receiving the row their geometry needs.
+        let ty = ifc_lite_core::ifc_type_from_keyword(type_name);
+        if !ty.is_subtype_of(IfcType::IfcProduct)
+            && !EXPORTER_STRATUM_ALIASES
+                .iter()
+                .any(|alias| keyword_eq(type_name, alias))
+        {
             continue;
         }
         let entity = match decoder.decode_at_uncached(start, end) {
             Ok(e) => e,
             Err(_) => continue,
         };
-        // PascalCase canonical name (IfcWall), not the STEP keyword (IFCWALL);
-        // the legacy-resolved type, so a proxy is "IfcBuildingElementProxy", not
-        // "Unknown", and equals the node's `ifcType` extra.
+        // PascalCase canonical name (IfcWall), not the STEP keyword (IFCWALL).
+        // An owned unknown compatibility alias intentionally retains its exact
+        // upper-case STEP spelling, matching the geometry label.
         let ifc_type = ty.name().to_string();
         let global_id = opt_string(entity.get(0));
         let name = opt_string(entity.get(2));
@@ -350,23 +368,26 @@ pub fn stream_export_model_with_options(
             }
         }
 
-        f(EntityRow {
-            express_id: id,
-            ifc_type,
-            global_id,
-            name,
-            description,
-            object_type,
-            has_geometry,
-            placement,
-            property_sets,
-            quantity_sets,
-            attributes: if opts.attributes {
-                render_attributes(&entity)
-            } else {
-                Vec::new()
+        f(
+            EntityRow {
+                express_id: id,
+                ifc_type,
+                global_id,
+                name,
+                description,
+                object_type,
+                has_geometry,
+                placement,
+                property_sets,
+                quantity_sets,
+                attributes: if opts.attributes {
+                    render_attributes(&entity, type_name, source_schema.as_deref())
+                } else {
+                    Vec::new()
+                },
             },
-        }, Some(&entity));
+            Some(&entity),
+        );
 
         // Keep the property-resolution cache bounded across the whole file.
         // `clear_entity_cache`, not `clear_cache`: the latter also drops the
@@ -405,39 +426,35 @@ pub fn stream_export_model_with_options(
         // IfcRelDefinesByProperties.
         let (property_sets, quantity_sets) = resolve_pset_defs(&mut decoder, &cand.pset_def_ids);
 
-        f(EntityRow {
-            express_id: cand.express_id,
-            // PascalCase canonical name (IfcBoilerType) — equals the node's
-            // `ifcType` extra the geometry pass emits.
-            ifc_type: cand.ifc_type.name().to_string(),
-            global_id: cand.global_id.clone(),
-            name: cand.name.clone(),
-            description: cand.description.clone(),
-            // IfcTypeObject has no ObjectType attribute (attr 4 is
-            // ApplicableOccurrence); leave unset rather than mislabel it.
-            object_type: None,
-            // It is meshed by construction (RepresentationMaps present).
-            has_geometry: true,
-            // A type object has no ObjectPlacement — it is not an occurrence.
-            placement: None,
-            property_sets,
-            quantity_sets,
-            // Pass 3 assembles this row from the pass-1 scan and does not hold
-            // the type entity, so this costs one decode. Worth it: the option
-            // promises attributes on every row, and a type carries the ones a
-            // consumer wants (`IfcDoorType.PredefinedType`). The count is
-            // bounded by orphan-geometry types, which is a handful per file.
-            attributes: if opts.attributes {
-                decoder
-                    .decode_by_id(cand.express_id)
-                    .ok()
-                    .map(|t| render_attributes(&t))
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
+        f(
+            EntityRow {
+                express_id: cand.express_id,
+                // PascalCase canonical name (IfcBoilerType) — equals the node's
+                // `ifcType` extra the geometry pass emits.
+                ifc_type: cand.ifc_type.name().to_string(),
+                global_id: cand.global_id.clone(),
+                name: cand.name.clone(),
+                description: cand.description.clone(),
+                // IfcTypeObject attr 4 is ApplicableOccurrence, not ObjectType.
+                object_type: None,
+                has_geometry: true,
+                placement: None,
+                property_sets,
+                quantity_sets,
+                // Pass 3 has no type handle, so honouring the attributes option
+                // costs one decode per rare orphan-geometry type.
+                attributes: if opts.attributes {
+                    decoder
+                        .decode_by_id(cand.express_id)
+                        .ok()
+                        .map(|t| render_attributes(&t, &cand.type_name, source_schema.as_deref()))
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                },
             },
-        }, None);
-
+            None,
+        );
         if decoder.cache_size() > PSET_CACHE_CAP {
             decoder.clear_entity_cache();
         }

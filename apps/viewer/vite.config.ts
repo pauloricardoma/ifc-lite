@@ -1,3 +1,7 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import Icons from 'unplugin-icons/vite';
@@ -12,6 +16,7 @@ import { oauthCallbackRoutes } from './vite-plugins/oauth-callback';
 // Same allowlist the production relay uses, so dev and prod cannot disagree
 // about which Dalux node a request reaches (#2792).
 import { daluxRelayRoute } from './vite-plugins/dalux-relay';
+import { deploymentAssetsDir } from '../../scripts/lib/deployment-assets-dir.mjs';
 
 // --- Build-time changelog parser ---
 interface ReleaseHighlight {
@@ -73,15 +78,6 @@ function extractBulletDescription(line: string): string | null {
   if (prPattern) return prPattern[1].trim();
 
   return null;
-}
-
-function compareSemver(a: string, b: string): number {
-  const pa = a.split('.').map(Number);
-  const pb = b.split('.').map(Number);
-  for (let i = 0; i < 3; i++) {
-    if (pa[i] !== pb[i]) return pa[i] - pb[i];
-  }
-  return 0;
 }
 
 function parseChangelogs(): PackageChangelog[] {
@@ -314,11 +310,10 @@ export default defineConfig({
   },
   build: {
     target: 'esnext',
+    assetsDir: deploymentAssetsDir(process.env.VERCEL_DEPLOYMENT_ID, process.env.VERCEL_SKEW_PROTECTION_ENABLED), // #4886
     chunkSizeWarningLimit: 6000,
-    // Opt-in production source maps, for PostHog error tracking. Without them
-    // every captured stack frame is unreadable minified soup ("Could not find
-    // sourcemap for source url"), which is why triaging a production crash has
-    // meant hand-fetching the deployed bundle from its immutable deployment URL.
+    // Opt-in production source maps for PostHog error tracking: without them every
+    // captured stack frame is minified soup ("Could not find sourcemap for source url").
     //
     // Gated on VITE_SOURCEMAP rather than always-on for two reasons: rollup's
     // map generation for this bundle costs real build time and memory, and the
@@ -356,6 +351,9 @@ export default defineConfig({
           if (id.includes('/node_modules/apache-arrow/')) return 'arrow';
           if (id.includes('/node_modules/parquet-wasm/')) return 'parquet';
           if (id.includes('/node_modules/cesium/')) return 'cesium';
+          // ECharts (+ zrender) and the dashboard grid: reached only through the lazy Charts panel (#3944).
+          if (id.includes('/node_modules/echarts/') || id.includes('/node_modules/zrender/')) return 'echarts';
+          if (id.includes('/node_modules/react-grid-layout/')) return 'grid-layout';
           // @radix-ui/@floating-ui run synchronous, top-level module-init
           // code (e.g. react-tooltip's `createPopperScope()` at module
           // scope). The default chunker otherwise merges them into whatever
@@ -369,16 +367,10 @@ export default defineConfig({
           // scope (issue #2243). Keep radix/floating-ui in their own chunk,
           // clear of the store's async taint, so their module-init always
           // finishes before anything can import from them.
-          if (
-            id.includes('/node_modules/@radix-ui/') ||
-            id.includes('/node_modules/@floating-ui/')
-          ) return 'radix-ui';
+          if (id.includes('/node_modules/@radix-ui/') || id.includes('/node_modules/@floating-ui/')) return 'radix-ui';
           // three.js + addons — only the /mcp landing imports them, keep
           // the main viewer / pages off the hook.
-          if (
-            id.includes('/node_modules/three/') ||
-            id.includes('/node_modules/.pnpm/three@')
-          ) return 'three';
+          if (id.includes('/node_modules/three/') || id.includes('/node_modules/.pnpm/three@')) return 'three';
           return undefined;
         },
       },

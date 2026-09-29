@@ -66,9 +66,14 @@ export function normalizeExtension(extension: string): string {
  * `model`, `a.b.ifczip` -> `a.b`), leaving a dotless name unchanged. Use before
  * {@link buildExportFilename} so the source extension is not carried into the
  * exported name — the canonical replacement for a hand-rolled `/\.[^.]+$/`.
+ *
+ * A copy suffix after the extension survives (`model.ifc (2)` -> `model (2)`):
+ * a room recipient's second copy of one file is named that way (#4444), and
+ * stripping the suffix with the extension made both copies download under one
+ * name.
  */
 export function stripExtension(name: string): string {
-  return name.replace(/\.[^./\\]+$/, '');
+  return name.replace(/\.[^./\\]+?( \(\d+\))?$/, '$1');
 }
 
 /**
@@ -102,6 +107,40 @@ export function buildExportFilename(
   const stemBudget = Math.max(1, maxLength - sanitizedExt.length);
   const stem = sanitizeFilename(baseName, { maxLength: stemBudget });
   return `${stem}${sanitizedExt}`;
+}
+
+/**
+ * The download filename for anything exported FROM a model: the model's name
+ * without its source extension, plus an optional `suffix`, as `ext`
+ * (`Haus.ifc` + `_visible` + `glb` -> `Haus_visible.glb`). Every model export
+ * names its file through this, so the same model in the same format comes out
+ * under the same name whichever surface started it (#5833).
+ *
+ * `suffix` is a code constant (`_visible`, `_merged`, `_entities`), never user
+ * text. The stem is truncated before the suffix is appended, so a long model
+ * name loses its tail rather than the suffix that says what the file is.
+ */
+export function modelExportFilename(modelName: string, extension: string, suffix = ''): string {
+  const maxLength = 60;
+  const extReserve = Math.min(EXTENSION_MAX_LENGTH, normalizeExtension(extension).length - 1) + 1;
+  const stem = sanitizeFilename(stripExtension(modelName), {
+    fallback: 'model',
+    maxLength: Math.max(1, maxLength - extReserve - suffix.length),
+  });
+  return buildExportFilename(`${stem}${suffix}`, extension, maxLength);
+}
+
+/**
+ * The model name an export of "the model on screen" is filed under: the ACTIVE
+ * model's, since that is the one the one-click exports read (`ifcDataStore`
+ * follows `setActiveModel`). A legacy single-model session has no `models`
+ * entry, so this is `''` and {@link modelExportFilename} falls back to `model`.
+ */
+export function activeModelName(state: {
+  activeModelId: string | null;
+  models: ReadonlyMap<string, { name: string }>;
+}): string {
+  return (state.activeModelId ? state.models.get(state.activeModelId)?.name : undefined) ?? '';
 }
 
 /** True when we can actually trigger a download (browser context). */
@@ -160,4 +199,24 @@ export function downloadFile(
 export function downloadDataUrl(dataUrl: string, filename: string): void {
   if (!canDownload()) return;
   clickDownloadAnchor(dataUrl, filename);
+}
+
+/**
+ * Decode a `data:...;base64,...` URL into raw bytes — the other half of an
+ * export that has to EMBED what a canvas produced (a BCF viewpoint snapshot)
+ * rather than hand it to the browser. Undefined for anything that is not a
+ * decodable data URL, so a failed capture drops the image instead of the
+ * export.
+ */
+export function dataUrlToBytes(dataUrl: string): Uint8Array | undefined {
+  const comma = dataUrl.indexOf(',');
+  if (comma < 0) return undefined;
+  try {
+    const binary = atob(dataUrl.slice(comma + 1));
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  } catch {
+    return undefined;
+  }
 }

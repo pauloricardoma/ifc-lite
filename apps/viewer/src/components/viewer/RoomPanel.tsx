@@ -16,39 +16,51 @@
 import { useCallback, useMemo, useState } from 'react';
 import { Check, Link2, LocateFixed, LogOut, Share2, ShieldOff, UserMinus, Users } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { IconButton } from '@/components/ui/icon-button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useViewerStore } from '@/store';
+import { toast } from '@/components/ui/toast';
+import { useTranslation } from '@/i18n';
+import type { TranslationKey } from '@/i18n';
 import type { CollabRole } from '@/store/slices/collabSlice';
 import { buildShareUrl, mintRoomToken } from '@/lib/collab/share-link';
+import { describeSeedPhase, isCollabSeedInFlight } from '@/lib/collab/seed-phase';
 
 interface RoomPanelProps {
   onClose: () => void;
 }
 
-/** Connection status → dot color + label. */
-const STATUS_META: Record<string, { tone: string; label: string; pulse: boolean }> = {
-  connected: { tone: 'bg-emerald-500', label: 'Live', pulse: true },
-  syncing: { tone: 'bg-amber-500', label: 'Syncing', pulse: true },
-  connecting: { tone: 'bg-amber-500', label: 'Connecting', pulse: true },
-  indexeddb: { tone: 'bg-sky-500', label: 'Local', pulse: false },
-  memory: { tone: 'bg-sky-500', label: 'Local', pulse: false },
-  disconnected: { tone: 'bg-muted-foreground/50', label: 'Offline', pulse: false },
+/** Connection status → dot color + label key. */
+const STATUS_META: Record<string, { tone: string; labelKey: TranslationKey; pulse: boolean }> = {
+  connected: { tone: 'bg-emerald-500', labelKey: 'zonesPanel.roomPanel.status.live', pulse: true },
+  syncing: { tone: 'bg-amber-500', labelKey: 'zonesPanel.roomPanel.status.syncing', pulse: true },
+  connecting: { tone: 'bg-amber-500', labelKey: 'zonesPanel.roomPanel.status.connecting', pulse: true },
+  indexeddb: { tone: 'bg-sky-500', labelKey: 'zonesPanel.roomPanel.status.local', pulse: false },
+  memory: { tone: 'bg-sky-500', labelKey: 'zonesPanel.roomPanel.status.local', pulse: false },
+  disconnected: { tone: 'bg-muted-foreground/50', labelKey: 'zonesPanel.roomPanel.status.offline', pulse: false },
 };
+/**
+ * Overrides the connection status while the owner's initial seed is still
+ * going in (#4446): the socket IS connected, but a room that does not yet
+ * hold the model is not "Live" to anyone who would join it.
+ */
+const SEEDING_META = { tone: 'bg-amber-500', labelKey: 'zonesPanel.roomPanel.status.uploading' as TranslationKey, pulse: true };
 
 /** Role → badge accent. Subtle, role-tinted, dark-mode aware. */
-const ROLE_META: Record<CollabRole, { label: string; cls: string }> = {
-  admin: { label: 'Admin', cls: 'border-violet-500/30 bg-violet-500/10 text-violet-600 dark:text-violet-300' },
-  editor: { label: 'Editor', cls: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-300' },
-  commenter: { label: 'Comment', cls: 'border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-300' },
-  viewer: { label: 'Viewer', cls: 'border-sky-500/30 bg-sky-500/10 text-sky-600 dark:text-sky-300' },
+const ROLE_META: Record<CollabRole, { labelKey: TranslationKey; cls: string }> = {
+  admin: { labelKey: 'zonesPanel.roomPanel.role.admin', cls: 'border-violet-500/30 bg-violet-500/10 text-violet-600 dark:text-violet-300' },
+  editor: { labelKey: 'zonesPanel.roomPanel.role.editor', cls: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-300' },
+  commenter: { labelKey: 'zonesPanel.roomPanel.role.commenter', cls: 'border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-300' },
+  viewer: { labelKey: 'zonesPanel.roomPanel.role.viewer', cls: 'border-sky-500/30 bg-sky-500/10 text-sky-600 dark:text-sky-300' },
 };
 
 function RoleBadge({ role }: { role: CollabRole }) {
+  const { t } = useTranslation();
   const m = ROLE_META[role];
   return (
-    <span className={`shrink-0 rounded-full border px-1.5 py-px text-[10px] font-medium leading-none ${m.cls}`}>
-      {m.label}
+    <span className={`shrink-0 rounded-full border px-1.5 py-px text-2xs font-medium leading-none ${m.cls}`}>
+      {t(m.labelKey)}
     </span>
   );
 }
@@ -94,10 +106,11 @@ function PeerRow({
   onJump?: () => void;
   onKick?: () => void;
 }) {
+  const { t } = useTranslation();
   // Sub-line: activity (idle/measuring…) and/or selection count.
   const subParts: string[] = [];
   if (activity && activity !== 'active') subParts.push(activity);
-  if (selectionCount && selectionCount > 0) subParts.push(`${selectionCount} selected`);
+  if (selectionCount && selectionCount > 0) subParts.push(t('zonesPanel.roomPanel.selectedCount', { count: selectionCount }));
   const subLine = subParts.join(' · ');
   return (
     <div
@@ -108,53 +121,48 @@ function PeerRow({
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-1.5">
           <span className="truncate text-xs font-medium">{name}</span>
-          {isSelf && <span className="text-[10px] text-muted-foreground">(you)</span>}
+          {isSelf && <span className="text-2xs text-muted-foreground">{t('zonesPanel.roomPanel.youSuffix')}</span>}
         </div>
-        {subLine && <span className="text-[10px] capitalize text-muted-foreground">{subLine}</span>}
+        {subLine && <span className="text-2xs capitalize text-muted-foreground">{subLine}</span>}
       </div>
       {role && <RoleBadge role={role} />}
       {onJump && (
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              className="size-5 shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover:opacity-100"
-              onClick={onJump}
-              aria-label={`Jump to ${name}'s view`}
-            >
-              <LocateFixed className="size-3" />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="left">Jump to view</TooltipContent>
-        </Tooltip>
+        <IconButton
+          label={t('zonesPanel.roomPanel.jumpToAriaLabel', { name })}
+          tooltip={t('zonesPanel.roomPanel.jumpToTooltip')}
+          tooltipSide="left"
+          size="icon-sm"
+          className="size-5 shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover:opacity-100"
+          onClick={onJump}
+        >
+          <LocateFixed className="size-3" />
+        </IconButton>
       )}
       {onKick && (
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              className="size-5 shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover:opacity-100"
-              onClick={onKick}
-              aria-label={`Remove ${name}`}
-            >
-              <UserMinus className="size-3" />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="left">Remove from room</TooltipContent>
-        </Tooltip>
+        <IconButton
+          label={t('zonesPanel.roomPanel.removePeerAriaLabel', { name })}
+          tooltip={t('zonesPanel.roomPanel.removeFromRoomTooltip')}
+          tooltipSide="left"
+          size="icon-sm"
+          className="size-5 shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover:opacity-100"
+          onClick={onKick}
+        >
+          <UserMinus className="size-3" />
+        </IconButton>
       )}
     </div>
   );
 }
 
 export function RoomPanel({ onClose }: RoomPanelProps) {
+  const { t } = useTranslation();
   const collabRoomId = useViewerStore((s) => s.collabRoomId);
   const collabStatus = useViewerStore((s) => s.collabStatus);
   const collabRole = useViewerStore((s) => s.collabRole);
   const collabIdentity = useViewerStore((s) => s.collabIdentity);
   const collabPeers = useViewerStore((s) => s.collabPeers);
+  const seedPhase = useViewerStore((s) => s.collabSeedPhase);
+  const seedProgress = useViewerStore((s) => s.collabSeedProgress);
   const stopCollab = useViewerStore((s) => s.stopCollab);
   const kickPeer = useViewerStore((s) => s.kickPeer);
   const revokeCollabLink = useViewerStore((s) => s.revokeCollabLink);
@@ -162,7 +170,15 @@ export function RoomPanel({ onClose }: RoomPanelProps) {
   const [copied, setCopied] = useState(false);
   const [revoked, setRevoked] = useState(false);
 
-  const status = STATUS_META[collabStatus] ?? STATUS_META.disconnected;
+  const seeding = isCollabSeedInFlight(seedPhase);
+  // A seed whose socket dropped is stalled, not progressing: the provider's
+  // 'disconnected' wins over the upload badge so the user sees "Offline" and
+  // knows to reconnect — while the copy link stays withheld and Leave still
+  // says what it abandons, because the upload IS still pending.
+  const stalled = seeding && collabStatus === 'disconnected';
+  const uploading = seeding && !stalled;
+  const status = uploading ? SEEDING_META : (STATUS_META[collabStatus] ?? STATUS_META.disconnected);
+  const seedLabel = seeding ? describeSeedPhase(seedPhase, seedProgress) : null;
   const selfRole: CollabRole = collabRole ?? 'admin';
   const isAdmin = collabRole === 'admin';
   const peerCount = collabPeers.length + 1;
@@ -179,21 +195,26 @@ export function RoomPanel({ onClose }: RoomPanelProps) {
       setCopied(true);
       setTimeout(() => setCopied(false), 1600);
     } catch (err) {
-      // The button simply never turns into "Copied!" — the only feedback the
-      // user gets. Mint failures (expired admin bearer, room revoked) look
-      // exactly like a blocked clipboard from the outside, so name the cause
-      // here; the dialog Share flow remains the fallback. One per click.
+      // Mint failures (expired admin bearer, room revoked) look exactly like a
+      // blocked clipboard from the outside: log the cause, tell the user (#5600).
       console.warn('[collab] could not copy the room link', err);
+      toast.error(t('zonesPanel.roomPanel.copyLinkFailed'));
     }
-  }, [collabRoomId, isAdmin, selfRole]);
+  }, [collabRoomId, isAdmin, selfRole, t]);
 
   const handleRevoke = useCallback(async () => {
     const ok = await revokeCollabLink();
-    if (ok) {
-      setRevoked(true);
-      setTimeout(() => setRevoked(false), 2000);
+    if (!ok) {
+      toast.error(t('zonesPanel.roomPanel.revokeLinkFailed'));
+      return;
     }
-  }, [revokeCollabLink]);
+    setRevoked(true);
+    setTimeout(() => setRevoked(false), 2000);
+  }, [revokeCollabLink, t]);
+
+  const handleKick = useCallback(async (clientId: number, name: string) => {
+    if (!(await kickPeer(clientId))) toast.error(t('zonesPanel.roomPanel.removePeerFailed', { name }));
+  }, [kickPeer, t]);
 
   const handleLeave = useCallback(() => {
     stopCollab();
@@ -224,51 +245,51 @@ export function RoomPanel({ onClose }: RoomPanelProps) {
     () =>
       collabPeers.filter((p) => p?.user).map((p, i) => {
         const clientId = (p as { clientId?: number }).clientId;
+        const name = p.user.name ?? 'Guest';
         const camera = (p as { camera?: { position: Vec3; target: Vec3; fov: number } }).camera;
         const selection = (p as { selection?: string[] }).selection;
         return (
           <PeerRow
             key={p.user.id}
             color={p.user.color ?? '#888'}
-            name={p.user.name ?? 'Guest'}
+            name={name}
             role={(p as { role?: CollabRole }).role}
             activity={p.status ?? (p.tool && p.tool !== 'select' ? p.tool : undefined)}
             selectionCount={selection?.length}
             index={i + 1}
             onJump={camera ? () => jumpToPeer(camera) : undefined}
-            onKick={isAdmin && clientId != null ? () => void kickPeer(clientId) : undefined}
+            onKick={isAdmin && clientId != null ? () => void handleKick(clientId, name) : undefined}
           />
         );
       }),
-    [collabPeers, isAdmin, kickPeer, jumpToPeer],
+    [collabPeers, isAdmin, handleKick, jumpToPeer],
   );
 
   if (!collabRoomId) {
     return (
       <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
         <Users className="size-6 text-muted-foreground" aria-hidden />
-        <p className="text-sm font-medium">Work on this model together</p>
+        <p className="text-sm font-medium">{t('zonesPanel.roomPanel.emptyTitle')}</p>
         <p className="max-w-[30ch] text-xs text-muted-foreground">
-          Create a room to edit live with others: shared cursors, presence,
-          and every edit synced. Invites are one link.
+          {t('zonesPanel.roomPanel.emptyDescription')}
         </p>
         <Button
           size="sm"
-          className="mt-1 h-7 gap-1.5 px-3 text-[11px]"
+          className="mt-1 h-7 gap-1.5 px-3 text-2xs"
           onClick={() => window.dispatchEvent(new CustomEvent('ifc-lite:open-share-dialog'))}
         >
           <Share2 className="size-3.5" aria-hidden />
-          Create a room
+          {t('zonesPanel.roomPanel.createRoomButton')}
         </Button>
-        <p className="max-w-[30ch] text-[10px] text-muted-foreground/70">
-          Got an invite? Just open the link - it lands you in the room.
+        <p className="max-w-[30ch] text-2xs text-muted-foreground">
+          {t('zonesPanel.roomPanel.inviteHint')}
         </p>
       </div>
     );
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col" aria-label="Collaboration room">
+    <div className="flex h-full min-h-0 flex-col" aria-label={t('zonesPanel.roomPanel.rootAriaLabel')}>
       {/* Header */}
       <div className="flex items-center gap-2 border-b px-3 py-2">
         <span className="relative flex size-2 items-center justify-center">
@@ -278,10 +299,19 @@ export function RoomPanel({ onClose }: RoomPanelProps) {
           <span className={`relative inline-flex size-2 rounded-full ${status.tone}`} />
         </span>
         <div className="min-w-0 flex-1">
-          <div className="text-xs font-semibold leading-tight">{status.label} room</div>
-          <div className="truncate font-mono text-[10px] text-muted-foreground">{collabRoomId}</div>
+          <div className="text-xs font-semibold leading-tight">
+            {uploading
+              ? t('zonesPanel.roomPanel.uploadingModel')
+              : t('zonesPanel.roomPanel.statusRoom', { status: t(status.labelKey) })}
+          </div>
+          {seedLabel && (
+            <output className="block truncate text-2xs text-muted-foreground">
+              {seedLabel}
+            </output>
+          )}
+          <div className="truncate font-mono text-2xs text-muted-foreground">{collabRoomId}</div>
         </div>
-        <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+        <span className="rounded-full bg-muted px-1.5 py-0.5 text-2xs font-medium text-muted-foreground">
           {peerCount}
         </span>
       </div>
@@ -298,8 +328,8 @@ export function RoomPanel({ onClose }: RoomPanelProps) {
           />
           {peerRows}
           {peerRows.length === 0 && (
-            <p className="px-1.5 py-2 text-[11px] text-muted-foreground">
-              You're the only one here. Copy the link to invite others.
+            <p className="px-1.5 py-2 text-2xs text-muted-foreground">
+              {t('zonesPanel.roomPanel.onlyOneHereMessage')}
             </p>
           )}
         </div>
@@ -312,9 +342,12 @@ export function RoomPanel({ onClose }: RoomPanelProps) {
           size="sm"
           className="h-8 w-full justify-start gap-2"
           onClick={handleCopyLink}
+          // Same rule as the Share dialog: no invite until the model is in the room.
+          disabled={seeding}
+          title={seeding ? t('zonesPanel.roomPanel.copyLinkUnavailableTitle') : undefined}
         >
           {copied ? <Check className="size-3.5" /> : <Link2 className="size-3.5" />}
-          {copied ? 'Link copied' : 'Copy invite link'}
+          {copied ? t('zonesPanel.roomPanel.linkCopied') : t('zonesPanel.roomPanel.copyInviteLinkLabel')}
         </Button>
         <div className="flex items-center gap-1.5">
           {isAdmin && (
@@ -327,10 +360,10 @@ export function RoomPanel({ onClose }: RoomPanelProps) {
                   onClick={handleRevoke}
                 >
                   <ShieldOff className="size-3.5" />
-                  {revoked ? 'Revoked' : 'Revoke link'}
+                  {revoked ? t('zonesPanel.roomPanel.revokedLabel') : t('zonesPanel.roomPanel.revokeLinkLabel')}
                 </Button>
               </TooltipTrigger>
-              <TooltipContent side="bottom">Invalidate the current share link</TooltipContent>
+              <TooltipContent side="bottom">{t('zonesPanel.roomPanel.revokeLinkTooltip')}</TooltipContent>
             </Tooltip>
           )}
           <Button
@@ -340,7 +373,7 @@ export function RoomPanel({ onClose }: RoomPanelProps) {
             onClick={handleLeave}
           >
             <LogOut className="size-3.5" />
-            Leave room
+            {seeding ? t('zonesPanel.roomPanel.leaveAbandonsUploadLabel') : t('zonesPanel.roomPanel.leaveRoomLabel')}
           </Button>
         </div>
       </div>

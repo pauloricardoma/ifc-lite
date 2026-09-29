@@ -1911,7 +1911,7 @@ export class ViewerEngine {
     this.measure = null;
     this.restoreConsole?.();
     delete (globalThis as any).__ifc_lite_render_stats__;
-    try { this.renderer?.dispose?.(); } catch { /* já pode estar solto */ }
+    try { this.renderer?.destroy(); } catch { /* já pode estar solto */ }
   }
 
   private finishLoad(meshCount: number): void {

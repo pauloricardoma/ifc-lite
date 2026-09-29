@@ -19,6 +19,7 @@ import type {
 } from '../../types.js';
 import type { IDSAuditIssue } from '../types.js';
 import { XSD_NUMERIC_SPECIALS } from '../../constraints/xsd-cast.js';
+import { isValidXsdDateTimeLiteral, isXsdDateTimeBase } from '../../constraints/xsd-datetime.js';
 import { compileXsdRegex } from './regex.js';
 import { auditRequirementCardinality } from './cardinality.js';
 
@@ -247,7 +248,24 @@ function checkBounds(
       facetType,
     });
   }
+  if (c.unparseableFacets !== undefined && c.unparseableFacets.length > 0) {
+    for (const f of c.unparseableFacets) {
+      issues.push({
+        severity: 'error',
+        code: 'E_RESTRICTION_FACET_UNPARSEABLE',
+        message: `xs:${f.facet} @value="${f.rawValue}" could not be parsed as a number — this facet is dropped and, until fixed, the whole restriction rejects every value (it does not fall back to unbounded)`,
+        path,
+        facetType,
+        detail: { facet: f.facet, rawValue: f.rawValue },
+      });
+    }
+  }
+  // A facet that failed to parse already produced the more precise
+  // `E_RESTRICTION_FACET_UNPARSEABLE` above; don't also report the
+  // constraint as merely "empty" (misleading — something WAS
+  // authored, it just didn't parse).
   const empty =
+    (c.unparseableFacets === undefined || c.unparseableFacets.length === 0) &&
     c.minInclusive === undefined &&
     c.minExclusive === undefined &&
     c.maxInclusive === undefined &&
@@ -271,9 +289,9 @@ function checkBounds(
  * escape codes to JS regex equivalents (cf. upstream `XmlRegex.cs`).
  *
  * Translation handles `\i`/`\c`/`\d`/`\w` and their negations via
- * Unicode property escapes (compiled with the `u` flag). Char-class
- * subtraction (`[a-z-[aeiou]]`) is XSD-only and surfaces as
- * `W_REGEX_UNVERIFIED`. Any remaining syntactic errors are real
+ * Unicode property escapes (compiled with the `u` flag), and char-class
+ * subtraction (`[a-z-[aeiou]]`) as a negative lookahead. A construct that
+ * can only be approximated surfaces as `W_REGEX_UNVERIFIED`. Any remaining syntactic errors are real
  * authoring mistakes and surface as `E_RESTRICTION_EMPTY` (upstream
  * Report 109).
  */
@@ -311,8 +329,9 @@ function checkPattern(
 
 /**
  * Validate that `value` matches the lexical space of the supplied XSD
- * primitive base. Mirrors upstream `XsTypes.IsValid` (see the table); flags
- * `<xs:enumeration value="12,0"/>` under `<xs:restriction base="xs:double">`.
+ * primitive base. Mirrors upstream `XsTypes.IsValid` (see the table, and the
+ * date family it hands off); flags `<xs:enumeration value="12,0"/>` under
+ * `<xs:restriction base="xs:double">`.
  */
 const XS_VALUE_REGEX: Record<string, RegExp> = {
   // Upstream `XmlRegex.cs`, except the mantissa: `[0-9]*(?:\.[0-9]*)?` not
@@ -323,14 +342,13 @@ const XS_VALUE_REGEX: Record<string, RegExp> = {
   'xs:float': /^([-+]?[0-9]*(?:\.[0-9]*)?([eE][-+]?[0-9]+)?|NaN|\+INF|-INF)$/,
   'xs:decimal': /^([-+]?[0-9]*(?:\.[0-9]*)?([eE][-+]?[0-9]+)?|NaN|\+INF|-INF)$/,
   'xs:boolean': /^(true|false|0|1)$/,
-  'xs:date': /^\d{4}-\d{2}-\d{2}(Z|([+-]\d{2}:\d{2}))?$/,
-  'xs:dateTime':
-    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|([+-]\d{2}:\d{2}))?$/,
-  'xs:time': /^\d{2}:\d{2}:\d{2}(\.\d+)?(Z|([+-]\d{2}:\d{2}))?$/,
+  // The date family is absent on purpose: its value space is a calendar, not a
+  // digit-run shape, so it goes through `isValidXsdDateTimeLiteral` (#3721).
   'xs:duration': /^[-+]?P(\d+Y)?(\d+M)?(\d+D)?(T(\d+H)?(\d+M)?(\d+S)?)?$/,
 };
 
 export function isValidLexicalForXsType(value: string, base: string): boolean {
+  if (isXsdDateTimeBase(base)) return isValidXsdDateTimeLiteral(value, base);
   const rx = XS_VALUE_REGEX[base];
   if (!rx) return true; // base we don't recognise → don't fabricate errors
   if (base === 'xs:double' || base === 'xs:float' || base === 'xs:decimal') {

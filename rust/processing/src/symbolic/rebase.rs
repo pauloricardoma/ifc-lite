@@ -7,7 +7,10 @@
 //!
 //! The mesh pipeline stores `world = origin + position + rtc_offset` in IFC
 //! Z-up metres (`crate::simplify_session`), so a re-based vertex is the IFC
-//! coordinate minus the RTC offset on ALL THREE axes. The viewer reads that
+//! coordinate minus the RTC offset on ALL THREE axes — and, in the site-local
+//! tier, turned by the site placement's inverse rotation as well
+//! (`processor::site_local`, #4706). Both halves come off the one
+//! [`MeshFrame`] the caller's meshes were baked in. The viewer reads that
 //! Y-up: `renderX = ifcX - rtc.x`, `renderZ = -(ifcY - rtc.y)`,
 //! `renderY = ifcZ - rtc.z` (`apps/viewer/src/lib/wall-rects-from-meshes.ts`).
 //! Symbolic primitives are overlaid on that scene, so they must be re-based
@@ -23,38 +26,81 @@
 //! [`RenderFrameRebase::plan`] / [`RenderFrameRebase::elevation`], a call
 //! site can no longer pick the wrong one.
 
-/// Large-coordinate threshold (metres). Below it the model is local-coord
-/// territory and re-basing would shift the overlay off-screen, so the rebase
-/// is the identity — matching `ModelBounds::has_large_coordinates` and the
-/// mesh pipeline's own needs-shift decision.
-const LARGE_COORD_THRESHOLD: f64 = 10_000.0;
+use crate::mesh_frame::MeshFrame;
 
-/// The model's RTC offset, in IFC Z-up metres, as a coordinate rebase.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// The model's mesh frame, in IFC Z-up metres, as a coordinate rebase.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct RenderFrameRebase {
-    /// IFC X (easting) component.
+    /// IFC X (easting) component of the translation.
     x: f32,
-    /// IFC Y (northing) component.
+    /// IFC Y (northing) component of the translation.
     y: f32,
-    /// IFC Z (elevation) component.
+    /// IFC Z (elevation) component of the translation.
     z: f32,
+    /// The plan block of the frame's inverse rotation, as the frame's images
+    /// of the world X and Y axes: `[x_axis.x, x_axis.y, y_axis.x, y_axis.y]`.
+    /// The identity for every frame that removes no rotation.
+    axes: [f32; 4],
+}
+
+impl Default for RenderFrameRebase {
+    /// The identity, spelled as the frame that is one.
+    fn default() -> Self {
+        Self::from_frame(MeshFrame::RawIfc)
+    }
 }
 
 impl RenderFrameRebase {
-    /// Build the rebase for a detected RTC offset (IFC Z-up metres), or the
-    /// identity when the model is not large-coordinate.
-    pub(super) fn from_rtc_offset(rtc_offset: (f64, f64, f64)) -> Self {
-        let needs_rtc = rtc_offset.0.abs() > LARGE_COORD_THRESHOLD
-            || rtc_offset.1.abs() > LARGE_COORD_THRESHOLD
-            || rtc_offset.2.abs() > LARGE_COORD_THRESHOLD;
-        if !needs_rtc {
-            return Self::default();
-        }
+    /// The rebase for a mesh frame: subtracts what the frame subtracts AND
+    /// removes what it rotates away, so a `RawIfc` frame is the identity. The
+    /// frame owns both decisions.
+    ///
+    /// The rotation arrives as the frame's images of the world X and Y axes
+    /// rather than as a matrix, so this cannot transpose it by hand. Their
+    /// elevation components are dropped, which is exact for a rotation about
+    /// Z, the only kind a plan view can express and the only kind an IfcSite
+    /// placement carries in the fixtures and files this has run on. A site
+    /// placement that tilts OUT of the plan moves elevation into the plan pair
+    /// and back, and the 2D stream has no per-point elevation to carry that:
+    /// its symbols would stay upright while the meshes tilt. Not handled here,
+    /// and not hidden either — `MeshFrame::rotate_into_frame` is the full 3x3
+    /// for a consumer that can use all of it.
+    pub(super) fn from_frame(frame: MeshFrame) -> Self {
+        let (x, y, z) = frame.rtc_offset();
+        let x_axis = frame.rotate_into_frame([1.0, 0.0, 0.0]);
+        let y_axis = frame.rotate_into_frame([0.0, 1.0, 0.0]);
         Self {
-            x: rtc_offset.0 as f32,
-            y: rtc_offset.1 as f32,
-            z: rtc_offset.2 as f32,
+            x: x as f32,
+            y: y as f32,
+            z: z as f32,
+            axes: [
+                x_axis[0] as f32,
+                x_axis[1] as f32,
+                y_axis[0] as f32,
+                y_axis[1] as f32,
+            ],
         }
+    }
+
+    /// An IFC plan DIRECTION in the renderer's 2D pair. The frame's rotation
+    /// applies; its translation does not, because a direction has no position.
+    ///
+    /// Text baselines are the consumer (`text.rs`). The handedness flip lives
+    /// here too, so a caller cannot negate the northing of a point and forget
+    /// to negate the direction beside it.
+    pub(super) fn plan_direction(self, ifc_dx: f32, ifc_dy: f32) -> (f32, f32) {
+        let (x, y) = self.rotate_plan(ifc_dx, ifc_dy);
+        (x, -y + 0.0)
+    }
+
+    /// The inverse rotation restricted to the plan: an IFC plan pair in the
+    /// frame's own axes, before the handedness flip.
+    #[inline]
+    fn rotate_plan(self, x: f32, y: f32) -> (f32, f32) {
+        (
+            self.axes[0] * x + self.axes[2] * y,
+            self.axes[1] * x + self.axes[3] * y,
+        )
     }
 
     /// IFC plan coordinates → the renderer's 2D pair `(renderX, -renderZ)`,
@@ -69,10 +115,15 @@ impl RenderFrameRebase {
         // the worker boundary. Emitting -0.0 would spend that signal on an
         // artifact of how the flip is written. Adding 0.0 maps -0.0 to +0.0
         // and is the identity on every other value, IEEE-754 round-to-nearest.
-        (ifc_x - self.x, -(ifc_y - self.y) + 0.0)
+        let (x, y) = self.rotate_plan(ifc_x - self.x, ifc_y - self.y);
+        (x, -y + 0.0)
     }
 
     /// IFC elevation → the renderer's `world_y`.
+    ///
+    /// The frame's rotation does not enter: the plan rotation this carries
+    /// fixes the Z axis (see [`RenderFrameRebase::from_frame`]), so an
+    /// elevation is only ever offset.
     pub(super) fn elevation(self, ifc_z: f32) -> f32 {
         ifc_z - self.z
     }

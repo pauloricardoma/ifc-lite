@@ -9,7 +9,7 @@
 //! already world-space, so no transform is applied.
 
 use crate::aabb::Aabb;
-use crate::bvh::Bvh;
+use crate::bvh::{js_max, js_min, Bvh};
 use crate::obb::{detect_obb, MeshLike, Obb};
 use crate::triangle::closest_pt_point_triangle;
 use crate::vec3::{cross, dist_sq, dot, sub, Vec3};
@@ -32,7 +32,7 @@ pub struct TriMesh {
     /// Number of triangles.
     pub count: usize,
     bvh: Bvh,
-    /// Starting half-size for the expanding-cube probe in `distance_to_surface`:
+    /// Starting half-size for the expanding-cube probe in `closest_on_surface`:
     /// a power-of-two fraction of the mesh's longest axis, scaled down by the
     /// cube root of the triangle count so it lands near the average triangle
     /// size. Derived with exact power-of-two arithmetic (no `powi`/`cbrt`, whose
@@ -196,32 +196,19 @@ impl TriMesh {
         [s[0] / nf, s[1] / nf, s[2] / nf]
     }
 
-    /// Minimum point-to-triangle distance over `tris`, as a squared distance.
-    fn min_dist_sq_over(&self, p: Vec3, tris: &[u32]) -> f64 {
-        let mut best = f64::INFINITY;
-        for &t in tris {
-            let [a, b, c] = self.tri(t as usize);
-            let q = closest_pt_point_triangle(p, a, b, c);
-            let d2 = dist_sq(p, q);
-            if d2 < best {
-                best = d2;
-            }
-        }
-        best
-    }
-
-    /// Exhaustive fallback for `distance_to_surface`: every triangle, index order.
-    fn distance_to_surface_scan(&self, p: Vec3) -> f64 {
-        let mut best = f64::INFINITY;
-        for t in 0..self.count {
+    /// Minimum point-to-triangle squared distance over `tris`, with the
+    /// closest point (the first one reaching the minimum, in visit order).
+    fn closest_over(&self, p: Vec3, tris: impl IntoIterator<Item = usize>) -> (f64, Vec3) {
+        let mut best = (f64::INFINITY, p);
+        for t in tris {
             let [a, b, c] = self.tri(t);
             let q = closest_pt_point_triangle(p, a, b, c);
             let d2 = dist_sq(p, q);
-            if d2 < best {
-                best = d2;
+            if d2 < best.0 {
+                best = (d2, q);
             }
         }
-        best.sqrt()
+        best
     }
 
     /// Exact distance from `p` to this mesh's surface: the minimum point-to-
@@ -255,7 +242,7 @@ impl TriMesh {
     ///
     /// `min` selects an element rather than accumulating, so visiting a superset
     /// of the argmin in a different order returns the identical `f64`. The TS
-    /// `distanceToSurface` runs the identical sequence of queries on the
+    /// `closestOnSurface` runs the identical sequence of queries on the
     /// identical BVH, keeping the two kernels bit-identical (see the shared probe
     /// fixture in `kernel_tests.rs` / `tri-mesh.test.ts`).
     ///
@@ -266,10 +253,22 @@ impl TriMesh {
     /// empty. It is kept only as defence-in-depth against a future
     /// `query_tris` regression, not as a code path with coverage; do not read
     /// it as a tested safety net.
-    pub fn distance_to_surface(&self, p: Vec3) -> f64 {
+    ///
+    /// Returns the distance together with the closest surface point, whose
+    /// direction from `p` is what the depth's precision floor is projected
+    /// onto (#5405).
+    pub fn closest_on_surface(&self, p: Vec3) -> (f64, Vec3) {
         if self.count == 0 {
-            return f64::INFINITY;
+            return (f64::INFINITY, p);
         }
+        let scan = || {
+            let (d2, q) = self.closest_over(p, 0..self.count);
+            (d2.sqrt(), q)
+        };
+        let over = |tris: &[u32]| {
+            let (d2, q) = self.closest_over(p, tris.iter().map(|&t| t as usize));
+            (d2.sqrt(), q)
+        };
         let mut h = self.probe_seed;
         // 64 doublings from a positive seed overflow to infinity, whose cube
         // intersects every finite box — so the loop only runs out on NaN
@@ -278,19 +277,19 @@ impl TriMesh {
         for _ in 0..64 {
             let hits = self.query_tris(&cube_around(p, h));
             if !hits.is_empty() {
-                let d = self.min_dist_sq_over(p, &hits).sqrt();
-                if d <= h {
-                    return d;
+                let near = over(&hits);
+                if near.0 <= h {
+                    return near;
                 }
-                let wider = self.query_tris(&cube_around(p, d));
+                let wider = self.query_tris(&cube_around(p, near.0));
                 if !wider.is_empty() {
-                    return self.min_dist_sq_over(p, &wider).sqrt();
+                    return over(&wider);
                 }
-                return self.distance_to_surface_scan(p);
+                return scan();
             }
             h *= 2.0;
         }
-        self.distance_to_surface_scan(p)
+        scan()
     }
 
     /// True when `p` is inside this closed mesh. Casts a fixed-direction ray and
@@ -360,6 +359,13 @@ impl MeshLike for TriMesh {
     }
 }
 
+/// Bounds of one triangle, matching `tri-mesh.ts`'s `triBounds`
+/// (`Math.min`/`Math.max`): a NaN vertex NaNs the bounds, so `Aabb::intersects`
+/// excludes the triangle from every query. `f64::min`/`max` would drop the NaN
+/// and fabricate finite bounds from the other two vertices (#5220). This is
+/// deliberately the opposite of `bvh.rs`'s `compute_bounds`, which SKIPS a NaN
+/// so one corrupt entity cannot blind its siblings; a triangle's bounds come
+/// from its own three vertices only, so there is no sibling to protect.
 fn tri_bounds(positions: &[f64], indices: &[u32], t: usize) -> Aabb {
     let o = t * 3;
     let va = vertex(positions, indices[o]);
@@ -367,14 +373,14 @@ fn tri_bounds(positions: &[f64], indices: &[u32], t: usize) -> Aabb {
     let vc = vertex(positions, indices[o + 2]);
     Aabb::new(
         [
-            va[0].min(vb[0]).min(vc[0]),
-            va[1].min(vb[1]).min(vc[1]),
-            va[2].min(vb[2]).min(vc[2]),
+            js_min(js_min(va[0], vb[0]), vc[0]),
+            js_min(js_min(va[1], vb[1]), vc[1]),
+            js_min(js_min(va[2], vb[2]), vc[2]),
         ],
         [
-            va[0].max(vb[0]).max(vc[0]),
-            va[1].max(vb[1]).max(vc[1]),
-            va[2].max(vb[2]).max(vc[2]),
+            js_max(js_max(va[0], vb[0]), vc[0]),
+            js_max(js_max(va[1], vb[1]), vc[1]),
+            js_max(js_max(va[2], vb[2]), vc[2]),
         ],
     )
 }

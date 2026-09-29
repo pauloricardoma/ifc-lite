@@ -8,6 +8,7 @@
 
 import { ensureParquetInit } from './parquet-decoder.js';
 import { nullableFloat64Column } from './parquet-nullable.js';
+import { decodeMaterialAssociations } from './material-association-decoder.js';
 
 export interface EntityMetadata {
   entity_id: number;
@@ -212,6 +213,8 @@ export interface Property {
   /** Raw IFC measure/value type tag (e.g. "IFCLENGTHMEASURE"), when present.
    *  Added with the data-model v3 payload; `undefined` for older servers. */
   data_type?: string;
+  /** IfcPropertyTableValue: no single `data_type` by design (#5224). v7 payload. */
+  data_type_mixed?: true;
   /** Candidate value array for multi-valued properties (enumerated / bounded /
    *  list / table), for IDS any-match checks. v5 payload; absent otherwise. */
   values?: string[];
@@ -240,6 +243,10 @@ export interface Relationship {
   rel_type: string;
   relating_id: number;
   related_id: number;
+  /** Express id of the `IfcRel*` entity this row came from. v6 payload (issue
+   *  #3860); `undefined` for older servers. `0` on the synthetic
+   *  `TYPEHASPROPERTYSETS` rows, which no IFC entity declares. */
+  rel_id?: number;
 }
 
 export interface SpatialNode {
@@ -279,11 +286,24 @@ export interface ClassificationAssociation {
 /** A material (or one material layer) associated with an element. */
 export interface MaterialAssociation {
   element_id: number;
-  /** Layer-set name; absent for a single material / list / constituent set. */
+  /** IfcRelAssociatesMaterial id; absent on older server payloads. */
+  association_id?: number;
+  definition_id?: number;
+  member_count?: number;
+  /** Effective resolved definition kind (a *Usage is reported as its set);
+   * absent on older server payloads. */
+  kind?: 'IfcMaterial' | 'IfcMaterialLayerSet' | 'IfcMaterialProfileSet' | 'IfcMaterialConstituentSet' | 'IfcMaterialList';
+  /** Name of a layer, profile, or constituent set; absent for a single material or list. */
   set_name?: string;
-  /** 0-based layer index within its set (0 for a single material). */
+  /** 0-based member index within its set or list (0 for a single material). */
   layer_index: number;
   material_name: string;
+  /** Whether IfcMaterial.Name was present, including an authored empty string. */
+  material_name_present?: boolean;
+  material_id?: number;
+  member_name?: string;
+  material_category?: string;
+  fraction?: number;
   /** Layer thickness in metres (already unit-scaled); absent if not a layer. */
   thickness?: number;
   is_ventilated?: boolean;
@@ -492,6 +512,7 @@ export async function decodeDataModel(data: ArrayBuffer): Promise<DataModel> {
   const dataTypesArr = propertiesArrow.getChild('data_type')?.toArray() as (string | null)[] | undefined;
   // Additive v5 column: JSON-encoded candidate arrays, sparse (issue #1766).
   const valuesJsonArr = propertiesArrow.getChild('values_json')?.toArray() as (string | null)[] | undefined;
+  const dataTypeMixedCol = propertiesArrow.getChild('data_type_mixed'); // v7 (#5224)
 
   const propertySets = new Map<number, PropertySet>();
   for (let i = 0; i < psetIds.length; i++) {
@@ -510,6 +531,7 @@ export async function decodeDataModel(data: ArrayBuffer): Promise<DataModel> {
       property_type: propertyTypesArr[i] ?? '',
       data_type: dataTypesArr?.[i] ?? undefined,
       values: parseValuesJson(valuesJsonArr?.[i]),
+      ...(dataTypeMixedCol?.get(i) === true ? { data_type_mixed: true as const } : {}),
     });
   }
 
@@ -548,6 +570,10 @@ export async function decodeDataModel(data: ArrayBuffer): Promise<DataModel> {
   const relTypesArr = relationshipsArrow.getChild('rel_type')?.toArray() as string[];
   const relatingIds = relationshipsArrow.getChild('relating_id')?.toArray() as Uint32Array;
   const relatedIds = relationshipsArrow.getChild('related_id')?.toArray() as Uint32Array;
+  // rel_id arrives with the v6 payload (issue #3860). An older server sends no
+  // such column: leave the field absent rather than defaulting to 0, so a
+  // caller can tell "no id on the wire" from the genuine 0 on synthetic rows.
+  const relIds = relationshipsArrow.getChild('rel_id')?.toArray() as Uint32Array | undefined;
 
   // Pre-allocate array for better performance
   const relationships: Relationship[] = new Array(relatingIds.length);
@@ -557,6 +583,7 @@ export async function decodeDataModel(data: ArrayBuffer): Promise<DataModel> {
       relating_id: relatingIds[i],
       related_id: relatedIds[i],
     };
+    if (relIds !== undefined) relationships[i].rel_id = relIds[i];
   }
 
   // Parse spatial hierarchy - format: [nodes_len][nodes_data][element_to_storey_len][element_to_storey_data]...
@@ -692,30 +719,9 @@ export async function decodeDataModel(data: ArrayBuffer): Promise<DataModel> {
     }
   }
 
-  // Material associations (issue #900).
-  const materials: MaterialAssociation[] = [];
-  if (materialsData) {
-    const t = arrow.tableFromIPC(parquet.readParquet(materialsData).intoIPCStream());
-    const elementIds = t.getChild('element_id')?.toArray() as Uint32Array;
-    const setNames = t.getChild('set_name')?.toArray() as (string | null)[];
-    const layerIndices = t.getChild('layer_index')?.toArray() as Uint32Array;
-    const materialNames = t.getChild('material_name')?.toArray() as (string | null)[];
-    const thicknesses = nullableFloat64Column(t, 'thickness');
-    const ventChild = t.getChild('is_ventilated');
-    const categories = t.getChild('category')?.toArray() as (string | null)[];
-    for (let i = 0; i < elementIds.length; i++) {
-      const vent = ventChild?.get(i);
-      materials.push({
-        element_id: elementIds[i],
-        set_name: setNames?.[i] || undefined,
-        layer_index: layerIndices[i],
-        material_name: materialNames?.[i] ?? '',
-        thickness: thicknesses?.[i] ?? undefined,
-        is_ventilated: vent === null || vent === undefined ? undefined : Boolean(vent),
-        category: categories?.[i] || undefined,
-      });
-    }
-  }
+  const materials = materialsData
+    ? decodeMaterialAssociations(arrow.tableFromIPC(parquet.readParquet(materialsData).intoIPCStream()))
+    : [];
 
   // Document associations (issue #900).
   const documents: DocumentAssociation[] = [];

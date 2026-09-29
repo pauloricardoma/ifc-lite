@@ -1,5 +1,140 @@
 # @ifc-lite/codegen
 
+## 1.18.1
+
+### Patch Changes
+
+- Updated dependencies [[`ccc491e`](https://github.com/LTplus-AG/ifc-lite/commit/ccc491efac18ce496af47c91b1ef4fc04ebecca5), [`7215c2a`](https://github.com/LTplus-AG/ifc-lite/commit/7215c2a9344ede37c90680e1eb2a6c2b70c0ee3d), [`5c02af8`](https://github.com/LTplus-AG/ifc-lite/commit/5c02af8b7fda4d2fe53f79d3f00b9d192fc664d9)]:
+  - @ifc-lite/data@6.0.0
+
+## 1.18.0
+
+### Minor Changes
+
+- [#5014](https://github.com/LTplus-AG/ifc-lite/pull/5014) [`19af4c9`](https://github.com/LTplus-AG/ifc-lite/commit/19af4c9b5529a9052daf8a023ebe4e5144b9db2f) Thanks [@louistrue](https://github.com/louistrue)! - Generate the Rust `IfcType` discriminant universe from IFC4X3, the IFC4 family including IFC4X1, and IFC2X3 so supported legacy entity keywords retain their exact IFC names. Keep schema-version-specific attribute metadata separate and preserve the existing geometry classification mappings.
+
+### Patch Changes
+
+- [#4996](https://github.com/LTplus-AG/ifc-lite/pull/4996) [`6e283f0`](https://github.com/LTplus-AG/ifc-lite/commit/6e283f0fb187195aae76097dd4ee1660a20ae325) Thanks [@louistrue](https://github.com/louistrue)! - Generate crate-private IFC2X3 and IFC4 Rust registries alongside the canonical IFC4X3 registry. Exported entity attributes now use the source file's declared schema for positional names, while retaining metadata for transitional entities absent from the bundled EXPRESS inputs.
+- Updated dependencies [[`d38af5a`](https://github.com/LTplus-AG/ifc-lite/commit/d38af5afd36f12329fe6f33bf905d28fca65ba43), [`e1ace4f`](https://github.com/LTplus-AG/ifc-lite/commit/e1ace4f05a45a252d502bf72a506336185d2b157), [`ab8380e`](https://github.com/LTplus-AG/ifc-lite/commit/ab8380e6b9edf1ca1f05abf343ae6040ac8aee77), [`e211790`](https://github.com/LTplus-AG/ifc-lite/commit/e211790ff4d7070d908fb519652158089652dd9c)]:
+  - @ifc-lite/data@5.0.0
+
+## 1.17.0
+
+### Minor Changes
+
+- [#4218](https://github.com/LTplus-AG/ifc-lite/pull/4218) [`b5cb19a`](https://github.com/LTplus-AG/ifc-lite/commit/b5cb19ae80610107f7b3b3914efa7234dfbe4999) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Bring IFC2X3 into `@ifc-lite/codegen` ([#4202](https://github.com/LTplus-AG/ifc-lite/issues/4202)). `packages/codegen/schemas/`
+  now carries `IFC2X3_TC1.exp` (the official buildingSMART express longform
+  distribution) alongside the existing IFC4 and IFC4X3 schemas, and
+  `generateAll()` / `pnpm generate:ifc2x3` produce
+  `packages/codegen/generated/ifc2x3/` the same way the other two do — 653
+  entities, 327 types, 164 enums, 46 selects, with EXPRESS attribute types,
+  optionality, enum/select domains and inheritance chains, not just attribute
+  names. `scripts/check-codegen-sync.mjs` regenerates it in CI and fails the
+  build if the committed copy has drifted from `IFC2X3_TC1.exp`.
+  
+  `IFC2X3_TC1.exp` is the first schema in this repo sourced with CRLF line
+  endings; committed normalized to LF (matching the other two) because a raw
+  `\r` inside a multi-line `SELECT` type's underlying-type string breaks the
+  generated `schema-registry.ts`'s string literal for `tsc`. It also has 12
+  `SET/LIST … OF UNIQUE` occurrences — the syntax [#4212](https://github.com/LTplus-AG/ifc-lite/issues/4212) is filed against for
+  IFC4/IFC4X3 — which the existing UNIQUE-stripping fix already handles
+  correctly for this schema too (zero `UNIQUE` leaks into the generated
+  output).
+  
+  `@ifc-lite/parser` gains `getSchemaRegistryForVersion('IFC2X3' | 'IFC4' |
+  'IFC4X3')`, selecting the codegen-generated runtime registry by schema
+  version. `getSchemaRegistryForVersion('IFC4')` returns the exact
+  `SCHEMA_REGISTRY` object the package already exported, so every existing
+  caller's answer is unchanged. The lookup throws rather than returning an
+  empty registry if a version's `entities` map has zero keys, so a broken
+  regeneration reads as a thrown error, never as a silently empty result.
+
+- [#4211](https://github.com/LTplus-AG/ifc-lite/pull/4211) [`098e241`](https://github.com/LTplus-AG/ifc-lite/commit/098e2419cac5bd72f5524c7cddfa1b4da7971696) Thanks [@mpancera](https://github.com/mpancera)! - Expose the runtime hierarchy helpers as their own subpath,
+  `@ifc-lite/codegen/schema-hierarchy`, and import them from there in the two
+  runtime call sites (`lod0-generator`, the IDS classification bridge).
+  
+  The package root exports two things with different audiences: the generator,
+  which imports `node:fs` and `node:path` because it reads `.exp` files and
+  writes source, and the `isSubtypeOf` family, which is pure and is meant to be
+  called at runtime against a generated `SCHEMA_REGISTRY`. Importing the second
+  therefore dragged the first along. In a bundler that tree-shakes, the generator
+  falls away and nothing is wrong. In a dev server that does not, it is fetched
+  and evaluated, the `node:fs` stub throws at import, and the viewer never
+  mounts — it cycles through boot-self-heal reloads on a blank page.
+  
+  `schema-hierarchy.ts` has no imports at all, so the subpath is browser-safe by
+  construction rather than by convention, and the existing build already emits
+  `dist/schema-hierarchy.js` and its declarations. The root entry keeps every
+  export it had, so nothing that imports it today has to change.
+
+### Patch Changes
+
+- [#4363](https://github.com/LTplus-AG/ifc-lite/pull/4363) [`e69c9b5`](https://github.com/LTplus-AG/ifc-lite/commit/e69c9b5ac993e672ebd1e736c2b7d3997a7ac8bc) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Normalize CRLF/lone-CR line endings before parsing an EXPRESS `.exp` schema, so a schema fetched or generated fresh on Windows no longer leaks a stray `\r` into the generated TypeScript output (which breaks `tsc` on the emitted code).
+
+- [#4468](https://github.com/LTplus-AG/ifc-lite/pull/4468) [`78905e6`](https://github.com/LTplus-AG/ifc-lite/commit/78905e6866c33d97f6ee7e39e35c3f86d9121ae2) Thanks [@louistrue](https://github.com/louistrue)! - express-parser: strip an EXPRESS element qualifier from every aggregate shape, not only the numerically bounded one ([#4212](https://github.com/LTplus-AG/ifc-lite/issues/4212)).
+  
+  `UNIQUE` and `OPTIONAL` in front of an aggregate's element type (`LIST [1:?] OF UNIQUE IfcGridAxis`) constrain the elements; they are not part of the element type name and have no TypeScript equivalent. [#3565](https://github.com/LTplus-AG/ifc-lite/issues/3565) dropped them in `parseNestedCollection`, but `parseAttribute` only reached that function when the aggregate carried numeric bounds. A symbolic bound (`LIST [1:Dim] OF UNIQUE X`), no bound at all (`LIST OF UNIQUE X`), or an `OPTIONAL UNIQUE` element qualifier fell to a string-replace fallback that carried the qualifier into `attr.type` verbatim, so the emitter wrote `UNIQUE X[]` into the entity interface and `type: 'UNIQUE X'` into `schema-registry.ts`, where it sits inside a string literal that no typecheck reads. Aggregate bounds are now matched loosely and only become `arrayBounds` when both ends are numeric, and every element type goes through `parseNestedCollection`.
+  
+  The three schemas committed in this package (IFC2X3_TC1, IFC4_ADD2_TC1, IFC4X3) use numeric bounds for all 36 of their `OF UNIQUE` occurrences (12, 11 and 13), so their regenerated output is byte identical. The fix matters for any other `.exp` fed to the CLI.
+- Updated dependencies [[`ced8bb4`](https://github.com/LTplus-AG/ifc-lite/commit/ced8bb46c368648bd54a1bab716d049143faa036), [`be4fdb9`](https://github.com/LTplus-AG/ifc-lite/commit/be4fdb9ffe6995c74d3629887021c98b843beadb)]:
+  - @ifc-lite/data@4.1.0
+
+## 1.16.0
+
+### Minor Changes
+
+- [#4041](https://github.com/LTplus-AG/ifc-lite/pull/4041) [`faf2946`](https://github.com/LTplus-AG/ifc-lite/commit/faf294674d88050501c3f0737cae555555b9ea5b) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Export `@ifc-lite/codegen`'s generated schema hierarchy so type-membership questions ("is this entity a subtype of X?") can be answered from the actual EXPRESS `SUBTYPE OF` chain instead of a string test on the type name.
+  
+  `@ifc-lite/codegen` now ships its generated `ifc4` and `ifc4x3` bundles (`SCHEMA_REGISTRY`, entity/type/enum/select interfaces, serializers) as `@ifc-lite/codegen/ifc4` and `@ifc-lite/codegen/ifc4x3` subpath exports, and adds `isSubtypeOf` / `isSubtypeOfAny` / `isProperSubtypeOf` / `isProperSubtypeOfAny` helpers built on each bundle's `inheritanceChain`.
+  
+  `@ifc-lite/ids`'s `isNonRootedClassifiableResourceType` (deciding whether an entity can carry classifications via `IfcExternalReferenceRelationship`) and `@ifc-lite/export`'s LOD0 generator (excluding materials from candidate elements) now use these helpers instead of pinned `startsWith`/`endsWith`/`includes` string tests on the type name — the pattern behind three separate one-string-test-wrong-at-a-different-edge incidents in as many days.
+
+### Patch Changes
+
+- [#4005](https://github.com/LTplus-AG/ifc-lite/pull/4005) [`2ac2d03`](https://github.com/LTplus-AG/ifc-lite/commit/2ac2d03b874bd9f58637c8c8d194b8f8a9e563af) Thanks [@louistrue](https://github.com/louistrue)! - Generate a canonical-first Rust type lookup without duplicating the finite match, preserving Unicode case normalization and unknown-type identifiers.
+
+## 1.15.12
+
+### Patch Changes
+
+- [#3565](https://github.com/LTplus-AG/ifc-lite/pull/3565) [`140a6d8`](https://github.com/LTplus-AG/ifc-lite/commit/140a6d8541224341835c98028dc75e6a5ccd605d) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix the EXPRESS code generator dropping a `UNIQUE` collection constraint into
+  the element type instead of stripping it.
+  
+  EXPRESS allows `UNIQUE` directly in front of a collection's element type
+  (e.g. `LIST [1:?] OF UNIQUE IfcGridAxis`, real syntax from `IfcGrid.UAxes` in
+  both `IFC4_ADD2_TC1.exp` and `IFC4X3.exp`) — it constrains the collection's
+  elements, it is not part of the element type name. `parseNestedCollection`
+  never stripped it, so the parsed attribute type carried the leftover keyword
+  verbatim (`type: 'UNIQUE IfcGridAxis'`), and a collection nested one level
+  under a `UNIQUE` (`LIST [1:?] OF UNIQUE LIST [1:2] OF IfcLengthMeasure`)
+  fell through the "ends with Measure" heuristic entirely and lost an array
+  dimension (`number[]` instead of `IfcLengthMeasure[][]`).
+  
+  Eight IFC4 attributes and two additional IFC4X3-only attributes were affected
+  (`IfcTypeProduct.RepresentationMaps`, `IfcGrid.{UAxes,VAxes,WAxes}`,
+  `IfcIndexedPolygonalFaceWithVoids.InnerCoordIndices`, `IfcPath.EdgeList`,
+  `IfcPolyLoop.Polygon`, `IfcPropertyEnumeration.EnumerationValues`,
+  `IfcPropertyTableValue.DefiningValues`, `IfcVirtualGridIntersection.IntersectingAxes`,
+  `IfcStructuralLoadConfiguration.Locations`, plus IFC4X3's
+  `IfcTriangulatedFaceSet.Faces` and `IfcIndexedPolygonalTextureMap.InnerTexCoordIndices`).
+  `packages/codegen/generated/ifc4/entities.ts` and `generated/ifc4x3/entities.ts`
+  carried the bug outright (invalid TypeScript, e.g. `UAxes: UNIQUE IfcGridAxis[];`);
+  `packages/parser/src/generated/entities.ts` had it hand-patched to valid syntax
+  in one prior commit without ever touching the generator, so
+  `schema-registry.ts` — which carries the same attribute type as a plain
+  string, so `tsc` never flagged it — kept shipping `type: 'UNIQUE IfcGridAxis'`
+  as runtime metadata in every published `@ifc-lite/parser` release.
+  
+  Regenerated and committed `packages/codegen/generated/{ifc4,ifc4x3}/{entities,schema-registry}.ts`
+  and `packages/parser/src/generated/{entities,schema-registry}.ts` to match the
+  fixed generator; a fresh regeneration against the committed `.exp` schemas is
+  now byte-identical to what's committed.
+
+- [#3855](https://github.com/LTplus-AG/ifc-lite/pull/3855) [`182215a`](https://github.com/LTplus-AG/ifc-lite/commit/182215a835c4beac6a776bcb4eb1d019cab9063e) Thanks [@louistrue](https://github.com/louistrue)! - Corrected the code samples on each package's npm landing page: the README fences are now typechecked against the package's real exports, so the snippets import what they call, declare the values they read, and no longer show removed options or renamed methods. Patch-bumping every package whose README changed so the corrections actually reach npmjs.com.
+- Updated dependencies [[`bcbe7b9`](https://github.com/LTplus-AG/ifc-lite/commit/bcbe7b9afa38e8dafb5900e73575c71a8fd96012), [`1000dce`](https://github.com/LTplus-AG/ifc-lite/commit/1000dce72e9ec75c59848efefc1f709d01172e72), [`89c4cf2`](https://github.com/LTplus-AG/ifc-lite/commit/89c4cf22e83d76115035f7dcbf6e34f9c06dd091), [`a1aebc8`](https://github.com/LTplus-AG/ifc-lite/commit/a1aebc822b819221258f4759edf4c82ff0d140f7), [`f8e03d4`](https://github.com/LTplus-AG/ifc-lite/commit/f8e03d4d5bb620fc9e807d5233091d145a201165), [`a1069f8`](https://github.com/LTplus-AG/ifc-lite/commit/a1069f8f096fcfc5771200a2748466096c3463d5), [`1060a30`](https://github.com/LTplus-AG/ifc-lite/commit/1060a30187c8f6bb327f9e356056f2364568e8ff), [`a2488e8`](https://github.com/LTplus-AG/ifc-lite/commit/a2488e858bc7792cdcc818f7759c0a6e46e7d892), [`8368339`](https://github.com/LTplus-AG/ifc-lite/commit/83683393654d8c1b903f03b5c6e9e5ff111fdaf0)]:
+  - @ifc-lite/data@4.0.0
+
 ## 1.15.11
 
 ### Patch Changes

@@ -365,7 +365,6 @@ class IDSTranslationServiceImpl implements TranslationService {
     }
   }
 
-
   /**
    * Describe a failure in human-readable form
    */
@@ -428,9 +427,7 @@ class IDSTranslationServiceImpl implements TranslationService {
             available: context.availablePsets,
           });
         }
-        return this.interpolate(t.psetMissing, {
-          pset: field || expected || '?',
-        });
+        return this.interpolate(t.psetMissing, { pset: field || expected || '?' });
 
       case 'PROPERTY_MISSING':
         if (context?.availableProperties) {
@@ -445,6 +442,8 @@ class IDSTranslationServiceImpl implements TranslationService {
           pset: context?.propertySet || '?',
         });
 
+      case 'PROPERTY_EMPTY':
+        return this.interpolate(t.propertyEmpty, { pset: this.extractPsetFromField(field), property: this.extractPropertyFromField(field) });
       case 'PROPERTY_VALUE_MISMATCH':
         return this.interpolate(t.propertyValueMismatch, {
           pset: this.extractPsetFromField(field),
@@ -453,6 +452,8 @@ class IDSTranslationServiceImpl implements TranslationService {
           expected: expected || '?',
         });
 
+      case 'PROPERTY_DATATYPE_UNKNOWN':
+        return this.interpolate(t.propertyDatatypeUnknown, { pset: this.extractPsetFromField(field), property: this.extractPropertyFromField(field), expected: expected || '?' });
       case 'PROPERTY_DATATYPE_MISMATCH':
         return this.interpolate(t.propertyDatatypeMismatch, {
           pset: this.extractPsetFromField(field),
@@ -497,9 +498,14 @@ class IDSTranslationServiceImpl implements TranslationService {
           expected: expected || '?',
         });
 
+      case 'CLASSIFICATION_UNRESOLVED':
+        return field === 'presence' ? t.classificationPresenceUnresolved : t.classificationUnresolved;
+
       // Material failures
       case 'MATERIAL_MISSING':
         return t.materialMissing;
+      case 'MATERIAL_UNRESOLVED':
+        return t.materialUnresolved;
 
       case 'MATERIAL_VALUE_MISMATCH':
         if (context?.availableMaterials) {
@@ -596,9 +602,7 @@ class IDSTranslationServiceImpl implements TranslationService {
       .replace(/^Doit/i, 'Devrait');
   }
 
-  /**
-   * Get status text
-   */
+  /** Get status text */
   getStatusText(status: 'pass' | 'fail' | 'not_applicable'): string {
     return this.translations.status[status];
   }

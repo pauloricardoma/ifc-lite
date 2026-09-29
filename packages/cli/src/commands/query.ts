@@ -10,9 +10,11 @@
  * classifications, attributes, relationships, type properties.
  */
 
+import { SelectorUnsupportedError } from '@ifc-lite/sdk';
 import { createHeadlessContext } from '../loader.js';
 import { printJson, getFlag, hasFlag, fatal, validateLimit } from '../output.js';
 import { STANDARD_QTO_MAP, sortEntities } from './query-aggregation.js';
+import { resolveStoreyIds } from './query-storey.js';
 import { VALID_GROUP_BY_KEYS, outputCount, outputSum, outputAggregation, outputGroupBy, outputEntities, computeUniqueValues } from './query-output.js';
 import { applyWhereFilter, parseWhereFilter, compareValues, normalizeBooleanValue } from './where-filter.js';
 
@@ -52,6 +54,11 @@ export async function queryCommand(args: string[]): Promise<void> {
   const rowLimit = validateLimit(limit);
   const offset = validateLimit(getFlag(args, '--offset'), '--offset');
   const propFilter = getFlag(args, '--where');
+  // #4094: an IfcOpenShell-style selector, e.g. "IfcWall, Pset_WallCommon.
+  // FireRating=2HR". Its classes union with the same `types` list --type
+  // populates; its property comparisons AND with the query, as does --where's
+  // manual application to `q.toArray()` below.
+  const select = getFlag(args, '--select');
   const jsonOutput = hasFlag(args, '--json');
   const countOnly = hasFlag(args, '--count');
   const spatial = hasFlag(args, '--spatial');
@@ -296,21 +303,21 @@ export async function queryCommand(args: string[]): Promise<void> {
     const types = type.split(',');
     q = q.byType(...types);
   }
-
-  // --storey filter: restrict to entities in a specific storey
-  if (storeyFilter) {
-    const storeys = bim.storeys();
-    const matchedStorey = storeys.find((s: any) =>
-      s.name === storeyFilter ||
-      s.name.toLowerCase().includes(storeyFilter.toLowerCase()) ||
-      String(s.ref.expressId) === storeyFilter
-    );
-    if (!matchedStorey) {
-      const names = storeys.map((s: any) => s.name).filter(Boolean).join(', ');
-      fatal(`Storey "${storeyFilter}" not found. Available: ${names || '(none)'}`);
+  if (select) {
+    try {
+      q = q.select(select);
+    } catch (err) {
+      if (err instanceof SelectorUnsupportedError || err instanceof Error) {
+        fatal(err.message);
+      }
+      throw err;
     }
-    const contained = bim.contains(matchedStorey.ref);
-    const storeyIds = new Set(contained.map((e: any) => e.ref.expressId));
+  }
+
+  // --storey filter: restrict to entities in a specific storey (or storeys
+  // sharing a Name — see resolveStoreyIds).
+  if (storeyFilter) {
+    const storeyIds = resolveStoreyIds(bim, storeyFilter);
     // Post-filter: only keep entities that are in this storey
     const baseEntities = q.toArray();
     let storeyEntities = baseEntities.filter((e: any) => storeyIds.has(e.ref.expressId));

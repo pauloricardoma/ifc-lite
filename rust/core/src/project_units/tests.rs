@@ -238,3 +238,167 @@ fn cyclic_derived_unit_terminates_not_stack_overflow() {
     let mut decoder = EntityDecoder::new(content);
     assert!(resolve_unit_by_ref(&mut decoder, 10).is_none());
 }
+
+/// Run `resolve_unit_by_ref(#10)` on a worker thread, failing the test if it
+/// has not returned by `limit`. The timeout is the assertion: a walk that
+/// regresses to `k^depth` takes seconds at k=3, so a one-second limit cannot
+/// pass by accident and cannot hang the revert oracle.
+fn resolve_within(
+    content: String,
+    limit: std::time::Duration,
+) -> Option<(Option<String>, ResolvedUnit, bool)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut decoder = EntityDecoder::new(&content);
+        let _ = tx.send(resolve_unit_by_ref(&mut decoder, 10));
+    });
+    match rx.recv_timeout(limit) {
+        Ok(out) => out,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("resolve_unit_by_ref did not return within {limit:?}")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("resolve_unit_by_ref's worker panicked (not a hang)")
+        }
+    }
+}
+
+/// The same cycle as above with THREE elements per level, each pointing back
+/// at the derived unit. A depth cap alone bounds one path's length, not the
+/// breadth: every level fans out three ways, so the walk cost `3^16` before
+/// the path set refused the re-entry. The k=1 test above cannot see this,
+/// being the one fan-out the cap is sufficient for.
+#[test]
+fn cyclic_derived_unit_with_fan_out_returns_in_bounded_time() {
+    let content = "\
+#10=IFCDERIVEDUNIT((#11,#12,#13),.USERDEFINED.);
+#11=IFCDERIVEDUNITELEMENT(#10,1);
+#12=IFCDERIVEDUNITELEMENT(#10,1);
+#13=IFCDERIVEDUNITELEMENT(#10,1);
+"
+    .to_string();
+    let out = resolve_within(content, std::time::Duration::from_secs(1));
+    assert!(out.is_none(), "a derived unit made only of itself resolves to nothing");
+}
+
+/// An ACYCLIC fan-out: twelve derived units in a chain, each listing the next
+/// one four times. No id repeats on any path, so the path set never fires
+/// and the depth cap never binds (12 < 16); only the decode budget bounds
+/// the `4^12` element resolutions, and with them the composed symbol, which
+/// would otherwise be `4^12` copies of `m`. Refused, not truncated: the
+/// result is `None`, not a symbol composed of whichever elements the walk
+/// reached.
+#[test]
+fn acyclic_derived_unit_fan_out_is_refused_in_bounded_time() {
+    let mut content = String::new();
+    for level in 0..12u32 {
+        let unit = 10 + level * 10;
+        let next = unit + 10;
+        content.push_str(&format!(
+            "#{unit}=IFCDERIVEDUNIT((#{a},#{b},#{c},#{d}),.USERDEFINED.);\n\
+             #{a}=IFCDERIVEDUNITELEMENT(#{next},1);\n\
+             #{b}=IFCDERIVEDUNITELEMENT(#{next},1);\n\
+             #{c}=IFCDERIVEDUNITELEMENT(#{next},1);\n\
+             #{d}=IFCDERIVEDUNITELEMENT(#{next},1);\n",
+            a = unit + 1,
+            b = unit + 2,
+            c = unit + 3,
+            d = unit + 4,
+        ));
+    }
+    content.push_str("#130=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);\n");
+    let out = resolve_within(content, std::time::Duration::from_secs(1));
+    assert!(out.is_none(), "an over-budget walk must refuse the unit, got {out:?}");
+}
+
+/// The budget on a TREE rather than a fan-out: three hundred distinct
+/// elements over three hundred distinct SI units. Refused, not truncated:
+/// the result is `None`, not a symbol composed of whichever elements the
+/// walk reached before the budget ran out.
+#[test]
+fn an_over_budget_unit_graph_is_refused_not_truncated() {
+    let n = 300u32;
+    let elements: Vec<String> = (0..n).map(|i| format!("#{}", 100 + 2 * i)).collect();
+    let mut content = format!("#10=IFCDERIVEDUNIT(({}),.USERDEFINED.);\n", elements.join(","));
+    for i in 0..n {
+        let (elem, unit) = (100 + 2 * i, 101 + 2 * i);
+        content.push_str(&format!(
+            "#{elem}=IFCDERIVEDUNITELEMENT(#{unit},1);\n#{unit}=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);\n"
+        ));
+    }
+    let out = resolve_within(content, std::time::Duration::from_secs(1));
+    assert!(out.is_none(), "an over-budget walk must refuse the unit, got {out:?}");
+}
+
+/// The budget must not bind on a real derived unit: a flow rate over a
+/// conversion-based length whose factor is itself an SI unit resolves as
+/// before, with decodes to spare.
+#[test]
+fn real_derived_units_stay_well_under_the_budget() {
+    let content = "\
+#10=IFCDERIVEDUNIT((#11,#12),.VOLUMETRICFLOWRATEUNIT.,$);
+#11=IFCDERIVEDUNITELEMENT(#20,3);
+#12=IFCDERIVEDUNITELEMENT(#21,-1);
+#20=IFCCONVERSIONBASEDUNIT(*,.LENGTHUNIT.,'FOOT',#30);
+#30=IFCMEASUREWITHUNIT(IFCLENGTHMEASURE(0.3048),#22);
+#21=IFCSIUNIT(*,.TIMEUNIT.,$,.SECOND.);
+#22=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+";
+    let mut decoder = EntityDecoder::new(content);
+    let (_, resolved, _) = resolve_unit_by_ref(&mut decoder, 10).expect("resolves");
+    assert_eq!(resolved.symbol, "ft\u{00B3}/s");
+    assert!((resolved.si_scale - 0.3048f64.powi(3)).abs() < 1e-12);
+}
+
+/// A cyclic element beside two sound ones poisons the whole authored unit.
+/// Returning only the sound siblings would falsely report `m/s` for an
+/// unresolved definition and give downstream conversions a fabricated scale.
+#[test]
+fn a_cyclic_element_refuses_the_whole_unit_instead_of_truncating_it() {
+    let content = "\
+#10=IFCDERIVEDUNIT((#11,#12,#13),.LINEARVELOCITYUNIT.,$);
+#11=IFCDERIVEDUNITELEMENT(#10,1);
+#12=IFCDERIVEDUNITELEMENT(#20,1);
+#13=IFCDERIVEDUNITELEMENT(#21,-1);
+#20=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#21=IFCSIUNIT(*,.TIMEUNIT.,$,.SECOND.);
+";
+    let mut decoder = EntityDecoder::new(content);
+    assert!(resolve_unit_by_ref(&mut decoder, 10).is_none());
+}
+
+/// A file-supplied `IfcDerivedUnitElement.Exponent` of `i32::MIN` reached
+/// `superscript` as a re-signed negative magnitude and panicked with an
+/// arithmetic overflow (`'-' - '0'` in `u32`). It must resolve, and an
+/// exponent below `i32::MIN` must saturate rather than wrap to something
+/// small and plausible.
+#[test]
+fn derived_unit_element_exponent_i32_min_resolves_without_panic() {
+    let content = "\
+#10=IFCDERIVEDUNIT((#11),.USERDEFINED.);
+#11=IFCDERIVEDUNITELEMENT(#12,-2147483648);
+#12=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#20=IFCDERIVEDUNIT((#21),.USERDEFINED.);
+#21=IFCDERIVEDUNITELEMENT(#12,-9223372036854775808);
+";
+    let mut decoder = EntityDecoder::new(content);
+    let (_, resolved, _) = resolve_unit_by_ref(&mut decoder, 10).expect("resolves");
+    assert!(resolved.symbol.starts_with("1/m"), "got {}", resolved.symbol);
+    // `i64::MIN` saturates to the same exponent, so the two are identical.
+    let (_, saturated, _) = resolve_unit_by_ref(&mut decoder, 20).expect("resolves");
+    assert_eq!(saturated.symbol, resolved.symbol);
+}
+
+/// #4690: a conversion-based unit whose factor does not resolve and whose name
+/// has no known factor is not a resolved unit through either accessor. The
+/// display cases (FOOT, CUBIT) are the shared `unit_symbol_vectors.json` rows.
+#[test]
+fn issue_4690_an_unresolved_conversion_unit_is_not_a_resolved_unit() {
+    let unknown = "DATA;\n#1=IFCPROJECT('guid',$,'Test',$,$,$,$,$,#2);\n#2=IFCUNITASSIGNMENT((#3));\n\
+                   #3=IFCCONVERSIONBASEDUNIT(#4,.LENGTHUNIT.,'CUBIT',#5);\n\
+                   #4=IFCDIMENSIONALEXPONENTS(1,0,0,0,0,0,0);\n\
+                   #5=IFCMEASUREWITHUNIT(IFCLENGTHMEASURE(457.2),#99);\nENDSEC;\n";
+    assert_eq!(units_of(unknown).resolved_for_unit_type("LENGTHUNIT"), None);
+    let mut decoder = EntityDecoder::new(unknown);
+    assert!(resolve_unit_by_ref(&mut decoder, 3).is_none());
+}

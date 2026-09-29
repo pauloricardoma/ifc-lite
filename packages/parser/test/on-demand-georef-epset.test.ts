@@ -90,9 +90,28 @@ describe('extractGeoreferencingOnDemand — IFC2x3 ePset fallback', () => {
     expect(georef?.projectedCRS?.name).toBe('EPSG:4326');
   });
 
+  // A refused IfcMapConversion beside a CRS with no usable Name claims nothing,
+  // so the entity extractor takes the ePSet path. The loader gated the ePSets on
+  // the conversion's presence, never handed them over, and the browser reported
+  // the site fallback where the server reported the ePSet (#4695).
+  it.each(['$', "' '"])('loads the ePSets behind a refused conversion and a CRS named %s', async (name) => {
+    const ifc = `#1=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-05,$,$);
+#2=IFCPROJECTEDCRS(${name},$,$,$,$,$,$);
+#3=IFCMAPCONVERSION(#1,#2,1000.,2000.,42.,1.0E999,0.,1.);
+#30=IFCSITE('06pHC0eJnCHlVXWW2sVoPO',$,'Site',$,$,$,$,$,.ELEMENT.,(51,26,47,208626),(5,27,36,650968),$,$,$);
+#1360=IFCPROPERTYSINGLEVALUE('TargetCRS',$,IFCLABEL('EPSG:28992'),$);
+#1361=IFCPROPERTYSINGLEVALUE('Eastings',$,IFCLENGTHMEASURE(155000.),$);
+#1367=IFCPROPERTYSET('2If4Y3Lpv6dgTDkC5x_dnr',$,'ePset_MapConversion',$,(#1360,#1361));`;
+    const georef = extractGeoreferencingOnDemand(await storeFromIfc(ifc));
+
+    expect(georef?.source).toBe('ePSetMapConversion');
+    expect(georef?.projectedCRS?.name).toBe('EPSG:28992');
+    expect(georef?.mapConversion?.eastings).toBe(155000);
+  });
+
   it('memoizes per store so repeated calls do not re-scan property sets', async () => {
-    // The on-demand scan decodes every IfcPropertySet to find ePset_MapConversion
-    // on models without an IfcMapConversion. The viewer calls this on the render
+    // The on-demand scan considers every IfcPropertySet to find ePset_MapConversion
+    // when the IFC4 entities claim no georeference. The viewer calls this on the render
     // path once per streamed geometry batch, so without caching a property-heavy
     // model re-scans tens of thousands of psets per batch (regression #1404).
     const ifc = `#30=IFCSITE('06pHC0eJnCHlVXWW2sVoPO',$,'Site',$,$,$,$,$,.ELEMENT.,(51,26,47,208626),(5,27,36,650968),$,$,$);
@@ -111,9 +130,9 @@ describe('extractGeoreferencingOnDemand — IFC2x3 ePset fallback', () => {
 
   // Work-count regression guard (deterministic, machine-independent — counts
   // work done, not wall-clock). The georef scan decodes one entity per property
-  // set on models without an IfcMapConversion; memoization must drop that to
-  // zero on subsequent calls so the viewer's per-batch invocations are free.
-  it('scans property sets once: zero entity decodes on the memoized second call', async () => {
+  // set on models whose IFC4 entities claim no georeference used to dominate cold load.
+  // Ordinary names need no full decode; subsequent calls remain memoized.
+  it('rejects unrelated property sets before decoding and memoizes the site result', async () => {
     const PSET_COUNT = 400;
     let ifc = `#30=IFCSITE('06pHC0eJnCHlVXWW2sVoPO',$,'Site',$,$,$,$,$,.ELEMENT.,(51,26,47,208626),(5,27,36,650968),$,$,$);\n`;
     // Many non-georef property sets force the scan to run to completion (the
@@ -125,18 +144,37 @@ describe('extractGeoreferencingOnDemand — IFC2x3 ePset fallback', () => {
 
     const decode = vi.spyOn(EntityExtractor.prototype, 'extractEntity');
     decode.mockClear();
-    extractGeoreferencingOnDemand(store);
+    const georef = extractGeoreferencingOnDemand(store);
     const firstCallDecodes = decode.mock.calls.length;
     decode.mockClear();
     extractGeoreferencingOnDemand(store);
     const secondCallDecodes = decode.mock.calls.length;
     decode.mockRestore();
 
-    // First call actually scanned the property sets...
-    expect(firstCallDecodes).toBeGreaterThanOrEqual(PSET_COUNT);
+    expect(georef?.projectedCRS?.name).toBe('EPSG:4326');
+    // Only the real IfcSite needs decoding; unrelated psets stay in the source.
+    expect(firstCallDecodes).toBe(1);
     // ...the second call did NO work — the regression (#1404) re-scanned on
     // every geometry batch, which on a real model is tens of thousands of
     // decodes per batch.
     expect(secondCallDecodes).toBe(0);
+  });
+
+  it.each([
+    'ePsEt_MapConversion',
+    String.raw`\X2\0065\X0\PSet_MapConversion`,
+    String.raw`eP\X2\0053\X0\et_MapConversion`,
+  ])('preserves canonical georeferencing for literal and encoded Name: %s', async (name) => {
+    const store = await storeFromIfc(`#1=IFCPROPERTYSINGLEVALUE('Eastings',$,IFCLENGTHMEASURE(42.),$);
+#2=IFCPROPERTYSET('g',$,'${name}',$,(#1));`);
+    const georef = extractGeoreferencingOnDemand(store);
+    expect(georef?.source).toBe('ePSetMapConversion');
+    expect(georef?.mapConversion?.eastings).toBe(42);
+  });
+
+  it('a georeferencing token in another attribute does not identify a property set', async () => {
+    const store = await storeFromIfc(`#1=IFCPROPERTYSINGLEVALUE('Eastings',$,IFCLENGTHMEASURE(999.),$);
+#2=IFCPROPERTYSET('ePSet_MapConversion',$,'Ordinary','ePSet_ProjectedCRS',(#1));`);
+    expect(extractGeoreferencingOnDemand(store)).toBeNull();
   });
 });

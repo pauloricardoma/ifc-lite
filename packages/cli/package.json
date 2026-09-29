@@ -1,7 +1,7 @@
 {
   "name": "@ifc-lite/cli",
-  "version": "0.26.0",
-  "description": "CLI toolkit for IFC files — query, validate, export, create, and script BIM data",
+  "version": "0.38.0",
+  "description": "CLI toolkit for IFC files \u2014 query, validate, export, create, and script BIM data",
   "type": "module",
   "bin": {
     "ifc-lite": "./dist/index.js"
@@ -28,29 +28,33 @@
   ],
   "dependencies": {
     "@ifc-lite/bcf": "workspace:^",
+    "@ifc-lite/cache": "workspace:^",
     "@ifc-lite/clash": "workspace:^",
     "@ifc-lite/create": "workspace:^",
     "@ifc-lite/data": "workspace:^",
     "@ifc-lite/diff": "workspace:^",
     "@ifc-lite/export": "workspace:^",
     "@ifc-lite/extensions": "workspace:^",
+    "@ifc-lite/flow": "workspace:^",
+    "@ifc-lite/flow-nodes": "workspace:^",
     "@ifc-lite/geometry": "workspace:^",
     "@ifc-lite/ids": "workspace:^",
     "@ifc-lite/ifcx": "workspace:^",
-    "@ifc-lite/merge": "workspace:^",
     "@ifc-lite/mcp": "workspace:^",
+    "@ifc-lite/merge": "workspace:^",
     "@ifc-lite/mutations": "workspace:^",
     "@ifc-lite/parser": "workspace:^",
     "@ifc-lite/query": "workspace:^",
+    "@ifc-lite/rules": "workspace:^",
     "@ifc-lite/sandbox": "workspace:^",
     "@ifc-lite/sdk": "workspace:^",
     "@ifc-lite/viewer-core": "workspace:^",
     "@ifc-lite/wasm": "workspace:^"
   },
   "devDependencies": {
-    "@types/node": "^26.4.0",
+    "@types/node": "^26.6.2",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.11"
+    "vitest": "^5.0.2"
   },
   "engines": {
     "node": ">=18.0.0"

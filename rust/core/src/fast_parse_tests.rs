@@ -3,6 +3,47 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use super::*;
+use std::cell::Cell;
+
+thread_local! {
+    static COMMENT_AWARE_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
+pub(super) fn mark_comment_aware_call() {
+    COMMENT_AWARE_CALLS.with(|calls| calls.set(calls.get() + 1));
+}
+
+fn comment_aware_calls() -> usize {
+    COMMENT_AWARE_CALLS.with(Cell::get)
+}
+
+/// The #4720 regression was not incorrect output: it put comment detection in
+/// every delimiter iteration of the overwhelmingly comment-free point-list
+/// path. Keep the dispatch itself observable so reverting #4735 makes this
+/// test fail even though both implementations return the same numbers.
+#[test]
+fn comment_free_lists_stay_out_of_the_comment_aware_loops() {
+    COMMENT_AWARE_CALLS.with(|calls| calls.set(0));
+
+    assert_eq!(parse_coordinates_direct(b"((1.,2.,3.))"), [1.0, 2.0, 3.0]);
+    assert_eq!(
+        parse_coordinates_direct_f64(b"((1.,2.,3.))"),
+        [1.0, 2.0, 3.0]
+    );
+    assert_eq!(parse_indices_direct(b"((1,2,3))"), [0, 1, 2]);
+    assert_eq!(comment_aware_calls(), 0);
+
+    assert_eq!(
+        parse_coordinates_direct(b"((1.,/* 9 */2.,3.))"),
+        [1.0, 2.0, 3.0]
+    );
+    assert_eq!(
+        parse_coordinates_direct_f64(b"((1.,/* 9 */2.,3.))"),
+        [1.0, 2.0, 3.0]
+    );
+    assert_eq!(parse_indices_direct(b"((1,/* 9 */2,3))"), [0, 1, 2]);
+    assert_eq!(comment_aware_calls(), 3);
+}
 
 #[test]
 fn test_parse_coordinates_direct() {
@@ -153,6 +194,56 @@ fn test_extract_coordinate_list() {
     assert!((coords[3] - 100.0).abs() < 0.001);
 }
 
+/// The CoordList is attribute 0, found by depth: the old first-`((`-to-last-`))`
+/// span read an IFC4X3 TagList's digits as coordinates and refused a list
+/// written `( (`. Core review behind #4577 (finding 6).
+#[test]
+fn coordinate_list_is_attribute_zero_found_by_depth() {
+    let read = extract_coordinate_list_from_entity;
+    let tagged = b"#1=IFCCARTESIANPOINTLIST3D(((0.,1.,2.)),('P9'));";
+    assert_eq!(read(tagged).unwrap(), [0.0, 1.0, 2.0]);
+    let spaced = b"#1=IFCCARTESIANPOINTLIST3D( /* c) */\t( (0.,1.,2.) ),$);";
+    assert_eq!(read(spaced).unwrap(), [0.0, 1.0, 2.0]);
+    // A `(` in a head comment does not open the list (the rule
+    // `nth_attribute_is_present` uses; a bare `memchr` landed inside it).
+    let head = b"#1=IFCCARTESIANPOINTLIST3D /* (v2) */ (((0.,1.,2.)),$);";
+    assert_eq!(read(head).unwrap(), [0.0, 1.0, 2.0]);
+    assert!(read(b"#1=IFCCARTESIANPOINTLIST3D($,(('P1')));").is_none());
+    assert!(read(b"#1=IFCCARTESIANPOINTLIST3D(((0.,1.,2.)").is_none());
+}
+
+/// `process_triangulated_faceset_direct` handed the coordinate entity's
+/// WHOLE record to `parse_coordinates_direct`, which reads every number it
+/// meets: the instance name `78` and the `3` in `IFCCARTESIANPOINTLIST3D`
+/// came back as the first two coordinates, 11 floats for 3 points, and every
+/// vertex was shifted by two. Reverting the fix fails the `positions`
+/// assertion (it yields `[78.0, 3.0, 0.0, 0.0, 150.0, ...]`).
+/// Found by the core review behind #4577 (finding 6).
+#[test]
+fn process_triangulated_faceset_direct_does_not_read_the_record_prefix_as_coordinates() {
+    let faceset = b"#77=IFCTRIANGULATEDFACESET(#78,$,$,((1,2,3)),$);";
+    let points: &[u8] = b"#78=IFCCARTESIANPOINTLIST3D(((0.,0.,150.),(0.,40.,140.),(100.,0.,0.)));";
+    let mesh =
+        process_triangulated_faceset_direct(faceset, |id| (id == 78).then(|| points.to_vec()))
+            .expect("a well-formed faceset with a resolvable point list");
+
+    assert_eq!(
+        mesh.positions,
+        [0.0, 0.0, 150.0, 0.0, 40.0, 140.0, 100.0, 0.0, 0.0]
+    );
+    assert_eq!(mesh.indices, [0, 1, 2]);
+}
+
+/// A point list whose attribute 0 is not a list has no coordinates to
+/// read, so the faceset is refused rather than meshed from whatever numbers
+/// the record prefix happens to carry.
+#[test]
+fn process_triangulated_faceset_direct_refuses_a_point_list_without_a_coordinate_span() {
+    let faceset = b"#77=IFCTRIANGULATEDFACESET(#78,$,$,((1,2,3)),$);";
+    let points: &[u8] = b"#78=IFCCARTESIANPOINTLIST3D($);";
+    assert!(process_triangulated_faceset_direct(faceset, |_| Some(points.to_vec())).is_none());
+}
+
 #[test]
 fn test_should_use_fast_path() {
     assert!(should_use_fast_path("IFCCARTESIANPOINTLIST3D"));
@@ -243,8 +334,98 @@ fn extract_entity_refs_from_list_refuses_above_u32_max_and_resolves_at_the_bound
     assert_eq!(ids, vec![1, u32::MAX, 2]);
 }
 
+/// #4687: a comment inside a coordinate or index list is trivia. Its digits
+/// used to become an extra coordinate or index, shifting every one after it.
+#[test]
+fn issue_4687_a_comment_in_a_coordinate_or_index_list_is_trivia() {
+    let plain = b"#5=IFCCARTESIANPOINTLIST3D(((0.,0.,0.),(1.,0.,0.),(0.,1.,0.)));";
+    let commented = b"#5=IFCCARTESIANPOINTLIST3D(((0.,0.,0.) /* rev 7 */,(1.,0.,0.),(0.,1.,0.)));";
+    assert_eq!(extract_coordinate_list_from_entity(commented), extract_coordinate_list_from_entity(plain));
+    assert_eq!(parse_coordinates_direct_f64(b"((0.,0.,0.)/*-.5*/,(1.,0.,0.))"), [0., 0., 0., 1., 0., 0.]);
+    assert_eq!(parse_indices_direct(b"((1,2,3) /* face 2 */,(2,1,4))"), [0, 1, 2, 1, 0, 3]);
+    // An unterminated comment ends the list rather than reading its contents.
+    assert_eq!(parse_indices_direct(b"((1,2,3) /* 9 9"), [0, 1, 2]);
+}
+
 #[test]
 fn extract_entity_refs_from_list_hash_with_no_digits_does_not_panic() {
     let ids = extract_entity_refs_from_list(b"(#,#2)");
     assert_eq!(ids, vec![2]);
+}
+
+/// #5266: a dropped comma corrupts one numeric literal into two, e.g.
+/// `1.52.3` for what was meant to be `1.52,3`. `fast_float2::parse_partial`
+/// parses the `1.52` prefix and reports it consumed, leaving `.3` free to be
+/// misread as the START of the next coordinate -- every later value in the
+/// list shifts by one position instead of the list being refused. Pins both
+/// the non-comment-aware hot loops (`fast_parse.rs`) and their comment-aware
+/// twins (`fast_parse_comments.rs`, reached here via the leading `/` in the
+/// `_with_comment` cases, which routes through `may_contain_step_comment`).
+#[test]
+fn issue_5266_corrupted_literal_refuses_the_whole_list_not_split_into_two_coordinates() {
+    // Unpatched: parse_coordinates_direct(b"((1.52.3,4.0,5.0))") == [1.52, 0.3, 4.0, 5.0].
+    assert_eq!(parse_coordinates_direct(b"((1.52.3,4.0,5.0))"), Vec::<f32>::new());
+    assert_eq!(parse_coordinates_direct_f64(b"((1.52.3,4.0,5.0))"), Vec::<f64>::new());
+
+    // Same corrupted literal, forced through the comment-aware twins by a
+    // `/* ... */` elsewhere in the same list so `may_contain_step_comment`
+    // dispatches to them.
+    assert_eq!(
+        parse_coordinates_direct(b"((1.52.3,4.0,5.0) /* c */,(6.0,7.0,8.0))"),
+        Vec::<f32>::new()
+    );
+    assert_eq!(
+        parse_coordinates_direct_f64(b"((1.52.3,4.0,5.0) /* c */,(6.0,7.0,8.0))"),
+        Vec::<f64>::new()
+    );
+
+    // Control: a legal comment glued directly onto a numeric literal, with no
+    // delimiter before it, must still be accepted -- the fix must not
+    // refuse every number a comment touches, only a corrupted one.
+    assert_eq!(
+        parse_coordinates_direct_f64(b"((1.5/* c */,2.0,3.0))"),
+        [1.5, 2.0, 3.0]
+    );
+}
+
+/// #5266 follow-up: a token the list walk cannot read as one whole STEP
+/// literal refuses the list. Before, the walk skipped any byte that did not
+/// start a number, so `nan` vanished and every later value shifted left.
+#[test]
+fn issue_5266_non_step_tokens_refuse_the_list_instead_of_vanishing() {
+    for list in [&b"((nan,1.,2.))"[..], b"((inf,1.,2.))", b"((1.,2.,3.x))", b"(($,1.,2.))"] {
+        let shown = String::from_utf8_lossy(list);
+        assert_eq!(parse_coordinates_direct_f64(list), Vec::<f64>::new(), "{shown}");
+        assert_eq!(parse_coordinates_direct(list), Vec::<f32>::new(), "{shown}");
+    }
+    // The comment-aware twin applies the same rule.
+    assert_eq!(parse_coordinates_direct_f64(b"((nan,1.,2.) /* c */)"), Vec::<f64>::new());
+    // A missing value, a trailing comma or a missing comma between points
+    // would shorten or shift the list, so the tokenizer refuses them and so
+    // does the walk.
+    for list in [&b"((1.,,2.,3.),(4.,5.,6.))"[..], b"((1.,2.,))", b"((1.,2.,3.)(4.,5.,6.))", b"((,1.))", b"((1.,2.,3.)", b"((1.,2.,3.)))"] {
+        assert_eq!(parse_coordinates_direct_f64(list), Vec::<f64>::new(), "{}", String::from_utf8_lossy(list));
+    }
+    // A refused CoordList is `None` from the entity reader, not an empty
+    // success (Claude review on 4b0e3564d).
+    assert_eq!(
+        extract_coordinate_list_from_entity(b"#1=IFCCARTESIANPOINTLIST3D(((nan,1.,2.)),$);"),
+        None
+    );
+    assert_eq!(
+        extract_coordinate_list_from_entity(b"#1=IFCCARTESIANPOINTLIST3D(((0.,1.,2.)),$);"),
+        Some(vec![0.0, 1.0, 2.0])
+    );
+    // A dropped comma with trivia in the gap is still a dropped comma.
+    assert_eq!(parse_coordinates_direct_f64(b"((1.52 .3,4.,5.))"), Vec::<f64>::new());
+    assert_eq!(parse_coordinates_direct_f64(b"((1.52/*c*/.3,4.,5.))"), Vec::<f64>::new());
+    assert_eq!(
+        parse_coordinates_direct_f64(b"((1. , 2. /* y */ ,3. ))"),
+        [1.0, 2.0, 3.0]
+    );
+    // Legal forms keep reading, including signs, bare-dot and exponents.
+    assert_eq!(
+        parse_coordinates_direct_f64(b"((+1.5,.5,-1.E2),(0.,0.,3./* z */))"),
+        [1.5, 0.5, -100.0, 0.0, 0.0, 3.0]
+    );
 }

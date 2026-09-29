@@ -11,11 +11,13 @@ export { StringTable } from './string-table.js';
 export { EntityTableBuilder, entityTableFromColumns, entityTableToColumns } from './entity-table.js';
 export { exactTypeName, exactNameOfRow } from './exact-type-name.js';
 export type { ExactTypeNameSource } from './exact-type-name.js';
+export { resolvedTypeName } from './resolved-type-name.js';
 export type { EntityTable, EntityTableColumns } from './entity-table.js';
 export { PropertyTableBuilder, propertyTableFromColumns, propertyTableToColumns, comparePropertyValues } from './property-table.js';
 export { groupPropertySetsByInstance } from './group-property-sets.js';
 export type { PropertyTable, PropertyTableColumns, PropertySet, Property, PropertyValue } from './property-table.js';
 export { QuantityTableBuilder, quantityTableFromColumns, quantityTableToColumns } from './quantity-table.js';
+export { groupQuantitySetsByInstance } from './group-quantity-sets.js';
 export type { QuantityTable, QuantityTableColumns, QuantitySet, Quantity } from './quantity-table.js';
 export {
   RelationshipGraphBuilder,
@@ -33,9 +35,12 @@ export type {
   Edge,
   RelationshipInfo,
 } from './relationship-graph.js';
+export { edgeSurvives, flattenRelationshipEdges, binarySearchU32 } from './relationship-graph-helpers.js';
+export type { FlattenedRelationshipEdge } from './relationship-graph-helpers.js';
+export { RelationshipType, relationshipTypeName } from './relationship-type.js';
 export * from './types.js';
 // Explicitly export const enums for runtime use
-export { IfcTypeEnum, PropertyValueType, QuantityType, RelationshipType, EntityFlags } from './types.js';
+export { IfcTypeEnum, PropertyValueType, QuantityType, EntityFlags } from './types.js';
 export type { SpatialNode, SpatialHierarchy } from './types.js';
 export {
   IFC_BUILDING_STOREY_ELEVATION_INDEX,
@@ -43,9 +48,13 @@ export {
   STOREY_ELEVATION_MATCH_TOLERANCE_M,
   findStoreyByElevation,
 } from './storey-elevation.js';
+// The absent-RefDirection fill, one definition shared with the renderer (#5922).
+export { firstProjAxis } from './axis2-placement.js';
 export type { IfcStoreBase, IfcSourceHeader } from './data-store.js';
 export { getAggregatedChildren, collectAggregatedDescendants } from './decomposition.js';
 export type { DecompositionRelationships } from './decomposition.js';
+export { collectSpatialAncestors } from './ancestor-lookup.js';
+export type { AncestorRelationships } from './ancestor-lookup.js';
 export { linearToSrgb } from './color.js';
 // Schema-agnostic STEP serialization primitives — the single source of truth
 // re-exported by the per-schema serializer bundles (parser runtime + codegen).
@@ -62,6 +71,8 @@ export {
   parseStepValue,
   escapeStepString,
 } from './step-serializers.js';
+export { isCompleteStepNumericLiteral } from './step-numeric-literal.js';
+export { fileSchemaIdentifier } from './file-schema-identifier.js';
 export type {
   StepValue,
   EntityRef,
@@ -99,6 +110,7 @@ export {
   isEntitySubtypeOf,
   RESERVED_PSET_PREFIXES,
 } from './ifc-schema/index.js';
+export { expandTypeNamesToDescendants } from './ifc-schema/descendants.js';
 
 // Raw bundled entity tables — exposed so synchronous consumers (parser
 // categorizer, geometry routers) can walk the inheritance chain across
@@ -106,6 +118,9 @@ export {
 // as read-only.
 export { ENTITIES_IFC2X3 } from './ifc-schema/generated/entities-ifc2x3.js';
 export { ENTITIES_IFC4 } from './ifc-schema/generated/entities-ifc4.js';
+// ENTITIES_IFC4 checked against the IFC4 EXPRESS schema (#5204): what every
+// schema-specific IFC4 reader should use. The raw table above is lint-gated.
+export { ENTITIES_IFC4_EXPRESS } from './ifc-schema/entities-ifc4-express.js';
 export { ENTITIES_IFC4X3 } from './ifc-schema/generated/entities-ifc4x3.js';
 // The upstream SchemaInfo tables the `ENTITIES_*` lists come from also carry
 // EXPRESS *defined types* (`IfcLengthMeasure`, `IfcBoolean`, `IfcTextAlignment`,
@@ -133,3 +148,16 @@ export { createLogger, logger, type LogLevel, type LogContext } from './logger.j
 // Spectre-class timing-attack mitigation; this helper transparently
 // routes those calls through a thread-local scratch buffer.
 export { safeUtf8Decode, textDecoderAcceptsSab } from './utf8-decode.js';
+
+export { spatialLookups } from './spatial-lookups.js';
+
+// Effective entity enumeration for a live session: source index minus
+// tombstones plus overlay-created entities, retypes applied (#5249). The one
+// algorithm; `@ifc-lite/mutations`' `iterateEffectiveEntityIds` delegates here.
+export {
+  iterateEffectiveEntities,
+  countEffectiveEntityTypes,
+  type EffectiveEntity,
+  type EffectiveEntityOverlay,
+  type EffectiveEntitySource,
+} from './effective-entities.js';

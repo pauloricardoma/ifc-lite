@@ -17,30 +17,11 @@
 //! name is exactly GlobalId-shaped and would be silently treated as one by
 //! any denylist that omits `IFCCOLOURRGB`.
 //!
-//! This module instead asks the generated schema directly via
-//! [`ifc_lite_core::IfcType::is_subtype_of`], which can't drift out of sync
-//! with the schema it's generated from. The one gap: `rust-core`'s generated
-//! `IfcType` table is derived from IFC4X3 alone, so a handful of rooted
-//! types that IFC4X3 dropped or renamed (`IFCPROXY`, `IFCDOORSTYLE`, the
-//! IFC4 `*StandardCase`/`*ElementedCase` family, ...) resolve to
-//! `IfcType::Unknown` and would wrongly read as non-rooted. Two things close
-//! that gap: the lookup goes through
-//! [`ifc_lite_core::legacy_aware_ifc_type`], which resolves the names
-//! `rust/core/src/legacy_entities.rs` maps to a surviving base type, and
-//! [`LEGACY_ROOTED_TYPES`] covers the rooted IFC2X3/IFC4 names that table
-//! does not carry. An unrecognised type in neither stays non-rooted -- the
-//! safe direction, since assuming rootedness for a genuinely unknown/vendor
-//! type is the same corruption this check exists to prevent.
-//!
-//! The JS classifier (`isRootedType` in
-//! `packages/export/src/merged-exporter.ts`) has the same two-part shape --
-//! a schema-union walk plus the `ENTITY_NAME_ALIASES` table that mirrors
-//! `legacy_entities.rs` -- and both are pinned to one shared fixture by
-//! `rust/export/tests/rooted_type_parity.rs` and
-//! `packages/export/src/rooted-type-sweep.parity.test.ts`. That fixture's
-//! universe includes the alias names precisely because omitting them once
-//! let three of them disagree across the two languages unnoticed (#3124
-//! review).
+//! This module asks the generated type universe directly via
+//! [`ifc_lite_core::IfcType::is_subtype_of`], so rootedness follows EXPRESS
+//! inheritance instead of a hand-maintained classification table. The three
+//! documented exporter-only stratum spellings are the sole bounded exception;
+//! unknown vendor names fail closed.
 
 // Wired into `merged.rs`'s GlobalId reconciliation (`export_merged_with_stats`),
 // which previously carried its own near-identical copy of this same
@@ -53,116 +34,16 @@ use ifc_lite_core::IfcType;
 /// True if `type_name` (case-insensitive) is an `IfcRoot` subtype and so
 /// carries a GlobalId as its first attribute.
 ///
-/// Two-step: the generated IFC4X3 schema settles it for any type it
-/// recognises; [`LEGACY_ROOTED_TYPES`] settles it for the few genuinely-rooted
-/// IFC2X3/IFC4 types IFC4X3 no longer has. Anything else -- any name neither
-/// table recognises -- is not rooted.
-///
-/// The schema step goes through [`ifc_lite_core::legacy_aware_ifc_type`], not
-/// a bare `IfcType::from_str`. `from_str` answers `Unknown` for the three
-/// IFC4X3 stratum leaves (`IFCSOLIDSTRATUM`, `IFCVOIDSTRATUM`,
-/// `IFCWATERSTRATUM`), which the generated enum models only by their abstract
-/// base `IfcGeotechnicalStratum` -- a rooted type. The JS classifier resolves
-/// them through its mirror table (`ENTITY_NAME_ALIASES` in
-/// `packages/parser/src/ifc-schema.ts`) and answers `true`, so a bare
-/// `from_str` here made the two languages disagree: `export_merged` would
-/// reconcile a shared GlobalId across two models for `IFCWALL` but leave a
-/// duplicate for `IFCSOLIDSTRATUM` (#3124 review). `legacy_aware_ifc_type` is
-/// the same resolution every other classifying pass in the workspace uses
-/// (see its own doc on #1496), so this is the general fix, not a carve-out
-/// for three names.
+/// Generated EXPRESS inheritance decides recognized names. The three
+/// exporter-only stratum aliases are rooted compatibility spellings; all other
+/// unknown names fail closed.
 pub fn is_rooted_type(type_name: &str) -> bool {
-    if ifc_lite_core::legacy_aware_ifc_type(type_name).is_subtype_of(IfcType::IfcRoot) {
+    let upper = type_name.to_ascii_uppercase();
+    if ifc_lite_core::is_exporter_stratum_alias(&upper) {
         return true;
     }
-    is_legacy_rooted_type(&type_name.to_ascii_uppercase())
+    IfcType::from_str(&upper).is_subtype_of(IfcType::IfcRoot)
 }
-
-/// Rooted entity types that exist in IFC2X3 and/or IFC4 but were dropped or
-/// renamed by IFC4X3 -- the only schema `rust-core`'s generated `IfcType`
-/// table is derived from (`rust/core/src/generated/schema.rs`). For these,
-/// `IfcType::from_str` resolves to `Unknown`, which `is_subtype_of(IfcRoot)`
-/// correctly refuses on its own.
-///
-/// Some of these names ALSO appear in `rust/core/src/legacy_entities.rs` and
-/// so are already rooted by the time [`is_rooted_type`]'s first branch runs
-/// (`IFCDOORSTYLE` -> `IfcDoorType`, `IFCPROXY` ->
-/// `IfcBuildingElementProxy`, the `*StandardCase` family, ...). The overlap
-/// is deliberate, not dead weight: that table's mandate is "which surviving
-/// type does this legacy name behave like", which is a different question
-/// from "is this name rooted", and it deliberately omits rooted non-product
-/// names like `IFCSCHEDULETIMECONTROL` and the removed `IFCREL*` types that
-/// only this list carries.
-///
-/// Independently re-verified (2026-08-20) by walking each name's parent
-/// chain in `@ifc-lite/data`'s generated IFC2X3 and IFC4 entity tables
-/// (`packages/data/src/ifc-schema/generated/entities-ifc2x3.ts`,
-/// `entities-ifc4.ts`) until it reaches `IfcRoot` or a dead end, and
-/// confirming absence from `entities-ifc4x3.ts` (i.e. that
-/// `IfcType::from_str` really does yield `Unknown` for each). All 54
-/// resolved to `IfcRoot` in at least one of IFC2X3/IFC4 and none are present
-/// in IFC4X3. Re-verify the same way (or regenerate from a diff of those
-/// three tables) rather than editing this list ad hoc.
-fn is_legacy_rooted_type(upper: &str) -> bool {
-    LEGACY_ROOTED_TYPES.contains(&upper)
-}
-
-pub const LEGACY_ROOTED_TYPES: &[&str] = &[
-    "IFCBEAMSTANDARDCASE",
-    "IFCBUILDINGELEMENT",
-    "IFCBUILDINGELEMENTCOMPONENT",
-    "IFCBUILDINGELEMENTTYPE",
-    "IFCCHAMFEREDGEFEATURE",
-    "IFCCOLUMNSTANDARDCASE",
-    "IFCCONDITION",
-    "IFCCONDITIONCRITERION",
-    "IFCDOORSTANDARDCASE",
-    "IFCDOORSTYLE",
-    "IFCEDGEFEATURE",
-    "IFCELECTRICDISTRIBUTIONPOINT",
-    "IFCELECTRICHEATERTYPE",
-    "IFCELECTRICALBASEPROPERTIES",
-    "IFCELECTRICALCIRCUIT",
-    "IFCELECTRICALELEMENT",
-    "IFCENERGYPROPERTIES",
-    "IFCEQUIPMENTELEMENT",
-    "IFCEQUIPMENTSTANDARD",
-    "IFCFLUIDFLOWPROPERTIES",
-    "IFCFURNITURESTANDARD",
-    "IFCGASTERMINALTYPE",
-    "IFCMEMBERSTANDARDCASE",
-    "IFCMOVE",
-    "IFCOPENINGSTANDARDCASE",
-    "IFCORDERACTION",
-    "IFCPLATESTANDARDCASE",
-    "IFCPROJECTORDERRECORD",
-    "IFCPROXY",
-    "IFCRELASSIGNSTASKS",
-    "IFCRELASSIGNSTOPROJECTORDER",
-    "IFCRELASSOCIATESAPPLIEDVALUE",
-    "IFCRELASSOCIATESPROFILEPROPERTIES",
-    "IFCRELCONNECTSSTRUCTURALELEMENT",
-    "IFCRELINTERACTIONREQUIREMENTS",
-    "IFCRELOCCUPIESSPACES",
-    "IFCRELOVERRIDESPROPERTIES",
-    "IFCRELSCHEDULESCOSTITEMS",
-    "IFCROUNDEDEDGEFEATURE",
-    "IFCSCHEDULETIMECONTROL",
-    "IFCSERVICELIFE",
-    "IFCSERVICELIFEFACTOR",
-    "IFCSLABELEMENTEDCASE",
-    "IFCSLABSTANDARDCASE",
-    "IFCSOUNDPROPERTIES",
-    "IFCSOUNDVALUE",
-    "IFCSPACEPROGRAM",
-    "IFCSPACETHERMALLOADPROPERTIES",
-    "IFCSTRUCTURALLINEARACTIONVARYING",
-    "IFCSTRUCTURALPLANARACTIONVARYING",
-    "IFCTIMESERIESSCHEDULE",
-    "IFCWALLELEMENTEDCASE",
-    "IFCWINDOWSTANDARDCASE",
-    "IFCWINDOWSTYLE",
-];
 
 /// The leading 22-char GlobalId of a rooted entity's raw STEP line, or `None`
 /// if the type is not rooted or the first attribute is not a GlobalId-shaped
@@ -239,17 +120,11 @@ mod tests {
         assert!(is_rooted_type("IFCWALL"));
     }
 
-    /// IFC2X3-only rooted type: a bare `IfcType::from_str` yields `Unknown`
-    /// for `IFCDOORSTYLE` because the IFC4X3-generated table doesn't carry
-    /// it, so this case can only pass through one of the two legacy paths --
-    /// `legacy_aware_ifc_type` (which maps it to `IfcDoorType`) or
-    /// `LEGACY_ROOTED_TYPES`, which also lists it.
+    /// IFC2X3-only rooted type: the generated supported-schema universe keeps
+    /// its exact name while rootedness remains compatible with the legacy path.
     #[test]
-    fn door_style_is_rooted_via_the_legacy_table() {
-        assert!(matches!(
-            IfcType::from_str("IFCDOORSTYLE"),
-            IfcType::Unknown(_)
-        ));
+    fn door_style_keeps_its_exact_name_and_is_rooted() {
+        assert_eq!(IfcType::from_str("IFCDOORSTYLE"), IfcType::IfcDoorStyle);
         assert!(is_rooted_type("IFCDOORSTYLE"));
 
         let line = b"#30=IFCDOORSTYLE('9zY8xW7vU6tS5rQ4pO3nM2',#2,'DoorStyle',$,$,$,$,$,.DOOR.,.SINGLE_SWING_LEFT.,.T.,.T.);";
@@ -262,8 +137,8 @@ mod tests {
     /// `IFCPROXY`, the other legacy case cited alongside `IFCDOORSTYLE`
     /// (IFC2X3 AND IFC4; dropped from IFC4X3).
     #[test]
-    fn proxy_is_rooted_via_the_legacy_table() {
-        assert!(matches!(IfcType::from_str("IFCPROXY"), IfcType::Unknown(_)));
+    fn proxy_keeps_its_exact_name_and_is_rooted() {
+        assert_eq!(IfcType::from_str("IFCPROXY"), IfcType::IfcProxy);
         assert!(is_rooted_type("IFCPROXY"));
     }
 
@@ -281,10 +156,6 @@ mod tests {
             assert!(
                 matches!(IfcType::from_str(name), IfcType::Unknown(_)),
                 "{name} now resolves in the generated schema; this test's premise is stale"
-            );
-            assert!(
-                !LEGACY_ROOTED_TYPES.contains(&name),
-                "{name} is in LEGACY_ROOTED_TYPES, so it no longer exercises the alias path"
             );
             assert!(is_rooted_type(name), "{name} should be rooted");
         }
@@ -305,9 +176,6 @@ mod tests {
     /// this module exists to prevent.
     #[test]
     fn a_legacy_name_with_a_non_rooted_base_stays_non_rooted() {
-        assert!(ifc_lite_core::is_legacy_entity(
-            "IFCPRESENTATIONSTYLEASSIGNMENT"
-        ));
         assert!(!is_rooted_type("IFCPRESENTATIONSTYLEASSIGNMENT"));
     }
 
@@ -335,19 +203,32 @@ mod tests {
         assert!(is_rooted_type("ifcWall"));
         assert!(is_rooted_type("ifcdoorstyle"));
         assert!(!is_rooted_type("ifcColourRgb"));
+        // CamelCase spelling of a name that ONLY the generated legacy table
+        // (not `IfcType::from_str`) resolves as rooted.
+        assert!(is_rooted_type("IfcProxy"));
+        assert!(is_rooted_type("IfcBuildingElement"));
     }
 
-    /// All 54 legacy entries resolve to `Unknown` against the generated
-    /// IFC4X3-only schema (that's the gap this table exists to close) and
-    /// are individually recognised as rooted.
+    /// `IFCSCHEDULETIMECONTROL` and `IFCRELASSIGNSTASKS` are rooted names
+    /// `rust/core/src/legacy_entities.rs` does NOT carry at all (confirmed:
+    /// `grep -n "IFCSCHEDULETIMECONTROL\|IFCRELASSIGNSTASKS"
+    /// rust/core/src/legacy_entities.rs` matches nothing), so `is_rooted_type`
+    /// used to answer `true` only through `LEGACY_ROOTED_TYPES`. Their exact
+    /// generated variants now carry the EXPRESS parent chain too; keep the
+    /// transitional table entries pinned until #4203 removes that table.
     #[test]
-    fn every_legacy_entry_is_unknown_to_the_generated_schema_and_rooted_here() {
-        for &name in LEGACY_ROOTED_TYPES {
-            assert!(
-                matches!(IfcType::from_str(name), IfcType::Unknown(_)),
-                "{name} unexpectedly resolved in the generated IFC4X3 schema; \
-                 it may have been added there and no longer needs the legacy table"
-            );
+    fn a_table_only_legacy_name_is_rooted_only_through_the_generated_table() {
+        assert!(is_rooted_type("IFCSCHEDULETIMECONTROL"));
+        assert!(is_rooted_type("ifcscheduletimecontrol"));
+        assert!(is_rooted_type("IfcRelAssignsTasks"));
+    }
+
+    /// Every bounded compatibility alias remains rooted without becoming an
+    /// invented generated schema variant.
+    #[test]
+    fn every_compatibility_alias_is_rooted_without_an_invented_variant() {
+        for &name in ifc_lite_core::EXPORTER_STRATUM_ALIASES {
+            assert!(matches!(IfcType::from_str(name), IfcType::Unknown(_)));
             assert!(is_rooted_type(name), "{name} should be rooted");
         }
     }

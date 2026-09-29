@@ -23,8 +23,11 @@
 import type { StateCreator } from 'zustand';
 import type { Tier1Index } from '@/lib/search/tier1-index';
 import type { SearchResult, MatchField } from '@/lib/search/tier0-scan';
-import type { FilterRule, Combinator } from '@/lib/search/filter-rules';
+import type { FilterRule } from '@ifc-lite/rules';
+import { emptyFilterGroup, type FilterGroup } from '@ifc-lite/rules';
 import type { FilterSchema, PsetQtoSchema, FilterValueSchema } from '@/lib/search/filter-schema';
+import type { IfcDataStore } from '@ifc-lite/parser';
+import { clampGroupIndex, createFilterGroupActions } from './searchSlice.filterGroups.js';
 
 /** Index lifecycle state for a single model. */
 export type Tier1IndexStatus = 'pending' | 'building' | 'ready' | 'error';
@@ -75,18 +78,23 @@ export interface SearchFilterResult {
 }
 
 /**
- * Unified filter state — chip rules + AND/OR + result cap. Drives the
- * path-B evaluator in `lib/search/filter-evaluate.ts`.
+ * Unified filter state — OR-of-AND filter groups + result cap. Drives the
+ * path-B evaluator in `@ifc-lite/rules's filter-evaluate.ts`
+ * (`evaluateFilterGroupsFederated`).
+ *
+ * `groups` is never empty: the builder always has an "active" group to add
+ * rules into, so a filter with nothing typed yet is one group with zero
+ * rules, not zero groups (#4904). `+` in the selector field, or the "Add
+ * group" button in the builder, appends another group; groups OR together.
  */
 export interface SearchFilterStateValue {
-  rules: FilterRule[];
-  combinator: Combinator;
+  groups: FilterGroup[];
   /** Result cap. `0` = no cap (evaluator's internal default applies). */
   limit: number;
 }
 
 export function emptyFilterState(): SearchFilterStateValue {
-  return { rules: [], combinator: 'AND', limit: 500 };
+  return { groups: [emptyFilterGroup()], limit: 500 };
 }
 
 /**
@@ -96,6 +104,9 @@ export function emptyFilterState(): SearchFilterStateValue {
 export interface FilterSchemaCacheEntry {
   /** Cheap pass — storeys + ifcTypes. Always populated when entry exists. */
   basic: FilterSchema;
+  /** Source and edit revision that all three cached passes describe. */
+  sourceStore?: IfcDataStore;
+  mutationVersion?: number;
   /** Expensive pass — pset / qto names. Lazy; null until first request. */
   psetQto: PsetQtoSchema | null;
   /** Expensive pass — distinct material / classification / property values
@@ -129,8 +140,12 @@ export interface SearchSlice {
   searchFilterRunning: boolean;
   /** Latest Filter error message — set when the evaluator throws. */
   searchFilterError: string | null;
-  /** Filter rule state — chip rules, combinator, limit. */
+  /** Filter rule state — OR-of-AND groups, limit. */
   searchFilter: SearchFilterStateValue;
+  /** Which `searchFilter.groups` index the builder UI's rule list, AND/OR
+   *  toggle and add/remove-rule actions target. Clamped into range whenever
+   *  a group is removed or the whole filter state is replaced. */
+  searchFilterActiveGroup: number;
   /**
    * Set when a rule is pushed into the Filter from outside the modal
    * (e.g. clicking a Hierarchy node). The Filter panel watches this and
@@ -189,20 +204,33 @@ export interface SearchSlice {
   setSearchFilterError: (error: string | null) => void;
 
   // ── Filter-rule actions ───────────────────────────────────────────
-  /** Replace the whole filter state — used by Reset and preset loading. */
+  /** Replace the whole filter state — used by Reset and preset loading.
+   *  Clamps the active group index into the new state's range. */
   setSearchFilter: (state: SearchFilterStateValue) => void;
   /** Arm/disarm the "auto-run on next Filter render" flag. */
   setSearchFilterAutoRunPending: (pending: boolean) => void;
-  setFilterCombinator: (combinator: Combinator) => void;
   setFilterLimit: (limit: number) => void;
+  /** Add a rule to the ACTIVE group. */
   addFilterRule: (rule: FilterRule) => void;
+  /** Update rule `index` within the ACTIVE group. */
   updateFilterRule: (index: number, rule: FilterRule) => void;
+  /** Remove rule `index` from the ACTIVE group. */
   removeFilterRule: (index: number) => void;
-  /** Drop every rule but keep combinator + limit. */
+  /** Drop every rule in the ACTIVE group but keep its combinator, the other
+   *  groups, and the limit. */
   clearFilterRules: () => void;
+  /** Drop EVERY group back to one empty AND group — what a caller with no
+   *  per-group UI context (the inline toolbar's "Clear filters") uses. */
+  clearAllFilterGroups: () => void;
+  /** Switch which group the rule-editing actions above target. `FilterGroupEditor.tsx`
+   *  (#5138 PR 5) owns adding/removing groups itself, through its controlled
+   *  `onChange` updater — this store only tracks which one is active. */
+  setActiveFilterGroup: (index: number) => void;
 
   // ── Schema cache actions ──────────────────────────────────────────
-  setFilterSchema: (modelId: string, basic: FilterSchema) => void;
+  setFilterSchema: (modelId: string, basic: FilterSchema, context?: {
+    sourceStore: IfcDataStore; mutationVersion: number;
+  }) => void;
   setFilterPsetQtoSchema: (modelId: string, psetQto: PsetQtoSchema) => void;
   setFilterValueSchema: (modelId: string, values: FilterValueSchema) => void;
   removeFilterSchema: (modelId: string) => void;
@@ -222,6 +250,7 @@ export const createSearchSlice: StateCreator<SearchSlice, [], [], SearchSlice> =
   searchFilterRunning: false,
   searchFilterError: null,
   searchFilter: emptyFilterState(),
+  searchFilterActiveGroup: 0,
   searchFilterAutoRunPending: false,
   searchFilterSchema: new Map(),
 
@@ -306,54 +335,32 @@ export const createSearchSlice: StateCreator<SearchSlice, [], [], SearchSlice> =
   setSearchFilterResult: (searchFilterResult) => set({ searchFilterResult, searchFilterError: null }),
   setSearchFilterError: (searchFilterError) => set({ searchFilterError }),
 
-  setSearchFilter: (searchFilter) => set({ searchFilter }),
+  setSearchFilter: (searchFilter) =>
+    set((state) => ({
+      searchFilter,
+      searchFilterActiveGroup: clampGroupIndex(state.searchFilterActiveGroup, searchFilter.groups.length),
+    })),
 
   setSearchFilterAutoRunPending: (searchFilterAutoRunPending) =>
     set({ searchFilterAutoRunPending }),
 
-  setFilterCombinator: (combinator) =>
-    set((state) => ({ searchFilter: { ...state.searchFilter, combinator } })),
-
   setFilterLimit: (limit) =>
     set((state) => ({ searchFilter: { ...state.searchFilter, limit } })),
 
-  addFilterRule: (rule) =>
-    set((state) => ({
-      searchFilter: {
-        ...state.searchFilter,
-        rules: [...state.searchFilter.rules, rule],
-      },
-    })),
+  // Group-aware rule/combinator/group actions — see searchSlice.filterGroups.ts.
+  ...createFilterGroupActions(set),
 
-  updateFilterRule: (index, rule) =>
-    set((state) => {
-      const rules = state.searchFilter.rules;
-      if (index < 0 || index >= rules.length) return {};
-      const next = rules.slice();
-      next[index] = rule;
-      return { searchFilter: { ...state.searchFilter, rules: next } };
-    }),
-
-  removeFilterRule: (index) =>
-    set((state) => {
-      const rules = state.searchFilter.rules;
-      if (index < 0 || index >= rules.length) return {};
-      const next = rules.slice();
-      next.splice(index, 1);
-      return { searchFilter: { ...state.searchFilter, rules: next } };
-    }),
-
-  clearFilterRules: () =>
-    set((state) => ({ searchFilter: { ...state.searchFilter, rules: [] } })),
-
-  setFilterSchema: (modelId, basic) =>
+  setFilterSchema: (modelId, basic, context) =>
     set((state) => {
       const next = new Map(state.searchFilterSchema);
       const existing = next.get(modelId);
+      const sameSource = existing?.sourceStore === context?.sourceStore
+        && existing?.mutationVersion === context?.mutationVersion;
       next.set(modelId, {
         basic,
-        psetQto: existing?.psetQto ?? null,
-        values: existing?.values ?? null,
+        ...context,
+        psetQto: sameSource ? existing?.psetQto ?? null : null,
+        values: sameSource ? existing?.values ?? null : null,
       });
       return { searchFilterSchema: next };
     }),

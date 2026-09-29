@@ -18,53 +18,17 @@
 import type { IfcDataStore } from '@ifc-lite/parser';
 import type { MutablePropertyView } from '@ifc-lite/mutations';
 import type { MeshData, GeometryResult } from '@ifc-lite/geometry';
-import {
-  IfcTypeEnumToString,
-  type IfcTypeEnum,
-  PropertyValueType,
-  IFCX_VERSION,
-} from '@ifc-lite/data';
+import { IFCX_VERSION } from '@ifc-lite/data';
 import { convertEntityType, type IfcSchemaVersion } from './schema-converter.js';
 import { getEffectiveEntityIndex } from './effective-index.js';
+import { Ifc5AppearanceWriter } from './ifc5-appearance.js';
+import { IFCX_APPEARANCE_SCHEMAS, type IfcxEncodedImage } from '@ifc-lite/ifcx';
 import { buildMaterialAttribute } from './ifc5-material.js';
-import { collectRequiredImports, generateUuid, stepTypeToClassName } from './ifc5-export-helpers.js';
+import { collectRequiredImports, generateUuid, stepTypeToClassName, stripNodePathPrefix, type UnrepresentedPropertySet } from './ifc5-export-helpers.js';
+import { writePsetProperties, type PropertyCollision, type PsetPropertySinks } from './ifc5-pset-properties.js';
 import { addClassificationAttribute } from './ifc5-classification.js';
-
-/** Recursive spatial tree node type used when walking the hierarchy. */
-interface SpatialTreeNode {
-  expressId: number;
-  name?: string;
-  children: SpatialTreeNode[];
-}
-
-/**
- * Property names that have official IFC5 schema definitions in prop@v5a.ifcx.
- * Source: https://github.com/buildingSMART/ifcx.dev/blob/main/@standards.buildingsmart.org/ifc/core/prop@v5a.ifcx
- *
- * IFC4 properties NOT in this set (e.g. Reference, LoadBearing, ExtendToStructure)
- * must be omitted from IFC5 export — the viewer reports "Missing schema" errors for them.
- *
- * Name and Description are handled separately (always exported), so they're excluded here.
- */
-export const IFC5_KNOWN_PROP_NAMES = new Set([
-  'UsageType',
-  'TypeName',
-  'IsExternal',
-  'RefElevation',
-  'ElevationOfRefHeight',
-  'ElevationOfTerrain',
-  'NumberOfStoreys',
-  'Height',
-  'Width',
-  'Length',
-  'Depth',
-  'Volume',
-  'NetVolume',
-  'NetArea',
-  'NetSideArea',
-  'CrossSectionArea',
-  'Station',
-]);
+import { buildIfc5TreeScope, type Ifc5TreeScope } from './ifc5-tree-scope.js';
+import { ifc5EntityRows, type Ifc5EntityRow } from './ifc5-effective-rows.js';
 
 // ============================================================================
 // Types
@@ -72,6 +36,8 @@ export const IFC5_KNOWN_PROP_NAMES = new Set([
 
 /** Options for IFC5 export */
 export interface Ifc5ExportOptions {
+  /** Original image bytes keyed by exact MeshTextureRef.url; retained in IFCX without recompression. */
+  textureSources?: ReadonlyMap<string, IfcxEncodedImage>;
   /** Author name */
   author?: string;
   /** Data version identifier */
@@ -98,6 +64,14 @@ export interface Ifc5ExportOptions {
    *  When true, relationship entities (IfcRel*), type objects, materials,
    *  and other non-spatial entities are excluded from the output. */
   onlyTreeEntities?: boolean;
+  /**
+   * A namespace prefix to remove from GlobalId-derived node paths (#4444). A
+   * store reconstructed from a shared room keys its entities by room path,
+   * `/<slotId>/<GlobalId>`; the slot is the room's namespace, not the
+   * model's, so the exported file carries `/<GlobalId>` — the same paths a
+   * single-model room exports. GlobalIds outside the prefix are untouched.
+   */
+  stripPathPrefix?: string;
 }
 
 /** Result of IFC5 export */
@@ -110,6 +84,11 @@ export interface Ifc5ExportResult {
     propertyCount: number;
     meshCount: number;
     fileSize: number;
+    /** Psets the exporter could not represent (see {@link recordIfEmptyPset}, #5201); check this is 0 before treating the export as complete. `unrepresentedPropertySets` names each one. */
+    skippedCount: number;
+    unrepresentedPropertySets: UnrepresentedPropertySet[];
+    /** Official-schema flat keys two psets on one entity disagreed on (#5376). With `onlyKnownProperties: false` every value also went out pset-qualified (`valueLost: false`). */
+    propertyCollisions: PropertyCollision[];
   };
 }
 
@@ -206,11 +185,12 @@ export class Ifc5Exporter {
       options.applyMutations !== false,
     );
 
-    // Build visible set
-    const visibleIds = this.buildVisibleSet(options);
+    const rows = ifc5EntityRows(this.dataStore, this.mutationView, options.applyMutations !== false);
+    const visibleIds = this.buildVisibleSet(options, rows);
 
-    // Build spatial tree set (entities reachable from the project node)
-    const treeIds = options.onlyTreeEntities !== false ? this.buildTreeEntitySet() : null;
+    // One effective graph drives membership and parent selection, including overlay endpoint edits.
+    const treeScope = buildIfc5TreeScope(this.dataStore, effective, options.applyMutations !== false ? this.mutationView : null);
+    const treeIds = options.onlyTreeEntities !== false ? treeScope.treeIds : null;
 
     // The single emission gate. Three independent, deliberately separate
     // mechanisms can keep an entity out of the export — an overlay tombstone
@@ -229,10 +209,11 @@ export class Ifc5Exporter {
       || (treeIds !== null && !treeIds.has(id));
 
     // Build UUID paths and child-name maps from spatial hierarchy
-    this.buildEntityMaps(isOmitted);
+    this.buildEntityMaps(rows, isOmitted, treeScope, options.stripPathPrefix);
 
     // Build mesh lookup by expressId
     const meshByEntity = this.buildMeshLookup(options);
+    const appearance = new Ifc5AppearanceWriter(new Set(this.entityUuids.values()), options.textureSources);
 
     // Collect nodes
     const nodes: IfcxNodeOutput[] = [];
@@ -240,21 +221,19 @@ export class Ifc5Exporter {
     const emittedIds = new Set<number>();
     let propertyCount = 0;
     let meshCount = 0;
-
-    const { entities, strings } = this.dataStore;
+    const sinks: PsetPropertySinks = { unrepresentedPropertySets: [], propertyCollisions: [] };
 
     // Find the project entity so we can create a root node pointing to it
     let projectExpressId: number | null = null;
 
-    for (let i = 0; i < entities.count; i++) {
-      const expressId = entities.expressId[i];
+    for (const row of rows) {
+      const expressId = row.expressId;
 
       // Overlay tombstone (an entity `MutablePropertyView.deleteEntity()`
       // removed), visibility filter, or spatial tree filter — see `isOmitted`.
       if (isOmitted(expressId)) continue;
 
-      const typeEnum = entities.typeEnum[i];
-      const typeName = IfcTypeEnumToString(typeEnum as IfcTypeEnum) || 'IfcElement';
+      const typeName = row.type === 'IFCUNCLASSIFIED' ? 'IfcElement' : row.type;
 
       // Convert entity type to IFC5 (aligned with IFC4X3)
       const ifc5Type = convertEntityType(
@@ -282,25 +261,20 @@ export class Ifc5Exporter {
       };
 
       // Name → bsi::ifc::prop::Name (IFC5 uses prop namespace, not bsi::ifc::name)
-      const name = strings.get(entities.name[i])
-        || this.spatialNodeNames.get(expressId);
+      const name = row.name || this.spatialNodeNames.get(expressId);
       if (name) {
         attributes['bsi::ifc::prop::Name'] = name;
       }
 
       // Description → bsi::ifc::prop::Description
-      const description = strings.get(entities.description[i]);
+      const description = row.description;
       if (description) {
         attributes['bsi::ifc::prop::Description'] = description;
       }
 
       // Properties
       if (options.includeProperties !== false) {
-        const props = this.getPropertiesForEntity(expressId, options);
-        for (const [key, value] of Object.entries(props)) {
-          attributes[key] = value;
-          propertyCount++;
-        }
+        propertyCount += this.writePropertiesForEntity(attributes, expressId, options, sinks);
       }
 
       // Material (bsi::ifc::material) — see ifc5-material.ts.
@@ -324,16 +298,21 @@ export class Ifc5Exporter {
       if (options.includeGeometry !== false) {
         const meshes = meshByEntity.get(expressId);
         if (meshes && meshes.length > 0) {
-          const usdMesh = this.convertToUsdMesh(meshes);
-          attributes['usd::usdgeom::mesh'] = usdMesh;
+          if (meshes.some((mesh) => mesh.texture || mesh.textureRef)) {
+            nodes.push(...appearance.fragments(node, meshes, (mesh) => this.convertToUsdMesh([mesh])));
+            meshCount += meshes.length;
+          } else {
+            const usdMesh = this.convertToUsdMesh(meshes);
+            attributes['usd::usdgeom::mesh'] = usdMesh;
 
-          // Color/presentation
-          const [r, g, b, a] = meshes[0].color;
-          attributes['bsi::ifc::presentation::diffuseColor'] = [r, g, b];
-          if (a < 1.0) {
-            attributes['bsi::ifc::presentation::opacity'] = a;
+            // Color/presentation
+            const [r, g, b, a] = meshes[0].color;
+            attributes['bsi::ifc::presentation::diffuseColor'] = [r, g, b];
+            if (a < 1.0) {
+              attributes['bsi::ifc::presentation::opacity'] = a;
+            }
+            meshCount++;
           }
-          meshCount++;
         }
       }
 
@@ -348,9 +327,7 @@ export class Ifc5Exporter {
     if (projectExpressId !== null) {
       const projectUuid = this.entityUuids.get(projectExpressId);
       if (projectUuid) {
-        const projectName = this.childNames.get(projectExpressId)
-          || strings.get(entities.name[this.findEntityIndex(projectExpressId)])
-          || 'Project';
+        const projectName = this.childNames.get(projectExpressId) || 'Project';
         rootChildren[projectName] = projectUuid;
       }
     }
@@ -379,6 +356,8 @@ export class Ifc5Exporter {
       });
     }
 
+    nodes.push(...appearance.images);
+
     // Determine required imports by scanning which attribute namespaces are used
     const imports = collectRequiredImports(nodes);
 
@@ -392,7 +371,7 @@ export class Ifc5Exporter {
         timestamp: new Date().toISOString(),
       },
       imports,
-      schemas: {},
+      schemas: appearance.images.length ? IFCX_APPEARANCE_SCHEMAS : {},
       data: nodes,
     };
 
@@ -407,17 +386,11 @@ export class Ifc5Exporter {
         propertyCount,
         meshCount,
         fileSize: new TextEncoder().encode(content).length,
+        skippedCount: sinks.unrepresentedPropertySets.length,
+        unrepresentedPropertySets: sinks.unrepresentedPropertySets,
+        propertyCollisions: sinks.propertyCollisions,
       },
     };
-  }
-
-  /** Find the entity table index for a given expressId. */
-  private findEntityIndex(expressId: number): number {
-    const { entities } = this.dataStore;
-    for (let i = 0; i < entities.count; i++) {
-      if (entities.expressId[i] === expressId) return i;
-    }
-    return 0;
   }
 
   // --------------------------------------------------------------------------
@@ -430,16 +403,16 @@ export class Ifc5Exporter {
    * IFCX uses flat UUID paths (not hierarchical). Hierarchy is expressed
    * solely via the `children` dict on each node. This method:
    * 1. Assigns a UUID to every emitted entity (using GlobalId when available)
-   * 2. Builds the spatial parent→children map
+   * 2. Builds the parent→children map (containment, then decomposition)
    * 3. Computes unique child names for the children dict keys
    *
    * @param isOmitted `export`'s single emission gate — true for an entity that
    *   will NOT be emitted as a node (deleted, hidden, or outside the exported
    *   tree). Every step below is driven by it rather than by the deletion
    *   check alone, so the maps can never describe a node `export` never wrote.
+   * @param stripPathPrefix see {@link Ifc5ExportOptions.stripPathPrefix}.
    */
-  private buildEntityMaps(isOmitted: (id: number) => boolean): void {
-    const { spatialHierarchy, entities, strings } = this.dataStore;
+  private buildEntityMaps(rows: readonly Ifc5EntityRow[], isOmitted: (id: number) => boolean, treeScope: Ifc5TreeScope, stripPathPrefix?: string): void {
 
     // --- 1. Assign UUID paths ---
     // An omitted entity gets no UUID entry. `getChildrenForEntity`'s `addChild`
@@ -449,60 +422,31 @@ export class Ifc5Exporter {
     // (computed once from the parsed source, not re-derived per export) may
     // still list it as contained (#2046, #2047).
     this.entityUuids.clear();
-    for (let i = 0; i < entities.count; i++) {
-      const id = entities.expressId[i];
+    for (const row of rows) {
+      const id = row.expressId;
       if (isOmitted(id)) continue;
       // Use IFC GlobalId if available, otherwise generate a deterministic UUID
-      const globalId = strings.get(entities.globalId[i]);
-      this.entityUuids.set(id, globalId || generateUuid(id));
+      const globalId = row.globalId;
+      this.entityUuids.set(id, globalId ? stripNodePathPrefix(globalId, stripPathPrefix) : generateUuid(id));
     }
 
     // --- 2. Build parent→children and spatial maps ---
-    const parentOf = new Map<number, number>();
-
-    const processChildren = (parentId: number, childIds: Set<number> | number[] | undefined) => {
-      if (!childIds) return;
-      for (const childId of childIds) {
-        parentOf.set(childId, parentId);
-      }
-    };
-
-    this.spatialNodeNames.clear();
-    if (spatialHierarchy?.project) {
-      const walkTree = (node: { expressId: number; name?: string; children: SpatialTreeNode[] }) => {
-        if (node.name) {
-          this.spatialNodeNames.set(node.expressId, node.name);
-        }
-        for (const child of node.children) {
-          parentOf.set(child.expressId, node.expressId);
-          walkTree(child);
-        }
-      };
-      walkTree(spatialHierarchy.project);
-    }
-
-    // Add element containment from flat maps
-    if (spatialHierarchy) {
-      for (const map of [spatialHierarchy.bySite, spatialHierarchy.byBuilding, spatialHierarchy.byStorey, spatialHierarchy.bySpace]) {
-        if (map) {
-          for (const [parentId, children] of map) {
-            processChildren(parentId, children);
-          }
-        }
-      }
-    }
+    // Containment first, decomposition second — see ifc5-tree-scope.ts. The
+    // same scope answers tree membership, so what the filter KEEPS and what
+    // the hierarchy can PLACE cannot drift apart (#4841).
+    const { parentOf, spatialNodeNames } = treeScope;
+    this.spatialNodeNames = spatialNodeNames;
 
     // --- 3. Compute unique child names ---
     // Build entity name lookup
     const entityNameById = new Map<number, string>();
-    for (let i = 0; i < entities.count; i++) {
-      const id = entities.expressId[i];
+    for (const row of rows) {
+      const id = row.expressId;
       if (isOmitted(id)) continue;
-      let name = strings.get(entities.name[i]) || '';
+      let name = row.name;
       if (!name) name = this.spatialNodeNames.get(id) || '';
       if (!name) {
-        const typeName = IfcTypeEnumToString(entities.typeEnum[i] as IfcTypeEnum);
-        if (typeName !== 'Unknown') name = typeName;
+        if (row.type !== 'IFCUNCLASSIFIED') name = stepTypeToClassName(row.type);
       }
       entityNameById.set(id, name);
     }
@@ -557,8 +501,8 @@ export class Ifc5Exporter {
       if (!this.childrenOf.has(effectiveParent)) this.childrenOf.set(effectiveParent, []);
       this.childrenOf.get(effectiveParent)!.push(childId);
     }
-    for (let i = 0; i < entities.count; i++) {
-      const id = entities.expressId[i];
+    for (const row of rows) {
+      const id = row.expressId;
       if (isOmitted(id)) continue;
       if (!parentOf.has(id)) {
         if (!this.childrenOf.has(undefined)) this.childrenOf.set(undefined, []);
@@ -587,57 +531,14 @@ export class Ifc5Exporter {
   // Properties
   // --------------------------------------------------------------------------
 
-  /**
-   * Get properties for an entity, converted to IFCX attribute format.
-   */
-  private getPropertiesForEntity(
-    entityId: number,
-    options: Ifc5ExportOptions,
-  ): Record<string, unknown> {
-    const result: Record<string, unknown> = {};
-
-    // Prefer mutation view if available
-    if (this.mutationView && options.applyMutations !== false) {
-      const psets = this.mutationView.getForEntity(entityId);
-      for (const pset of psets) {
-        for (const prop of pset.properties) {
-          if (options.onlyKnownProperties !== false && !IFC5_KNOWN_PROP_NAMES.has(prop.name)) continue;
-          const key = `bsi::ifc::prop::${prop.name}`;
-          result[key] = this.convertPropertyValue(prop.value, prop.type);
-        }
-      }
-    } else if (this.dataStore.properties) {
-      const psets = this.dataStore.properties.getForEntity(entityId);
-      for (const pset of psets) {
-        for (const prop of pset.properties) {
-          if (options.onlyKnownProperties !== false && !IFC5_KNOWN_PROP_NAMES.has(prop.name)) continue;
-          const key = `bsi::ifc::prop::${prop.name}`;
-          result[key] = this.convertPropertyValue(prop.value, prop.type);
-        }
-      }
-    }
-
-    return result;
-  }
-
-  /**
-   * Convert a property value to IFCX-compatible format.
-   * IFCX uses native JSON types rather than IFC wrapped types.
-   */
-  private convertPropertyValue(value: unknown, type: PropertyValueType): unknown {
-    if (value === null || value === undefined) return null;
-
-    switch (type) {
-      case PropertyValueType.Real:
-        return Number(value);
-      case PropertyValueType.Integer:
-        return Math.round(Number(value));
-      case PropertyValueType.Boolean:
-      case PropertyValueType.Logical:
-        return Boolean(value);
-      default:
-        return value;
-    }
+  /** Write an entity's psets as IFCX attributes (see `ifc5-pset-properties.ts`, #5201, #5376). */
+  private writePropertiesForEntity(
+    attributes: Record<string, unknown>, entityId: number, options: Ifc5ExportOptions, sinks: PsetPropertySinks,
+  ): number {
+    const psets = this.mutationView && options.applyMutations !== false
+      ? this.mutationView.getForEntity(entityId)
+      : this.dataStore.properties?.getForEntity(entityId) ?? [];
+    return writePsetProperties(attributes, entityId, psets, options.onlyKnownProperties !== false, sinks);
   }
 
   // --------------------------------------------------------------------------
@@ -754,50 +655,17 @@ export class Ifc5Exporter {
   // --------------------------------------------------------------------------
 
   /**
-   * Build the set of entity IDs reachable from the spatial tree.
-   * Includes Project, Site, Building, Storey, Space, and all contained elements.
-   */
-  private buildTreeEntitySet(): Set<number> {
-    const ids = new Set<number>();
-
-    // Walk spatial hierarchy tree
-    const { spatialHierarchy } = this.dataStore;
-    if (spatialHierarchy?.project) {
-      const walk = (node: { expressId: number; children: SpatialTreeNode[] }) => {
-        ids.add(node.expressId);
-        for (const child of node.children) walk(child);
-      };
-      walk(spatialHierarchy.project);
-    }
-
-    // Add elements from containment maps (elements assigned to storeys, etc.)
-    if (spatialHierarchy) {
-      for (const map of [spatialHierarchy.bySite, spatialHierarchy.byBuilding, spatialHierarchy.byStorey, spatialHierarchy.bySpace]) {
-        if (map) {
-          for (const children of map.values()) {
-            for (const id of children) ids.add(id);
-          }
-        }
-      }
-    }
-
-    return ids;
-  }
-
-  /**
    * Build visible entity set if visibility filtering is requested.
    */
-  private buildVisibleSet(options: Ifc5ExportOptions): Set<number> | null {
+  private buildVisibleSet(options: Ifc5ExportOptions, rows: readonly Ifc5EntityRow[]): Set<number> | null {
     if (!options.visibleOnly) return null;
 
     const hidden = options.hiddenEntityIds ?? new Set<number>();
     const isolated = options.isolatedEntityIds ?? null;
     const visible = new Set<number>();
 
-    const { entities } = this.dataStore;
-
-    for (let i = 0; i < entities.count; i++) {
-      const id = entities.expressId[i];
+    for (const row of rows) {
+      const id = row.expressId;
       if (isolated) {
         // When isolation is active, only isolated entities are visible
         if (isolated.has(id)) visible.add(id);

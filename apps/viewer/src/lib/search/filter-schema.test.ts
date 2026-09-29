@@ -12,10 +12,13 @@ import {
   PropertyValueType,
   QuantityType,
   IfcTypeEnum,
+  RelationshipGraphBuilder,
+  RelationshipType,
 } from '@ifc-lite/data';
 import type { SpatialHierarchy } from '@ifc-lite/data';
 import type { IfcDataStore } from '@ifc-lite/parser';
-import { discoverFilterSchema, discoverPropertyAndQuantitySchema } from './filter-schema.js';
+import { MutablePropertyView } from '@ifc-lite/mutations';
+import { discoverFilterSchema, discoverPropertyAndQuantitySchema, discoverFilterValues } from './filter-schema.js';
 
 interface EntityRow {
   expressId: number;
@@ -123,7 +126,10 @@ function buildStore(args: {
     entityCount: args.entities.length,
     parseTime: 0,
     source: new Uint8Array(0),
-    entityIndex: { byId: { ranges: new Uint32Array(0), index: new Map() }, byType },
+    entityIndex: {
+      byId: new Map(args.entities.map((entity) => [entity.expressId, { type: entity.type }])),
+      byType,
+    },
     strings,
     entities,
     properties,
@@ -182,6 +188,18 @@ describe('discoverFilterSchema — basic pass', () => {
     });
     const schema = discoverFilterSchema(store);
     assert.deepStrictEqual(schema.storeys, [['Roof', null]]);
+  });
+
+  it('reads live storey edits from columns when a server-hydrated store has no STEP bytes (#5249)', () => {
+    const store = buildStore({
+      entities: [{ expressId: 42, type: 'IFCBUILDINGSTOREY', globalId: '', name: 'Old level' }],
+      storeys: [{ id: 42, name: 'Old level', elevation: 1 }],
+    });
+    const view = new MutablePropertyView(store.properties, 'm1');
+    view.setAttribute(42, 'Name', 'Live level');
+    view.setPositionalAttribute(42, 9, { real: 4 });
+
+    assert.deepStrictEqual(discoverFilterSchema(store, view).storeys, [['Live level', 4]]);
   });
 });
 
@@ -255,5 +273,85 @@ describe('discoverPropertyAndQuantitySchema — fallback pass via PropertyTable'
       scoped.psets.map(([n]) => n).sort(),
       ['Pset_CoveringCommon', 'Pset_Tiling'],
     );
+  });
+});
+
+/**
+ * A minimal real STEP-lines store (mirrors materialDefinitionTypes.test.ts's
+ * `storeWithAssociation`) so `discoverFilterValues` exercises the actual
+ * on-demand material resolver rather than a stubbed table. Two walls, two
+ * `IfcRelAssociatesMaterial`: Wall-A's material carries a Category
+ * ("Masonry") that differs from its Name ("Fired Clay Brick"); Wall-B's
+ * material has a Name ("Steel") only, no Category — so a fixture that only
+ * exercised Category coverage couldn't tell a real fix from a swap that
+ * dropped Name matching.
+ */
+function buildMaterialStore(): IfcDataStore {
+  const lines = [
+    `#1=IFCWALL('GUID1',$,'Wall A',$,$,$,$,$,$);`,
+    `#2=IFCMATERIAL('Fired Clay Brick',$,'Masonry');`,
+    `#3=IFCWALL('GUID2',$,'Wall B',$,$,$,$,$,$);`,
+    `#4=IFCMATERIAL('Steel',$,$);`,
+  ];
+  const text = lines.join('\n');
+  const byId = new Map<number, { expressId: number; type: string; byteOffset: number; byteLength: number; lineNumber: number }>();
+  let cursor = 0;
+  for (const line of lines) {
+    const start = text.indexOf(line, cursor);
+    const match = line.match(/^#(\d+)\s*=\s*(\w+)\(/)!;
+    byId.set(parseInt(match[1], 10), {
+      expressId: parseInt(match[1], 10),
+      type: match[2],
+      byteOffset: start,
+      byteLength: line.length,
+      lineNumber: 1,
+    });
+    cursor = start + line.length;
+  }
+
+  const strings = new StringTable();
+  const builder = new EntityTableBuilder(2, strings);
+  builder.add(1, 'IFCWALL', 'GUID1', 'Wall A', '', '', false, false);
+  builder.add(3, 'IFCWALL', 'GUID2', 'Wall B', '', '', false, false);
+  const entities = builder.build();
+
+  const rel = new RelationshipGraphBuilder();
+  rel.addEdge(2, 1, RelationshipType.AssociatesMaterial, 100);
+  rel.addEdge(4, 3, RelationshipType.AssociatesMaterial, 101);
+
+  return {
+    fileSize: 0,
+    schemaVersion: 'IFC4',
+    entityCount: 2,
+    parseTime: 0,
+    source: new TextEncoder().encode(text),
+    entityIndex: { byId, byType: new Map() },
+    strings,
+    entities,
+    properties: new PropertyTableBuilder(strings).build(),
+    quantities: new QuantityTableBuilder(strings).build(),
+    relationships: rel.build(),
+    onDemandMaterialMap: new Map([[1, [2]], [3, [4]]]),
+  } as unknown as IfcDataStore;
+}
+
+describe('discoverFilterValues — material dropdown must offer the same values `material=` matches', () => {
+  it('BOUNDING CONTROL: Name-only material still surfaces (Wall-B, "Steel")', () => {
+    const schema = discoverFilterValues(buildMaterialStore());
+    assert.ok(schema.materials.includes('Steel'), 'Name-only material must still be discovered');
+  });
+
+  it('offers a material Category value that no element carries as a Name (#4780 gap)', () => {
+    const schema = discoverFilterValues(buildMaterialStore());
+    // Wall-A's material Name is "Fired Clay Brick"; "Masonry" is its
+    // Category only. `material=Masonry` matches (materialMatchCandidates,
+    // #4094 / #4780) so the dropdown must suggest it too - otherwise a valid
+    // match target is invisible to anyone who isn't typing it blind.
+    assert.ok(
+      schema.materials.includes('Masonry'),
+      `expected the Category "Masonry" among discovered materials, got: ${JSON.stringify(schema.materials)}`,
+    );
+    // The Name that carries it must still be present (additive, not a swap).
+    assert.ok(schema.materials.includes('Fired Clay Brick'));
   });
 });

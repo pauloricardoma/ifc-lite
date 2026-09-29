@@ -2,15 +2,16 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-/**
- * Data state slice (IFC data and geometry)
- */
-
 import type { StateCreator } from 'zustand';
+import { carryReleasedMesh, retainReleasedMeshProvenance } from '@/lib/released-mesh-provenance';
+import { pruneMeshesFromGeometry } from './data-mesh-prune.js';
+import { replaceEntityMeshesPatch, type PendingMeshEdits } from './data-mesh-replace.js';
+import type { PreAlignmentMeshBaseline } from './data-mesh-prealign.js';
 import type { IfcDataStore } from '@ifc-lite/parser';
-import type { GeometryResult, CoordinateInfo } from '@ifc-lite/geometry';
+import type { GeometryResult, CoordinateInfo, MeshData } from '@ifc-lite/geometry';
 import type { FederatedModel } from '../types.js';
-import { DATA_DEFAULTS } from '../constants.js';
+import { appendGeometryBatchPatch } from './dataSlice.appendGeometryBatch.js';
+import { noteInstancedShardModel } from '../instancedShardModels.js';
 
 /**
  * Cross-slice state that dataSlice reads/writes via the combined store.
@@ -41,6 +42,7 @@ export interface DataSlice {
   boundedGeometryMode: boolean;
   /** Transient overlay colors (lens/IDS/sdk overlays). */
   pendingColorUpdates: Map<number, [number, number, number, number]> | null;
+  /** Monotonic durable revision of renderer color deliveries (clearing the queue does not bump it). */ colorPresentationRevision: number;
   /** Persistent mesh color updates (IFC deferred style/material colors). */
   pendingMeshColorUpdates: Map<number, [number, number, number, number]> | null;
   /**
@@ -60,7 +62,13 @@ export interface DataSlice {
   setIfcDataStore: (result: IfcDataStore | null) => void;
   setGeometryResult: (result: GeometryResult | null) => void;
   setBoundedGeometryMode: (enabled: boolean) => void;
-  appendGeometryBatch: (meshes: GeometryResult['meshes'], coordinateInfo?: CoordinateInfo) => void;
+  /**
+   * Append newly created meshes to the geometry of the model that OWNS
+   * them — `modelId` is required and never inferred (#4922). See
+   * `appendGeometryBatchPatch` in `dataSlice.appendGeometryBatch.ts` for the
+   * routing contract.
+   */
+  appendGeometryBatch: (modelId: string, meshes: GeometryResult['meshes'], coordinateInfo?: CoordinateInfo) => void;
   /** Signal that mesh positions/normals have been mutated in place — see
    *  `geometryContentVersion` for why this is separate from setGeometryResult. */
   bumpGeometryContentVersion: () => void;
@@ -81,19 +89,31 @@ export interface DataSlice {
     options?: { override?: boolean },
   ) => void;
   /**
-   * Pending mesh removals for the renderer. Authoring actions
-   * (split, delete) push globalIds here; `useGeometryStreaming`
-   * flushes them on the next frame via
-   * `scene.removeMeshesForEntities` and then prunes the matching
-   * meshes out of `geometryResult.meshes` so picking + bounds
-   * recomputation stay consistent.
+   * Pending mesh removals for the renderer. Authoring actions (split, delete)
+   * push globalIds here; `useGeometryStreaming` flushes them on the next frame
+   * via `scene.removeMeshesForEntities`, then calls `pruneGeometryMeshes` to
+   * drop the matching meshes out of `geometryResult.meshes` so picking and
+   * bounds recomputation stay consistent.
    *
-   * Stored as a Set on the slice rather than a transient ref so
-   * tests + headless workflows can observe it directly.
+   * A Set on the slice rather than a transient ref, so tests and headless
+   * workflows can observe it directly.
    */
   pendingMeshRemovals: Set<number> | null;
   setPendingMeshRemovals: (ids: Set<number>) => void;
   clearPendingMeshRemovals: () => void;
+  pruneGeometryMeshes: (ids: Set<number>) => void;
+  /**
+   * Swap the meshes of `modelId`'s entities (GLOBAL ids) for re-meshed ones in
+   * one update, queueing them on `pendingMeshEdits` for `useMeshEditDrain`.
+   * See `data-mesh-replace.ts`.
+   */
+  replaceEntityMeshes: (
+    modelId: string,
+    byGlobalId: ReadonlyMap<number, readonly MeshData[]>,
+    preAligned?: ReadonlyMap<number, readonly PreAlignmentMeshBaseline[]>,
+  ) => void;
+  pendingMeshEdits: PendingMeshEdits | null;
+  clearPendingMeshEdits: () => void;
   /**
    * Emit-both GPU-instancing: raw IFNS shard bytes (transferable ArrayBuffers)
    * collated per geometry batch by the worker, tagged with the owning model's
@@ -155,25 +175,31 @@ export interface DataSlice {
   updateCoordinateInfo: (coordinateInfo: CoordinateInfo) => void;
 }
 
-const getDefaultCoordinateInfo = (): CoordinateInfo => ({
-  // Create fresh copies to avoid shared object references
-  originShift: { x: DATA_DEFAULTS.ORIGIN_SHIFT.x, y: DATA_DEFAULTS.ORIGIN_SHIFT.y, z: DATA_DEFAULTS.ORIGIN_SHIFT.z },
-  originalBounds: {
-    min: { x: DATA_DEFAULTS.ORIGIN_SHIFT.x, y: DATA_DEFAULTS.ORIGIN_SHIFT.y, z: DATA_DEFAULTS.ORIGIN_SHIFT.z },
-    max: { x: DATA_DEFAULTS.ORIGIN_SHIFT.x, y: DATA_DEFAULTS.ORIGIN_SHIFT.y, z: DATA_DEFAULTS.ORIGIN_SHIFT.z },
-  },
-  shiftedBounds: {
-    min: { x: DATA_DEFAULTS.ORIGIN_SHIFT.x, y: DATA_DEFAULTS.ORIGIN_SHIFT.y, z: DATA_DEFAULTS.ORIGIN_SHIFT.z },
-    max: { x: DATA_DEFAULTS.ORIGIN_SHIFT.x, y: DATA_DEFAULTS.ORIGIN_SHIFT.y, z: DATA_DEFAULTS.ORIGIN_SHIFT.z },
-  },
-  hasLargeCoordinates: DATA_DEFAULTS.HAS_LARGE_COORDINATES,
-});
+/**
+ * Patch that writes `geometryResult` to the top-level mirror AND the active
+ * model's record, as ONE shared object. Every action that replaces the mirror
+ * must go through here: `appendGeometryBatch` builds on the model record
+ * (#4922) and `pruneMeshesFromGeometry` prunes each shared object once, so a
+ * mirror-only write (e.g. a recolor) would be silently reverted by the next
+ * append or active-model switch.
+ */
+function withActiveModelGeometry(
+  state: Pick<DataCrossSliceState, 'activeModelId' | 'models'>,
+  geometryResult: GeometryResult | null,
+): { geometryResult: GeometryResult | null; models?: Map<string, FederatedModel> } {
+  const modelId = state.activeModelId;
+  const model = modelId ? state.models.get(modelId) : undefined;
+  if (!modelId || !model) return { geometryResult };
+  const models = new Map(state.models);
+  models.set(modelId, { ...model, geometryResult });
+  return { geometryResult, models };
+}
 
 const EMPTY_POSITIONS = new Float32Array(0);
 const EMPTY_NORMALS = new Float32Array(0);
 const EMPTY_INDICES = new Uint32Array(0);
 
-export const createDataSlice: StateCreator<DataSlice & DataCrossSliceState, [], [], DataSlice> = (set, get) => ({
+export const createDataSlice: StateCreator<DataSlice & DataCrossSliceState, [], [], DataSlice> = (set, _get) => ({
   // Initial state
   ifcDataStore: null,
   geometryResult: null,
@@ -181,9 +207,11 @@ export const createDataSlice: StateCreator<DataSlice & DataCrossSliceState, [], 
   geometryContentVersion: 0,
   boundedGeometryMode: false,
   pendingColorUpdates: null,
+  colorPresentationRevision: 0,
   pendingMeshColorUpdates: null,
   meshColorBackup: null,
   pendingMeshRemovals: null,
+  pendingMeshEdits: null,
   pendingInstancedShards: null,
   pendingMeshTranslations: null,
   pendingMeshRotations: null,
@@ -217,19 +245,7 @@ export const createDataSlice: StateCreator<DataSlice & DataCrossSliceState, [], 
     // for no gain -- the mistake this fix already made once, in `removeModel`.
     const backup = geometryResult !== state.geometryResult ? { meshColorBackup: null } : {};
 
-    const modelId = state.activeModelId;
-    if (!modelId) {
-      return { geometryResult, geometryUpdateTick: state.geometryUpdateTick + 1, ...backup };
-    }
-
-    const model = state.models.get(modelId);
-    if (!model) {
-      return { geometryResult, geometryUpdateTick: state.geometryUpdateTick + 1, ...backup };
-    }
-
-    const models = new Map(state.models);
-    models.set(modelId, { ...model, geometryResult });
-    return { geometryResult, models, geometryUpdateTick: state.geometryUpdateTick + 1, ...backup };
+    return { ...withActiveModelGeometry(state, geometryResult), geometryUpdateTick: state.geometryUpdateTick + 1, ...backup };
   }),
 
   setBoundedGeometryMode: (boundedGeometryMode) => set({ boundedGeometryMode }),
@@ -238,64 +254,9 @@ export const createDataSlice: StateCreator<DataSlice & DataCrossSliceState, [], 
     geometryContentVersion: state.geometryContentVersion + 1,
   })),
 
-  appendGeometryBatch: (meshes, coordinateInfo) => set((state) => {
-    // Incremental totals: O(batch_size) instead of O(total_accumulated) .reduce()
-    let batchTriangles = 0;
-    let batchVertices = 0;
-    for (let i = 0; i < meshes.length; i++) {
-      batchTriangles += meshes[i].indices.length / 3;
-      batchVertices += meshes[i].positions.length / 3;
-    }
-
-    if (!state.geometryResult) {
-      const geometryResult = {
-        meshes: meshes.slice(),
-        totalTriangles: batchTriangles,
-        totalVertices: batchVertices,
-        coordinateInfo: coordinateInfo || getDefaultCoordinateInfo(),
-      };
-      const modelId = state.activeModelId;
-      if (!modelId) {
-        return { geometryResult, geometryUpdateTick: state.geometryUpdateTick + 1 };
-      }
-      const model = state.models.get(modelId);
-      if (!model) {
-        return { geometryResult, geometryUpdateTick: state.geometryUpdateTick + 1 };
-      }
-      const models = new Map(state.models);
-      models.set(modelId, { ...model, geometryResult });
-      return { geometryResult, models, geometryUpdateTick: state.geometryUpdateTick + 1 };
-    }
-
-    // Mutate the existing array in-place (O(batch) per append) instead of
-    // .concat() (O(total) per append) to avoid O(N²) for large files.
-    // The new geometryResult object reference below is sufficient for
-    // Zustand/React change detection — array identity doesn't need to change.
-    const existingMeshes = state.geometryResult.meshes;
-    for (let i = 0; i < meshes.length; i++) {
-      existingMeshes.push(meshes[i]);
-    }
-
-    const geometryResult = {
-      ...state.geometryResult,
-      meshes: existingMeshes,
-      totalTriangles: state.geometryResult.totalTriangles + batchTriangles,
-      totalVertices: state.geometryResult.totalVertices + batchVertices,
-      coordinateInfo: coordinateInfo || state.geometryResult.coordinateInfo,
-    };
-    const modelId = state.activeModelId;
-    if (!modelId) {
-      return { geometryResult, geometryUpdateTick: state.geometryUpdateTick + 1 };
-    }
-    const model = state.models.get(modelId);
-    if (!model) {
-      return { geometryResult, geometryUpdateTick: state.geometryUpdateTick + 1 };
-    }
-    const models = new Map(state.models);
-    models.set(modelId, { ...model, geometryResult });
-    return { geometryResult, models, geometryUpdateTick: state.geometryUpdateTick + 1 };
-  }),
-
+  appendGeometryBatch: (modelId, meshes, coordinateInfo) => set((state) => (
+    appendGeometryBatchPatch(state, modelId, meshes, coordinateInfo)
+  )),
   releaseGeometryMemory: () => set((state) => {
     if (!state.geometryResult || !state.boundedGeometryMode) {
       return {};
@@ -303,26 +264,18 @@ export const createDataSlice: StateCreator<DataSlice & DataCrossSliceState, [], 
 
     const meshes = state.geometryResult.meshes;
     for (let i = 0; i < meshes.length; i++) {
+      retainReleasedMeshProvenance(meshes[i]);
       meshes[i].positions = EMPTY_POSITIONS;
       meshes[i].normals = EMPTY_NORMALS;
       meshes[i].indices = EMPTY_INDICES;
+      delete meshes[i].appearanceSource;
     }
 
     const geometryResult = {
       ...state.geometryResult,
       meshes,
     };
-    const modelId = state.activeModelId;
-    if (!modelId) {
-      return { geometryResult, geometryUpdateTick: state.geometryUpdateTick + 1 };
-    }
-    const model = state.models.get(modelId);
-    if (!model) {
-      return { geometryResult, geometryUpdateTick: state.geometryUpdateTick + 1 };
-    }
-    const models = new Map(state.models);
-    models.set(modelId, { ...model, geometryResult });
-    return { geometryResult, models, geometryUpdateTick: state.geometryUpdateTick + 1 };
+    return { ...withActiveModelGeometry(state, geometryResult), geometryUpdateTick: state.geometryUpdateTick + 1 };
   }),
 
   updateMeshColors: (updates, options) => set((state) => {
@@ -351,21 +304,18 @@ export const createDataSlice: StateCreator<DataSlice & DataCrossSliceState, [], 
         if (meshColorBackup && !meshColorBackup.has(mesh.expressId)) {
           meshColorBackup.set(mesh.expressId, mesh.color);
         }
-        return { ...mesh, color: newColor };
+        return carryReleasedMesh(mesh, { ...mesh, color: newColor });
       }
       return mesh;
     });
     return {
-      geometryResult: {
-        ...state.geometryResult,
-        meshes: updatedMeshes,
-      },
+      ...withActiveModelGeometry(state, { ...state.geometryResult, meshes: updatedMeshes }),
       pendingMeshColorUpdates: clonedUpdates,
       ...(meshColorBackup ? { meshColorBackup } : {}),
     };
   }),
 
-  setPendingColorUpdates: (updates) => set({ pendingColorUpdates: new Map(updates) }),
+  setPendingColorUpdates: (updates) => set((state) => ({ pendingColorUpdates: new Map(updates), colorPresentationRevision: state.colorPresentationRevision + 1 })),
 
   clearPendingColorUpdates: () => set({ pendingColorUpdates: null }),
 
@@ -393,10 +343,7 @@ export const createDataSlice: StateCreator<DataSlice & DataCrossSliceState, [], 
     });
 
     return {
-      geometryResult: {
-        ...state.geometryResult,
-        meshes: restoredMeshes,
-      },
+      ...withActiveModelGeometry(state, { ...state.geometryResult, meshes: restoredMeshes }),
       pendingMeshColorUpdates: new Map(backup),
       meshColorBackup: null,
     };
@@ -412,14 +359,21 @@ export const createDataSlice: StateCreator<DataSlice & DataCrossSliceState, [], 
   }),
 
   clearPendingMeshRemovals: () => set({ pendingMeshRemovals: null }),
+  pruneGeometryMeshes: (ids) => set((state) => pruneMeshesFromGeometry(state, ids)),
+  replaceEntityMeshes: (modelId, byGlobalId, preAligned) =>
+    set((state) => replaceEntityMeshesPatch(state, modelId, byGlobalId, preAligned)),
+  clearPendingMeshEdits: () => set({ pendingMeshEdits: null }),
 
-  appendInstancedShards: (modelId, shards) => set((state) => ({
+  appendInstancedShards: (modelId, shards) => set((state) => {
+    if (shards.length > 0) noteInstancedShardModel(modelId);
+    return {
     // Accumulate across batches — useGeometryStreaming drains once per frame.
     pendingInstancedShards: [
       ...(state.pendingInstancedShards ?? []),
       ...shards.map((bytes) => ({ modelId, bytes })),
     ],
-  })),
+    };
+  }),
 
   clearInstancedShards: () => set({ pendingInstancedShards: null }),
 
@@ -467,16 +421,6 @@ export const createDataSlice: StateCreator<DataSlice & DataCrossSliceState, [], 
       ...state.geometryResult,
       coordinateInfo,
     };
-    const modelId = state.activeModelId;
-    if (!modelId) {
-      return { geometryResult, geometryUpdateTick: state.geometryUpdateTick + 1 };
-    }
-    const model = state.models.get(modelId);
-    if (!model) {
-      return { geometryResult, geometryUpdateTick: state.geometryUpdateTick + 1 };
-    }
-    const models = new Map(state.models);
-    models.set(modelId, { ...model, geometryResult });
-    return { geometryResult, models, geometryUpdateTick: state.geometryUpdateTick + 1 };
+    return { ...withActiveModelGeometry(state, geometryResult), geometryUpdateTick: state.geometryUpdateTick + 1 };
   }),
 });

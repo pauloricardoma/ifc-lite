@@ -11,6 +11,9 @@
       "@ifc-lite/parser/browser": ["../../packages/parser/src/browser"],
       "@ifc-lite/geometry": ["../../packages/geometry/src"],
       "@ifc-lite/geometry/geometry-class": ["../../packages/geometry/src/geometry-class"],
+      "@ifc-lite/geometry/world-frame": ["../../packages/geometry/src/world-frame"],
+      "@ifc-lite/geometry/rtc-rebase": ["../../packages/geometry/src/rtc-rebase"],
+      "@ifc-lite/geometry/remesh": ["../../packages/geometry/src/remesh"],
       "@ifc-lite/renderer": ["../../packages/renderer/src"],
       "@ifc-lite/query": ["../../packages/query/src"],
       "@ifc-lite/spatial": ["../../packages/spatial/src"],
@@ -31,6 +34,7 @@
       "@ifc-lite/ids": ["../../packages/ids/src"],
       "@ifc-lite/encoding": ["../../packages/encoding/src"],
       "@ifc-lite/lists": ["../../packages/lists/src"],
+      "@ifc-lite/rules": ["../../packages/rules/src"],
       "@ifc-lite/sandbox": ["../../packages/sandbox/src"],
       "@ifc-lite/sandbox/schema": ["../../packages/sandbox/src/bridge-schema"],
       "@ifc-lite/plugin-api": ["../../packages/plugin-api/src"],
@@ -39,6 +43,6 @@
       "@ifc-lite/source-msgraph": ["../../packages/source-msgraph/src"]
     }
   },
-  "include": ["src/**/*", "../../packages/renderer/src/webgpu-types.d.ts"],
+  "include": ["src/**/*"],
   "exclude": ["src/lib/scripts/templates"]
 }

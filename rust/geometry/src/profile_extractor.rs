@@ -111,10 +111,10 @@ pub fn extract_profiles_with_diagnostics<T: AsRef<[u8]> + ?Sized>(content: &T, m
         // void/feature family) are boolean operands, not building structure —
         // they must never emit a construction-projection profile, and walking
         // the supertype chain covers the whole family in one check. Resolved
-        // from `type_name`, NOT `entity.ifc_type`: the decoder sets that with a
-        // bare `from_str`, so a legacy keyword arrives as `Unknown` (a subtype
-        // of nothing) and `IFCOPENINGSTANDARDCASE` emitted a profile (#3172).
-        let resolved_type = ifc_lite_core::legacy_aware_ifc_type(type_name);
+        // Resolve from `type_name`, not `entity.ifc_type`: only the legacy-aware
+        // resolver preserves exact variants. Before support, bare `from_str` produced
+        // `Unknown` and `IFCOPENINGSTANDARDCASE` emitted a profile (#3172).
+        let resolved_type = ifc_lite_core::ifc_type_from_keyword(type_name);
         if resolved_type.is_subtype_of(IfcType::IfcFeatureElement) {
             continue;
         }
@@ -169,7 +169,7 @@ pub fn extract_profiles_with_diagnostics<T: AsRef<[u8]> + ?Sized>(content: &T, m
             };
 
             for item in &items {
-                if is_extruded_area_solid(item.ifc_type) {
+                if is_extruded_area_solid(item.ifc_type.clone()) {
                     match extract_extruded_solid(
                         id,
                         &ifc_type_name,
@@ -326,7 +326,7 @@ fn extract_mapped_item_profiles(
     };
 
     for sub_item in &items {
-        if is_extruded_area_solid(sub_item.ifc_type) {
+        if is_extruded_area_solid(sub_item.ifc_type.clone()) {
             match extract_extruded_solid(
                 element_id,
                 ifc_type,
@@ -597,7 +597,7 @@ fn parse_axis2_placement_2d(
     placement: &DecodedEntity,
     decoder: &mut EntityDecoder,
 ) -> Result<Matrix4<f64>> {
-    crate::router::transforms::mapped::axis2_placement_2d_matrix(placement, decoder)
+    crate::transform::parse_axis2_placement_2d(placement, decoder)
 }
 
 fn parse_axis2_placement_3d(
@@ -673,7 +673,7 @@ fn parse_cartesian_point(
     Ok(Point3::new(x, y, z))
 }
 
-/// Parse IfcDirection entity to a Vector3.
+/// Parse an IfcDirection to its RAW ratios. `build_axis2_matrix` normalises once; a bare `normalize()` here turned `(0,0,0)` into NaN BEFORE its `try_normalize` guard, which cannot recover a NaN.
 fn parse_direction_entity(entity: &DecodedEntity) -> Result<Vector3<f64>> {
     let ratios = entity
         .get(0)
@@ -684,7 +684,7 @@ fn parse_direction_entity(entity: &DecodedEntity) -> Result<Vector3<f64>> {
     let y = ratios.get(1).and_then(|v| v.as_float()).unwrap_or(0.0);
     let z = ratios.get(2).and_then(|v| v.as_float()).unwrap_or(1.0);
 
-    Ok(Vector3::new(x, y, z).normalize())
+    Ok(Vector3::new(x, y, z))
 }
 
 /// Parse IfcExtrudedAreaSolid ExtrudedDirection (attr 2) to a local Vector3.
@@ -747,7 +747,7 @@ fn convert_ifc_to_webgl(m: &Matrix4<f64>) -> [f32; 16] {
 fn detect_unit_scale(content: &[u8], decoder: &mut EntityDecoder) -> f64 {
     let mut scanner = EntityScanner::new(content);
     while let Some((id, type_name, _, _)) = scanner.next_entity() {
-        if type_name == "IFCPROJECT" {
+        if ifc_lite_core::keyword_eq(type_name, "IFCPROJECT") {
             if let Ok(scale) = ifc_lite_core::extract_length_unit_scale(decoder, id) {
                 return scale;
             }

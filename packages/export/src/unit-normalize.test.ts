@@ -81,6 +81,62 @@ describe('scaleTypedMeasures', () => {
     expect(scaleTypedMeasures('(IFCLENGTHMEASURE(1000.),IFCLENGTHMEASURE(2000.))', 0.001, 1, 1))
       .toBe('(IFCLENGTHMEASURE(1.),IFCLENGTHMEASURE(2.))');
   });
+
+  // #3789: the keyword and its '(' may be separated by a STEP writer's line
+  // wrap, the TS sibling of the Rust tokenizer's #3205 fix.
+  it('scales a measure wrapped across whitespace before its "("', () => {
+    expect(scaleTypedMeasures('IFCLENGTHMEASURE\r\n(100.)', 0.001, 1, 1))
+      .toBe('IFCLENGTHMEASURE(0.1)');
+  });
+
+  it('two-way rule: does not treat a keyword followed by non-whitespace junk as a measure', () => {
+    // 'X' between the keyword and '(' is neither whitespace nor part of the
+    // keyword itself, so this must be left completely untouched.
+    const input = 'IFCLENGTHMEASUREX(100.)';
+    expect(scaleTypedMeasures(input, 0.001, 1, 1)).toBe(input);
+  });
+
+  // TS/Rust parity (#3789 follow-up): ISO 10303-21 permits a comment anywhere
+  // whitespace is legal, including between the keyword and its '('. Rust's
+  // tokenizer already skips it there; this rewriter did not, so a comment in
+  // that position left the measure unscaled while every sibling measure on
+  // the same line was rescaled -- an inconsistent, mixed-unit normalized file.
+  it('scales a measure separated from its "(" by a block comment', () => {
+    // Mirrors the whitespace case above: the rewriter drops whatever sat
+    // between the keyword and '(' (whitespace or a comment) rather than
+    // preserving it -- it is rebuilding the token, not patching a slice.
+    expect(scaleTypedMeasures('IFCLENGTHMEASURE/* mm */(100.)', 0.001, 1, 1))
+      .toBe('IFCLENGTHMEASURE(0.1)');
+  });
+
+  it('a comment containing "(" or ";" does not derail the parse (control)', () => {
+    expect(scaleTypedMeasures('IFCLENGTHMEASURE/* has ( and ; inside */(100.)', 0.001, 1, 1))
+      .toBe('IFCLENGTHMEASURE(0.1)');
+  });
+
+  it('two-way rule: an unterminated comment before "(" is not treated as trivia', () => {
+    const input = 'IFCLENGTHMEASURE/* never closes (100.)';
+    expect(scaleTypedMeasures(input, 0.001, 1, 1)).toBe(input);
+  });
+
+  it('two-way rule: a WRAPPED keyword inside a quoted string is still left alone', () => {
+    // The quoted-string alternative runs first precisely so a keyword that is
+    // only text inside an IFCLABEL is never rewritten. Widening the keyword
+    // branch across whitespace and comments must not reach into a string
+    // literal, which spans newlines too — the case the adjacent-keyword test
+    // above could not have caught.
+    const wrapped = "#1=IFCPROPERTYSINGLEVALUE('IFCLENGTHMEASURE\r\n(1000.)',$);";
+    expect(scaleTypedMeasures(wrapped, 0.001, 1, 1)).toBe(wrapped);
+    const commented = "#1=IFCPROPERTYSINGLEVALUE('IFCLENGTHMEASURE/* mm */(1000.)',$);";
+    expect(scaleTypedMeasures(commented, 0.001, 1, 1)).toBe(commented);
+  });
+
+  it('scales a real wrapped measure that sits after a quoted string on the same line', () => {
+    // The string branch must consume only the string, not shadow the real
+    // measure that follows it.
+    expect(scaleTypedMeasures("#1=IFCX('a',IFCLENGTHMEASURE (1000.));", 0.001, 1, 1))
+      .toBe("#1=IFCX('a',IFCLENGTHMEASURE(1.));");
+  });
 });
 
 describe('getEntityLengthPlan (schema-derived)', () => {
@@ -125,9 +181,9 @@ describe('rescaleEntityLengths (full entity lines)', () => {
     // `findOuterArgs` is where a malformed record stops: it tracks quotes and
     // depth to find the `)` that closes the record's own `(`, so a line that
     // never closes either has no argument span at all and is returned as-is.
-    // That is also why `splitTopLevelStepArguments` returning null is
-    // unreachable from here — the span it is handed is balanced by
-    // construction — so nothing below pretends to exercise that guard.
+    // `splitTopLevelStepArguments` returning null IS separately reachable past
+    // this point — see the "refuses to guess at a malformed slot" describe
+    // block below, which exercises that path directly.
     const unterminated = "#8=IFCBUILDINGSTOREY('g',$,'L1,$,$,$,$,$,.ELEMENT.,3000.);";
     expect(rescaleEntityLengths(unterminated, 'IFCBUILDINGSTOREY', 0.001, 1, 1)).toBe(unterminated);
 
@@ -210,6 +266,68 @@ describe('rescaleEntityLengths (full entity lines)', () => {
   it('is a no-op when all factors are 1', () => {
     const line = '#6=IFCCARTESIANPOINT((100.,200.,300.));';
     expect(rescaleEntityLengths(line, 'IFCCARTESIANPOINT', 1, 1, 1)).toBe(line);
+  });
+
+  it('rescales a length quantity that carries a binary literal in another slot (#4173 regression repro)', () => {
+    // `isWellFormedStepSlot` (step-slot-grammar.ts, #4162) did not recognize
+    // the STEP binary literal `"..."` as a value, so a well-formed line whose
+    // Description happened to be a binary literal made `splitTopLevelStepArguments`
+    // reject the whole split — and this function used to treat that null as
+    // "nothing to do" and hand the line back with its LengthValue UNSCALED.
+    const baseline = "#1=IFCQUANTITYLENGTH('Len',$,$,5000.,$);";
+    expect(rescaleEntityLengths(baseline, 'IFCQUANTITYLENGTH', 0.001, 1, 1))
+      .toBe("#1=IFCQUANTITYLENGTH('Len',$,$,5.,$);");
+
+    const withBinary = '#1=IFCQUANTITYLENGTH(\'Len\',"0123ABC",$,5000.,$);';
+    expect(rescaleEntityLengths(withBinary, 'IFCQUANTITYLENGTH', 0.001, 1, 1))
+      .toBe('#1=IFCQUANTITYLENGTH(\'Len\',"0123ABC",$,5.,$);');
+  });
+
+  /**
+   * ISO-10303-21 comment content is unrestricted: a `/* ... *​/` inside the
+   * argument list can hold a comma, an unbalanced paren, or an odd number of
+   * `'`, none of which are argument-list structure. `splitTopLevelStepArguments`'s
+   * outer scan had no comment awareness, so each of these corrupted its
+   * comma/paren/quote tracking and produced a phantom fragment beginning with
+   * `/` — outside every token charset — which `isWellFormedStepSlot` then
+   * rejected, turning a legal line into a null split. Before #4173 that null
+   * was swallowed as "nothing to scale"; after, it throws. Either way this is
+   * a legal file, so the correct behaviour is neither: rescale it cleanly.
+   */
+  it('rescales past a comma inside a comment without throwing', () => {
+    const line = "#1=IFCQUANTITYLENGTH('Len',/* a, b */$,$,5000.,$);";
+    expect(rescaleEntityLengths(line, 'IFCQUANTITYLENGTH', 0.001, 1, 1))
+      .toBe("#1=IFCQUANTITYLENGTH('Len',/* a, b */$,$,5.,$);");
+  });
+
+  it('rescales past an unbalanced paren inside a comment without throwing', () => {
+    const line = "#1=IFCQUANTITYLENGTH('Len',/* ( */$,$,5000.,$);";
+    expect(rescaleEntityLengths(line, 'IFCQUANTITYLENGTH', 0.001, 1, 1))
+      .toBe("#1=IFCQUANTITYLENGTH('Len',/* ( */$,$,5.,$);");
+  });
+
+  it('rescales past an apostrophe inside a comment without throwing', () => {
+    const line = "#1=IFCQUANTITYLENGTH('Len',/* wall's edge */$,$,5000.,$);";
+    expect(rescaleEntityLengths(line, 'IFCQUANTITYLENGTH', 0.001, 1, 1))
+      .toBe("#1=IFCQUANTITYLENGTH('Len',/* wall's edge */$,$,5.,$);");
+  });
+});
+
+describe('rescaleEntityLengths refuses to guess at a malformed slot', () => {
+  it('throws rather than silently leaving length data in the wrong unit', () => {
+    // `findOuterArgs` only certifies the outer span's SCAN state (balanced
+    // parens/quotes) — it says nothing about whether each top-level slot is
+    // itself a well-formed value. A lone comment sitting between two commas
+    // is exactly such a case (step-argument-parser.test.ts's phantom-slot
+    // suite): it leaves quote parity and paren depth clean but is not a
+    // value, so `isWellFormedStepSlot` rejects it and
+    // `splitTopLevelStepArguments` returns null even though `findOuterArgs`
+    // found a clean span. This line's LengthValue (slot 3) would silently
+    // keep its stale unit if that null were swallowed.
+    const line = "#1=IFCQUANTITYLENGTH('Len',$,/* c */,5000.,$);";
+    expect(() => rescaleEntityLengths(line, 'IFCQUANTITYLENGTH', 0.001, 1, 1)).toThrow(
+      /cannot split/,
+    );
   });
 });
 

@@ -63,12 +63,20 @@ export interface PointCloudNode {
   spatialIndex: PointCloudSpatialIndex;
   /**
    * Optional per-asset GPU model matrix (column-major, 16 floats),
-   * applied in the vertex shader as `uniforms.model * vec4(position, 1)`
-   * before `viewProj` (issue #1804: aligns a georeferenced point cloud
-   * with the IFC model's `IfcMapConversion`). `undefined` → identity,
-   * written by `writePointCloudUniforms`.
+   * Its linear part is applied in the vertex shader; the translation is
+   * separately retained as `rteOrigin` and split against the camera before
+   * projection. That keeps a georeferenced cloud aligned without rounding a
+   * map-grid origin into an f32 matrix (issue #1804, #5049).
    */
   model?: Float32Array;
+  /** Exact model translation retained until the RTE upload boundary. */
+  rteOrigin?: [number, number, number];
+  /**
+   * Canonical f64 placement for CPU work (bounds, ray snap and measurement).
+   * `model` is deliberately a GPU-only f32 linear transform: its translation
+   * is not authoritative at map-grid offsets.
+   */
+  placement?: Float64Array;
 }
 
 /**
@@ -94,8 +102,8 @@ export interface PointCloudNode {
  * must fall back to identity rather than poison the result.
  */
 export function isUsableModelMatrix(
-  model: Float32Array | undefined,
-): model is Float32Array {
+  model: Float32Array | Float64Array | undefined,
+): model is Float32Array | Float64Array {
   if (!model || model.length !== 16) return false;
   for (let i = 0; i < 16; i++) {
     if (!Number.isFinite(model[i])) return false;
@@ -105,7 +113,7 @@ export function isUsableModelMatrix(
 
 export function transformAabb(
   bounds: { min: [number, number, number]; max: [number, number, number] },
-  model: Float32Array | undefined,
+  model: Float32Array | Float64Array | undefined,
 ): { min: [number, number, number]; max: [number, number, number] } {
   if (!isUsableModelMatrix(model)) return bounds;
   const min: [number, number, number] = [Infinity, Infinity, Infinity];
@@ -286,7 +294,7 @@ function appendPointSubBuffer(
   try {
     deviationBuffer = device.createBuffer({
       size: count * 4,
-      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     });
   } catch (err) {
     try {
@@ -362,4 +370,17 @@ function growBounds(
 
 function clamp01(v: number): number {
   return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+
+/** Destroy all nodes, or only assets belonging to one ingestion owner. */
+export function clearOwnedPointCloudNodes<Owner extends string>(
+  nodes: Map<number, PointCloudNode>, owners: Map<number, Owner>, owner?: Owner,
+): void {
+  for (const [id, node] of nodes) {
+    if (owner !== undefined && owners.get(id) !== owner) continue;
+    destroyNode(node);
+    nodes.delete(id);
+    owners.delete(id);
+  }
+  if (owner === undefined) owners.clear();
 }

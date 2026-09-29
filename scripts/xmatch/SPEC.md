@@ -12,7 +12,7 @@ Run it:
 
 ```
 pnpm fixtures                        # the corpus lives in tests/models/manifest.json
-pnpm turbo build --filter=@ifc-lite/diff --filter=@ifc-lite/cli
+pnpm turbo build --filter=@ifc-lite/parser --filter=@ifc-lite/diff --filter=@ifc-lite/cli
 node scripts/xmatch/run.mjs          # score against the pre-registered thresholds
 node scripts/xmatch/run.mjs --self-test   # mutation-check the harness itself
 ```
@@ -28,15 +28,20 @@ The shipped code, imported and not re-implemented:
 | --- | --- |
 | data fingerprints | `buildFileFingerprints` — `packages/cli/dist/commands/diff-engine.js` |
 | canonical hashing | `buildDataFingerprint` / `buildComponentFingerprints` — `@ifc-lite/diff` |
-| geometry hash + world AABB | the wasm mesh pass with `setComputeGeometryHashes(1e-3)` |
-| the matcher | `diffModels(..., { scope: 'both', matchUnpairedByContent: true })` |
+| geometry hash + world AABB + volume | `runGeometryPass` — `packages/cli/dist/commands/diff-geometry.js` (issue #4956), the same `ifc-lite diff --by-content --geometry` mesh pass; `geometryVolumeValues` where the mesh was proved closed |
+| assembly (attach the geometry pass onto the data fingerprints) | `attachGeometryFingerprints` — `packages/cli/dist/commands/diff-geometry.js` |
+| spatial container | `spatialContainerPath` — `@ifc-lite/parser`, the name path the successor stage's `position` profile keys on |
+| the matcher | `diffModels(..., { scope: 'both', matchUnpairedByContent: true, detectSplitMerge: true, detectSuccessors: true })` |
+| class families | `classFamilyResolver` — `packages/diff/dist/class-families.js`, the same table the two claim stages bucket by |
 
-The one thing the harness supplies itself is the *pairing* of those two halves
-(attach each entity's world hash and box to its data fingerprint), which is what
-`apps/viewer/src/lib/compare/buildFingerprints.ts` does in the browser. That
-viewer module could not be imported from a Node script (its `@ifc-lite/parser`
-import cycles through `@ifc-lite/ifcx` under `tsx`), so the *assembly* is
-duplicated while the *hashing* is not. A known limitation, listed again below.
+`fingerprints.mjs` supplies only the file-level orchestration (parse, call the
+two adapters, resolve `spatialContainerPath`, optionally strip keys); the
+fingerprint assembly itself — data hash, geometry pass, and attaching one onto
+the other — is entirely the CLI's own `--geometry` code (issue #4956, superseding
+the duplicate this file used to carry). The volume is kept only when finite
+and positive — the wasm's `NaN` means "not proved closed", not zero — exactly
+as `@ifc-lite/geometry`'s `geometryVolumeAt` resolves it; without it a split
+claim can only ever reach `extent`.
 
 ## The answer key
 
@@ -45,6 +50,14 @@ A seeded mutation program (`mutate.mjs`) turns one real model from
 by **source express id** — a channel the matcher never reads. The key is
 produced by construction: the generator records what it did, rather than
 deriving a correspondence from any hash or comparison.
+
+The key carries two digests (issue #4989 review): `sourceSha256` is always
+the PRISTINE file's digest — the bytes `sourcePath` names on disk, whether or
+not anything in this run touched them — and `baseSha256` is the digest of the
+text `build-pair.mjs` actually fingerprints as "base". The two are byte-identical
+for every model with no `merged` role; they diverge exactly when `merged`
+produced a mutated base text (see below), and a reader comparing the key
+against what was actually scored must use `baseSha256`.
 
 The head is a from-scratch re-export of the kind content matching exists for:
 
@@ -65,6 +78,81 @@ Declared mutations, applied to elements the geometry pass produced a mesh for:
 | `duplicated` | clone the element into every relationship list it sits in | an unresolved `duplicated` group containing both |
 | `deleted` | drop the element, prune it out of every list | nothing at all |
 | `inserted` | a head-only clone under a new name, 5 m away | nothing at all |
+| `respecified` | re-GUID plus ONE data edit — a property value in a pset the element owns outright, else its `Name` — and no geometry edit | `respecified`, tier `geometry-only`, **never** `renamed` |
+| `thickened` | scale the SHORTER axis of the one extruded rectangle the element owns outright by 1.25, and rename | no content match; a `footprint` `SuccessorClaim` (old box nests in new, IoU 0.8) |
+| `swapped` | point the element's owned body `IfcMappedItem` at a different `IfcRepresentationMap` used by another element of the same class (family as fallback), and rename | no content match; a `position` or `footprint` `SuccessorClaim` |
+| `splitLength` | the owned extruded rectangle becomes two half-length products: a clone enrolled in every list, a private copy of the shape chain, both renamed | no content match, no successor; one `split` claim, `verified` when volumes were proved, else `extent` |
+| `merged` | the INVERSE of `splitLength` (issue #4989): a detached rectangle owner is split into two half-length products IN THE BASE ONLY, and the single original product survives, renamed, in the HEAD | no content match, no successor; one `merge` claim, expected `verified` (containment + exact volume sum) |
+| `insertedNearby` | on a `deleted` element: a head-only clone of the same class at 0.3x its size on every axis, INSIDE its box | nothing at all — a `SuccessorClaim` onto it is the negative control |
+
+The four kinds after `inserted` and the second negative control are issue
+#4955's: the harness now also exercises the split/merge stage and the
+successor stage, both opt-in stages that run on what content matching left
+unbound. A "rectangle" is either an `IfcRectangleProfileDef` or an
+`IfcArbitraryClosedProfileDef` whose outer curve is four corners at right
+angles, read into one model and written back in the profile's own spelling:
+rvt01 has 2 of the former and several hundred of the latter, and a fixture
+that only knew the named profile would have had no split population on two
+of three models. Half-length pieces are re-centred in the profile's own 2D
+frame, so no 3D placement is touched; the clone shares the (unedited)
+`IfcLocalPlacement`.
+
+`merged` (issue #4989) is built as the literal inverse of `splitLength`, not
+merely something that scores like one. An EARLIER version of this role
+picked two independently-real, "adjacent" rectangle owners and glued a new
+rectangle over one of them — honest-*sounding*, but a generator defect a
+review caught (2026-09-19): `mergeElementLength` extended the primary's
+profile along one fixed axis without checking which side the donor sat on,
+so most constructed pairs pointed away from their supposed partner and the
+engine correctly refused to merge them — measured `byMerge` recall 0.125,
+precision 0.5, both artefacts of the direction bug rather than a property of
+the engine. That construction, `mergePairs`/`mergeElementLength`, is
+deleted; there is exactly one construction now.
+
+The base revision is normally fingerprinted straight off the real file on
+disk (`fingerprintFile(modelPath, …)` in `build-pair.mjs`), untouched by the
+generator — which is exactly why a "pick two real neighbours" approach
+seemed necessary. But nothing stops the generator from producing a SECOND,
+separately-mutated base text for the one role that needs it: `mutate.mjs`
+picks a detached rectangle owner (interleaved with `splitLength` against the
+same candidate pool — see below), renames it in the live HEAD file
+(`freshName('merged')`) and touches nothing else there, then
+`merge-base-split.mjs`'s `splitBaseForMerge` re-parses the PRISTINE text
+fresh and calls `splitElementLength` on it — the exact same call
+`splitLength` makes on the head — producing two real half-length products in
+that base-only file: the primary's own id (edited in place, own GlobalId
+kept) and a new clone (own express id, a freshly minted GlobalId — this base
+file never goes through `mutate.mjs`'s `reguidAll`, so `splitBaseForMerge`
+mints the clone's itself, off a PRNG stream derived from the seed but never
+`random`, so it draws nothing from the streams `swapped`'s donor choice is
+already documented as immune to). `build-pair.mjs` fingerprints that base text
+instead of the pristine file whenever it differs. Both real base-side halves
+then tile the HEAD survivor's UNEDITED, full-length shape EXACTLY — the
+engine's verified merge case (containment plus an exact volume sum), the
+same proof `splitLength` already gets to 100% `verified` — not a coincidence
+of adjacency scanning.
+
+The answer key records the pair as TWO `key.elements` rows — `{ base:
+primaryId, kind: 'merged', head: [primaryId] }` and `{ base: cloneId, kind:
+'merged', head: [primaryId] }` — rather than one row with an array `base`,
+because every OTHER reader of `key.elements` (`score.mjs`, `guards.mjs`)
+assumes `element.base` is a single id; `scoreMerges` (`score-claims.mjs`)
+reconstructs `{ base: [primaryId, cloneId], head: [primaryId] }` by grouping
+on the shared `head`. `splitLength` and `merged` INTERLEAVE their draw from
+the same detached-rectangle-owner pool (`mutate-support.mjs`'s
+`interleaveSplitAndMerge`) rather than one draining it before the other
+starts — draining first was the OTHER thing the 2026-09-19 review caught:
+duplex's whole 9-element pool went to `splitLength` + `insertedNearby`
+before `merged` ever got a turn under the old ordering. Even interleaved,
+duplex's pool has no room left for `merged` once `splitLength` (4) and
+`insertedNearby`'s own rectangle draw (5) are satisfied, so its `plan`
+explicitly zeroes `merged` (`run.mjs`) rather than stealing back
+`insertedNearby`'s corpus-floor headroom; rvt01's 59-element pool alone
+carries `merged`'s population floor (8 of 8 measured `verified`, 100%
+recall/precision). Both real elements are enrolled in the survivor's
+containment list by simple fact — the clone is `splitLength`'s own
+`cloneElement`, inheriting the primary's real membership — so "the head
+product spans both" needs no separate proof here.
 
 Elements the key covers but never mutates geometrically — `IfcProject`,
 storeys, types, groups — are `renamed`, and they are the population that can
@@ -95,8 +183,29 @@ complexity lives. IFC shares nodes aggressively, so:
   changes the file and nothing about the geometry — the calibration stratum
   caught exactly that on the first run, as five re-sampled elements matching at
   tier 1 with an unchanged hash;
-* `deleted` / `duplicated` refuse unless every reference to the element sits
-  inside a list;
+* `deleted` / `duplicated` / `splitLength` / `merged` / `insertedNearby`
+  refuse unless every reference to the element sits inside a list;
+* `thickened`, `splitLength` and `merged` require ONE owned extruded
+  rectangle, not several: thickening every layer of a multi-layer wall by
+  1.25 produces overlapping layers whose union box is not the `V_old /
+  V_new` the footprint profile is specified against; `merged` reuses
+  `splitElementLength` itself (on the base-only file), so it inherits that
+  same requirement and needs no compatibility test of its own — there is
+  only one element involved, not a pair to match;
+* `swapped` rewrites the one pointer from the element's own `IfcMappedItem`
+  to a map, never the map (type geometry shared by every occurrence). The
+  donor must be structurally different from the element's own map
+  (`representationMapDigest`): ArchiCAD writes several byte-identical maps
+  per window, and a swap onto one of those keeps the world geometry hash and
+  is rightly paired as `respecified`, which the key would then call wrong.
+  What the digest cannot see is a MIRROR of a symmetric shape — AC20's two
+  window maps are exactly that — so `swapped` is 0 on AC20 with that reason;
+* `respecified` excludes hosts as well as features, because finding F1 (a
+  host's hash can move with statement order through the opening CSG) would
+  otherwise score the engine against a key that promised an unchanged shape;
+* `respecified` edits a property VALUE, never a name: a label gets a suffix,
+  a number is scaled, a logical is flipped, and the property-name multiset
+  the guards assert identical is untouched;
 * and **no mutation ever touches a feature** (`IfcOpeningElement` and friends,
   the related side of `IfcRelVoidsElement` / `IfcRelProjectsElement`), because
   its geometry is subtracted from its host's — moving an opening reshapes the
@@ -152,7 +261,15 @@ The guards that turn that into a named failure, all fatal for the pair:
 5. every keyed head element was actually fingerprinted;
 6. both revisions carry geometry hashes (otherwise the engine's capability
    abstention silently switches the geometry tiers off and every match reports
-   `renamed`).
+   `renamed`);
+7. every keyed counterpart carries the same spatial container NAME path as
+   its base — the re-GUID must not have touched a storey or space name — with
+   one exception that is REPORTED rather than failed: a path containing `#`
+   names an unnamed spatial node by its express id, which no re-export
+   preserves (finding F4 below);
+8. every `insertedNearby` element really sits inside the deleted element's
+   box, checked against the geometry pass's own boxes. A control planted next
+   door would pass vacuously.
 
 ## The three strata
 
@@ -169,7 +286,47 @@ whether the engine's own verdict matches what was actually done.
 
 **By geometry class** — `prismatic` / `curved` / `none`, decided from the
 element's representation subgraph in the source file (does it reference an
-`IfcCircle`, a B-spline, a swept disk, …). This stratum is not optional. The
+`IfcCircle`, a B-spline, a swept disk, …).
+
+Since issue #4955 there are three more, for the two claim stages:
+
+**By successor** — `bySuccessor.footprint` (the `thickened` population) and
+`bySuccessor.position` (the `swapped` population): keyed by the profile the
+harness EXPECTS, like `byKind` is keyed by the mutation, so recall has a fixed
+denominator per profile. Recall credits a claim with the right head at any
+confidence; `kindAgreement` is whether the reported confidence was one the
+harness accepts — only `footprint` for a thickened wall, either for a swapped
+family, whose box may or may not still overlap heavily. `bySuccessorConfidence`
+is the `byTier` analogue: precision per REPORTED profile, so a profile that
+starts guessing shows even while the other carries the recall.
+
+**By split** — `bySplit`: recall over the `splitLength` population, precision
+over every `split` claim (a `merge` claim is scored separately, under
+`byMerge` — see below — and counted only informationally here as
+`mergeClaims`, so it can never inflate `bySplit`'s own claimed/precision
+denominators), a claim correct only when its whole is a split base and its
+piece SET is exactly that base's two heads. `kindAgreement` is the confidence:
+`verified` expected when the whole and both pieces carry a proved volume,
+`extent` otherwise — read off the fingerprints, not assumed.
+
+**By merge** — `byMerge` (issue #4989), the mirror image: recall over the
+`merged` population (pairs, not rows — `score.mjs`'s corpus-population sum
+uses `byMerge.population` rather than the raw `key.elements` count for
+exactly this reason), precision over every `merge` claim, a claim correct
+only when its whole is a `merged` head and its piece SET is exactly that
+head's two real bases `{a, b}`. A `split` claim is counted only
+informationally (`splitClaims`). Because the construction is the engine's
+own verified-merge case (containment plus an exact volume sum — see the
+`merged` row above), measured recall/precision/kindAgreement on rvt01 (the
+only populated pair; duplex's pool is spoken for) are 8/8/8/8 — all
+`verified`, same as `bySplit`.
+
+Two more negative controls with a zero target: `falseSuccessors.insertedNearby`
+(a claim onto the small element planted inside a deleted element's box) and
+`falseSuccessors.neighbourSuccessor` (any other successor claim whose head is
+not the base's true counterpart, including every claim on a `deleted` base).
+And `respecifiedControl.reportedRenamed`: a `respecified` pair reported as
+`renamed` would mean the data hash called two different payloads equal. This stratum is not optional. The
 geometry hash is a **world-space quantized triangle multiset**, so a producer
 that re-samples a curve emits different triangles for the same nominal surface
 and cannot match at tier 1. Aggregate-only reporting is exactly how that hides
@@ -209,10 +366,21 @@ discriminating.
 * **Pre-registered thresholds, kept even after they are missed.** See the next
   section — the gating floor and the pre-registered target are two different
   numbers and both are in `thresholds.json`.
-* **The harness is mutation-checked, three ways.** `--self-test` swaps in an
+* **The harness is mutation-checked, seven ways.** `--self-test` swaps in an
   always-match matcher, an always-abstain matcher and an over-eager one, and
-  asserts the fixture rejects all three. If any passes, the harness proves
-  nothing and the run fails.
+  asserts the fixture rejects all three. Four more target the claim strata
+  and each must be rejected by the clause family it was written against, not
+  merely by something: `overlap-successor` (every touching box pair is a
+  successor; must trip `falseSuccessors.*`), `rotated-claims` (the real claims
+  with their partners shuffled one step; must trip a claim precision floor or
+  `neighbourSuccessor`), `respecified-as-renamed` (the geometry-only verdicts
+  relabelled tier-1 `renamed`; must trip `byKind.respecified.kindAgreement`
+  or the `reportedRenamed` ceiling) and `silent-claims` (no claims at all;
+  must trip a claim recall floor). A claim mutant is skipped on a pair whose
+  key expects no claim — on AC20 the claim floors are skipped, so a mutant
+  there could only survive vacuously — and every mutant must have been
+  applied and rejected on at least one pair. If any survives, the harness
+  proves nothing and the run fails.
 
 ## Floors versus targets
 
@@ -225,8 +393,9 @@ the last blessed measurement" — it is **not** a claim that the number is good.
 **The pre-registered target** is what was written down in commit `79604caa`,
 before the harness had produced a single number. It never gates, it is never
 edited to match a result, and any stratum below it is printed on every run as
-`BELOW PRE-REGISTERED TARGET`. Two lines print today. That is a standing debt,
-deliberately impossible to lose track of:
+`BELOW PRE-REGISTERED TARGET`. Two lines printed after the first run, and the
+claim stages added their own (see "Second run", findings F4-F6). That is a
+standing debt, deliberately impossible to lose track of:
 
 | stratum | floor | measured | target |
 | --- | --- | --- | --- |
@@ -439,6 +608,107 @@ mutation check now scores mutants on per-pair clauses only, so every rejection
 is a function of what the matcher actually returned. The conclusion survived
 the correction; the evidence for it on two of three models did not.
 
+## Second run: the claim stages (2026-09-18, issue #4955)
+
+The first scored run of the four new mutations, against the thresholds
+pre-registered in commit `2a0da8059`. Populations across the corpus:
+respecified 38, thickened 24, swapped 12, splitLength 12, insertedNearby 12
+(duplex 14/10/6/4/4, AC20 4/0/0/0/0, rvt01 20/14/6/8/8). The nearby control
+rides ON the `deleted` population — rectangle-owning deleted elements are
+relabelled — so every model still deletes exactly the 12 the plan declares. AC20 is sized down
+on purpose: it has 126 keyed elements of which 17 can never be matched, so
+every element a new role takes out of `renamed` moves that stratum's recall
+towards its 0.777 floor, and seven is the most it can spare; its extrusions
+are not rectangles and its only donor maps are mirrors (see the locality
+rules above), so three of the new kinds have nothing to take there anyway.
+
+What measured 1.0 everywhere it was populated, and whose floors therefore sit
+at the ratchet ceiling: `respecified` recall, precision and kindAgreement
+(38/38 paired at tier `geometry-only`, 0 reported `renamed`); `footprint`
+recall and precision (24/24); `position` precision; `bySplit` recall and
+kindAgreement (12/12, all `verified` — every half-length rectangle extrusion
+was proved closed, so the volume attachment did what it was added for); the
+`neighbourSuccessor` control (0). The content strata did not move: precision
+1.000 on every model, all four original negative controls at 0.
+
+Four shortfalls, each printed as a gap on every run, each a finding about the
+engine or its adapters rather than the fixture, none tuned around:
+
+All three findings below were **fixed in the engine stack** on the same day
+(F4 in the parser, F5/F6 in `@ifc-lite/diff`) and the harness re-measured
+against the fixed tip. The paragraphs keep the original measurement and the
+repro as regression notes; the "after" numbers follow each.
+
+**F4 (FIXED) — an unnamed spatial node switches the `position` profile off.**
+`spatialContainerPath` spells an unnamed node as `#<expressId>`; Duplex's
+`IfcBuilding` has no Name, so every container path in it reads
+`0001/Default/#36/Level 1`, and no re-export preserves an express id. The
+profile requires the path equal on both sides, so on Duplex it can never fire:
+`bySuccessor.position.recall` 0.166667 there (the one recovered swap was a
+same-size donor caught by `footprint`), 0.833333 on rvt01 where the building
+is named, 0.5 across the corpus against a 0.6 target. The guard for container
+paths reports rather than fails an `#` path for this reason. Repro:
+`spatialContainerPath(store, id)` on `tests/models/ara3d/duplex.ifc` for any
+contained element. *Fix:* an unnamed node is labelled by LongName, then by
+class (`0001/Default/IfcBuilding/Level 1`), never by express id. *After:*
+`bySuccessor.position.recall` 0.166667 → **0.333333** on duplex; the four
+swaps still unclaimed there (and two on rvt01) are the harness pointing a
+4.8 m window at a 0.75 m donor, or a stool at a bed, which F6's size check
+now refuses on purpose — a donor-selection limit of the fixture, reported
+as the standing corpus gap 0.5 < 0.6 rather than tuned around. The stable
+paths also exposed a leak in the fixture itself: a `thickened` IfcSpace was
+renamed, moving the container path of everything inside it. No #4955 role
+is taken by a spatial element any more, and the container guard is what
+caught it.
+
+**F5 (FIXED) — a `duplicated` group is claimed as an `extent` split.** The content
+pass reports two stacked copies of one element as a `duplicated` group and
+retires nothing, so the whole and both copies stay in the residue; the split
+stage's in-place lane then finds two same-class boxes inside the whole's box
+covering its extent and, with no volume to refute it (furniture, coverings,
+stairs — open shells by design), claims `extent`. Every wrong split claim in
+the corpus is one of these: 7 on duplex, 1 on AC20 (its stair), 4 on rvt01,
+one of which also absorbed an `insertedNearby` element as a third piece.
+`bySplit.precision` 0.363636 / — / 0.666667 per model, 0.5 across the corpus
+against 0.98. Two pieces whose boxes COINCIDE with each other cannot be a
+split of anything, and the group they came from was already adjudicated.
+Minimal repro: base `A` with box B; heads `A1`, `A2` with the same data hash
+as `A` and the same box B, no volumes → `detectSplitMerge` claims
+`{ kind: 'split', confidence: 'extent', whole: A, pieces: [A1, A2] }`.
+*Fix:* the extent tier refuses any two pieces whose boxes coincide (IoU ≥
+0.5). *After:* `bySplit.precision` 0.363636 / — / 0.666667 → **1 / — / 1**,
+zero wrong claims in the corpus, 12/12 splits still `verified`.
+
+**F6 (FIXED) — the `position` profile has no size check.** A deleted covering and a
+head-only element of the same class at 0.3x its size, inside its box, are
+paired as `position` successors at IoU 0.027: 7 of the 8 `insertedNearby`
+controls on rvt01 (the eighth was bound as a piece of an F5 split claim, and
+the successor stage skips what a split binds). The profile
+argues from centre distance, container and uniqueness alone; a thickened wall
+and a stool where a wall was look the same to it. `falseSuccessors.insertedNearby`
+7 on rvt01 against a target of 0 — at the time the one gating ceiling that
+had to be raised above zero, per pair and as a corpus total, with the target
+left at 0 — and `bySuccessorConfidence.position.precision` 0.416667 against 0.98.
+Minimal repro: deleted `D` with box `[0,0,0]..[5,0.2,3]`, added `N` of the
+same class and container with box `[1.75,0.07,0]..[3.25,0.13,0.9]`, no other
+residue → a `position` claim `D → N`. *Fix:* the profile requires every axis
+extent within 2x of the other's. *After:* `falseSuccessors.insertedNearby`
+7 → **0** (ceiling back to 0, per pair and corpus), and
+`bySuccessorConfidence.position.precision` 0.416667 → **1** (4/4 on rvt01,
+1/1 on duplex).
+
+**Uniqueness margin, not a defect.** Two of rvt01's 14 thickened coverings
+were recovered by `position` rather than `footprint` (kindAgreement
+0.857143 against 0.9): the footprint profile abstains when a runner-up box
+overlaps at half the threshold or more, and rvt01's stacked finishes provide
+one. The pair was still found; the profile that found it is what the number
+records.
+
+The mutation check rejects all seven mutants wherever they apply. AC20
+expects no claim, so `rotated-claims` and `silent-claims` are skipped there
+and applied on the other two models; every other mutant is rejected on all
+three, each on its own clause family.
+
 ## What is NOT in here
 
 **A genuine foreign pair — two tools exporting one design — is not available in
@@ -460,10 +730,17 @@ Also absent, and worth stating:
 
 * the fixture measures the **matcher**, not the viewer's compare UI or the
   identity-map sidecar;
-* the fingerprint assembly is duplicated from the viewer adapter (see above), so
-  a change to that adapter alone would not be caught here;
+* the fingerprint assembly is the CLI's `--geometry` code, not the viewer's
+  (`apps/viewer/src/lib/compare/buildFingerprints.ts`), so a divergence
+  between those two adapters is out of scope here — only `diff-fingerprints.test.ts`
+  in `@ifc-lite/mcp` cross-checks the CLI adapter against a second copy;
 * the mutation program applies one mutation per element. Compound edits (a
-  wall that moved *and* was re-clad) are not covered.
+  wall that moved *and* was re-clad) are not covered — `thickened` and
+  `swapped` each pair one geometry edit with a rename, which is the minimum a
+  successor needs to exist at all, and `splitLength` renames both halves;
+* `swapped` cannot be constructed on a model whose only donor maps are
+  copies or mirrors of the element's own (AC20), and no mutation exercises a
+  `merge` claim: the corpus has no element that is the union of two others.
 
 ## Cost and scheduling
 

@@ -14,6 +14,7 @@
  * `zonesSlice` already does).
  */
 
+import { trackExportCompleted } from '@/lib/analytics';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Box,
@@ -30,9 +31,12 @@ import {
   X,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { IconButton } from '@/components/ui/icon-button';
 import { Input } from '@/components/ui/input';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { useViewerStore } from '@/store';
+import { useTranslation } from '@/i18n';
+import type { TranslationKey } from '@/i18n';
 import { downloadFile, sanitizeFilename } from '@/lib/export/download';
 import { toast } from '@/components/ui/toast';
 import { generateZonesFromStoreys } from '@/hooks/useZoneStoreyGeneration';
@@ -90,15 +94,14 @@ function NumberField({
         else setDraft(round(value));
       }}
       onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
-      className={className ?? 'h-6 w-16 px-1 text-[11px]'}
+      className={className ?? 'h-6 w-16 px-1 text-2xs'}
     />
   );
 }
 
 function ZoneRow({
-  setId, zone, editing, exporting, exportProgress, onEdit, onUpdate, onRemove, onSelect, onExportGeometry,
+  zone, editing, exporting, exportProgress, onEdit, onUpdate, onRemove, onSelect, onExportGeometry,
 }: {
-  setId: string;
   zone: Zone;
   editing: boolean;
   /** A geometry export for THIS zone is running: the control is disabled and
@@ -114,10 +117,11 @@ function ZoneRow({
   onSelect: () => void;
   onExportGeometry: () => void;
 }) {
+  const { t } = useTranslation();
   return (
     <div className={`rounded-md border p-2 text-xs space-y-1.5 ${editing ? 'border-amber-500 bg-amber-500/5' : 'border-border/60'}`}>
       <div className="flex items-center gap-1.5">
-        <Input
+        <Input aria-label={t('zonesPanel.zoneRow.nameAriaLabel')}
           value={zone.name}
           onChange={(e) => onUpdate({ name: e.target.value })}
           className="h-6 flex-1 px-1.5 text-xs font-medium"
@@ -127,42 +131,37 @@ function ZoneRow({
             (see `ZoneOverlay`). A control that does nothing is worse than no
             control. */}
         {!zone.footprint && (
-          <Button
+          <IconButton
+            label={editing ? t('zonesPanel.zoneRow.stopEditingTitle') : t('zonesPanel.zoneRow.editIn3dTitle')}
             variant={editing ? 'default' : 'ghost'}
-            size="icon"
             className="h-6 w-6"
-            title={editing ? 'Stop editing in 3D' : 'Edit in 3D (move / resize / rotate handles)'}
             onClick={onEdit}
           >
             <Pencil className="h-3 w-3" />
-          </Button>
+          </IconButton>
         )}
-        <Button variant="ghost" size="icon" className="h-6 w-6" title="Select elements in this zone" onClick={onSelect}>
+        <IconButton label={t('zonesPanel.zoneRow.selectTitle')} className="h-6 w-6" onClick={onSelect}>
           <MousePointerClick className="h-3 w-3" />
-        </Button>
+        </IconButton>
         {/* The geometry half of #2508: elements wholly in this zone plus the
             CUT pieces of the straddlers, as one model of this section. */}
-        <Button
-          variant="ghost"
-          size="icon"
+        <IconButton
+          label={t('zonesPanel.zoneRow.exportGeometryAriaLabel', { name: zone.name })}
+          tooltip={exporting ? t('zonesPanel.zoneRow.exportingTitle') : t('zonesPanel.zoneRow.exportGeometryTitle')}
           className="h-6 w-6"
-          title={exporting
-            ? 'Cutting this zone\'s geometry, this can take a while'
-            : "Export this zone's geometry (straddlers cut at the boundary) as GLB"}
-          aria-label={`Export ${zone.name} geometry`}
           disabled={exporting}
           onClick={onExportGeometry}
         >
           <Scissors className={`h-3 w-3${exporting ? ' animate-pulse' : ''}`} />
-        </Button>
+        </IconButton>
         {exporting && exportProgress && (
-          <span className="text-[10px] tabular-nums text-muted-foreground" role="status" aria-live="polite">
-            Cutting {exportProgress.done}/{exportProgress.total}
-          </span>
+          <output className="text-2xs tabular-nums text-muted-foreground" aria-live="polite">
+            {t('zonesPanel.zoneRow.cuttingProgress', { done: exportProgress.done, total: exportProgress.total })}
+          </output>
         )}
-        <Button variant="ghost" size="icon" className="h-6 w-6 text-destructive" title="Delete zone" onClick={onRemove}>
+        <IconButton label={t('zonesPanel.zoneRow.deleteZoneTitle')} className="h-6 w-6 text-destructive" onClick={onRemove}>
           <Trash2 className="h-3 w-3" />
-        </Button>
+        </IconButton>
       </div>
       {/* A PRISM zone (#2508 item 4) owns only its vertical extent: its X/Z
           centre, size and rotation are DERIVED from the footprint, so offering
@@ -171,14 +170,14 @@ function ZoneRow({
       {zone.footprint ? (
         <div className="grid grid-cols-3 gap-1">
           <label className="flex flex-col gap-0.5">
-            <span className="text-muted-foreground">Base (Y)</span>
+            <span className="text-muted-foreground">{t('zonesPanel.zoneRow.baseYLabel')}</span>
             <NumberField
               value={zone.center[1] - zone.size[1] / 2}
               onCommit={(v) => onUpdate({ center: [zone.center[0], v + zone.size[1] / 2, zone.center[2]] })}
             />
           </label>
           <label className="flex flex-col gap-0.5">
-            <span className="text-muted-foreground">Height (Y)</span>
+            <span className="text-muted-foreground">{t('zonesPanel.zoneRow.prismHeightLabel')}</span>
             <NumberField
               value={zone.size[1]}
               onCommit={(v) => {
@@ -191,15 +190,15 @@ function ZoneRow({
               }}
             />
           </label>
-          <span className="self-end text-[10px] text-muted-foreground truncate" title="Footprint imported from JSON; the 3D handles edit boxes only">
-            prism, {zone.footprint.length} pts
+          <span className="self-end text-2xs text-muted-foreground truncate" title={t('zonesPanel.zoneRow.footprintTitle')}>
+            {t('zonesPanel.zoneRow.prismPts', { count: zone.footprint.length })}
           </span>
         </div>
       ) : (
       <div className="grid grid-cols-3 gap-1">
-        {(['Center X', 'Center Y', 'Center Z'] as const).map((label, i) => (
-          <label key={label} className="flex flex-col gap-0.5">
-            <span className="text-muted-foreground">{label}</span>
+        {(['zonesPanel.zoneRow.centerXLabel', 'zonesPanel.zoneRow.centerYLabel', 'zonesPanel.zoneRow.centerZLabel'] as const).map((labelKey, i) => (
+          <label key={labelKey} className="flex flex-col gap-0.5">
+            <span className="text-muted-foreground">{t(labelKey)}</span>
             <NumberField
               value={zone.center[i]}
               onCommit={(v) => {
@@ -210,9 +209,9 @@ function ZoneRow({
             />
           </label>
         ))}
-        {(['Width (X)', 'Height (Y)', 'Depth (Z)'] as const).map((label, i) => (
-          <label key={label} className="flex flex-col gap-0.5">
-            <span className="text-muted-foreground">{label}</span>
+        {(['zonesPanel.zoneRow.widthLabel', 'zonesPanel.zoneRow.heightLabel', 'zonesPanel.zoneRow.depthLabel'] as const).map((labelKey, i) => (
+          <label key={labelKey} className="flex flex-col gap-0.5">
+            <span className="text-muted-foreground">{t(labelKey)}</span>
             <NumberField
               value={zone.size[i]}
               onCommit={(v) => {
@@ -224,7 +223,7 @@ function ZoneRow({
           </label>
         ))}
         <label className="flex flex-col gap-0.5">
-          <span className="text-muted-foreground">Rotation (°)</span>
+          <span className="text-muted-foreground">{t('zonesPanel.zoneRow.rotationLabel')}</span>
           <NumberField value={toDeg(zone.rotationY)} onCommit={(v) => onUpdate({ rotationY: fromDeg(v) })} />
         </label>
       </div>
@@ -234,6 +233,7 @@ function ZoneRow({
 }
 
 export function ZonesPanel({ onClose }: ZonesPanelProps) {
+  const { t } = useTranslation();
   const zoneSets = useViewerStore((s) => s.zoneSets);
   const editingZone = useViewerStore((s) => s.editingZone);
   const zoneAssignmentTiming = useViewerStore((s) => s.zoneAssignmentTiming);
@@ -280,81 +280,73 @@ export function ZonesPanel({ onClose }: ZonesPanelProps) {
     createZoneSet(name);
     setNewSetName('');
   }, [newSetName, createZoneSet]);
-
   const handleGenerateFromStoreys = useCallback(() => {
     const result = generateZonesFromStoreys();
     if (!result.ok) {
-      toast.error(`Could not generate zones from storeys: ${result.error}`);
+      toast.error(t('zonesPanel.generateFromStoreysError', { error: result.error }));
       return;
     }
     const id = createZoneSet('Storeys');
     replaceZonesInSet(id, result.zones);
-    toast.success(`Generated ${result.zones.length} zone(s) from storeys`);
-  }, [createZoneSet, replaceZonesInSet]);
-
+    toast.success(t('zonesPanel.generateFromStoreysSuccess', { count: result.zones.length }));
+  }, [createZoneSet, replaceZonesInSet, t]);
   const handleExport = useCallback(() => {
     const json = exportZoneSetsJSON();
     downloadFile(json, `${sanitizeFilename('zone-sets')}.json`, 'application/json');
+    trackExportCompleted({ format: 'json', surface: 'zones_panel' });
   }, [exportZoneSetsJSON]);
-
   const handleImportFile = useCallback(async (file: File | null | undefined) => {
     if (!file) return;
     try {
       const text = await file.text();
       const result = importZoneSetsJSON(text);
       if (!result.ok) {
-        toast.error(`Import failed: ${result.error}`);
+        toast.error(t('zonesPanel.importFailed', { error: result.error }));
       } else {
-        toast.success('Zone sets imported');
+        toast.success(t('zonesPanel.importSuccess'));
       }
     } catch (error) {
-      toast.error(`Import failed: ${error instanceof Error ? error.message : String(error)}`);
+      toast.error(t('zonesPanel.importFailed', { error: error instanceof Error ? error.message : String(error) }));
     } finally {
       if (importInputRef.current) importInputRef.current.value = '';
     }
-  }, [importZoneSetsJSON]);
+  }, [importZoneSetsJSON, t]);
 
   return (
     <div className="flex h-full flex-col">
       <div className="flex items-center gap-2 border-b p-3">
         <Box className="h-4 w-4 text-amber-600" />
-        <span className="font-medium text-sm flex-1">Location zones</span>
+        <span className="font-medium text-sm flex-1">{t('zonesPanel.header.title')}</span>
         {onClose && (
-          <Button variant="ghost" size="icon" className="h-6 w-6" onClick={handleClose}>
+          <IconButton label={t('zonesPanel.header.closeLabel')} className="h-6 w-6" onClick={handleClose}>
             <X className="h-3.5 w-3.5" />
-          </Button>
+          </IconButton>
         )}
       </div>
 
       <div className="flex items-center gap-1.5 border-b p-2">
-        <Input
+        <Input aria-label={t('zonesPanel.header.newSetPlaceholder')}
           value={newSetName}
           onChange={(e) => setNewSetName(e.target.value)}
-          placeholder="New zone set name…"
+          placeholder={t('zonesPanel.header.newSetPlaceholder')}
           className="h-7 flex-1 text-xs"
           onKeyDown={(e) => { if (e.key === 'Enter') handleAddSet(); }}
         />
         <Button size="sm" className="h-7" onClick={handleAddSet}>
-          <Plus className="h-3.5 w-3.5" /> Set
+          <Plus className="h-3.5 w-3.5" /> {t('zonesPanel.header.addSetButton')}
         </Button>
       </div>
 
       <div className="flex items-center gap-1.5 border-b p-2">
         <Button variant="outline" size="sm" className="h-7 flex-1" onClick={handleGenerateFromStoreys}>
-          <Layers3 className="h-3.5 w-3.5" /> Generate from storeys
+          <Layers3 className="h-3.5 w-3.5" /> {t('zonesPanel.header.generateFromStoreysButton')}
         </Button>
-        <Button variant="ghost" size="icon" className="h-7 w-7" title="Export zone sets as JSON" onClick={handleExport}>
+        <IconButton label={t('zonesPanel.header.exportSetsTitle')} className="h-7 w-7" onClick={handleExport}>
           <Download className="h-3.5 w-3.5" />
-        </Button>
-        <Button
-          variant="ghost"
-          size="icon"
-          className="h-7 w-7"
-          title="Import zone sets from JSON"
-          onClick={() => importInputRef.current?.click()}
-        >
+        </IconButton>
+        <IconButton label={t('zonesPanel.header.importSetsTitle')} className="h-7 w-7" onClick={() => importInputRef.current?.click()}>
           <Upload className="h-3.5 w-3.5" />
-        </Button>
+        </IconButton>
         <input
           ref={importInputRef}
           type="file"
@@ -366,56 +358,47 @@ export function ZonesPanel({ onClose }: ZonesPanelProps) {
 
       <div className="flex-1 overflow-y-auto p-2 space-y-2">
         {zoneSets.length === 0 && (
-          <p className="p-3 text-xs text-muted-foreground">
-            No zone sets yet. Create one above, or generate one from the model&apos;s storeys.
-          </p>
+          <p className="p-3 text-xs text-muted-foreground">{t('zonesPanel.emptyState')}</p>
         )}
         {zoneSets.map((zs) => (
           <Collapsible key={zs.id} defaultOpen className="rounded-md border">
             <div className="flex items-center gap-1 p-1.5">
               <CollapsibleTrigger className="flex-1 flex items-center gap-1.5 px-1 py-0.5 text-left">
                 <span className="font-medium text-xs">{zs.name}</span>
-                <span className="text-[10px] text-muted-foreground">{zs.zones.length} zone{zs.zones.length === 1 ? '' : 's'}</span>
+                <span className="text-2xs text-muted-foreground">{t('zonesPanel.zoneCount', { count: zs.zones.length })}</span>
               </CollapsibleTrigger>
-              <Button
-                variant="ghost"
-                size="icon"
+              <IconButton
+                label={zs.visible ? t('zonesPanel.hideIn3dTitle') : t('zonesPanel.showIn3dTitle')}
                 className="h-6 w-6"
-                title={zs.visible ? 'Hide in 3D view' : 'Show in 3D view'}
                 onClick={() => setZoneSetVisible(zs.id, !zs.visible)}
               >
                 {zs.visible ? <Eye className="h-3.5 w-3.5" /> : <EyeOff className="h-3.5 w-3.5" />}
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
+              </IconButton>
+              <IconButton
+                label={t('zonesPanel.addZoneTitle')}
                 className="h-6 w-6"
-                title="Add zone"
                 onClick={() => addZone(zs.id, { name: `Zone ${zs.zones.length + 1}` })}
               >
                 <Plus className="h-3.5 w-3.5" />
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
+              </IconButton>
+              <IconButton
+                label={t('zonesPanel.deleteZoneSetTitle')}
                 className="h-6 w-6 text-destructive"
-                title="Delete zone set"
                 onClick={() => removeZoneSet(zs.id)}
               >
                 <Trash2 className="h-3.5 w-3.5" />
-              </Button>
+              </IconButton>
             </div>
             <CollapsibleContent className="space-y-1.5 border-t p-1.5">
-              <Input
+              <Input aria-label={t('zonesPanel.setNameAriaLabel')}
                 value={zs.name}
                 onChange={(e) => renameZoneSet(zs.id, e.target.value)}
-                className="h-6 text-[11px] text-muted-foreground"
-                placeholder="Set name"
+                className="h-6 text-2xs text-muted-foreground"
+                placeholder={t('zonesPanel.setNamePlaceholder')}
               />
               {zs.zones.map((zone) => (
                 <ZoneRow
                   key={zone.id}
-                  setId={zs.id}
                   zone={zone}
                   editing={editingZone?.setId === zs.id && editingZone.zoneId === zone.id}
                   onEdit={() => setEditingZone(
@@ -427,8 +410,8 @@ export function ZonesPanel({ onClose }: ZonesPanelProps) {
                   onRemove={() => removeZone(zs.id, zone.id)}
                   onSelect={() => {
                     const count = selectElementsInZone(zs.id, zone.id);
-                    if (count > 0) toast.success(`Selected ${count} element(s)`);
-                    else toast.info('No elements in this zone');
+                    if (count > 0) toast.success(t('zonesPanel.selectedElements', { count }));
+                    else toast.info(t('zonesPanel.noElementsInZone'));
                   }}
                   exporting={exportingZoneId === zone.id}
                   exportProgress={exportProgress}
@@ -461,9 +444,8 @@ export function ZonesPanel({ onClose }: ZonesPanelProps) {
                       // unhandled rejection, so the user would sit in front of
                       // a control that reset itself and said nothing.
                       console.error('[zones] geometry export failed', error);
-                      toast.error(
-                        `Could not export ${zone.name}: ${error instanceof Error ? error.message : 'unknown error'}`,
-                      );
+                      const message = error instanceof Error ? error.message : 'unknown error';
+                      toast.error(t('zonesPanel.exportZoneError', { name: zone.name, message }));
                       return;
                     } finally {
                       exportingRef.current = false;
@@ -472,21 +454,24 @@ export function ZonesPanel({ onClose }: ZonesPanelProps) {
                     }
                     if (!result.ok) {
                       toast.error(result.reason === 'no-binding'
-                        ? 'The geometry engine in this build cannot split meshes'
+                        ? t('zonesPanel.exportNoBinding')
                         : result.reason === 'busy'
                           // Reachable by closing the panel mid-export and
                           // reopening it: this component's own guard resets,
                           // the run behind it does not.
-                          ? 'Another zone is still being cut. Wait for it to finish.'
-                          : 'Nothing to export: no loaded geometry reaches this zone');
+                          ? t('zonesPanel.exportBusy')
+                          : t('zonesPanel.exportNothingToExport'));
                       return;
                     }
+                    trackExportCompleted({ format: 'glb', surface: 'zones_panel' });
                     const { whole, cut, refused, noGeometry, elapsedMs } = result.summary;
-                    toast.success(
-                      `Exported ${whole} whole and ${cut} cut element(s) in ${(elapsedMs / 1000).toFixed(1)}s`
-                      + (refused > 0 ? `, ${refused} not cut (mesh not a proven closed solid, or the pieces did not add up)` : '')
-                      + (noGeometry > 0 ? `, ${noGeometry} with no loaded geometry` : ''),
-                    );
+                    const elapsed = (elapsedMs / 1000).toFixed(1);
+                    const successKey: TranslationKey = refused > 0 && noGeometry > 0
+                      ? 'zonesPanel.exportGeometrySuccessBoth'
+                      : refused > 0 ? 'zonesPanel.exportGeometrySuccessRefusedOnly'
+                        : noGeometry > 0 ? 'zonesPanel.exportGeometrySuccessNoGeometryOnly'
+                          : 'zonesPanel.exportGeometrySuccessPlain';
+                    toast.success(t(successKey, { whole, cut, elapsed, refused, noGeometry }));
                   }}
                 />
               ))}
@@ -501,9 +486,11 @@ export function ZonesPanel({ onClose }: ZonesPanelProps) {
       </div>
 
       {zoneAssignmentTiming && (
-        <div className="border-t p-2 text-[10px] text-muted-foreground">
-          Last assignment: {zoneAssignmentTiming.elementCount.toLocaleString()} element(s) x{' '}
-          {zoneAssignmentTiming.zoneSetCount} set(s) in {zoneAssignmentTiming.elapsedMs.toFixed(1)}ms
+        <div className="border-t p-2 text-2xs text-muted-foreground">
+          {t('zonesPanel.assignmentTimingLine', {
+            elementCount: zoneAssignmentTiming.elementCount.toLocaleString(),
+            zoneSetCount: zoneAssignmentTiming.zoneSetCount, elapsedMs: zoneAssignmentTiming.elapsedMs.toFixed(1),
+          })}
         </div>
       )}
     </div>

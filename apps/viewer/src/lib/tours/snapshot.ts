@@ -17,6 +17,8 @@
  */
 
 import type { ViewerState } from '@/store';
+import { activeBottomPanel, bottomPanelFlags } from '@/lib/panels/bottom-panels';
+import { releaseOwnedVisibility } from '@/lib/visibility/ownership';
 import type { UiSnapshot, UiSnapshotKey, ViewerStoreApi } from './types';
 
 export function captureUiSnapshot(store: ViewerStoreApi): UiSnapshot {
@@ -24,7 +26,7 @@ export function captureUiSnapshot(store: ViewerStoreApi): UiSnapshot {
   return {
     sidebarMode: s.sidebarMode,
     openSidePanel: s.bcfPanelVisible ? 'bcf'
-      : s.idsPanelVisible ? 'ids'
+      : s.idsPanelVisible ? 'validation'
       : s.lensPanelVisible ? 'lens'
       : s.clashPanelVisible ? 'clash'
       : s.comparePanelVisible ? 'compare'
@@ -32,7 +34,7 @@ export function captureUiSnapshot(store: ViewerStoreApi): UiSnapshot {
       : null,
     leftPanelCollapsed: s.leftPanelCollapsed,
     rightPanelCollapsed: s.rightPanelCollapsed,
-    bottomPanel: s.scriptPanelVisible ? 'script' : s.ganttPanelVisible ? 'gantt' : s.listPanelVisible ? 'lists' : null,
+    bottomPanel: activeBottomPanel(s),
     activeTool: s.activeTool,
     editEnabled: s.editEnabled,
     propertiesActiveTab: s.propertiesActiveTab,
@@ -43,6 +45,18 @@ export function captureUiSnapshot(store: ViewerStoreApi): UiSnapshot {
       selectedEntitiesSet: [...s.selectedEntitiesSet],
       selectedEntities: [...s.selectedEntities],
       selectedModelId: s.selectedModelId,
+      chartOwned: s.chartSelectionRevision != null
+        && s.chartSelectionRevision === s.selectionRevision,
+      chartSlice: s.chartSlice ? [...s.chartSlice] : null,
+      chartSliceSource: s.chartSliceSource,
+      chartSliceBuckets: s.chartSliceBuckets?.map((bucket) => ({
+        ...bucket,
+        ids: [...bucket.ids],
+      })) ?? null,
+      chartVisibilityOwned: s.chartSelectionRevision === s.selectionRevision
+        && s.chartVisibilityOwned
+        ? { channel: s.chartVisibilityOwned.channel, ids: [...s.chartVisibilityOwned.ids] }
+        : null,
     },
     activeStorey: s.activeStorey,
     selectedStoreys: [...s.selectedStoreys],
@@ -50,11 +64,11 @@ export function captureUiSnapshot(store: ViewerStoreApi): UiSnapshot {
       axis: s.sectionPlane.axis,
       position: s.sectionPlane.position,
       enabled: s.sectionPlane.enabled,
+      parked: s.sectionPlane.parked === true, // a cut left in the Section tool (#4910)
       flipped: s.sectionPlane.flipped,
       custom: s.sectionPlane.custom ? structuredClone(s.sectionPlane.custom) : undefined,
     },
     activeLensId: s.activeLensId,
-    toolbarStyle: s.toolbarStyle,
     ribbonTab: s.ribbonTab,
     ribbonCollapsed: s.ribbonCollapsed,
     camera: s.cameraCallbacks.getViewpoint?.() ?? null,
@@ -80,19 +94,19 @@ export function restoreUiSnapshot(
   // Panels first: showWorkspacePanel is the single sanctioned transition (it
   // re-docks floats/pop-outs and the exclusivity subscription tracks it).
   if (!keep.has('openSidePanel')) {
-    s.showWorkspacePanel(snapshot.openSidePanel ?? 'properties');
+    s.showWorkspacePanel(snapshot.openSidePanel ?? 'properties', 'programmatic');
   }
   if (!keep.has('bottomPanel')) {
     if (snapshot.bottomPanel) {
-      s.showWorkspacePanel(snapshot.bottomPanel);
+      s.showWorkspacePanel(snapshot.bottomPanel, 'programmatic');
     } else {
-      store.setState({ scriptPanelVisible: false, ganttPanelVisible: false, listPanelVisible: false });
+      store.setState(bottomPanelFlags(null));
     }
   }
 
   // Tool, then editEnabled explicitly - setActiveTool auto-flips it.
   if (!keep.has('activeTool')) {
-    s.setActiveTool(snapshot.activeTool);
+    s.setActiveTool(snapshot.activeTool, 'programmatic');
     s.setEditEnabled(snapshot.editEnabled);
   }
 
@@ -100,6 +114,8 @@ export function restoreUiSnapshot(
   // otherwise clear both channels (stale refs must never be applied).
   if (!keep.has('selection')) {
     if (modelsChanged) {
+      const current = store.getState();
+      releaseOwnedVisibility(current, current.chartVisibilityOwned);
       store.setState({
         selectedEntityId: null,
         selectedEntityIds: new Set<number>(),
@@ -109,17 +125,85 @@ export function restoreUiSnapshot(
         selectedModelId: null,
         selectedStoreys: new Set<number>(),
         activeStorey: null,
+        selectionRevision: store.getState().selectionRevision + 1,
+        chartSlice: null,
+        chartSliceSource: null,
+        chartSliceBuckets: null,
+        chartSelectionRevision: null,
+        chartVisibilityOwned: null,
+        chartVisibilityRevision: null,
       });
     } else {
-      store.setState({
-        selectedEntityId: snapshot.selection.selectedEntityId,
-        selectedEntityIds: new Set(snapshot.selection.selectedEntityIds),
-        selectedEntity: snapshot.selection.selectedEntity,
-        selectedEntitiesSet: new Set(snapshot.selection.selectedEntitiesSet),
-        selectedEntities: [...snapshot.selection.selectedEntities],
-        selectedModelId: snapshot.selection.selectedModelId,
-        selectedStoreys: new Set(snapshot.selectedStoreys),
-        activeStorey: snapshot.activeStorey,
+      const capturedChartOwned = snapshot.selection.chartOwned
+        && snapshot.selection.chartSlice !== null
+        && snapshot.selection.chartSliceSource !== null
+        && snapshot.selection.chartSliceBuckets !== null;
+      const capturedChartVisibility = capturedChartOwned
+        ? snapshot.selection.chartVisibilityOwned
+        : null;
+      if (!capturedChartVisibility) {
+        const current = store.getState();
+        releaseOwnedVisibility(current, current.chartVisibilityOwned);
+      }
+      store.setState((state) => {
+        const selectionRevision = state.selectionRevision + 1;
+        return {
+          selectedEntityId: snapshot.selection.selectedEntityId,
+          selectedEntityIds: new Set(snapshot.selection.selectedEntityIds),
+          selectedEntity: snapshot.selection.selectedEntity,
+          selectedEntitiesSet: new Set(snapshot.selection.selectedEntitiesSet),
+          selectedEntities: [...snapshot.selection.selectedEntities],
+          selectedModelId: snapshot.selection.selectedModelId,
+          selectedStoreys: new Set(snapshot.selectedStoreys),
+          activeStorey: snapshot.activeStorey,
+          selectionRevision,
+          ...(capturedChartOwned
+            ? {
+                chartSlice: new Set(snapshot.selection.chartSlice ?? []),
+                chartSliceSource: snapshot.selection.chartSliceSource,
+                chartSliceBuckets: snapshot.selection.chartSliceBuckets?.map((bucket) => ({
+                  ...bucket,
+                  ids: [...bucket.ids],
+                })) ?? null,
+                chartSelectionRevision: selectionRevision,
+                ...(capturedChartVisibility
+                  ? {
+                      isolatedEntities: capturedChartVisibility.channel === 'isolate'
+                        ? new Set(capturedChartVisibility.ids)
+                        : null,
+                      ghostExceptEntities: capturedChartVisibility.channel === 'ghost'
+                        ? new Set(capturedChartVisibility.ids)
+                        : null,
+                      ...(capturedChartVisibility.channel === 'isolate'
+                        ? { hiddenEntities: new Set<number>() }
+                        : {}),
+                      idsFocusVisibilityOwned: null,
+                      clashVisibilityOwned: null,
+                      basketVisibilityOwned: null,
+                      chartVisibilityOwned: {
+                        channel: capturedChartVisibility.channel,
+                        ids: new Set(capturedChartVisibility.ids),
+                      },
+                      chartVisibilityRevision: state.visibilityRevision + 1,
+                    }
+                  : {
+                      chartVisibilityOwned: null,
+                      // The captured chart selection had no live visibility
+                      // claim (for example, an IDS isolation replaced it).
+                      // Keep the remount guard closed so restoring the logical
+                      // slice cannot overwrite that foreign presentation.
+                      chartVisibilityRevision: null,
+                    }),
+              }
+            : {
+                chartSlice: null,
+                chartSliceSource: null,
+                chartSliceBuckets: null,
+                chartSelectionRevision: null,
+                chartVisibilityOwned: null,
+                chartVisibilityRevision: null,
+              }),
+        };
       });
     }
   }
@@ -134,6 +218,7 @@ export function restoreUiSnapshot(
         axis: snapshot.sectionPlane.axis,
         position: snapshot.sectionPlane.position,
         enabled: snapshot.sectionPlane.enabled,
+        parked: snapshot.sectionPlane.parked,
         flipped: snapshot.sectionPlane.flipped,
         custom: snapshot.sectionPlane.custom,
       },
@@ -148,20 +233,11 @@ export function restoreUiSnapshot(
     s.setPropertiesActiveTab(snapshot.propertiesActiveTab);
   }
 
-  // Toolbar: restored TRANSIENTLY (setState, not setToolbarStyle) so a tour
-  // never writes the stored preference. Tours move the toolbar to teach it,
-  // which is a preview, not a choice — localStorage must only ever change
-  // when the user works the toolbar control themselves. Restoring through
-  // the persisting setter would also overwrite a deliberate switch made
-  // DURING the tour with the pre-tour value.
-  if (!keep.has('toolbarStyle') && store.getState().toolbarStyle !== snapshot.toolbarStyle) {
-    store.setState({ toolbarStyle: snapshot.toolbarStyle });
-  }
   if (!keep.has('ribbonTab') && store.getState().ribbonTab !== snapshot.ribbonTab) {
     s.setRibbonTab(snapshot.ribbonTab);
   }
   // `setRibbonCollapsed` persists as well, so restore it transiently for the
-  // same reason as the toolbar above — the ribbon tour expands the band to
+  // ribbon tour expands the band to
   // point at things in it, and that preview must not overwrite the choice of
   // someone who keeps it collapsed.
   if (!keep.has('ribbonCollapsed') && store.getState().ribbonCollapsed !== snapshot.ribbonCollapsed) {

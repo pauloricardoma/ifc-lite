@@ -1,6 +1,7 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+import { assertModelTranslation } from '../model-translation.js';
 
 /**
  * Manages point cloud assets in the renderer.
@@ -16,18 +17,21 @@
  */
 
 import type { PointCloudAsset } from '@ifc-lite/geometry';
+import { PointCloudHandleIds } from './point-cloud-handle-ids.js';
+import { PointCloudPlacements, unionPointCloudBounds } from './point-cloud-placement.js';
+import { PointCloudVisibility } from './point-cloud-visibility.js';
 import { PointRenderPipeline, POINT_QUAD_VERTS, POINT_UNIFORM_SIZE } from './point-pipeline.js';
 import {
   appendChunkToNode,
   createNode,
-  destroyNode,
-  transformAabb,
+  destroyNode, clearOwnedPointCloudNodes,
   uploadAssetToGpu,
   type PointCloudChunkInput,
   type PointCloudNode,
   type PointCloudNodeMeta,
 } from './point-cloud-node.js';
 import type { PointCloudSpatialIndex } from './point-cloud-spatial-index.js';
+import { buildPickNodeSources, resolvePickedAsset } from './point-cloud-pick-sources.js';
 import { buildRayQuerySources } from './point-cloud-ray-transform.js';
 import {
   normalizeClassMask,
@@ -35,6 +39,8 @@ import {
   type PointColorMode,
   type PointSizeMode,
 } from './point-cloud-uniforms.js';
+import type { RelativeToEyeFrame } from '../relative-to-eye.js';
+import type { ClipBox } from '../types.js';
 
 export interface ResolvedSectionPlane {
   normal: [number, number, number];
@@ -59,10 +65,13 @@ export type { PointColorMode, PointSizeMode };
 export interface PointCloudDrawState {
   /** column-major view-projection matrix (16 floats) */
   viewProj: Float32Array;
-  /** Section plane already resolved by the main render path. */
+  /** Shared RTE camera frame; point paths may not derive another rebase. */
+  relativeToEyeFrame: RelativeToEyeFrame;
+  /** Section plane resolved by the main render path. */
   sectionPlane?: ResolvedSectionPlane | null;
-  /** Viewport size in pixels — needed by the splat shader to convert
-   *  pixel sizes into clip-space offsets. */
+  /** Main mesh crop box, packed in the same RTE camera frame. */
+  clipBox?: ClipBox | null;
+  /** Viewport pixels for splat shader clip-space offsets. */
   viewport?: { width: number; height: number };
 }
 
@@ -132,9 +141,12 @@ type NodeOwner = 'ifcx' | 'streamed';
 export class PointCloudRenderer {
   private device: GPUDevice;
   private pipeline: PointRenderPipeline;
+  private placements = new PointCloudPlacements();
+  private modelTranslations = new Map<number, readonly [number, number, number]>();
   private nodes = new Map<number, PointCloudNode>();
   private nodeOwners = new Map<number, NodeOwner>();
-  private nextHandleId = 1;
+  private readonly visibility = new PointCloudVisibility();
+  readonly handleIds: PointCloudHandleIds;
   private uniformScratch = new Float32Array(POINT_UNIFORM_SIZE / 4);
   private uniformScratchU32 = new Uint32Array(this.uniformScratch.buffer);
   private options: ResolvedPointCloudRenderOptions = {
@@ -154,9 +166,11 @@ export class PointCloudRenderer {
     colorFormat: GPUTextureFormat,
     depthFormat: GPUTextureFormat,
     sampleCount: number,
+    startHandleId = 1, // see PointCloudHandleIds — Renderer.teardown() passes its watermark here
   ) {
     this.device = device;
     this.pipeline = new PointRenderPipeline(device, colorFormat, depthFormat, sampleCount);
+    this.handleIds = new PointCloudHandleIds(startHandleId);
   }
 
   setOptions(opts: PointCloudRenderOptions): void {
@@ -186,9 +200,7 @@ export class PointCloudRenderer {
   }
 
   getOptions(): Readonly<ResolvedPointCloudRenderOptions> {
-    // Snapshot the mask — handing out the live Uint32Array would let
-    // callers mutate renderer visibility without going through
-    // setOptions.
+    // Snapshot the mask so callers cannot mutate visibility outside setOptions.
     return { ...this.options, classMask: this.options.classMask.slice() };
   }
 
@@ -201,15 +213,18 @@ export class PointCloudRenderer {
   setAssets(assets: ReadonlyArray<PointCloudAsset>): void {
     this.clearOwner('ifcx');
     for (const asset of assets) {
+      if (asset.chunk.pointCount === 0) continue; // streamed identity descriptors carry no geometry
       this.addAsset(asset);
     }
   }
 
   addAsset(asset: PointCloudAsset): PointCloudAssetHandle {
     const node = uploadAssetToGpu(this.device, this.pipeline, asset);
-    const id = this.nextHandleId++;
+    const id = this.handleIds.allocate();
     this.nodes.set(id, node);
     this.nodeOwners.set(id, 'ifcx');
+    this.visibility.add(id);
+    this.placements.translate(node, this.modelTranslations.get(asset.modelIndex ?? 0) ?? [0, 0, 0]);
     return { id };
   }
 
@@ -218,9 +233,10 @@ export class PointCloudRenderer {
   /** Open an empty asset that chunks will be appended to. */
   beginAsset(meta: PointCloudNodeMeta): PointCloudAssetHandle {
     const node = createNode(this.device, this.pipeline, meta);
-    const id = this.nextHandleId++;
+    const id = this.handleIds.allocate();
     this.nodes.set(id, node);
     this.nodeOwners.set(id, 'streamed');
+    this.visibility.add(id);
     return { id };
   }
 
@@ -244,6 +260,7 @@ export class PointCloudRenderer {
     destroyNode(node);
     this.nodes.delete(handle.id);
     this.nodeOwners.delete(handle.id);
+    this.visibility.remove(handle.id);
   }
 
   /**
@@ -260,46 +277,66 @@ export class PointCloudRenderer {
     node.meta.expressId = newExpressId >>> 0;
   }
 
-  /**
-   * Set (or clear) a streamed asset's per-vertex GPU model matrix
-   * (issue #1804: point-cloud ↔ `IfcMapConversion` alignment). Pass
-   * `null` to reset to identity. Takes effect on the next frame's
-   * uniform write — no GPU buffer rewrite needed, so toggling alignment
-   * on/off is cheap.
-   */
-  setAssetTransform(handle: PointCloudAssetHandle, matrix: Float32Array | null): void {
+  /** Import alignment composes with manual placement without reuploading points. */
+  setAssetTransform(handle: PointCloudAssetHandle, matrix: Float32Array | Float64Array | null): void {
     const node = this.nodes.get(handle.id);
     if (!node) return;
-    node.model = matrix ?? undefined;
+    this.placements.align(node, matrix);
+  }
+
+  setAssetTranslation(handle: PointCloudAssetHandle, translation: readonly [number, number, number]): void {
+    const node = this.nodes.get(handle.id);
+    if (node) this.placements.translate(node, translation);
+  }
+
+  /** Hide a resident asset from rendering and both point-cloud pick paths. */
+  setAssetVisible(handle: PointCloudAssetHandle, visible: boolean): boolean { return this.visibility.set(handle.id, visible, this.nodes.has(handle.id)); }
+
+  validateModelTranslation(modelIndex: number, translation: readonly [number, number, number]): void {
+    assertModelTranslation(modelIndex, translation);
+    for (const [id, node] of this.nodes) if (this.nodeOwners.get(id) === 'ifcx' && (node.meta.modelIndex ?? 0) === modelIndex) {
+      this.placements.validateTranslation(node, translation);
+    }
+  }
+
+  setModelTranslation(modelIndex: number, translation: readonly [number, number, number]): void {
+    this.validateModelTranslation(modelIndex, translation);
+    this.modelTranslations.set(modelIndex, [...translation]);
+    for (const [id, node] of this.nodes) {
+      if (this.nodeOwners.get(id) === 'ifcx' && (node.meta.modelIndex ?? 0) === modelIndex) {
+        this.placements.translate(node, translation);
+      }
+    }
+  }
+
+  getAssetTransform(handle: PointCloudAssetHandle): Float32Array | undefined { const matrix = this.nodes.get(handle.id)?.model; return matrix ? new Float32Array(matrix) : undefined; }
+
+  getPlacementBounds(modelIndex: number, handle?: PointCloudAssetHandle) {
+    // Model-specific framing must obey whole-scene visibility: a hidden scan cannot move the camera.
+    const nodes = handle
+      ? this.visibility.visible(handle.id) ? [this.nodes.get(handle.id)] : []
+      : [...this.nodes].filter(([id, node]) => this.visibility.visible(id)
+        && this.nodeOwners.get(id) === 'ifcx' && (node.meta.modelIndex ?? 0) === modelIndex)
+        .map(([, node]) => node);
+    return unionPointCloudBounds(nodes);
   }
 
   // ─── lifecycle / queries ─────────────────────────────────────────────────
 
   clear(): void {
-    for (const node of this.nodes.values()) {
-      destroyNode(node);
-    }
-    this.nodes.clear();
-    this.nodeOwners.clear();
+    // Clearing assets is independent of model placement. Full renderer teardown
+    // discards this renderer instance and its offset map together.
+    clearOwnedPointCloudNodes(this.nodes, this.nodeOwners);
+    this.visibility.clear();
   }
 
   private clearOwner(owner: NodeOwner): void {
-    for (const [id, ownerKind] of this.nodeOwners.entries()) {
-      if (ownerKind !== owner) continue;
-      const node = this.nodes.get(id);
-      if (node) destroyNode(node);
-      this.nodes.delete(id);
-      this.nodeOwners.delete(id);
-    }
+    for (const [id, current] of this.nodeOwners) if (current === owner) this.visibility.remove(id);
+    clearOwnedPointCloudNodes(this.nodes, this.nodeOwners, owner);
   }
 
-  hasAssets(): boolean {
-    return this.nodes.size > 0;
-  }
-
-  getNodeCount(): number {
-    return this.nodes.size;
-  }
+  hasAssets(): boolean { return this.nodes.size > 0; }
+  getNodeCount(): number { return this.nodes.size; }
 
   /**
    * Iterate every uploaded node. Exposed so the deviation compute
@@ -320,28 +357,7 @@ export class PointCloudRenderer {
   }
 
   getBounds(): { min: [number, number, number]; max: [number, number, number] } | null {
-    if (this.nodes.size === 0) return null;
-    let minX = Infinity, minY = Infinity, minZ = Infinity;
-    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-    let any = false;
-    for (const node of this.nodes.values()) {
-      if (!Number.isFinite(node.bounds.min[0])) continue;
-      any = true;
-      // Report WORLD-space extents: fold the per-asset model matrix
-      // (issue #1804 IfcMapConversion alignment) into the chunk-space
-      // bounds, so the height-ramp min/max and the viewer's scene
-      // bounds/framing agree with where the vertex shader actually
-      // places the points. Identity/no-matrix nodes pass through as-is.
-      const b = transformAabb(node.bounds, node.model);
-      if (b.min[0] < minX) minX = b.min[0];
-      if (b.min[1] < minY) minY = b.min[1];
-      if (b.min[2] < minZ) minZ = b.min[2];
-      if (b.max[0] > maxX) maxX = b.max[0];
-      if (b.max[1] > maxY) maxY = b.max[1];
-      if (b.max[2] > maxZ) maxZ = b.max[2];
-    }
-    if (!any) return null;
-    return { min: [minX, minY, minZ], max: [maxX, maxY, maxZ] };
+    return unionPointCloudBounds(this.visibleNodes());
   }
 
   /**
@@ -375,20 +391,20 @@ export class PointCloudRenderer {
     const bounds = this.getBounds();
     const heightMin = bounds ? bounds.min[1] : 0;
     const heightMax = bounds ? bounds.max[1] : 1;
-    // Default to 1×1 if the caller didn't supply a viewport — keeps the
-    // shader from dividing by zero in adaptive-world mode and degrades
-    // gracefully to "all points the same fixed-px size".
+    // A missing viewport uses 1×1, avoiding adaptive-world division by zero.
     const viewportW = Math.max(1, state.viewport?.width ?? 1);
     const viewportH = Math.max(1, state.viewport?.height ?? 1);
 
-    for (const node of this.nodes.values()) {
-      writePointCloudUniforms(
+    for (const [id, node] of this.nodes) {
+      if (!this.visibility.visible(id)) continue;
+      const drawable = writePointCloudUniforms(
         this.device,
         this.uniformScratch,
         this.uniformScratchU32,
         node,
         {
           viewProj: state.viewProj,
+          relativeToEyeFrame: state.relativeToEyeFrame,
           fixedColor: this.options.fixedColor,
           colorMode: this.options.colorMode,
           sizeMode: this.options.sizeMode,
@@ -398,6 +414,7 @@ export class PointCloudRenderer {
           sectionNormal: normal,
           sectionDist: distance,
           sectionEnabled: enabled,
+          clipBox: state.clipBox,
           heightMin,
           heightMax,
           viewportW,
@@ -408,6 +425,7 @@ export class PointCloudRenderer {
           deviationHalfRange: this.options.deviationRange.halfRange,
         },
       );
+      if (!drawable) continue;
       pass.setBindGroup(0, node.bindGroup);
       for (const chunk of node.chunks) {
         pass.setVertexBuffer(0, chunk.vertexBuffer);
@@ -419,59 +437,37 @@ export class PointCloudRenderer {
     }
   }
 
-  /**
-   * Resolve a packed objectId rgba8 sample back to the asset that owns it.
-   * Returns null when the sample doesn't match any asset's expressId.
-   */
+  /** Resolve an objectId rgba8 sample, or null when it matches no asset. */
   resolvePick(expressId: number): { handle: PointCloudAssetHandle; meta: PointCloudNodeMeta } | null {
-    for (const [id, node] of this.nodes.entries()) {
-      if ((node.meta.expressId >>> 0) === (expressId >>> 0)) {
-        return { handle: { id }, meta: node.meta };
-      }
-    }
-    return null;
+    return resolvePickedAsset(this.nodes.entries(), expressId);
   }
 
-  /**
-   * Snapshot of nodes shaped for the picker — only the data the GPU
-   * picking pass actually needs (expressId, modelIndex, chunk vertex
-   * buffers + counts). Returns a fresh array; callers may iterate
-   * freely without worrying about mutation during a pick.
-   */
+  /** Picker snapshot uses each visible splat's exact model matrix. */
   getPickNodes(): Array<{
     expressId: number;
     modelIndex?: number;
+    model?: Float32Array;
+    rteOrigin?: [number, number, number];
     chunks: Array<{ vertexBuffer: GPUBuffer; pointCount: number }>;
   }> {
-    const out: Array<{ expressId: number; modelIndex?: number; chunks: Array<{ vertexBuffer: GPUBuffer; pointCount: number }> }> = [];
-    for (const node of this.nodes.values()) {
-      if (node.pointCount === 0) continue;
-      out.push({
-        expressId: node.meta.expressId,
-        modelIndex: node.meta.modelIndex,
-        chunks: node.chunks.map((c) => ({ vertexBuffer: c.vertexBuffer, pointCount: c.pointCount })),
-      });
-    }
-    return out;
+    return buildPickNodeSources(this.visibleNodes());
   }
 
-  /**
-   * Snapshot of every node's CPU spatial index (issue #1860), for the
-   * measure tool's ray-based point snapping (`RaycastEngine`). Skips
-   * empty nodes, mirroring `getPickNodes`. Each source carries the
-   * CURRENT class visibility bitmask so the query skips points the
-   * splat shader is hiding (#1783) — snapping to invisible scan data
-   * would otherwise silently corrupt measurements.
-   */
+  /** CPU spatial-index snapshot for measurement snapping (#1860), with the
+   * live visibility mask so hidden points cannot corrupt measurements (#1783). */
   getRayQuerySources(): Array<{
     expressId: number;
     modelIndex?: number;
     index: PointCloudSpatialIndex;
     classMask: Uint32Array;
-    model?: Float32Array;
+    model?: Float32Array | Float64Array;
   }> {
     // `classMask` is a live reference — read synchronously within one
     // query, and `setOptions` replaces (never mutates in place) the array.
-    return buildRayQuerySources(this.nodes.values(), this.options.classMask);
+    return buildRayQuerySources(this.visibleNodes(), this.options.classMask);
+  }
+
+  private *visibleNodes(): IterableIterator<PointCloudNode> {
+    for (const [id, node] of this.nodes) if (this.visibility.visible(id)) yield node;
   }
 }

@@ -206,10 +206,38 @@ describe('StepExporter', () => {
       applyMutations: true,
     });
 
+    // Description was edited to '' — a real, present-but-empty IfcLabel
+    // (#4931), not the source's original absent-attribute `$`.
     expect(decode(result.content)).toContain(
-      "#1=IFCCOLUMN('g',$,'Updated Name',$,'CSV Type',$,$,'CSV-TAG',.USERDEFINED.);",
+      "#1=IFCCOLUMN('g',$,'Updated Name','','CSV Type',$,$,'CSV-TAG',.USERDEFINED.);",
     );
     expect(result.stats.modifiedEntityCount).toBe(1);
+  });
+
+  // #4931: a pending edit setting a STRING-typed root attribute to '' used to
+  // serialize as `$` (`serializeStringSlot` folded '' into the same branch as
+  // the null marker), collapsing an explicit empty IfcLabel to absent. STEP —
+  // and the read side fixed in #4881/#4909 — distinguish '' (present, empty)
+  // from $ (absent), so only a literal `$` edit may write the null token.
+  it('writes a pending edit to an empty string as the STEP empty-string token, not $', () => {
+    const dataStore = buildMockDataStore([
+      [1, 'IFCCOLUMN', "#1=IFCCOLUMN('g',$,'Old Name','Old Description','Old Type',$,$,'OLD-TAG',.COLUMN.);"],
+    ]);
+    const mutationView = new LiveMutablePropertyView(null, 'model-1');
+    mutationView.setAttribute(1, 'Description', '');
+
+    const exporter = new StepExporter(dataStore, mutationView);
+    const result = exporter.export({ schema: 'IFC4', applyMutations: true });
+
+    expect(decode(result.content)).toContain(
+      "#1=IFCCOLUMN('g',$,'Old Name','','Old Type',$,$,'OLD-TAG',.COLUMN.);",
+    );
+    // A genuinely unset attribute — never edited — still exports as `$`
+    // (ObjectType/BuildingType were never touched here); this fix does not
+    // turn every `$` into `''`, only an explicit edit to an empty string.
+    expect(decode(result.content)).not.toContain(
+      "#1=IFCCOLUMN('g',$,'Old Name',$,'Old Type',$,$,'OLD-TAG',.COLUMN.);",
+    );
   });
 
   // `IfcTask`'s attribute order DIFFERS between IFC2X3 and IFC4: IFC2X3 has
@@ -460,6 +488,145 @@ describe('StepExporter', () => {
     const content = decode(result.content);
 
     expect(content).not.toContain('#3=IFCDOOR');
+    expect(findDanglingRefs(content)).toEqual([]);
+  });
+
+  // The fourth route by which a line vanishes under visibleOnly is not a
+  // dangling reference at all: IfcMapConversion.SourceCRS points AT the
+  // representation context and nothing points back, so the forward closure
+  // simply never reaches it. This pins step-collection.ts's wiring of
+  // collectGeoreferencingEntities — the unit tests in georef-closure.test.ts
+  // stay green with that call-site deleted, this one does not.
+  it('retains IFCMAPCONVERSION and IFCPROJECTEDCRS in a visibleOnly export of a georeferenced model', () => {
+    const dataStore = buildMockDataStore([
+      [1, 'IFCPROJECT', "#1=IFCPROJECT('1ys5Xwuxz8gPJk6N$NGhA1',$,'P',$,$,$,$,(#4),$);"],
+      [2, 'IFCWALL', "#2=IFCWALL('1ys5Xwuxz8gPJk6N$NGhA2',$,'Wall',$,$,$,$,$);"],
+      [3, 'IFCWALL', "#3=IFCWALL('1ys5Xwuxz8gPJk6N$NGhA3',$,'HiddenWall',$,$,$,$,$);"],
+      [4, 'IFCGEOMETRICREPRESENTATIONCONTEXT', "#4=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-5,$,$);"],
+      [5, 'IFCMAPCONVERSION', '#5=IFCMAPCONVERSION(#4,#6,160000.,450000.,0.,$,$,$);'],
+      [6, 'IFCPROJECTEDCRS', "#6=IFCPROJECTEDCRS('EPSG:2056',$,$,$,$,$,$);"],
+    ]);
+
+    const result = new StepExporter(dataStore, liveView(dataStore)).export({
+      schema: 'IFC4',
+      visibleOnly: true,
+      hiddenEntityIds: new Set([3]),
+    });
+    const content = decode(result.content);
+
+    expect(content).toContain('#5=IFCMAPCONVERSION');
+    expect(content).toContain('#6=IFCPROJECTEDCRS');
+    expect(content).not.toContain('HiddenWall');
+    expect(findDanglingRefs(content)).toEqual([]);
+  });
+
+  // The fifth route, and PR #3698's own follow-up: `collectStyleEntities`
+  // (`style-closure.ts`) rescues an `IFCPRESENTATIONLAYERASSIGNMENT` into the
+  // closure when ANY of its `AssignedItems` is already visible — but a layer
+  // assignment routinely spans MANY products (one CAD layer naming every
+  // wall's shape representation), so a layer shared by a visible and a
+  // hidden wall must not drag the hidden wall's geometry back in with it.
+  it('does not leak a hidden product’s geometry through a layer assignment it shares with a visible one', () => {
+    const dataStore = buildMockDataStore([
+      [1, 'IFCPROJECT', "#1=IFCPROJECT('1ys5Xwuxz8gPJk6N$NGhA1',$,'P',$,$,$,$,$,$);"],
+      [2, 'IFCWALL', "#2=IFCWALL('1ys5Xwuxz8gPJk6N$NGhA2',$,'VisibleWall',$,$,$,$,#10);"],
+      [3, 'IFCWALL', "#3=IFCWALL('1ys5Xwuxz8gPJk6N$NGhA3',$,'HiddenWall',$,$,$,$,#99);"],
+      [10, 'IFCSHAPEREPRESENTATION', "#10=IFCSHAPEREPRESENTATION($,'Body','SweptSolid',(#11));"],
+      [11, 'IFCEXTRUDEDAREASOLID', '#11=IFCEXTRUDEDAREASOLID(#12,#13,#14,3.);'],
+      [12, 'IFCARBITRARYCLOSEDPROFILEDEF', "#12=IFCARBITRARYCLOSEDPROFILEDEF(.AREA.,$,#15);"],
+      [13, 'IFCAXIS2PLACEMENT3D', '#13=IFCAXIS2PLACEMENT3D($,$,$);'],
+      [14, 'IFCDIRECTION', '#14=IFCDIRECTION((0.,0.,1.));'],
+      [15, 'IFCPOLYLINE', '#15=IFCPOLYLINE((#16,#17));'],
+      [16, 'IFCCARTESIANPOINT', '#16=IFCCARTESIANPOINT((0.,0.));'],
+      [17, 'IFCCARTESIANPOINT', '#17=IFCCARTESIANPOINT((1.,1.));'],
+      // #99/#98 belong exclusively to the HIDDEN wall — never reachable from
+      // any visible root except through the shared layer assignment below.
+      [99, 'IFCSHAPEREPRESENTATION', "#99=IFCSHAPEREPRESENTATION($,'Body','SweptSolid',(#98));"],
+      [98, 'IFCEXTRUDEDAREASOLID', '#98=IFCEXTRUDEDAREASOLID(#12,#13,#14,3.);'],
+      // One CAD layer naming BOTH walls' shape representations.
+      [20, 'IFCPRESENTATIONLAYERASSIGNMENT', "#20=IFCPRESENTATIONLAYERASSIGNMENT('Layer_Walls',$,(#10,#99),$);"],
+    ]);
+
+    const result = new StepExporter(dataStore, liveView(dataStore)).export({
+      schema: 'IFC4',
+      visibleOnly: true,
+      hiddenEntityIds: new Set([3]),
+    });
+    const content = decode(result.content);
+
+    // The hidden wall's own line is correctly omitted (pre-existing behaviour).
+    expect(content).not.toContain('HiddenWall');
+    // The shared layer assignment is still rescued — that is PR #3698's
+    // whole purpose — and the VISIBLE wall's geometry survives intact.
+    expect(content).toContain('IFCPRESENTATIONLAYERASSIGNMENT');
+    expect(content).toContain('#10=IFCSHAPEREPRESENTATION');
+    expect(content).toContain('#11=IFCEXTRUDEDAREASOLID');
+    // RED before the fix: the forward walk from the rescued #20 pulled in
+    // the HIDDEN wall's own shape representation and solid too.
+    expect(content).not.toContain('#99=IFCSHAPEREPRESENTATION');
+    expect(content).not.toContain('#98=IFCEXTRUDEDAREASOLID');
+    // The rescued layer assignment's OWN line must not keep naming #99 now
+    // that #99 has no defining line — `filterHiddenRefsFromRelationshipLine`
+    // narrows AssignedItems down to the surviving member instead of shipping
+    // a dangling `#99` (step-source-iteration.ts's new STYLE_RESCUE_TYPES arm).
+    const layerLine = content.split('\n').find((line) => line.startsWith('#20='));
+    expect(layerLine).toContain('#10');
+    expect(layerLine).not.toContain('#99');
+    expect(findDanglingRefs(content)).toEqual([]);
+  });
+
+  // Control: a layer assignment naming ONLY visible items must still be
+  // rescued with its FULL closure — nothing in the fix should make the
+  // rescue itself more conservative than PR #3698 intended.
+  it('control: a layer assignment naming only visible items keeps its full closure', () => {
+    const dataStore = buildMockDataStore([
+      [1, 'IFCPROJECT', "#1=IFCPROJECT('1ys5Xwuxz8gPJk6N$NGhA1',$,'P',$,$,$,$,$,$);"],
+      [2, 'IFCWALL', "#2=IFCWALL('1ys5Xwuxz8gPJk6N$NGhA2',$,'VisibleWall',$,$,$,$,#10);"],
+      [10, 'IFCSHAPEREPRESENTATION', "#10=IFCSHAPEREPRESENTATION($,'Body','SweptSolid',(#11));"],
+      [11, 'IFCEXTRUDEDAREASOLID', '#11=IFCEXTRUDEDAREASOLID($,$,$,3.);'],
+      [20, 'IFCPRESENTATIONLAYERASSIGNMENT', "#20=IFCPRESENTATIONLAYERASSIGNMENT('Layer_Walls',$,(#10),$);"],
+    ]);
+
+    const result = new StepExporter(dataStore, liveView(dataStore)).export({
+      schema: 'IFC4',
+      visibleOnly: true,
+      hiddenEntityIds: new Set<number>(),
+    });
+    const content = decode(result.content);
+
+    expect(content).toContain('#20=IFCPRESENTATIONLAYERASSIGNMENT');
+    expect(content).toContain('#10=IFCSHAPEREPRESENTATION');
+    expect(content).toContain('#11=IFCEXTRUDEDAREASOLID');
+    expect(findDanglingRefs(content)).toEqual([]);
+  });
+
+  // Control: a normal FULL export (no `visibleOnly`) is completely
+  // unaffected — `mayNameOmittedRefs` is false with no hidden ids, an
+  // overlay, geometry exclusion or unreadable ref in play, so the new
+  // STYLE_RESCUE_TYPES writer branch never even runs, and `collectStyleEntities`
+  // is never called at all (`pass.allowedEntityIds` stays null).
+  it('control: a full export with a shared layer assignment is unaffected by the visibleOnly fix', () => {
+    const dataStore = buildMockDataStore([
+      [1, 'IFCPROJECT', "#1=IFCPROJECT('1ys5Xwuxz8gPJk6N$NGhA1',$,'P',$,$,$,$,$,$);"],
+      [2, 'IFCWALL', "#2=IFCWALL('1ys5Xwuxz8gPJk6N$NGhA2',$,'VisibleWall',$,$,$,$,#10);"],
+      [3, 'IFCWALL', "#3=IFCWALL('1ys5Xwuxz8gPJk6N$NGhA3',$,'OtherWall',$,$,$,$,#99);"],
+      [10, 'IFCSHAPEREPRESENTATION', "#10=IFCSHAPEREPRESENTATION($,'Body','SweptSolid',(#11));"],
+      [11, 'IFCEXTRUDEDAREASOLID', '#11=IFCEXTRUDEDAREASOLID($,$,$,3.);'],
+      [99, 'IFCSHAPEREPRESENTATION', "#99=IFCSHAPEREPRESENTATION($,'Body','SweptSolid',(#98));"],
+      [98, 'IFCEXTRUDEDAREASOLID', '#98=IFCEXTRUDEDAREASOLID($,$,$,3.);'],
+      [20, 'IFCPRESENTATIONLAYERASSIGNMENT', "#20=IFCPRESENTATIONLAYERASSIGNMENT('Layer_Walls',$,(#10,#99),$);"],
+    ]);
+
+    const result = new StepExporter(dataStore, liveView(dataStore)).export({ schema: 'IFC4' });
+    const content = decode(result.content);
+
+    // Nothing is hidden under a plain full export — every entity ships,
+    // including BOTH walls' geometry, byte-identical to the source records.
+    expect(content).toContain('VisibleWall');
+    expect(content).toContain('OtherWall');
+    expect(content).toContain('#99=IFCSHAPEREPRESENTATION');
+    expect(content).toContain('#98=IFCEXTRUDEDAREASOLID');
+    expect(content).toContain("#20=IFCPRESENTATIONLAYERASSIGNMENT('Layer_Walls',$,(#10,#99),$);");
     expect(findDanglingRefs(content)).toEqual([]);
   });
 
@@ -861,7 +1028,7 @@ describe('StepExporter', () => {
   // `@ifc-lite/data`: `entities-ifc2x3.ts` vs `entities-ifc4.ts`), so there is
   // no arity difference for THESE FOUR classes to exercise. What this test
   // instead confirms is that the closure/bridge mechanism — which is purely
-  // SYNTACTIC (byte/text parsing of the STEP line, `splitTopLevelArgs`) for a
+  // SYNTACTIC (byte/text parsing of the STEP line, `splitTopLevelListItems`) for a
   // SOURCE-backed relationship, and consults `getAttributeNamesAcrossSchemas`
   // (a version-invariant, IFC4-pinned-then-union resolver) only for a NAMED
   // attribute override — behaves identically when `dataStore.schemaVersion`
@@ -1063,7 +1230,7 @@ describe('StepExporter', () => {
   // at the SAME indices (4/5) in both schemas — the shorter arity is a
   // TRAILING difference — so this exercises the same retarget shape as the
   // IFC4 tests above, just on the schema that genuinely has fewer attributes
-  // to parse `splitTopLevelArgs` over.
+  // to parse `splitTopLevelListItems` over.
   it('does not leave a dangling ref for a retargeted IfcRelSequence on an IFC2X3 source (a genuine arity difference)', () => {
     const dataStore = buildMockDataStore([
       [1, 'IFCPROJECT', "#1=IFCPROJECT('1ys5Xwuxz8gPJk6N$NGhA1',$,'P',$,$,$,$,$,$);"],

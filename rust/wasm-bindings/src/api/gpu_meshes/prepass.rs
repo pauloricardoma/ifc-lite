@@ -6,17 +6,8 @@ use crate::api::IfcAPI;
 use js_sys::Function;
 use wasm_bindgen::prelude::*;
 
-/// Reduce a 128-bit geometry hash to the 32-bit worker-affinity key the job
-/// stream carries. Jobs with the SAME key are routed to the same geometry worker,
-/// so their (byte-identical) geometry is meshed once per model instead of once per
-/// worker — the win the per-worker content-dedup cache can't get across separate
-/// WASM realms. A 32-bit collision only co-locates two unrelated geometries on one
-/// worker (harmless: the cache still keys them apart), so xor-folding the lanes is
-/// plenty.
-#[inline]
-fn fold_u128_to_u32(h: u128) -> u32 {
-    (h as u32) ^ ((h >> 32) as u32) ^ ((h >> 64) as u32) ^ ((h >> 96) as u32)
-}
+use super::prepass_affinity::fold_u128_to_u32;
+use super::prepass_discovery::is_disabled;
 
 // The per-submesh #858 palette split lives inside the canonical per-element
 // producer (`ifc_lite_processing::element`) — shared with the native pipeline.
@@ -62,19 +53,16 @@ impl IfcAPI {
         // the FULL entity index, so the single-stage `SmallFileSingle` ladder is
         // correct. It also seeds the decoder so nothing downstream re-pays the
         // IFCPROJECT hunt.
-        let rtc_jobs: Vec<_> = pre_pass
-            .simple_jobs
-            .iter()
-            .take(25)
-            .chain(pre_pass.complex_jobs.iter().take(25))
-            .copied()
-            .collect();
+        //
+        // No job list: this used to hand the detector 25 simple + 25 complex
+        // jobs, a window nothing else in the codebase shared, and the frame
+        // came out different from the one the overlays and the native pipeline
+        // picked for the same file (#4611).
         let meta = resolve_stream_meta(
             MetaMode::SmallFileSingle,
             content,
             pre_pass.project_id,
             pre_pass.site_position,
-            &rtc_jobs,
             &mut decoder,
         );
 
@@ -84,7 +72,7 @@ impl IfcAPI {
         // Serialize jobs as flat Uint32Array: [id, start, end, id, start, end, ...]
         let jobs_flat = js_sys::Uint32Array::new_with_length((total_jobs * 3) as u32);
         let mut idx = 0u32;
-        for &(id, start, end, _ifc_type) in pre_pass
+        for &(id, start, end, _) in pre_pass
             .simple_jobs
             .iter()
             .chain(pre_pass.complex_jobs.iter())
@@ -97,12 +85,13 @@ impl IfcAPI {
 
         // Flat wire encodings from the shared resolver: styles (layered
         // precedence), voids, and the #407 material colour lists.
-        let (style_ids_vec, style_colors_vec) = ifc_lite_processing::prepass::flat_styles_rgba8(
-            &pre_pass.resolved,
-            &mut decoder,
-        );
-        let (void_keys_vec, void_counts_vec, void_values_vec) =
-            ifc_lite_processing::prepass::flat_voids(&pre_pass.resolved.void_index);
+        let (style_ids_vec, style_colors_vec, style_finishes_vec) =
+            ifc_lite_processing::prepass::flat_styles_with_finishes(
+                &pre_pass.resolved,
+                &pre_pass.geometry_finishes,
+                &mut decoder,
+            );
+        let (void_keys_vec, void_counts_vec, void_values_vec) = ifc_lite_processing::prepass::flat_voids(&pre_pass.resolved.void_index);
         let (mat_ids_vec, mat_counts_vec, mat_colors_vec) =
             ifc_lite_processing::prepass::flat_material_colors(
                 &pre_pass.resolved.element_material_colors,
@@ -130,6 +119,8 @@ impl IfcAPI {
         crate::api::set_js_prop(&result, "voidValues", &void_values);
         crate::api::set_js_prop(&result, "styleIds", &style_ids);
         crate::api::set_js_prop(&result, "styleColors", &style_colors);
+        // #5582: `[metallic, roughness]` per style id, NaN when unauthored.
+        crate::api::set_js_prop(&result, "styleFinishes", &js_sys::Float32Array::from(style_finishes_vec.as_slice()));
         // #407/#913 §2.3: per-element material colour lists so the batch path
         // can run the transparent/opaque sub-mesh alternation.
         crate::api::set_js_prop(&result, "materialElementIds", &material_element_ids);
@@ -187,6 +178,7 @@ impl IfcAPI {
             None,
             false,
             None,
+            false,
         )
     }
 
@@ -201,12 +193,13 @@ impl IfcAPI {
         prebuilt: Option<ifc_lite_core::ColumnarEntityIndex>,
         external_styles: bool,
         columns: Option<super::prepass_discovery::IndexColumns<'_>>,
+        compute_source_fingerprint: bool,
     ) -> Result<JsValue, JsValue> {
         let prebuilt_arc: Option<std::sync::Arc<ifc_lite_core::ColumnarEntityIndex>> =
             prebuilt.map(std::sync::Arc::new);
         // Load START on the streaming pre-pass path (see build_pre_pass_once).
         self.reset_pipeline_diagnostics();
-        use ifc_lite_core::{has_geometry_by_name, EntityDecoder, EntityScanner, IfcType};
+        use ifc_lite_core::{has_geometry_by_name, keyword_eq, EntityDecoder, EntityScanner, IfcType};
         use ifc_lite_geometry::GeometryRouter;
         use ifc_lite_processing::stream_meta::{resolve_stream_meta, MetaMode};
 
@@ -234,7 +227,13 @@ impl IfcAPI {
         // one-time cost) instead of a fatal up-front OOM. Ordinary (<2GB) files
         // are unaffected — their `len/50` estimate stays under the cap.
         const PREPASS_INDEX_RESERVE_CAP: usize = 40_000_000; // ~0.5GB reserved
-        let estimated = (content.len() / 50).min(PREPASS_INDEX_RESERVE_CAP);
+        // #3985: a prebuilt index serves every lookup and is retained below;
+        // its unused staging map must not reserve another source-sized table.
+        let estimated = if prebuilt_arc.is_some() {
+            0
+        } else {
+            (content.len() / 50).min(PREPASS_INDEX_RESERVE_CAP)
+        };
         let mut entity_index: rustc_hash::FxHashMap<u32, (usize, usize)> =
             rustc_hash::FxHashMap::with_capacity_and_hasher(estimated, Default::default());
 
@@ -249,9 +248,8 @@ impl IfcAPI {
         // (referenced RepresentationMaps, instantiated type ids, the material-
         // layer index). Collect the spans they need HERE, during the one scan the
         // pre-pass already runs, then build + ship each ONCE below (`rel_associates_material`
-        // spans are already stashed in `prepass_spans`).
+        // and `defines_by_type` spans are already stashed in `prepass_spans`).
         let mut mapped_item_spans: Vec<(u32, usize, usize)> = Vec::new();
-        let mut rel_defines_by_type_spans: Vec<(u32, usize, usize)> = Vec::new();
         // #957/#962: IfcTypeProduct candidates (id, span, resolved type), stashed
         // here so the orphan-type-geometry pass reuses THIS scan instead of a
         // second full EntityScanner walk over the file. `IfcType` is captured
@@ -271,7 +269,24 @@ impl IfcAPI {
         // `chunk_size` jobs awaiting flush. After `meta` the buffer is
         // drained as the first jobs event; subsequent flushes happen at
         // every `chunk_size` boundary.
-        const RTC_SAMPLE_THRESHOLD: usize = 50;
+        // Not a sample window: the RTC window is the file's (#4611). This is
+        // only how many geometry jobs must be buffered before the meta event
+        // is worth dispatching.
+        const META_EMIT_JOB_THRESHOLD: usize = 50;
+
+        // Dispatch the `meta` event. One writer for both emission points (the
+        // mid-scan one and the tail one) so they cannot ship different property
+        // sets for the same bundle.
+        fn emit_meta(
+            on_event: &Function,
+            meta_res: &ifc_lite_processing::stream_meta::StreamMeta,
+        ) -> Result<(), JsValue> {
+            let meta = js_sys::Object::new();
+            crate::api::set_js_prop(&meta, "type", &"meta".into());
+            super::prepass_sharded::set_stream_meta_props(&meta, meta_res);
+            on_event.call1(&JsValue::NULL, &meta.into())?;
+            Ok(())
+        }
 
         // Emit a chunk of jobs to JS as a Uint32Array of [id, start, end] triples,
         // PLUS a parallel `affinity` Uint32Array (one precomputed key per job). The
@@ -326,7 +341,6 @@ impl IfcAPI {
             prepass_spans = d.prepass_spans;
             prepass_spans.styled_items = Vec::new(); // shards resolve styles
             mapped_item_spans = d.mapped_item_spans;
-            rel_defines_by_type_spans = d.rel_defines_by_type_spans;
             type_candidate_spans = d.type_candidate_spans;
             has_layer_set = d.has_layer_set;
         } else {
@@ -335,88 +349,60 @@ impl IfcAPI {
                 entity_index.insert(id, (start, end)); // prebuilt mode: map unused
             }
 
-            match type_name {
-                "IFCPROJECT" => {
-                    if project_id.is_none() {
-                        project_id = Some(id);
-                    }
+            if prepass_spans.stash(type_name, id, start, end) {
+                // span-list record, nothing else to do for it
+            } else if keyword_eq(type_name, "IFCPROJECT") {
+                if project_id.is_none() {
+                    project_id = Some(id);
                 }
-                "IFCSITE" => {
-                    if site_position.is_none() {
-                        site_position = Some((id, start, end));
-                    }
-                    let ifc_type = ifc_lite_core::legacy_aware_ifc_type(type_name);
+            } else if keyword_eq(type_name, "IFCSITE") {
+                if site_position.is_none() {
+                    site_position = Some((id, start, end));
+                }
+                let ifc_type = ifc_lite_core::ifc_type_from_keyword(type_name);
+                buffered_jobs.push((id, start, end, ifc_type));
+                total_jobs += 1;
+            } else if keyword_eq(type_name, "IFCMAPPEDITEM") {
+                mapped_item_spans.push((id, start, end));
+            } else if keyword_eq(type_name, "IFCMATERIALLAYERSET")
+                || keyword_eq(type_name, "IFCMATERIALLAYERSETUSAGE")
+            {
+                has_layer_set = true;
+            } else {
+                // #957/#962: an IfcTypeProduct subtype (its geometry is
+                // authored on RepresentationMaps, not the type itself, so it
+                // never matches `has_geometry_by_name`). Stash it for the
+                // orphan-type pass; the RepresentationMaps attr-6 decode +
+                // referenced-filter happens later in
+                // `collect_type_geometry_jobs_from_spans`.
+                if let Some(type_ty) = ifc_lite_core::type_product_ifc_type(type_name) {
+                    type_candidate_spans.push((id, start, end, type_ty));
+                }
+                if has_geometry_by_name(type_name) && !is_disabled(&disabled_types, type_name) {
+                    let ifc_type = ifc_lite_core::ifc_type_from_keyword(type_name);
+                    // We don't bucket by simple/complex here — the host
+                    // distributes work across N geometry workers anyway, and
+                    // nothing else reads the split: RTC sampling has its own
+                    // file-scoped window (#4611).
                     buffered_jobs.push((id, start, end, ifc_type));
                     total_jobs += 1;
-                }
-                "IFCSTYLEDITEM" => {
-                    prepass_spans.styled_items.push((id, start, end));
-                }
-                "IFCINDEXEDCOLOURMAP" => {
-                    prepass_spans.indexed_colour_maps.push((id, start, end));
-                }
-                "IFCMATERIALDEFINITIONREPRESENTATION" => {
-                    prepass_spans.material_def_reprs.push((id, start, end));
-                }
-                "IFCRELASSOCIATESMATERIAL" => {
-                    prepass_spans.rel_associates_material.push((id, start, end));
-                }
-                "IFCRELVOIDSELEMENT" => {
-                    prepass_spans.void_rels.push((id, start, end));
-                }
-                "IFCRELFILLSELEMENT" => {
-                    prepass_spans.fills_rels.push((id, start, end));
-                }
-                "IFCRELAGGREGATES" => {
-                    prepass_spans.aggregate_rels.push((id, start, end));
-                }
-                "IFCMAPPEDITEM" => {
-                    mapped_item_spans.push((id, start, end));
-                }
-                "IFCRELDEFINESBYTYPE" => {
-                    rel_defines_by_type_spans.push((id, start, end));
-                    prepass_spans.defines_by_type.push((id, start, end)); // material type-fallback
-                }
-                "IFCMATERIALLAYERSET" | "IFCMATERIALLAYERSETUSAGE" => {
-                    has_layer_set = true;
-                }
-                _ => {
-                    // #957/#962: an IfcTypeProduct subtype (its geometry is
-                    // authored on RepresentationMaps, not the type itself, so it
-                    // never matches `has_geometry_by_name`). Stash it for the
-                    // orphan-type pass; the RepresentationMaps attr-6 decode +
-                    // referenced-filter happens later in
-                    // `collect_type_geometry_jobs_from_spans`.
-                    if let Some(type_ty) = ifc_lite_core::type_product_ifc_type(type_name) {
-                        type_candidate_spans.push((id, start, end, type_ty));
-                    }
-                    if has_geometry_by_name(type_name) && !disabled_types.contains(type_name) {
-                        let ifc_type = ifc_lite_core::legacy_aware_ifc_type(type_name);
-                        // We don't bucket by simple/complex here — the host
-                        // distributes work across N geometry workers anyway,
-                        // and the simple/complex split was a heuristic for
-                        // RTC sampling that we now resolve once after
-                        // RTC_SAMPLE_THRESHOLD jobs have been collected.
-                        buffered_jobs.push((id, start, end, ifc_type));
-                        total_jobs += 1;
-                    } else if !disabled_types.contains(type_name)
-                        && ifc_lite_core::is_representationless_spatial_container_by_name(
-                            type_name,
-                        )
-                        && ifc_lite_core::nth_attribute_is_present(&content[start..end], 6)
-                    {
-                        // #1910: mirrors the identical exception in
-                        // `rust/processing/src/processor/mod.rs` — a spatial
-                        // container `has_geometry_by_name` blocks by name
-                        // (`IfcBuilding` et al.) that exceptionally carries a
-                        // real `Representation` (e.g. a DGM/terrain export
-                        // with no `IfcBuildingElement` children at all) must
-                        // still be scheduled for meshing, or the browser
-                        // viewer renders nothing despite a correct scene tree.
-                        let ifc_type = ifc_lite_core::legacy_aware_ifc_type(type_name);
-                        buffered_jobs.push((id, start, end, ifc_type));
-                        total_jobs += 1;
-                    }
+                } else if !is_disabled(&disabled_types, type_name)
+                    && ifc_lite_core::is_representationless_spatial_container_by_name(
+                        type_name,
+                    )
+                    && ifc_lite_core::nth_attribute_is_present(&content[start..end], 6)
+                {
+                    // #1910: mirrors the identical exception in
+                    // `rust/processing/src/processor/mod.rs` — a spatial
+                    // container `has_geometry_by_name` blocks by name
+                    // (`IfcBuilding` et al.) that exceptionally carries a
+                    // real `Representation` (e.g. a DGM/terrain export
+                    // with no `IfcBuildingElement` children at all) must
+                    // still be scheduled for meshing, or the browser
+                    // viewer renders nothing despite a correct scene tree.
+                    let ifc_type = ifc_lite_core::ifc_type_from_keyword(type_name);
+                    buffered_jobs.push((id, start, end, ifc_type));
+                    total_jobs += 1;
                 }
             }
 
@@ -430,7 +416,7 @@ impl IfcAPI {
             // substring search and resolves partial-index chains against a
             // full index instead of silently defaulting (a millimetre model
             // resolved as metres renders 1000× oversized).
-            if !meta_emitted && buffered_jobs.len() >= RTC_SAMPLE_THRESHOLD {
+            if !meta_emitted && buffered_jobs.len() >= META_EMIT_JOB_THRESHOLD {
                 // MID-SCAN meta emission — the streaming win (~17 s → ~3 s
                 // time-to-first-geometry on a 986 MB file). The RESOLUTION logic
                 // (3-stage RTC ladder: partial-index detect → full-index
@@ -438,42 +424,33 @@ impl IfcAPI {
                 // placement-bounds last resort) lives in the shared
                 // `resolve_stream_meta` so it cannot drift from the tail /
                 // `buildPrePassOnce` paths. Emission STAYS HERE, unchanged: the
-                // meta event is dispatched the moment RTC_SAMPLE_THRESHOLD jobs
+                // meta event is dispatched the moment META_EMIT_JOB_THRESHOLD jobs
                 // are buffered, near the top of the file, so workers spin up
                 // early. Do NOT move this to a post-scan point — that regresses
                 // every large file.
+                // The buffered jobs are the TRIGGER for emitting here, not the
+                // RTC sample window: the window is the file's (#4611). What the
+                // ladder still needs from the scan is how far the index reaches,
+                // which is the end of the last job buffered.
+                //
                 // PREBUILT index (sharded): full index available, so run the
                 // single-stage full-index ladder (what the partial ladder
                 // escalates to anyway) — no mid-scan full-rescan detour.
-                let meta_res = if let Some(pi) = &prebuilt_arc {
-                    let mut decoder =
-                        EntityDecoder::with_arc_columnar_index(content, pi.clone());
-                    resolve_stream_meta(
+                let scanned_through = buffered_jobs.last().map_or(0, |&(_, _, end, _)| end);
+                let (mut decoder, mode) = match &prebuilt_arc {
+                    Some(pi) => (
+                        EntityDecoder::with_arc_columnar_index(content, pi.clone()),
                         MetaMode::SmallFileSingle,
-                        content,
-                        project_id,
-                        site_position,
-                        &buffered_jobs,
-                        &mut decoder,
-                    )
-                } else {
-                    let mut decoder = EntityDecoder::with_index(content, entity_index.clone());
-                    resolve_stream_meta(
-                        MetaMode::StreamingPartial,
-                        content,
-                        project_id,
-                        site_position,
-                        &buffered_jobs,
-                        &mut decoder,
-                    )
+                    ),
+                    None => (
+                        EntityDecoder::with_index(content, entity_index.clone()),
+                        MetaMode::StreamingPartial { scanned_through },
+                    ),
                 };
+                let meta_res =
+                    resolve_stream_meta(mode, content, project_id, site_position, &mut decoder);
                 plane_angle_to_radians = meta_res.plane_angle_to_radians;
-
-                // Emit meta event.
-                let meta = js_sys::Object::new();
-                crate::api::set_js_prop(&meta, "type", &"meta".into());
-                super::prepass_sharded::set_stream_meta_props(&meta, &meta_res);
-                on_event.call1(&JsValue::NULL, &meta.into())?;
+                emit_meta(on_event, &meta_res)?;
                 meta_emitted = true;
                 // Jobs stay buffered through the scan; the post-scan pass
                 // emits them with exact geometry-hash affinity keys (workers
@@ -489,40 +466,25 @@ impl IfcAPI {
             // Build a decoder lazily for unit/RTC/site lookups. With a
             // sub-50-job file the scan is essentially instant anyway, so the
             // full entity index is already complete here — the single-stage
-            // `SmallFileSingle` ladder (one detect_rtc_offset_with_fallback) is
+            // `SmallFileSingle` ladder (one detect_rtc_offset_for_file) is
             // correct, sharing its resolution with `buildPrePassOnce`.
-            let meta_jobs = &buffered_jobs[..buffered_jobs.len().min(RTC_SAMPLE_THRESHOLD)];
-            let meta_res = if let Some(pi) = &prebuilt_arc {
-                let mut decoder = EntityDecoder::with_arc_columnar_index(content, pi.clone());
-                resolve_stream_meta(
-                    MetaMode::SmallFileSingle,
-                    content,
-                    project_id,
-                    site_position,
-                    meta_jobs,
-                    &mut decoder,
-                )
-            } else {
-                let mut decoder = EntityDecoder::with_index(content, entity_index.clone());
-                resolve_stream_meta(
-                    MetaMode::SmallFileSingle,
-                    content,
-                    project_id,
-                    site_position,
-                    &buffered_jobs,
-                    &mut decoder,
-                )
+            let mut decoder = match &prebuilt_arc {
+                Some(pi) => EntityDecoder::with_arc_columnar_index(content, pi.clone()),
+                None => EntityDecoder::with_index(content, entity_index.clone()),
             };
+            let meta_res = resolve_stream_meta(
+                MetaMode::SmallFileSingle,
+                content,
+                project_id,
+                site_position,
+                &mut decoder,
+            );
             plane_angle_to_radians = meta_res.plane_angle_to_radians;
-
-            let meta = js_sys::Object::new();
-            crate::api::set_js_prop(&meta, "type", &"meta".into());
-            super::prepass_sharded::set_stream_meta_props(&meta, &meta_res);
-            on_event.call1(&JsValue::NULL, &meta.into())?;
+            emit_meta(on_event, &meta_res)?;
         }
 
-        let oversized_id_count = scanner.skipped_oversized_ids(); // #3395, reported + exported below
-        ifc_lite_core::report_oversized_ids(oversized_id_count);
+        let (oversized_id_count, malformed_record_found) = (scanner.skipped_oversized_ids(), scanner.malformed_record_start().is_some()); // #3395/#3695, reported here and exported below
+        ifc_lite_core::report_scan_diagnostics(oversized_id_count, malformed_record_found);
         // Cache for processGeometryBatch reuse. Convert the scan's FxHashMap
         // into a compact columnar index (sorted u32 columns + binary search):
         // ~229 MB vs the hashmap's ~436 MB on a 19.1 M-entity model (#1682).
@@ -569,6 +531,7 @@ impl IfcAPI {
             crate::api::set_js_prop(&index_event, "starts", &starts_arr);
             crate::api::set_js_prop(&index_event, "lengths", &lengths_arr);
             crate::api::set_js_prop(&index_event, "oversizedIdCount", &(oversized_id_count as f64).into()); // #3395: the parser worker sees only these columns
+            crate::api::set_js_prop(&index_event, "malformedRecordFound", &malformed_record_found.into()); // #3695
             on_event.call1(&JsValue::NULL, &index_event.into())?;
         }
 
@@ -588,7 +551,14 @@ impl IfcAPI {
                     defer_attached_styles: false,
                 },
             );
-            let styles_event = super::prepass_sharded::styles_payload(&resolved, &mut decoder);
+            // #5582: the finishes walk the same styled-item spans; this path
+            // never runs in defer mode, so no styled item is skipped.
+            let geometry_finishes = ifc_lite_processing::prepass::resolve_geometry_finishes(
+                &prepass_spans.styled_items,
+                &mut decoder,
+            );
+            let styles_event =
+                super::prepass_sharded::styles_payload(&resolved, &geometry_finishes, &mut decoder);
             crate::api::set_js_prop(&styles_event, "type", &"styles".into());
             on_event.call1(&JsValue::NULL, &styles_event.into())?;
         }
@@ -609,7 +579,7 @@ impl IfcAPI {
             );
         let instantiated_type_ids =
             crate::api::styling::build_instantiated_type_ids_from_spans(
-                &rel_defines_by_type_spans,
+                &prepass_spans.defines_by_type,
                 &mut decoder,
             );
         // #1623 Phase 3 don't-bake plan: the RepresentationMap ids an IfcMappedItem
@@ -710,24 +680,18 @@ impl IfcAPI {
         {
             let mut akey_decoder =
                 EntityDecoder::with_arc_columnar_index(content, entity_index_arc.clone());
-            let akey_router = GeometryRouter::new();
+            let akey_router = GeometryRouter::new(); // not drained: meshes nothing (issue_3821_auxiliary_routers_mesh_nothing.rs)
             let rest = &buffered_jobs[first_n..];
-            let mut affinity: Vec<u32> = Vec::with_capacity(rest.len());
-            for &(id, _s, _e, _t) in rest {
-                let key = match akey_decoder.decode_by_id(id) {
+            super::affinity_chunks::emit_affinity_chunks(rest, chunk_size,
+                |&(id, _s, _e, _)| match akey_decoder.decode_by_id(id) {
                     Ok(ent) => akey_router
                         .geometry_routing_key(&ent, &mut akey_decoder)
                         .map(fold_u128_to_u32)
                         .unwrap_or(id),
                     Err(_) => id,
-                };
-                affinity.push(key);
-            }
-            for (jobs_chunk, aff_chunk) in
-                rest.chunks(chunk_size).zip(affinity.chunks(chunk_size))
-            {
-                emit_jobs_chunk(on_event, jobs_chunk, aff_chunk)?;
-            }
+                },
+                |jobs_chunk, affinity| emit_jobs_chunk(on_event, jobs_chunk, affinity),
+            )?;
         }
         buffered_jobs.clear();
 
@@ -751,7 +715,7 @@ impl IfcAPI {
         // type-library (#957) geometry, so skip producing it at load when the
         // caller asks (the Types view re-loads on demand).
         if !skip_type_geometry
-            && memchr::memmem::find(content, b"IFCREPRESENTATIONMAP").is_some()
+            && ifc_lite_core::find_keyword(content, b"IFCREPRESENTATIONMAP").is_some()
         {
             let type_jobs = crate::api::styling::collect_type_geometry_jobs_from_spans(
                 &mapped_item_spans,
@@ -771,6 +735,11 @@ impl IfcAPI {
         let done = js_sys::Object::new();
         crate::api::set_js_prop(&done, "type", &"complete".into());
         crate::api::set_js_prop(&done, "totalJobs", &(total_jobs as f64).into());
+        if compute_source_fingerprint {
+            // Whole original source, including malformed/unparsed trailing bytes.
+            let key = super::source_fingerprint::source_fingerprint(data);
+            crate::api::set_js_prop(&done, "sourceContentKey", &key.into());
+        }
         on_event.call1(&JsValue::NULL, &done.into())?;
 
         Ok(JsValue::UNDEFINED)
@@ -778,20 +747,5 @@ impl IfcAPI {
 }
 
 #[cfg(test)]
-mod affinity_tests {
-    use super::fold_u128_to_u32;
-
-    #[test]
-    fn fold_is_stable_and_mixes_all_lanes() {
-        // Identical hashes fold to identical keys (routing stickiness).
-        assert_eq!(fold_u128_to_u32(0x1234_5678_9abc_def0_1111_2222_3333_4444),
-                   fold_u128_to_u32(0x1234_5678_9abc_def0_1111_2222_3333_4444));
-        // A change confined to ANY single 32-bit lane changes the key — so two
-        // geometries differing only in their high bits still route apart.
-        let base = 0u128;
-        assert_ne!(fold_u128_to_u32(base), fold_u128_to_u32(base | (1u128 << 0)));
-        assert_ne!(fold_u128_to_u32(base), fold_u128_to_u32(base | (1u128 << 40)));
-        assert_ne!(fold_u128_to_u32(base), fold_u128_to_u32(base | (1u128 << 72)));
-        assert_ne!(fold_u128_to_u32(base), fold_u128_to_u32(base | (1u128 << 120)));
-    }
-}
+#[path = "prepass_tests.rs"]
+mod prepass_tests;

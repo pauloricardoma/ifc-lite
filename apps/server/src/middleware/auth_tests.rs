@@ -12,7 +12,7 @@
 //! direction, the one that actually protects the compute routes.
 
 use super::*;
-use axum::{body::Body, http::Request, routing::get, Router};
+use axum::{body::Body, http::{Request, StatusCode}, routing::get, Router};
 use tower::ServiceExt;
 
 /// A `Config` with everything at a fixed, irrelevant value except the token —
@@ -24,6 +24,7 @@ fn config_with_token(token: Option<&str>) -> Arc<Config> {
         cache_dir: String::from("/tmp/ifc-lite-auth-tests"),
         max_file_size_mb: 500,
         request_timeout_secs: 300,
+        stream_idle_timeout_secs: 600,
         worker_threads: 1,
         initial_batch_size: 100,
         max_batch_size: 1000,

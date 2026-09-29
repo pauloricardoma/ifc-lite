@@ -11,6 +11,9 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, memo } from 'react';
+import { useTranslation } from '@/i18n';
+import { ChatResizeHandle } from './ChatResizeHandle';
+import { shortcutLabel } from '@/lib/commands/shortcut-label';
 import {
   Play,
   Save,
@@ -25,13 +28,11 @@ import {
   Info,
   AlertTriangle,
   Bot,
-  PanelRightClose,
-  PanelRightOpen,
-  Undo2,
-  Redo2,
+  Undo2, Redo2,
   Wrench,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { IconButton } from '@/components/ui/icon-button';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import {
   DropdownMenu,
@@ -60,67 +61,10 @@ import { ChatPanel } from './ChatPanel';
 import { PromoteToolDialog } from '@/components/extensions/PromoteToolDialog';
 import { useOptionalExtensionHost } from '@/sdk/ExtensionHostProvider';
 import type { LogEntry } from '@/store/slices/scriptSlice';
+import { useScriptState, formatLogArgs } from './scriptPanelState';
 
-interface ScriptPanelProps {
-  onClose?: () => void;
-}
-
-/** Consolidated script state selector — single subscription instead of 14 */
-function useScriptState() {
-  const editorContent = useViewerStore((s) => s.scriptEditorContent);
-  const setEditorContent = useViewerStore((s) => s.setScriptEditorContent);
-  const executionState = useViewerStore((s) => s.scriptExecutionState);
-  const lastResult = useViewerStore((s) => s.scriptLastResult);
-  const lastError = useViewerStore((s) => s.scriptLastError);
-  const savedScripts = useViewerStore((s) => s.savedScripts);
-  const activeScriptId = useViewerStore((s) => s.activeScriptId);
-  const editorDirty = useViewerStore((s) => s.scriptEditorDirty);
-  const createScript = useViewerStore((s) => s.createScript);
-  const saveActiveScript = useViewerStore((s) => s.saveActiveScript);
-  const deleteScript = useViewerStore((s) => s.deleteScript);
-  const setActiveScriptId = useViewerStore((s) => s.setActiveScriptId);
-  const deleteConfirmId = useViewerStore((s) => s.scriptDeleteConfirmId);
-  const setDeleteConfirmId = useViewerStore((s) => s.setScriptDeleteConfirmId);
-  const setScriptCursorContext = useViewerStore((s) => s.setScriptCursorContext);
-  const registerScriptEditorApplyAdapter = useViewerStore((s) => s.registerScriptEditorApplyAdapter);
-  const scriptCanUndo = useViewerStore((s) => s.scriptCanUndo);
-  const scriptCanRedo = useViewerStore((s) => s.scriptCanRedo);
-  const setScriptHistoryState = useViewerStore((s) => s.setScriptHistoryState);
-  const undoScriptEditor = useViewerStore((s) => s.undoScriptEditor);
-  const redoScriptEditor = useViewerStore((s) => s.redoScriptEditor);
-  const queueChatRepairRequest = useViewerStore((s) => s.queueChatRepairRequest);
-  const chatToolReady = useViewerStore((s) => s.chatToolReady);
-  const setChatToolReady = useViewerStore((s) => s.setChatToolReady);
-
-  return {
-    editorContent,
-    setEditorContent,
-    executionState,
-    lastResult,
-    lastError,
-    savedScripts,
-    activeScriptId,
-    editorDirty,
-    createScript,
-    saveActiveScript,
-    deleteScript,
-    setActiveScriptId,
-    deleteConfirmId,
-    setDeleteConfirmId,
-    setScriptCursorContext,
-    registerScriptEditorApplyAdapter,
-    scriptCanUndo,
-    scriptCanRedo,
-    setScriptHistoryState,
-    undoScriptEditor,
-    redoScriptEditor,
-    queueChatRepairRequest,
-    chatToolReady,
-    setChatToolReady,
-  };
-}
-
-export function ScriptPanel({ onClose }: ScriptPanelProps) {
+export function ScriptPanel() {
+  const { t } = useTranslation();
   const {
     editorContent,
     setEditorContent,
@@ -271,7 +215,7 @@ export function ScriptPanel({ onClose }: ScriptPanelProps) {
         <div className="flex items-center gap-1 px-2 py-1.5 border-b shrink-0">
           <FileCode2 className="h-4 w-4 text-muted-foreground shrink-0" />
           <span className="text-sm font-medium truncate">
-            {activeScript ? activeScript.name : 'Script Editor'}
+            {activeScript ? activeScript.name : t('scriptPanel.header.defaultTitle')}
             {editorDirty && <span className="text-muted-foreground ml-1">*</span>}
           </span>
           <div className="flex-1" />
@@ -280,9 +224,12 @@ export function ScriptPanel({ onClose }: ScriptPanelProps) {
           {savedScripts.length > 0 && (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
-                <Button variant="ghost" size="icon-xs" aria-label="Select saved script">
+                <IconButton
+                  label={t('scriptPanel.header.selectScriptAriaLabel')}
+                  size="icon-xs"
+                >
                   <ChevronDown className="h-3.5 w-3.5" />
-                </Button>
+                </IconButton>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
                 {savedScripts.map((s) => (
@@ -302,7 +249,7 @@ export function ScriptPanel({ onClose }: ScriptPanelProps) {
                     className="text-destructive"
                   >
                     <Trash2 className="h-3.5 w-3.5 mr-2" />
-                    Delete
+                    {t('scriptPanel.header.deleteMenuItem')}
                   </DropdownMenuItem>
                 )}
               </DropdownMenuContent>
@@ -310,27 +257,16 @@ export function ScriptPanel({ onClose }: ScriptPanelProps) {
           )}
 
           {/* AI Chat toggle */}
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant={chatPanelVisible ? 'default' : 'ghost'}
-                size="icon-xs"
-                onClick={toggleChat}
-                className={cn(chatPanelVisible && 'bg-blue-500 hover:bg-blue-600 text-white')}
-                aria-label={chatPanelVisible ? 'Hide AI Chat' : 'Show AI Chat'}
-                {...tourAnchor(TOUR_ANCHORS.scriptChatToggle)}
-              >
-                <Bot className="h-3.5 w-3.5" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>{chatPanelVisible ? 'Hide AI Chat' : 'Show AI Chat'}</TooltipContent>
-          </Tooltip>
-
-          {onClose && (
-            <Button variant="ghost" size="icon-xs" aria-label="Close" onClick={onClose}>
-              <X className="h-3.5 w-3.5" />
-            </Button>
-          )}
+          <IconButton
+            label={chatPanelVisible ? t('scriptPanel.header.hideAiChat') : t('scriptPanel.header.showAiChat')}
+            variant={chatPanelVisible ? 'default' : 'ghost'}
+            size="icon-xs"
+            onClick={toggleChat}
+            className={cn(chatPanelVisible && 'bg-blue-500 hover:bg-blue-600 text-white')}
+            {...tourAnchor(TOUR_ANCHORS.scriptChatToggle)}
+          >
+            <Bot className="h-3.5 w-3.5" />
+          </IconButton>
         </div>
 
         {/* Post-authoring "install as tool" banner — surfaces right
@@ -345,9 +281,9 @@ export function ScriptPanel({ onClose }: ScriptPanelProps) {
                 <Wrench className="h-4 w-4" />
               </div>
               <div className="flex-1 min-w-0">
-                <div className="text-xs font-semibold">This script is ready</div>
-                <div className="text-[11px] text-muted-foreground">
-                  Install it as a one-click button in your toolbar.
+                <div className="text-xs font-semibold">{t('scriptPanel.toolReady.title')}</div>
+                <div className="text-2xs text-muted-foreground">
+                  {t('scriptPanel.toolReady.description')}
                 </div>
               </div>
               <Button
@@ -359,17 +295,16 @@ export function ScriptPanel({ onClose }: ScriptPanelProps) {
                 className="shrink-0"
               >
                 <Wrench className="mr-1 h-3.5 w-3.5" />
-                Install as tool
+                {t('scriptPanel.toolReady.installButton')}
               </Button>
-              <Button
+              <IconButton
+                label={t('scriptPanel.toolReady.dismissAriaLabel')}
                 size="icon-xs"
-                variant="ghost"
                 onClick={() => setChatToolReady(null)}
-                aria-label="Dismiss"
                 className="shrink-0"
               >
                 <X className="h-3.5 w-3.5" />
-              </Button>
+              </IconButton>
             </div>
           </div>
         )}
@@ -387,20 +322,20 @@ export function ScriptPanel({ onClose }: ScriptPanelProps) {
                 {...tourAnchor(TOUR_ANCHORS.scriptRun)}
               >
                 <Play className="h-3.5 w-3.5" />
-                Run
+                {t('scriptPanel.toolbar.runButton')}
               </Button>
             </TooltipTrigger>
-            <TooltipContent>Run script (Ctrl+Enter)</TooltipContent>
+            <TooltipContent>{t('scriptPanel.toolbar.runTooltip', { keys: shortcutLabel('script.run') })}</TooltipContent>
           </Tooltip>
 
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button variant="ghost" size="icon-xs" aria-label="Save script" onClick={handleSave}>
-                <Save className="h-3.5 w-3.5" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>Save (Ctrl+S)</TooltipContent>
-          </Tooltip>
+          <IconButton
+            label={t('scriptPanel.toolbar.saveAriaLabel')}
+            tooltip={t('scriptPanel.toolbar.saveTooltip', { keys: shortcutLabel('script.save') })}
+            size="icon-xs"
+            onClick={handleSave}
+          >
+            <Save className="h-3.5 w-3.5" />
+          </IconButton>
 
           {/* Save-as-tool — the explicit, always-visible bridge from a
               one-shot script to a persistent toolbar button. A labelled
@@ -413,88 +348,76 @@ export function ScriptPanel({ onClose }: ScriptPanelProps) {
                 size="sm"
                 onClick={() => setPromoteOpen(true)}
                 disabled={!canPromote}
-                aria-label="Save this script as a persistent tool"
+                aria-label={t('scriptPanel.toolbar.saveAsToolAriaLabel')}
                 className="gap-1"
               >
                 <Wrench className="h-3.5 w-3.5" />
-                Save as tool
+                {t('scriptPanel.toolbar.saveAsToolButton')}
               </Button>
             </TooltipTrigger>
-            <TooltipContent>
-              Turn this script into a permanent one-click button in your toolbar
-            </TooltipContent>
+            <TooltipContent>{t('scriptPanel.toolbar.saveAsToolTooltip')}</TooltipContent>
           </Tooltip>
 
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                onClick={undoScriptEditor}
-                disabled={!scriptCanUndo}
-                aria-label="Undo"
-              >
-                <Undo2 className="h-3.5 w-3.5" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>Undo (Ctrl+Z)</TooltipContent>
-          </Tooltip>
+          <IconButton
+            label={t('scriptPanel.toolbar.undoAriaLabel')}
+            tooltip={t('scriptPanel.toolbar.undoTooltip', { keys: shortcutLabel('script.undo') })}
+            size="icon-xs"
+            onClick={undoScriptEditor}
+            disabled={!scriptCanUndo}
+          >
+            <Undo2 className="h-3.5 w-3.5" />
+          </IconButton>
 
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                onClick={redoScriptEditor}
-                disabled={!scriptCanRedo}
-                aria-label="Redo"
-              >
-                <Redo2 className="h-3.5 w-3.5" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>Redo (Ctrl+Shift+Z)</TooltipContent>
-          </Tooltip>
+          <IconButton
+            label={t('scriptPanel.toolbar.redoAriaLabel')}
+            tooltip={t('scriptPanel.toolbar.redoTooltip', { keys: shortcutLabel('script.redo') })}
+            size="icon-xs"
+            onClick={redoScriptEditor}
+            disabled={!scriptCanRedo}
+          >
+            <Redo2 className="h-3.5 w-3.5" />
+          </IconButton>
 
           {/* New script dropdown with templates */}
           <DropdownMenu>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <DropdownMenuTrigger asChild>
-                  <Button variant="ghost" size="icon-xs" aria-label="New script" {...tourAnchor(TOUR_ANCHORS.scriptNew)}>
-                    <Plus className="h-3.5 w-3.5" />
-                  </Button>
-                </DropdownMenuTrigger>
-              </TooltipTrigger>
-              <TooltipContent>New script</TooltipContent>
-            </Tooltip>
+            <DropdownMenuTrigger asChild>
+              <IconButton
+                label={t('scriptPanel.toolbar.newScript')}
+                size="icon-xs"
+                {...tourAnchor(TOUR_ANCHORS.scriptNew)}
+              >
+                <Plus className="h-3.5 w-3.5" />
+              </IconButton>
+            </DropdownMenuTrigger>
             <DropdownMenuContent align="start">
               <DropdownMenuItem onClick={() => handleNew('Untitled Script')}>
                 <FileCode2 className="h-3.5 w-3.5 mr-2" />
-                Blank Script
+                {t('scriptPanel.toolbar.blankScriptMenuItem')}
               </DropdownMenuItem>
               <DropdownMenuSeparator />
-              {SCRIPT_TEMPLATES.map((t) => (
-                <DropdownMenuItem key={t.name} onClick={() => handleNew(t.name, t.code)}>
+              {SCRIPT_TEMPLATES.map((tpl) => (
+                <DropdownMenuItem key={tpl.name} onClick={() => handleNew(tpl.name, tpl.code)}>
                   <FileCode2 className="h-3.5 w-3.5 mr-2" />
-                  {t.name}
+                  {tpl.name}
                 </DropdownMenuItem>
               ))}
             </DropdownMenuContent>
           </DropdownMenu>
 
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button variant="ghost" size="icon-xs" aria-label="Reset sandbox" onClick={reset}>
-                <RotateCcw className="h-3.5 w-3.5" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>Reset sandbox</TooltipContent>
-          </Tooltip>
+          <IconButton
+            label={t('scriptPanel.toolbar.resetSandbox')}
+            size="icon-xs"
+            onClick={reset}
+          >
+            <RotateCcw className="h-3.5 w-3.5" />
+          </IconButton>
 
           {/* Status indicator */}
           <div className="flex-1" />
           {executionState === 'running' && (
-            <span className="text-xs text-muted-foreground animate-pulse">Running...</span>
+            <span className="text-xs text-muted-foreground animate-pulse">
+              {t('scriptPanel.status.running')}
+            </span>
           )}
           {executionState === 'success' && lastResult && (
             <span className="text-xs text-green-600 dark:text-green-400 flex items-center gap-1">
@@ -505,7 +428,7 @@ export function ScriptPanel({ onClose }: ScriptPanelProps) {
           {executionState === 'error' && (
             <span className="text-xs text-destructive flex items-center gap-1">
               <AlertCircle className="h-3 w-3" />
-              Error
+              {t('scriptPanel.status.error')}
             </span>
           )}
         </div>
@@ -534,7 +457,9 @@ export function ScriptPanel({ onClose }: ScriptPanelProps) {
             <ChevronDown
               className={cn('h-3 w-3 transition-transform', outputCollapsed && '-rotate-90')}
             />
-            <span className="text-xs font-medium text-muted-foreground">Output</span>
+            <span className="text-xs font-medium text-muted-foreground">
+              {t('scriptPanel.output.header')}
+            </span>
             {lastResult && lastResult.logs.length > 0 && (
               <span className="text-xs text-muted-foreground">({lastResult.logs.length})</span>
             )}
@@ -554,9 +479,12 @@ export function ScriptPanel({ onClose }: ScriptPanelProps) {
                           surface a one-line cue so the user understands
                           why the rewrite is needed before clicking Fix. */}
                       {/(document|window|navigator|location|fetch|XMLHttpRequest|localStorage|indexedDB|setTimeout|setInterval) is not defined/.test(lastError) && (
-                        <div className="mt-1 text-[11px] text-muted-foreground font-sans">
-                          Scripts run in a QuickJS sandbox — no DOM, no <code className="font-mono">fetch</code>, no browser globals.
-                          Use <code className="font-mono">bim.*</code> APIs for viewer / data / export side-effects.
+                        <div className="mt-1 text-2xs text-muted-foreground font-sans">
+                          {t('scriptPanel.output.sandboxHintPrefix')}{' '}
+                          <code className="font-mono">{t('scriptPanel.output.fetchCode')}</code>
+                          {t('scriptPanel.output.sandboxHintMiddle')}{' '}
+                          <code className="font-mono">{t('scriptPanel.output.bimCode')}</code>{' '}
+                          {t('scriptPanel.output.sandboxHintSuffix')}
                         </div>
                       )}
                       <div className="mt-1">
@@ -566,7 +494,7 @@ export function ScriptPanel({ onClose }: ScriptPanelProps) {
                           className="h-6 px-2 text-xs border-destructive/40 text-destructive bg-transparent hover:bg-destructive/10"
                           onClick={handleFixWithLlm}
                         >
-                          Fix with LLM
+                          {t('scriptPanel.output.fixWithLlmButton')}
                         </Button>
                       </div>
                     </div>
@@ -581,7 +509,7 @@ export function ScriptPanel({ onClose }: ScriptPanelProps) {
                 {/* Return value */}
                 {lastResult && lastResult.value !== undefined && lastResult.value !== null && (
                   <div className="text-muted-foreground mt-1 pt-1 border-t border-border/50">
-                    <span className="opacity-60">Return: </span>
+                    <span className="opacity-60">{t('scriptPanel.output.returnLabel')} </span>
                     <span className="text-foreground">
                       {typeof lastResult.value === 'object'
                         ? JSON.stringify(lastResult.value, null, 2)
@@ -593,7 +521,7 @@ export function ScriptPanel({ onClose }: ScriptPanelProps) {
                 {/* Empty state */}
                 {!lastError && !lastResult && (
                   <div className="text-muted-foreground py-2 text-center">
-                    Press Run or Ctrl+Enter to execute
+                    {t('scriptPanel.output.emptyState', { keys: shortcutLabel('script.run') })}
                   </div>
                 )}
               </div>
@@ -605,10 +533,7 @@ export function ScriptPanel({ onClose }: ScriptPanelProps) {
       {/* Right side: AI Chat panel (collapsible, resizable) */}
       {chatPanelVisible && (
         <>
-          <div
-            className="w-1.5 bg-border hover:bg-primary/50 active:bg-primary/70 transition-colors cursor-col-resize shrink-0 h-full"
-            onMouseDown={handleChatResizeStart}
-          />
+          <ChatResizeHandle width={chatWidth} onWidthChange={setChatWidth} onMouseDown={handleChatResizeStart} />
           <div style={{ width: chatWidth }} className="shrink-0 h-full min-w-0">
             <ChatPanel onClose={() => setChatPanelVisible(false)} />
           </div>
@@ -619,18 +544,19 @@ export function ScriptPanel({ onClose }: ScriptPanelProps) {
       <Dialog open={deleteConfirmId !== null} onOpenChange={(open) => { if (!open) setDeleteConfirmId(null); }}>
         <DialogContent className="sm:max-w-[400px]">
           <DialogHeader>
-            <DialogTitle>Delete Script</DialogTitle>
+            <DialogTitle>{t('scriptPanel.deleteDialog.title')}</DialogTitle>
             <DialogDescription>
-              Are you sure you want to delete &ldquo;{deleteConfirmScript?.name ?? 'this script'}&rdquo;?
-              This action cannot be undone.
+              {t('scriptPanel.deleteDialog.confirmPrefix')}
+              {deleteConfirmScript?.name ?? t('scriptPanel.deleteDialog.fallbackScriptName')}
+              {t('scriptPanel.deleteDialog.confirmSuffix')}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button variant="ghost" onClick={() => setDeleteConfirmId(null)}>
-              Cancel
+              {t('scriptPanel.deleteDialog.cancelButton')}
             </Button>
             <Button variant="destructive" onClick={handleDeleteConfirm}>
-              Delete
+              {t('scriptPanel.deleteDialog.deleteButton')}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -640,29 +566,12 @@ export function ScriptPanel({ onClose }: ScriptPanelProps) {
         <PromoteToolDialog
           open={promoteOpen}
           source={editorContent}
-          initialName={
-            savedScripts.find((s) => s.id === activeScriptId)?.name
-            ?? 'My tool'
-          }
+          initialName={savedScripts.find((s) => s.id === activeScriptId)?.name}
           onClose={() => setPromoteOpen(false)}
         />
       )}
     </div>
   );
-}
-
-/** Format a log entry's args into a display string */
-function formatLogArgs(args: unknown[]): string {
-  return args.map((a) => {
-    if (typeof a === 'object' && a !== null) {
-      try {
-        return JSON.stringify(a, null, 2);
-      } catch {
-        return String(a);
-      }
-    }
-    return String(a);
-  }).join(' ');
 }
 
 /** Render a single log entry with appropriate icon and color — memoized */

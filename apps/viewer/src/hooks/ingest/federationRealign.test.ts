@@ -19,13 +19,15 @@ import assert from 'node:assert';
 
 import type { MapConversion, ProjectedCRS } from '@ifc-lite/parser';
 import type { CoordinateInfo, EntityWorldAabb, GeometryResult, MeshData } from '@ifc-lite/geometry';
-import type { ModelGeoref } from './federationAlign.js';
+import type { ModelSpatialPlacement } from './federationAlign.js';
+import { spatialReferenceFromIfc } from '../../lib/geo/ifc-spatial-reference.js';
 import {
   capturePreAlignment,
   realignFederationModels,
   restorePreAlignment,
   type RealignableModel,
 } from './federationRealign.js';
+import { appendGeometryBatchPatch } from '../../store/slices/dataSlice.appendGeometryBatch.js';
 
 function coordinateInfo(over?: Partial<CoordinateInfo>): CoordinateInfo {
   return {
@@ -40,22 +42,14 @@ function coordinateInfo(over?: Partial<CoordinateInfo>): CoordinateInfo {
 function georef(
   conversion: Partial<MapConversion>,
   crsName = 'EPSG:2056',
-): Omit<ModelGeoref, 'coordinateInfo'> {
+): Omit<ModelSpatialPlacement, 'coordinateInfo'> {
+  const mapConversion = {
+    id: 1, sourceCRS: 2, targetCRS: 3, eastings: 0, northings: 0,
+    orthogonalHeight: 0, xAxisAbscissa: 1, xAxisOrdinate: 0, scale: 1, ...conversion,
+  } as MapConversion;
   return {
-    mapConversion: {
-      id: 1,
-      sourceCRS: 2,
-      targetCRS: 3,
-      eastings: 0,
-      northings: 0,
-      orthogonalHeight: 0,
-      xAxisAbscissa: 1,
-      xAxisOrdinate: 0,
-      scale: 1,
-      ...conversion,
-    },
-    projectedCRS: { id: 4, name: crsName, mapUnitScale: 1 } as ProjectedCRS,
-    lengthUnitScale: 1,
+    spatialReference: spatialReferenceFromIfc({ mapConversion,
+      projectedCRS: { id: 4, name: crsName, verticalDatum: 'EPSG:5729', mapUnitScale: 1 } as ProjectedCRS, lengthUnitScale: 1 }),
   };
 }
 
@@ -105,13 +99,16 @@ function boxMesh(
 
 interface TestModel extends RealignableModel {
   /** The model's own georef, minus the coordinateInfo the resolver supplies. */
-  ownGeoref: Omit<ModelGeoref, 'coordinateInfo'>;
+  ownGeoref: Omit<ModelSpatialPlacement, 'coordinateInfo'>;
+  /** Display-only fields prove immutable record replacement retains geometry. */
+  name?: string;
+  visible?: boolean;
 }
 
 function model(
   meshes: MeshData[],
   info: CoordinateInfo,
-  ownGeoref: Omit<ModelGeoref, 'coordinateInfo'>,
+  ownGeoref: Omit<ModelSpatialPlacement, 'coordinateInfo'>,
   instanced?: Map<number, EntityWorldAabb>,
 ): TestModel {
   const geometryResult: GeometryResult = {
@@ -125,12 +122,12 @@ function model(
 }
 
 /**
- * Exactly what `extractModelGeoref` does for the fields that matter here: the
- * MapConversion and CRS come from the file, the `coordinateInfo` is whatever
+ * Exactly what `extractModelSpatialPlacement` does for the fields that matter
+ * here: the neutral spatial reference comes from the file, and `coordinateInfo` is whatever
  * the model's geometry carries AT THE MOMENT OF THE CALL. That last part is
  * what makes reading the anchor's frame before restoring it observable.
  */
-function resolveGeoref(_modelId: string, m: TestModel): ModelGeoref {
+function resolveGeoref(_modelId: string, m: TestModel): ModelSpatialPlacement {
   return { ...m.ownGeoref, coordinateInfo: m.geometryResult?.coordinateInfo };
 }
 
@@ -148,6 +145,7 @@ async function realign(models: Map<string, TestModel>, anchorModelId: string) {
   return realignFederationModels<TestModel>({
     models: Array.from(models.entries()),
     anchorModelId,
+    anchorModel: anchor,
     // Resolved BEFORE the call, exactly as `findReferenceGeorefModel` does it —
     // so this georef carries the anchor's frame as it stands pre-restore.
     anchorGeoref: resolveGeoref(anchorModelId, anchor),
@@ -313,7 +311,7 @@ describe('realignFederationModels — switching the anchor back restores it (#20
     assertBytesEqual(aMesh.positions, aPositionsUnderX, 'A must land in the same frame as in round 1');
     assertBytesEqual(aMesh.normals!, aNormalsUnderX, 'A normals must match round 1');
     assert.deepStrictEqual(aMesh.geometryAabb, aBoxUnderX, 'A world box must match round 1');
-    assert.deepStrictEqual(aMesh.origin, [0, 0, 0], 'A was aligned, so its origin is folded in again');
+    assert.ok(aMesh.origin, 'A remains in a local mesh frame after alignment; large translations stay out of f32 positions');
     assert.equal(third.counts.aligned, 1);
     assert.equal(third.counts.skipped, 0);
     assert.equal(third.counts.failed, 0);
@@ -471,6 +469,7 @@ describe('realignFederationModels — switching the anchor back restores it (#20
     const result = await realignFederationModels<TestModel>({
       models: Array.from(models.entries()),
       anchorModelId: 'X',
+      anchorModel: anchor,
       anchorGeoref: resolveGeoref('X', anchor),
       resolveGeoref: (modelId, m) => (modelId === 'A' ? null : resolveGeoref(modelId, m)),
       updateModel: applyPatch(models),
@@ -565,5 +564,434 @@ describe('realignFederationModels — switching the anchor back restores it (#20
     const result = await realign(models, 'X');
     assert.deepStrictEqual(result.movedModelIds, [], 'an identity alignment moves nothing');
     assert.equal(result.counts.aligned, 1, 'it still counts as handled');
+  });
+
+  it('rolls a superseded realignment back to its prior mesh and status (#5048)', async () => {
+    const { models, a } = federation();
+    const before = new Float32Array(a.geometryResult!.meshes[0].positions);
+    const anchor = models.get('X')!;
+    const result = await realignFederationModels<TestModel>({
+      models: Array.from(models.entries()),
+      anchorModelId: 'X',
+      anchorModel: anchor,
+      anchorGeoref: resolveGeoref('X', anchor),
+      resolveGeoref,
+      updateModel: applyPatch(models),
+      isCurrent: () => false,
+    });
+    assert.equal(result.stale, true);
+    assertBytesEqual(a.geometryResult!.meshes[0].positions, before, 'stale work cannot publish a mixed frame');
+    assert.equal(a.federationAlignmentStatus, 'none', 'the old alignment badge is restored with the mesh');
+  });
+
+  it('serializes a stale rollback before a newer anchor can publish (#5048)', async () => {
+    const x = model([boxMesh(71, [0, 0, 0])], coordinateInfo(), georef({ eastings: 0 }));
+    const b = model([boxMesh(72, [1, 0, 0])], coordinateInfo(), georef({ eastings: 100 }));
+    const models = new Map<string, TestModel>([['X', x], ['B', b]]);
+    let oldCurrent = true;
+    const oldResolve = (modelId: string, candidate: TestModel): ModelSpatialPlacement => {
+      const resolved = resolveGeoref(modelId, candidate);
+      // Force the old operation through the asynchronous cross-CRS path while
+      // the replacement only needs the same-CRS path.
+      return modelId === 'X'
+        ? { ...resolved, spatialReference: { ...resolved.spatialReference, horizontal: { id: 'EPSG:999999' } } }
+        : resolved;
+    };
+    const older = realignFederationModels<TestModel>({
+      models: Array.from(models.entries()), anchorModelId: 'B', anchorModel: b, anchorGeoref: resolveGeoref('B', b),
+      resolveGeoref: oldResolve, updateModel: applyPatch(models), isCurrent: () => oldCurrent,
+    });
+    oldCurrent = false;
+    const newer = realignFederationModels<TestModel>({
+      models: Array.from(models.entries()), anchorModelId: 'X', anchorModel: x, anchorGeoref: resolveGeoref('X', x),
+      resolveGeoref, updateModel: applyPatch(models),
+    });
+    const [stale, latest] = await Promise.all([older, newer]);
+    assert.equal(stale.stale, true);
+    assert.equal(latest.counts.aligned, 1, JSON.stringify(latest.counts));
+    assert.equal(worldPositionsOf(b.geometryResult!.meshes[0])[0], 101,
+      'the newer B→X alignment must survive the stale B pass rollback (not the old source x=1)');
+  });
+
+  it('reads immutable store records only after a queued pass enters the transaction (#5048)', async () => {
+    // Zustand's updateModel replaces the record. If the second request retains
+    // the pre-queue array, it sees B without the first pass's snapshot, takes
+    // x=101 as a new baseline, and re-bakes it to x=201. The live record has
+    // the x=1 baseline and must stay at x=101.
+    const x = model([boxMesh(81, [0, 0, 0])], coordinateInfo(), georef({ eastings: 0 }));
+    const b = model([boxMesh(82, [1, 0, 0])], coordinateInfo(), georef({ eastings: 100 }));
+    const models = new Map<string, TestModel>([['X', x], ['B', b]]);
+    const updateImmutable = (modelId: string, patch: Partial<RealignableModel>) => {
+      const previous = models.get(modelId);
+      if (!previous) return;
+      models.set(modelId, { ...previous, ...patch });
+    };
+    const params = () => ({
+      models: () => Array.from(models.entries()) as Array<[string, TestModel]>,
+      getModel: (modelId: string) => models.get(modelId),
+      anchorModelId: 'X',
+      anchorModel: models.get('X')!,
+      anchorGeoref: resolveGeoref('X', models.get('X')!),
+      resolveGeoref,
+      updateModel: updateImmutable,
+    });
+
+    await Promise.all([
+      realignFederationModels<TestModel>(params()),
+      realignFederationModels<TestModel>(params()),
+    ]);
+    assert.equal(worldPositionsOf(models.get('B')!.geometryResult!.meshes[0])[0], 101,
+      'the queued same-CRS pass must restore B\'s live snapshot, never capture the first baked x=101 as baseline');
+  });
+
+  it('lets the newest queued request survive a no-op stale predecessor (#5048)', async () => {
+    const x = model([boxMesh(821, [0, 0, 0])], coordinateInfo(), georef({ eastings: 0 }));
+    const b = model([boxMesh(822, [1, 0, 0])], coordinateInfo(), georef({ eastings: 100 }));
+    const models = new Map<string, TestModel>([['X', x], ['B', b]]);
+    const updateImmutable = (modelId: string, patch: Partial<RealignableModel>) => {
+      const previous = models.get(modelId);
+      if (previous) models.set(modelId, { ...previous, ...patch });
+    };
+    let firstCurrent = true;
+    const request = (isCurrent?: () => boolean) => realignFederationModels<TestModel>({
+      models: () => Array.from(models.entries()) as Array<[string, TestModel]>,
+      getModel: (modelId) => models.get(modelId),
+      anchorModelId: 'X', anchorModel: models.get('X')!, anchorGeoref: resolveGeoref('X', models.get('X')!),
+      resolveGeoref, updateModel: updateImmutable, isCurrent,
+    });
+    const older = request(() => firstCurrent);
+    firstCurrent = false;
+    const newer = request();
+
+    const results = await Promise.all([older, newer]);
+    assert.deepEqual(results.map((result) => result.stale), [true, false]);
+    assert.equal(worldPositionsOf(models.get('B')!.geometryResult!.meshes[0])[0], 101,
+      'a request that never mutated must not replace records and cancel its successor');
+  });
+
+  it('does not adopt an anchor replaced before its queued transaction owns the federation (#5048)', async () => {
+    const x = model([boxMesh(83, [1, 0, 0])], coordinateInfo(), georef({ eastings: 100 }));
+    const b = model([boxMesh(84, [2, 0, 0])], coordinateInfo(), georef({ eastings: 200 }));
+    const models = new Map<string, TestModel>([['X', x], ['B', b]]);
+    const replacement = model([boxMesh(85, [9100, 0, 0])], coordinateInfo(), georef({ eastings: 9100 }));
+    const beforeReplacement = new Float32Array(replacement.geometryResult!.meshes[0].positions);
+
+    // The first request occupies the serial queue but aborts at entry. The
+    // X request is therefore queued while X is still the selected record,
+    // then X is replaced before that request gets ownership.
+    const blocker = realignFederationModels<TestModel>({
+      models: () => Array.from(models.entries()) as Array<[string, TestModel]>,
+      getModel: (modelId) => models.get(modelId),
+      anchorModelId: 'B', anchorModel: b, anchorGeoref: resolveGeoref('B', b),
+      resolveGeoref, updateModel: applyPatch(models), isCurrent: () => false,
+    });
+    const queued = realignFederationModels<TestModel>({
+      models: () => Array.from(models.entries()) as Array<[string, TestModel]>,
+      getModel: (modelId) => models.get(modelId),
+      anchorModelId: 'X', anchorModel: models.get('X')!, anchorGeoref: resolveGeoref('X', models.get('X')!),
+      resolveGeoref, updateModel: applyPatch(models),
+    });
+    models.set('X', replacement);
+
+    const [, result] = await Promise.all([blocker, queued]);
+    assert.equal(result.stale, true, 'a queued pass cannot use a replacement anchor record');
+    assert.equal(replacement.federationAlignmentStatus, 'none', 'the replacement must not receive an anchor patch');
+    assertBytesEqual(replacement.geometryResult!.meshes[0].positions, beforeReplacement,
+      'the replacement geometry must remain untouched before the stale fence');
+  });
+
+  it('does not roll back over a replacement model that arrives during a CRS await (#5048)', async () => {
+    const x = model([boxMesh(91, [0, 0, 0])], coordinateInfo(), georef({ eastings: 0 }));
+    const b = model([boxMesh(92, [1, 0, 0])], coordinateInfo(), georef({ eastings: 100 }, 'EPSG:4326'));
+    const models = new Map<string, TestModel>([['X', x], ['B', b]]);
+    const updateImmutable = (modelId: string, patch: Partial<RealignableModel>) => {
+      const previous = models.get(modelId);
+      if (previous) models.set(modelId, { ...previous, ...patch });
+    };
+    let replaced = false;
+    const resolveWithReplacement = (modelId: string, candidate: TestModel): ModelSpatialPlacement | null => {
+      if (modelId === 'B' && !replaced) {
+        replaced = true;
+        // `alignGeometryToReference` now awaits its CRS definitions. Queue the
+        // replacement after this resolver returns so it lands in that await,
+        // not before the old transaction chose B.
+        queueMicrotask(() => {
+          models.set('B', model([boxMesh(93, [9100, 0, 0])], coordinateInfo(), georef({ eastings: 9100 })));
+        });
+      }
+      return resolveGeoref(modelId, candidate);
+    };
+    const result = await realignFederationModels<TestModel>({
+      models: () => Array.from(models.entries()) as Array<[string, TestModel]>,
+      getModel: (modelId) => models.get(modelId),
+      anchorModelId: 'X', anchorModel: x, anchorGeoref: resolveGeoref('X', x),
+      resolveGeoref: resolveWithReplacement, updateModel: updateImmutable,
+    });
+
+    const replacement = models.get('B')!;
+    assert.equal(result.stale, true, 'the old transaction must stop once B is replaced');
+    assert.equal(worldPositionsOf(replacement.geometryResult!.meshes[0])[0], 9100,
+      'rollback must retain the replacement geometry rather than restoring old B');
+    assert.equal(replacement.preAlignment, undefined,
+      'rollback must retain the replacement\'s own baseline rather than installing old B\'s snapshot');
+  });
+
+  it('restores shared geometry after an immutable visibility/rename replacement during a CRS await (#5048)', async () => {
+    const x = model([boxMesh(94, [0, 0, 0])], coordinateInfo(), georef({ eastings: 0 }));
+    const b = model([boxMesh(95, [1, 0, 0])], coordinateInfo(), georef({ eastings: 100 }));
+    const models = new Map<string, TestModel>([['X', x], ['B', b]]);
+    const before = new Float32Array(b.geometryResult!.meshes[0].positions);
+    const updateImmutable = (modelId: string, patch: Partial<RealignableModel>) => {
+      const previous = models.get(modelId);
+      if (previous) models.set(modelId, { ...previous, ...patch });
+    };
+    let renamed = false;
+    const resolveWithRename = (modelId: string, candidate: TestModel): ModelSpatialPlacement | null => {
+      if (modelId === 'B' && !renamed) {
+        renamed = true;
+        queueMicrotask(() => {
+          const current = models.get('B');
+          if (current) {
+            models.set('B', { ...current, visible: false, name: 'renamed while aligning' });
+          }
+        });
+      }
+      return resolveGeoref(modelId, candidate);
+    };
+    const stale = await realignFederationModels<TestModel>({
+      models: () => Array.from(models.entries()) as Array<[string, TestModel]>,
+      getModel: (modelId) => models.get(modelId),
+      anchorModelId: 'X', anchorModel: x, anchorGeoref: resolveGeoref('X', x),
+      resolveGeoref: resolveWithRename, updateModel: updateImmutable,
+    });
+
+    const replacement = models.get('B')!;
+    assert.equal(stale.stale, true, 'a replacement record invalidates the in-flight pass');
+    assert.equal(replacement.name, 'renamed while aligning');
+    assert.equal(replacement.visible, false);
+    assertBytesEqual(replacement.geometryResult!.meshes[0].positions, before,
+      'the replacement still owns B\'s mutated geometry, so stale rollback must restore it');
+
+    const fresh = await realignFederationModels<TestModel>({
+      models: () => Array.from(models.entries()) as Array<[string, TestModel]>,
+      getModel: (modelId) => models.get(modelId),
+      anchorModelId: 'X', anchorModel: models.get('X')!, anchorGeoref: resolveGeoref('X', models.get('X')!),
+      resolveGeoref, updateModel: updateImmutable,
+    });
+    assert.equal(fresh.stale, false);
+    assert.equal(worldPositionsOf(models.get('B')!.geometryResult!.meshes[0])[0], 101,
+      'the next pass starts from B\'s source geometry, rather than double-aligning the abandoned bake');
+  });
+
+  it('rolls back when the anchor is replaced during another model\'s CRS await (#5048)', async () => {
+    const x = model([boxMesh(96, [0, 0, 0])], coordinateInfo(), georef({ eastings: 0 }));
+    const b = model([boxMesh(97, [1, 0, 0])], coordinateInfo(), georef({ eastings: 100 }, 'EPSG:4326'));
+    const models = new Map<string, TestModel>([['X', x], ['B', b]]);
+    const beforeB = new Float32Array(b.geometryResult!.meshes[0].positions);
+    const updateImmutable = (modelId: string, patch: Partial<RealignableModel>) => {
+      const previous = models.get(modelId);
+      if (previous) models.set(modelId, { ...previous, ...patch });
+    };
+    let replaced = false;
+    const resolveWithAnchorReplacement = (modelId: string, candidate: TestModel): ModelSpatialPlacement | null => {
+      if (modelId === 'B' && !replaced) {
+        replaced = true;
+        queueMicrotask(() => {
+          models.set('X', model([boxMesh(98, [7000, 0, 0])], coordinateInfo(), georef({ eastings: 7000 })));
+        });
+      }
+      return resolveGeoref(modelId, candidate);
+    };
+
+    const result = await realignFederationModels<TestModel>({
+      models: () => Array.from(models.entries()) as Array<[string, TestModel]>,
+      getModel: (modelId) => models.get(modelId),
+      anchorModelId: 'X', anchorModel: x, anchorGeoref: resolveGeoref('X', x),
+      resolveGeoref: resolveWithAnchorReplacement, updateModel: updateImmutable,
+    });
+
+    assert.equal(result.stale, true, 'the pass cannot publish against the replaced anchor');
+    assert.equal(worldPositionsOf(models.get('X')!.geometryResult!.meshes[0])[0], 7000,
+      'rollback must not overwrite the new anchor geometry');
+    assertBytesEqual(models.get('B')!.geometryResult!.meshes[0].positions, beforeB,
+      'the non-anchor bake is rolled back when its destination anchor changed');
+  });
+
+  it('rolls back when the anchor is removed during another model\'s CRS await (#5048)', async () => {
+    const x = model([boxMesh(99, [0, 0, 0])], coordinateInfo(), georef({ eastings: 0 }));
+    const b = model([boxMesh(100, [1, 0, 0])], coordinateInfo(), georef({ eastings: 100 }, 'EPSG:4326'));
+    const models = new Map<string, TestModel>([['X', x], ['B', b]]);
+    const beforeB = new Float32Array(b.geometryResult!.meshes[0].positions);
+    const updateImmutable = (modelId: string, patch: Partial<RealignableModel>) => {
+      const previous = models.get(modelId);
+      if (previous) models.set(modelId, { ...previous, ...patch });
+    };
+    let removed = false;
+    const resolveWithAnchorRemoval = (modelId: string, candidate: TestModel): ModelSpatialPlacement | null => {
+      if (modelId === 'B' && !removed) {
+        removed = true;
+        queueMicrotask(() => models.delete('X'));
+      }
+      return resolveGeoref(modelId, candidate);
+    };
+
+    const result = await realignFederationModels<TestModel>({
+      models: () => Array.from(models.entries()) as Array<[string, TestModel]>,
+      getModel: (modelId) => models.get(modelId),
+      anchorModelId: 'X', anchorModel: x, anchorGeoref: resolveGeoref('X', x),
+      resolveGeoref: resolveWithAnchorRemoval, updateModel: updateImmutable,
+    });
+
+    assert.equal(result.stale, true, 'the pass cannot publish against a removed anchor');
+    assert.equal(models.has('X'), false, 'rollback must not resurrect the removed anchor');
+    assertBytesEqual(models.get('B')!.geometryResult!.meshes[0].positions, beforeB,
+      'the non-anchor bake is rolled back when its destination anchor disappears');
+  });
+});
+
+/**
+ * #4970: a mesh appended onto a model that already carries a `preAlignment`
+ * snapshot (`dataSlice.appendGeometryBatch.ts`, e.g. `addWall`/`addSlab`, a
+ * split's two halves, or a delete-undo restore via `mutation-mesh-stash.ts`)
+ * used to get no baseline slot. `restorePreAlignment` restores BY INDEX and
+ * silently skips anything past the snapshot's length, so the appended mesh
+ * survived its first post-append bake (nothing to restore yet) but was
+ * double-transformed on the SECOND — every align after that compounds
+ * further.
+ *
+ * Each case below drives three rounds against the real
+ * `realignFederationModels` + `capturePreAlignment`/`restorePreAlignment`
+ * pair, and appends through the REAL `appendGeometryBatchPatch` (the exact
+ * function `dataSlice.ts`'s `appendGeometryBatch` store action calls) rather
+ * than reaching into the snapshot machinery directly — so these tests keep
+ * observing a real behavioural change even under a blunt whole-file
+ * production revert, instead of failing to load: round 1 captures X's
+ * snapshot and bakes it into A; the mesh(es) are appended via
+ * `appendGeometryBatchPatch`, exactly as `addWall`/a split/the undo-restore
+ * stash do; round 2 gives the appended mesh its first bake (T2, into B —
+ * indistinguishable from a correct restore, since there is nothing to
+ * restore yet); round 3 (T3, back into A) is where a missing slot would
+ * compound. The appended mesh's final world position must equal a SIBLING
+ * mesh that carried the same pristine local coordinates from the very start
+ * and was never appended — the ground truth neither bug nor fix can fake.
+ */
+describe('appendGeometryBatch growing the preAlignment snapshot (#4970)', () => {
+  const EPS = 1e-6;
+
+  function assertClose(actual: MeshData, expected: MeshData, label: string): void {
+    assert.equal(actual.positions.length, expected.positions.length, `${label}: length mismatch`);
+    const actualOrigin = actual.origin ?? [0, 0, 0];
+    const expectedOrigin = expected.origin ?? [0, 0, 0];
+    for (let i = 0; i < actual.positions.length; i += 1) {
+      const axis = i % 3;
+      const actualWorld = actual.positions[i] + actualOrigin[axis];
+      const expectedWorld = expected.positions[i] + expectedOrigin[axis];
+      assert.ok(
+        Math.abs(actualWorld - expectedWorld) < EPS,
+        `${label}: index ${i} — ${actualWorld} vs ${expectedWorld}`,
+      );
+    }
+  }
+
+  /** A third model, distinct enough from A that aligning to it is a different transform (T2/T3 vs T1). */
+  function extraAnchor(): TestModel {
+    const theta = Math.PI / 5;
+    return model(
+      [boxMesh(91, [2, 0, 1])],
+      coordinateInfo({ originShift: { x: 40, y: 0, z: -10 } }),
+      georef({ eastings: 1200, northings: -400, xAxisAbscissa: Math.cos(theta), xAxisOrdinate: Math.sin(theta) }),
+    );
+  }
+
+  /** The `models` shape `appendGeometryBatchPatch` actually asks for. Its
+   *  runtime use of a model record is exactly what `TestModel` provides
+   *  (`geometryResult`, `preAlignment`); the wider `FederatedModel` fields
+   *  the type otherwise requires are load-bearing nowhere this function
+   *  reads, so the fixture stands in for them the same way `dataSlice.test.ts`
+   *  already does for this same call. */
+  type AppendState = Parameters<typeof appendGeometryBatchPatch>[0];
+
+  /**
+   * Appends `appended` (in X's pristine frame, exactly as every real caller
+   * hands meshes to `appendGeometryBatch`) onto X immediately after round 1,
+   * through the REAL `appendGeometryBatchPatch`, then runs the two more
+   * rounds needed to expose a stale slot.
+   */
+  async function roundTripAppended(appended: MeshData[]): Promise<TestModel> {
+    const { models, x } = federation();
+    models.set('B', extraAnchor());
+
+    // Round 1: X captures its snapshot and bakes into A (T1).
+    await realign(models, 'A');
+    assert.ok(x.preAlignment, 'fixture: X must have a snapshot after round 1');
+
+    // Append through the production entry point, not the snapshot internals
+    // directly — this is what `dataSlice.ts`'s `appendGeometryBatch` action
+    // calls for every authoring/undo-restore/streaming caller.
+    const patch = appendGeometryBatchPatch(
+      {
+        activeModelId: null,
+        models: models as unknown as AppendState['models'],
+        geometryResult: null,
+        geometryUpdateTick: 0,
+      },
+      'X',
+      appended,
+    );
+    const grownX = patch.models?.get('X') as unknown as TestModel | undefined;
+    assert.ok(grownX, 'appendGeometryBatchPatch must return an updated record for X');
+    models.set('X', grownX);
+
+    assert.equal(
+      grownX.preAlignment?.positions.length,
+      grownX.geometryResult!.meshes.length,
+      'the snapshot must be index-aligned with geometryResult.meshes right after the append',
+    );
+
+    // Round 2: anchor moves to B (T2) — the appended mesh's first bake.
+    await realign(models, 'B');
+    // Round 3: anchor moves back to A (T3) — the second bake, where a
+    // missing slot compounds onto the first.
+    await realign(models, 'A');
+
+    return models.get('X')!;
+  }
+
+  it('an authored mesh (addWall/addSlab) matches a never-appended sibling with the same pristine coordinates', async () => {
+    // Same pristine local coordinates as X's own mesh 12 ([10, 0, 5]), which
+    // stays in the fixture untouched — the ground truth.
+    const appendedMesh = boxMesh(101, [10, 0, 5]);
+    const x = await roundTripAppended([appendedMesh]);
+
+    const sibling = x.geometryResult!.meshes.find((m) => m.expressId === 12)!;
+    const appendedResult = x.geometryResult!.meshes.find((m) => m.expressId === 101)!;
+    assertClose(appendedResult, sibling, 'authored mesh world position vs sibling');
+  });
+
+  it('a split\'s two halves each match a never-appended sibling with the same pristine coordinates', async () => {
+    // Two meshes appended in the same batch, as a split hands both halves to
+    // `appendGeometryBatch` together.
+    const leftHalf = boxMesh(102, [10, 0, 5]);
+    const rightHalf = boxMesh(103, [0, 0, 0]);
+    const x = await roundTripAppended([leftHalf, rightHalf]);
+
+    const siblingLeft = x.geometryResult!.meshes.find((m) => m.expressId === 12)!;
+    const siblingRight = x.geometryResult!.meshes.find((m) => m.expressId === 11)!;
+    const left = x.geometryResult!.meshes.find((m) => m.expressId === 102)!;
+    const right = x.geometryResult!.meshes.find((m) => m.expressId === 103)!;
+    assertClose(left, siblingLeft, 'split left half vs sibling');
+    assertClose(right, siblingRight, 'split right half vs sibling');
+  });
+
+  it('a delete-undo-restored mesh (#4925 stash path) matches a never-appended sibling', async () => {
+    // `mutation-mesh-stash.ts` hands `appendGeometryBatch` the PRISTINE
+    // (unrotated/unaligned) frame it stashed at delete time — the exact same
+    // shape an authored mesh arrives in, so the same growth path applies.
+    const restoredMesh = boxMesh(104, [10, 0, 5]);
+    const x = await roundTripAppended([restoredMesh]);
+
+    const sibling = x.geometryResult!.meshes.find((m) => m.expressId === 12)!;
+    const restored = x.geometryResult!.meshes.find((m) => m.expressId === 104)!;
+    assertClose(restored, sibling, 'undo-restored mesh world position vs sibling');
   });
 });

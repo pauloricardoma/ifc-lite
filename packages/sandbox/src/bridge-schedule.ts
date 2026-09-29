@@ -6,7 +6,7 @@
  * Bridge schema — bim.schedule namespace methods.
  *
  * Reads IFC 4D / construction-sequence data (IfcTask, IfcRelSequence, IfcTaskTime,
- * IfcWorkSchedule, IfcWorkPlan) from the active model. Reuses the `query`
+ * IfcWorkSchedule, IfcWorkPlan, IfcWorkCalendar) from the active model. Reuses the `query`
  * permission since it's read-only metadata access — same trust level as
  * `bim.query.*`.
  *
@@ -83,6 +83,7 @@ const TASK_FIELDS: FieldSpec[] = [
   mk('AssignedProductExpressIds',   'productExpressIds',            'number[]', false),
   mk('AssignedProductGlobalIds',    'productGlobalIds',             'string[]', false),
   mk('ControllingScheduleGlobalIds','controllingScheduleGlobalIds', 'string[]', false),
+  mk('CalendarGlobalIds',           'calendarGlobalIds',            'string[]'),
   // TaskTime is a nested struct — handled by the schema-to-type helper below.
 ];
 
@@ -100,6 +101,38 @@ const WORK_SCHEDULE_FIELDS: FieldSpec[] = [
   mk('PredefinedType',  'predefinedType',  'string'),
   mk('Kind',            'kind',            "'WorkSchedule' | 'WorkPlan'", false),
   mk('TaskGlobalIds',   'taskGlobalIds',   'string[]', false),
+  mk('CalendarGlobalIds', 'calendarGlobalIds', 'string[]'),
+];
+
+const RECURRENCE_PATTERN_FIELDS: FieldSpec[] = [
+  mk('RecurrenceType',   'recurrenceType',   'string'),
+  mk('DayComponent',     'dayComponent',     'number[]', false),
+  mk('WeekdayComponent', 'weekdayComponent', 'number[]', false),
+  mk('MonthComponent',   'monthComponent',   'number[]', false),
+  mk('Position',         'position',         'number'),
+  mk('Interval',         'interval',         'number'),
+  mk('Occurrences',      'occurrences',      'number'),
+  mk('TimePeriods',      'timePeriods',      '{ Start: string; End: string }[]', false),
+];
+
+const WORK_TIME_FIELDS: FieldSpec[] = [
+  mk('Name',                  'name',                  'string'),
+  mk('DataOrigin',            'dataOrigin',            'string'),
+  mk('UserDefinedDataOrigin', 'userDefinedDataOrigin', 'string'),
+  mk('Start',                 'start',                 'string'),
+  mk('Finish',                'finish',                'string'),
+  // RecurrencePattern is a nested struct — handled by the builder below.
+];
+
+const WORK_CALENDAR_FIELDS: FieldSpec[] = [
+  mk('GlobalId',       'globalId',       'string', false),
+  mk('ExpressId',      'expressId',      'number', false),
+  mk('Name',           'name',           'string', false),
+  mk('Description',    'description',    'string'),
+  mk('ObjectType',     'objectType',     'string'),
+  mk('Identification', 'identification', 'string'),
+  mk('PredefinedType', 'predefinedType', 'string'),
+  // WorkingTimes / ExceptionTimes are nested struct arrays — see below.
 ];
 
 const SEQUENCE_FIELDS: FieldSpec[] = [
@@ -124,12 +157,22 @@ const TASK_TIME_RETURN = buildReturnType(TASK_TIME_FIELDS);
 const TASK_RETURN      = buildReturnType(TASK_FIELDS, `TaskTime?: ${TASK_TIME_RETURN}`);
 const WORK_SCHEDULE_RETURN = buildReturnType(WORK_SCHEDULE_FIELDS);
 const SEQUENCE_RETURN  = buildReturnType(SEQUENCE_FIELDS);
+const RECURRENCE_PATTERN_RETURN = buildReturnType(RECURRENCE_PATTERN_FIELDS);
+const WORK_TIME_RETURN = buildReturnType(
+  WORK_TIME_FIELDS,
+  `RecurrencePattern?: ${RECURRENCE_PATTERN_RETURN}`,
+);
+const WORK_CALENDAR_RETURN = buildReturnType(
+  WORK_CALENDAR_FIELDS,
+  `WorkingTimes: Array<${WORK_TIME_RETURN}>; ExceptionTimes: Array<${WORK_TIME_RETURN}>`,
+);
 
 const DATA_RETURN =
   `{ HasSchedule: boolean;`
   + ` WorkSchedules: Array<${WORK_SCHEDULE_RETURN}>;`
   + ` Tasks: Array<${TASK_RETURN}>;`
-  + ` Sequences: Array<${SEQUENCE_RETURN}> }`;
+  + ` Sequences: Array<${SEQUENCE_RETURN}>;`
+  + ` WorkCalendars: Array<${WORK_CALENDAR_RETURN}> }`;
 
 // ─── Schema → runtime translator ──────────────────────────────────────
 
@@ -167,12 +210,42 @@ function translateSequence(s: any): Record<string, unknown> {
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
+function translateRecurrencePattern(p: any): Record<string, unknown> | undefined {
+  if (!p) return undefined;
+  return {
+    ...translateByFields(p, RECURRENCE_PATTERN_FIELDS),
+    // TimePeriods is the one nested field whose ELEMENTS need re-keying too
+    // (start/end -> Start/End), so it can't ride on `translateByFields`.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    TimePeriods: (p.timePeriods ?? []).map((tp: any) => ({ Start: tp.start, End: tp.end })),
+  };
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function translateWorkTime(wt: any): Record<string, unknown> {
+  return {
+    ...translateByFields(wt, WORK_TIME_FIELDS),
+    RecurrencePattern: translateRecurrencePattern(wt.recurrencePattern),
+  };
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function translateWorkCalendar(c: any): Record<string, unknown> {
+  return {
+    ...translateByFields(c, WORK_CALENDAR_FIELDS),
+    WorkingTimes: (c.workingTimes ?? []).map(translateWorkTime),
+    ExceptionTimes: (c.exceptionTimes ?? []).map(translateWorkTime),
+  };
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 function translateData(d: any): Record<string, unknown> {
   return {
     HasSchedule: d.hasSchedule,
     WorkSchedules: (d.workSchedules ?? []).map(translateWorkSchedule),
     Tasks: (d.tasks ?? []).map(translateTask),
     Sequences: (d.sequences ?? []).map(translateSequence),
+    WorkCalendars: (d.workCalendars ?? []).map(translateWorkCalendar),
   };
 }
 
@@ -183,27 +256,36 @@ export const __schedule_schema_testing = {
   TASK_FIELDS,
   WORK_SCHEDULE_FIELDS,
   SEQUENCE_FIELDS,
+  WORK_CALENDAR_FIELDS,
+  WORK_TIME_FIELDS,
+  RECURRENCE_PATTERN_FIELDS,
   TASK_TIME_RETURN,
   TASK_RETURN,
   WORK_SCHEDULE_RETURN,
   SEQUENCE_RETURN,
+  WORK_CALENDAR_RETURN,
+  WORK_TIME_RETURN,
+  RECURRENCE_PATTERN_RETURN,
   DATA_RETURN,
   translateTask,
   translateTaskTime,
   translateWorkSchedule,
   translateSequence,
+  translateWorkCalendar,
+  translateWorkTime,
+  translateRecurrencePattern,
   translateData,
 };
 
 export function buildScheduleNamespace(): NamespaceSchema {
   return {
     name: 'schedule',
-    doc: '4D / IFC construction schedule reader (IfcTask, IfcWorkSchedule, IfcRelSequence)',
+    doc: '4D / IFC construction schedule reader (IfcTask, IfcWorkSchedule, IfcRelSequence, IfcWorkCalendar)',
     permission: 'query',
     methods: [
       {
         name: 'data',
-        doc: 'Full schedule extraction — tasks, dependencies, and work schedules.',
+        doc: 'Full schedule extraction — tasks, dependencies, work schedules, and work calendars.',
         args: ['string'],
         paramNames: ['modelId'],
         tsParamTypes: ['string | undefined'],

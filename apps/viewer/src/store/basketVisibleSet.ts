@@ -17,6 +17,7 @@ import { useViewerStore } from './index.js';
 import { toGlobalIdFromModels } from './globalId.js';
 import { isTypeVisible } from './typeVisibilityFilter.js';
 import { collectAggregatedDescendants, type AggregationRelationships } from '../utils/aggregation.js';
+import { effectiveSpatialMembers } from '../lib/effective-spatial-members.js';
 
 type ViewerStateSnapshot = ReturnType<typeof useViewerStore.getState>;
 
@@ -52,16 +53,6 @@ function digestNumberSet(values: Iterable<number>): string {
   return `${count}:${xor >>> 0}:${sum >>> 0}`;
 }
 
-function digestModelEntityMap(map: Map<string, Set<number>>): string {
-  if (map.size === 0) return '0';
-  const parts: string[] = [];
-  for (const [modelId, ids] of map) {
-    parts.push(`${modelId}:${digestNumberSet(ids)}`);
-  }
-  parts.sort();
-  return parts.join('|');
-}
-
 function visibilityFingerprint(state: ViewerStateSnapshot): string {
   const tv = state.typeVisibility;
 
@@ -78,8 +69,6 @@ function visibilityFingerprint(state: ViewerStateSnapshot): string {
     state.isolatedEntities ? digestNumberSet(state.isolatedEntities) : 'none',
     state.classFilter ? digestNumberSet(state.classFilter.ids) : 'none',
     digestNumberSet(state.lensHiddenIds),
-    digestModelEntityMap(state.hiddenEntitiesByModel),
-    digestModelEntityMap(state.isolatedEntitiesByModel),
     digestNumberSet(state.selectedStoreys),
     tv.spaces ? 1 : 0,
     tv.spatialZones ? 1 : 0,
@@ -200,15 +189,15 @@ function getSelectedStoreyElementRefs(state: ViewerStateSnapshot): EntityRef[] {
   if (state.selectedStoreys.size === 0) return [];
 
   const refs: EntityRef[] = [];
-
   if (state.models.size > 0) {
     for (const [modelId, model] of state.models) {
-      const hierarchy = model.ifcDataStore?.spatialHierarchy;
-      if (!hierarchy) continue;
+      const modelStore = model.ifcDataStore;
+      const hierarchy = modelStore?.spatialHierarchy;
+      if (!modelStore || !hierarchy) continue;
       const offset = model.idOffset ?? 0;
       for (const storeyId of state.selectedStoreys) {
-        const storeyElementIds = hierarchy.byStorey.get(storeyId) || hierarchy.byStorey.get(storeyId - offset);
-        if (!storeyElementIds) continue;
+        const localStoreyId = hierarchy.byStorey.has(storeyId) ? storeyId : storeyId - offset;
+        const storeyElementIds = effectiveSpatialMembers(modelStore, state.mutationViews.get(modelId), localStoreyId);
         for (const localId of storeyElementIds) {
           refs.push({ modelId, expressId: localId });
         }
@@ -216,8 +205,7 @@ function getSelectedStoreyElementRefs(state: ViewerStateSnapshot): EntityRef[] {
     }
   } else if (state.ifcDataStore?.spatialHierarchy) {
     for (const storeyId of state.selectedStoreys) {
-      const storeyElementIds = state.ifcDataStore.spatialHierarchy.byStorey.get(storeyId);
-      if (!storeyElementIds) continue;
+      const storeyElementIds = effectiveSpatialMembers(state.ifcDataStore, state.mutationViews.get('legacy'), storeyId);
       for (const id of storeyElementIds) {
         refs.push({ modelId: 'legacy', expressId: id });
       }
@@ -446,12 +434,6 @@ function getVisibleGlobalIds(state: ViewerStateSnapshot): Set<number> {
     if (globalIsolation !== null && !globalIsolation.has(candidate.globalId)) continue;
     if (globalHidden.has(candidate.globalId)) continue;
 
-    const modelHidden = state.hiddenEntitiesByModel.get(candidate.modelId);
-    if (modelHidden?.has(candidate.expressId)) continue;
-
-    const modelIsolated = state.isolatedEntitiesByModel.get(candidate.modelId);
-    if (modelIsolated && !modelIsolated.has(candidate.expressId)) continue;
-
     visible.add(candidate.globalId);
   }
 
@@ -551,13 +533,12 @@ export function getSmartBasketInputFromStore(): { refs: EntityRef[]; source: Bas
   return { refs: [], source: 'empty' };
 }
 
+/** "Is the basket shown?" — every basket element is isolated. A subset test, not equality: a basket that
+ *  WIDENED a foreign isolation (#4527) is shown too, and "Show active basket" would evict the foreign ids. */
 export function isBasketIsolationActiveFromStore(): boolean {
   const state = useViewerStore.getState();
   if (state.pinboardEntities.size === 0 || state.isolatedEntities === null) return false;
-
-  const basketIds = basketToGlobalIds(state);
-  if (basketIds.size !== state.isolatedEntities.size) return false;
-  for (const id of basketIds) {
+  for (const id of basketToGlobalIds(state)) {
     if (!state.isolatedEntities.has(id)) return false;
   }
   return true;

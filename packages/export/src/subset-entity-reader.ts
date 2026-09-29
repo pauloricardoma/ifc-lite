@@ -12,18 +12,26 @@
  * Deliberately thin: this module owns none of the parsing rules itself. It
  * composes `decodeRange` (`source-ref-bounds.ts`, the same readability gate
  * every other byte-range read in this package uses — #2491) with
- * `splitTopLevelArgs` (`step-argument-parser.ts`, the same quote/paren-aware
- * splitter `filterHiddenRefsFromRelationshipLine` uses) so a second,
- * independent STEP-line parser cannot disagree with the ones the rest of the
- * exporter already relies on.
+ * `readStepSlots` (`step-argument-parser.ts`, the same validated record reader
+ * `filterHiddenRefsFromRelationshipLine` uses) so a second, independent
+ * STEP-line parser cannot disagree with the ones the rest of the exporter
+ * already relies on.
  */
 
 import type { IfcSourceBytes } from '@ifc-lite/parser';
 import { getAttributeNamesAcrossSchemas, resolveEntityNameAlias } from '@ifc-lite/parser';
-import { ENTITIES_IFC2X3, ENTITIES_IFC4, ENTITIES_IFC4X3, type IfcEntityInfo } from '@ifc-lite/data';
+import { ENTITIES_IFC2X3, ENTITIES_IFC4_EXPRESS, ENTITIES_IFC4X3, type IfcEntityInfo } from '@ifc-lite/data';
 import { createSourceRefReader, decodeRange } from './source-ref-bounds.js';
-import { splitTopLevelArgs } from './step-argument-parser.js';
+import { readStepSlots } from './step-argument-parser.js';
 
+/**
+ * `#N=TYPE(...);` record, with STEP trivia (whitespace and/or a
+ * `/* ... *​/` comment, #3789) tolerated between the type name and `(` —
+ * the same adjacency fix the rest of this package's record readers carry.
+ * Without it a wrapped record reads as unparseable, `readEntityArgs` returns
+ * `null`, and `anonymize-placement.ts` / `anonymize-scrub.ts` silently skip
+ * that entity instead of scrubbing it.
+ */
 /** One entity's parsed STEP record: its type token and top-level arguments,
  *  in declaration order (still raw STEP tokens — `#N`, `'text'`, `$`, `.T.`,
  *  a nested `(...)` list — not decoded values). */
@@ -64,10 +72,8 @@ export function readEntityArgs(
   if (!isReadable(ref)) return null;
 
   const line = decodeRange(store.source, ref.byteOffset, ref.byteOffset + ref.byteLength);
-  const match = line.match(/^#\d+\s*=\s*(\w+)\(([\s\S]*)\)\s*;\s*$/);
-  if (!match) return null;
-  const [, type, argsText] = match;
-  return { type: type.toUpperCase(), args: splitTopLevelArgs(argsText) };
+  const record = readStepSlots(line);
+  return record === null ? null : { type: record.type, args: record.slots.map((arg) => arg.trim()) };
 }
 
 /**
@@ -81,7 +87,8 @@ export type SourceStepSchema = 'IFC2X3' | 'IFC4' | 'IFC4X3';
 
 const ATTRIBUTE_NAMES_BY_SCHEMA: Readonly<Record<SourceStepSchema, ReadonlyMap<string, readonly string[]>>> = {
   IFC2X3: attributeTableByUpperName(ENTITIES_IFC2X3),
-  IFC4: attributeTableByUpperName(ENTITIES_IFC4),
+  // Checked against the IFC4 EXPRESS registry (#5204): no phantom rows, no `TagList`.
+  IFC4: attributeTableByUpperName(ENTITIES_IFC4_EXPRESS),
   IFC4X3: attributeTableByUpperName(ENTITIES_IFC4X3),
 };
 

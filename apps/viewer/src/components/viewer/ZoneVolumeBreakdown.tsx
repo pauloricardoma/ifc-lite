@@ -21,6 +21,7 @@ import { useMemo, useState } from 'react';
 import { Scissors, TriangleAlert } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useViewerStore } from '@/store';
+import { useTranslation } from '@/i18n';
 import { useZoneApportionment } from '@/hooks/useZoneApportionment';
 import {
   allBasisBreakdowns,
@@ -79,13 +80,14 @@ function useVolumeFormatter(projectUnits: ProjectUnits, overrides: Record<string
 }
 
 function BasisRows({ breakdown, format }: { breakdown: BasisBreakdown; format: (v: number) => string }) {
+  const { t } = useTranslation();
   const note = volumeBasisRatioNote(breakdown.basis);
   return (
     <div className="px-3 py-2">
       <div className="flex items-baseline gap-2 pb-1">
-        <span className="text-[11px] uppercase tracking-wide font-medium">{volumeBasisLabel(breakdown.basis)}</span>
+        <span className="text-2xs uppercase tracking-wide font-medium">{volumeBasisLabel(breakdown.basis)}</span>
         {breakdown.quantityName && (
-          <span className="text-[11px] text-muted-foreground truncate">{breakdown.quantityName}</span>
+          <span className="text-2xs text-muted-foreground truncate">{breakdown.quantityName}</span>
         )}
         <span className="text-xs font-mono ml-auto">{format(breakdown.totalM3)}</span>
       </div>
@@ -99,18 +101,19 @@ function BasisRows({ breakdown, format }: { breakdown: BasisBreakdown; format: (
         ))}
         {breakdown.outsideM3 > 0 && (
           <div className="grid grid-cols-[minmax(70px,1fr)_auto_auto] gap-2 py-1 text-sm items-baseline">
-            <span className="text-muted-foreground italic truncate">in no zone</span>
+            <span className="text-muted-foreground italic truncate">{t('zonesPanel.volumeBreakdown.outsideZoneLabel')}</span>
             <span className="font-mono text-xs text-muted-foreground" />
             <span className="font-medium font-mono">{format(breakdown.outsideM3)}</span>
           </div>
         )}
       </div>
-      {note && <p className="pt-1 text-[11px] text-muted-foreground">{note}</p>}
+      {note && <p className="pt-1 text-2xs text-muted-foreground">{note}</p>}
     </div>
   );
 }
 
 export function ZoneVolumeBreakdown({ zoneSet, globalId, quantitySets, projectUnits, unitDisplayOverrides }: Props) {
+  const { t } = useTranslation();
   const cache = useViewerStore((s) => s.zoneApportionment);
   const { computeElement } = useZoneApportionment();
   // The refusal is keyed by WHAT it is about. A bare `useState<string | null>`
@@ -139,20 +142,19 @@ export function ZoneVolumeBreakdown({ zoneSet, globalId, quantitySets, projectUn
       <div className="px-3 py-2 space-y-1">
         {reason === 'no-geometry' && (
           <p className="text-xs text-muted-foreground flex items-center gap-1.5">
-            <TriangleAlert className="h-3.5 w-3.5" /> No geometry loaded for this element, so its volume cannot be split.
+            <TriangleAlert className="h-3.5 w-3.5" /> {t('zonesPanel.volumeBreakdown.noGeometryMessage')}
           </p>
         )}
         {reason === 'unproved-solid' && (
           <p className="text-xs text-muted-foreground flex items-center gap-1.5">
             <TriangleAlert className="h-3.5 w-3.5" />
-            Its mesh is not a proven closed solid, so no volume can be stated for it — let alone split.
+            {t('zonesPanel.volumeBreakdown.unprovedSolidMessage')}
           </p>
         )}
         {reason === 'rescaled-by-alignment' && (
           <p className="text-xs text-muted-foreground flex items-center gap-1.5">
             <TriangleAlert className="h-3.5 w-3.5" />
-            Federation alignment rescaled this element's model, so its proved volume no longer
-            describes the geometry on screen. Re-anchor the federation on this model to split it.
+            {t('zonesPanel.volumeBreakdown.rescaledMessage')}
           </p>
         )}
         {/* A reason with no branch of its own must still SAY something: the
@@ -161,7 +163,7 @@ export function ZoneVolumeBreakdown({ zoneSet, globalId, quantitySets, projectUn
         {reason !== null && !KNOWN_REFUSALS.has(reason) && (
           <p className="text-xs text-muted-foreground flex items-center gap-1.5">
             <TriangleAlert className="h-3.5 w-3.5" />
-            Its volume could not be split ({reason}).
+            {t('zonesPanel.volumeBreakdown.unknownReasonMessage', { reason })}
           </p>
         )}
         {!reason && (
@@ -174,7 +176,7 @@ export function ZoneVolumeBreakdown({ zoneSet, globalId, quantitySets, projectUn
               setLocal({ key: identity, refusal: result.refusal });
             }}
           >
-            <Scissors className="h-3.5 w-3.5 mr-1.5" /> Split volume by zone
+            <Scissors className="h-3.5 w-3.5 mr-1.5" /> {t('zonesPanel.volumeBreakdown.splitButton')}
           </Button>
         )}
       </div>
@@ -184,15 +186,15 @@ export function ZoneVolumeBreakdown({ zoneSet, globalId, quantitySets, projectUn
   return (
     <div className="border-t">
       {apportionment.overlapping && (
-        <p className="px-3 pt-2 text-[11px] text-amber-600 flex items-center gap-1.5">
+        <p className="px-3 pt-2 text-2xs text-amber-600 flex items-center gap-1.5">
           <TriangleAlert className="h-3.5 w-3.5" />
-          These zones overlap each other, so the shares double-count and do not add up to the whole.
+          {t('zonesPanel.volumeBreakdown.overlapWarning')}
         </p>
       )}
       {breakdowns?.map((breakdown) => (
         <BasisRows key={breakdown.basis} breakdown={breakdown} format={volume.format} />
       ))}
-      <p className="px-3 pb-2 text-[11px] text-muted-foreground">{VOLUME_BASIS_LEGEND}</p>
+      <p className="px-3 pb-2 text-2xs text-muted-foreground">{VOLUME_BASIS_LEGEND}</p>
     </div>
   );
 }

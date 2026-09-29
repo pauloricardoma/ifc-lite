@@ -184,6 +184,35 @@ describe('buildEntityFingerprints - component sub-hashes (#1891)', () => {
   });
 });
 
+describe('buildEntityFingerprints - authored-key ownership (#5005 review)', () => {
+  it('refuses a product key also owned by an out-of-viewer-scope IfcTask', async () => {
+    const store = await storeFromStep([
+      "#1=IFCWALL('0aaaaaaaaaaaaaaaaaaaaa',$,'Wall',$,$,$,$,'wall-tag',.STANDARD.);",
+      "#2=IFCPROPERTYSINGLEVALUE('Key',$,IFCLABEL('SHARED'),$);",
+      "#3=IFCPROPERTYSET('0bbbbbbbbbbbbbbbbbbbbb',$,'Pset_Asset',$,(#2));",
+      "#4=IFCRELDEFINESBYPROPERTIES('0ccccccccccccccccccccc',$,$,$,(#1),#3);",
+      "#5=IFCTASK('0ddddddddddddddddddddd',$,'Task',$,$,$,$,'TASK-1',$,.F.,$,$,.CONSTRUCTION.);",
+      "#6=IFCPROPERTYSINGLEVALUE('Key',$,IFCLABEL('SHARED'),$);",
+      "#7=IFCPROPERTYSET('0eeeeeeeeeeeeeeeeeeeee',$,'Pset_Asset',$,(#6));",
+      "#8=IFCRELDEFINESBYPROPERTIES('0fffffffffffffffffffff',$,$,$,(#5),#7);",
+    ].join('\n'));
+    const duplicateAuthoredKeys = new Map<string, number[]>();
+    const built = await buildEntityFingerprints({
+      modelId: 'A',
+      store,
+      meshes: meshes(1, 7n),
+      idOffset: 0,
+      keyProperty: 'Pset_Asset.Key',
+      duplicateAuthoredKeys,
+    });
+
+    const wall = built.find((fingerprint) => fingerprint.ref.localId === 1);
+    assert.ok(wall);
+    assert.strictEqual(wall.key, '0aaaaaaaaaaaaaaaaaaaaa');
+    assert.deepStrictEqual(duplicateAuthoredKeys.get('SHARED'), [1, 5]);
+  });
+});
+
 describe('buildEntityFingerprints - geometry hash first-wins (#924)', () => {
   it('keeps the FIRST defined hash when two submeshes of one entity disagree', async () => {
     // The doc comment on `geometryByLocalId` promises "the first mesh carrying
@@ -836,6 +865,60 @@ describe('buildEntityFingerprints - resolved materials', () => {
     assert.notStrictEqual(withMaterial.dataHash, without.dataHash);
     assert.ok(withMaterial.components!['material'], 'the material-bearing side carries the key');
     assert.strictEqual(without.components!['material'], undefined, 'the bare side carries none');
+  });
+});
+
+describe('buildEntityFingerprints - resolved classifications', () => {
+  /** A proxy associated with a classification through
+   *  `IfcRelAssociatesClassification` -> `IfcClassificationReference` ->
+   *  `IfcClassification`. `base` shifts express ids, same renumbering control
+   *  as the materials suite above. */
+  function classifiedProxy(identification: string, base: number): string {
+    const n = (offset: number) => `#${base + offset}`;
+    return [
+      `${n(1)}=IFCBUILDINGELEMENTPROXY('0proxyproxyproxyproxy',$,'road - roadside verge - soil',$,$,$,$,$,.NOTDEFINED.);`,
+      `${n(2)}=IFCCLASSIFICATION('Uniclass2015',$,$,'Uniclass2015',$,$,$);`,
+      `${n(3)}=IFCCLASSIFICATIONREFERENCE($,'${identification}','Timber wall',${n(2)},$);`,
+      `${n(4)}=IFCRELASSOCIATESCLASSIFICATION('0relclarelclarelclar',$,$,$,(${n(1)}),${n(3)});`,
+    ].join('\n');
+  }
+
+  async function side(step: string, modelId: string) {
+    const store = await storeFromStep(step);
+    const built = await buildEntityFingerprints({ modelId, store, meshes: [], idOffset: 0 });
+    const proxy = built.find((f) => f.key === '0proxyproxyproxyproxy');
+    assert.ok(proxy, `expected the proxy in ${modelId}`);
+    return proxy;
+  }
+
+  it('reports a re-coded classification as a data change', async () => {
+    // Same shape as the material gap above: re-coding an element from one
+    // Uniclass group to another, geometry and every property untouched, went
+    // unreported before classifications had a channel.
+    const a = await side(classifiedProxy('Ss_25_10_30', 0), 'A');
+    const b = await side(classifiedProxy('Ss_25_10_90', 0), 'B');
+    assert.notStrictEqual(a.dataHash, b.dataHash, 'a classification edit must move the data hash');
+    const diff = diffModels([a], [b], { scope: 'both' });
+    const entry = diff.byKey.get('0proxyproxyproxyproxy');
+    assert.strictEqual(entry!.state, 'modified');
+    assert.deepStrictEqual(entry!.changeKinds, ['data']);
+    assert.deepStrictEqual(entry!.changedComponents, ['classification']);
+  });
+
+  it('stays SILENT when the classification entities are renumbered but the code is not', async () => {
+    const a = await side(classifiedProxy('Ss_25_10_30', 0), 'A');
+    const b = await side(classifiedProxy('Ss_25_10_30', 500), 'B');
+    assert.strictEqual(a.dataHash, b.dataHash);
+    assert.strictEqual(diffModels([a], [b], { scope: 'both' }).byKey.get('0proxyproxyproxyproxy')!.state, 'unchanged');
+  });
+
+  it('reports gaining a classification, and losing one', async () => {
+    const bare = "#1=IFCBUILDINGELEMENTPROXY('0proxyproxyproxyproxy',$,'road - roadside verge - soil',$,$,$,$,$,.NOTDEFINED.);";
+    const withClass = await side(classifiedProxy('Ss_25_10_30', 0), 'A');
+    const without = await side(bare, 'B');
+    assert.notStrictEqual(withClass.dataHash, without.dataHash);
+    assert.ok(withClass.components!['classification'], 'the classified side carries the key');
+    assert.strictEqual(without.components!['classification'], undefined, 'the bare side carries none');
   });
 });
 

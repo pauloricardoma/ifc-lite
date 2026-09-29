@@ -31,10 +31,11 @@ import type { EffectiveEntityIndex } from './effective-index.js';
 // therefore correct and deliberate -- nothing here calls it, and the import
 // erases.
 import type { createSourceRefReader } from './source-ref-bounds.js';
+import type { Ifc2x3SlotFill } from './schema-converter-ifc2x3-slots.js';
+import type { Ifc4SlotCheck } from './schema-converter-ifc4-slots.js';
+import type { EnumReconciliation } from './schema-converter-enums.js';
 
-/**
- * Options for STEP export
- */
+/** Options for STEP export */
 export interface StepExportOptions {
   /** IFC schema version for the output file (any version, will convert if needed) */
   schema: 'IFC2X3' | 'IFC4' | 'IFC4X3' | 'IFC5';
@@ -216,13 +217,80 @@ export const relationshipWithheldWarning = (expressId: number, type: string): st
   `Relationship #${expressId} (${type}) was withheld from the export: it names at least one entity that has no line in this export, in a slot with no spelling for an omitted reference (a single-valued attribute, or a set whose every member is omitted). Anything else that relationship associated is no longer associated in the output.`;
 
 /**
+ * Same withholding, for a rescued `IFCSTYLEDITEM` / `IFCSTYLEDREPRESENTATION`
+ * / `IFCPRESENTATIONLAYERASSIGNMENT` / `IFCPRESENTATIONLAYERWITHSTYLE`
+ * (`style-closure.ts`'s `collectStyleEntities`) rather than an `IFCREL*`
+ * line — a distinct message rather than reusing {@link relationshipWithheldWarning}
+ * verbatim because that one says "Relationship", which these are not; the
+ * dangling-ref shape it withholds against is identical (a single-valued
+ * attribute, e.g. `IfcStyledItem.Item`, naming an entity this export omits).
+ */
+export const styleEntityWithheldWarning = (expressId: number, type: string): string =>
+  `Entity #${expressId} (${type}) was withheld from the export: it names at least one entity that has no line in this export, in a slot with no spelling for an omitted reference (a single-valued attribute, or a set whose every member is omitted).`;
+
+/**
+ * The edits queued for a source record were dropped because its own argument
+ * list could not be read as a list of slots.
+ *
+ * Said out loud, because the alternative was worse in both directions. Writing
+ * by index into parts a mis-scan produced lands the value on a different
+ * attribute and deletes what was there, while reporting success; refusing
+ * without saying so leaves an export that looks like it carried the edit. The
+ * usual cause is an undoubled apostrophe inside a string-typed attribute, which
+ * an authoring tool emits when it forgets to double one — two of those leave
+ * quote parity even and paren depth at zero, so nothing structural notices
+ * (#4125).
+ *
+ * It says what was DROPPED and nothing about what was written. It used to open
+ * "was written exactly as the source file has it", which is a claim this
+ * sentence is in no position to make: the pipeline that produces it runs before
+ * `writeSourceEntityLines` hands the record to `convertStepLine`, and a
+ * cross-schema export can rename the record's type, trim or pad its attribute
+ * list, replace it with an `IFCPROXY`, or drop it from the output entirely. So
+ * on exactly the path where a caller most needs to know what became of a
+ * dropped edit, the diagnostic was false (#4213).
+ *
+ * Buffering the report until the line's fate is known — the treatment
+ * `step-source-iteration.ts` already applies to the withholding branches — does
+ * not fit here. The refusal is produced one layer below the two writers, and
+ * the other of them (`step-property-sets.ts`'s type-object rewrite) never
+ * converts at all, so a message about the output would have to be assembled
+ * differently per caller for a fact neither caller is reporting. A sentence
+ * about the refusal is true on every path, which is what a shared message needs
+ * to be. It does not replace the dropped clause with a weaker one either — "the
+ * record keeps the values the source gave it" is false on the same conversion
+ * path, for the same reason.
+ *
+ * `type` is the class the SOURCE record carries, which is the class the dropped
+ * edits were queued against; it is not a claim about the class the export
+ * writes, which on that same conversion path can differ.
+ */
+export const unreadableRecordEditsDroppedWarning = (expressId: number, type: string): string =>
+  `Entity #${expressId} (${type}): its argument list could not be read as a list of attributes, so every edit queued for it (attribute, retype and positional alike) was dropped rather than applied to a slot that may not be the one meant. The usual cause is an apostrophe inside a string attribute that was not doubled.`;
+
+/**
  * What `step-attribute-mutations.ts`'s `applySourceLineMutations` produced: the rewritten
  * line, plus which edit kinds that rewrite actually delivered. The delivery
  * half is {@link SourceLineDelivery} rather than three loose booleans so that
  * the pipeline and the ledger cannot disagree about what a source line carries
  * — an added kind has one place to be added.
  */
-export type SourceLineMutations = SourceLineDelivery & { text: string };
+export type SourceLineMutations = SourceLineDelivery & {
+  text: string;
+  /**
+   * The line's argument list did not scan into slots, so NONE of the edits
+   * queued for it was applied and `text` is the source's own bytes.
+   *
+   * Separate from the three delivery flags because it answers a different
+   * question. Those say what this line carries; this says the pipeline refused
+   * to write it at all. Without it a refusal is indistinguishable from an edit
+   * that resolved to the text already there — three false flags either way —
+   * and writing by index into an argument list this scanner could not read is
+   * exactly how an edit lands on the wrong attribute while reporting success
+   * (#2470, #4125).
+   */
+  unreadable: boolean;
+};
 
 /**
  * The state one `export()` call shares across its seven phases.
@@ -293,7 +361,7 @@ export interface ExportPass {
   // ---- the collection passes' output ----
   readonly modifiedEntities: Set<number>;
   readonly modifiedAttributes: Map<number, Map<string, string>>;
-  readonly newPropertySets: Array<{ entityId: number; psets: PropertySet[] }>;
+  readonly newPropertySets: Array<{ entityId: number; psets: PropertySet[]; sourceMembers?: ReadonlyMap<string, ReadonlyMap<string, number>> }>; // set → property → reusable source atom (#5794)
   readonly newQuantitySets: Array<{ entityId: number; qsets: QuantitySet[] }>;
   readonly typeOwnedPsetNamesByEntity: Map<number, Set<string>>;
   readonly typeOwnedPsetIdsByEntity: Map<number, number[]>;
@@ -302,8 +370,24 @@ export interface ExportPass {
   readonly overlayTypeOwnedPsets: Map<number, IfcAttributeValue>;
   readonly skipPropertySetIds: Set<number>;
   readonly skipRelationshipIds: Set<number>;
+  readonly detachedRelatedObjects: Map<number, Set<number>>; // shared rel → elements copied on write off it (#5794)
   readonly newGeorefLines: string[];
   readonly warnings: string[];
+  /** The slots an IFC2X3 downgrade must settle: `OwnerHistory` by reuse
+   *  (#4686), every other required slot from the generated table (#4714). The
+   *  owner history is settled by `export()` once `willBeEmitted` can answer,
+   *  before either writer converts a line; the warnings join the result. */
+  readonly slotFill: Ifc2x3SlotFill;
+  /** Counts IFC4-required slots an IFC4X3/IFC5 source left `$` (#5202);
+   *  never fills one. Its warning joins the result like {@link slotFill}'s. */
+  readonly ifc4Slots: Ifc4SlotCheck;
+  readonly enums: EnumReconciliation; // enum members the target lacks (#5365)
+  /** Express ids `convertStepLine` will OMIT outright this export
+   *  (`computeWithheldRefIds`, #4206) — empty unless `schema` is IFC2X3 and
+   *  the source holds an entity of a `WITHHOLDABLE_UNROOTED_TYPES` type.
+   *  Both writers thread it through so a record naming one of these ids is
+   *  redirected to the same fallback instead of shipping a dangling `#N`. */
+  readonly withheldRefIds: ReadonlySet<number>;
 
   // ---- the shared predicates (see item 1 above) ----
   readonly buildHeader: (modifications: number) => string;

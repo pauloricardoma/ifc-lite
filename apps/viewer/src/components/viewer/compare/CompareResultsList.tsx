@@ -11,23 +11,28 @@ import { Plus, Minus, PencilLine, MousePointerClick } from 'lucide-react';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { cn } from '@/lib/utils';
 import { tourAnchor, TOUR_ANCHORS } from '@/lib/tours/anchors';
+import { useTranslation, type TranslationKey } from '@/i18n';
 import { COMPARE_COLORS, rgbaCss, type RGBA } from '@/lib/compare/overlay';
 import { groupHeaderCount, type ProductTypeSplit } from '@/lib/compare/productTypeCounts';
 import type { DiffState } from '@ifc-lite/diff';
 import type { CompareResult } from '@/store/slices/compareSlice';
 import { hasReportableChanges, type CompareMatchRow, type CompareRow } from './changeRow';
 import { CompareMatchGroups } from './CompareMatchGroups';
+import { CompareSuggestions, type SuggestionDecision } from './CompareSuggestions';
+import { AnalysisResultList } from '../analysis/AnalysisResultList';
+import type { SuggestionDecisions, SuggestionRow } from '@/lib/compare/suggestions';
 
+/** Every changed entry of one state, listed in full through the virtualised
+ *  analysis result list (#5834) - no display cap. */
 export interface CompareBucket {
   rows: CompareRow[];
-  truncated: number;
 }
 
 /** States listed in the panel (unchanged only affects 3D ghosting). */
-export const LISTED_STATES: { state: Exclude<DiffState, 'unchanged'>; label: string; color: RGBA; Icon: typeof Plus }[] = [
-  { state: 'modified', label: 'Changed', color: COMPARE_COLORS.modified, Icon: PencilLine },
-  { state: 'added', label: 'Added', color: COMPARE_COLORS.added, Icon: Plus },
-  { state: 'deleted', label: 'Deleted', color: COMPARE_COLORS.deleted, Icon: Minus },
+export const LISTED_STATES: { state: Exclude<DiffState, 'unchanged'>; labelKey: TranslationKey; color: RGBA; Icon: typeof Plus }[] = [
+  { state: 'modified', labelKey: 'comparePanel.resultsList.stateChanged', color: COMPARE_COLORS.modified, Icon: PencilLine },
+  { state: 'added', labelKey: 'comparePanel.resultsList.stateAdded', color: COMPARE_COLORS.added, Icon: Plus },
+  { state: 'deleted', labelKey: 'comparePanel.resultsList.stateDeleted', color: COMPARE_COLORS.deleted, Icon: Minus },
 ];
 
 /**
@@ -55,8 +60,8 @@ export function CountBadge({
       <span className="text-sm font-semibold tabular-nums" style={{ color: rgbaCss([color[0], color[1], color[2], 1]) }}>
         {value.toLocaleString()}
       </span>
-      <span className="text-[10px] text-muted-foreground">{label}</span>
-      {hint && <span className="text-[9px] text-muted-foreground/70">{hint}</span>}
+      <span className="text-2xs text-muted-foreground">{label}</span>
+      {hint && <span className="text-2xs text-muted-foreground">{hint}</span>}
     </div>
   );
 }
@@ -77,6 +82,13 @@ interface CompareResultsListProps {
   onFocusGroup: (state: DiffState) => void;
   onFocusMatch: (row: CompareMatchRow) => void;
   onFocusMatchGroup: (rows: CompareMatchRow[]) => void;
+  /** Suggestions (#4955): successor / split-merge claims and unresolved groups. */
+  suggestions: SuggestionRow[];
+  suggestionDecisions: SuggestionDecisions;
+  onFocusSuggestion: (row: SuggestionRow) => void;
+  onFocusSuggestionGroup: (rows: SuggestionRow[]) => void;
+  onAcceptSuggestion: (decision: SuggestionDecision) => void;
+  onRejectSuggestion: (decision: SuggestionDecision) => void;
 }
 
 export function CompareResultsList({
@@ -90,41 +102,52 @@ export function CompareResultsList({
   onFocusGroup,
   onFocusMatch,
   onFocusMatchGroup,
+  suggestions,
+  suggestionDecisions,
+  onFocusSuggestion,
+  onFocusSuggestionGroup,
+  onAcceptSuggestion,
+  onRejectSuggestion,
 }: CompareResultsListProps) {
+  const { t } = useTranslation();
   return (
     <ScrollArea className="flex-1 min-h-0" {...tourAnchor(TOUR_ANCHORS.compareResults)}>
       {!result ? (
         <div className="p-4 text-sm text-muted-foreground">
-          Run a comparison to see added, changed, and deleted elements.
+          {t('comparePanel.resultsList.emptyPrompt')}
         </div>
       ) : (
         <div className="p-2 space-y-3">
-          {LISTED_STATES.map(({ state, label, color, Icon }) => {
+          {LISTED_STATES.map(({ state, labelKey, color, Icon }) => {
             const bucket = groups.get(state);
             if (!bucket || bucket.rows.length === 0) return null;
+            const label = t(labelKey);
             return (
               <div key={state}>
                 <button
                   type="button"
                   onClick={() => onFocusGroup(state)}
-                  title={`Select all ${label.toLowerCase()} in 3D`}
+                  title={t('comparePanel.resultsList.selectAllInDTitle', { label: label.toLowerCase() })}
                   className="group w-full flex items-center gap-1.5 px-1 py-1 text-xs font-medium rounded hover:bg-muted transition-colors"
                 >
                   <Icon className="h-3.5 w-3.5" style={{ color: rgbaCss(color) }} />
                   <span>{label}</span>
                   {/* Products-first, matching the count badges above: the raw
-                      `rows + truncated` total conflates products and type
+                      bucket length conflates products and type
                       objects, and two totals for one quantity in one panel is
                       the confusion the split exists to remove. */}
                   <span className="text-muted-foreground">
-                    ({split ? groupHeaderCount(split, state) : bucket.rows.length + bucket.truncated})
+                    ({split ? groupHeaderCount(split, state) : bucket.rows.length})
                   </span>
                   <MousePointerClick className="h-3 w-3 ml-auto opacity-0 group-hover:opacity-60 transition-opacity" />
                 </button>
-                <div className="space-y-0.5">
-                  {bucket.rows.map((row) => (
+                <AnalysisResultList
+                  className="max-h-80"
+                  items={bucket.rows}
+                  getKey={(row) => row.key}
+                  estimateSize={() => 26}
+                  renderRow={(row) => (
                     <button
-                      key={row.key}
                       onClick={() => onFocus(row)}
                       className={cn(
                         'w-full text-left rounded px-2 py-1 flex items-center gap-2 hover:bg-muted transition-colors min-w-0',
@@ -133,19 +156,14 @@ export function CompareResultsList({
                     >
                       <span className="h-2.5 w-2.5 rounded-sm shrink-0" style={{ backgroundColor: rgbaCss(color) }} />
                       <span className="min-w-0 flex-1 truncate text-xs">{row.name || row.ifcType}</span>
-                      <span className="shrink-0 text-[10px] text-muted-foreground">
+                      <span className="shrink-0 text-2xs text-muted-foreground">
                         {state === 'modified' && row.changeKinds.length > 0
                           ? row.changeKinds.join(' · ')
                           : row.ifcType.replace(/^Ifc/, '')}
                       </span>
                     </button>
-                  ))}
-                  {bucket.truncated > 0 && (
-                    <p className="px-2 py-1 text-[10px] text-muted-foreground">
-                      +{bucket.truncated} more not shown
-                    </p>
                   )}
-                </div>
+                />
               </div>
             );
           })}
@@ -155,12 +173,21 @@ export function CompareResultsList({
             onFocus={onFocusMatch}
             onFocusGroup={onFocusMatchGroup}
           />
+          <CompareSuggestions
+            rows={suggestions}
+            selectedKey={selectedKey}
+            decisions={suggestionDecisions}
+            onFocus={onFocusSuggestion}
+            onFocusGroup={onFocusSuggestionGroup}
+            onAccept={onAcceptSuggestion}
+            onReject={onRejectSuggestion}
+          />
           {/* Exact negation of the panel's "Download report" bar, through the
               same predicate - offering a report over "the models match" (or the
               reverse) is precisely what two independent derivations produced. */}
           {counts && !hasReportableChanges(counts, matchRows) && (
             <div className="p-3 text-sm text-muted-foreground">
-              No differences in scope “{result.scope}”. The models match.
+              {t('comparePanel.resultsList.noDifferences', { scope: result.scope })}
             </div>
           )}
         </div>

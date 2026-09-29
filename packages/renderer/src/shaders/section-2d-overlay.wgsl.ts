@@ -41,10 +41,15 @@ export const SECTION_2D_UNIFORM_SLOTS = {
   params2: 32,
   /** vec4<f32> overlay / section-cut line colour — floats 36..39 (bytes 144..159) */
   lineColor: 36,
+  /** mat4 camera-relative projection for opt-in anchored overlays. */
+  rteViewProj: 40,
+  /** split f64-like (origin - eye) delta; w = 1 enables RTE. */
+  originDeltaHigh: 56,
+  originDeltaLow: 60,
 } as const;
 
 /** Total float count of one uniform record (40 floats = 160 bytes). */
-export const SECTION_2D_UNIFORM_FLOATS = 40;
+export const SECTION_2D_UNIFORM_FLOATS = 64;
 
 /** Total byte size of one uniform record. */
 export const SECTION_2D_UNIFORM_BYTES = SECTION_2D_UNIFORM_FLOATS * 4;
@@ -52,12 +57,12 @@ export const SECTION_2D_UNIFORM_BYTES = SECTION_2D_UNIFORM_FLOATS * 4;
 /**
  * One uniform slot per draw site.
  *
- * The overlay renderer issues up to six draws into a **single** render pass —
- * the section cut cap plus five world-space line families — and every one of
+ * The overlay renderer issues up to seven draw sites into a **single** render pass —
+ * the section cut cap plus six world-space line families — and every one of
  * them needs a different `lineColor` (and, for the cap, a different
  * `planeOffset` and the whole cap-style tail). With one record shared between
  * them the last `queue.writeBuffer` before submit is what the GPU sees for all
- * six: `writeBuffer` is a *queue* operation, so it is applied before the
+ * seven: `writeBuffer` is a *queue* operation, so it is applied before the
  * command buffer that references it executes, no matter where in the encoding
  * it was issued. Every earlier draw therefore rendered with the last draw's
  * uniforms — most visibly, the clash box's colour bleeding onto the annotation,
@@ -65,23 +70,36 @@ export const SECTION_2D_UNIFORM_BYTES = SECTION_2D_UNIFORM_FLOATS * 4;
  * hatch to the zeroed tail the line draws write.
  *
  * Each site owning a fixed slot, addressed with a dynamic bind-group offset,
- * is what makes the six draws independent while keeping the buffer, the layout
+ * is what makes the seven draw sites independent while keeping the buffer, the layout
  * and the bind group under the single owner issue #2456 insisted on. A slot per
  * site (rather than a bump allocator) needs no per-frame reset hook: each site
  * draws at most once per pass.
  */
+/**
+ * Max independently-anchored line partitions per channel in one pass.
+ *
+ * Spatial batching normally keeps this close to one.  The explicit 256-record
+ * ceiling still bounds the shared dynamic-uniform allocation (384 KiB at the
+ * WebGPU-guaranteed 256-byte stride) while accepting genuinely disjoint survey
+ * features instead of making the old 32-record implementation throw midway
+ * through a render submission.
+ */
+export const SECTION_2D_MAX_LINE_PARTITIONS = 256;
+
 export const SECTION_2D_UNIFORM_SLOT_INDEX = {
   /** The section cut cap: fill + outline, which share one record by design. */
   sectionCut: 0,
   annotation: 1,
-  alignment: 2,
-  grid: 3,
-  dxf: 4,
-  clashBox: 5,
+  alignment: 1 + SECTION_2D_MAX_LINE_PARTITIONS,
+  grid: 1 + SECTION_2D_MAX_LINE_PARTITIONS * 2,
+  dxf: 1 + SECTION_2D_MAX_LINE_PARTITIONS * 3,
+  terrain: 1 + SECTION_2D_MAX_LINE_PARTITIONS * 4,
+  centreline: 1 + SECTION_2D_MAX_LINE_PARTITIONS * 5,
+  clashBox: 1 + SECTION_2D_MAX_LINE_PARTITIONS * 6,
 } as const;
 
-/** How many uniform records the shared buffer holds — one per entry above. */
-export const SECTION_2D_UNIFORM_SLOT_COUNT = Object.keys(SECTION_2D_UNIFORM_SLOT_INDEX).length;
+/** One cap record plus a partition range for every line family. */
+export const SECTION_2D_UNIFORM_SLOT_COUNT = 1 + SECTION_2D_MAX_LINE_PARTITIONS * 7;
 
 /**
  * Byte stride between uniform slots for `device`.
@@ -118,6 +136,10 @@ export const SECTION_2D_CAP_FILL_WGSL = /* wgsl */ `
           params:         vec4<f32>,
           // x=secondaryAngleRad, y,z,w reserved
           params2:        vec4<f32>,
+          lineColor:       vec4<f32>,
+          rteViewProj:     mat4x4<f32>,
+          originDeltaHigh: vec4<f32>,
+          originDeltaLow:  vec4<f32>,
         }
         @binding(0) @group(0) var<uniform> uniforms: Uniforms;
 
@@ -135,7 +157,9 @@ export const SECTION_2D_CAP_FILL_WGSL = /* wgsl */ `
         fn vs_main(input: VertexInput) -> VertexOutput {
           var output: VertexOutput;
           let offsetPos = input.position + uniforms.planeOffset.xyz;
-          output.position = uniforms.viewProj * vec4<f32>(offsetPos, 1.0);
+          let global = uniforms.viewProj * vec4<f32>(offsetPos, 1.0);
+          let relative = (offsetPos + uniforms.originDeltaHigh.xyz) + uniforms.originDeltaLow.xyz;
+          output.position = select(global, uniforms.rteViewProj * vec4<f32>(relative, 1.0), uniforms.originDeltaHigh.w == 1.0);
           output.color = input.color;
           return output;
         }
@@ -247,6 +271,9 @@ export const SECTION_2D_OVERLAY_LINE_WGSL = /* wgsl */ `
           params: vec4<f32>,
           params2: vec4<f32>,
           lineColor: vec4<f32>,
+          rteViewProj: mat4x4<f32>,
+          originDeltaHigh: vec4<f32>,
+          originDeltaLow: vec4<f32>,
         }
         @binding(0) @group(0) var<uniform> uniforms: Uniforms;
 
@@ -262,7 +289,9 @@ export const SECTION_2D_OVERLAY_LINE_WGSL = /* wgsl */ `
         fn vs_main(input: VertexInput) -> VertexOutput {
           var output: VertexOutput;
           let offsetPos = input.position + uniforms.planeOffset.xyz;
-          let clip = uniforms.viewProj * vec4<f32>(offsetPos, 1.0);
+          let global = uniforms.viewProj * vec4<f32>(offsetPos, 1.0);
+          let relative = (offsetPos + uniforms.originDeltaHigh.xyz) + uniforms.originDeltaLow.xyz;
+          let clip = select(global, uniforms.rteViewProj * vec4<f32>(relative, 1.0), uniforms.originDeltaHigh.w == 1.0);
           // Reverse-Z decal nudge for lines coplanar with model faces
           // (issue #812). WebGPU forbids depthStencil.depthBias on non-
           // triangle topologies, so we do the equivalent in clip space:

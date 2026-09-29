@@ -22,7 +22,7 @@
 //! covered class-wide and would not distinguish this PR's contribution from
 //! the merged one-liner.
 
-use ifc_lite_core::{build_entity_index, has_geometry_by_name, EntityDecoder, EntityScanner};
+use ifc_lite_core::{build_entity_index, has_geometry_by_name, EntityDecoder, EntityScanner, RtcVerdict};
 use ifc_lite_geometry::GeometryRouter;
 
 const FIXTURE: &str = concat!(
@@ -116,7 +116,7 @@ fn storey_only_geometry_is_scheduled_and_meshes() {
 }
 
 
-/// Finding-2 coverage: `detect_rtc_offset_from_first_element`'s
+/// Finding-2 coverage: the whole-file RTC detector's
 /// `is_exceptional_spatial_container` / `has_geometry_by_name` interaction
 /// (`rust/geometry/src/router/rtc_offset.rs:412-414`). The building fixture
 /// alone no longer exercises this — `has_geometry_by_name("IFCBUILDING")` is
@@ -132,17 +132,17 @@ fn storey_only_geometry_rtc_offset_is_no_longer_zero() {
     let mut decoder = EntityDecoder::with_index(&content, entity_index);
     let router = GeometryRouter::with_units(&content, &mut decoder);
 
-    let offset = router.detect_rtc_offset_from_first_element(&content, &mut decoder);
+    let verdict = router.detect_rtc_offset_for_file(content.as_bytes(), &mut decoder);
 
     assert!(
-        offset.0.abs() > 10_000.0 || offset.1.abs() > 10_000.0,
-        "expected a large RTC offset once the storey's exceptional geometry is \
-         sampled, got {offset:?}"
+        matches!(verdict, Some(RtcVerdict::Large { .. })),
+        "expected a Large verdict once the storey's exceptional geometry is \
+         sampled, got {verdict:?}"
     );
 }
 
-/// Direct truth-table coverage of the two predicates `detect_rtc_offset_from_first_element`
-/// combines at line 412-414, independent of any fixture: confirms the
+/// Direct truth-table coverage of the two predicates the detector's job scan
+/// combines (`file_geometry_spans`), independent of any fixture: confirms the
 /// interaction is neither "both must be true" nor "either alone suffices" in
 /// the wrong direction for the representative cases this PR cares about.
 #[test]

@@ -7,90 +7,84 @@
  * (Cesium / sun / SpaceMouse), and interface options.
  */
 
-import { Globe2, MousePointerClick, Move, PanelTop, } from 'lucide-react';
-import { Orthographic, Viewpoint, SpaceMouse, Lighting } from '@/icons';
+import { Orthographic, Viewpoint, SpaceMouse, Lighting, World, Move, FollowWork, Settings, Spatial } from '@/icons';
 import { useViewerStore } from '@/store';
+import { useEffectiveSkyEnabled } from '@/hooks/useEffectiveSkyEnabled';
 import { TOUR_ANCHORS, tourAnchor } from '@/lib/tours/anchors';
+import { useTranslation } from '@/i18n';
 import { useCameraCommands } from '../../toolbar/CameraCommands';
+import { useWorkspacePanelControls } from '../../toolbar/useWorkspacePanelControls';
+import { CAMERA_RIBBON_COMMAND_IDS } from '../../surface-commands-view-ribbon';
 import {
   RibbonGroup,
   RibbonGroupDivider,
-  RibbonLargeButton,
-  RibbonSmallButton,
   RibbonSmallStack,
 } from '../primitives';
+import { RibbonCommandLargeButton, RibbonCommandSmallButton } from '../command-button';
 
 export function ViewTab() {
-  // Camera, preset views and the 90° rotations come from the shared
-  // command list the classic toolbar also renders, so the two styles
-  // cannot host different camera commands (see toolbar/CameraCommands).
+  const { t } = useTranslation();
+  // Camera, preset views and the 90° rotations use the shared
+  // command list (see toolbar/CameraCommands).
   const cameraCommands = useCameraCommands();
   const projectionMode = useViewerStore((state) => state.projectionMode);
-  const toggleProjectionMode = useViewerStore((state) => state.toggleProjectionMode);
-  const setToolbarStyle = useViewerStore((state) => state.setToolbarStyle);
   const ribbonContextualTabs = useViewerStore((state) => state.ribbonContextualTabs);
-  const setRibbonContextualTabs = useViewerStore((state) => state.setRibbonContextualTabs);
+  const centrelineOverlayEnabled = useViewerStore((state) => state.centrelineOverlayEnabled);
 
   // Cesium 3D overlay state
   const cesiumAvailable = useViewerStore((state) => state.cesiumAvailable);
   const cesiumEnabled = useViewerStore((state) => state.cesiumEnabled);
-  const toggleCesium = useViewerStore((state) => state.toggleCesium);
   const cesiumPlacementEditMode = useViewerStore((state) => state.cesiumPlacementEditMode);
-  const setCesiumPlacementEditMode = useViewerStore((state) => state.setCesiumPlacementEditMode);
-  const activeTool = useViewerStore((state) => state.activeTool);
-  const setActiveTool = useViewerStore((state) => state.setActiveTool);
+  const { activeWorkspacePanels, handleToggleBottomPanel } = useWorkspacePanelControls('ribbon');
 
-  // Sun & Sky panel state (sky, lighting presets, sun-path study)
+  // Environment panel state (sky, lighting presets, sun-path study, #5506)
   const solarEnabled = useViewerStore((state) => state.solarEnabled);
-  const envPanelOpen = useViewerStore((state) => state.envPanelOpen);
-  const toggleEnvPanel = useViewerStore((state) => state.toggleEnvPanel);
-  const envSkyEnabled = useViewerStore((state) => state.envSkyEnabled);
+  // Effective, not raw: the Cesium world context defaults this on (#4771).
+  const envSkyEnabled = useEffectiveSkyEnabled();
   const envPreset = useViewerStore((state) => state.envPreset);
 
-  // SpaceMouse panel state (3D mouse navigation, #1677)
-  const spaceMousePanelOpen = useViewerStore((state) => state.spaceMousePanelOpen);
-  const toggleSpaceMousePanel = useViewerStore((state) => state.toggleSpaceMousePanel);
+  // SpaceMouse connection state (3D mouse navigation, #1677); its settings
+  // moved to Preferences → Navigation (#5509).
   const spaceMouseConnected = useViewerStore((state) => state.spaceMouseConnected);
 
-  // Basket presentation state
+  // Basket presentation state. The dock flag (`basketPresentationVisible`) is
+  // still the source of truth for "active" — the `presentation` bottom panel
+  // reuses it (#5508) — but opening/closing routes through the bottom-panel
+  // table (`handleToggleBottomPanel`) rather than the raw toggle, so it stays
+  // mutually exclusive with Script/Schedule/Lists/etc. instead of stacking a
+  // second bottom panel open underneath.
   const pinboardEntities = useViewerStore((state) => state.pinboardEntities);
   const basketViewCount = useViewerStore((state) => state.basketViews.length);
-  const basketPresentationVisible = useViewerStore((state) => state.basketPresentationVisible);
-  const toggleBasketPresentationVisible = useViewerStore((state) => state.toggleBasketPresentationVisible);
   const hasModels = useViewerStore((state) => state.models.size > 0 || (state.geometryResult?.meshes.length ?? 0) > 0);
 
   return (
     <>
-      <RibbonGroup label="Projection">
-        <RibbonLargeButton
+      <RibbonGroup label={t('ribbon.view.projectionGroup')}>
+        <RibbonCommandLargeButton
+          commandId="view:projection"
           icon={Orthographic}
-          label="Orthographic"
-          tooltip="Toggle orthographic projection"
           active={projectionMode === 'orthographic'}
-          onClick={() => toggleProjectionMode()}
         />
       </RibbonGroup>
 
       <RibbonGroupDivider />
 
-      <RibbonGroup label="Camera">
+      <RibbonGroup label={t('ribbon.view.cameraGroup')}>
         {cameraCommands
           .filter((command) => command.group === 'camera')
           .map((command) => (
-            <RibbonLargeButton
+            <RibbonCommandLargeButton
               key={command.id}
+              commandId={CAMERA_RIBBON_COMMAND_IDS[command.id]}
               icon={command.icon}
-              label={command.label}
-              tooltip={command.tooltip}
-              shortcut={command.shortcut}
-              onClick={command.run}
+              tooltip={t(command.tooltipKey)}
             />
           ))}
       </RibbonGroup>
 
       <RibbonGroupDivider />
 
-      <RibbonGroup label="View">
+      <RibbonGroup label={t('ribbon.view.viewGroup')}>
         {/* The six axis views split across two small stacks in registry
             order (top/front/left over bottom/back/right). */}
         {[0, 1].map((column) => (
@@ -99,12 +93,10 @@ export function ViewTab() {
               .filter((command) => command.group === 'preset')
               .filter((_, index) => index % 2 === column)
               .map((command) => (
-                <RibbonSmallButton
+                <RibbonCommandSmallButton
                   key={command.id}
+                  commandId={CAMERA_RIBBON_COMMAND_IDS[command.id]}
                   icon={command.icon}
-                  label={command.label}
-                  shortcut={command.shortcut}
-                  onClick={command.run}
                 />
               ))}
           </RibbonSmallStack>
@@ -114,105 +106,87 @@ export function ViewTab() {
         {cameraCommands
           .filter((command) => command.group !== 'camera' && command.group !== 'preset')
           .map((command) => (
-            <RibbonLargeButton
+            <RibbonCommandLargeButton
               key={command.id}
+              commandId={CAMERA_RIBBON_COMMAND_IDS[command.id]}
               icon={command.icon}
-              label={command.label}
-              tooltip={command.tooltip}
-              shortcut={command.shortcut}
-              onClick={command.run}
+              tooltip={t(command.tooltipKey)}
             />
           ))}
       </RibbonGroup>
 
       <RibbonGroupDivider />
 
-      <RibbonGroup label="Context">
+      <RibbonGroup label={t('ribbon.view.contextGroup')}>
+        <RibbonCommandLargeButton
+          commandId="view:centreline"
+          icon={Spatial}
+          active={centrelineOverlayEnabled}
+        />
         {/* Cesium 3D World Context — the world-context affordance is one
             click away when a model has georeferencing. When active, the
             "Move georeference" sub-toggle appears beside it (its amber
             tint signals a modal pose whose exit affordance stays visible). */}
         {cesiumAvailable && (
-          <RibbonLargeButton
-            icon={Globe2}
-            label="World"
-            tooltip={cesiumEnabled ? 'Hide 3D world context (Cesium)' : 'Show 3D world context (Cesium)'}
+          <RibbonCommandLargeButton
+            commandId="view:world"
+            icon={World}
+            tooltip={cesiumEnabled ? t('ribbon.view.worldHideTooltip') : t('ribbon.view.worldShowTooltip')}
             active={cesiumEnabled}
             activeClassName="bg-teal-600/20 text-foreground ring-1 ring-inset ring-teal-600/50"
-            onClick={() => {
-              toggleCesium();
-              if (cesiumEnabled) {
-                setCesiumPlacementEditMode(false);
-                if (activeTool === 'cesium-placement') setActiveTool('select');
-              }
-            }}
           />
         )}
-        <RibbonLargeButton
+        <RibbonCommandLargeButton
+          commandId="view:lighting"
           icon={Lighting}
-          label="Lighting"
-          tooltip="Sun, sky and lighting presets"
-          active={envPanelOpen || solarEnabled || envSkyEnabled || envPreset !== 'default'}
+          active={activeWorkspacePanels.has('environment') || solarEnabled || envSkyEnabled || envPreset !== 'default'}
           activeClassName="bg-amber-500/20 text-foreground ring-1 ring-inset ring-amber-500/50"
-          onClick={toggleEnvPanel}
         />
         <RibbonSmallStack>
           {cesiumAvailable && cesiumEnabled && (
-            <RibbonSmallButton
+            <RibbonCommandSmallButton
+              commandId="view:move-georef"
               icon={Move}
-              label="Move georef"
-              tooltip={cesiumPlacementEditMode ? 'Stop moving georeference' : 'Move georeference in Cesium'}
+              tooltip={cesiumPlacementEditMode ? t('ribbon.view.moveGeorefStopTooltip') : t('ribbon.view.moveGeorefStartTooltip')}
               active={cesiumPlacementEditMode}
               activeClassName="bg-amber-500/20 text-foreground ring-1 ring-inset ring-amber-500/50"
-              onClick={() => {
-                const next = !cesiumPlacementEditMode;
-                setCesiumPlacementEditMode(next);
-                setActiveTool(next ? 'cesium-placement' : 'select');
-              }}
             />
           )}
-          <RibbonSmallButton
+          <RibbonCommandSmallButton
+            commandId="view:spacemouse"
             icon={SpaceMouse}
-            label="SpaceMouse"
-            tooltip="Connect a 3Dconnexion SpaceMouse (WebHID)"
-            active={spaceMousePanelOpen || spaceMouseConnected}
-            activeClassName="bg-teal-600/20 text-foreground ring-1 ring-inset ring-teal-600/50"
-            onClick={toggleSpaceMousePanel}
+            active={spaceMouseConnected}
+            activeClassName="bg-primary/20 text-foreground ring-1 ring-inset ring-primary/50"
           />
         </RibbonSmallStack>
       </RibbonGroup>
 
       <RibbonGroupDivider />
 
-      <RibbonGroup label="Interface">
-        <RibbonLargeButton
+      <RibbonGroup label={t('ribbon.view.interfaceGroup')}>
+        <RibbonCommandLargeButton
+          commandId="vis:toggle-presentation"
           icon={Viewpoint}
-          label="Present"
-          tooltip={`Basket presentation dock (views: ${basketViewCount}, entities: ${pinboardEntities.size})`}
-          active={basketPresentationVisible}
+          tooltip={t('ribbon.view.presentTooltip', { views: basketViewCount, entities: pinboardEntities.size })}
+          active={activeWorkspacePanels.has('presentation')}
           disabled={!hasModels}
-          onClick={toggleBasketPresentationVisible}
+          commandContext={{ activateBottomPanel: handleToggleBottomPanel }}
           badge={(basketViewCount > 0 || pinboardEntities.size > 0) ? (
-            <span className="absolute -top-0.5 right-0.5 flex h-[14px] min-w-[14px] items-center justify-center rounded-full border border-background bg-primary px-0.5 text-[9px] font-bold text-primary-foreground">
+            <span className="absolute -top-0.5 right-0.5 flex h-[14px] min-w-[14px] items-center justify-center rounded-full border border-background bg-primary px-0.5 text-2xs font-bold text-primary-foreground">
               {basketViewCount > 0 ? `${basketViewCount}/${pinboardEntities.size}` : pinboardEntities.size}
             </span>
           ) : undefined}
         />
         <RibbonSmallStack>
-          <RibbonSmallButton
-            icon={MousePointerClick}
-            label="Follow work"
-            tooltip="Open the Elements tab on selection and Author in edit mode, then hand the tab back"
+          <RibbonCommandSmallButton
+            commandId="view:follow-work"
+            icon={FollowWork}
             active={ribbonContextualTabs}
-            onClick={() => setRibbonContextualTabs(!ribbonContextualTabs)}
             {...tourAnchor(TOUR_ANCHORS.ribbonFollowWork)}
           />
-          <RibbonSmallButton
-            icon={PanelTop}
-            label="Classic bar"
-            tooltip="Switch back to the classic single-strip toolbar (remembered on this browser)"
-            onClick={() => setToolbarStyle('classic')}
-            {...tourAnchor(TOUR_ANCHORS.ribbonClassicSwitch)}
+          <RibbonCommandSmallButton
+            commandId="pref:settings"
+            icon={Settings}
           />
         </RibbonSmallStack>
       </RibbonGroup>

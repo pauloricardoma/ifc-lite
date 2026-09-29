@@ -28,7 +28,7 @@ import { WebGPUDevice } from './device.js';
 
 // `configureContext()` reads GPUTextureUsage.RENDER_ATTACHMENT, which node
 // does not define. Same stub as device-adapter-info.test.ts.
-(globalThis as Record<string, unknown>).GPUTextureUsage ??= { RENDER_ATTACHMENT: 0x10 };
+(globalThis as Record<string, unknown>).GPUTextureUsage ??= { COPY_SRC: 0x01, RENDER_ATTACHMENT: 0x10 };
 
 const savedNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
 
@@ -52,6 +52,12 @@ function makeFakeDevice(grantedFeatures: readonly string[]): unknown {
   };
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
 function installNavigator(adapter: unknown): void {
   Object.defineProperty(globalThis, 'navigator', {
     value: {
@@ -64,11 +70,11 @@ function installNavigator(adapter: unknown): void {
   });
 }
 
-function makeCanvas(): HTMLCanvasElement {
+function makeCanvas(onConfigure?: (configuration: GPUCanvasConfiguration) => void): HTMLCanvasElement {
   return {
     width: 256,
     height: 256,
-    getContext: () => ({ configure: () => { /* accepted */ } }),
+    getContext: () => ({ configure: (configuration: GPUCanvasConfiguration) => onConfigure?.(configuration) }),
   } as unknown as HTMLCanvasElement;
 }
 
@@ -121,6 +127,22 @@ async function withCapturedWarnings(fn: () => Promise<void>): Promise<string[]> 
 }
 
 describe('WebGPUDevice requestDevice staging — an adapter that accepts everything', () => {
+  it('configures the presented canvas texture as a bounded-readback source', async () => {
+    const { adapter } = makeRecordingAdapter([], () => []);
+    installNavigator(adapter);
+    const configurations: GPUCanvasConfiguration[] = [];
+
+    const device = new WebGPUDevice();
+    await device.init(makeCanvas((configuration) => configurations.push(configuration)));
+
+    assert.equal(configurations.length, 1);
+    assert.equal(
+      configurations[0]!.usage,
+      GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+      'color capture must reuse the presented texture instead of allocating a viewport-sized witness',
+    );
+  });
+
   it('asks for the raised buffer limits AND the timestamp-query feature in one request', async () => {
     const { adapter, calls } = makeRecordingAdapter(['timestamp-query'], (d) => d?.requiredFeatures ?? []);
     installNavigator(adapter);
@@ -258,5 +280,43 @@ describe('WebGPUDevice.hasTimestampQueryFeature', () => {
 
   it('is false before init() has run', async () => {
     assert.equal(new WebGPUDevice().hasTimestampQueryFeature(), false);
+  });
+});
+
+describe('WebGPUDevice loss lifetime (#4885)', () => {
+  it('ignores a delayed loss settlement from the GPUDevice replaced by destroy()+init()', async () => {
+    const firstLoss = deferred<{ message: string; reason?: string }>();
+    const secondLoss = deferred<{ message: string; reason?: string }>();
+    const fakeDevices = [firstLoss, secondLoss].map((loss) => ({
+      lost: loss.promise,
+      limits: { maxTextureDimension2D: 8192 },
+      features: new Set<string>(),
+      destroy: () => { /* settlement timing is controlled by the test */ },
+    }));
+    let nextDevice = 0;
+    installNavigator({
+      info: { vendor: 'testvendor', architecture: 'testarch' },
+      features: new Set<string>(),
+      limits: {},
+      requestDevice: async () => fakeDevices[nextDevice++],
+    });
+
+    const device = new WebGPUDevice();
+    const losses: string[] = [];
+    device.onDeviceLost((info) => losses.push(info.message));
+    await device.init(makeCanvas());
+    device.destroy();
+    await device.init(makeCanvas());
+
+    firstLoss.resolve({ message: 'old device failed late', reason: 'unknown' });
+    await Promise.resolve();
+    assert.deepEqual(losses, [], 'the superseded device notified the replacement lifetime');
+
+    const warnings = await withCapturedWarnings(async () => {
+      secondLoss.resolve({ message: 'replacement failed', reason: 'unknown' });
+      await Promise.resolve();
+    });
+    assert.deepEqual(losses, ['replacement failed'], 'the active device loss must still notify');
+    assert.ok(warnings.some((line) => line.includes('replacement failed')));
   });
 });

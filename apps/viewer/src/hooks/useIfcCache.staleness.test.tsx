@@ -81,6 +81,7 @@ const COORD_INFO: CoordinateInfo = {
   originalBounds: { min: { x: 0, y: 0, z: 0 }, max: { x: 2001, y: 1, z: 0 } },
   shiftedBounds: { min: { x: 0, y: 0, z: 0 }, max: { x: 2001, y: 1, z: 0 } },
   hasLargeCoordinates: false,
+  wasmRtcFrame: { x: 5_000_000, y: -0, z: 407, needsShift: false },
 };
 
 const SOURCE_TEXT = [
@@ -293,10 +294,21 @@ afterEach(async () => {
     pendingInstancedShards: null,
     ifcDataStore: null,
     geometryStreamingActive: false,
+    activeModelId: null,
+    models: new Map(),
   });
 });
 
+type ViewerModels = ReturnType<typeof useViewerStore.getState>['models'];
+
 async function load(entry: CacheResult, isStale: () => boolean): Promise<CacheLoadResult> {
+  // useIfcLoader upserts the primary model (making it active) before it calls
+  // loadFromCache, and appendGeometryBatch only files meshes under a known or
+  // active model (#4922). Register it the same way here, or every chunk is dropped.
+  useViewerStore.setState({
+    activeModelId: 'model-old',
+    models: new Map([['model-old', { id: 'model-old', geometryResult: null }]]) as unknown as ViewerModels,
+  });
   let result!: CacheLoadResult;
   await act(async () => {
     result = await loadFromCache!(entry, 'old.ifc', 'model-old', undefined, undefined, isStale);
@@ -471,6 +483,13 @@ describe('loadFromCache — bounding controls: the fix must not disable caching'
     assert.equal(after.shards?.length, 1, 'the instanced shards must be restored');
     assert.equal(after.shards?.[0].modelId, 'model-old', 'shards must be attributed to the model');
     assert.ok(after.ifcDataStore, 'the data store must be written');
+    const restoredFrame = useViewerStore.getState().geometryResult?.coordinateInfo.wasmRtcFrame;
+    assert.deepEqual(
+      restoredFrame,
+      COORD_INFO.wasmRtcFrame,
+      'the viewer cache reload must retain exact producer-frame provenance',
+    );
+    assert.equal(Object.is(restoredFrame?.y, -0), true, 'the cache reload must retain signed zero');
     assert.equal(after.progress?.phase, 'Complete (from cache)', 'the load must report completion');
     assert.equal(after.streaming, false, 'the stream must be closed so the fragments finalize');
   });

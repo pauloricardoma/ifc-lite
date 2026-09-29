@@ -3,21 +3,21 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * IDS (Information Delivery Specification) state slice
- *
- * Manages IDS validation state, results, and viewer integration.
+ * IDS (Information Delivery Specification) state slice. Manages IDS
+ * validation state, results, and viewer integration.
  */
 
 import type { StateCreator } from 'zustand';
 import type {
   IDSAuditReport,
   IDSDocument,
-  IDSValidationReport,
-  IDSSpecificationResult,
-  IDSEntityResult,
+  ValidationReport,
+  SpecificationResult,
+  EntityResult,
   SupportedLocale,
   ValidationProgress,
 } from '@ifc-lite/ids';
+import type { IdsErrorState } from '../../hooks/ids/resolveValidationTarget.js';
 import {
   endIdsRowFocusPresentation,
   type IDSRowFocusPresentation,
@@ -84,8 +84,10 @@ export interface IDSSliceState {
   idsAuditReport: IDSAuditReport | null;
   /** Whether the audit pipeline is currently running. */
   idsAuditing: boolean;
-  /** Validation report after running validation */
-  idsValidationReport: IDSValidationReport | null;
+  /** Validation report (#5138: generalised over its source; today always `source.kind === 'ids'`). */
+  idsValidationReport: ValidationReport | null;
+  /** `idsValidationReport.source.kind`, mirrored so consumers can gate without null-checking the report. */
+  validationSource: 'ids' | 'rules' | null;
   /** Currently active specification (for filtering results) */
   idsActiveSpecificationId: string | null;
   /** Currently selected entity in results */
@@ -96,8 +98,8 @@ export interface IDSSliceState {
   idsLoading: boolean;
   /** Validation progress */
   idsProgress: ValidationProgress | null;
-  /** Error message */
-  idsError: string | null;
+  /** Error message: a caught-exception string, or a catalogued resolver error. */
+  idsError: IdsErrorState | null;
   /** Current locale for translations */
   idsLocale: SupportedLocale;
   /** Display options */
@@ -141,7 +143,7 @@ export interface IDSSlice extends IDSSliceState {
   setIdsAuditing: (auditing: boolean) => void;
 
   // Validation actions
-  setIdsValidationReport: (report: IDSValidationReport | null) => void;
+  setIdsValidationReport: (report: ValidationReport | null) => void;
   clearIdsValidationReport: () => void;
   setIdsProgress: (progress: ValidationProgress | null) => void;
 
@@ -153,7 +155,7 @@ export interface IDSSlice extends IDSSliceState {
   setIdsPanelVisible: (visible: boolean) => void;
   toggleIdsPanel: () => void;
   setIdsLoading: (loading: boolean) => void;
-  setIdsError: (error: string | null) => void;
+  setIdsError: (error: IdsErrorState | null) => void;
   setIdsLocale: (locale: SupportedLocale) => void;
   setIdsDisplayOptions: (options: Partial<IDSDisplayOptions>) => void;
   setIdsFilterMode: (mode: IDSFilterMode) => void;
@@ -163,10 +165,10 @@ export interface IDSSlice extends IDSSliceState {
   setIdsFocusVisibilityOwned: (owned: IDSFocusVisibilityOwnership) => void;
 
   // Utility getters
-  getActiveSpecificationResult: () => IDSSpecificationResult | null;
-  getFailedEntitiesForSpec: (specId: string) => IDSEntityResult[];
-  getPassedEntitiesForSpec: (specId: string) => IDSEntityResult[];
-  getEntityResultById: (modelId: string, expressId: number) => IDSEntityResult | null;
+  getActiveSpecificationResult: () => SpecificationResult | null;
+  getFailedEntitiesForSpec: (specId: string) => EntityResult[];
+  getPassedEntitiesForSpec: (specId: string) => EntityResult[];
+  getEntityResultById: (modelId: string, expressId: number) => EntityResult | null;
   isEntityFailed: (modelId: string, expressId: number) => boolean;
   isEntityPassed: (modelId: string, expressId: number) => boolean;
 }
@@ -201,7 +203,7 @@ const getDefaultLocale = (): SupportedLocale => {
  * Build cached entity ID sets from validation report
  */
 function buildEntityIdSets(
-  report: IDSValidationReport | null
+  report: ValidationReport | null
 ): { failed: Set<string>; passed: Set<string> } {
   const failed = new Set<string>();
   const passed = new Set<string>();
@@ -252,6 +254,7 @@ export const createIdsSlice: StateCreator<IDSSlice, [], [], IDSSlice> = (set, ge
   idsAuditReport: null,
   idsAuditing: false,
   idsValidationReport: null,
+  validationSource: null,
   idsActiveSpecificationId: null,
   idsActiveEntityId: null,
   idsPanelVisible: false,
@@ -289,6 +292,7 @@ export const createIdsSlice: StateCreator<IDSSlice, [], [], IDSSlice> = (set, ge
       // active for a report that no longer exists.
       idsAuditReport: null,
       idsValidationReport: null,
+      validationSource: null,
       idsActiveSpecificationId: null,
       idsActiveEntityId: null,
       idsError: null,
@@ -316,6 +320,7 @@ export const createIdsSlice: StateCreator<IDSSlice, [], [], IDSSlice> = (set, ge
       idsDocument: null,
       idsAuditReport: null,
       idsValidationReport: null,
+      validationSource: null,
       idsActiveSpecificationId: null,
       idsActiveEntityId: null,
       idsError: null,
@@ -342,6 +347,7 @@ export const createIdsSlice: StateCreator<IDSSlice, [], [], IDSSlice> = (set, ge
     endIdsRowFocus(get);
     set({
       idsValidationReport: report,
+      validationSource: report ? report.source.kind : null,
       idsFailedEntityIds: failed,
       idsPassedEntityIds: passed,
       idsIsolateMode: null,
@@ -362,6 +368,7 @@ export const createIdsSlice: StateCreator<IDSSlice, [], [], IDSSlice> = (set, ge
     endIdsRowFocus(get);
     set({
       idsValidationReport: null,
+      validationSource: null,
       idsActiveSpecificationId: null,
       idsActiveEntityId: null,
       idsIsolationScope: 'ids',

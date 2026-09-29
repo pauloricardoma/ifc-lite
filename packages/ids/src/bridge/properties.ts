@@ -11,12 +11,13 @@ import {
   extractAllEntityAttributes,
   extractMaterialPropertiesForMaterialId,
   mergeInheritedPropertySets,
+  getAttributeTypeForSchema,
 } from '@ifc-lite/parser';
 import { RelationshipType } from '@ifc-lite/data';
 
 import type { PropertySetInfo } from '../types.js';
 import { idsDataTypeForProperty, idsDataTypeForQuantity } from './data-types.js';
-import { applyUnitConversion, resolveMeasureScales, type MeasureScales } from './units.js';
+import { applyUnitConversion, resolveEntityMeasureScales, type MeasureScales } from './units.js';
 
 interface RawProp {
   name: string;
@@ -24,6 +25,19 @@ interface RawProp {
   type: unknown;
   values?: string[];
   dataType?: string;
+  dataTypeMixed?: true;
+}
+
+/**
+ * The IDS dataType of a raw property. The source's own tag wins. A
+ * multi-valued property without one is UNKNOWN: its display type says
+ * nothing about its members, so no type is invented. Only an explicit
+ * `dataTypeMixed` (a table) exempts a property from a dataType check (#5224).
+ */
+function idsDataTypeOf(p: RawProp): Pick<PropertySetInfo['properties'][number], 'dataType' | 'dataTypeMixed'> {
+  const hasMultiValue = Array.isArray(p.values) && p.values.length > 0;
+  const dataType = p.dataType ?? (hasMultiValue ? undefined : idsDataTypeForProperty(p.type as number | string | undefined));
+  return { dataType, ...(p.dataTypeMixed ? { dataTypeMixed: true } : {}) };
 }
 
 /**
@@ -39,17 +53,17 @@ interface RawProp {
  *   3. Inherited property sets from `IfcRelDefinesByType`.
  *
  * Length-, area- and volume-typed properties are converted to base SI
- * units per the project's declared units (`lengthUnitScale`, and the
- * declared AREAUNIT/VOLUMEUNIT where present — see `resolveMeasureScales`)
- * so IDS literals (always metre / m² / m³) compare correctly.
+ * units per the ENTITY'S OWN OWNING `IFCPROJECT`'s declared units — see
+ * `resolveEntityMeasureScales` — so IDS literals (always metre / m² / m³)
+ * compare correctly even for an entity belonging to a later `IFCPROJECT`
+ * in a multi-project (federated-merge) file.
  */
 export function collectAllPropertySets(
   store: IfcDataStore,
   expressId: number
 ): PropertySetInfo[] {
   const own: PropertySetInfo[] = [];
-  const scale = store.lengthUnitScale;
-  const measureScales = resolveMeasureScales(store);
+  const { length: scale, ...measureScales } = resolveEntityMeasureScales(store, expressId);
 
   appendInstancePropertySets(store, expressId, scale, measureScales, own);
   appendQuantitySets(store, expressId, scale, measureScales, own);
@@ -152,6 +166,7 @@ function appendPredefinedPropertySets(
     ) || [];
 
   for (const psetId of psetIds) {
+    // @raw-entity-enumeration-ok point lookup for one source pset reached through the parser's source-snapshot relationship index; this is not a base-entity enumeration
     const ref = store.entityIndex?.byId?.get?.(psetId);
     if (!ref) continue;
     const tu = String((ref as { type?: unknown }).type).toUpperCase();
@@ -175,10 +190,10 @@ function appendPredefinedPropertySets(
       .map((a) => ({
         name: a.name,
         value: a.value,
-        // dataType intentionally left empty: without a per-attribute
-        // schema lookup we can't know if PanelOperation is IFCDOORPANELOPERATIONENUM
-        // vs anything else. The IDS dataType gate then no-ops for these slots.
-        dataType: '',
+        // The attribute's declared EXPRESS type is its dataType (PanelOperation
+        // → IFCDOORPANELOPERATIONENUM). Unknown to the schema means unknown, and
+        // a dataType check fails rather than passing unchecked (#5224).
+        dataType: getAttributeTypeForSchema(tu, a.name, store.schemaVersion)?.toUpperCase(),
       }));
     if (properties.length > 0) out.push({ name: psetNameAttr, properties });
   }
@@ -229,6 +244,7 @@ function appendMaterialOwnPropertySets(
 function resolveEntityTypeName(store: IfcDataStore, expressId: number): string | undefined {
   const fromTable = store.entities?.getTypeName?.(expressId);
   if (fromTable && fromTable !== 'Unknown') return fromTable;
+  // @raw-entity-enumeration-ok point lookup for one source record to guard the parsed material-owned-property projection; this helper projects source property sets and is not a live candidate/type enumeration
   const entry = store.entityIndex?.byId?.get(expressId);
   if (!entry) return undefined;
   return typeof entry === 'object' && 'type' in entry ? String((entry as { type: unknown }).type) : undefined;
@@ -293,7 +309,7 @@ function appendTypeEntityOwnProperties(
         value: Array.isArray(p.value)
           ? JSON.stringify(p.value)
           : (p.value as string | number | boolean | null),
-        dataType: idsDataTypeForProperty(p.type as number | string | undefined),
+        ...idsDataTypeOf(p as RawProp),
         ...(Array.isArray(p.values) && p.values.length > 0
           ? { values: p.values }
           : {}),
@@ -305,9 +321,7 @@ function appendTypeEntityOwnProperties(
 /**
  * Project a raw parser property record into the validator's
  * `PropertySetInfo['properties'][number]` shape — applies unit
- * conversion and resolves the IDS dataType. Multi-valued properties
- * (lists, enumerations, table values) suppress dataType so the
- * validator's dataType gate falls through to the value match.
+ * conversion and resolves the IDS dataType (`idsDataTypeOf`).
  */
 function projectProperty(
   p: RawProp,
@@ -315,9 +329,8 @@ function projectProperty(
   measureScales: MeasureScales
 ): PropertySetInfo['properties'][number] {
   const hasMultiValue = Array.isArray(p.values) && p.values.length > 0;
-  const dataType =
-    p.dataType ??
-    (hasMultiValue ? undefined : idsDataTypeForProperty(p.type as number | string | undefined));
+  const types = idsDataTypeOf(p);
+  const dataType = types.dataType;
   const baseValue = Array.isArray(p.value)
     ? JSON.stringify(p.value)
     : (p.value as string | number | boolean | null);
@@ -326,7 +339,7 @@ function projectProperty(
   return {
     name: p.name,
     value: converted.value,
-    dataType: dataType ?? '',
+    ...types,
     ...(converted.values ? { values: converted.values } : {}),
   };
 }

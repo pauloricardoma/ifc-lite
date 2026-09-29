@@ -46,9 +46,10 @@ END-ISO-10303-21;
  * One entity from each `IfcRoot` branch, plus classes that are not `IfcRoot` at
  * all and classes no schema registry knows.
  *
- * - `IfcTask` / `IfcActor` are `IfcObjectDefinition`s the columnar parser does
- *   not put in its `EntityTable` (they are not `IfcProduct` subtypes), so their
- *   GlobalId has to come from the STEP record.
+ * - `IfcTask` / `IfcActor` are `IfcObjectDefinition`s that are not `IfcProduct`
+ *   subtypes. Before #4204's IfcRoot-descendant retention, the columnar parser
+ *   did not put them in its `EntityTable` and their GlobalId had to come from
+ *   the STEP record; now they are IfcRoot descendants the table holds directly.
  * - `IfcRelDefinesByProperties` is an `IfcRelationship` and `IfcPropertySet` is
  *   an `IfcPropertyDefinition`: both carry GlobalIds, both stay out.
  * - `IfcMaterial` has no GlobalId at all — its first attribute is a Name, which
@@ -96,7 +97,9 @@ END-ISO-10303-21;
  *
  * - `IfcMove` (an `IfcTask` subtype) and `IfcSpaceProgram` (an `IfcControl`)
  *   are `IfcObjectDefinition`s with real GlobalIds in slot 0, and are not
- *   `IfcProduct`s, so the `EntityTable` does not hold them.
+ *   `IfcProduct`s. Before #4204 the `EntityTable` did not hold them; now
+ *   #4204's IfcRoot-descendant retention reaches them through the bundled
+ *   IFC2X3 schema's inheritance chain, independent of the IFC4 codegen pin.
  * - `IfcSymbolStyle` is a *resource*: no GlobalId at all, a Name in slot 0. Its
  *   class name ends in `STYLE`, which is one of the parser's two name-based
  *   branches, so the table does hold it — with `hatch` in the GlobalId column.
@@ -311,3 +314,34 @@ END-ISO-10303-21;
 `;
 }
 
+/**
+ * A minimal model with one wall associated to one Uniclass-style
+ * classification reference, under a chosen identification code — for the
+ * classification oracle case (an `IfcRelAssociatesClassification` re-coding
+ * with no geometry, property or quantity edit).
+ */
+export function classificationModel(identification: string): string {
+  return `ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION((''),'2;1');
+FILE_NAME('m','2026',(''),(''),'','','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1= IFCPROJECT('${guid('PROJ')}',$,'Proj',$,$,$,$,(#20),#30);
+#20= IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-5,#21,$);
+#21= IFCAXIS2PLACEMENT3D(#22,$,$);
+#22= IFCCARTESIANPOINT((0.,0.,0.));
+#30= IFCUNITASSIGNMENT((#31));
+#31= IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#40= IFCLOCALPLACEMENT($,#21);
+#41= IFCBUILDINGSTOREY('${guid('STOR')}',$,'L01',$,$,#40,$,$,.ELEMENT.,0.);
+#70= IFCWALL('${guid('WALL')}',$,'Wall A',$,$,#40,$,'tagA',$);
+#90= IFCCLASSIFICATION('Uniclass2015',$,$,'Uniclass2015',$,$,$);
+#91= IFCCLASSIFICATIONREFERENCE($,'${identification}','Timber wall',#90,$);
+#92= IFCRELASSOCIATESCLASSIFICATION('${guid('RELA')}',$,$,$,(#70),#91);
+#96= IFCRELCONTAINEDINSPATIALSTRUCTURE('${guid('RELC')}',$,$,$,(#70),#41);
+ENDSEC;
+END-ISO-10303-21;
+`;
+}

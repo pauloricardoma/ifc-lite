@@ -45,7 +45,19 @@ export function previewSetPattern(setField: string, setNames: Iterable<string>):
     return { isPattern: false, isInvalid: LOOKS_LIKE_PATTERN.test(set), matches: [] };
   }
 
-  const match = compileNameMatcher(set);
+  // `compileNameMatcher` throws (rather than falling back to a literal
+  // match) for a pattern with a catastrophic-backtracking shape or over the
+  // length cap — see its own docs. This runs on every keystroke via the
+  // caller's `useMemo`, with no surrounding try/catch, so an uncaught throw
+  // here would crash the column builder while the user is still typing.
+  // Route it into the same `isInvalid` signal a malformed literal already
+  // uses, instead of letting it escape.
+  let match: ReturnType<typeof compileNameMatcher>;
+  try {
+    match = compileNameMatcher(set);
+  } catch {
+    return { isPattern: false, isInvalid: true, matches: [] };
+  }
   const matches: string[] = [];
   for (const name of setNames) {
     if (match(name)) matches.push(name);
@@ -53,16 +65,17 @@ export function previewSetPattern(setField: string, setNames: Iterable<string>):
   return { isPattern: true, isInvalid: false, matches };
 }
 
-/**
- * Human hint for a pattern's matches: `matches 2 sets: A, B`, capping the named
- * sets at `cap` then appending ` +N more`. Zero matches reads
- * `matches 0 sets in loaded models` (the pattern is valid, just unmatched).
- */
-export function formatMatchHint(matches: string[], cap = 3): string {
-  const n = matches.length;
-  if (n === 0) return 'matches 0 sets in loaded models';
-  const shown = matches.slice(0, cap).join(', ');
-  const extra = n - Math.min(cap, n);
-  const suffix = extra > 0 ? ` +${extra} more` : '';
-  return `matches ${n} ${n === 1 ? 'set' : 'sets'}: ${shown}${suffix}`;
+/** Locale-neutral facts used to render the translated pattern-match hint. */
+export interface MatchHintFacts {
+  count: number;
+  shown: string[];
+  extra: number;
+}
+
+export function matchHintFacts(matches: string[], cap = 3): MatchHintFacts {
+  return {
+    count: matches.length,
+    shown: matches.slice(0, cap),
+    extra: Math.max(0, matches.length - cap),
+  };
 }

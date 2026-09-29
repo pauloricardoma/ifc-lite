@@ -47,6 +47,8 @@ interface FakeServerState {
   dynamicRegistration?: boolean;
   /** Registration requests seen, for asserting what was sent. */
   registrations: Array<Record<string, unknown>>;
+  /** Every token-endpoint form body, in order. */
+  tokenForms: URLSearchParams[];
 }
 
 /** Fake BCF server at the fetch boundary: auth discovery, OAuth2, projects. */
@@ -55,6 +57,7 @@ function installFakeServer(): FakeServerState {
     validTokens: new Set(['token-1']),
     grants: [],
     registrations: [],
+    tokenForms: [],
   };
   const json = (body: unknown, status = 200) =>
     new Response(JSON.stringify(body), {
@@ -63,6 +66,14 @@ function installFakeServer(): FakeServerState {
     });
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input));
+    // The API lives under /bcf; everything else is the web UI, which answers
+    // unknown paths with an HTML 404 (as a BIMcollab Nexus space does).
+    if (!url.pathname.startsWith('/bcf/')) {
+      return new Response('<!DOCTYPE html><html><title>space</title></html>', {
+        status: 404,
+        headers: { 'Content-Type': 'text/html' },
+      });
+    }
     if (url.pathname === '/bcf/2.1/auth') {
       return json({
         oauth2_auth_url: 'https://fake.example/bcf/oauth2/auth',
@@ -81,6 +92,7 @@ function installFakeServer(): FakeServerState {
       if (state.tokenGate) await state.tokenGate;
       const form = new URLSearchParams(String(init?.body));
       state.grants.push(form.get('grant_type') ?? '');
+      state.tokenForms.push(form);
       if (form.get('grant_type') === 'authorization_code') {
         if (form.get('code') !== 'good-code' || !form.get('code_verifier')) {
           return json({ error: 'invalid_grant', error_description: 'bad code' }, 400);
@@ -143,8 +155,17 @@ describe('validateBcfServerUrl', () => {
 
 describe('loadBcfServerConfig', () => {
   it('degrades corrupted or partial storage to signed-out, never throws', () => {
-    localStorage.setItem('ifc-lite:bcf-server:v1', '{not json');
-    assert.equal(loadBcfServerConfig(), null);
+    // The corrupt record is reported through console.warn with the parser's
+    // SyntaxError; keep it out of the TAP stream, where a "SyntaxError:" line
+    // reads as a module load failure to the CI observer gate.
+    const warn = console.warn;
+    console.warn = () => {};
+    try {
+      localStorage.setItem('ifc-lite:bcf-server:v1', '{not json');
+      assert.equal(loadBcfServerConfig(), null);
+    } finally {
+      console.warn = warn;
+    }
     // A record without an access token is a broken session, not a connection.
     localStorage.setItem('ifc-lite:bcf-server:v1', JSON.stringify({ serverUrl: 'https://x' }));
     assert.equal(loadBcfServerConfig(), null);
@@ -203,6 +224,56 @@ describe('signInToBcfServer', () => {
     await assert.rejects(
       signInToBcfServer('https://fake.example/bcf', 'tester@example.com', 'wrong'),
       /bad credentials/,
+    );
+    assert.equal(loadBcfServerConfig(), null);
+  });
+});
+
+describe('bare space URL (BIMcollab Nexus, issue #3900)', () => {
+  // Users are told to enter the space address, e.g.
+  // https://myspace.bimcollab.com, by BIMcollab and by Solibri's BCF
+  // connector. The API is served under /bcf, and the space answers
+  // /2.1/auth with an HTML 404, so sign-in used to die with
+  // "BCF request failed (HTTP 404)".
+  it('signs in with the password grant against the /bcf root', async () => {
+    installFakeServer();
+    const config = await signInToBcfServer('https://fake.example', 'tester@example.com', 'right');
+    assert.equal(config.serverUrl, 'https://fake.example/bcf');
+    const projects = await listBcfServerProjects();
+    assert.equal(projects[0]?.name, 'Project One');
+  });
+
+  it('signs in with a pasted access token against the /bcf root', async () => {
+    const server = installFakeServer();
+    server.validTokens.add('pasted-token');
+    const config = await signInWithToken('https://fake.example/', 'pasted-token');
+    assert.equal(config.serverUrl, 'https://fake.example/bcf');
+    assert.equal(config.userId, 'tester@example.com');
+  });
+
+  it('prepares the browser OAuth flow against the /bcf root', async () => {
+    installFakeServer();
+    const preparation = await prepareBcfOAuth('https://fake.example');
+    assert.equal(preparation.serverUrl, 'https://fake.example/bcf');
+    assert.equal(preparation.tokenUrl, 'https://fake.example/bcf/oauth2/token');
+  });
+
+  it('names the address the user entered when it is not a BCF server', async () => {
+    installFakeServer();
+    await assert.rejects(
+      signInToBcfServer('https://fake.example/wrong', 'tester@example.com', 'right'),
+      /HTTP 404.*https:\/\/fake\.example\/wrong\/2\.1\/auth/,
+    );
+    assert.equal(loadBcfServerConfig(), null);
+  });
+
+  it('stores nothing when a token sign-in on a bare host is rejected', async () => {
+    // The resolved base is only reached with the token AFTER anonymous
+    // discovery, so a rejected token must leave no session behind.
+    installFakeServer();
+    await assert.rejects(
+      signInWithToken('https://fake.example', 'made-up-token'),
+      /Not authenticated/,
     );
     assert.equal(loadBcfServerConfig(), null);
   });
@@ -483,6 +554,63 @@ describe('prepareBcfOAuth', () => {
       /insecure client registration endpoint/,
     );
     assert.equal(server.registrations.length, 0, 'no client secret may be minted over http');
+  });
+
+  it('uses the caller-supplied wording when no client id can be had', async () => {
+    // BIMcollab issues client ids to application vendors only; telling a
+    // space user to "register an OAuth application" is a dead end (#3900).
+    const server = installFakeServer();
+    server.dynamicRegistration = false;
+    await assert.rejects(
+      prepareBcfOAuth('https://fake.example/bcf', {
+        missingClientIdMessage: 'BIMcollab issues client ids to application vendors',
+      }),
+      /issues client ids to application vendors/,
+    );
+  });
+
+  it('names a vendor-registered redirect URI on this origin instead of the default path', async () => {
+    // BIMcollab's playground client is pinned to http://localhost:5000/Callback;
+    // the request must carry exactly what the vendor registered, and the
+    // exchange must repeat it.
+    const server = installFakeServer();
+    const redirectUri = `${window.location.origin}/Callback`;
+    const preparation = await prepareBcfOAuth('https://fake.example/bcf', {
+      clientId: 'PlayGround_Client',
+      clientSecret: 'play-secret',
+      redirectUri,
+    });
+    assert.equal(new URL(preparation.authorizeUrl).searchParams.get('redirect_uri'), redirectUri);
+    assert.equal(preparation.redirectUri, redirectUri);
+    const config = await completeBcfOAuth(
+      preparation,
+      `${redirectUri}?code=good-code&state=${preparation.state}`,
+    );
+    const exchange = server.tokenForms.at(-1);
+    assert.ok(exchange);
+    assert.equal(exchange.get('redirect_uri'), redirectUri);
+    assert.equal(exchange.get('client_id'), 'PlayGround_Client');
+    assert.equal(exchange.get('client_secret'), 'play-secret');
+    assert.equal(config.clientId, 'PlayGround_Client', 'kept for the refresh grant');
+  });
+
+  it('refuses a redirect URI on another origin before touching the network', async () => {
+    // The callback page reports back over an origin-scoped BroadcastChannel,
+    // so a redirect to a different origin would strand the user on the
+    // vendor's callback with nobody listening.
+    let fetched = false;
+    globalThis.fetch = (async () => {
+      fetched = true;
+      return new Response('{}');
+    }) as typeof fetch;
+    await assert.rejects(
+      prepareBcfOAuth('https://fake.example/bcf', {
+        clientId: 'x',
+        redirectUri: 'https://www.ifclite.com/oauth/bcf/callback',
+      }),
+      /Open the viewer at https:\/\/www\.ifclite\.com/,
+    );
+    assert.equal(fetched, false);
   });
 });
 

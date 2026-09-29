@@ -1,13 +1,13 @@
 # BCF Collaboration
 
-IFClite supports **BCF (BIM Collaboration Format)**, the buildingSMART standard for issue tracking in BIM projects. The `@ifc-lite/bcf` package implements BCF 2.1 and 3.0 specifications.
+IFClite supports **BCF (BIM Collaboration Format)**, the buildingSMART standard for topic tracking in BIM projects. The `@ifc-lite/bcf` package implements BCF 2.1 and 3.0 specifications.
 
 ## What is BCF?
 
-BCF allows teams to create, share, and manage issues (called **topics**) linked to specific locations and components in a BIM model. Each topic can include:
+BCF allows teams to create, share, and manage **topics** linked to specific locations and components in a BIM model. Each topic can optionally be typed (Issue, Request, Comment, and more) and can include:
 
 - **Viewpoints** - Camera positions and component visibility snapshots
-- **Comments** - Discussion threads on the issue
+- **Comments** - Discussion threads on the topic
 - **Component references** - Links to specific IFC entities via GlobalId
 
 ## Quick Start
@@ -28,6 +28,18 @@ for (const [guid, topic] of project.topics) {
   console.log(`    Comments: ${topic.comments.length}`);
   console.log(`    Viewpoints: ${topic.viewpoints.length}`);
 }
+```
+
+If a topic or viewpoint cannot be read, the reader keeps the other items and
+reports the skipped item through `onWarning`. The callback also reports an
+unsupported version that was read using BCF 2.1 rules:
+
+```typescript
+import { readBCF } from '@ifc-lite/bcf';
+
+const project = await readBCF(bcfBuffer, {
+  onWarning: (message, kind) => console.warn(`BCF import ${kind}: ${message}`),
+});
 ```
 
 ### Creating BCF Projects
@@ -72,7 +84,7 @@ const bcfBlob = await writeBCF(project);
 
 ## Viewpoints
 
-Viewpoints capture the camera state and component visibility at the time an issue is created. IFClite provides utilities to convert between viewer camera state and BCF viewpoint format.
+Viewpoints capture the camera state and component visibility at the time a topic is created. IFClite provides utilities to convert between viewer camera state and BCF viewpoint format.
 
 ### Creating Viewpoints
 
@@ -81,7 +93,7 @@ import { createViewpoint } from '@ifc-lite/bcf';
 
 // Create a viewpoint from current viewer state
 const viewpoint = createViewpoint({
-  camera: currentCameraState,   // { position, target, up, fov, isOrthographic?, orthoScale? }
+  camera: currentCameraState,   // { position, target, up, fov, aspectRatio?, isOrthographic?, orthoScale? }
   selectedGuids: selectedGuids, // IFC GlobalIds of selected entities
   hiddenGuids: hiddenGuids,     // IFC GlobalIds of hidden entities
   visibleGuids: visibleGuids,   // IFC GlobalIds for isolation mode (optional)
@@ -89,6 +101,17 @@ const viewpoint = createViewpoint({
   snapshot: base64Image,        // Screenshot as base64 (optional)
 });
 ```
+
+`aspectRatio` is the viewport's width divided by its height, and it is
+**required for BCF 3.0**. `v3_0/visinfo.xsd` makes `<AspectRatio>` a mandatory
+child of both camera types, and `@ifc-lite/bcf` will not invent one, so
+`writeBCF` throws for the whole archive on the first camera that lacks it. It
+must be finite and greater than zero. BCF 2.1 has no such element, so leave it
+unset when writing 2.1 rather than assert a viewport nobody had.
+
+Note that a project's version is not always chosen in your own code:
+`readBCF` sets `project.version` from the imported `bcf.version`, so importing
+another tool's 3.0 archive and adding a viewpoint lands on the 3.0 rule.
 
 ### Restoring Viewpoints
 
@@ -104,6 +127,48 @@ const state = extractViewpointState(viewpoint);
 // state.visibleGuids - entities for isolation mode
 // state.coloredGuids - entities with color overrides
 ```
+
+### Coordinate frames
+
+BCF positions (`CameraViewPoint`, clipping-plane and bitmap locations, line
+points) are IFC **world** coordinates, Z-up. IFClite's geometry is not: for a
+georeferenced or otherwise far-from-origin model the mesher subtracts an RTC
+offset and possibly an origin shift, so a renderer camera, a section plane and
+every mesh or clash bound are in that shifted render frame, Y-up. Writing a
+render-frame camera puts it kilometres from the building in BIMcollab, usBIM
+or Solibri.
+
+`@ifc-lite/geometry/world-frame` owns the conversion. `renderFrameWorldOffset` turns a
+`GeometryResult`'s `coordinateInfo` into the render frame -> world translation
+in BCF axes; `translateViewpoint` applies it on export, and
+`viewpointFromWorld` undoes it on import (a viewpoint written by ifc-lite
+before #4806, still in the render frame, is recognised against the model
+bounds and kept as it is). For a federation, `federationFrameInfo` picks the
+federation's shared RTC frame (see [Federation → Coordinates in a
+Federation](federation.md#coordinates-in-a-federation)), which every supported
+meshed model is converged onto whatever order the models loaded in.
+
+```typescript
+import { createViewpoint, translateViewpoint, viewpointFromWorld } from '@ifc-lite/bcf';
+import { renderFrameWorldOffset } from '@ifc-lite/geometry/world-frame';
+
+const offset = renderFrameWorldOffset(result.coordinateInfo);
+
+// Export: render-frame camera -> world viewpoint
+const worldViewpoint = translateViewpoint(createViewpoint({ camera: currentCameraState }), offset);
+
+// Import: world viewpoint -> render frame, before extractViewpointState
+const localViewpoint = viewpointFromWorld(worldViewpoint, offset, result.coordinateInfo.shiftedBounds);
+```
+
+The viewer, `ifc-lite clash --bcf`, the MCP playground's `clash_bcf_export`
+and `bim.bcf` in the SDK all do this for you. In the SDK,
+`bim.bcf.createViewpoint({ camera: bim.viewer.getCamera() })` writes world
+coordinates and `bim.bcf.extractViewpointState()` returns a camera for
+`bim.viewer.setCamera()` whenever the host's viewer backend implements the
+optional `getRenderFrameOffset()` (the ifc-lite viewer does); without it no
+offset is applied. The low-level converters (`cameraToPerspective`,
+`sectionPlaneToClippingPlane`, ...) never change frames.
 
 ## GUID Conversion
 
@@ -122,6 +187,8 @@ if (isValidIfcGuid(guid)) {
 
 `generateIfcGuid`, `generateUuid`, and `isValidUuid` are also re-exported.
 
+In the viewer, activating a viewpoint shows its clipping plane (or clears the cut when it has none). Closing the BCF panel gives back the section cut and tool you had before the first viewpoint, unless you moved the cut in the meantime.
+
 ## IDS Validation Reports as BCF
 
 Failed IDS validation results can be turned into a BCF project, one topic per failure group:
@@ -133,7 +200,13 @@ const project = createBCFFromIDSReport(reportInput, options);
 const blob = await writeBCF(project);
 ```
 
-The viewer's IDS panel uses this to export validation failures as BCF, with optional camera viewpoints and snapshots. See [IDS Validation](ids.md).
+The viewer's Data validation panel (IDS validation entry) uses this to export validation failures as BCF, with optional camera viewpoints and snapshots. See [IDS Validation](ids.md).
+
+`createBCFFromIDSReport` stops at `maxTopics` (default 1,000) and adds one Info topic saying how many items were left out. The viewer's export dialog defaults to one topic per failing specification, because one topic per entity grows with the model. It also shows how many topics the chosen grouping makes and warns before an export would pass the cap. Snapshots are rendered for at most that many entities.
+
+Exporting `version: '3.0'` also needs `entityBounds`. BCF 3.0 requires exactly one camera per viewpoint, and `createBCFFromIDSReport` computes that camera only from the bounds you pass, keyed `"modelId:expressId"`. Bounds that are absent, or that cover only some of the entities a viewpoint frames, make the call throw and name the topic it could not frame, rather than write a partial view that leaves the rest off screen. With no bounds to hand, export `version: '2.1'`, or set an explicit camera on every viewpoint before writing 3.0.
+
+A computed camera gets an `AspectRatio` of 16/9, the convention for a viewpoint that never had a viewport behind it. Pass `aspectRatio` to use your own viewport's width / height instead; it must be a finite number greater than 0, since `visinfo.xsd` types `AspectRatio` as `PositiveDouble`, and the option is rejected where you set it rather than later inside `writeBCF`.
 
 ## Clash Results as BCF
 
@@ -142,12 +215,15 @@ The clash package (`@ifc-lite/clash/bcf`) exports clash detection results as a B
 ```typescript
 import { createBCFFromClashResult, mapBcfToClashes } from '@ifc-lite/clash/bcf';
 import { clashReviewKey } from '@ifc-lite/clash';
+import { renderFrameWorldOffset } from '@ifc-lite/geometry/world-frame';
 
 const project = await createBCFFromClashResult(clashResult, groups, {
   author: 'clash@ifc-lite',
   projectName: 'Clash report',
   // Optional: map each clash to its review status ('open' | 'resolved' | 'accepted')
   reviewStatusOf: (clash) => myReviews.get(clashReviewKey(clash))?.status ?? 'open',
+  // Clash bounds are in the mesher's render frame; BCF cameras must be world.
+  worldOffset: renderFrameWorldOffset(result.coordinateInfo),
 });
 ```
 
@@ -157,11 +233,24 @@ Clash review status (`open` / `resolved` / `accepted`, tracked with an optional 
 
 ## 3D Overlay Markers
 
-For rendering BCF topics as markers in a 3D view, the package provides viewer-agnostic marker positioning plus a DOM renderer:
+For rendering BCF topics as markers in a 3D view, the package provides viewer-agnostic marker positioning. `computeMarkerPositions` turns topics into world-space (Y-up) markers — a pin position, an optional connector anchor on the referenced component, and the topic's title, status and priority — and leaves drawing them to your renderer:
 
 ```typescript
-import { computeMarkerPositions, BCFOverlayRenderer } from '@ifc-lite/bcf';
+import { computeMarkerPositions, type BCFTopic, type OverlayBBox } from '@ifc-lite/bcf';
+
+declare const topics: BCFTopic[];
+declare function boundsForGuid(ifcGuid: string): OverlayBBox | null;
+
+const markers = computeMarkerPositions(topics, boundsForGuid, {
+  statusFilter: ['Open', 'In Progress'],
+});
+for (const marker of markers) {
+  // Project marker.position (and marker.connectorAnchor, when present) to
+  // screen space with your own camera, then draw a pin coloured by marker.status.
+}
 ```
+
+The package no longer ships a DOM renderer for these markers. The IFClite viewer draws them as `Pin` / `AnchoredCard` primitives on its shared scene-overlay projector; any other host renders them from `computeMarkerPositions`' output.
 
 ## BCF Servers (BCF API)
 
@@ -170,17 +259,22 @@ Beyond `.bcfzip` files, the `@ifc-lite/bcf-api` package connects to [buildingSMA
 ```typescript
 import {
   BcfApiClient,
-  normalizeBcfBaseUrl,
+  discoverBcfService,
   requestPasswordToken,
   fetchProjectAsBCF,
 } from '@ifc-lite/bcf-api';
 
-const baseUrl = normalizeBcfBaseUrl('https://example.com/bcf');
+// Normalizes the address and fetches the server's `/auth` document. Vendors
+// tell users to enter the bare space or instance URL (BIMcollab:
+// https://myspace.bimcollab.com) while serving the API under a path, so a
+// pathless address is also tried at `/bcf`; `baseUrl` is whichever answered.
+const { baseUrl, authInfo } = await discoverBcfService({
+  baseUrl: 'https://example.com/bcf',
+});
 
-// Discover the token endpoint, then sign in with the OAuth2 password grant
-const auth = await new BcfApiClient({ baseUrl }).getAuthInfo();
+// Then sign in with the OAuth2 password grant against the discovered endpoint
 const token = await requestPasswordToken({
-  tokenUrl: auth.oauth2_token_url!,
+  tokenUrl: authInfo.oauth2_token_url!,
   username: 'you@example.com',
   password: 'secret',
 });
@@ -200,8 +294,16 @@ The client implements the BCF API 2.1 routes (projects, extensions, topics with 
 
 In the IFClite viewer, BCF is integrated through the BCF panel:
 
-1. **Load BCF** - Drag and drop a `.bcf` or `.bcfzip` file or use the BCF panel to import
+1. **Load BCF** - Open the BCF panel and use its Import button to pick a `.bcf` or `.bcfzip` file (dropping one onto the main viewport is not supported — it names a model file, not a BCF archive). Load the IFC model a BCF's topics were captured from *before* importing it, so their viewpoints and component references resolve; the panel warns when you import with no model loaded.
 2. **Connect to a BCF server** - The cloud button in the panel header connects to a BCF API server — pick a known server (Aconex regions, BIMcollab, BIMData.io, BIM Track/Newforma Konekt, Catenda Hub, Dalux Field, OpenProject, StreamBIM) or enter a custom URL, sign in via the browser OAuth popup (authorization code + PKCE, with dynamic client registration where the server offers it), email & password, a pasted access token, or OAuth client credentials — then list its projects and load topics, viewpoints, and snapshots straight into the panel
+   - **Vendor-issued OAuth apps.** Some vendors — BIMcollab in particular — issue OAuth client ids to *application* developers, never to the people who administer a space, and refuse the password and client-credentials grants for such a client. Space users therefore cannot supply a client id themselves. A deployment signs its users in through its own registered public client instead:
+
+     ```
+     VITE_BCF_APP_BIMCOLLAB_CLIENT_ID=<issued client id>
+     VITE_BCF_APP_BIMCOLLAB_REDIRECT_URI=<only if the vendor registered something other than https://<this origin>/oauth/bcf/callback>
+     ```
+
+     With the app configured, picking that server shows no client-id field: the user enters their space URL, clicks Connect and signs in with their own account in the popup. Only the public client id and redirect URI may use `VITE_*`; never put a client secret there because Vite exposes those values to browser code. PKCE and the registered redirect URI protect the authorization code. A confidential client requires a server-side token exchange and is not supported by this browser flow. The redirect URI must be on the deployment's own origin, because the popup hands the result back over an origin-scoped `BroadcastChannel`. Without the app, the form says plainly that the vendor issues client ids to application vendors instead of asking the user to register one. To develop against BIMcollab's playground, whose published client is pinned to `http://localhost:5000/Callback`, set that as the redirect URI and run `vite --port 5000`; the dev server routes the configured path to the callback page.
 3. **Browse Topics** - View all issues with status, priority, and labels
 4. **Navigate Viewpoints** - Click a viewpoint to restore camera and visibility
 5. **Add Comments** - Discuss issues directly in the viewer
@@ -213,7 +315,7 @@ In the IFClite viewer, BCF is integrated through the BCF panel:
 | Type | Description |
 |------|-------------|
 | `BCFProject` | Top-level container with topics map and version |
-| `BCFTopic` | An issue with title, status, comments, and viewpoints |
+| `BCFTopic` | A topic with title, status, comments, and viewpoints |
 | `BCFComment` | A comment on a topic with author and timestamp |
 | `BCFViewpoint` | Camera state, component visibility, and clipping planes |
 | `BCFComponents` | Selected, visible, and colored component references |

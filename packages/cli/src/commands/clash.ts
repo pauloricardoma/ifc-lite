@@ -9,31 +9,32 @@
  * headlessly, maps it to representation-agnostic clash elements, then runs the
  * clash engine with either a single ad-hoc rule (--a/--b) or the standard
  * discipline matrix (--matrix). Results print as a concise human summary or
- * machine-readable JSON, and can be exported as a BCF archive (--bcf).
+ * machine-readable JSON, and can be exported as a BCF archive (--bcf) or as a
+ * flat CSV table with both elements' GlobalIds per row (--csv, #3944).
  */
 
 import { readFile, writeFile } from 'node:fs/promises';
-import { basename } from 'node:path';
+import { basename, resolve } from 'node:path';
 import { createHeadlessContext } from '../loader.js';
 import { getFlag, hasFlag, fatal, printJson, routeConsoleDiagnosticsToStderr } from '../output.js';
-import { GeometryProcessor, type MeshData } from '@ifc-lite/geometry';
+import { GeometryProcessor, type CoordinateInfo, type MeshData } from '@ifc-lite/geometry';
+import { renderFrameWorldOffset } from '@ifc-lite/geometry/world-frame';
 import type { IfcDataStore } from '@ifc-lite/parser';
 import {
   createClashEngine,
-  disciplineMatrixRules,
   groupClashes,
   isClusterGroupingIneffective,
   classifyRuleCoverage,
   ruleHadNoMatch,
   type Clash,
-  type ClashMode,
   sortClashes,
   type ClashResult,
-  type ClashRule,
 } from '@ifc-lite/clash';
 import { elementsFromStep } from '@ifc-lite/clash/step';
 import { createBCFFromClashResult } from '@ifc-lite/clash/bcf';
 import { writeBCF } from '@ifc-lite/bcf';
+import { writeClashCsv } from './clash-csv.js';
+import { buildRules, parseGroupBy, parseMode, parseNumberFlag } from './clash-args.js';
 
 /** Maximum number of clashes embedded in --json output before truncation. */
 const JSON_CLASH_CAP = 1000;
@@ -56,10 +57,20 @@ export function worstFirst(clashes: readonly Clash[]): Clash[] {
 }
 
 /**
+ * Meshes plus the frame they are in. The mesher shifts large coordinates
+ * towards the origin, so clash bounds are render-frame values; the frame is
+ * what turns them back into world coordinates for BCF (#4879).
+ */
+interface MeshedModel {
+  meshes: MeshData[];
+  coordinateInfo: CoordinateInfo | undefined;
+}
+
+/**
  * Mesh a model once and cache the meshes by model id so repeated clash runs
  * within a single process never re-mesh the same file.
  */
-const meshCache = new Map<string, MeshData[]>();
+const meshCache = new Map<string, MeshedModel>();
 
 let sharedProcessor: GeometryProcessor | undefined;
 
@@ -76,74 +87,28 @@ async function getProcessor(): Promise<GeometryProcessor> {
  * Mesh the whole model. Prefers the parsed `store.source` bytes; falls back to
  * reading the file path from disk when the store did not retain its source.
  */
-async function meshModel(store: IfcDataStore, modelId: string, filePath: string): Promise<MeshData[]> {
+async function meshModel(store: IfcDataStore, modelId: string, filePath: string): Promise<MeshedModel> {
   const cached = meshCache.get(modelId);
   if (cached) return cached;
 
-  const mesh = async (bytes: Uint8Array): Promise<MeshData[]> => {
+  const mesh = async (bytes: Uint8Array): Promise<MeshedModel> => {
     const processor = await getProcessor();
     const result = await processor.process(bytes);
-    return result.meshes;
+    return { meshes: result.meshes, coordinateInfo: result.coordinateInfo };
   };
 
   // The wasm mesher is a genuine whole-file consumer, so the source is
   // materialised — but scoped, so the buffer cannot outlive the mesh pass
   // (only the meshes are cached).
-  let meshes: MeshData[];
+  let meshed: MeshedModel;
   if (store.source.byteLength > 0) {
-    meshes = await store.source.withMaterializedAsync(mesh);
+    meshed = await store.source.withMaterializedAsync(mesh);
   } else {
     const buffer = await readFile(filePath);
-    meshes = await mesh(new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength));
+    meshed = await mesh(new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength));
   }
-  meshCache.set(modelId, meshes);
-  return meshes;
-}
-
-function parseMode(raw: string | undefined): ClashMode {
-  const mode = raw ?? 'hard';
-  if (mode !== 'hard' && mode !== 'clearance') {
-    fatal(`Invalid --mode "${mode}". Supported modes: hard, clearance`);
-  }
-  return mode;
-}
-
-function parseNumberFlag(raw: string | undefined, flag: string): number | undefined {
-  if (raw === undefined) return undefined;
-  const value = Number(raw);
-  if (!Number.isFinite(value)) {
-    fatal(`Invalid ${flag} value "${raw}" (must be a number)`);
-  }
-  return value;
-}
-
-type ClashGroupByCli = 'cluster' | 'rule' | 'typePair' | 'element';
-
-function parseGroupBy(raw: string | undefined): ClashGroupByCli {
-  const g = raw ?? 'cluster';
-  if (g !== 'cluster' && g !== 'rule' && g !== 'typePair' && g !== 'element') {
-    fatal(`Invalid --group "${g}". Supported: cluster, rule, typePair, element`);
-  }
-  return g as ClashGroupByCli;
-}
-
-function buildRules(args: string[], mode: ClashMode, tolerance: number | undefined, clearance: number | undefined): ClashRule[] {
-  if (hasFlag(args, '--matrix')) {
-    return disciplineMatrixRules(mode, clearance);
-  }
-
-  const a = getFlag(args, '--a') ?? '*';
-  const b = getFlag(args, '--b');
-  const rule: ClashRule = {
-    id: 'cli-rule',
-    name: b ? `${a} vs ${b}` : `${a} self-clash`,
-    a,
-    mode,
-  };
-  if (b !== undefined) rule.b = b;
-  if (tolerance !== undefined) rule.tolerance = tolerance;
-  if (clearance !== undefined) rule.clearance = clearance;
-  return [rule];
+  meshCache.set(modelId, meshed);
+  return meshed;
 }
 
 /**
@@ -267,7 +232,7 @@ export async function clashCommand(args: string[]): Promise<void> {
 
   const filePath = args.find(a => !a.startsWith('-'));
   if (!filePath) {
-    fatal('Usage: ifc-lite clash <file.ifc> [--a <selector>] [--b <selector>] [--mode hard|clearance] [--tolerance N] [--clearance N] [--matrix] [--bcf <out.bcfzip>] [--group cluster|rule|typePair|element] [--bcf-status <status>] [--max-topics N] [--json]');
+    fatal('Usage: ifc-lite clash <file.ifc> [--a <selector>] [--b <selector>] [--mode hard|clearance] [--tolerance N] [--clearance N] [--matrix] [--bcf <out.bcfzip>] [--group cluster|rule|typePair|element] [--bcf-status <status>] [--max-topics N] [--csv <out.csv>] [--json]');
   }
 
   const jsonOutput = hasFlag(args, '--json');
@@ -276,6 +241,15 @@ export async function clashCommand(args: string[]): Promise<void> {
   const tolerance = parseNumberFlag(getFlag(args, '--tolerance'), '--tolerance');
   const clearance = parseNumberFlag(getFlag(args, '--clearance'), '--clearance');
   const bcfPath = getFlag(args, '--bcf');
+  const csvPath = getFlag(args, '--csv');
+  // `ifc-lite clash --csv model.ifc` (input path forgotten) selects `model.ifc`
+  // as BOTH input and output, and a successful run would replace the IFC with
+  // CSV bytes. Refuse any output that resolves to the input.
+  for (const [flag, out] of [['--csv', csvPath], ['--bcf', bcfPath]] as const) {
+    if (out && resolve(out) === resolve(filePath)) {
+      fatal(`${flag} ${out} is the input model; pass a different output path (did you forget <file.ifc>?)`);
+    }
+  }
   const bcfGroupBy = parseGroupBy(getFlag(args, '--group'));
   const bcfStatus = getFlag(args, '--bcf-status');
   const maxTopics = parseNumberFlag(getFlag(args, '--max-topics'), '--max-topics');
@@ -291,7 +265,7 @@ export async function clashCommand(args: string[]): Promise<void> {
   try {
     const modelId = basename(filePath);
     if (!jsonOutput) process.stderr.write(`  Meshing ${modelId} ...\n`);
-    const meshes = await meshModel(store, modelId, filePath);
+    const { meshes, coordinateInfo } = await meshModel(store, modelId, filePath);
 
     const { elements, exclusions } = elementsFromStep({ store, meshes, modelId });
 
@@ -324,6 +298,9 @@ export async function clashCommand(args: string[]): Promise<void> {
         author: 'ifc-lite clash',
         projectName: 'Clash report',
         // Headless: no snapshots (no renderer) — viewer export embeds those.
+        // Clash bounds are in the mesher's shifted frame; BCF cameras are
+        // world coordinates, or other tools look kilometres away (#4879).
+        worldOffset: renderFrameWorldOffset(coordinateInfo),
         ...(bcfStatus ? { status: bcfStatus } : {}),
         ...(maxTopics != null ? { maxTopics } : {}),
       });
@@ -331,6 +308,11 @@ export async function clashCommand(args: string[]): Promise<void> {
       const buffer = Buffer.from(await blob.arrayBuffer());
       await writeFile(bcfPath, buffer);
       process.stderr.write(`  BCF report written to ${bcfPath} (${groups.length} topic group(s), grouped by ${bcfGroupBy})\n`);
+    }
+
+    if (csvPath) {
+      const rows = await writeClashCsv(csvPath, result, store, modelId);
+      process.stderr.write(`  CSV table written to ${csvPath} (${rows} clash row(s))\n`);
     }
 
     if (jsonOutput) {

@@ -11,9 +11,9 @@
 
 import type { IfcxFile, ComposedNode } from './types.js';
 import { ATTR, SPATIAL_TYPES, isTypedPropertyValue, parseV5aKey } from './types.js';
-import { composeIfcx, findRoots } from './composition.js';
+import { composeIfcx } from './composition.js';
 import { extractEntities } from './entity-extractor.js';
-import { extractProperties, routesToQuantityTable } from './property-extractor.js';
+import { extractProperties, mirroredFlatPropertyKeys, routesToQuantityTable } from './property-extractor.js';
 import { extractGeometry, type MeshData } from './geometry-extractor.js';
 import { extractPointClouds, type PointCloudExtraction } from './pointcloud-extractor.js';
 import { buildHierarchy } from './hierarchy-builder.js';
@@ -27,13 +27,11 @@ import {
 import type { SpatialHierarchy, EntityTable, PropertyTable, QuantityTable, RelationshipGraph } from '@ifc-lite/data';
 
 // Federated composition imports
-import { LayerStack, createLayerStack, type IfcxLayer, type LayerSource } from './layer-stack.js';
-import { PathIndex, createPathIndex, parsePath, type ParsedPath, type PathEntry } from './path-resolver.js';
+import { LayerStack, createLayerStack } from './layer-stack.js';
+import { PathIndex } from './path-resolver.js';
 import {
   composeFederated,
-  type ComposeOptions,
   type FederatedCompositionResult,
-  type ComposedNodeWithSources,
 } from './federated-composition.js';
 
 // Re-exported so the IFCX version constant can be imported from the package
@@ -41,8 +39,8 @@ import {
 // see the comment on IFCX_VERSION itself.
 export { IFCX_VERSION } from '@ifc-lite/data';
 
-// Re-export types
 export * from './types.js';
+export { encodeIfcxImage, IFCX_APPEARANCE, IFCX_IMAGE, IFCX_APPEARANCE_SCHEMAS, type IfcxPixels, type IfcxEncodedImage } from './appearance-wire.js';
 export { composeIfcx, findRoots, getDescendants } from './composition.js';
 export { applyTombstones, isTombstoned } from './tombstones.js';
 export { bakeLayers, type BakeOptions } from './bake.js';
@@ -224,7 +222,7 @@ export async function parseIfcx(
   const quantities = buildQuantities(composed, pathToId, strings);
 
   const parseTime = performance.now() - startTime;
-
+  // @raw-entity-enumeration-ok parser construction reports the count of freshly composed IFCX source rows before any live mutation view exists
   return {
     entities,
     properties,
@@ -370,13 +368,13 @@ function buildQuantities(
     // Get the IFC class to use as context for qset naming
     const ifcClass = (node.attributes.get('bsi::ifc::class') as { code?: string })?.code;
     const qsetName = ifcClass ? `Qto_${ifcClass.replace('Ifc', '')}BaseQuantities` : 'BaseQuantities';
-
+    const mirrored = mirroredFlatPropertyKeys(node.attributes); // #5376: a flat mirror of a qualified value
     for (const [key, value] of node.attributes) {
       // Same routing rule the property extractor uses to skip — the v5a
       // namespace mirrors the collab inflation dialect, typed records
       // (#1031) unwrap to their scalar — so neither table drops or
       // double-claims an attribute.
-      if (!routesToQuantityTable(key, value)) continue;
+      if (mirrored.has(key) || !routesToQuantityTable(key, value)) continue;
 
       const v5a = parseV5aKey(key);
       const propName = v5a?.name ?? key.split('::').pop() ?? '';
@@ -384,9 +382,9 @@ function buildQuantities(
 
       builder.add({
         entityId: expressId,
-        // Keep the authored set name (Qto_* or custom) when the key
-        // carries one; only heuristic-routed keys get the synthesized set.
+        // Keep the authored set name (Qto_* or custom) when the key carries one; else the synthesized set.
         qsetName: v5a ? v5a.setName : qsetName,
+        qsetGlobalId: '', // IFCX's flat model has no qset GlobalId; parity with property-extractor.ts's psetGlobalId.
         quantityName: propName,
         quantityType: getQuantityType(propName, v5a ? v5a.setName.startsWith('Qto_') : true),
         value: effective as number,
@@ -615,7 +613,7 @@ function finalizeFederatedResult(
   }
 
   const parseTime = performance.now() - startTime;
-
+  // @raw-entity-enumeration-ok federated parser construction reports the count of freshly composed IFCX source rows before any live mutation view exists
   return {
     entities,
     properties,

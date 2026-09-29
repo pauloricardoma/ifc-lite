@@ -25,6 +25,7 @@ import type {
   SdkRequest,
   SdkResponse,
   SpatialFrustum,
+  StructuralExtractionData,
   Transport,
   TypePropertiesData,
   WorkScheduleData,
@@ -107,6 +108,37 @@ function createMockBackend() {
     addRoof: vi.fn((modelId: string) => ({ modelId, expressId: 106 })),
     addPlate: vi.fn((modelId: string) => ({ modelId, expressId: 107 })),
     addMember: vi.fn((modelId: string) => ({ modelId, expressId: 108 })),
+    addCostSchedule: vi.fn((modelId: string) => ({ modelId, expressId: 200 })),
+    addCostItem: vi.fn((modelId: string) => ({ modelId, expressId: 201 })),
+    addCostValue: vi.fn((modelId: string) => ({ modelId, expressId: 202 })),
+    addCostQuantity: vi.fn((modelId: string) => ({ modelId, expressId: 203 })),
+    nestCostItems: vi.fn((modelId: string) => ({ modelId, expressId: 204 })),
+    assignCostItemsToSchedule: vi.fn((modelId: string) => ({ modelId, expressId: 205 })),
+    assignToCostItem: vi.fn((modelId: string) => ({ modelId, expressId: 206 })),
+    setCostItemValues: vi.fn(),
+    removeCostEntity: vi.fn(),
+    // #5167 S.1: `StoreBackendMethods` gained the structural authoring surface,
+    // and this hand-built mock must satisfy it or the typecheck lane fails
+    // (vitest does not typecheck, so the package's own suite stays green).
+    addStructuralAnalysisModel: vi.fn((modelId: string) => ({ modelId, expressId: 300 })),
+    addStructuralCurveMember: vi.fn((modelId: string) => ({ modelId, expressId: 301 })),
+    addStructuralPointConnection: vi.fn((modelId: string) => ({ modelId, expressId: 302 })),
+    addStructuralLoadGroup: vi.fn((modelId: string) => ({ modelId, expressId: 303 })),
+    addStructuralPointAction: vi.fn((modelId: string) => ({ modelId, expressId: 304 })),
+    addStructuralLinearAction: vi.fn((modelId: string) => ({ modelId, expressId: 305 })),
+    connectStructuralMemberToConnection: vi.fn((modelId: string) => ({ modelId, expressId: 306 })),
+    connectStructuralActivityToItem: vi.fn((modelId: string) => ({ modelId, expressId: 307 })),
+    assignToStructuralGroup: vi.fn((modelId: string) => ({ modelId, expressId: 308 })),
+    // #6232: openings, hosted doors/windows, types and materials.
+    addOpening: vi.fn((modelId: string) => ({ modelId, expressId: 400 })),
+    addHostedDoor: vi.fn((modelId: string) => ({ modelId, expressId: 401 })),
+    addHostedWindow: vi.fn((modelId: string) => ({ modelId, expressId: 402 })),
+    addElementType: vi.fn((modelId: string) => ({ modelId, expressId: 403 })),
+    assignType: vi.fn((modelId: string) => ({ modelId, expressId: 404 })),
+    addMaterial: vi.fn((modelId: string) => ({ modelId, expressId: 405 })),
+    addMaterialLayerSet: vi.fn((modelId: string) => ({ modelId, expressId: 406 })),
+    addMaterialLayerSetUsage: vi.fn((modelId: string) => ({ modelId, expressId: 407 })),
+    assignMaterial: vi.fn((modelId: string) => ({ modelId, expressId: 408 })),
   };
   const spatial = {
     queryBounds: vi.fn((_modelId: string, _bounds: AABB): EntityRef[] => []),
@@ -142,11 +174,31 @@ function createMockBackend() {
       workSchedules: [],
       tasks: [],
       sequences: [],
+      workCalendars: [],
       hasSchedule: false,
     })),
     tasks: vi.fn((_modelId?: string): ScheduleTaskData[] => []),
     workSchedules: vi.fn((_modelId?: string): WorkScheduleData[] => []),
     sequences: vi.fn((_modelId?: string): ScheduleSequenceData[] => []),
+  };
+
+  const structural = {
+    data: vi.fn((_modelId?: string): StructuralExtractionData => ({
+      analysisModels: [],
+      members: [],
+      connections: [],
+      activities: [],
+      loadGroups: [],
+      resultGroups: [],
+      hasStructural: false,
+      loadsTruncated: false,
+    })),
+    analysisModels: vi.fn((_modelId?: string): StructuralExtractionData['analysisModels'] => []),
+    members: vi.fn((_modelId?: string): StructuralExtractionData['members'] => []),
+    connections: vi.fn((_modelId?: string): StructuralExtractionData['connections'] => []),
+    activities: vi.fn((_modelId?: string): StructuralExtractionData['activities'] => []),
+    loadGroups: vi.fn((_modelId?: string): StructuralExtractionData['loadGroups'] => []),
+    resultGroups: vi.fn((_modelId?: string): StructuralExtractionData['resultGroups'] => []),
   };
 
   const backend: BimBackend = {
@@ -162,10 +214,11 @@ function createMockBackend() {
     lens,
     files,
     schedule,
+    structural,
     subscribe: vi.fn(() => () => {}),
   };
 
-  return { backend, model, query, selection, visibility, viewer, mutate, store, spatial, export: exportNs, lens, files, schedule };
+  return { backend, model, query, selection, visibility, viewer, mutate, store, spatial, export: exportNs, lens, files, schedule, structural };
 }
 
 describe('BimContext', () => {
@@ -186,6 +239,14 @@ describe('BimContext', () => {
     expect(bim.list).toBeDefined();
     expect(bim.events).toBeDefined();
     expect(bim.spatial).toBeDefined();
+  });
+
+  it('keeps existing backends compatible and reports unsupported structural reads', () => {
+    const { structural: _structural, ...backend } = createMockBackend().backend;
+    const bim = createBimContext({ backend });
+
+    expect(bim.model.list()).toEqual([]);
+    expect(() => bim.structural.data()).toThrow('bim.structural is not supported by this backend');
   });
 
   it('throws without backend or transport', () => {
@@ -528,6 +589,41 @@ describe('ExportNamespace', () => {
     );
   });
 
+  /**
+   * #4738: `refs` carries "is a filter active" as well as "which entities", so
+   * the two meanings must not share the empty array. Omitting it asks for the
+   * whole model; an empty array is an ACTIVE filter that matched nothing and
+   * is refused here, at the one home every backend's STEP export goes through,
+   * so no caller has to carry its own guard. Below this point `undefined` is
+   * the only "no filter": `ExportBackendMethods.ifc` is typed for it and both
+   * headless backends branch on `refs != null`.
+   *
+   * The byte-level proof that the refusal is not cosmetic — the same call used
+   * to return all 1045 entities of `hello-wall.ifc` — is in
+   * `packages/cli/src/commands/export.zero-match.test.ts`.
+   */
+  it('ifc() exports the whole model when no ref list is given', () => {
+    const { backend, export: exportNs } = createMockBackend();
+    const bim = createBimContext({ backend });
+
+    const content = bim.export.ifc(undefined, { schema: 'IFC4' });
+
+    expect(content).toContain('ISO-10303-21');
+    // `undefined`, not `[]`: the absence has to reach the backend, or a backend
+    // that refuses an empty list (the viewer's) cannot tell the two apart.
+    expect(exportNs.ifc).toHaveBeenCalledWith(undefined, { schema: 'IFC4' });
+  });
+
+  it('ifc() refuses an empty ref list instead of exporting the whole model', () => {
+    const { backend, export: exportNs } = createMockBackend();
+    const bim = createBimContext({ backend });
+
+    expect(() => bim.export.ifc([], { schema: 'IFC4' })).toThrow(/matched nothing/);
+    // The refusal has to happen BEFORE the backend runs: reaching the backend
+    // with an empty array is exactly what produced the whole-model export.
+    expect(exportNs.ifc).not.toHaveBeenCalled();
+  });
+
   it('hbjson() delegates to a geometry-capable backend', async () => {
     const { backend } = createMockBackend();
     const mock = vi.fn(async (_name?: string) => '{"type":"Model","rooms":[]}');
@@ -600,6 +696,22 @@ describe('ViewerNamespace', () => {
 
     bim.viewer.select([{ modelId: 'm', expressId: 1 }]);
     expect(selection.set).toHaveBeenCalled();
+  });
+
+  it('resetColors distinguishes an omitted list from an empty match (#4789)', () => {
+    const { backend, viewer } = createMockBackend();
+    const bim = createBimContext({ backend });
+    const ref = { modelId: 'm', expressId: 1 };
+
+    bim.viewer.resetColors();
+    bim.viewer.resetColors(undefined);
+    bim.viewer.resetColors([]);
+    bim.viewer.resetColors([ref]);
+
+    expect(viewer.resetColors).toHaveBeenCalledTimes(3);
+    expect(viewer.resetColors).toHaveBeenNthCalledWith(1, undefined);
+    expect(viewer.resetColors).toHaveBeenNthCalledWith(2, undefined);
+    expect(viewer.resetColors).toHaveBeenNthCalledWith(3, [ref]);
   });
 });
 
@@ -687,6 +799,72 @@ describe('MutateNamespace', () => {
 
     bim.mutate.undo('model-1');
     expect(mutate.undo).toHaveBeenCalledWith('model-1');
+  });
+
+  it('batchAsync() keeps the batch open across awaits and closes it on rejection too', async () => {
+    const { backend, mutate } = createMockBackend();
+    const bim = createBimContext({ backend });
+
+    const value = await bim.mutate.batchAsync('flow run', async () => {
+      expect(mutate.batchBegin).toHaveBeenCalledWith('flow run');
+      expect(mutate.batchEnd).not.toHaveBeenCalled();
+      await Promise.resolve();
+      // Still open after the suspension: an implementation that ran `fn()`
+      // without awaiting it would have closed the batch by now.
+      expect(mutate.batchEnd).not.toHaveBeenCalled();
+      bim.mutate.setProperty({ modelId: 'm', expressId: 1 }, 'Pset', 'Prop', 1);
+      return 42;
+    });
+    expect(value).toBe(42);
+    expect(mutate.batchEnd).toHaveBeenCalledWith('flow run');
+
+    await expect(bim.mutate.batchAsync('failing', async () => { throw new Error('boom'); })).rejects.toThrow('boom');
+    expect(mutate.batchEnd).toHaveBeenLastCalledWith('failing');
+  });
+
+  it('batchAsync() joins a batch in flight — nested or overlapping — and closes the one marker when the last settles', async () => {
+    const { backend, mutate } = createMockBackend();
+    const bim = createBimContext({ backend });
+    const calls: string[] = [];
+    mutate.batchBegin.mockImplementation((label: string) => { calls.push(`begin ${label}`); });
+    mutate.batchEnd.mockImplementation((label: string) => { calls.push(`end ${label}`); });
+
+    // Nested: the inner call must not wait for the outer, which is waiting for it.
+    const nested = await bim.mutate.batchAsync('outer', async () => `outer+${await bim.mutate.batchAsync('inner', async () => 'inner')}`);
+    expect(nested).toBe('outer+inner');
+    expect(calls).toEqual(['begin outer', 'end outer']);
+
+    // Overlapping, first settles first: no second marker, so nothing closes out of order.
+    calls.length = 0;
+    let releaseA!: () => void;
+    const a = bim.mutate.batchAsync('A', () => new Promise<string>((resolve) => { releaseA = () => resolve('a'); }));
+    let releaseB!: () => void;
+    const b = bim.mutate.batchAsync('B', () => new Promise<string>((resolve) => { releaseB = () => resolve('b'); }));
+    releaseA();
+    expect(await a).toBe('a');
+    expect(calls).toEqual(['begin A']);
+    releaseB();
+    expect(await b).toBe('b');
+    expect(calls).toEqual(['begin A', 'end A']);
+
+    // A failed batch still releases the marker for the next independent one.
+    calls.length = 0;
+    await expect(bim.mutate.batchAsync('C', async () => { throw new Error('boom'); })).rejects.toThrow('boom');
+    expect(await bim.mutate.batchAsync('D', async () => 'd')).toBe('d');
+    expect(calls).toEqual(['begin C', 'end C', 'begin D', 'end D']);
+
+    // Inside a synchronous batch it is refused rather than opening a marker
+    // the sync batch would then pop out of order; a sync batch inside an
+    // async one nests fine.
+    calls.length = 0;
+    let refused: unknown;
+    bim.mutate.batch('sync', () => { bim.mutate.batchAsync('async', async () => 1).catch((e: unknown) => { refused = e; }); });
+    await Promise.resolve();
+    expect(String(refused)).toMatch(/cannot start inside a synchronous batch/);
+    expect(calls).toEqual(['begin sync', 'end sync']);
+    calls.length = 0;
+    await bim.mutate.batchAsync('outer', async () => { bim.mutate.batch('inner', () => {}); });
+    expect(calls).toEqual(['begin outer', 'begin inner', 'end inner', 'end outer']);
   });
 });
 

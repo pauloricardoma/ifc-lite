@@ -10,6 +10,21 @@ use ifc_lite_core::{DecodedEntity, EntityDecoder, IfcSchema, IfcType};
 
 use crate::router::GeometryProcessor;
 
+/// Two directrix samples closer than this (model units) are one point for
+/// tangent purposes: their difference has no usable direction (#5191).
+const TUBE_DEDUPE_EPS: f64 = 1e-9;
+
+/// Gate every directrix before `build_tube_rmf` (#5191). A non-finite sample
+/// is a load error: it would put NaN into every frame the RMF propagates to.
+/// Fewer than two distinct samples (including all-coincident, which would
+/// otherwise fabricate a flat disc from the end caps) sweeps nothing.
+pub(crate) fn directrix_is_sweepable(points: &[Point3<f64>]) -> Result<bool> {
+    if points.iter().any(|p| !(p.x.is_finite() && p.y.is_finite() && p.z.is_finite())) {
+        return Err(Error::geometry("swept solid directrix has a non-finite coordinate".to_string()));
+    }
+    Ok(points.iter().any(|p| (p - points[0]).norm() >= TUBE_DEDUPE_EPS))
+}
+
 /// Build a rotation-minimising frame (RMF) for sweeping a circular cross-section
 /// along `curve_points`. Returns `(tangents, perp1s, perp2s)`, each of length
 /// `curve_points.len()`.
@@ -23,6 +38,8 @@ use crate::router::GeometryProcessor;
 /// by rotating it from `tangents[i-1]` onto `tangents[i]` (the minimum rotation
 /// that aligns them). When consecutive tangents are parallel the frame stays
 /// untouched.
+///
+/// Precondition: `curve_points` passed [`directrix_is_sweepable`].
 pub(crate) fn build_tube_rmf(
     curve_points: &[Point3<f64>],
 ) -> (Vec<Vector3<f64>>, Vec<Vector3<f64>>, Vec<Vector3<f64>>) {
@@ -34,15 +51,47 @@ pub(crate) fn build_tube_rmf(
         return (tangents, perp1s, perp2s);
     }
 
-    for i in 0..n {
-        let t = if i == 0 {
-            (curve_points[1] - curve_points[0]).normalize()
-        } else if i == n - 1 {
-            (curve_points[i] - curve_points[i - 1]).normalize()
-        } else {
-            ((curve_points[i + 1] - curve_points[i - 1]) / 2.0).normalize()
-        };
-        tangents.push(t);
+    // #5191: a duplicate consecutive directrix point (e.g. two composite-curve
+    // segments sharing an endpoint) makes the finite difference a zero vector,
+    // whose `.normalize()` is NaN. Difference over the distinct points (`kept`)
+    // and give each dropped duplicate its owner's tangent, so `tangents` stays
+    // parallel to `curve_points`.
+    let mut kept: Vec<Point3<f64>> = Vec::with_capacity(n);
+    let mut owner: Vec<usize> = Vec::with_capacity(n);
+    for &p in curve_points {
+        if let Some(&last) = kept.last() {
+            if (p - last).norm() < TUBE_DEDUPE_EPS {
+                owner.push(kept.len() - 1);
+                continue;
+            }
+        }
+        kept.push(p);
+        owner.push(kept.len() - 1);
+    }
+
+    let m = kept.len();
+    let kept_tangents: Vec<Vector3<f64>> = if m < 2 {
+        // Every sample coincides: no direction exists. `process` never gets
+        // here (it meshes nothing); a fixed axis keeps the frame finite.
+        vec![Vector3::new(1.0, 0.0, 0.0); m]
+    } else {
+        (0..m)
+            .map(|k| {
+                let t = if k == 0 {
+                    kept[1] - kept[0]
+                } else if k == m - 1 {
+                    kept[k] - kept[k - 1]
+                } else {
+                    (kept[k + 1] - kept[k - 1]) / 2.0
+                };
+                // `kept` has no consecutive duplicates: the difference is non-zero.
+                t.normalize()
+            })
+            .collect()
+    };
+
+    for &o in &owner {
+        tangents.push(kept_tangents[o]);
     }
 
     let up0 = if tangents[0].x.abs() < 0.9 {
@@ -65,6 +114,11 @@ pub(crate) fn build_tube_rmf(
         // Anti-parallel (cos_a ≈ -1) leaves axis ill-defined, but a 180° turn
         // between consecutive samples on a swept-disk directrix is physically
         // implausible; we keep the previous frame and accept the degraded case.
+        //
+        // NaN-latching hazard (#5191): NaN comparisons are false, so a NaN
+        // tangent also reads as "nearly parallel" and freezes a poisoned frame
+        // for every later ring. Finite tangents are a precondition, held by the
+        // dedupe above and by `directrix_is_sweepable` refusing non-finite points.
         if axis_norm > 1e-9 && cos_a < 1.0 - 1e-12 {
             let axis = axis / axis_norm;
             let sin_a = (1.0 - cos_a * cos_a).max(0.0).sqrt();
@@ -80,6 +134,104 @@ pub(crate) fn build_tube_rmf(
     }
 
     (tangents, perp1s, perp2s)
+}
+
+/// Mesh a circular (optionally annular) cross-section swept along
+/// `curve_points`: one ring of `segments` vertices per sample on the outer
+/// wall, a second ring per sample on the bore when `inner_radius` is set, and
+/// caps at both ends (discs for a rod, annuli for a tube). Returns
+/// `(positions, indices)`.
+///
+/// Every triangle is wound so its geometric normal points OUT of the material:
+/// outer wall radially outward, bore wall radially inward (toward the axis),
+/// start cap along `-t`, end cap along `+t`. The frame `(perp1, perp2, t)` is
+/// right-handed (`perp2 = t x perp1`), so a ring vertex at angle `theta` sits
+/// at `p + r(cos theta perp1 + sin theta perp2)` and CCW order in the
+/// `(perp1, perp2)` plane faces `+t`. `swept_disk_side_walls_face_outward` in
+/// `tests/swept_disk_winding_and_bore.rs` pins the sign.
+fn build_tube(
+    curve_points: &[Point3<f64>],
+    radius: f64,
+    inner_radius: Option<f64>,
+    segments: usize,
+) -> (Vec<f32>, Vec<u32>) {
+    let n = curve_points.len();
+    let seg = segments as u32;
+    let walls = if inner_radius.is_some() { 2 } else { 1 };
+    let mut positions: Vec<f32> = Vec::with_capacity(3 * (walls * n * segments + 2));
+    let mut indices: Vec<u32> = Vec::with_capacity(6 * segments * walls * n);
+
+    // Build a rotation-minimising frame across all sample points up-front.
+    // (Per-iteration `up` selection caused frame flips at sharp bends.)
+    let (_, perp1s, perp2s) = build_tube_rmf(curve_points);
+    let unit_circle: Vec<(f64, f64)> = (0..segments)
+        .map(|j| {
+            let angle = 2.0 * std::f64::consts::PI * j as f64 / segments as f64;
+            (angle.cos(), angle.sin())
+        })
+        .collect();
+
+    let push_ring = |positions: &mut Vec<f32>, i: usize, r: f64| {
+        let p = curve_points[i];
+        for &(cos, sin) in &unit_circle {
+            let vertex = p + (perp1s[i] * (r * cos) + perp2s[i] * (r * sin));
+            positions.extend_from_slice(&[vertex.x as f32, vertex.y as f32, vertex.z as f32]);
+        }
+    };
+    // Join ring `a` to ring `b`. `outward` is the outer wall's winding
+    // (ring i to ring i+1, normal away from the axis); `false` is its mirror.
+    // The bore wall and both annular caps (outer ring to bore ring) reuse it.
+    let push_strip = |indices: &mut Vec<u32>, a: u32, b: u32, outward: bool| {
+        for j in 0..seg {
+            let j_next = (j + 1) % seg;
+            if outward {
+                indices.extend_from_slice(&[a + j, b + j_next, b + j]);
+                indices.extend_from_slice(&[a + j, a + j_next, b + j_next]);
+            } else {
+                indices.extend_from_slice(&[a + j, b + j, b + j_next]);
+                indices.extend_from_slice(&[a + j, b + j_next, a + j_next]);
+            }
+        }
+    };
+
+    let ring = |i: usize| (i * segments) as u32;
+    for i in 0..n {
+        push_ring(&mut positions, i, radius);
+    }
+    for i in 0..n - 1 {
+        push_strip(&mut indices, ring(i), ring(i + 1), true);
+    }
+
+    match inner_radius {
+        Some(inner) => {
+            // Bore rings follow the outer rings, same sample order.
+            let bore = |i: usize| ring(n + i);
+            for i in 0..n {
+                push_ring(&mut positions, i, inner);
+            }
+            for i in 0..n - 1 {
+                push_strip(&mut indices, bore(i), bore(i + 1), false);
+            }
+            // Annular caps: start faces -t, end faces +t.
+            push_strip(&mut indices, ring(0), bore(0), false);
+            push_strip(&mut indices, ring(n - 1), bore(n - 1), true);
+        }
+        None => {
+            // Disc caps fanned from the sample point on the axis.
+            let (c0, c1) = (ring(n), ring(n) + 1);
+            for p in [curve_points[0], curve_points[n - 1]] {
+                positions.extend_from_slice(&[p.x as f32, p.y as f32, p.z as f32]);
+            }
+            let (o0, o1) = (ring(0), ring(n - 1));
+            for j in 0..seg {
+                let jn = (j + 1) % seg;
+                indices.extend_from_slice(&[c0, o0 + jn, o0 + j]); // start cap faces -t
+                indices.extend_from_slice(&[c1, o1 + j, o1 + jn]); // end cap faces +t
+            }
+        }
+    }
+
+    (positions, indices)
 }
 
 /// SweptDiskSolid processor
@@ -119,151 +271,39 @@ impl GeometryProcessor for SweptDiskSolidProcessor {
             .get_float(1)
             .ok_or_else(|| Error::geometry("SweptDiskSolid missing Radius".to_string()))?;
 
-        // Get inner radius if hollow
-        let _inner_radius = entity.get_float(2);
+        // InnerRadius (optional): a hollow tube's bore. Only a bore strictly
+        // inside the outer wall bounds an annulus; a non-positive, non-finite,
+        // or at-or-past-`radius` value cannot, and the sweep meshes as a rod.
+        let inner_radius = entity
+            .get_float(2)
+            .filter(|&r| r.is_finite() && r > 0.0 && r < radius);
 
-        // StartParam / EndParam (optional IfcParameterValue). Per IFC spec, when the
-        // directrix is an IfcCompositeCurve the curve is parameterised so that segment
-        // index `i` covers parameter range [i, i+1]. Without honoring these, files that
-        // intend e.g. only the first segment to be swept render every segment — the
-        // common rebar case where a 2 m bar reads as 12 m with hooks unfolded.
+        // StartParam / EndParam (optional IfcParameterValue), in the directrix's
+        // own IFC parametrisation. Without honoring these, files that intend e.g.
+        // only the first leg to be swept render every segment — the common rebar
+        // case where a 2 m bar reads as 12 m with hooks unfolded.
         let start_param = entity.get_float(3);
         let end_param = entity.get_float(4);
 
-        // Resolve the directrix curve
         let directrix = decoder
             .resolve_ref(directrix_attr)?
             .ok_or_else(|| Error::geometry("Failed to resolve Directrix".to_string()))?;
+        let curve_points = self.profile_processor.get_directrix_points(
+            &directrix,
+            decoder,
+            start_param,
+            end_param,
+            quality,
+        )?;
 
-        // Get points along the curve, honoring trim parameters where the directrix's
-        // parameterisation is well-defined and obvious from the entity:
-        //   - IfcCompositeCurve (and IfcCompositeCurveOnSurface): segment-index based,
-        //     each segment contributes 1.0 to the parameter.
-        //   - IfcPolyline: point-index based, each segment between consecutive points
-        //     contributes 1.0 to the parameter.
-        //   - IfcLine: linearly parameterised P(u) = Pnt + u·V, so StartParam/EndParam
-        //     map straight onto the segment endpoints.
-        // Other directrix types (IfcCircle, IfcBSplineCurve) have angle-/knot-based
-        // parameterisations and fall back to the full sampler. An IfcTrimmedCurve
-        // directrix is sampled over its own Trim1/Trim2 by get_curve_points (a
-        // trimmed IfcLine retains full 3D); a file's redundant solid-level
-        // StartParam/EndParam are then a no-op. Files using a raw circle/spline
-        // directrix with explicit StartParam/EndParam still render the full curve —
-        // flagged as a known limitation.
-        // The lower-level trimmed samplers below don't take a `quality`
-        // argument; set it on the profile processor so any arcs they sample
-        // honour the requested detail level.
-        self.profile_processor.set_tessellation_quality(quality);
-        let has_trim = start_param.is_some() || end_param.is_some();
-        let curve_points = if has_trim
-            && directrix.ifc_type.is_subtype_of(IfcType::IfcCompositeCurve)
-        {
-            self.profile_processor
-                .get_composite_curve_points_trimmed(
-                    &directrix,
-                    decoder,
-                    start_param,
-                    end_param,
-                )?
-        } else if has_trim && directrix.ifc_type == IfcType::IfcPolyline {
-            self.profile_processor
-                .get_polyline_points_trimmed(&directrix, decoder, start_param, end_param)?
-        } else if has_trim && directrix.ifc_type == IfcType::IfcLine {
-            // A bare IfcLine directrix is parameterised as P(u) = Pnt + u·V, so the
-            // solid's StartParam/EndParam map straight onto the segment endpoints.
-            // Without this the line samples over its unit range [0,1] only and the
-            // swept extent collapses to the (tool-emitted) vector magnitude.
-            self.profile_processor.get_line_points_3d(
-                &directrix,
-                decoder,
-                start_param.unwrap_or(0.0),
-                end_param.unwrap_or(1.0),
-            )?
-        } else {
-            self.profile_processor
-                .get_curve_points(&directrix, decoder, quality)?
-        };
-
-        if curve_points.len() < 2 {
-            return Ok(Mesh::new()); // Not enough points
+        if !directrix_is_sweepable(&curve_points)? {
+            return Ok(Mesh::new());
         }
 
         // Generate tube mesh by sweeping circle along curve
         // 24 segments around the circle at Medium; scaled by quality.
         let segments = scale_segments(24, 8, 96, quality);
-        let mut positions = Vec::new();
-        let mut indices = Vec::new();
-
-        // Build a rotation-minimising frame across all sample points up-front.
-        // (Per-iteration `up` selection caused frame flips at sharp bends.)
-        let (_, perp1s, perp2s) = build_tube_rmf(&curve_points);
-
-        // For each point on the curve, create a ring of vertices
-        for i in 0..curve_points.len() {
-            let p = curve_points[i];
-            let perp1 = perp1s[i];
-            let perp2 = perp2s[i];
-
-            // Create ring of vertices
-            for j in 0..segments {
-                let angle = 2.0 * std::f64::consts::PI * j as f64 / segments as f64;
-                let offset = perp1 * (radius * angle.cos()) + perp2 * (radius * angle.sin());
-                let vertex = p + offset;
-
-                positions.push(vertex.x as f32);
-                positions.push(vertex.y as f32);
-                positions.push(vertex.z as f32);
-            }
-
-            // Create triangles connecting this ring to the next
-            if i < curve_points.len() - 1 {
-                let base = (i * segments) as u32;
-                let next_base = ((i + 1) * segments) as u32;
-
-                for j in 0..segments {
-                    let j_next = (j + 1) % segments;
-
-                    // Two triangles per quad
-                    indices.push(base + j as u32);
-                    indices.push(next_base + j as u32);
-                    indices.push(next_base + j_next as u32);
-
-                    indices.push(base + j as u32);
-                    indices.push(next_base + j_next as u32);
-                    indices.push(base + j_next as u32);
-                }
-            }
-        }
-
-        // Add end caps
-        // Start cap
-        let center_idx = (positions.len() / 3) as u32;
-        let start = curve_points[0];
-        positions.push(start.x as f32);
-        positions.push(start.y as f32);
-        positions.push(start.z as f32);
-
-        for j in 0..segments {
-            let j_next = (j + 1) % segments;
-            indices.push(center_idx);
-            indices.push(j_next as u32);
-            indices.push(j as u32);
-        }
-
-        // End cap
-        let end_center_idx = (positions.len() / 3) as u32;
-        let end_base = ((curve_points.len() - 1) * segments) as u32;
-        let end = curve_points[curve_points.len() - 1];
-        positions.push(end.x as f32);
-        positions.push(end.y as f32);
-        positions.push(end.z as f32);
-
-        for j in 0..segments {
-            let j_next = (j + 1) % segments;
-            indices.push(end_center_idx);
-            indices.push(end_base + j as u32);
-            indices.push(end_base + j_next as u32);
-        }
+        let (positions, indices) = build_tube(&curve_points, radius, inner_radius, segments);
 
         let mut mesh = Mesh {
             positions,
@@ -271,6 +311,8 @@ impl GeometryProcessor for SweptDiskSolidProcessor {
             indices,
             rtc_applied: false,
             origin: [0.0; 3],
+            welded_in_object_frame: false,
+            plane_tags: None,
         instance_meta: None, local_bounds: None, local_to_world: None };
 
         // Ship smooth per-vertex normals, computed here in the directrix-local
@@ -299,57 +341,5 @@ impl Default for SweptDiskSolidProcessor {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rmf_is_constant_on_a_straight_line() {
-        // Three collinear samples → tangents identical → frame must not change.
-        let pts = vec![
-            Point3::new(0.0, 0.0, 0.0),
-            Point3::new(1.0, 0.0, 0.0),
-            Point3::new(2.0, 0.0, 0.0),
-        ];
-        let (tangents, perp1s, perp2s) = build_tube_rmf(&pts);
-        assert_eq!(tangents.len(), 3);
-        for i in 1..3 {
-            assert!((tangents[i] - tangents[0]).norm() < 1e-9);
-            assert!((perp1s[i] - perp1s[0]).norm() < 1e-9);
-            assert!((perp2s[i] - perp2s[0]).norm() < 1e-9);
-        }
-    }
-
-    #[test]
-    fn rmf_does_not_flip_at_sharp_bends() {
-        // L-shape (0,0,0) → (1,0,0) → (1,1,0). The previous implementation
-        // re-picked `up` per cross-section based on `tangent.x.abs() < 0.9`:
-        // at i=0 tangent is +X (|x|=1, picks up=Y) → perp1 = +Z; at i=1 the
-        // midpoint tangent is (1/√2, 1/√2, 0) (|x|≈0.71 < 0.9, picks up=X)
-        // → perp1 = -Z. The sign flip mirrors the cross-section ring and
-        // produces a twisted/flat-ribbon tube. RMF must propagate +Z through.
-        let pts = vec![
-            Point3::new(0.0, 0.0, 0.0),
-            Point3::new(1.0, 0.0, 0.0),
-            Point3::new(1.0, 1.0, 0.0),
-        ];
-        let (_, perp1s, _) = build_tube_rmf(&pts);
-        assert_eq!(perp1s.len(), 3);
-        for (i, p) in perp1s.iter().enumerate() {
-            assert!(
-                p.z > 0.5,
-                "perp1 at i={i} flipped or rotated out of +Z half-space: {p:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn rmf_handles_degenerate_inputs() {
-        let empty: Vec<Point3<f64>> = Vec::new();
-        let (t, p1, p2) = build_tube_rmf(&empty);
-        assert!(t.is_empty() && p1.is_empty() && p2.is_empty());
-
-        let single = vec![Point3::new(0.0, 0.0, 0.0)];
-        let (t, p1, p2) = build_tube_rmf(&single);
-        assert!(t.is_empty() && p1.is_empty() && p2.is_empty());
-    }
-}
+#[path = "disk_tests.rs"]
+mod tests;

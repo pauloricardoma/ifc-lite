@@ -10,6 +10,7 @@ import {
   SECTION_2D_UNIFORM_SLOTS,
   SECTION_2D_UNIFORM_SLOT_COUNT,
   SECTION_2D_UNIFORM_SLOT_INDEX,
+  SECTION_2D_MAX_LINE_PARTITIONS,
 } from './shaders/section-2d-overlay.wgsl.js';
 
 // WebGPU enum globals referenced by the renderer's bind-group visibility and
@@ -22,12 +23,12 @@ import {
 };
 
 /**
- * `Section2DOverlayRenderer` is ONE nullable GPU object backing six buffer
+ * `Section2DOverlayRenderer` is ONE nullable GPU object backing eight buffer
  * families. Nothing pinned its ownership rules until this file: the clash-box
- * family (#1277) was the sixth added and was silently missing from `dispose()`,
- * so its vertex buffer leaked on every renderer teardown while the whole suite
- * stayed green. These tests count `createBuffer` against `destroy()` so the
- * seventh family cannot repeat it.
+ * family (#1277) was once silently missing from `dispose()`, so its vertex
+ * buffer leaked on every renderer teardown while the whole suite stayed green.
+ * These tests count `createBuffer` against `destroy()` so another family cannot
+ * repeat it.
  */
 
 interface FakeBuffer extends GPUBuffer {
@@ -38,12 +39,18 @@ interface FakeBuffer extends GPUBuffer {
 function makeDevice(minUniformBufferOffsetAlignment = 256) {
   const buffers: FakeBuffer[] = [];
   const writes: Array<{ buffer: GPUBuffer; offset: number; data: Float32Array }> = [];
+  /** The descriptor each pipeline was created from. */
+  const pipelineDescs = new Map<GPURenderPipeline, GPURenderPipelineDescriptor>();
   const device = {
     limits: { minUniformBufferOffsetAlignment } as unknown as GPUSupportedLimits,
     createBindGroupLayout: () => ({}) as GPUBindGroupLayout,
     createPipelineLayout: () => ({}) as GPUPipelineLayout,
     createShaderModule: (desc: { code: string }) => ({ code: desc.code }) as unknown as GPUShaderModule,
-    createRenderPipeline: (desc: unknown) => ({ desc }) as unknown as GPURenderPipeline,
+    createRenderPipeline: (desc: GPURenderPipelineDescriptor) => {
+      const pipeline = ({ desc }) as unknown as GPURenderPipeline;
+      pipelineDescs.set(pipeline, desc);
+      return pipeline;
+    },
     createBindGroup: () => ({}) as GPUBindGroup,
     createBuffer: (desc: { size: number }) => {
       const buf = {
@@ -68,15 +75,20 @@ function makeDevice(minUniformBufferOffsetAlignment = 256) {
       },
     },
   } as unknown as GPUDevice;
-  return { device, buffers, writes };
+  return { device, buffers, writes, pipelineDescs };
 }
 
 function makePass() {
   const calls: string[] = [];
   /** Dynamic bind-group offsets, in the order they were bound. */
   const binds: number[] = [];
+  /** Every pipeline set, in order. */
+  const pipelines: GPURenderPipeline[] = [];
   const pass = {
-    setPipeline: () => calls.push('setPipeline'),
+    setPipeline: (p: GPURenderPipeline) => {
+      calls.push('setPipeline');
+      pipelines.push(p);
+    },
     setBindGroup: (_i: number, _g: GPUBindGroup, dynamicOffsets?: number[]) => {
       calls.push('setBindGroup');
       binds.push(dynamicOffsets?.[0] ?? 0);
@@ -86,7 +98,7 @@ function makePass() {
     draw: (n: number) => calls.push(`draw:${n}`),
     drawIndexed: (n: number) => calls.push(`drawIndexed:${n}`),
   } as unknown as GPURenderPassEncoder;
-  return { pass, calls, binds };
+  return { pass, calls, binds, pipelines };
 }
 
 /** Two segments = 12 floats, the minimum a family accepts. */
@@ -136,7 +148,7 @@ type Family = {
   draw: (r: Section2DOverlayRenderer, p: GPURenderPassEncoder, vp: Float32Array) => void;
 };
 
-// The four named channels come from `LINE_OVERLAY_CHANNELS` itself, so a fifth
+// The named channels come from `LINE_OVERLAY_CHANNELS` itself, so another
 // channel is covered by every test below the moment it joins that list —
 // nobody has to remember to add a row here. The clash box is spelled out
 // because it is not a channel: its own colour, its own entry points.
@@ -158,9 +170,9 @@ const FAMILIES: Family[] = [
 ];
 
 function newRenderer(minUniformBufferOffsetAlignment = 256) {
-  const { device, buffers, writes } = makeDevice(minUniformBufferOffsetAlignment);
+  const { device, buffers, writes, pipelineDescs } = makeDevice(minUniformBufferOffsetAlignment);
   const renderer = new Section2DOverlayRenderer(device, 'bgra8unorm' as GPUTextureFormat, 4);
-  return { renderer, buffers, writes };
+  return { renderer, buffers, writes, pipelineDescs };
 }
 
 describe('Section2DOverlayRenderer: per-family buffer ownership', () => {
@@ -287,6 +299,79 @@ describe('Section2DOverlayRenderer: per-family buffer ownership', () => {
   });
 });
 
+describe('selected centreline depth (#5778)', () => {
+  it('rebuilds lazy centreline and shared pipelines after dispose and reinit', () => {
+    const { renderer, pipelineDescs } = newRenderer();
+    renderer.setLineOverlay('centreline', SEGMENTS);
+    const first = makePass();
+    renderer.drawLineOverlay(first.pass, OPTIONS.viewProj, 'centreline');
+    const oldPipeline = first.pipelines[0];
+    renderer.setLineOverlay('grid', SEGMENTS);
+    const oldOrdinary = makePass();
+    renderer.drawLineOverlay(oldOrdinary.pass, OPTIONS.viewProj, 'grid');
+    const oldPipelineCount = pipelineDescs.size;
+    assert.strictEqual(pipelineDescs.get(oldPipeline)?.depthStencil?.depthCompare, 'always');
+
+    renderer.dispose();
+    const empty = makePass();
+    renderer.drawLineOverlay(empty.pass, OPTIONS.viewProj, 'centreline');
+    assert.deepStrictEqual(empty.calls, []);
+    assert.ok(pipelineDescs.size > oldPipelineCount, 'reinit rebuilds the shared device pipelines');
+    assert.strictEqual([...pipelineDescs.values()].filter(
+      (desc) => desc.depthStencil?.depthCompare === 'always').length, 1,
+    'reinit with an empty centreline keeps the x-ray pipeline lazy');
+
+    renderer.setLineOverlay('grid', SEGMENTS);
+    const ordinary = makePass();
+    renderer.drawLineOverlay(ordinary.pass, OPTIONS.viewProj, 'grid');
+    assert.deepStrictEqual(ordinary.calls, ['setPipeline', 'setBindGroup', 'setVertexBuffer', 'draw:4']);
+    assert.notStrictEqual(ordinary.pipelines[0], oldOrdinary.pipelines[0]);
+
+    renderer.setLineOverlay('centreline', SEGMENTS);
+    const second = makePass();
+    renderer.drawLineOverlay(second.pass, OPTIONS.viewProj, 'centreline');
+    assert.deepStrictEqual(second.calls, ['setPipeline', 'setBindGroup', 'setVertexBuffer', 'draw:4']);
+    assert.notStrictEqual(second.pipelines[0], oldPipeline, 'the old GPU pipeline is never rebound');
+    assert.strictEqual(pipelineDescs.get(second.pipelines[0])?.depthStencil?.depthCompare, 'always');
+  });
+
+  it('creates the depth pipeline only after a centreline has drawable segments', () => {
+    const { renderer, pipelineDescs } = newRenderer();
+    renderer.setLineOverlay('grid', SEGMENTS);
+    const ordinaryPipelines = pipelineDescs.size;
+    const empty = makePass();
+    renderer.drawLineOverlay(empty.pass, OPTIONS.viewProj, 'centreline');
+    assert.deepStrictEqual(empty.calls, []);
+    assert.strictEqual(pipelineDescs.size, ordinaryPipelines,
+      'normal frames with no centreline must not allocate its depth pipeline');
+
+    renderer.setLineOverlay('centreline', SEGMENTS);
+    const populated = makePass();
+    renderer.drawLineOverlay(populated.pass, OPTIONS.viewProj, 'centreline');
+    assert.deepStrictEqual(populated.calls, ['setPipeline', 'setBindGroup', 'setVertexBuffer', 'draw:4']);
+    assert.strictEqual(pipelineDescs.size, ordinaryPipelines + 1);
+    assert.strictEqual(pipelineDescs.get(populated.pipelines[0])?.depthStencil?.depthCompare, 'always');
+
+    renderer.setLineOverlay('centreline', null);
+    renderer.drawLineOverlay(makePass().pass, OPTIONS.viewProj, 'centreline');
+    assert.strictEqual(pipelineDescs.size, ordinaryPipelines + 1,
+      'clearing the channel must not allocate another pipeline');
+  });
+
+  it('draws through its swept solid without changing other line channels', () => {
+    const { renderer, pipelineDescs } = newRenderer();
+    renderer.setLineOverlay('grid', SEGMENTS);
+    renderer.setLineOverlay('centreline', SEGMENTS);
+    assert.ok(![...pipelineDescs.values()].some((desc) => desc.depthStencil?.depthCompare === 'always'),
+      'the x-ray pipeline is created only for a selected centreline draw');
+    const { pass, pipelines } = makePass();
+    renderer.drawLineOverlay(pass, OPTIONS.viewProj, 'grid');
+    renderer.drawLineOverlay(pass, OPTIONS.viewProj, 'centreline');
+    assert.strictEqual(pipelineDescs.get(pipelines[0])?.depthStencil?.depthCompare, 'greater-equal');
+    assert.strictEqual(pipelineDescs.get(pipelines[1])?.depthStencil?.depthCompare, 'always');
+  });
+});
+
 describe('Section2DOverlayRenderer: dispose releases EVERY family (#1277 leak)', () => {
   it('destroys every uploaded family buffer and the shared uniform buffer', () => {
     const { renderer, buffers } = newRenderer();
@@ -335,7 +420,7 @@ describe('Section2DOverlayRenderer: dispose releases EVERY family (#1277 leak)',
 });
 
 describe('SECTION_2D_UNIFORM_SLOT_INDEX (#3342)', () => {
-  it('is dense: values are exactly {0, ..., SECTION_2D_UNIFORM_SLOT_COUNT - 1}, no gaps or duplicates', () => {
+  it('reserves non-overlapping partition ranges inside the shared buffer', () => {
     // SECTION_2D_UNIFORM_SLOT_COUNT is *derived* from this index
     // (Object.keys(...).length), so comparing the two against each other
     // would hold by construction no matter what the index contains — it
@@ -344,10 +429,13 @@ describe('SECTION_2D_UNIFORM_SLOT_INDEX (#3342)', () => {
     // the buffer is sized for `count` slots but a draw addresses a slot
     // beyond it. Pin density instead: every slot value 0..COUNT-1 must be
     // used exactly once.
-    const values = Object.values(SECTION_2D_UNIFORM_SLOT_INDEX);
-    const sorted = [...values].sort((a, b) => a - b);
-    const expected = Array.from({ length: SECTION_2D_UNIFORM_SLOT_COUNT }, (_, i) => i);
-    assert.deepStrictEqual(sorted, expected, 'slot values must be exactly 0..COUNT-1 with no gaps or duplicates');
+    const starts = Object.values(SECTION_2D_UNIFORM_SLOT_INDEX).sort((a, b) => a - b);
+    assert.equal(starts[0], 0, 'the section cap owns the first record');
+    assert.equal(starts[1], 1, 'line partitions begin after the cap record');
+    for (let index = 2; index < starts.length; index++) {
+      assert.equal(starts[index] - starts[index - 1], SECTION_2D_MAX_LINE_PARTITIONS);
+    }
+    assert.equal(SECTION_2D_UNIFORM_SLOT_COUNT, 1 + (starts.length - 1) * SECTION_2D_MAX_LINE_PARTITIONS);
   });
 });
 
@@ -396,6 +484,74 @@ describe('Section2DOverlayRenderer: shared uniform buffer', () => {
       [0, 0, 0, 0],
     );
     assert.deepStrictEqual(Array.from(u.slice(0, 16)), new Array(16).fill(7));
+  });
+
+  it('keeps centimetre residuals at 5,000 km for anchored lines and section caps (#5049)', () => {
+    const { renderer, writes } = newRenderer();
+    const eye = [5_000_000.25, 20, -4] as const;
+    const rte = new Float32Array(16).fill(3);
+    renderer.setLineOverlay('annotation', {
+      localVertices: new Float32Array([0.01, 0, 0, 0.02, 0, 0]),
+      origin: [5_000_000.255, 20, -4],
+    });
+    const { pass } = makePass();
+    renderer.drawLineOverlay(pass, new Float32Array(16), 'annotation', rte, eye);
+    let u = lastWrite(writes);
+    assert.ok(Math.abs(u[SECTION_2D_UNIFORM_SLOTS.originDeltaHigh] + u[SECTION_2D_UNIFORM_SLOTS.originDeltaLow] - 0.005) < 1e-7);
+    assert.strictEqual(u[SECTION_2D_UNIFORM_SLOTS.originDeltaHigh + 3], 1);
+
+    renderer.uploadDrawing(TRIANGLE, [], 'side', 5_000_000.255);
+    renderer.draw(pass, { ...OPTIONS, viewProj: new Float32Array(16), rteViewProj: rte, rteCamera: eye, showFills: true, showOutlines: true, capStyle: CAP_STYLE });
+    u = lastWrite(writes);
+    assert.ok(Math.abs(u[SECTION_2D_UNIFORM_SLOTS.originDeltaHigh] + u[SECTION_2D_UNIFORM_SLOTS.originDeltaLow] - 0.005) < 1e-7);
+    assert.strictEqual(u[SECTION_2D_UNIFORM_SLOTS.originDeltaHigh + 3], 1);
+  });
+
+  it('restores a rebased cap anchor for a legacy world-space projection (#5152)', () => {
+    const { renderer, writes } = newRenderer();
+    const anchor = 5_000_000.255;
+    renderer.uploadDrawing(TRIANGLE, [], 'side', anchor);
+    const { pass } = makePass();
+
+    // No RTE frame: callers using the legacy world-space matrix still need
+    // the locally uploaded cap vertices returned to their source position.
+    renderer.draw(pass, { ...OPTIONS, viewProj: new Float32Array(16).fill(7) });
+
+    const u = lastWrite(writes);
+    const S = SECTION_2D_UNIFORM_SLOTS;
+    assert.equal(u[S.planeOffset], Math.fround(anchor), 'legacy world projection receives the cap anchor');
+    assert.deepEqual(Array.from(u.slice(S.planeOffset + 1, S.planeOffset + 4)), [0, 0, 0]);
+    assert.equal(u[S.originDeltaHigh + 3], 0, 'legacy projection must not select the RTE transform');
+    assert.deepEqual(Array.from(u.slice(S.viewProj, S.viewProj + 16)), new Array(16).fill(7));
+  });
+
+  it('keeps the focused clash wireframe in the same anchored RTE frame (#5049)', () => {
+    const { renderer, writes } = newRenderer();
+    const eye = [5_000_000.25, 20, -4] as const;
+    renderer.uploadClashBoxLines3D({
+      localVertices: new Float32Array([0, 0, 0, 0.01, 0, 0]),
+      origin: [5_000_000.255, 20, -4],
+    });
+    const { pass } = makePass();
+    renderer.drawClashBoxLines3D(pass, new Float32Array(16), new Float32Array(16), eye);
+    const u = lastWrite(writes);
+    const delta = u[SECTION_2D_UNIFORM_SLOTS.originDeltaHigh] + u[SECTION_2D_UNIFORM_SLOTS.originDeltaLow];
+    assert.ok(Math.abs(delta - 0.005) < 1e-7, `clash wireframe residual became ${delta}`);
+    assert.strictEqual(u[SECTION_2D_UNIFORM_SLOTS.originDeltaHigh + 3], 1);
+  });
+
+  it('draws independently anchored partitions instead of dropping a >8km overlay (#5049)', () => {
+    const { renderer, writes } = newRenderer();
+    renderer.setLineOverlay('annotation', [
+      { localVertices: new Float32Array([0, 0, 0, 4_500, 0, 0]), origin: [5_000_000.015625, 0, 0] },
+      { localVertices: new Float32Array([0, 0, 0, 4_500, 0, 0]), origin: [5_004_500.015625, 0, 0] },
+    ]);
+    const { pass, calls } = makePass();
+    renderer.drawLineOverlay(pass, new Float32Array(16), 'annotation', new Float32Array(16), [5_000_000, 0, 0]);
+    assert.deepStrictEqual(calls.filter((call) => call.startsWith('draw:')), ['draw:2', 'draw:2']);
+    const deltas = writes.slice(-2).map((write) => write.data[SECTION_2D_UNIFORM_SLOTS.originDeltaHigh] + write.data[SECTION_2D_UNIFORM_SLOTS.originDeltaLow]);
+    assert.ok(Math.abs(deltas[0] - 0.015625) < 1e-7);
+    assert.ok(Math.abs(deltas[1] - 4_500.015625) < 1e-4);
   });
 
   it('places the cap style at the capFill / capStroke / params slots', () => {
@@ -479,12 +635,33 @@ describe('Section2DOverlayRenderer: section-cut draw gating', () => {
     assert.ok(calls.some((c) => c.startsWith('drawIndexed:')), 'fill drawn');
   });
 
+  // The post passes read the depth buffer after the scene pass (ambient
+  // occlusion, #5384). The cap fill writes no depth, so under a cap that
+  // buffer held the clipped element's inside faces and AO darkened the cap.
+  it('replays the cap into depth after the fill, changing no pixel (#5384)', () => {
+    const { renderer, pipelineDescs } = newRenderer();
+    renderer.uploadDrawing(TRIANGLE, [], 'front', 0);
+    const { pass, calls, pipelines } = makePass();
+    renderer.draw(pass, { ...OPTIONS, showOutlines: false, showFills: true, capStyle: CAP_STYLE });
+
+    const fills = calls.filter((c) => c.startsWith('drawIndexed:'));
+    assert.strictEqual(fills.length, 2, 'the cap colour, then the cap depth');
+    assert.strictEqual(fills[0], fills[1], 'the depth replay covers the same triangles');
+    const [colour, depth] = pipelines.map((p) => pipelineDescs.get(p));
+    assert.ok(colour && depth, 'both draws bind a pipeline this renderer created');
+    assert.strictEqual(colour.depthStencil?.depthWriteEnabled, false, 'the visible cap still writes no depth');
+    assert.strictEqual(depth.depthStencil?.depthWriteEnabled, true, 'the replay writes the cap depth');
+    assert.strictEqual(depth.depthStencil?.depthCompare, colour.depthStencil?.depthCompare, 'occluded where the cap is occluded');
+    const masks = [...(depth.fragment?.targets ?? [])].map((t) => t?.writeMask);
+    assert.deepStrictEqual(masks, [0, 0], 'colour and object-id writes are masked off');
+  });
+
   it('suppresses the outline when showOutlines is false', () => {
     const { renderer } = newRenderer();
     renderer.uploadDrawing(TRIANGLE, [], 'front', 0);
     const { pass, calls } = makePass();
     renderer.draw(pass, { ...OPTIONS, showOutlines: false, showFills: true, capStyle: CAP_STYLE });
-    assert.ok(!calls.some((c) => /^draw:/.test(c)), 'no outline draw');
+    assert.ok(!calls.some((c) => c.startsWith('draw:')), 'no outline draw');
     assert.ok(calls.some((c) => c.startsWith('drawIndexed:')), 'fill still drawn');
   });
 
@@ -515,17 +692,17 @@ describe('Section2DOverlayRenderer: section-cut draw gating', () => {
 });
 
 /**
- * Six draws, six uniform records.
+ * Seven draw sites, seven uniform records.
  *
- * `Section2DOverlayRenderer` encodes the cut cap and up to five world-space
+ * `Section2DOverlayRenderer` encodes the cut cap and up to six world-space
  * line families into ONE render pass (`renderer-overlays.ts` calls them one
  * after another), and each needs different uniforms. They all wrote byte 0 of
  * one 160-byte buffer. `queue.writeBuffer` is a *queue* operation: it is
  * applied before the command buffer that references the buffer executes,
  * wherever in the encoding it was issued. So the last write before submit is
- * what all six draws read — the clash box's magenta bleeding onto every other
+ * what all seven draw sites read — the clash box's magenta bleeding onto every other
  * overlay, and the cap's fill colour and hatch replaced by the zeroed tail a
- * line draw writes. Pre-existing on `origin/main`, where the same six draws
+ * line draw writes. Pre-existing on `origin/main`, where the same draw sites
  * write `this.uniformBuffer` at offset 0.
  */
 describe('Section2DOverlayRenderer: one uniform record per draw (#2456)', () => {
@@ -547,26 +724,42 @@ describe('Section2DOverlayRenderer: one uniform record per draw (#2456)', () => 
     drawWholeFrame(renderer, pass);
 
     // One uniform write per draw site: the cap (which its fill and outline
-    // share by design) plus the five families.
+    // share by design) plus the six families.
     const uniformOffsets = writes.slice(uniformWritesBefore).map((w) => w.offset);
-    assert.strictEqual(uniformOffsets.length, SECTION_2D_UNIFORM_SLOT_COUNT);
+    const drawSites = FAMILIES.length + 1;
+    assert.strictEqual(uniformOffsets.length, drawSites);
     assert.strictEqual(
       new Set(uniformOffsets).size,
-      SECTION_2D_UNIFORM_SLOT_COUNT,
-      `the six draws must not share a record; offsets were ${JSON.stringify(uniformOffsets)}`,
+      drawSites,
+      `the seven draw sites must not share a record; offsets were ${JSON.stringify(uniformOffsets)}`,
     );
 
     // …and every bound record must be one that was actually written for it.
-    // 7 binds: cap fill + cap outline (same slot) + five families.
-    assert.strictEqual(binds.length, SECTION_2D_UNIFORM_SLOT_COUNT + 1);
+    // 8 binds: cap fill + cap outline (same slot) + six families.
+    assert.strictEqual(binds.length, drawSites + 1);
     assert.strictEqual(
       new Set(binds).size,
-      SECTION_2D_UNIFORM_SLOT_COUNT,
-      'the cap fill and outline share slot 0; the five families do not share anything',
+      drawSites,
+      'the cap fill and outline share slot 0; the six families do not share anything',
     );
     for (const offset of binds) {
       assert.ok(uniformOffsets.includes(offset), `nothing was written to bound offset ${offset}`);
     }
+  });
+
+  it('draws more than 32 independently anchored line partitions safely (#5049)', () => {
+    const { renderer, writes } = newRenderer();
+    const partitions = Array.from({ length: 40 }, (_, index) => ({
+      origin: [index * 25_000, 0, 0] as [number, number, number],
+      localVertices: new Float32Array([0, 0, 0, 1, 0, 0]),
+    }));
+    renderer.setLineOverlay('grid', partitions);
+    const { pass, calls, binds } = makePass();
+    const before = writes.length;
+    renderer.drawLineOverlay(pass, new Float32Array(16), 'grid', new Float32Array(16), [0, 0, 0]);
+    assert.equal(calls.filter((call) => call === 'draw:2').length, 40);
+    assert.equal(new Set(binds).size, 40, 'each partition receives an immutable uniform record');
+    assert.equal(writes.slice(before).length, 40);
   });
 
   it('the clash box colour cannot reach the other families', () => {
@@ -617,7 +810,7 @@ describe('Section2DOverlayRenderer: one uniform record per draw (#2456)', () => 
     assert.deepStrictEqual(
       Array.from(settled.data.slice(F, F + 4)).map((v) => Math.round(v * 100) / 100),
       Array.from(CAP_STYLE_HATCHED.fillColor),
-      'the cap fill colour must survive the five line draws encoded after it',
+      'the cap fill colour must survive the six line draws encoded after it',
     );
     assert.strictEqual(
       settled.data[SECTION_2D_UNIFORM_SLOTS.params],
@@ -642,7 +835,7 @@ describe('Section2DOverlayRenderer: one uniform record per draw (#2456)', () => 
     renderer.drawClashBoxLines3D(pass, new Float32Array(16).fill(0));
 
     const offsets = writes.slice(before).map((w) => w.offset);
-    const stride = 192; // ceil(160 / 64) * 64
+    const stride = 256; // ceil(256 / 64) * 64
     for (const o of offsets) {
       assert.strictEqual(o % 64, 0, `offset ${o} is not 64-byte aligned`);
     }

@@ -7,3 +7,6 @@
 
 mod attr_indices;
 pub use attr_indices::{root_attr_indices, RootAttrIndices};
+
+mod relationship_slots;
+pub use relationship_slots::{relationship_slots, RelationshipSlots};

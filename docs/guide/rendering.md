@@ -42,6 +42,16 @@ flowchart TB
 
 Key rendering features include section planes for model slicing, snap detection for precision interaction, GPU picking for object selection, and measurement tools for calculating distances and angles between geometry points. For generating 2D plans and elevations from 3D models, see the [2D Drawing Guide](drawing-2d.md).
 
+## Inspecting swept-disk source geometry
+
+Select a product containing `IfcSweptDiskSolid` geometry, then open **Properties → Quantities → Derived source geometry** or **Measure → Source**. Each solid shows its source solid and directrix IDs, mapped path, effective radius, optional inner radius, complete or unsupported status, and whether a CSG operation modified the source. Complete records show analytic total and per-segment centreline lengths, plus each arc's bend magnitude and signed sweep. Click an unmodified segment row to isolate it in the centreline overlay; click it again to clear the highlight.
+
+These lengths come from the authored directrix in metres, with the viewer's display-unit preference applied. They are separate from authored IFC attributes and `IfcElementQuantity` values. A source modified by CSG may differ from the visible mesh, and an unsupported description cannot provide a derived length. The readout does not infer fabrication quantities or a bar count.
+
+With the centreline overlay enabled, the Measure tool can snap to its authored line and signed arc segments. The snap point is evaluated on the source curve in the displayed model frame, including federation alignment and model placement; the drawn line approximation does not determine it. Segment snapping stops when the overlay is off, the product is hidden or isolated away, or a CSG-modified source cannot describe the visible solid. `SnapTarget.metadata.sourceCurve` identifies the source model, product, solid, directrix, mapped path, occurrence and segment, and carries the exact source length and normalized parameter. Mesh and scan snaps remain available at the same cursor.
+
+For renderer integrations, `Renderer.setSourceSnapCurves(curves)` replaces the opt-in list used by magnetic picking. Each `SourceSnapCurve` supplies a global picking ID, authored source identity, kind (`line` or `arc`), exact length, and `pointAt(t)` evaluator in displayed Y-up world metres; signed arcs also supply `sweepAngle`. Set `affineDisplayFrame: false` when the evaluator includes a nonlinear cross-CRS reprojection, so clip handling checks the evaluated point instead of assuming linear or circular clip roots. An extremely narrow clipped span after nonlinear reprojection may have no candidate; the picker never returns a clipped point. Pass `[]` when the source overlay is hidden or its selection changes.
+
 ## Basic Setup
 
 ```typescript
@@ -67,6 +77,60 @@ function animate() {
 }
 animate();
 ```
+
+## Appearance triangle mapping
+
+`expandAppearanceCorners(mesh, sourceIndices, cornerUvs, targetIndices, targetCornerNormals, targetVertexCount)` binds
+canonical authored UVs to a mesh or streamed fragment. It validates the source
+topology against `mesh.appearanceSource`, preserves exact triangle positions, installs canonical target corner normals in renderer Y-up,
+and expands welded vertices when individual corners need different UVs. The
+returned mesh records the target canonical topology for a subsequent edit.
+The canonical target vertex count bounds index references; retained unused vertices
+mean that triangle-corner count is not a valid vertex-pool bound.
+Missing or stale provenance throws; matching array lengths alone are insufficient.
+
+`equivalentAppearanceGeometry(before, after)` checks exact triangle-corner
+equivalence, including compressed-to-expanded undo/redo. Its default also checks
+normal equality; `{ allowNormalChanges: true }` permits canonical shading changes
+while still requiring exact positions and corner order. Validate the current
+history state with the strict default before applying such a transition. Both functions consume
+canonical planner data; they do not calculate IFC mapping rules. Callers retain
+ownership of the input arrays and must treat shared geometry/provenance arrays
+as immutable. Expansion allocates one vertex per triangle corner and is an
+explicit authoring operation, outside ordinary model loading.
+
+## Reversible appearance previews
+
+After model streaming and GPU uploads finish, call
+`renderer.getAppearancePreview()` to obtain the scene's owned preview API.
+`begin({ expressId, modelIndex })` claims one renderer entity and returns a
+token. Resolve federation IDs before calling it. The model index is checked
+against every part so another model cannot be edited through the token.
+
+`update(token, parts)` takes every original mesh part in order. It preserves
+exact triangle positions/normals and ownership; corner expansion through
+`expandAppearanceCorners` may represent the same triangles with UV seams.
+New bitmap content requires a new texture identity. Input geometry, image and
+UV arrays are borrowed immutable data. Textured and ordinary untextured parts
+are supported, including owners sharing a flat GPU batch. Instanced geometry,
+per-vertex mixed-owner data, released CPU geometry and unfinished uploads are
+explicitly rejected.
+
+Replacement GPU resources are staged before replacing the current preview.
+Original resources remain owned by the token until `cancel(token)` restores
+them or `commit(token)` keeps the result and releases the originals. A cancelled
+or scene-invalidated issued token can be cancelled again safely; updates and
+commits with stale/foreign tokens fail. Model removal and scene teardown release
+hidden originals as well as active previews.
+
+For a multi-object command, `prepareCommit(tokens)` validates the entire group
+and returns an idempotent commit function. Changing any prepared draft fences
+that commit before it consumes an owner. The caller must coordinate this with
+its IFC/entity transaction and image leases; the renderer does not publish IFC
+changes or manage application history. Returned `AppearanceChange` records hold
+frozen CPU mesh wrappers for before/after history, never GPU handles. Retain
+the images and arrays as long as history needs them, and request a render after
+the application publishes the completed command.
 
 ## Camera Controls
 
@@ -115,6 +179,8 @@ await camera.animateTo(
 camera.orbit(deltaX, deltaY);   // Rotate around target
 camera.pan(deltaX, deltaY);     // Move camera sideways
 camera.zoom(delta);             // Zoom in/out
+// Zoom in toward the surface under the cursor, stopping short of it (#5393):
+// camera.zoom(delta, false, x, y, w, h, false, renderer.raycastScene(x, y)?.intersection.point);
 ```
 
 ## Section Planes
@@ -448,7 +514,8 @@ canvas.addEventListener('click', async (e) => {
 
 `EntityRef` carries the byte range along with the type. When you hold the index as its
 concrete `CompactEntityIndex`, `getByteRange(id)` returns `{ byteOffset, byteLength }`
-on its own, without building an `EntityRef`.
+on its own, without building an `EntityRef`. Its `maxExpressId` getter reads the
+highest indexed ID in constant time and returns `0` for an empty index.
 
 #### When `geometryItemId` is absent
 
@@ -505,6 +572,20 @@ renderer.render({ selectedIds });
 
 ### Raycasting
 
+Scene raycasts and magnetic snapping include regular, batched, textured and
+instanced geometry. A textured surface in front of another object participates
+in nearest-surface selection, with the same hidden/isolation filters and retained
+local origins. CPU raycasts intersect triangles; texture alpha does not cut holes
+in the picking surface. `Renderer.raycastScene()` also uses the active section
+plane and crop box; when a front triangle is clipped, the ray continues to the
+nearest visible triangle behind it.
+
+Custom `RaycastEngine` scene adapters can optionally implement
+`getTexturedMeshes()` returning owners with `expressId` and optional `modelIndex`;
+`getMeshDataPieces` supplies their retained geometry. Existing adapters without
+that capability keep their regular/batched/instanced behavior. This does not add
+texture GPU handles to the `Renderer.getScene()` interface.
+
 ```typescript
 // Full raycast with intersection details
 const result = renderer.raycastScene(x, y);
@@ -517,8 +598,17 @@ if (result) {
   console.log(`Distance: ${intersection.distance}`);
   console.log(`Entity: #${intersection.expressId}`);
   console.log(`Triangle: ${intersection.triangleIndex}`);
+  console.log(`Federation model: ${intersection.modelIndex}`);
+  console.log(`Representation item: ${intersection.geometryItemId}`);
+  console.log(`Evaluated-surface triangle: ${intersection.sourceTriangleIndex}`);
 }
 ```
+
+`triangleIndex` is local to the rendered mesh piece. Use
+`sourceTriangleIndex` for persisted face masks: it follows
+`MeshData.appearanceSource.cornerIndices` through streaming fragments, UV seam
+expansion and textured/retained mask partitions. The key is absent when that
+mapping or the representation-item identity cannot be proved.
 
 ## Visibility Control
 
@@ -560,20 +650,20 @@ The viewer app provides a **basket** — an incremental isolation set that lets 
 
 | Operation | Keyboard | Toolbar | Context Menu | Description |
 |-----------|----------|---------|--------------|-------------|
-| **Set** | `I` | `=` button | Set as Basket (=) | Replace basket with current selection |
-| **Add** | `+` | `+` button | Add to Basket (+) | Add current selection to basket |
+| **Isolate** | `I` | Isolate button | Isolate selection | Replace basket with current selection and isolate it |
+| **Set** | — | Set button | Set as Basket | Replace basket with current selection |
+| **Add** | `=` or `+` | `+` button | Add to Basket | Add current selection to basket |
 | **Remove** | `-` | `-` button | Remove from Basket (-) | Remove current selection from basket |
-| **Clear** | `Esc` | — | — | Clear basket and all filters |
-| **Show All** | `A` | Eye icon | Show All | Clear hidden/isolated state |
+| **Show All** | `A` | Eye icon | Show All | Clear every filter; see below |
 
 **Workflow example:**
 
 1. Click a wall, press `I` — basket now contains just that wall (everything else hidden)
-2. Cmd+Click two doors to multi-select them, press `+` — doors are added to the basket
-3. Click a window, press `+` — window added too
+2. Cmd+Click two doors to multi-select them, press `=` or `+` — doors are added to the basket
+3. Click a window, press `=` or `+` — window added too
 4. Click the wall, press `-` — wall removed from basket, only doors and window remain
 
-The toolbar `=` button shows a badge with the current basket count when active. Multi-select (Cmd/Ctrl+Click) works with all basket operations — select multiple entities first, then press `+` or `-` to add/remove them all at once.
+The toolbar Set button shows a badge with the current basket count when active. Multi-select (Cmd/Ctrl+Click) works with all basket operations — select multiple entities first, then press `=` / `+` or `-` to add/remove them all at once.
 
 **Additional visibility shortcuts:**
 
@@ -581,8 +671,29 @@ The toolbar `=` button shows a badge with the current basket count when active. 
 |----------|--------|
 | `Del` / `Backspace` | Hide selected entity |
 | `Space` | Hide selected entity (viewport-focused only) |
-| `A` | Show all (reset hidden + isolation) |
-| `Esc` | Reset all (clear selection, basket, isolation, tools) |
+| `A` | Show all (see below for what it clears and what it keeps) |
+| `Esc` | One step per press: cancel the gesture in progress, else leave the tool, else clear the selection. Never changes visibility |
+
+**What Show All clears.** Show All, the `A` key and the context menu's Show all use one visibility-reason table (`apps/viewer/src/lib/visibility/visibility-reasons.ts`). Home changes the camera pose and fit while leaving visibility intact. At 1 model and at N models alike, Show All clears:
+
+- manual hides outside the active lens's hide set;
+- isolation (and leaves the basket view);
+- X-ray ghosting;
+- the Class filter;
+- the storey filter and Solo mode;
+- Exploded mode (levels return to Stacked);
+- hidden federated models.
+
+It deliberately **keeps** four settings that are preferences rather than filters on this view:
+
+- the active lens, with its colours and its hides;
+- the class-type toggles (Spaces, Openings, Site, …), which are remembered between sessions;
+- the Model/Types view mode;
+- classes an embedding page hid.
+
+If you manually hid an element before the active lens also hid it, the element
+stays manually hidden when you turn the lens off. Show All keeps that overlap
+with the lens without transferring ownership of your hide to the lens.
 
 ## Render Options
 
@@ -884,7 +995,12 @@ non-framing grid bubble otherwise.
 
 The equivalent for 3D line overlays is keyed by channel rather than per item:
 `setLineOverlay('annotation', …)` grows the bounds and `setLineOverlay('grid', …)`
-does not.
+does not. The `centreline` channel is also non-framing: it is intended for a
+selected element's analytic directrix, and clearing it with
+`setLineOverlay('centreline', null)` leaves the other line channels alone.
+The centreline drawing remains visible as x-ray context through section and
+crop cuts. Magnetic snapping to its exact source curve still follows the active
+pick clipping, so a clipped-out part of that drawing is not a snap target.
 
 ## Complete Example
 
@@ -990,3 +1106,70 @@ async function createViewer() {
 - [Server Guide](server.md) - Server-based rendering
 - [2D Drawing Guide](drawing-2d.md) - Generate 2D plans and elevations
 - [API Reference](../api/typescript.md) - Complete API docs
+
+Preview cancellation rejoins only partitions of the same original flat batch,
+after every related draft closes. Committed textured owners remain separate;
+undoing them can rejoin their original cohort. Restoration respects original
+vertex/index allocation bounds and current colors. If replacement allocation
+fails, split batches remain drawable and the renderer reports a warning.
+Cohort metadata is cleared when its entities or scene are removed.
+
+## Model workspace translations
+
+`Renderer.setModelTranslation(modelIndex, [x, y, z])` sets an absolute manual
+translation in **renderer Y-up metres**. It applies to flat, textured, instanced
+and embedded pointcloud geometry assigned that model index, including later
+uploads. Pass `[0, 0, 0]` to reset. Keep each loaded model's index stable until
+it is removed; do not compact indices while its geometry remains on the GPU.
+`renderer.getScene().getModelTranslation(modelIndex)` reads the current offset
+in the same Y-up metre frame. It defaults to zero before a placement is set.
+The scene retains occurrence records and bounds after releasing CPU vertices,
+so whole-model movement remains available in GPU-resident mode.
+
+`Renderer.setModelRotation(modelIndex, angle, [px, py, pz])` turns a model's
+GPU-instanced occurrences about the vertical (+Y) axis through the render-frame
+pivot `(px, pz)` (`py` is unused — the axis is always vertical); `angle === 0`
+clears it. It is the instanced-geometry counterpart to `setModelTranslation`
+and composes with it (rotate about the pivot, then translate). It does not
+touch flat, authored, batched or point-cloud geometry — an instanced-only
+model's flat pieces, if any, must be rotated separately (e.g. by the caller's
+own bake).
+
+For a separately streamed scan, call
+`Renderer.setPointCloudTranslation(handle, [x, y, z])`. Its manual translation
+composes after the matrix passed to `setPointCloudTransform`, which accepts
+`Float64Array` as well as `Float32Array`. Pass coarse alignment matrices in
+float64 so cancellation with a manual correction happens before GPU rounding.
+`getPointCloudTransform(handle)` returns the final draw matrix for CPU spatial
+consumers. `getModelPlacementBounds(modelIndex, handle?)` returns placed bounds
+for framing a model and its streamed scan.
+
+These APIs move workspace geometry; they do not rewrite source IFC placements
+or point records. The web viewer supplies transactions, undo, persistence and
+engineering Z-up inputs on top of them. See [Repositioning models and
+pointclouds](federation.md#repositioning-models-and-pointclouds).
+
+
+## Registered raster references
+
+`renderer.getReferenceImages()` manages image and PDF-page rasters in a separate string-ID namespace. `set({ id, bitmap, corners, visible, locked, opacity }, signal?)` uploads a raster and resolves after GPU validation. Corners are renderer Y-up coordinates, ordered top-left, top-right, bottom-right, bottom-left. The viewer derives them from immutable engineering Z-up metre registration using its existing federation offset; an RTC-only rebase preserves the registration, while an incompatible map frame reports a mismatch.
+
+Keep the bitmap's inventory lease until `set` settles. The renderer owns uploaded texture and buffer resources, and never closes the caller's bitmap. Replacement retains the previous valid image until upload succeeds. `remove(id)` and `clear()` invalidate pending publication and release resources; device loss and renderer destruction do the same. Draft controllers should remove only their own IDs, rather than clearing registered references.
+
+`await references.pick(x, y, options)` uses canvas-relative CSS pixels and the same visibility options as IFC picking. It returns `{ referenceId, point, distance }` separately from IFC selection. Hidden, locked and zero-opacity references do not select. The existing scene picker supplies occlusion depth; its CPU fallback uses the picked owner's precise raycast and conservatively refuses a reference when depth cannot be recovered. Picking uses the rectangular page footprint, including transparent pixels. References depth-test against IFC geometry without writing IFC object IDs or changing BIM bounds. Overlapping translucent planes use back-to-front ordering; intersecting translucent planes retain ordinary alpha-sorting limitations.
+
+This is a visual registration API. It does not create `IfcAnnotation`, persist image bytes, or promise arbitrary CRS reprojection. Application metadata/history and IFC authoring own those operations independently.
+
+### Creating an authored owner atomically
+
+`renderer.prepareAuthoredOwner(parts)` uploads all canonical `MeshData` parts for one
+new IFC owner, including separate colours and optional retained textures, while keeping it outside the visible scene and picking index. The owner
+must not already exist, and every part must have the same object and model identity.
+`prepareTexturedOwner(mesh)` remains the single textured-part convenience entry point.
+Keep the borrowed mesh buffers immutable until disposal. Clear/rebuild or placement
+changes invalidate an outstanding preparation. Call the returned `commit()` after the matching IFC
+transaction is ready, then publish the model/history state in the same synchronous
+turn. Always call `dispose()` in `finally`; it releases an uncommitted upload and
+leaves a committed scene owner intact. Keep the source image retained through the
+owner's model and undo history lifetimes. This API inserts native-produced geometry;
+it does not construct IFC entities or synthesize geometry from a reference image.

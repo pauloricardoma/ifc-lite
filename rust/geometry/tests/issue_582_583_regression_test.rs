@@ -21,10 +21,17 @@ use ifc_lite_core::IfcType;
 use ifc_lite_geometry::{GeometryRouter, VoidIndex};
 use rustc_hash::FxHashMap;
 
+mod support;
+
 fn read_fixture(rel: &str) -> Option<String> {
     let path = format!("../../tests/models/{}", rel);
     match std::fs::read_to_string(&path) {
         Ok(s) if s.starts_with("version https://git-lfs.github.com/spec/") => {
+            assert!(
+                !support::require_fixtures(),
+                "fixture is an LFS pointer and IFC_LITE_REQUIRE_FIXTURES=1 -- \
+                 run `pnpm fixtures` to download real bytes"
+            );
             eprintln!(
                 "skipping: fixture {path} is a Git LFS pointer; run `pnpm fixtures` from the repo root"
             );
@@ -32,6 +39,11 @@ fn read_fixture(rel: &str) -> Option<String> {
         }
         Ok(s) => Some(s),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            assert!(
+                !support::require_fixtures(),
+                "fixture missing and IFC_LITE_REQUIRE_FIXTURES=1 -- \
+                 run `pnpm fixtures` to download (sha256 in tests/models/manifest.json)"
+            );
             eprintln!(
                 "skipping: fixture {path} not present; run `pnpm fixtures` to download (manifest at tests/models/manifest.json)"
             );
@@ -189,6 +201,13 @@ fn issue_583_institute_var2_walls_and_doors_present() {
     );
 }
 
+// Default build only: with `csg_manifold_gate` on, the accept gate refuses two
+// boolean results on this fixture as non-manifold and #3854 routes each refusal
+// into `csg_failures_total`. That is the gate reporting, not a #583 regression;
+// the census in issue_3440_manifold_gate_census.rs is what pins the gated count.
+// #3925 also guards the raw-union-first roof path: walls #227944/#229966
+// need a clean repaired subtraction even when the default gate accepts a tear.
+#[cfg(not(feature = "csg_manifold_gate"))]
 #[test]
 fn issue_583_institute_var2_no_csg_failures() {
     let Some(content) = read_fixture("ara3d/C20-Institute-Var-2.ifc") else {

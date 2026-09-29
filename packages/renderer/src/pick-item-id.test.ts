@@ -107,6 +107,7 @@ function makeManager(piece: MeshData, pieceCount: number) {
     isGeometryDataReleased: () => false,
     getAllMeshDataExpressIds: () => [...meshDataMap.keys()],
     getMeshDataPieces: (expressId: number) => meshDataMap.get(expressId),
+    visibleMeshDataEntitiesExceed: (limit: number) => meshDataMap.size > limit,
     getInstancedTemplates: () => undefined,
     raycast: () => {
       calls.raycast += 1;
@@ -141,7 +142,7 @@ function makeManager(piece: MeshData, pieceCount: number) {
     scene as never,
     picker as never,
     canvas as HTMLCanvasElement,
-    (p) => hydrated.push(hydrate(p)),
+    (p) => { hydrated.push(hydrate(p)); return { ok: true as const, value: undefined }; },
   );
   return { manager, calls };
 }

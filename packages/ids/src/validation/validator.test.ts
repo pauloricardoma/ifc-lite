@@ -2,7 +2,14 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import { IfcParser } from '@ifc-lite/parser';
+import type { IfcDataStore, EntityRef } from '@ifc-lite/parser';
 import { validateIDS } from './validator.js';
+import { parseIDS } from '../parser/xml-parser.js';
+import {
+  createDataAccessor,
+  type EntityVisibilityView,
+} from '../bridge/data-accessor.js';
 import { createMockAccessor } from '../facets/test-helpers.js';
 import type {
   IDSDocument,
@@ -72,6 +79,9 @@ describe('validateIDS — all entities passing', () => {
     expect(report.specificationResults[0].applicableCount).toBe(2);
     expect(report.specificationResults[0].passedCount).toBe(2);
     expect(report.specificationResults[0].failedCount).toBe(0);
+    // No-regression pin (#5212): a genuinely passing spec still reports 100.
+    expect(report.specificationResults[0].passRate).toBe(100);
+    expect(report.summary.overallPassRate).toBe(100);
   });
 });
 
@@ -391,6 +401,29 @@ describe('validateIDS — cardinality', () => {
     expect(specResult.status).toBe('fail');
   });
 
+  // Issue #5212: `minOccurs: 1` with zero matching entities used to report
+  // `passRate: 100` (the `totalEntities === 0` default) next to
+  // `status: 'fail'` — both at the per-spec and the report-summary level.
+  it('#5212 — minOccurs unmet with zero matches reports passRate 0, not 100', async () => {
+    const accessor = createMockAccessor([
+      { expressId: 1, type: 'IfcSlab' }, // no walls
+    ]);
+
+    const spec = makeSpec({
+      minOccurs: 1,
+      requirements: [],
+    });
+
+    const report = await validateIDS(makeDoc([spec]), accessor, modelInfo);
+    const specResult = report.specificationResults[0];
+    expect(specResult.status).toBe('fail');
+    expect(specResult.applicableCount).toBe(0);
+    expect(specResult.passRate).toBe(0);
+
+    expect(report.summary.failedSpecifications).toBe(1);
+    expect(report.summary.overallPassRate).toBe(0);
+  });
+
   it('fails when entity count exceeds maxOccurs', async () => {
     const accessor = createMockAccessor([
       { expressId: 1, type: 'IfcWall', name: 'W1' },
@@ -408,6 +441,37 @@ describe('validateIDS — cardinality', () => {
     expect(specResult.cardinalityResult!.passed).toBe(false);
     expect(specResult.cardinalityResult!.message).toContain('at most 2');
     expect(specResult.status).toBe('fail');
+  });
+
+  // Issue #5212: three walls that each individually satisfy their (empty)
+  // requirements, but exceed `maxOccurs: 2` — `passedCount === totalEntities
+  // === 3` made the old formula land on `passRate: 100` while `status` was
+  // `'fail'`, and `failedSpecifications: 1` / `overallPassRate: 100`
+  // disagreed in the same summary object.
+  it('#5212 — maxOccurs exceeded with no per-entity failures reports passRate 0, not 100', async () => {
+    const accessor = createMockAccessor([
+      { expressId: 1, type: 'IfcWall', name: 'W1' },
+      { expressId: 2, type: 'IfcWall', name: 'W2' },
+      { expressId: 3, type: 'IfcWall', name: 'W3' },
+    ]);
+
+    const spec = makeSpec({
+      maxOccurs: 2,
+      requirements: [],
+    });
+
+    const report = await validateIDS(makeDoc([spec]), accessor, modelInfo);
+    const specResult = report.specificationResults[0];
+    expect(specResult.status).toBe('fail');
+    expect(specResult.applicableCount).toBe(3);
+    expect(specResult.passedCount).toBe(3);
+    expect(specResult.failedCount).toBe(0);
+    expect(specResult.passRate).toBe(0);
+
+    expect(report.summary.failedSpecifications).toBe(1);
+    expect(report.summary.totalEntitiesPassed).toBe(3);
+    expect(report.summary.totalEntitiesFailed).toBe(0);
+    expect(report.summary.overallPassRate).toBe(0);
   });
 
   it('returns undefined cardinality when no minOccurs/maxOccurs set', async () => {
@@ -461,6 +525,13 @@ describe('validateIDS — not applicable', () => {
     const report = await validateIDS(makeDoc([spec]), accessor, modelInfo);
     expect(report.specificationResults[0].status).toBe('not_applicable');
     expect(report.specificationResults[0].applicableCount).toBe(0);
+    // Documented behaviour (#5212): `not_applicable` is left at the
+    // `totalEntities === 0` default of 100, unlike the `'fail'` branch
+    // (minOccurs unmet) above, which is now 0. `not_applicable` is a
+    // third state distinct from a real pass, and collapsing it into 100
+    // is still arguably misleading — see the fix's changeset/PR notes for
+    // why this was left as a value-only, shape-preserving fix.
+    expect(report.specificationResults[0].passRate).toBe(100);
   });
 });
 
@@ -639,5 +710,386 @@ describe('validateIDS — report structure', () => {
     expect(entityResult.entityName).toBe('Wall_001');
     expect(entityResult.globalId).toBe('abc123');
     expect(entityResult.passed).toBe(true);
+  });
+});
+
+// ============================================================================
+// Unparseable bounds facet — the real user-visible message
+//
+// A present-but-unparseable `xs:restriction` facet (e.g.
+// `<xs:minInclusive value="not-a-number"/>`) fails closed everywhere,
+// but the ORIGINAL fix only routed the clear "this xs:restriction is
+// malformed" message through `getConstraintMismatchReason`, which
+// nothing in the real `validateIDS` path ever calls. The actual
+// `attribute-facet.ts` path builds `failureReason`/`expectedValue` via
+// `formatFailureReason` → `facet.expected` → `formatConstraint` →
+// `formatBounds`, which used to fall through to its `'any value'`
+// default whenever every numeric field was `undefined` — producing the
+// self-contradictory "does not match expected any value" for a
+// restriction that is rejecting every value. These tests exercise that
+// exact path (XML → `parseIDS` → `validateIDS`), not
+// `getConstraintMismatchReason` directly.
+// ============================================================================
+describe('validateIDS — unparseable bounds facet (issue #4231)', () => {
+  const malformedXml = `<ids xmlns="http://standards.buildingsmart.org/IDS"
+     xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <info><title>T</title></info>
+  <specifications>
+    <specification name="Test" ifcVersion="IFC4">
+      <applicability>
+        <entity><name><simpleValue>IFCWALL</simpleValue></name></entity>
+      </applicability>
+      <requirements>
+        <attribute>
+          <name><simpleValue>Name</simpleValue></name>
+          <value>
+            <xs:restriction>
+              <xs:minInclusive value="not-a-number"/>
+            </xs:restriction>
+          </value>
+        </attribute>
+      </requirements>
+    </specification>
+  </specifications>
+</ids>`;
+
+  const wellFormedXml = malformedXml
+    .replace('<xs:minInclusive value="not-a-number"/>', '<xs:minInclusive value="10"/>\n              <xs:maxInclusive value="20"/>');
+
+  it('names the broken facet in failureReason/expectedValue instead of claiming "any value"', async () => {
+    const doc = parseIDS(malformedXml);
+    const accessor = createMockAccessor([{ expressId: 1, type: 'IfcWall', name: '0' }]);
+    const report = await validateIDS(doc, accessor, modelInfo);
+    const result = report.specificationResults[0].entityResults[0].requirementResults[0];
+
+    expect(result.status).toBe('fail');
+    expect(result.failureReason).not.toContain('any value');
+    expect(result.expectedValue).not.toBe('any value');
+    expect(result.expectedValue).toContain('xs:minInclusive="not-a-number"');
+    expect(result.expectedValue).toContain('did not parse as a number');
+    expect(result.failureReason).toContain('xs:minInclusive="not-a-number"');
+  });
+
+  it('leaves a well-formed restriction failure message unchanged', async () => {
+    const doc = parseIDS(wellFormedXml);
+    const accessor = createMockAccessor([{ expressId: 1, type: 'IfcWall', name: '0' }]);
+    const report = await validateIDS(doc, accessor, modelInfo);
+    const result = report.specificationResults[0].entityResults[0].requirementResults[0];
+
+    expect(result.status).toBe('fail');
+    expect(result.expectedValue).toBe('between 10 and 20');
+    expect(result.failureReason).toBe(
+      'Attribute "Name" value "0" does not match expected between 10 and 20'
+    );
+  });
+});
+
+// ============================================================================
+// Generalised report shape (#5138 §5) — through a real parsed store, not
+// the mock accessor: proves the wiring `validator.ts` now writes
+// (`source`/`modelInfo` array) end to end, not just against a hand-built
+// IDSRequirement/IDSSpecification fixture.
+// ============================================================================
+
+const WALL_IFC = `ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION((''),'2;1');
+FILE_NAME('','',(''),(''),'','','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCWALL('0Wall00000000000000001',$,'Wall_001',$,$,$,$,$,$);
+ENDSEC;
+END-ISO-10303-21;
+`;
+
+describe('validateIDS — generalised report shape', () => {
+  it('an IDS run reports source.kind "ids" (carrying the validated document) and exactly one modelInfo entry', async () => {
+    const store = await new IfcParser().parseColumnar(
+      new TextEncoder().encode(WALL_IFC).buffer as ArrayBuffer,
+    );
+    const accessor = createDataAccessor(store);
+    const spec = makeSpec({
+      requirements: [
+        { id: 'req-0', facet: { type: 'attribute', name: sv('Name') }, optionality: 'required' },
+      ],
+    });
+    const document = makeDoc([spec]);
+
+    const report = await validateIDS(document, accessor, {
+      modelId: 'wall-fixture', schemaVersion: 'IFC4', entityCount: store.entityCount,
+    });
+
+    expect(report.source.kind).toBe('ids');
+    expect(report.source.kind === 'ids' && report.source.document).toBe(document);
+    expect(report.modelInfo.length).toBe(1);
+    expect(report.modelInfo[0]).toEqual({
+      modelId: 'wall-fixture', schemaVersion: 'IFC4', entityCount: store.entityCount,
+    });
+    expect(report.specificationResults[0].applicableCount).toBe(1);
+    expect(report.specificationResults[0].status).toBe('pass');
+  });
+});
+
+// ============================================================================
+// Tombstone-aware enumeration (#5184)
+// ============================================================================
+
+/**
+ * Three-entity store — ids 1, 2, 3 — mirroring the issue's own executed
+ * repro (`store before delete: entityIndex.byId keys [ 1, 2, 3 ]`,
+ * `accessor.getAllEntityIds() [ 1, 2, 3 ]`, `applicableCount: 3`).
+ */
+function makeThreeWallStore(): IfcDataStore {
+  const byId = new Map<number, EntityRef>([
+    [1, { expressId: 1, type: 'IfcWall', byteOffset: 0, byteLength: 0, lineNumber: 1 }],
+    [2, { expressId: 2, type: 'IfcWall', byteOffset: 0, byteLength: 0, lineNumber: 2 }],
+    [3, { expressId: 3, type: 'IfcWall', byteOffset: 0, byteLength: 0, lineNumber: 3 }],
+  ]);
+  return {
+    schemaVersion: 'IFC4',
+    source: new Uint8Array(),
+    entities: {
+      getTypeName: (id: number) => byId.get(id)?.type,
+      getObjectType: () => undefined,
+      getName: () => undefined,
+      getGlobalId: () => undefined,
+      getDescription: () => undefined,
+    },
+    entityIndex: { byId, byType: new Map([['IFCWALL', [1, 2, 3]]]) },
+    relationships: { getRelated: () => [] },
+  } as unknown as IfcDataStore;
+}
+
+function tombstoneView(ids: number[]): EntityVisibilityView {
+  const t = new Set(ids);
+  return { isDeleted: (id: number) => t.has(id), getNewEntities: () => [] };
+}
+
+describe('validateIDS — tombstoned entity excluded from enumeration (#5184)', () => {
+  // Applicability with NO entity facet, exactly the issue's own repro
+  // shape ("a specification whose applicability has no entity facet"),
+  // so `findApplicableEntities` calls `accessor.getAllEntityIds()`
+  // directly (validator.ts's `applicabilityFacets.length === 0` branch).
+  const specWithNoEntityFacet: IDSSpecification = {
+    id: 'spec-0',
+    name: 'Every entity must have a Name',
+    ifcVersions: ['IFC4'],
+    applicability: { facets: [] },
+    // Pinned so the fix must actually change `applicableCount`, not just
+    // avoid an error: 3 source entities, minOccurs 3. Before the fix,
+    // the tombstoned entity is still counted (applicableCount 3, cardinality
+    // wrongly satisfied); after the fix it is 2 (cardinality correctly fails).
+    minOccurs: 3,
+    requirements: [
+      { id: 'req-0', facet: { type: 'attribute', name: sv('Name') }, optionality: 'optional' },
+    ],
+  };
+
+  it('applicableCount excludes the tombstoned entity (pinned: 2, not 3)', async () => {
+    const accessor = createDataAccessor(makeThreeWallStore(), undefined, tombstoneView([2]));
+    const report = await validateIDS(makeDoc([specWithNoEntityFacet]), accessor, modelInfo);
+    expect(report.specificationResults[0].applicableCount).toBe(2);
+  });
+
+  it('the cardinality message reflects the corrected count, not the pre-tombstone one', async () => {
+    const accessor = createDataAccessor(makeThreeWallStore(), undefined, tombstoneView([2]));
+    const report = await validateIDS(makeDoc([specWithNoEntityFacet]), accessor, modelInfo);
+    const cardinality = report.specificationResults[0].cardinalityResult;
+    expect(cardinality?.passed).toBe(false);
+    expect(cardinality?.actualCount).toBe(2);
+    expect(cardinality?.message).toBe('Expected at least 3, found 2');
+  });
+
+  it('an accessor built with no entityVisibility argument still counts the tombstoned id (no-regression pin)', async () => {
+    const accessor = createDataAccessor(makeThreeWallStore());
+    const report = await validateIDS(makeDoc([specWithNoEntityFacet]), accessor, modelInfo);
+    expect(report.specificationResults[0].applicableCount).toBe(3);
+    expect(report.specificationResults[0].cardinalityResult?.passed).toBe(true);
+  });
+});
+
+// ============================================================================
+// Tombstone-aware enumeration via `getEntitiesByType` (#5184 follow-up)
+//
+// `specWithNoEntityFacet` above (no applicability facet at all) is the
+// MINORITY shape — it is the only case that routes through
+// `getAllEntityIds()`. A real-world IDS spec almost always names an entity
+// type (`<entity><name><simpleValue>IFCWALL</simpleValue></name></entity>`),
+// which `findApplicableEntities` resolves via `filterByEntityFacet` ->
+// `accessor.getEntitiesByType()` (`entity-facet.ts`'s `simpleValue` branch
+// for one type, `enumeration` branch for several) and NEVER falls back to
+// `getAllEntityIds()` for. These tests exercise that dominant path
+// directly — `makeSpec`'s default applicability is already an entity
+// `simpleValue` facet naming `IFCWALL`.
+// ============================================================================
+
+describe('validateIDS — tombstoned entity excluded via getEntitiesByType (#5184 follow-up)', () => {
+  // `makeSpec()`'s default applicability: { type: 'entity', name: sv('IFCWALL') }
+  const specEntityTyped: IDSSpecification = makeSpec({
+    id: 'spec-typed',
+    minOccurs: 3,
+    requirements: [
+      { id: 'req-0', facet: { type: 'attribute', name: sv('Name') }, optionality: 'optional' },
+    ],
+  });
+
+  it('applicableCount excludes the tombstoned entity for an entity-typed (simpleValue) spec (pinned: 2, not 3)', async () => {
+    const accessor = createDataAccessor(makeThreeWallStore(), undefined, tombstoneView([2]));
+    const report = await validateIDS(makeDoc([specEntityTyped]), accessor, modelInfo);
+    expect(report.specificationResults[0].applicableCount).toBe(2);
+    expect(report.specificationResults[0].cardinalityResult?.passed).toBe(false);
+  });
+
+  it('an accessor built with no entityVisibility argument still counts the tombstoned id through getEntitiesByType (no-regression pin)', async () => {
+    const accessor = createDataAccessor(makeThreeWallStore());
+    const report = await validateIDS(makeDoc([specEntityTyped]), accessor, modelInfo);
+    expect(report.specificationResults[0].applicableCount).toBe(3);
+    expect(report.specificationResults[0].cardinalityResult?.passed).toBe(true);
+  });
+
+  /**
+   * Store with two entity types, id 2 (a wall) tombstoned, exercising the
+   * `enumeration` branch of `filterByEntityFacet` (`entity-facet.ts`'s
+   * `constraint.type === 'enumeration'` loop, each iteration a separate
+   * `getEntitiesByType` call whose results are concatenated).
+   */
+  function makeWallAndDoorStore(): IfcDataStore {
+    const byId = new Map<number, EntityRef>([
+      [1, { expressId: 1, type: 'IfcWall', byteOffset: 0, byteLength: 0, lineNumber: 1 }],
+      [2, { expressId: 2, type: 'IfcWall', byteOffset: 0, byteLength: 0, lineNumber: 2 }],
+      [3, { expressId: 3, type: 'IfcDoor', byteOffset: 0, byteLength: 0, lineNumber: 3 }],
+    ]);
+    return {
+      schemaVersion: 'IFC4',
+      source: new Uint8Array(),
+      entities: {
+        getTypeName: (id: number) => byId.get(id)?.type,
+        getObjectType: () => undefined,
+        getName: () => undefined,
+        getGlobalId: () => undefined,
+        getDescription: () => undefined,
+      },
+      entityIndex: {
+        byId,
+        byType: new Map([
+          ['IFCWALL', [1, 2]],
+          ['IFCDOOR', [3]],
+        ]),
+      },
+      relationships: { getRelated: () => [] },
+    } as unknown as IfcDataStore;
+  }
+
+  const specEnumerationTyped: IDSSpecification = makeSpec({
+    id: 'spec-enum',
+    applicability: {
+      facets: [
+        { type: 'entity', name: { type: 'enumeration', values: ['IFCWALL', 'IFCDOOR'] } },
+      ],
+    },
+    minOccurs: 3,
+    requirements: [
+      { id: 'req-0', facet: { type: 'attribute', name: sv('Name') }, optionality: 'optional' },
+    ],
+  });
+
+  it('applicableCount excludes the tombstoned entity for an enumeration entity facet naming two types (pinned: 2, not 3)', async () => {
+    const accessor = createDataAccessor(makeWallAndDoorStore(), undefined, tombstoneView([2]));
+    const report = await validateIDS(makeDoc([specEnumerationTyped]), accessor, modelInfo);
+    expect(report.specificationResults[0].applicableCount).toBe(2);
+    expect(report.specificationResults[0].cardinalityResult?.passed).toBe(false);
+  });
+
+  it('an accessor with no entityVisibility argument still counts the tombstoned id through the enumeration branch (no-regression pin)', async () => {
+    const accessor = createDataAccessor(makeWallAndDoorStore());
+    const report = await validateIDS(makeDoc([specEnumerationTyped]), accessor, modelInfo);
+    expect(report.specificationResults[0].applicableCount).toBe(3);
+    expect(report.specificationResults[0].cardinalityResult?.passed).toBe(true);
+  });
+});
+
+// ============================================================================
+// IFC2X3 mapped-alias path (pin, #5184 follow-up)
+//
+// `filterByEntityFacet` returns `undefined` (full scan) for a
+// `simpleValue`/`enumeration` entity facet naming an IFC2X3-mapped alias
+// (`entity-facet.ts`), so `findApplicableEntities` falls back to
+// `accessor.getAllEntityIds()` rather than `getEntitiesByType()`. That
+// method already had the tombstone filter before this follow-up fix. This
+// is a PIN, not a new fix: it proves the alias path stayed tombstone-safe
+// while `getEntitiesByType` was being changed, not that it was fixed here.
+// ============================================================================
+
+describe('validateIDS — IFC2X3 mapped-alias path stays tombstone-safe (pin)', () => {
+  /**
+   * Two IFC2X3 `IfcFurnishingElement` occurrences (ids 1, 2), both typed by
+   * an `IfcFurnitureType` (id 20) via `IfcRelDefinesByType` — the pairing
+   * `IFCFURNITURE` maps to in `ifc2x3-type-mapping.ts`'s ROWS table. Id 2
+   * is tombstoned. The spec's applicability names the alias `IFCFURNITURE`
+   * directly, which IFC2X3 models never have as an actual entity type —
+   * only `matchesIfc2x3Mapping` can match it.
+   */
+  function makeIfc2x3FurnitureStore(): IfcDataStore {
+    const byId = new Map<number, EntityRef>([
+      [1, { expressId: 1, type: 'IfcFurnishingElement', byteOffset: 0, byteLength: 0, lineNumber: 1 }],
+      [2, { expressId: 2, type: 'IfcFurnishingElement', byteOffset: 0, byteLength: 0, lineNumber: 2 }],
+      [20, { expressId: 20, type: 'IfcFurnitureType', byteOffset: 0, byteLength: 0, lineNumber: 3 }],
+    ]);
+    return {
+      schemaVersion: 'IFC2X3',
+      source: new Uint8Array(),
+      entities: {
+        getTypeName: (id: number) => byId.get(id)?.type,
+        getObjectType: () => undefined,
+        getName: () => undefined,
+        getGlobalId: () => undefined,
+        getDescription: () => undefined,
+      },
+      entityIndex: {
+        byId,
+        byType: new Map([
+          ['IFCFURNISHINGELEMENT', [1, 2]],
+          ['IFCFURNITURETYPE', [20]],
+        ]),
+      },
+      // Both occurrences (1, 2) are related to the type object (20) via
+      // IfcRelDefinesByType, 'inverse' direction — the only relation
+      // `getTypeEntityType` (entity-facet.ts's `matchesIfc2x3Mapping`)
+      // consults. The third argument (RelationshipType) is ignored by
+      // this stub; every call this test triggers is a DefinesByType
+      // inverse lookup.
+      relationships: {
+        getRelated: (id: number) => (id === 1 || id === 2 ? [20] : []),
+      },
+    } as unknown as IfcDataStore;
+  }
+
+  const specAlias: IDSSpecification = makeSpec({
+    id: 'spec-alias',
+    applicability: { facets: [{ type: 'entity', name: sv('IFCFURNITURE') }] },
+    minOccurs: 2,
+    requirements: [
+      { id: 'req-0', facet: { type: 'attribute', name: sv('Name') }, optionality: 'optional' },
+    ],
+  });
+
+  it('matches the aliased occurrence/type pair at all (sanity: 2, no tombstone)', async () => {
+    const accessor = createDataAccessor(makeIfc2x3FurnitureStore());
+    const report = await validateIDS(makeDoc([specAlias]), accessor, {
+      ...modelInfo,
+      schemaVersion: 'IFC2X3',
+    });
+    expect(report.specificationResults[0].applicableCount).toBe(2);
+  });
+
+  it('excludes the tombstoned occurrence through the alias full-scan fallback (pinned: 1, not 2)', async () => {
+    const accessor = createDataAccessor(makeIfc2x3FurnitureStore(), undefined, tombstoneView([2]));
+    const report = await validateIDS(makeDoc([specAlias]), accessor, {
+      ...modelInfo,
+      schemaVersion: 'IFC2X3',
+    });
+    expect(report.specificationResults[0].applicableCount).toBe(1);
+    expect(report.specificationResults[0].cardinalityResult?.passed).toBe(false);
   });
 });

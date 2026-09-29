@@ -27,9 +27,19 @@ export type {
   AnonymizeResult,
 } from './anonymize-types.js';
 export { MergedExporter, type MergeModelInput, type MergeExportOptions, type MergeExportResult, type MergeBlobExportResult, type ExportProgress } from './merged-exporter.js';
-export { collectReferencedEntityIds, getVisibleEntityIds, collectStyleEntities } from './reference-collector.js';
+export { collectReferencedEntityIds, getVisibleEntityIds } from './reference-collector.js';
+export { collectStyleEntities } from './style-closure.js';
 export { convertEntityType, convertStepLine, needsConversion, describeConversion, type IfcSchemaVersion } from './schema-converter.js';
-export { Ifc5Exporter, IFC5_KNOWN_PROP_NAMES, type Ifc5ExportOptions, type Ifc5ExportResult } from './ifc5-exporter.js';
+export {
+  analyzeConversionLoss,
+  classifyEntityTypeConversion,
+  type ConversionLossReport,
+  type ConversionLossEntry,
+  type EntityConversionInfo,
+  type EntityConversionKind,
+} from './schema-conversion-loss-report.js';
+export { Ifc5Exporter, type Ifc5ExportOptions, type Ifc5ExportResult } from './ifc5-exporter.js';
+export { IFC5_KNOWN_PROP_NAMES, stripNodePathPrefix } from './ifc5-export-helpers.js';
 
 // LOD geometry generators (contributed by madsik)
 export type { Vec3, LodInput, Lod0Element, Lod0Json, Lod1MetaJson, GenerateLod1Result } from './lod-geometry-types.js';
@@ -49,6 +59,11 @@ export {
 export { generateLod0 } from './lod0-generator.js';
 export { generateLod1, type GenerateLod1Options } from './lod1-generator.js';
 export { parseGLB, extractGlbMapping, parseGLBToMeshData, countGlbMeshes } from './glb.js';
+export { countObjVertices } from './obj.js';
+// The JSON-LD / STEP twins of the two counters above: "did this export carry
+// any content?", for the formats whose writers emit a valid but entity-free
+// document when an isolation filter excludes everything (#4659).
+export { countJsonldNodes, countStepEntities } from './zero-content.js';
 
 export { columnsToParquet, isParquet } from './columns-to-parquet.js';
 // THE CSV cell escaper for this repo's TypeScript — RFC 4180 quoting plus the
@@ -60,3 +75,25 @@ export { columnsToParquet, isParquet } from './columns-to-parquet.js';
 // are the guard's internals, and the parity suite imports them from the module
 // directly. Callers need the two functions and the options type.
 export { escapeCsvCell, guardSpreadsheetFormula, type CsvCellOptions } from './csv-cell.js';
+// THE CSV table writer: header + rows of row objects through the escaper above.
+export { tableToCsv, csvCellOf, type TableToCsvOptions, type TableColumn } from './csv-table.js';
+
+export { planAuthoredResourceCleanup } from './authored-resource-cleanup.js';
+
+export { captureAppearanceDependencies } from './appearance-dependencies.js';
+// A source record as the exporter writes it, pending edits applied by the
+// exporter's own pipeline: read models that must agree with the exported
+// bytes (the cost read model, #4857) read this instead of re-serializing.
+export { effectiveSourceRecord, type EffectiveSourceRecord, effectiveCreatedRecord } from './effective-source-record.js';
+// O(affected) mini STEP file for re-meshing edited elements in the wasm
+// mesher (#6232 WP1): the viewer's re-mesh service is the consumer.
+export {
+  serializeEntitySubgraph,
+  remeshContextRoots,
+  type EntitySubgraph,
+  type EntitySubgraphRequest,
+} from './entity-subgraph.js';
+// Schema-aware STEP arguments for a freshly created entity — the serializer
+// the exporter uses for overlay-created records. The LandXML imagery export
+// appends the appearance planner's entities with it (#5942).
+export { serializeEntityArgs } from './attribute-real-slots.js';

@@ -32,6 +32,13 @@ fn mesh_volume(m: &Mesh) -> f64 {
         / 6.0
 }
 
+fn expect_cut(outcome: BatchSubtract, what: &str) -> Mesh {
+    match outcome {
+        BatchSubtract::Cut(m) => m,
+        other => panic!("{what}: expected BatchSubtract::Cut, got {other:?}"),
+    }
+}
+
 #[test]
 fn snap_reconciles_near_coplanar_and_is_deterministic() {
     // coords closer than the grid snap to the SAME value (f32-flush → exact)
@@ -104,6 +111,37 @@ fn kernel_cuts_a_real_mesh() {
     assert!((v - 7.0).abs() < 1e-3, "Mesh host−cutter volume = {v}, expected 7");
     // sanity: the round-tripped host mesh has volume 8
     assert!((mesh_volume(&host) - 8.0).abs() < 1e-4, "host round-trip volume wrong");
+}
+
+/// #5012: precise plane tags repair a union-only consolidation seam (#3914),
+/// but applying that merge to an intermediate difference/intersection changes
+/// the operands of later booleans and tore real fixture host #53374.
+#[test]
+fn boolean_outputs_scope_plane_tags_to_unions_5012() {
+    let a = tris_to_mesh(&cube_mesh(0.0, 2.0));
+    let b = tris_to_mesh(&cube_mesh(1.0, 3.0));
+
+    let united = union(&a, &b);
+    let union_tags = united
+        .plane_tags
+        .as_ref()
+        .expect("union output must carry plane tags");
+    assert_eq!(union_tags.len(), united.triangle_count());
+
+    assert!(
+        subtract(&a, &b).plane_tags.is_none(),
+        "difference output must not carry plane tags"
+    );
+    assert!(
+        expect_cut(subtract_many(&a, &[&b]), "batch difference")
+            .plane_tags
+            .is_none(),
+        "batch-difference output must not carry plane tags"
+    );
+    assert!(
+        intersection(&a, &b).plane_tags.is_none(),
+        "intersection output must not carry plane tags"
+    );
 }
 
 #[test]
@@ -398,7 +436,7 @@ fn subtract_many_two_pocket_group_matches_sequential() {
     let door = tris_to_mesh(&box_mesh([1., -1.0, 0.0], [2., 1.2, 2.5])); // flush bottom
     let window = tris_to_mesh(&box_mesh([4., -0.3, 0.5], [5., 0.5, 2.0]));
     let seq = subtract(&subtract(&wall, &door), &window);
-    let many = subtract_many(&wall, &[&door, &window]).expect("group must conform");
+    let many = expect_cut(subtract_many(&wall, &[&door, &window]), "group must conform");
     let (vs, vm) = (mesh_volume(&seq), mesh_volume(&many));
     let om = exact_open_edges(&many);
     assert_eq!(om, 0, "batched two-pocket cut left {om} exact open edges");
@@ -425,8 +463,10 @@ fn subtract_many_disjoint_openings_matches_sequential() {
     for t in op2.indices.chunks_exact_mut(3) {
         t.swap(1, 2);
     }
-    let batched = subtract_many(&wall, &[&op1, &op2, &op3])
-        .expect("disjoint box group must conform");
+    let batched = expect_cut(
+        subtract_many(&wall, &[&op1, &op2, &op3]),
+        "disjoint box group must conform",
+    );
     let v = mesh_volume(&batched);
     assert!((v - 4.8).abs() < 1e-3, "batched 3-opening wall volume = {v}, expected 4.8");
     let open = exact_open_edges(&batched);
@@ -437,5 +477,334 @@ fn subtract_many_disjoint_openings_matches_sequential() {
     assert!(
         (v - vs).abs() < 1e-6,
         "batched volume {v} != sequential volume {vs} on disjoint cutters"
+    );
+}
+
+/// A cutter whose AABB overlaps the host but whose solid never reaches it used
+/// to come back as `Some(host re-tessellated)`, the same shape as a real cut,
+/// and the router re-derived "did it cut" from a triangle count and a 0.1 %
+/// volume gate (`voids/sweep.rs`, repaired twice under #1788). The classifier
+/// now says it itself: every host sub-triangle kept and no cutter face kept is
+/// [`BatchSubtract::Unchanged`]. Mutation: force `changed = true` in
+/// `boolean_vids_components` and the first assertion reads `Cut`; force it
+/// `false` and the second reads `Unchanged`.
+#[test]
+fn subtract_many_reports_unchanged_when_no_cutter_reaches_the_host() {
+    let host = tris_to_mesh(&cube_mesh(0.0, 1.0));
+    // Tetrahedron in the x + y > 2.2 corner of the host's AABB: its own AABB
+    // [0.1, 2.1]^2 x [0.5, 1.5] overlaps the cube, its solid does not.
+    let tetra = |dx: f32| {
+        mesh_of(
+            &[
+                [2.1 + dx, 0.1 + dx, 0.5],
+                [0.1 + dx, 2.1 + dx, 0.5],
+                [2.1 + dx, 2.1 + dx, 0.5],
+                [2.1 + dx, 2.1 + dx, 1.5],
+            ],
+            &[[0, 1, 2], [0, 3, 1], [1, 3, 2], [2, 3, 0]],
+        )
+    };
+    let disjoint = tetra(0.0);
+    assert!(
+        matches!(subtract_many(&host, &[&disjoint]), BatchSubtract::Unchanged),
+        "a cutter that misses the host solid must read Unchanged, not Cut"
+    );
+    // The same tetrahedron slid into the cube is a real cut: volume drops.
+    let reaching = tetra(-0.6);
+    let cut = expect_cut(subtract_many(&host, &[&reaching]), "reaching tetra");
+    let v = mesh_volume(&cut).abs();
+    assert!(v < 0.99 && v > 0.5, "reaching tetra must remove volume: {v}");
+}
+
+/// Issue #3353, the N-ary half.
+///
+/// `union_many` reaches the same broadphase, `near_coplanar` guard and
+/// classifier as the binary union, so the per-axis snap that leaves two flush
+/// faces a few µm apart tears it the same way — and `union_many` is the
+/// PRIMARY union in the pipeline (`processors/boolean` builds the cutter union
+/// with it, `coaxial_union` behind that), not a side path.
+///
+/// # Why the binary fix did not simply extend here, and what was actually wrong
+///
+/// Applying `promote_operands_mutually` in `union_many` DOES help this family:
+/// a three-box near-coplanar sweep (49 corner placements x 3 snap offsets)
+/// tears 105 of 147 without it and 36 of 147 with it, and this fixture goes
+/// from 20 unmatched directed edges to 0.
+///
+/// Naively applying it also broke `tests/issue_960_segmented_roof_clip.rs`:
+/// wall #4148 came back 9850 mm tall against an expected ~8984 mm — the
+/// sequential fallback's full-height seam sliver, the exact defect #960
+/// removed. The mechanism (confirmed by instrumenting a debug build against
+/// the #960 fixture, not inferred): the roof-segment cutter prisms are
+/// authored analytically and already share BIT-IDENTICAL vertices at their
+/// true adjacency seams — no reconciliation needed there. But
+/// `promote_cutter_verts_onto_host_faces`'s per-vertex plane search
+/// deliberately EXCLUDES a vertex's own exact-match plane from candidacy
+/// (`d == 0.0 { continue }`, load-bearing for the tunnel-wall jamb-corner
+/// case elsewhere in this module) and then searches every OTHER host face
+/// within band for a nearer one. With `host` pooling many roof segments that
+/// share the same pitch (hence near-parallel planes), that search finds a
+/// spurious near-match on an unrelated, non-adjacent operand's plane and
+/// nudges the vertex a few µm off its true neighbour — measured on the #960
+/// fixture's four `union_many` calls: the count of bit-identical vertex pairs
+/// shared between operand pairs drops from (148, 4, 12, 248) pre-weld to
+/// (88, 4, 5, 159) post-weld. The weld was actively DESTROYING pre-existing
+/// exact seams, not merely reconciling noisy ones. The fix
+/// (`promote_cutter_verts_onto_host_faces` in `plane_weld.rs`) skips any
+/// cutter vertex that is already bit-identical to some host vertex — safe
+/// everywhere, since a genuinely-imprecise cutter vertex (the tunnel-wall
+/// case this guard was designed around) is by construction never in that
+/// set.
+///
+/// These live in-crate rather than beside
+/// `tests/issue_3353_near_coplanar_rotated_overlap.rs` because the production
+/// combination is `consolidate_coplanar(union_many(..))` and
+/// `consolidate_coplanar` is `pub(crate)`. Asserting the RAW `union_many`
+/// output instead would assert the wrong thing: raw N-ary output carries
+/// T-junctions that consolidation is expected to close (at `dz = 0` this same
+/// three-box fixture is 26 open edges raw and 0 consolidated), so a raw
+/// assertion would fail on geometry that is fine.
+mod issue_3353_nary_near_coplanar {
+    use super::*;
+    use crate::csg::ClippingProcessor;
+    use nalgebra::{Point3, Rotation3, Unit, Vector3};
+    use std::collections::HashMap;
+
+    /// `SNAP_GRID`, spelled out so the fixture is visibly scaled to the grid.
+    const SG: f64 = 1.0 / 65536.0;
+
+    fn boxed(min: [f64; 3], size: [f64; 3], rot: Option<(Vector3<f64>, f64, [f64; 3])>) -> Mesh {
+        let mx = [min[0] + size[0], min[1] + size[1], min[2] + size[2]];
+        let c = |i: usize| -> [f64; 2] { [min[i], mx[i]] };
+        let mut corners: Vec<Point3<f64>> = [
+            (0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0),
+            (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1),
+        ]
+        .iter()
+        .map(|&(i, j, k)| Point3::new(c(0)[i], c(1)[j], c(2)[k]))
+        .collect();
+        if let Some((axis, angle, about)) = rot {
+            let r = Rotation3::from_axis_angle(&Unit::new_normalize(axis), angle);
+            let o = Point3::new(about[0], about[1], about[2]);
+            for p in corners.iter_mut() {
+                *p = o + r * (*p - o);
+            }
+        }
+        let faces: [[usize; 4]; 6] = [
+            [0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4],
+            [2, 3, 7, 6], [0, 4, 7, 3], [1, 2, 6, 5],
+        ];
+        let mut m = Mesh::with_capacity(24, 36);
+        for f in &faces {
+            let e1 = corners[f[1]] - corners[f[0]];
+            let e2 = corners[f[2]] - corners[f[0]];
+            let n = e1.cross(&e2).try_normalize(1e-12).unwrap_or(Vector3::z());
+            let b = m.vertex_count() as u32;
+            for &i in f {
+                m.add_vertex(corners[i], n);
+            }
+            m.add_triangle(b, b + 1, b + 2);
+            m.add_triangle(b, b + 2, b + 3);
+        }
+        m
+    }
+
+    /// Unmatched directed edges after welding by position at 0.1 mm — the same
+    /// census check the `issue_3353_*` integration tests use.
+    fn open_edges(m: &Mesh) -> Result<usize, String> {
+        if m.is_empty() {
+            return Err("union produced nothing".to_string());
+        }
+        let w = m.welded_by_position(1e-4);
+        let mut edges: HashMap<(u32, u32), (u32, u32)> = HashMap::new();
+        for t in w.indices.chunks_exact(3) {
+            for k in 0..3 {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                if a == b {
+                    return Err(format!("degenerate edge: triangle repeats welded vertex {a}"));
+                }
+                let e = edges.entry((a.min(b), a.max(b))).or_insert((0, 0));
+                if a < b {
+                    e.0 += 1;
+                } else {
+                    e.1 += 1;
+                }
+            }
+        }
+        Ok(edges.values().filter(|&&(f, r)| f != 1 || r != 1).count())
+    }
+
+    /// A axis-aligned at the origin; B rotated +30 degrees about Z overlapping
+    /// its +X+Y corner; C rotated -20 degrees overlapping its -X+Y corner. Both
+    /// rotated boxes sit `dz` above A, so TWO of the three horizontal face
+    /// pairs are near-coplanar rather than flush.
+    fn three_boxes(dz: f64) -> [Mesh; 3] {
+        let a = boxed([0.0, 0.0, 0.0], [1.0, 1.0, 1.0], None);
+        let b = boxed(
+            [0.4, 0.4, dz],
+            [1.0, 1.0, 1.0],
+            Some((Vector3::z(), 30.0f64.to_radians(), [0.9, 0.9, 0.5 + dz])),
+        );
+        let c = boxed(
+            [-0.4, 0.4, dz],
+            [1.0, 1.0, 1.0],
+            Some((Vector3::z(), -20.0f64.to_radians(), [0.1, 0.9, 0.5 + dz])),
+        );
+        [a, b, c]
+    }
+
+    /// One snap step of offset: 20 unmatched directed edges before the weld
+    /// reached `union_many`, closed after. `dz = 0` is the control — exactly
+    /// flush was always clean, which is what names the near-coplanar regime.
+    #[test]
+    fn a_three_operand_near_coplanar_union_stays_closed() {
+        for dz in [SG, 0.0] {
+            let [a, b, c] = three_boxes(dz);
+            for (name, m) in [("A", &a), ("B", &b), ("C", &c)] {
+                assert_eq!(open_edges(m), Ok(0), "operand {name} must be closed going in");
+            }
+            // Every ordering: `union_many` has no privileged first operand, and
+            // the mutual weld walks the operands in index order, so the result
+            // must not depend on which one the caller lists first.
+            for order in [
+                [&a, &b, &c], [&a, &c, &b], [&b, &a, &c],
+                [&b, &c, &a], [&c, &a, &b], [&c, &b, &a],
+            ] {
+                let out = ClippingProcessor::consolidate_coplanar(union_many(&order));
+                assert_eq!(
+                    open_edges(&out),
+                    Ok(0),
+                    "a three-operand near-coplanar union must come back closed (dz={dz})"
+                );
+            }
+        }
+    }
+}
+
+/// A two-cutter group whose arrangement does not conform, so `subtract_many`
+/// reaches its lenient batch and the volume oracle. Captured (exact f32 coords)
+/// from the public `ara3d/dental_clinic.ifc` fixture: a gable wall already
+/// holding three windows, a stepped cutter trimming its sloped end, and a
+/// window cutter sharing the `z = 7.21` plane with it.
+fn lenient_gable_group() -> (Mesh, Mesh, Mesh) {
+    let wall = mesh_of(
+        &[
+            [0.11300659, 35.7639, 9.707001], [0.11300659, 50.47, 9.707001],
+            [0.11300659, 50.47, 4.5700073], [0.11300659, 33.630005, 4.5700073],
+            [0.11300659, 33.630005, 7.2100067], [0.11300659, 35.322647, 9.190659],
+            [0.11300659, 49.10556, 7.2100067], [0.11300659, 48.10556, 7.2100067],
+            [0.11300659, 48.10556, 5.475006], [0.11300659, 49.10556, 5.475006],
+            [0.11300659, 44.085556, 7.2100067], [0.11300659, 43.085556, 7.2100067],
+            [0.11300659, 43.085556, 5.475006], [0.11300659, 44.085556, 5.475006],
+            [0.11300659, 42.164444, 7.2100067], [0.11300659, 41.164444, 7.2100067],
+            [0.11300659, 41.164444, 5.475006], [0.11300659, 42.164444, 5.475006],
+            [0.38000488, 49.10556, 5.475006], [0.38000488, 49.10556, 7.2100067],
+            [0.38000488, 44.085556, 5.475006], [0.38000488, 44.085556, 7.2100067],
+            [0.38000488, 42.164444, 5.475006], [0.38000488, 42.164444, 7.2100067],
+            [0.38000488, 33.630005, 4.5700073], [0.38000488, 33.630005, 7.2100067],
+            [0.38000488, 35.7639, 9.707001], [0.38000488, 48.10556, 7.2100067],
+            [0.38000488, 43.085556, 7.2100067], [0.38000488, 41.164444, 7.2100067],
+            [0.38000488, 50.47, 4.5700073], [0.38000488, 41.164444, 5.475006],
+            [0.38000488, 43.085556, 5.475006], [0.38000488, 48.10556, 5.475006],
+            [0.38000488, 50.47, 9.707001],
+        ],
+        &[
+            [3, 4, 5], [1, 2, 6], [1, 6, 7], [2, 8, 9], [6, 2, 9], [1, 7, 10], [7, 8, 10],
+            [0, 1, 11], [1, 10, 11], [2, 12, 13], [8, 2, 13], [10, 8, 13], [0, 11, 14],
+            [11, 12, 14], [0, 14, 15], [5, 0, 15], [3, 5, 16], [5, 15, 16], [2, 3, 17],
+            [3, 16, 17], [12, 2, 17], [14, 12, 17], [9, 18, 19], [9, 19, 6], [13, 20, 21],
+            [13, 21, 10], [17, 22, 23], [17, 23, 14], [3, 24, 25], [3, 25, 4], [25, 5, 4],
+            [5, 25, 26], [0, 5, 26], [6, 19, 27], [6, 27, 7], [10, 21, 28], [10, 28, 11],
+            [14, 23, 29], [14, 29, 15], [2, 30, 24], [2, 24, 3], [16, 31, 22], [16, 22, 17],
+            [12, 32, 20], [12, 20, 13], [8, 33, 18], [8, 18, 9], [26, 34, 1], [26, 1, 0],
+            [15, 29, 31], [15, 31, 16], [11, 28, 32], [11, 32, 12], [7, 27, 33], [7, 33, 8],
+            [1, 34, 30], [1, 30, 2], [30, 18, 33], [30, 34, 19], [34, 27, 19], [18, 30, 19],
+            [30, 33, 20], [33, 27, 20], [30, 20, 32], [34, 26, 28], [34, 28, 21], [27, 34, 21],
+            [20, 27, 21], [24, 30, 22], [30, 32, 22], [32, 28, 22], [24, 22, 31], [26, 25, 31],
+            [25, 24, 31], [26, 31, 29], [26, 29, 23], [28, 26, 23], [22, 28, 23],
+        ],
+    );
+    let notch = mesh_of(
+        &[
+            [0.032899998, 35.763905, 8.4585], [0.032899998, 35.763905, 9.707],
+            [0.032899998, 33.63, 7.21], [0.032899998, 34.7635, 7.21],
+            [0.032899998, 34.7635, 8.4585], [0.46010488, 35.763905, 8.4585],
+            [0.46010488, 35.763905, 9.707], [0.46010488, 33.63, 7.21],
+            [0.46010488, 34.7635, 7.21], [0.46010488, 34.7635, 8.4585],
+        ],
+        &[
+            [0, 4, 1], [1, 4, 2], [2, 4, 3], [5, 6, 9], [6, 7, 9], [7, 8, 9], [0, 1, 6], [0, 6, 5],
+            [1, 2, 7], [1, 7, 6], [2, 3, 8], [2, 8, 7], [3, 4, 9], [3, 9, 8], [4, 0, 5], [4, 5, 9],
+        ],
+    );
+    let window = mesh_of(
+        &[
+            [0.032899998, 36.66444, 7.21], [0.032899998, 35.66444, 7.21],
+            [0.032899998, 35.66444, 5.475], [0.032899998, 36.66444, 5.475],
+            [0.46010488, 36.66444, 7.21], [0.46010488, 35.66444, 7.21],
+            [0.46010488, 35.66444, 5.475], [0.46010488, 36.66444, 5.475],
+        ],
+        &[
+            [0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7], [0, 1, 5], [0, 5, 4],
+            [1, 2, 6], [1, 6, 5], [2, 3, 7], [2, 7, 6], [3, 0, 4], [3, 4, 7],
+        ],
+    );
+    (wall, notch, window)
+}
+
+/// `subtract_many`'s volume oracle on an OPEN host (#4693).
+///
+/// The oracle accepted a lenient batch when `host − batch` matched Σ|host ∩
+/// cutter| within 1 %, with the host summed about its own AABB centre and the
+/// batch about ITS own. An open surface's sum moves with the reference point,
+/// so when the cut trims the host's bounding box, the flux of a crack the cut
+/// never touched lands in the removed volume.
+///
+/// Fixture: the non-conforming gable group above, plus a closed 0.1 m rod
+/// standing 0.13 m off the wall's +Y end (1.87 m long) and a third cutter that
+/// takes its outer metre. That moves the AABB centre 0.5 m in −Y. The open host
+/// adds one unpaired triangle inside the wall at `y = 45` (normal ±Y, 0.47 m²),
+/// away from every cutter. Both hosts remove the same solid. On origin/main the
+/// closed host is cut and the open one reads 5.577 against the oracle's 5.107
+/// (6× m³) and falls back as `Nonconforming`. Mutation: read `batch` about
+/// `volume_reference(&batch)` again and the open-host assertion fails.
+#[test]
+fn lenient_batch_on_an_open_host_reads_both_volumes_about_one_point_4693() {
+    use super::super::arrangement::{box_mesh, difference_all};
+    use crate::router::voids::geom::mesh_signed_volume_about;
+    let (wall, notch, window) = lenient_gable_group();
+    let rod = tris_to_mesh(&box_mesh([0.2, 50.6, 6.0], [0.3, 52.47, 6.1]));
+    let tip = tris_to_mesh(&box_mesh([0.1, 51.47, 5.9], [0.4, 53.0, 6.2]));
+    let mut closed = wall.clone();
+    closed.merge(&rod);
+    let mut open = closed.clone();
+    open.merge(&mesh_of(&[[0.15, 45.0, 4.8], [0.35, 45.0, 4.8], [0.25, 45.0, 9.5]], &[[0, 1, 2]]));
+    let cutters = [&notch, &window, &tip];
+
+    // Guard: the group must reach the lenient path, or nothing here reads the oracle.
+    let h = orient_outward(mesh_to_tris(&open));
+    let comps: Vec<Vec<Tri>> = cutters
+        .iter()
+        .map(|m| {
+            let mut c = mesh_to_tris(m);
+            promote_cutter_verts_onto_host_faces(&mut c, &h);
+            orient_outward(c)
+        })
+        .collect();
+    let refs: Vec<&[Tri]> = comps.iter().map(|c| c.as_slice()).collect();
+    assert!(difference_all(&h, &refs).is_none(), "the group must not conform");
+
+    // Host and cut read about one point on the unpaired triangle's plane, so
+    // the triangle adds nothing to either reading, snapped or not.
+    let removed = |host: &Mesh, what: &str| {
+        let cut = expect_cut(subtract_many(host, &cutters), what);
+        let o = [0.25, 45.0, 7.0];
+        mesh_signed_volume_about(host, &o) - mesh_signed_volume_about(&cut, &o)
+    };
+    let closed_removed = removed(&closed, "closed host");
+    let open_removed = removed(&open, "open host: the oracle read the crack as removed volume");
+    assert!(
+        (open_removed - closed_removed).abs() < 1e-4,
+        "open host removed {open_removed} m³, closed host {closed_removed} m³"
     );
 }

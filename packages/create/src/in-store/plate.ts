@@ -10,6 +10,7 @@
  */
 
 import type { StoreEditor } from '@ifc-lite/mutations';
+import { assertFinitePoint3 } from '../ifc-creator-math.js';
 import { toNativeLength, toNativePoint2, toNativePoint3, type SpatialAnchor } from './anchor.js';
 import {
   assertPositiveFinite,
@@ -35,6 +36,8 @@ export interface PlateRectangleParams {
   Description?: string;
   ObjectType?: string;
   Tag?: string;
+  /** Explicit GlobalId (22-char IFC GUID); generated when omitted. */
+  GlobalId?: string;
 }
 
 export interface PlatePolygonParams {
@@ -47,6 +50,8 @@ export interface PlatePolygonParams {
   Description?: string;
   ObjectType?: string;
   Tag?: string;
+  /** Explicit GlobalId (22-char IFC GUID); generated when omitted. */
+  GlobalId?: string;
 }
 
 export interface PlateBuildResult {
@@ -69,6 +74,9 @@ export function addPlateToStore(
   params: PlateInStoreParams,
 ): PlateBuildResult {
   assertPositiveFinite([params.Thickness], 'addPlateToStore: Thickness must be positive');
+  if (params.Position !== undefined) {
+    assertFinitePoint3({ Position: params.Position }, 'addPlateToStore');
+  }
   if (!isPolygonParams(params)) {
     assertPositiveFinite(
       [params.Width, params.Depth],

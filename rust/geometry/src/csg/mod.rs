@@ -15,11 +15,13 @@ use std::cell::RefCell;
 
 mod consolidate;
 mod degenerate_check;
+mod group_cut;
 mod normals;
 mod plane_eps;
 mod topology_diagnostic;
 mod union;
 
+pub use group_cut::{GroupCut, GroupReject};
 pub use normals::calculate_normals;
 pub(crate) use consolidate::tri_is_needle;
 
@@ -194,6 +196,8 @@ pub struct ClippingProcessor {
     /// on the `processors/boolean` path, METRES on `router/layers`. See
     /// [`plane_eps`] for the frames, the sizing and the KNOWN LIMITATION.
     pub epsilon: f64,
+    /// Metres per caller unit, used only by the physical ring-width noise gate.
+    length_unit_scale: f64,
     /// Boolean / CSG failures recorded since the last `take_failures()`.
     /// Interior-mutable so the existing `&self` API stays unchanged.
     failures: RefCell<Vec<BoolFailure>>,
@@ -204,6 +208,7 @@ impl ClippingProcessor {
     pub fn new() -> Self {
         Self {
             epsilon: 1e-6,
+            length_unit_scale: 1.0,
             failures: RefCell::new(Vec::new()),
         }
     }
@@ -279,27 +284,40 @@ impl ClippingProcessor {
     /// Subtract opening mesh from host mesh using CSG boolean operations
     /// on the pure-Rust exact mesh-arrangement kernel.
     ///
-    /// On any failure path the host is returned un-cut and a [`BoolFailure`]
-    /// record is appended to the processor's failure log (drainable via
-    /// [`Self::take_failures`]). An empty host returns an empty mesh without
-    /// recording a failure (it's a fast path, not a fallback). The accept path
-    /// also runs `record_topology_tear` (#3440 step 1): diagnostic only, never
-    /// gates, in every build. `topology_gate_reject` (#3440 step 2) runs the
-    /// same closure predicate but, ONLY when the crate is built with the
+    /// Returns the same [`GroupCut`] as [`Self::subtract_mesh_many`], a group
+    /// of one. It used to return the host un-cut on every bail, the shape of
+    /// a real cut, and callers guessed which one happened from the triangle
+    /// count and a 0.1 % volume test that read a small real cut as no cut
+    /// (#4692). A rejection leaves the host untouched. A cutter the kernel
+    /// classifies as not reaching the host solid still produces the
+    /// consolidated arrangement output, as it always did; it comes back as
+    /// [`GroupCut::Retessellated`], not as a cut, unless the arrangement did
+    /// not conform and the output has the host's triangle count, which comes
+    /// back as `Rejected(Nonconforming)` (#5362).
+    ///
+    /// Unlike the group path, the single cutter records a [`BoolFailure`]
+    /// (drainable via [`Self::take_failures`]) for an empty cutter
+    /// (`EmptyOperand`), a missed bounds overlap (`NoBoundsOverlap`) and a
+    /// budget trip (`OperandTooLarge`), as well as for `InvalidOutput` and
+    /// `GateRejected`. `EmptyHost` records nothing. `Cut` and `Retessellated`
+    /// pass the same validation and gates. The accept
+    /// path also runs `record_topology_tear` (#3440 step 1): diagnostic only,
+    /// never gates, in every build. `topology_gate_reject` (#3440 step 2) runs
+    /// the same closure predicate but, ONLY when the crate is built with the
     /// `csg_topology_gate` feature (off by default; no downstream crate turns
     /// it on), rejects a torn result the same way `KernelOutputInvalid` does.
-    pub fn subtract_mesh(&self, host_mesh: &Mesh, opening_mesh: &Mesh) -> Result<Mesh> {
+    pub fn subtract_mesh(&self, host_mesh: &Mesh, opening_mesh: &Mesh) -> GroupCut {
         record_csg_op(0, host_mesh.triangle_count(), opening_mesh.triangle_count());
         if host_mesh.is_empty() {
-            return Ok(Mesh::new());
+            return GroupCut::Rejected(GroupReject::EmptyHost);
         }
         if opening_mesh.is_empty() {
             self.record_failure(BoolOp::Difference, BoolFailureReason::EmptyOperand);
-            return Ok(host_mesh.clone());
+            return GroupCut::Rejected(GroupReject::NoOverlap);
         }
         if !Self::bounds_overlap(host_mesh, opening_mesh) {
             self.record_failure(BoolOp::Difference, BoolFailureReason::NoBoundsOverlap);
-            return Ok(host_mesh.clone());
+            return GroupCut::Rejected(GroupReject::NoOverlap);
         }
 
         // Pure-Rust exact mesh-arrangement kernel, with consolidate_coplanar
@@ -315,13 +333,14 @@ impl ClippingProcessor {
         // merges (the pinned `csg_quality_regression` spike bar). A
         // seam-preserving consolidation is the remaining follow-up.
         crate::kernel::budget::begin();
-        let raw = crate::kernel::mesh_bridge::subtract(host_mesh, opening_mesh);
+        let (raw, changed, conforming) =
+            crate::kernel::mesh_bridge::subtract_with_change(host_mesh, opening_mesh);
         // Deterministic escalation guardrail (#1109): if the exact predicate
         // cascade escalated past the per-boolean budget, the cut bailed mid-
-        // arrangement. Discard the partial result and return the host un-cut so
-        // the void router's #635 AABB box-cut fallback fires. The trip point is a
-        // pure function of the snapped operands, so server (native) and client
-        // (wasm) degrade the SAME element identically — parity preserved.
+        // arrangement. Discard the partial result (its `changed` bit too) and
+        // reject, so the void router's #635 AABB box-cut fallback fires. The
+        // trip point is a pure function of the snapped operands, so server
+        // (native) and client (wasm) degrade the SAME element identically.
         if crate::kernel::budget::tripped() {
             self.record_failure(
                 BoolOp::Difference,
@@ -330,95 +349,30 @@ impl ClippingProcessor {
                     polys_b: opening_mesh.triangle_count(),
                 },
             );
-            return Ok(host_mesh.clone());
+            return GroupCut::Rejected(GroupReject::BudgetTripped);
         }
-        let result = Self::consolidate_coplanar(raw);
+        let result = self.consolidate(raw);
         if !result.is_empty() && !self.validate_mesh(&result) {
             self.record_failure(BoolOp::Difference, BoolFailureReason::KernelOutputInvalid);
-            return Ok(host_mesh.clone());
+            return GroupCut::Rejected(GroupReject::InvalidOutput);
         }
-        if self.topology_gate_reject(BoolOp::Difference, &result) {
-            return Ok(host_mesh.clone());
+        if self.accept_gates_reject(BoolOp::Difference, &result) {
+            return GroupCut::Rejected(GroupReject::GateRejected);
         }
-        Ok(result).inspect(|m| self.record_topology_tear(BoolOp::Difference, m))
-    }
-
-    /// Subtract a GROUP of pairwise-disjoint opening cutters from the host in
-    /// ONE conforming arrangement (disjoint-cutter batching).
-    ///
-    /// A REJECTED group (the N-ary arrangement could not fully conform, or no
-    /// cutter overlaps the host) returns the host UN-CUT and records NO
-    /// failure: rejection is the expected, handled outcome — the router's
-    /// per-opening sequential loop (with the full #635 fallback machinery and
-    /// its own diagnostics) immediately takes over for the group's members, so
-    /// a failure record here would be pure noise on elements whose voids end
-    /// up perfectly cut (the issue-582/583 zero-CSG-failure bar). Only a
-    /// genuinely invalid kernel OUTPUT records, exactly like
-    /// [`Self::subtract_mesh`].
-    pub fn subtract_mesh_many(&self, host_mesh: &Mesh, cutters: &[&Mesh]) -> Result<Mesh> {
-        if host_mesh.is_empty() {
-            return Ok(Mesh::new());
+        self.record_topology_tear(BoolOp::Difference, &result);
+        if changed {
+            GroupCut::Cut(result)
+        } else if !conforming && result.triangle_count() == host_mesh.triangle_count() {
+            // A non-conforming "no change" is not proof the cutter misses the
+            // host (straddling sub-triangles can be misclassified), so it is
+            // not reported as a `Retessellated` miss, which callers read as
+            // disjoint (#5362). A same-count re-tessellation would be
+            // discarded anyway (`mesh_to_keep`), so this only keeps the #635
+            // fallback armed for it, as before #5362.
+            GroupCut::Rejected(GroupReject::Nonconforming)
+        } else {
+            GroupCut::Retessellated(result)
         }
-        let live: Vec<&Mesh> = cutters
-            .iter()
-            .copied()
-            .filter(|c| !c.is_empty() && Self::bounds_overlap(host_mesh, c))
-            .collect();
-        if live.is_empty() {
-            return Ok(host_mesh.clone()); // silent: sequential path takes over
-        }
-        // Cap the cutters packed into ONE conforming arrangement. Void cutters
-        // here are order-free (set difference: host − {all} ≡ host − {chunk₁} −
-        // {chunk₂} − …), and the N-ary arrangement cost is SUPER-LINEAR in the
-        // cutters in a single arrangement. A Revit IfcBuildingElementPart with
-        // ~90 openings cost ~12 s in one arrangement vs ~0.4 s chunked at 16 (30×),
-        // and on wasm that single element alone blew the geometry-stream watchdog —
-        // an 86 MB model that loaded in ~15 s natively STALLED at 40 s in the
-        // browser. Chunking bounds the per-arrangement cost so no single element
-        // can stall the stream. It is solid-equivalent (the batch path's contract
-        // is volume parity + watertightness, not byte-identical tessellation); for
-        // live.len() <= MAX_CUTTERS_PER_ARRANGEMENT it IS the prior single
-        // arrangement. On any chunk's budget trip / unrecovered constraint, reject
-        // the WHOLE group (return host un-cut) so the per-opening sequential path
-        // (own budget + #635 AABB fallback) takes over — identical to before.
-        const MAX_CUTTERS_PER_ARRANGEMENT: usize = 16;
-        let mut result = host_mesh.clone();
-        for chunk in live.chunks(MAX_CUTTERS_PER_ARRANGEMENT) {
-            // Census: record THIS kernel invocation's real operand sizes (the
-            // current host + this chunk's cutters). Chunking runs the kernel once
-            // per chunk, so report K real ops, not one synthetic op carrying the
-            // whole group's cutter total. For live.len() <= cap this is one record
-            // identical to the prior single arrangement.
-            let chunk_tris: usize = chunk.iter().map(|c| c.triangle_count()).sum();
-            record_csg_op(0, result.triangle_count(), chunk_tris);
-            crate::kernel::budget::begin();
-            let raw = crate::kernel::mesh_bridge::subtract_many(&result, chunk);
-            if crate::kernel::budget::tripped() {
-                // Escalation budget exceeded (#1109): reject the group silently so
-                // the per-opening sequential path takes over (deterministic).
-                return Ok(host_mesh.clone());
-            }
-            let Some(raw) = raw else {
-                // Unrecovered constraint in this chunk's arrangement — reject the
-                // group so the sequential per-opening path takes over.
-                return Ok(host_mesh.clone());
-            };
-            let next = Self::consolidate_coplanar(raw);
-            // Validate each intermediate BEFORE it becomes the next chunk's host:
-            // a non-watertight / invalid intermediate would silently corrupt every
-            // subsequent subtraction. On failure reject the whole group so the
-            // per-opening sequential path takes over — same guard as the
-            // un-chunked path, just applied per chunk.
-            if !next.is_empty() && !self.validate_mesh(&next) {
-                self.record_failure(BoolOp::Difference, BoolFailureReason::KernelOutputInvalid);
-                return Ok(host_mesh.clone());
-            }
-            if self.topology_gate_reject(BoolOp::Difference, &next) {
-                return Ok(host_mesh.clone());
-            }
-            result = next;
-        }
-        Ok(result).inspect(|m| self.record_topology_tear(BoolOp::Difference, m))
     }
 
     /// Intersect two meshes using CSG boolean operations on the pure-Rust
@@ -434,13 +388,12 @@ impl ClippingProcessor {
 
         // Pure-Rust exact kernel. An empty result is legitimate
         // (disjoint operands → empty intersection).
-        let result =
-            Self::consolidate_coplanar(crate::kernel::mesh_bridge::intersection(mesh_a, mesh_b));
+        let result = self.consolidate(crate::kernel::mesh_bridge::intersection(mesh_a, mesh_b));
         if !result.is_empty() && !self.validate_mesh(&result) {
             self.record_failure(BoolOp::Intersection, BoolFailureReason::KernelOutputInvalid);
             return Ok(Mesh::new());
         }
-        if self.topology_gate_reject(BoolOp::Intersection, &result) {
+        if self.accept_gates_reject(BoolOp::Intersection, &result) {
             return Ok(Mesh::new());
         }
         Ok(result).inspect(|m| self.record_topology_tear(BoolOp::Intersection, m))

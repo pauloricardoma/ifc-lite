@@ -55,13 +55,22 @@ jobs:
         run: node --test scripts/review/lane-canary.test.mjs
 
       - name: Install the reviewer CLI
-        run: npm install -g @anthropic-ai/claude-code@2.0.76
+        run: npm install -g @anthropic-ai/claude-code@2.1.278
 
       - name: Ask the reviewer for a known answer
         id: canary
         continue-on-error: true
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          CLAUDE_CODE_OAUTH_TOKEN_2: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_2 }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_REVIEW_MODELS: ${{ vars.OPENROUTER_REVIEW_MODELS }}
+          # THE ENSEMBLE, so the canary exercises the SAME path production takes:
+          # run-reviewer.mjs tries the parallel cheap ensemble before the CLI
+          # whenever these are set, exactly as claude-review.yml's real steps do.
+          REVIEW_ENSEMBLE_MODELS: ${{ vars.REVIEW_ENSEMBLE_MODELS }}
+          REVIEW_ENSEMBLE_STRONG_ON_RISK: ${{ vars.REVIEW_ENSEMBLE_STRONG_ON_RISK }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           set +e
           node scripts/review/lane-canary.mjs 2>&1 | tee "$RUNNER_TEMP/canary.log"
@@ -72,7 +81,14 @@ jobs:
       # updated in place rather than duplicated, so a week of failures is one
       # thread and the close is the all-clear.
       - name: Raise or update the ops issue
-        if: steps.canary.outputs.rc != '0'
+        # `always()` is load-bearing: setup/test failures and a timed-out
+        # canary leave `rc` unset, which must mean "lane down", not "skip the
+        # reporter".
+        # ONLY FROM THE DEFAULT BRANCH. A `workflow_dispatch` on a branch is how a
+        # canary change is proven before merge (#5621); its verdict is about that
+        # branch's canary, not the lane on main, so it must neither comment on nor
+        # close the ops issue.
+        if: always() && steps.canary.outputs.rc != '0' && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -93,7 +109,7 @@ jobs:
       # Closing the loop: a canary that only ever shouts is one people mute. When
       # it passes and an issue is open, say so and close it.
       - name: All clear
-        if: steps.canary.outputs.rc == '0'
+        if: steps.canary.outputs.rc == '0' && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -109,7 +125,7 @@ jobs:
       # failure still reaches a human even if this step is what someone later
       # decides to make non-blocking.
       - name: Fail the run if the lane is down
-        if: steps.canary.outputs.rc != '0'
+        if: always() && steps.canary.outputs.rc != '0'
         run: |
           echo "The lane canary failed; see the review-lane-down issue."
           exit 1

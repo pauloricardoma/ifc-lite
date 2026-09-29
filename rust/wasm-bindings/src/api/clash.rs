@@ -47,22 +47,31 @@ impl ClashSession {
             .ingest(positions, pos_ranges, indices, idx_ranges, aabbs);
     }
 
-    /// Run one rule. `group_a`/`group_b` are GLOBAL element indices; an empty
-    /// `group_b` means a self-clash within `group_a`. `mode`: 0 = hard,
-    /// 1 = clearance. Records carry GLOBAL element indices.
+    /// Run one rule. `group_a`/`group_b` are GLOBAL element indices.
+    /// OMIT `group_b` (pass `undefined`/`null`) for a self-clash within
+    /// `group_a`; pass an array -- INCLUDING an empty one -- for a two-sided
+    /// rule. An empty array is a B side that matched nothing and yields no
+    /// clashes, which is why this is nullable rather than "empty means
+    /// self" (#5354). `mode`: 0 = hard, 1 = clearance. Records carry GLOBAL
+    /// element indices.
     #[wasm_bindgen(js_name = runRule)]
     pub fn run_rule(
         &self,
         group_a: &[u32],
-        group_b: &[u32],
+        group_b: Option<Box<[u32]>>,
         mode: u8,
         tolerance: f64,
         clearance: f64,
         report_touch: bool,
     ) -> ClashRunResult {
-        let result =
-            self.inner
-                .run_rule(group_a, group_b, mode, tolerance, clearance, report_touch);
+        let (result, depth_floors) = self.inner.run_rule_with_depth_floors(
+            group_a,
+            group_b.as_deref(),
+            mode,
+            tolerance,
+            clearance,
+            report_touch,
+        );
 
         let n = result.records.len();
         let mut a = Vec::with_capacity(n);
@@ -89,6 +98,8 @@ impl ClashSession {
             status,
             distance,
             distance_kind,
+            // NaN marks "no floor" (every non-`Hard` record) across the FFI.
+            depth_floor: depth_floors.iter().map(|f| f.unwrap_or(f64::NAN)).collect(),
             points,
             bounds,
         }
@@ -112,6 +123,10 @@ pub struct ClashRunResult {
     /// Provenance of `distance`, one per record: `0` = measured on the meshes,
     /// `1` = estimated from the element AABBs. Mirrors `DistanceKind`.
     distance_kind: Vec<u8>,
+    /// Per record: for a `hard` record, the f32 noise floor of `distance`
+    /// along the direction it was measured (the classification floor);
+    /// `NaN` for every other status (#5639).
+    depth_floor: Vec<f64>,
     points: Vec<f64>,
     bounds: Vec<f64>,
 }
@@ -141,6 +156,11 @@ impl ClashRunResult {
     #[wasm_bindgen(getter, js_name = distanceKind)]
     pub fn distance_kind(&self) -> Vec<u8> {
         self.distance_kind.clone()
+    }
+
+    #[wasm_bindgen(getter, js_name = depthFloor)]
+    pub fn depth_floor(&self) -> Vec<f64> {
+        self.depth_floor.clone()
     }
 
     #[wasm_bindgen(getter)]

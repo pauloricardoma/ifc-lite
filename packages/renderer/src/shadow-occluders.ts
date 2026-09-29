@@ -90,16 +90,22 @@ export function originModelMatrix(
   return out;
 }
 
-/** Whether a batch/mesh with these ids has at least one visible element. */
+/**
+ * Whether a batch/mesh with these ids has at least one visible element.
+ *
+ * Delegates to {@link isEntityVisible} rather than re-deriving the hide/isolate
+ * rule here: a prior version treated `isolatedIds` as active only when
+ * `.size > 0`, which collapsed an active-but-empty isolate set (isolate to
+ * nothing) into "no isolation active" and let a fully isolated-out batch keep
+ * casting a phantom shadow. `isolatedIds` is meaningfully nullable — `null`/
+ * `undefined` means no isolation, an empty `Set` means isolate nothing — and
+ * only `isEntityVisible` gets that right everywhere else in this module.
+ */
 function anyVisible(ids: readonly number[], vis: ShadowVisibility | undefined): boolean {
   if (!vis) return true;
   const { hiddenIds, isolatedIds } = vis;
-  const hasIsolate = isolatedIds != null && isolatedIds.size > 0;
-  if (!hiddenIds && !hasIsolate) return true;
   for (const id of ids) {
-    if (hiddenIds?.has(id)) continue;
-    if (hasIsolate && !isolatedIds!.has(id)) continue;
-    return true;
+    if (isEntityVisible(id, hiddenIds, isolatedIds)) return true;
   }
   return false;
 }
@@ -174,6 +180,7 @@ export function collectShadowOccluders(
       indexBuffer: batch.indexBuffer,
       indexCount: batch.indexCount,
       model: originModelMatrix(batch.origin),
+      origin: batch.origin,
       quantParams: q ? [q.min[0], q.min[1], q.min[2], q.step] : undefined,
     });
   }
@@ -187,6 +194,8 @@ export function collectShadowOccluders(
       indexCount: it.indexCount,
       instanceBuffer: it.instanceBuffer,
       instanceCount: it.instanceCount,
+      canonicalAnchors: it.canonicalAnchors,
+      rteDeltas: it.rteDeltas,
     });
   }
 
@@ -200,6 +209,7 @@ export function collectShadowOccluders(
       indexBuffer: tm.indexBuffer,
       indexCount: tm.indexCount,
       model: originModelMatrix(tm.origin),
+      origin: tm.origin,
     });
   }
 
@@ -218,6 +228,7 @@ export function collectShadowOccluders(
       indexBuffer: mesh.indexBuffer,
       indexCount: mesh.indexCount,
       model: mesh.transform.m,
+      origin: mesh.rteOrigin ?? [mesh.transform.m[12], mesh.transform.m[13], mesh.transform.m[14]],
     });
   }
 

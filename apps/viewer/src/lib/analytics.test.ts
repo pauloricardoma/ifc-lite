@@ -6,6 +6,7 @@ import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { scrubEvent } from './analytics-scrub.js';
 import { beforeSend, ensureCapturableStack } from './analytics.js';
+import * as analytics from './analytics.js';
 import { __setChunkReloadPendingForTests } from './chunk-version-skew.js';
 
 // `scrubEvent` is the single `before_send` gate every captured event passes
@@ -21,6 +22,121 @@ const exceptionEvent = (value: string, extraProps: Record<string, unknown> = {})
     $exception_list: [{ type: 'Error', value }],
     ...extraProps,
   },
+});
+
+it('stored analytics opt-out suppresses explicit and automatic captures (#5866)', () => {
+  // These additions are checked at runtime so the production-revert oracle
+  // reaches assertions when it removes them from the existing module.
+  const added = analytics as typeof analytics & {
+    setAnalyticsOptOut?: (value: boolean) => void;
+    consentAwareAnalyticsClient?: (target: typeof analytics.posthog) => typeof analytics.posthog;
+  };
+  assert.ok(added.setAnalyticsOptOut);
+  assert.ok(added.consentAwareAnalyticsClient);
+  let explicitEvents = 0;
+  let exceptions = 0;
+  const guarded = added.consentAwareAnalyticsClient({
+    capture: () => { explicitEvents++; return undefined; },
+    captureException: () => { exceptions++; return undefined; },
+  });
+  try {
+    added.setAnalyticsOptOut(true);
+    guarded.capture('command_executed', { command_id: 'test' });
+    guarded.captureException(new Error('test'));
+    assert.equal(beforeSend({ event: 'command_executed', properties: { command_id: 'test' } }), null);
+    assert.equal(explicitEvents, 0);
+    assert.equal(exceptions, 0);
+
+    added.setAnalyticsOptOut(false);
+    guarded.capture('command_executed', { command_id: 'test' });
+    assert.equal(explicitEvents, 1);
+  } finally {
+    added.setAnalyticsOptOut(false);
+  }
+});
+
+it('records consenting session starts across opt-in and idle session rotation (#5614)', () => {
+  // Keep the import valid under a production-hunk revert so the oracle reaches
+  // the missing-recorder assertion instead of failing at module load.
+  const added = analytics as typeof analytics & {
+    createViewerSessionStartRecorder?: (
+      capture: () => void,
+      getSessionId: () => string,
+      isOptedOut: () => boolean,
+    ) => { onSessionId: (sessionId: string) => void; startNow: () => void };
+  };
+  assert.ok(added.createViewerSessionStartRecorder);
+  let optedOut = true;
+  let sessionId = '';
+  let nextSessionId: string | null = null;
+  const captures: string[] = [];
+  const record = added.createViewerSessionStartRecorder(
+    () => {
+      if (nextSessionId) {
+        sessionId = nextSessionId;
+        nextSessionId = null;
+        record.onSessionId(sessionId); // SDK callback during capture().
+      }
+      captures.push(`viewer_session_started:${sessionId}`);
+    },
+    () => sessionId,
+    () => optedOut,
+  );
+
+  record.startNow();
+  assert.deepEqual(captures, [], 'an opted-out visit has no denominator event');
+  optedOut = false;
+  nextSessionId = 'session-a';
+  record.startNow(); // A fresh no-interaction visit must create its SDK session.
+  record.onSessionId('session-a'); // Window-ID callback must not duplicate it.
+  sessionId = 'session-b';
+  record.onSessionId('session-b'); // An idle tab entered a new SDK session.
+  optedOut = true;
+  record.onSessionId('session-c');
+  optedOut = false;
+  nextSessionId = 'session-c';
+  record.startNow(); // Opt-in capture rotates the SDK session before sending.
+  record.onSessionId('session-c');
+  assert.deepEqual(captures, [
+    'viewer_session_started:session-a',
+    'viewer_session_started:session-b',
+    'viewer_session_started:session-c',
+  ]);
+
+  const scrubbed = beforeSend({
+    event: 'viewer_session_started',
+    properties: { $session_id: 'session-c', $current_url: 'https://ifclite.com/?model=secret' },
+  });
+  assert.equal(scrubbed?.properties?.$session_id, 'session-c');
+  assert.equal(scrubbed?.properties?.$current_url, 'https://ifclite.com/');
+});
+
+it('does not let session telemetry failure interrupt a viewer event (#5614)', () => {
+  const added = analytics as typeof analytics & {
+    createViewerSessionStartRecorder?: (
+      capture: () => void,
+      getSessionId: () => string,
+      isOptedOut: () => boolean,
+    ) => { onSessionId: (sessionId: string) => void; startNow: () => void };
+  };
+  assert.ok(added.createViewerSessionStartRecorder);
+  const warnings: unknown[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...messages: unknown[]) => { warnings.push(messages[0]); };
+  try {
+    let attempts = 0;
+    const record = added.createViewerSessionStartRecorder(
+      () => { attempts++; if (attempts === 1) throw new Error('network unavailable'); },
+      () => 'session-a',
+      () => false,
+    );
+    assert.doesNotThrow(() => record.onSessionId('session-a'));
+    record.onSessionId('session-a'); // Failed starts remain retryable.
+    assert.equal(attempts, 2);
+    assert.equal(warnings.length, 1);
+  } finally {
+    console.warn = originalWarn;
+  }
 });
 
 describe('scrubEvent — error_kind tagging', () => {
@@ -569,6 +685,42 @@ describe('scrubEvent — the noise filter never drops on a substring', () => {
     assert.equal(out?.properties?.$exception_fingerprint, 'ifc-lite:webgl_unavailable');
   });
 
+  it('downgrades a moved file to warning, but not the Safari crash that shares its wording', () => {
+    // A file that moved between the pick and the read is user-side, transient
+    // and unfixable from here - the same bar `cancelled` and
+    // `webgl_unavailable` clear - so it is kept, classified and fingerprinted,
+    // just not competing with real breakage at error level.
+    const moved = scrubEvent(exceptionEvent(
+      'A requested file or directory could not be found at the time an operation was processed.',
+      { $exception_level: 'error' },
+    ));
+    assert.notEqual(moved, null);
+    assert.equal(moved?.properties?.error_kind, 'file_unreadable');
+    assert.equal(moved?.properties?.$exception_level, 'warning');
+    assert.equal(moved?.properties?.$exception_fingerprint, 'ifc-lite:file_unreadable');
+
+    // And the reason the downgrade is safe: WebKit gives a reconciler crash the
+    // SAME text as a vanished file, and an uncontextualised occurrence is not
+    // claimed as a load failure. If it were, this downgrade would be hiding a
+    // hard React crash behind a warning.
+    const safariCrash = scrubEvent(exceptionEvent(
+      'The object can not be found here.',
+      { $exception_level: 'error' },
+    ));
+    assert.notEqual(safariCrash, null);
+    assert.equal(safariCrash?.properties?.error_kind, undefined);
+    assert.equal(safariCrash?.properties?.$exception_level, 'error');
+    assert.equal(safariCrash?.properties?.$exception_fingerprint, undefined);
+
+    // The same wording INSIDE a load is the real thing, and is downgraded.
+    const safariLoad = scrubEvent(exceptionEvent(
+      'The object can not be found here.',
+      { $exception_level: 'error', context: 'ifc_model_load' },
+    ));
+    assert.equal(safariLoad?.properties?.error_kind, 'file_unreadable');
+    assert.equal(safariLoad?.properties?.$exception_level, 'warning');
+  });
+
   it('KEEPS a Cesium-shaped stringification whose key list is really a sentence', () => {
     // The `^`-only arm's exact escape (CodeRabbit, round two of this PR): the
     // three key names are all present and the value starts correctly, so every
@@ -663,6 +815,49 @@ describe('scrubEvent — issue grouping', () => {
     assert.equal(stalled?.properties?.$exception_fingerprint, 'ifc-lite:geometry_stream_stalled');
     assert.equal(worker?.properties?.$exception_fingerprint, 'ifc-lite:geometry_worker_crash');
     assert.equal(oom?.properties?.$exception_fingerprint, 'ifc-lite:out_of_memory');
+  });
+
+  it('collapses the file-moved NotFoundError onto the file_unreadable fingerprint (#3731)', () => {
+    // Four PostHog issues carried this condition (#2546, #2860, #3324, #3731),
+    // each a fresh GitHub issue, because an unclassified message keeps
+    // PostHog's default type+message+stack grouping and the stack names the
+    // hashed bundle it came from. Both engine wordings, and the
+    // NotReadableError sibling, must land on ONE fingerprint.
+    const chromium = scrubEvent(exceptionEvent(
+      'A requested file or directory could not be found at the time an operation was processed.',
+    ));
+    const webkit = scrubEvent(exceptionEvent('The object can not be found here.', {
+      context: 'ifc_model_load',
+    }));
+    const unreadable = scrubEvent(exceptionEvent(
+      'NotReadableError: The requested file could not be read, typically due to permission problems that have occurred after a reference to a file was acquired.',
+    ));
+    assert.equal(chromium?.properties?.$exception_fingerprint, 'ifc-lite:file_unreadable');
+    assert.equal(webkit?.properties?.$exception_fingerprint, 'ifc-lite:file_unreadable');
+    assert.equal(unreadable?.properties?.$exception_fingerprint, 'ifc-lite:file_unreadable');
+    assert.equal(chromium?.properties?.error_kind, 'file_unreadable');
+  });
+
+  it('keeps a Safari reconciler crash out of the file_unreadable group (no load context)', () => {
+    // WebKit words the removeChild/insertBefore failure with its generic
+    // NotFoundError text, the same string a vanished file gets, so the message
+    // alone cannot separate them. A reconciler crash is UNCAUGHT and reaches
+    // PostHog with no `context`; that absence is what keeps it out of the
+    // file-picker issue and off the "your file moved" message.
+    const out = scrubEvent(exceptionEvent('The object can not be found here.'));
+    assert.equal(out?.properties?.error_kind, undefined);
+    assert.equal(out?.properties?.$exception_fingerprint, undefined);
+  });
+
+  it('keeps the DOM-mutation NotFoundError out of the file_unreadable group', () => {
+    // Same DOMException name, different failure entirely (#1229/#1230/#1232,
+    // the family harden-dom-mutations.ts suppresses). Grouping it with a moved
+    // file would bury a React-reconciler crash under a file-picker message.
+    const out = scrubEvent(exceptionEvent(
+      "Failed to execute 'removeChild' on 'Node': The node to be removed is not a child of this node.",
+    ));
+    assert.equal(out?.properties?.$exception_fingerprint, undefined);
+    assert.equal(out?.properties?.error_kind, undefined);
   });
 
   it('leaves unrecognised exceptions on PostHog default grouping', () => {

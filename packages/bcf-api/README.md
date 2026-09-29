@@ -1,6 +1,6 @@
 # @ifc-lite/bcf-api
 
-REST client for [buildingSMART BCF API](https://github.com/buildingSMART/BCF-API) (OpenCDE) servers. Connects to a BCF server, authenticates via OAuth2, and pulls projects, topics, comments and viewpoints into the [`@ifc-lite/bcf`](https://www.npmjs.com/package/@ifc-lite/bcf) in-memory model — so server-hosted issues flow through the same code paths as imported `.bcfzip` files.
+REST client for [buildingSMART BCF API](https://github.com/buildingSMART/BCF-API) (OpenCDE) servers. Connects to a BCF server, authenticates via OAuth2, and pulls projects, topics, comments and viewpoints into the [`@ifc-lite/bcf`](https://www.npmjs.com/package/@ifc-lite/bcf) in-memory model — so server-hosted topics flow through the same code paths as imported `.bcfzip` files.
 
 Works in the browser and in Node (uses the global `fetch`; injectable for tests). Implements the BCF API 2.1 routes.
 
@@ -15,17 +15,22 @@ npm install @ifc-lite/bcf-api @ifc-lite/bcf
 ```ts
 import {
   BcfApiClient,
-  normalizeBcfBaseUrl,
+  discoverBcfService,
   requestPasswordToken,
   fetchProjectAsBCF,
 } from '@ifc-lite/bcf-api';
 
-const baseUrl = normalizeBcfBaseUrl('https://example.com/bcf');
+// Normalizes the address and fetches `/auth`. Vendors tell users to enter the
+// bare space or instance URL (BIMcollab: https://myspace.bimcollab.com) while
+// serving the API under a path, so a pathless address also gets tried at
+// `/bcf`; `baseUrl` below is whichever one answered.
+const { baseUrl, authInfo } = await discoverBcfService({
+  baseUrl: 'https://example.com/bcf',
+});
 
-// Discover the token endpoint, then use the OAuth2 password grant
-const auth = await new BcfApiClient({ baseUrl }).getAuthInfo();
+// Then use the OAuth2 password grant against the discovered token endpoint
 const token = await requestPasswordToken({
-  tokenUrl: auth.oauth2_token_url!,
+  tokenUrl: authInfo.oauth2_token_url!,
   username: 'you@example.com',
   password: '...',
 });
@@ -46,6 +51,16 @@ const { project, warnings } = await fetchProjectAsBCF(client, projects[0].projec
 ## Direct endpoint access
 
 ```ts
+import { BcfApiClient } from '@ifc-lite/bcf-api';
+
+const client = new BcfApiClient({
+  baseUrl: 'https://example.com/bcf/2.1',
+  getAccessToken: () => 'your-access-token',
+});
+const projectId = 'my-project-guid';
+const topicGuid = 'my-topic-guid';
+const viewpointGuid = 'my-viewpoint-guid';
+
 await client.getVersions();
 await client.getCurrentUser();
 await client.getExtensions(projectId);

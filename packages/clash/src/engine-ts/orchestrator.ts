@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-import { matchesSelector } from '../selectors.js';
+import { clashMemberSet, inClashSet } from '../members.js';
 import { inferClashSeverity } from '../disciplines.js';
 import { isExcluded, qualifiedKey } from '../exclude.js';
 import { summarizeClashes } from '../analysis.js';
@@ -16,7 +16,51 @@ import {
   type ClashRuleCoverage,
   type ClashSettings,
 } from '../types.js';
-import type { ClashKernel } from './kernel.js';
+import type { ClashKernel, NarrowRecord } from './kernel.js';
+
+/**
+ * Thrown by {@link runClash} when a `tolerance` — either the run-level
+ * `ClashSettings.tolerance` or a per-rule `ClashRule.tolerance` — is not a
+ * finite number (`NaN`, `+Infinity`, `-Infinity`).
+ *
+ * `??` (the substitution `runClash` uses for an omitted tolerance) only
+ * triggers on `null`/`undefined`, not `NaN`, so a `NaN` tolerance — e.g. from
+ * `Number('')`/`Number('abc')` on a cleared UI input, or a unit-conversion
+ * division by zero upstream — used to sail through unchanged. It then poisons
+ * `Math.max(tolerance, rule.clearance ?? 0)` (`NaN` on any `Math.max` operand
+ * is always `NaN`), which poisons the broad-phase AABB inflation
+ * (`inflate(bounds, NaN)`), which fails every BVH overlap comparison, which
+ * yields zero candidate pairs — silently, with the run still reporting
+ * `classifyRuleCoverage() === 'clean'` because `matchedA`/`matchedB` are
+ * selector-match counts taken before any geometry ran (#4244). Rejecting the
+ * non-finite value at the door, before it can reach `Math.max`, makes that
+ * whole chain structurally unreachable rather than merely harder to trigger.
+ *
+ * A NEGATIVE finite tolerance is unaffected by this check and keeps its
+ * existing, correct behaviour: `Math.max(tolerance, clearance ?? 0)` clamps
+ * it to at least the clearance (or zero), same as before.
+ */
+export class NonFiniteToleranceError extends Error {
+  readonly source: string;
+  readonly value: number;
+
+  constructor(source: string, value: number) {
+    super(
+      `runClash: ${source} is ${value} (not a finite number) — refusing to run, ` +
+        'which would silently poison the broad-phase AABB margin and report a ' +
+        'false "clean" result over zero examined geometry',
+    );
+    this.name = 'NonFiniteToleranceError';
+    this.source = source;
+    this.value = value;
+  }
+}
+
+function requireFiniteTolerance(source: string, value: number): void {
+  if (!Number.isFinite(value)) {
+    throw new NonFiniteToleranceError(source, value);
+  }
+}
 
 /**
  * Backend-agnostic clash orchestration: selection, exclusions, severity, stable
@@ -32,6 +76,7 @@ export async function runClash(
   kernel: ClashKernel,
 ): Promise<ClashResult> {
   const tolerance = settings.tolerance ?? DEFAULT_CLASH_SETTINGS.tolerance;
+  requireFiniteTolerance('settings.tolerance', tolerance);
   const excludeVoidsAndHosts =
     settings.excludeVoidsAndHosts ?? DEFAULT_CLASH_SETTINGS.excludeVoidsAndHosts;
   const exclusions = excludeVoidsAndHosts ? settings.exclusions : undefined;
@@ -39,7 +84,14 @@ export async function runClash(
 
   const clashes: Clash[] = [];
   const ruleCoverage: ClashRuleCoverage[] = [];
-  const seen = new Set<string>();
+  // Maps a clash id to its index in `clashes`, not just membership: a kernel's
+  // broad phase MAY hand the narrow phase several candidate pairs for the same
+  // (A, B) entity pair (e.g. one entity split across several geometry
+  // sub-prims, each tested against the same `b` — see `broad.ts`'s cross-group
+  // loop). Keeping only membership and skipping every later duplicate would
+  // silently keep whichever submesh's record happened to be produced first,
+  // which can be the shallower — or entirely clean — one. See `mostSevere`.
+  const seen = new Map<string, number>();
   let droppedPairs = 0;
   // A single GLOBAL candidate-pair budget across the whole run (not per rule),
   // so `maxCandidatePairs` is an honest end-to-end guardrail.
@@ -56,19 +108,47 @@ export async function runClash(
       }
 
       const groupA: number[] = [];
-      const groupB: number[] | null = rule.b ? [] : null;
+      // A second side exists when the rule names one — by selector OR by
+      // membership. Keying only on `b` would silently drop a `membersB` the
+      // caller gave without a selector and turn the rule into a self-clash.
+      const groupB: number[] | null = rule.b !== undefined || rule.membersB ? [] : null;
+      // Membership when the rule carries one, type selector otherwise — the
+      // ONE place a rule's sides are resolved, so both kernels see the same
+      // partition and every later stage is unaware there are two ways in.
+      const membersA = clashMemberSet(rule.membersA);
+      const membersB = clashMemberSet(rule.membersB);
+      // Durable keys of everything each side matched, for `compareClashRevisions`
+      // (revision.ts) to answer "was this SPECIFIC element re-examined?" — a
+      // count alone (`matchedA`/`matchedB`) cannot tell a narrowed selector that
+      // dropped one previously-matched element from one that kept it. Bounded by
+      // the same element set already held in memory for this run, so it costs
+      // nothing beyond the string references (deduplicated by `Set`).
+      const matchedKeysA = new Set<string>();
+      const matchedKeysB: Set<string> | null = groupB ? new Set<string>() : null;
       for (let i = 0; i < elements.length; i += 1) {
-        const tag = elements[i].tag;
-        if (matchesSelector(tag, rule.a)) groupA.push(i);
-        if (groupB && matchesSelector(tag, rule.b!)) groupB.push(i);
+        const el = elements[i];
+        if (inClashSet(el, rule.a, membersA)) {
+          groupA.push(i);
+          matchedKeysA.add(el.key);
+        }
+        if (groupB && inClashSet(el, rule.b ?? '', membersB)) {
+          groupB.push(i);
+          matchedKeysB!.add(el.key);
+        }
       }
-      ruleCoverage.push({
+      const coverageEntry: ClashRuleCoverage = {
         rule: rule.id,
         matchedA: groupA.length,
         matchedB: groupB ? groupB.length : null,
-      });
+        matchedKeysA: [...matchedKeysA].sort(),
+        matchedKeysB: matchedKeysB ? [...matchedKeysB].sort() : null,
+        ...(membersA ? { fromMembersA: true } : {}),
+        ...(membersB ? { fromMembersB: true } : {}),
+      };
+      ruleCoverage.push(coverageEntry);
 
       const ruleTolerance = rule.tolerance ?? tolerance;
+      requireFiniteTolerance(`rule "${rule.id}".tolerance`, ruleTolerance);
       settings.onProgress?.({ phase: 'broad', rule: rule.id, done: 0, total: 0 });
 
       const { records, candidatesProcessed, candidatesDropped } = await kernel.detectRule(
@@ -83,6 +163,10 @@ export async function runClash(
           ? (done, total) => settings.onProgress!({ phase: 'narrow', rule: rule.id, done, total })
           : undefined,
       );
+      // Threaded onto the coverage entry already pushed above — see
+      // `ClashRuleCoverage.candidatesExamined`'s doc for why this is a
+      // diagnostic, not a coverage verdict (#4244).
+      coverageEntry.candidatesExamined = candidatesProcessed;
       remaining = Math.max(0, remaining - candidatesProcessed);
       droppedPairs += candidatesDropped;
 
@@ -104,21 +188,21 @@ export async function runClash(
         }
 
         const id = clashId(elA, elB, rule.id);
-        if (seen.has(id)) continue;
-        seen.add(id);
-
-        clashes.push({
-          id,
-          a: toRef(elA),
-          b: toRef(elB),
-          rule: rule.id,
-          status: rec.status,
-          distance: rec.distance,
-          distanceKind: rec.distanceKind,
-          point: rec.point,
-          bounds: rec.bounds,
-          severity: rule.severity ?? inferClashSeverity(elA.tag, elB.tag),
-        });
+        const existingIndex = seen.get(id);
+        if (existingIndex !== undefined) {
+          // A second record for an (A, B) entity pair already reported once
+          // this rule — keep whichever is more severe rather than whichever
+          // was produced first (#5194). `mostSevere` mirrors the ranking
+          // `analysis.ts` uses to prioritise a finished result: status first
+          // (a real clash outranks a mere touch), penetration depth / gap
+          // second.
+          if (mostSevere(rec, clashes[existingIndex])) {
+            clashes[existingIndex] = toClash(id, rec, elA, elB, rule);
+          }
+          continue;
+        }
+        seen.set(id, clashes.length);
+        clashes.push(toClash(id, rec, elA, elB, rule));
       }
     }
   } finally {
@@ -130,7 +214,12 @@ export async function runClash(
   const result: ClashResult = {
     clashes,
     summary: summarizeClashes(clashes),
-    rulesRun: rules,
+    // Without the resolved membership: `rulesRun` is the DESCRIPTION of what
+    // ran, kept in store state and structured-cloned into the script sandbox,
+    // while a member list is run state that can hold a quarter-million strings
+    // per side. `ruleCoverage` reports how many elements each side matched,
+    // which is the part a reader of a finished run wants.
+    rulesRun: rules.map(withoutMembership),
     ruleCoverage,
     settings: { tolerance, excludeVoidsAndHosts },
   };
@@ -140,8 +229,62 @@ export async function runClash(
   return result;
 }
 
+/** A rule as it is reported back: config only, no resolved membership. */
+function withoutMembership(rule: ClashRule): ClashRule {
+  if (!rule.membersA && !rule.membersB) return rule;
+  const { membersA: _a, membersB: _b, ...config } = rule;
+  return config;
+}
+
+function toClash(
+  id: string,
+  rec: NarrowRecord,
+  elA: ClashElement,
+  elB: ClashElement,
+  rule: ClashRule,
+): Clash {
+  return {
+    id,
+    a: toRef(elA),
+    b: toRef(elB),
+    rule: rule.id,
+    status: rec.status,
+    distance: rec.distance,
+    distanceKind: rec.distanceKind,
+    // Only present when the kernel set it (a `hard` record), so every other
+    // clash serialises exactly as before.
+    ...(rec.depthFloor !== undefined ? { depthFloor: rec.depthFloor } : {}),
+    point: rec.point,
+    bounds: rec.bounds,
+    severity: rule.severity ?? inferClashSeverity(elA.tag, elB.tag),
+  };
+}
+
 function toRef(el: ClashElement): ClashElementRef {
   return { key: el.key, ref: el.ref, model: el.model, tag: el.tag, name: el.name };
+}
+
+/**
+ * Whether `candidate` is at least as severe as `current`, for two narrow-phase
+ * verdicts on the SAME (A, B) entity pair.
+ *
+ * Lower rank = more severe, matching `analysis.ts`'s `SEVERITY_RANK` /
+ * `penetrationDepth` convention used to prioritise a finished result: a real
+ * clash (`hard` or `clearance`) outranks a mere `touch`, and `hard`/`clearance`
+ * never coexist for one rule (fixed by `rule.mode`), so their relative rank
+ * never actually competes. Within the same status, `narrow.ts`/`depth.ts`
+ * assign `distance` so the smaller value is always the worse one: `hard`
+ * carries the SIGNED penetration depth (negative, deeper = smaller), while
+ * `clearance`/`touch` carry the unsigned gap (smaller = closer = worse).
+ */
+function mostSevere(
+  candidate: Pick<Clash, 'status' | 'distance'>,
+  current: Pick<Clash, 'status' | 'distance'>,
+): boolean {
+  const rank: Record<Clash['status'], number> = { hard: 0, clearance: 0, touch: 1 };
+  const rankDiff = rank[candidate.status] - rank[current.status];
+  if (rankDiff !== 0) return rankDiff < 0;
+  return candidate.distance < current.distance;
 }
 
 /** Stable, deterministic clash identity from the two durable keys + rule. */

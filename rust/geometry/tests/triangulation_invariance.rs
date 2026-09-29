@@ -56,48 +56,85 @@
 //! sweep never reads it at all. Two `ara3d` fixtures are excluded that way:
 //! `ISSUE_053_20181220Holter_Tower_10.ifc` (169 MB) and
 //! `ISSUE_068_ARK_NUS_skolebygg.ifc` (54 MB). AGENTS.md's perf section already
-//! names this exact class — "a heavy CSG model (Holter/ISSUE_053) since CI
-//! never touches that class and that is where every shipped regression has
-//! lived" — and until #3434 the census instrument did not touch it either.
+//! names this exact class as the one where "every shipped regression has
+//! lived", and the census instrument did not touch it either. Per-PR CI still
+//! does not, deliberately: this lane is weekly, and AGENTS.md is worded to say
+//! per-PR rather than to advertise a gate list it tells you not to trust.
 //!
 //! [`heavy_fixture_issue_053_is_watertight`] and
-//! [`heavy_fixture_issue_068_has_a_known_boolean_tear`], near the bottom of this
-//! file, reach the two fixtures directly (bypassing `discover_models`'s size
-//! filter, not raising [`MAX_FIXTURE_BYTES`] itself) and run the SAME per-host
-//! walk via [`sweep`]. Both are `#[ignore]`d, this repo's existing convention
-//! for a fixture too expensive for the default `cargo test` — see
-//! `wall_opening_cut_regression.rs` and `issue_053_heavy_csg_probe.rs` for the
-//! same pattern. Run them SEPARATELY -- they have OPPOSITE expectations, and a
-//! bare `heavy_fixture` filter matches both, so it always reports a failure:
+//! [`heavy_fixture_issue_068_carries_the_known_3435_tear`], near the bottom of
+//! this file, reach the two fixtures directly (bypassing `discover_models`'s
+//! size filter, not raising [`MAX_FIXTURE_BYTES`] itself) and run the SAME
+//! per-host walk via [`sweep`], gated through the SAME [`census_golden`]
+//! machinery as the main corpus, against one shared golden,
+//! [`HEAVY_GOLDEN_PATH`].
 //!
-//!   # passes: ISSUE_053 against its own golden
-//!   cargo test -p ifc-lite-geometry --features triangulation-alt \
-//!     --test triangulation_invariance \
-//!     -- --ignored --nocapture heavy_fixture_issue_053_is_watertight
+//! ## What runs it
 //!
-//!   # FAILS TODAY, deliberately -- it asserts the #3435 tear is gone
-//!   cargo test -p ifc-lite-geometry --features triangulation-alt \
-//!     --test triangulation_invariance \
-//!     -- --ignored --nocapture heavy_fixture_issue_068
+//! `.github/workflows/geometry-census-heavy.yml`: weekly, plus
+//! `workflow_dispatch` before a kernel-sensitive merge. Both tests are
+//! `#[ignore]`d so neither `cargo test --workspace` nor the per-PR census job
+//! pays for 223 MiB of fixture; `-- --ignored heavy_fixture` matches both and is
+//! what that workflow runs.
 //!
-//! ISSUE_053 measures CLEAN (289/289 void hosts watertight) and is checked
-//! against its own per-host golden, [`HEAVY_GOLDEN_PATH`], exactly like the
-//! main corpus above — a genuine, gated coverage win. ISSUE_068 measures 29
-//! torn hosts / 285 open edges, a live, unfixed CSG defect now tracked as
-//! #3435 (one host, `IFCWALLSTANDARDCASE #43810`, carries 38
-//! `IfcRelVoidsElement` cuts against one swept solid and 27 of the 29 torn
-//! hosts are confirmed CSG-caused: `pre` reads watertight, `post` does not).
-//! That is NOT written into any golden: doing so would freeze a live bug as
-//! expected, checked-in output, which is the opposite of what #3434 is for.
-//! Its test instead asserts the CORRECT end state (`torn == 0`) and is
-//! expected to FAIL until #3435 is fixed, documenting the defect rather than
-//! certifying it.
+//! Wiring it is the whole of #3434. #3436 added these two tests and nothing
+//! ran them: no workflow step, no script, no `--ignored` anywhere under
+//! `.github/` or `scripts/`, so [`HEAVY_GOLDEN_PATH`] was a ratchet nobody
+//! turned. AGENTS.md states the rule for `scripts/` gates — "a guard nothing
+//! runs is the same absence as a guard that finds nothing" — and an `#[ignore]`
+//! no `--ignored` ever reaches is the same shape in Rust.
+//!
+//! ## Why the known tear is IN the golden
+//!
+//! ISSUE_068 is torn, and #3436 pinned the CORRECT end state (`torn == 0`)
+//! instead of recording the tear, so the test failed on every run by design.
+//! Nothing can be wired to that: a lane that is red whatever happens carries
+//! one bit and it is always the same bit. `assert_eq!(torn, 0)` reads
+//! identically at today's torn population and at ten times it on an entirely
+//! different set of hosts, so it cannot separate the KNOWN tear from a NEW
+//! one — which is the only question a standing lane is there to answer.
+//!
+//! The tear is therefore pinned PER HOST in [`HEAVY_GOLDEN_PATH`], exactly as
+//! the main corpus already pins its own torn hosts. The golden is a per-host
+//! CEILING, so a tear on a host that was clean files under `regressed`, a host
+//! that stops meshing under `missing`, a host absent from the golden under
+//! `added`, and every one of those is red.
+//!
+//! Recording it is not blessing it away, because the POPULATION is pinned
+//! separately as [`ISSUE_068_KNOWN_TORN_HOSTS`] and checked against the
+//! checked-in golden by
+//! [`the_heavy_golden_pins_the_known_3435_tear_population`] — which reads the
+//! file with `include_str!`, needs no fixture and no sweep, and therefore runs
+//! in the default `cargo test --workspace` on every PR. Moving that population
+//! in EITHER direction reds that test until someone edits a constant whose name
+//! says #3435. A fix has to lower it deliberately; a regression cannot raise it
+//! quietly.
+//!
+//! ## Why no counts are written in this section
+//!
+//! #3436's prose here said ISSUE_068 measured 29 torn hosts / 285 open edges,
+//! a doc comment beside it said 27/274, and by the time anything ran either
+//! one neither was true: swept at `6f445b6f2` the fixture reads 363 void hosts,
+//! 28 torn, 282 open edges, and its worst host `#43810` carries 40 open edges
+//! rather than the 42 recorded next to it. No geometry work targeted this
+//! fixture in between and no reader could have known any of that, because
+//! nothing re-derived it. The counts now live in the golden and in one named
+//! constant, both of which a test reads; the figures in this paragraph are
+//! dated on purpose, as history rather than as a claim about `main`.
 
 mod census_golden;
 
+#[path = "corpus/rtc_frame.rs"]
+mod census_rtc;
+
+mod support;
+
 use census_golden::{is_closed_solid, totals, Delta, HostRow, PreVoid};
-use ifc_lite_core::{build_entity_index, EntityDecoder, EntityScanner};
-use ifc_lite_geometry::{propagate_voids_to_parts, GeometryRouter, Mesh};
+use census_rtc::ModelFrame;
+use ifc_lite_core::{EntityDecoder, EntityScanner};
+use ifc_lite_geometry::kernel::mesh_volume::mesh_volume;
+use ifc_lite_geometry::take_plane_weld_stats;
+use ifc_lite_geometry::{propagate_voids_to_parts, Mesh};
 use rustc_hash::FxHashMap;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -174,36 +211,10 @@ fn discover_models() -> Vec<(String, PathBuf)> {
     out
 }
 
-/// Fixtures excluded from [`discover_models`] by [`MAX_FIXTURE_BYTES`], reached
-/// deliberately by the opt-in heavy lane at the bottom of this file (#3434).
-/// Relative to `tests/models/`, matching `discover_models`'s keys.
-const HEAVY_FIXTURES: &[&str] = &[
-    "ara3d/ISSUE_053_20181220Holter_Tower_10.ifc",
-    "ara3d/ISSUE_068_ARK_NUS_skolebygg.ifc",
-];
-
-/// `(manifest-relative path, absolute path)` for each fixture in
-/// [`HEAVY_FIXTURES`] that is actually on disk.
-///
-/// Unlike `discover_models`, this does NOT check size against
-/// `MAX_FIXTURE_BYTES` — reaching an oversized fixture is the entire point —
-/// and it does not read `manifest.json` either: it names its fixtures
-/// directly rather than filtering the full corpus down to two entries. A
-/// fixture not yet fetched is silently skipped rather than failing the lane,
-/// matching `discover_models`'s treatment of a missing file.
-fn discover_heavy_models() -> Vec<(String, PathBuf)> {
-    let models = crate_dir().join("..").join("..").join("tests/models");
-    HEAVY_FIXTURES
-        .iter()
-        .map(|rel| (rel.to_string(), models.join(rel)))
-        .filter(|(_, p)| p.is_file())
-        .collect()
-}
-
 /// Corpus floor. Every other check here is an upper bound or a per-host
 /// comparison scoped to the models actually swept, so without this a tree with
 /// no fixtures passes all of them while measuring nothing. Set under the
-/// manifest's full population (111 models / 1170 void hosts) so a single failed
+/// manifest's full population (112 models / 1170 void hosts) so a single failed
 /// fixture fetch does not red the build, but an unpopulated tree cannot pass.
 const MIN_MODELS: usize = 105;
 const MIN_VOID_HOSTS: usize = 1100;
@@ -217,6 +228,17 @@ fn set_alt(on: bool) {
 }
 #[cfg(not(feature = "triangulation-alt"))]
 fn set_alt(_on: bool) {}
+
+/// Restore the process-wide triangulator switch even when an assertion panics.
+#[cfg(not(any(feature = "csg_topology_gate", feature = "csg_manifold_gate")))]
+struct AltTriangulatorReset;
+
+#[cfg(not(any(feature = "csg_topology_gate", feature = "csg_manifold_gate")))]
+impl Drop for AltTriangulatorReset {
+    fn drop(&mut self) {
+        set_alt(false);
+    }
+}
 
 fn void_index(content: &str) -> FxHashMap<u32, Vec<u32>> {
     let mut idx: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
@@ -236,19 +258,17 @@ fn void_index(content: &str) -> FxHashMap<u32, Vec<u32>> {
 }
 
 /// Same element with NO voids applied: isolates solid construction from CSG.
-fn process_no_voids(content: &str, host_id: u32) -> Option<Mesh> {
-    let ei = build_entity_index(content);
-    let mut decoder = EntityDecoder::with_index(content, ei);
+fn process_no_voids(frame: &ModelFrame, host_id: u32) -> Option<Mesh> {
+    let mut decoder = frame.decoder();
     let entity = decoder.decode_by_id(host_id).ok()?;
-    let router = GeometryRouter::with_units(content, &mut decoder);
+    let router = frame.router(&mut decoder);
     router.process_element(&entity, &mut decoder).ok()
 }
 
-fn process(content: &str, host_id: u32, voids: &FxHashMap<u32, Vec<u32>>) -> Option<Mesh> {
-    let ei = build_entity_index(content);
-    let mut decoder = EntityDecoder::with_index(content, ei);
+fn process(frame: &ModelFrame, host_id: u32, voids: &FxHashMap<u32, Vec<u32>>) -> Option<Mesh> {
+    let mut decoder = frame.decoder();
     let entity = decoder.decode_by_id(host_id).ok()?;
-    let router = GeometryRouter::with_units(content, &mut decoder);
+    let router = frame.router(&mut decoder);
     router.process_element_with_voids(&entity, &mut decoder, voids).ok()
 }
 
@@ -503,6 +523,227 @@ fn max_abs_coord(mesh: &Mesh) -> f64 {
     mesh.positions.iter().fold(0.0f64, |m, &v| m.max((v as f64).abs()))
 }
 
+/// Signed enclosed volume in whole cm³, for [`HostRow::vol`] (#3422), which
+/// says where it is taken and why it is an integer. `kernel::mesh_volume`
+/// reads the same f32 positions `edge_stats` does, so one mesh is one integer.
+///
+/// The two do NOT read them at the same resolution, and
+/// [`a_sub_millimetre_crack_reads_watertight_but_shifts_the_volume`] measures
+/// what that costs. See [`HostRow::vol`] for why it is tolerable and why
+/// tightening the gate is not the remedy.
+fn volume_cm3(mesh: &Mesh) -> i64 {
+    (mesh_volume(mesh) * 1.0e6).round() as i64
+}
+
+/// A unit cube whose lid is a SEPARATE set of vertices, raised by `crack`
+/// metres above the walls' top edge, so the surface carries a slit of that
+/// width all the way round. The one shape that separates the census's
+/// watertightness reading from the closure `mesh_volume` actually needs.
+fn cracked_cube(crack: f32) -> Mesh {
+    let base = [[0.0f32, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    let mut positions: Vec<f32> = Vec::new();
+    for z in [0.0, 1.0, 1.0 + crack] {
+        for v in base {
+            positions.extend([v[0], v[1], z]);
+        }
+    }
+    let mut indices: Vec<u32> = vec![0, 2, 1, 0, 3, 2]; // floor, wound down
+    for k in 0..4u32 {
+        let (a, b) = (k, (k + 1) % 4);
+        indices.extend([a, b, b + 4, a, b + 4, a + 4]); // walls
+    }
+    indices.extend([8, 9, 10, 8, 10, 11]); // lid, off the RAISED copies
+    Mesh { positions, indices, ..Default::default() }
+}
+
+/// The blind spot [`HostRow::vol`]'s gate has, measured rather than asserted
+/// (#3422, raised in review on #3867).
+///
+/// `stats.open == 0` is the gate, and it is read off a walk that quantizes
+/// positions to a 1 mm GRID. `mesh_volume` integrates positions `mesh_to_tris`
+/// snapped to 1/65536 m. So a crack under half a snap bucket lands both of its
+/// sides in one grid cell, the edges pair, the host reads watertight — and the
+/// surface handed to the divergence sum is still open. The reading then carries
+/// the crack as an offset, and this test pins its size against the column's own
+/// 1 cm³ tolerance so nobody has to take the claim on trust.
+///
+/// The second arm is where the blind spot ENDS: at 0.9 mm the two sides fall in
+/// different cells, the walk sees the tear, and no volume is taken at all. The
+/// gap between the arms is the whole of the exposure — sub-half-bucket cracks,
+/// nothing wider.
+#[test]
+fn a_sub_millimetre_crack_reads_watertight_but_shifts_the_volume() {
+    let sealed = cracked_cube(0.0);
+    assert_eq!(edge_stats(&sealed).open, 0, "the sealed cube must be watertight");
+    let truth = volume_cm3(&sealed);
+    assert_eq!(truth, 1_000_000, "a unit cube is 1 m³");
+
+    // Under half the 1 mm bucket: invisible to the gate, visible in the sum.
+    let cracked = cracked_cube(0.0004);
+    assert_eq!(
+        edge_stats(&cracked).open,
+        0,
+        "a 0.4 mm slit is inside one snap bucket, so the census reads it watertight"
+    );
+    let off = (volume_cm3(&cracked) - truth).abs();
+    // Bounded ABOVE by the naive band term (the slit width times the lid area,
+    // 4e-4 m³ = 400 cm³), and far above the 1 cm³ tolerance this column diffs
+    // at — so the offset is real, not rounding, and its scale is the crack's.
+    assert!(
+        (100..=400).contains(&off),
+        "a 0.4 mm slit should shift the reading by ~a third of the 400 cm³ band term, got {off}"
+    );
+
+    // Over half the bucket: the gate catches it and takes no reading.
+    assert!(
+        edge_stats(&cracked_cube(0.0009)).open > 0,
+        "a 0.9 mm slit crosses the snap bucket, so the census must see it as torn"
+    );
+}
+
+/// One census row from a host's void-applied mesh. Every column that is a
+/// reading OF THAT MESH is derived here and nowhere else, so a test that
+/// builds a row from a mesh cannot drift from the sweep; `alt` and `pre` are
+/// second processing passes and stay with the caller, which has already read
+/// `stats` to decide whether `pre` is taken.
+fn row_from_mesh(
+    model: &str,
+    id: u32,
+    rep: String,
+    mesh: &Mesh,
+    stats: &EdgeStats,
+    alt: Option<usize>,
+    pre: PreVoid,
+) -> HostRow {
+    HostRow {
+        model: model.to_string(),
+        id,
+        rep,
+        open: stats.open,
+        strict: stats.strict,
+        tris: mesh.indices.len() / 3,
+        collapsed: stats.degenerate > 0,
+        far: max_abs_coord(mesh) >= F32_SAFE_MAGNITUDE,
+        alt,
+        pre,
+        // The mirror of `pre`: taken exactly where that one is not. Same
+        // SIGNED trigger, for the same reason.
+        vol: (stats.open == 0).then(|| volume_cm3(mesh)),
+    }
+}
+
+/// The golden a lane compares against, or that a bless overwrites.
+///
+/// Outside a bless an unreadable golden is fatal, whatever the reason: a lane
+/// that carried on would be measuring against nothing.
+///
+/// In bless mode exactly ONE failure is tolerated, and it is the one a
+/// column-adding change creates: [`census_golden::ParseError::Schema`], EVERY
+/// row on disk having exactly one column fewer than `parse` demands (#3397,
+/// #3422). `parse` identifies that shape positively rather than inferring it
+/// from any row-shape failure, so an arbitrary wrong column count — a
+/// truncated write, a mangled merge, one stray tab — is `Malformed` and stays
+/// fatal here.
+/// Its rows are intact but cannot be reused without inventing the new column,
+/// so the lane discards them and says so; every swept model is rewritten from
+/// this run, and a model NOT swept has no rows to keep, which the bless line's
+/// `kept` count shows. Before this the only way past the parse was the run
+/// report under `target/`, which the heavy lane does not write.
+///
+/// Every OTHER failure — a bad number, an unreadable flag, a truncated write,
+/// a mangled merge — is fatal in bless mode too. Treating it as an empty
+/// golden would be the absence-reads-as-success shape: in the heavy lane the
+/// two fixtures share one file and each blesses only its own model's rows, so
+/// a bless of ISSUE_053 against a file carrying one corrupt ISSUE_068 row
+/// would silently write a golden missing all 363 of that model's rows, taking
+/// the #3435 tear pin with them. `parse` separates the two classes so this
+/// function can refuse the second one.
+fn read_golden(path: &std::path::Path, bless: bool) -> Vec<HostRow> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    match census_golden::parse(&text) {
+        Ok(rows) => rows,
+        Err(e @ census_golden::ParseError::Schema { .. }) if bless => {
+            println!(
+                "\nBLESS WITHOUT COMPARISON: {} does not parse under the current golden \
+                 schema ({e}). Its rows cannot be compared or kept, so every swept model \
+                 is written from this run alone.",
+                path.display()
+            );
+            Vec::new()
+        }
+        Err(e @ census_golden::ParseError::Malformed(_)) => panic!(
+            "{} is CORRUPT, not merely on an older schema ({e}). A bless will not treat \
+             this as an empty golden: the rows it would silently drop include every model \
+             this run does not sweep. Fix or restore the file first.",
+            path.display()
+        ),
+        Err(e) => panic!("{} is unreadable: {e}", path.display()),
+    }
+}
+
+/// A golden one column short — the file every column-adding change leaves on
+/// disk. A measuring run must die on it (comparing against nothing certifies
+/// nothing); a bless must keep none of its rows, which cannot be reused
+/// without inventing the missing column. One fixture for both arms, so they
+/// cannot drift onto different inputs, removed before either assertion so a
+/// failure does not leak it.
+#[test]
+fn a_golden_one_column_short_kills_a_measuring_run_and_is_kept_by_no_bless() {
+    let path = std::env::temp_dir().join(format!("ifc-lite-3422-{}.tsv", std::process::id()));
+    std::fs::write(
+        &path,
+        "model\tid\trep\topen\ttris\tcoll\tfar\talt\tpre\tstrict\na.ifc\t1\tCSG\t0\t12\t0\t0\t0\t-\t0\n",
+    )
+    .expect("write the old-schema golden");
+    let measuring = std::panic::catch_unwind(|| read_golden(&path, false));
+    let blessing = std::panic::catch_unwind(|| read_golden(&path, true));
+    let _ = std::fs::remove_file(&path);
+
+    let err = measuring.expect_err("a measuring run must die on a golden one column short");
+    let text = err.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(text.contains("expected 11 columns, got 10"), "{text}");
+    let rows = blessing.expect("a bless must tolerate a golden one column short");
+    assert!(rows.is_empty(), "an old-schema row was kept: {rows:?}");
+}
+
+/// The other half of the same rule (#3422). A golden that is CORRUPT rather
+/// than merely on an older schema is fatal in BOTH modes: the rows a bless
+/// would discard include every model this run does not sweep, and in the heavy
+/// lane, where two fixtures share one file, that is 363 rows and the #3435
+/// tear pin.
+///
+/// The fixture is the schema-short row from the test above with the new column
+/// present and unreadable, so the ONLY difference between the two is the class
+/// of failure, not the file's shape. Without the split in
+/// `census_golden::ParseError` this test passes an empty `Vec` back and writes
+/// a golden missing the other model.
+#[test]
+fn a_bless_refuses_a_corrupt_golden_instead_of_treating_it_as_empty() {
+    let path =
+        std::env::temp_dir().join(format!("ifc-lite-3422-corrupt-{}.tsv", std::process::id()));
+    std::fs::write(
+        &path,
+        "model\tid\trep\topen\ttris\tcoll\tfar\talt\tpre\tstrict\tvol\n\
+         a.ifc\t1\tCSG\t0\t12\t0\t0\t0\t-\t0\tnot-a-number\n",
+    )
+    .expect("write the corrupt golden");
+    let measuring = std::panic::catch_unwind(|| read_golden(&path, false));
+    let blessing = std::panic::catch_unwind(|| read_golden(&path, true));
+    let _ = std::fs::remove_file(&path);
+
+    for (mode, outcome) in [("measuring", measuring), ("blessing", blessing)] {
+        let Err(err) = outcome else {
+            panic!("a corrupt golden must be fatal in {mode} mode");
+        };
+        let text = err.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(text.contains("is CORRUPT, not merely on an older schema"), "{mode}: {text}");
+        assert!(text.contains("bad volume"), "{mode}: {text}");
+        // And it must NOT be described as a schema change, or the reader
+        // reaches for the bless command that would destroy the file.
+        assert!(!text.contains("BLESS WITHOUT COMPARISON"), "{mode}: {text}");
+    }
+}
+
 /// The host, then the reasons that moved it. The one definition of that shape
 /// for the four buckets that carry a [`Delta`], so their print lines and their
 /// failure texts cannot drift apart. `missing` and `added` carry a bare
@@ -514,6 +755,33 @@ fn fmt_delta(d: &Delta) -> String {
 /// One indented line per delta, for a failure message.
 fn fmt_deltas(ds: &[Delta]) -> String {
     ds.iter().map(|d| format!("  {}", fmt_delta(d))).collect::<Vec<_>>().join("\n")
+}
+
+/// Every bucket, each host named, in one place for both lanes: the census
+/// lane's comment above its call says why every bucket prints before any
+/// assert. One definition so adding a bucket is one edit, not one per lane.
+fn print_buckets(diff: &census_golden::Diff) {
+    for d in &diff.improved {
+        println!("  IMPROVED  {}", fmt_delta(d));
+    }
+    for d in &diff.regressed {
+        println!("  REGRESSED  {}", fmt_delta(d));
+    }
+    for r in &diff.missing {
+        println!("  COVERAGE LOSS  {}", fmt_host(r));
+    }
+    for d in &diff.retessellated {
+        println!("  RETESSELLATED  {}", fmt_delta(d));
+    }
+    for d in &diff.volume_moved {
+        println!("  VOLUME MOVED  {}", fmt_delta(d));
+    }
+    for r in &diff.added {
+        println!("  ADDED  {}", fmt_host(r));
+    }
+    for d in &diff.changed {
+        println!("  RECLASSIFIED  {}", fmt_delta(d));
+    }
 }
 
 fn fmt_host(r: &HostRow) -> String {
@@ -535,6 +803,20 @@ fn fmt_host(r: &HostRow) -> String {
 fn sweep(models: &[(String, PathBuf)]) -> (Vec<HostRow>, BTreeSet<String>) {
     let mut rows: Vec<HostRow> = Vec::new();
     let mut swept_models: BTreeSet<String> = BTreeSet::new();
+    // #3353 weld telemetry, printed and NEVER written to the golden: a count
+    // that moves with the corpus would make the golden re-baseline on every
+    // fixture change. Zero in a default build (see `take_plane_weld_stats`),
+    // so this is only meaningful under `--features debug_geometry`.
+    //
+    // READ ONLY THE `all callers` COLUMN HERE. This corpus records ZERO unions
+    // (see `plane_weld::promote_operands_mutually`), so `union only` prints
+    // 0/0/0 by construction on every model, in every build — it is not
+    // evidence that the union weld does not fire, because nothing here calls
+    // it. Measuring the union caller needs a corpus that contains unions.
+    // The counters are also process-global while other tests in this file run
+    // concurrently, so per-model attribution is indicative, not exact.
+    let mut weld_totals: Vec<(String, [(u64, u64, u64); 2])> = Vec::new();
+    let _ = take_plane_weld_stats(); // discard anything earlier tests accrued
 
     for (rel, path) in models {
         let Ok(content) = std::fs::read_to_string(path) else {
@@ -548,14 +830,20 @@ fn sweep(models: &[(String, PathBuf)]) -> (Vec<HostRow>, BTreeSet<String>) {
             continue; // nothing to index the lines for
         }
         let lines = line_index(&content);
+        // #4127: the entity index and the RTC offset, ONCE per model rather
+        // than once per host. Both are pure functions of `content` (see
+        // `census_rtc`), and re-deriving them inside the loop is what put the
+        // heavy lane past its CI budget. The router and the decoder are still
+        // built per host.
+        let frame = ModelFrame::new(&content);
 
         for id in hosts {
             set_alt(false);
-            let Some(base) = process(&content, id, &voids) else {
+            let Some(base) = process(&frame, id, &voids) else {
                 continue;
             };
             set_alt(true);
-            let alt = process(&content, id, &voids);
+            let alt = process(&frame, id, &voids);
             set_alt(false);
 
             let stats = edge_stats(&base);
@@ -570,26 +858,63 @@ fn sweep(models: &[(String, PathBuf)]) -> (Vec<HostRow>, BTreeSet<String>) {
             let pre = if open == 0 {
                 PreVoid::NotTaken
             } else {
-                match process_no_voids(&content, id).map(|m| open_boundary_edges(&m)) {
+                match process_no_voids(&frame, id).map(|m| open_boundary_edges(&m)) {
                     Some(v) => PreVoid::Open(v),
                     None => PreVoid::Failed,
                 }
             };
-            rows.push(HostRow {
-                model: rel.clone(),
+            rows.push(row_from_mesh(
+                rel,
                 id,
-                rep: representation_type(&content, &lines, id),
-                open,
-                strict: stats.strict,
-                tris: base.indices.len() / 3,
-                collapsed: stats.degenerate > 0,
-                far: max_abs_coord(&base) >= F32_SAFE_MAGNITUDE,
-                alt: alt.as_ref().map(open_boundary_edges),
+                representation_type(&content, &lines, id),
+                &base,
+                &stats,
+                alt.as_ref().map(open_boundary_edges),
                 pre,
-            });
+            ));
         }
+        weld_totals.push((rel.clone(), take_plane_weld_stats()));
     }
 
+    // #3422: the wiring rule, asserted on every row this walk produces so both
+    // lanes inherit it. A sweep that stopped taking the reading would diff
+    // `Some` against `None`, which `classify` reads as "one reading is not a
+    // comparison", so every watertight host would read unchanged and the
+    // column would go dark with nothing failing; the golden pin in
+    // `census_golden` only proves the reading was taken once.
+    for r in &rows {
+        assert!(
+            r.volume_is_wired(),
+            "{} #{}: vol {:?} with open {} — the sweep takes the reading exactly where \
+             the host is watertight",
+            r.model,
+            r.id,
+            r.vol,
+            r.open
+        );
+    }
+
+    println!(
+        "\n=== plane-weld telemetry (#3353; zero without --features debug_geometry; \
+         'union only' is 0 by construction here, this corpus has no unions) ==="
+    );
+    let mut all = (0u64, 0u64, 0u64);
+    let mut uni = (0u64, 0u64, 0u64);
+    for (model, [a, u]) in &weld_totals {
+        if a.0 > 0 {
+            println!(
+                "  plane-weld: {model}: all callers {}/{}/{}, union only {}/{}/{} \
+                 (calls / moved something / vertices welded)",
+                a.0, a.1, a.2, u.0, u.1, u.2
+            );
+        }
+        all = (all.0 + a.0, all.1 + a.1, all.2 + a.2);
+        uni = (uni.0 + u.0, uni.1 + u.1, uni.2 + u.2);
+    }
+    println!(
+        "  plane-weld TOTAL: all callers {}/{}/{}, union only {}/{}/{}",
+        all.0, all.1, all.2, uni.0, uni.1, uni.2
+    );
     (rows, swept_models)
 }
 
@@ -624,6 +949,8 @@ fn sweep(models: &[(String, PathBuf)]) -> (Vec<HostRow>, BTreeSet<String>) {
 /// by construction and are left unlabelled.
 #[test]
 fn watertightness_census_and_triangulator_invariance() {
+    let _serial = CENSUS_SWEEP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
     if cfg!(not(feature = "triangulation-alt")) {
         eprintln!(
             "SKIPPED: rerun with --features triangulation-alt to enable the \
@@ -832,16 +1159,13 @@ fn watertightness_census_and_triangulator_invariance() {
         run.hosts
     );
 
-    let golden_path = crate_dir().join(GOLDEN_PATH);
-    let golden_text = std::fs::read_to_string(&golden_path).unwrap_or_default();
-    let golden = census_golden::parse(&golden_text)
-        .unwrap_or_else(|e| panic!("{} is unreadable: {e}", golden_path.display()));
-
     let bless = census_golden::bless_mode(
         std::env::var_os(BLESS_ENV).is_some(),
         std::env::var_os("CI").is_some_and(|v| !v.is_empty() && v != "0" && v != "false"),
     )
     .unwrap_or_else(|e| panic!("{e}"));
+    let golden_path = crate_dir().join(GOLDEN_PATH);
+    let golden = read_golden(&golden_path, bless);
 
     if bless {
         // Preserve the rows of models this run did NOT sweep, so blessing on a
@@ -899,36 +1223,22 @@ fn watertightness_census_and_triangulator_invariance() {
         "  ... called a re-tessellation, in any bucket: {}",
         diff.shrank_while_healing
     );
+    println!(
+        "volume moved (watertight both sides, enclosed volume differs): {}",
+        diff.volume_moved.len()
+    );
     println!("improved  : {}", diff.improved.len());
     // EVERY bucket names its hosts HERE, before any assert, `regressed`
     // included even though its assert happens to run first. The asserts run
-    // regressed -> missing -> retessellated -> added -> changed and the FIRST
-    // failure panics, so any bucket that only names its hosts inside its own
-    // assert is a bare count whenever an earlier one fails. Keeping all six in
-    // this block means reordering the asserts cannot silently cost a bucket its
-    // host names.
+    // one bucket at a time and the FIRST failure panics, so any bucket that
+    // only names its hosts inside its own assert is a bare count whenever an
+    // earlier one fails. Keeping every bucket in `print_buckets` means
+    // reordering the asserts cannot silently cost a bucket its host names.
     //
     // The run that motivated this is the one where several buckets are
     // non-empty at once: whatever stays in `regressed` panics first, and every
     // host that shrank while healing would otherwise show up only as a count.
-    for d in &diff.improved {
-        println!("  IMPROVED  {}", fmt_delta(d));
-    }
-    for d in &diff.regressed {
-        println!("  REGRESSED  {}", fmt_delta(d));
-    }
-    for r in &diff.missing {
-        println!("  COVERAGE LOSS  {}", fmt_host(r));
-    }
-    for d in &diff.retessellated {
-        println!("  RETESSELLATED  {}", fmt_delta(d));
-    }
-    for r in &diff.added {
-        println!("  ADDED  {}", fmt_host(r));
-    }
-    for d in &diff.changed {
-        println!("  RECLASSIFIED  {}", fmt_delta(d));
-    }
+    print_buckets(&diff);
 
     // Not a failure: `MIN_MODELS` sits under the corpus precisely so a failed
     // fixture fetch does not red the build, and a model that did not load has no
@@ -995,12 +1305,28 @@ fn watertightness_census_and_triangulator_invariance() {
     // able to tell "this tore" from "this shrank while healing".
     assert!(
         diff.retessellated.is_empty(),
-        "{} host(s) RE-TESSELLATED: fewer triangles AND fewer open edges. Usually \
-         a cut that stopped over-extending, but the test is magnitude-blind - a \
-         near-total loss on a torn host also lands here, so CHECK THE SHRINK \
-         before blessing. If the shrink is intended, re-bless:\n  {BLESS_CMD}\n{}",
+        "{} host(s) RE-TESSELLATED: fewer triangles with fewer open edges on a \
+         torn host, or at unchanged enclosed volume on a watertight one. Usually \
+         a cut that stopped over-extending or a mesher change. On a TORN host the \
+         test is magnitude-blind - a near-total loss also lands here, so CHECK \
+         THE SHRINK before blessing. If the shrink is intended, re-bless:\n  \
+         {BLESS_CMD}\n{}",
         diff.retessellated.len(),
         fmt_deltas(&diff.retessellated)
+    );
+
+    // Separated from both of the above (#3422): the enclosed volume of a
+    // watertight host moved, which no count sees when the topology holds. The
+    // message carries why neither direction is a verdict.
+    assert!(
+        diff.volume_moved.is_empty(),
+        "{} host(s) moved in ENCLOSED VOLUME while watertight on both sides. \
+         Neither direction is a verdict: less volume is an over-cut growing or a \
+         void that was silently skipped now applying; more is a healed over-cut \
+         or a void that stopped applying. Read the percentage against what the \
+         change was meant to do, then re-bless:\n  {BLESS_CMD}\n{}",
+        diff.volume_moved.len(),
+        fmt_deltas(&diff.volume_moved)
     );
 
     assert!(
@@ -1089,6 +1415,148 @@ fn watertightness_census_and_triangulator_invariance() {
     );
 }
 
+/// Regression for #4617: composing a re-extruded 2D cut with the residual exact
+/// cutter tore this mixed slab from 25 to 875 open edges. Staged mixed sets
+/// preserve the established topology under both triangulators; an unsafe prefix
+/// or correction retries the complete opening set on the original host. The same
+/// contract holds with the optional prism route disabled; that mode has its own
+/// expected tessellation and runs in a separate process during validation.
+#[cfg(not(any(feature = "csg_topology_gate", feature = "csg_manifold_gate")))]
+#[test]
+fn issue_129_mixed_bool2d_residual_preserves_established_topology() {
+    let _serial = CENSUS_SWEEP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _reset = AltTriangulatorReset;
+    let rel = "ara3d/ISSUE_129_N1540_17_EXE_MOD_448200_02_09_11SMC_IGC_V17.ifc".to_string();
+    let path = crate_dir().join("../..").join("tests/models").join(&rel);
+    if !oracle_fixture_present(&path) {
+        eprintln!("Skipping #4610 mixed-opening oracle: run pnpm fixtures");
+        return;
+    }
+    let content = std::fs::read_to_string(&path).expect("read ISSUE_129 fixture");
+    let voids = void_index(&content);
+    let frame = ModelFrame::new(&content);
+
+    #[cfg(feature = "triangulation-alt")]
+    let triangulators = [false, true].as_slice();
+    #[cfg(not(feature = "triangulation-alt"))]
+    let triangulators = [false].as_slice();
+
+    // #32810's triangle counts grew when consolidation stopped filling small
+    // openings on its large slab faces (#4698): 1936 -> 3224 and 2005 -> 3207,
+    // open and strict unchanged.
+    let expected = if std::env::var("IFC_LITE_PRISM_CUT").as_deref() == Ok("0") {
+        [(12381, 30, 31, 9400), (32810, 0, 0, 3224)]
+    } else {
+        [(12381, 25, 26, 7565), (32810, 3, 3, 3207)]
+    };
+    for &alt in triangulators {
+        set_alt(alt);
+        for (id, open, strict, tris) in expected {
+            let mesh =
+                process(&frame, id, &voids).unwrap_or_else(|| panic!("host #{id} must mesh"));
+            let stats = edge_stats(&mesh);
+            assert_eq!(stats.open, open, "host #{id}, alt={alt}: signed edge reading");
+            assert_eq!(stats.strict, strict, "host #{id}, alt={alt}: strict edge reading");
+            if !alt {
+                assert_eq!(mesh.triangle_count(), tris, "host #{id}: geometry must not shrink");
+            }
+        }
+    }
+}
+
+#[cfg(not(any(feature = "csg_topology_gate", feature = "csg_manifold_gate")))]
+#[test]
+fn issue_4627_dental_result_remains_closed() {
+    let _serial = CENSUS_SWEEP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _reset = AltTriangulatorReset;
+    let path = crate_dir().join("../../tests/models/ara3d/dental_clinic.ifc");
+    if !oracle_fixture_present(&path) {
+        eprintln!("Skipping #4627 dental result oracle: run pnpm fixtures");
+        return;
+    }
+    let content = std::fs::read_to_string(&path).expect("read dental clinic");
+    let voids = void_index(&content);
+    let frame = ModelFrame::new(&content);
+    set_alt(false);
+    for id in [319, 271, 218] {
+        let mesh = process(&frame, id, &voids).expect("dental host must mesh");
+        let stats = edge_stats(&mesh);
+        assert_eq!(
+            (stats.open, stats.strict),
+            (0, 0),
+            "host #{id} must remain closed"
+        );
+    }
+}
+
+#[cfg(not(any(feature = "csg_topology_gate", feature = "csg_manifold_gate")))]
+#[test]
+fn issue_4627_candidate_failures_preserve_prior_analytic_cuts() {
+    let mut failures = Vec::new();
+    let _serial = CENSUS_SWEEP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _reset = AltTriangulatorReset;
+    for (rel, expected) in [
+        (
+            "various/rvt01.ifc",
+            &[
+                // #5362: 33 open / 159 tris until the #635 fallback stopped
+                // box-cutting an opening the kernel found disjoint; enclosed
+                // volume moved toward IfcOpenShell (0.0189 -> 0.0202 m3, ref 0.0211).
+                (11477, 9, 9, 152, 18),
+                // #5410: 19 open / 139 tris until a plan-rotated host whose
+                // cutters author no depth took the wall-local frame; now closed
+                // (enclosed volume 0.01972 -> 0.01967 m3, IfcOpenShell 0.01752).
+                (11690, 0, 0, 144, 0),
+                (31156, 0, 0, 208, 0),
+                (17553, 0, 2, 214, 0),
+                (17615, 0, 0, 252, 0),
+                (25914, 28, 31, 84, 28),
+                (26610, 0, 0, 84, 0),
+                // rvt01 wall hosts the #3977 local-frame selector must leave
+                // closed (pinned after 0e8a42175 tore #10191 open via a -Z cutter depth).
+                (10191, 0, 0, 172, 0),
+                (26681, 35, 35, 191, 33),
+            ][..],
+        ),
+        (
+            "ara3d/ISSUE_129_N1540_17_EXE_MOD_448200_02_09_11SMC_IGC_V17.ifc",
+            &[
+                (247051, 0, 0, 60, 0),
+                (141060, 0, 0, 70, 0),
+                (145756, 0, 0, 38, 0),
+            ][..],
+        ),
+    ] {
+        let path = crate_dir().join("../../tests/models").join(rel);
+        if !oracle_fixture_present(&path) {
+            eprintln!("Skipping #4627 candidate oracle for {rel}: run pnpm fixtures");
+            continue;
+        }
+        let content = std::fs::read_to_string(&path).expect("read candidate fixture");
+        let voids = void_index(&content);
+        let frame = ModelFrame::new(&content);
+        #[cfg(feature = "triangulation-alt")]
+        let triangulators = &[false, true][..];
+        #[cfg(not(feature = "triangulation-alt"))]
+        let triangulators = &[false][..];
+        for &alt in triangulators {
+            set_alt(alt);
+            for &(id, open, strict, tris, alt_open) in expected {
+                let mesh = process(&frame, id, &voids).expect("candidate host must mesh");
+                let stats = edge_stats(&mesh);
+                if if alt {
+                    stats.open != alt_open
+                } else {
+                    (stats.open, stats.strict, mesh.triangle_count()) != (open, strict, tris)
+                } {
+                    failures.push((id, alt, stats.open, stats.strict, mesh.triangle_count()));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "regressed hosts: {failures:?}");
+}
+
 /// A unit cube as 8 welded vertices and 12 consistently wound triangles.
 ///
 /// Every one of its 18 undirected edges is used exactly once forward and once
@@ -1115,6 +1583,58 @@ fn unit_cube() -> Mesh {
         3, 0, 4, 3, 4, 7, // x = 0
     ];
     m
+}
+
+/// `n` disjoint doubled sheets: one triangle and its reverse, side by side.
+///
+/// The shape the volume column cannot read (#3422). The signed balance
+/// certifies it watertight — every undirected edge is used once forward and
+/// once reverse — and the divergence sum over a surface that encloses nothing
+/// is exactly 0, so a census row for it carries `open = 0`, `strict = 0` and
+/// `vol = Some(0)`. Real hosts of this shape exist: a wall modelled as a
+/// zero-thickness face, a duplicated shell that cancels itself.
+fn doubled_sheets(n: usize) -> Mesh {
+    let mut m = Mesh::default();
+    for i in 0..n {
+        let (b, x) = ((m.positions.len() / 3) as u32, i as f32 * 4.0);
+        m.positions.extend_from_slice(&[x, 0.0, 0.0, x + 1.0, 0.0, 0.0, x, 1.0, 0.0]);
+        m.indices.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 1]);
+    }
+    m
+}
+
+/// #3422, the zero-volume hole in the volume column's own routing. A host that
+/// loses HALF its sheets is watertight on both sides and reads 0 cm³ on both,
+/// so "the enclosed volume did not change" is true and says nothing. Routing
+/// the triangle drop on it filed a vanished component as a friendly
+/// re-tessellation.
+///
+/// Measured through `row_from_mesh`, the sweep's own row builder, so the zero
+/// is the reading the sweep would take and not a synthetic one.
+#[test]
+fn a_watertight_host_reading_zero_volume_is_not_re_tessellated_when_it_shrinks() {
+    let swept: BTreeSet<String> = ["sheets.ifc".to_string()].into_iter().collect();
+    let row = |m: &Mesh| {
+        let s = edge_stats(m);
+        row_from_mesh("sheets.ifc", 1, "Brep".into(), m, &s, Some(s.open), PreVoid::NotTaken)
+    };
+    let (before, after) = (row(&doubled_sheets(2)), row(&doubled_sheets(1)));
+
+    // The premise: watertight by both rules on both sides, and zero volume on
+    // both, with half the mesh gone.
+    for (what, r) in [("before", &before), ("after", &after)] {
+        assert_eq!(r.open, 0, "{what}: the signed balance certifies a doubled sheet");
+        assert_eq!(r.strict, 0, "{what}: and so does the strict rule, on disjoint sheets");
+        assert_eq!(r.vol, Some(0), "{what}: a surface enclosing nothing reads 0 cm³");
+    }
+    assert_eq!((before.tris, after.tris), (4, 2), "half the mesh must be gone");
+
+    let d = census_golden::diff(&[before], &[after], &swept);
+    assert_eq!(d.regressed.len(), 1, "a vanished sheet is geometry lost");
+    assert!(d.retessellated.is_empty(), "not a re-tessellation: there is no volume to be unchanged");
+    assert!(d.volume_moved.is_empty(), "and 0 -> 0 is not a move either");
+    let reasons = d.regressed[0].reasons.join("; ");
+    assert!(reasons.contains("triangles 4 -> 2 (geometry lost)"), "{reasons}");
 }
 
 /// [`unit_cube`] with one existing face triangle re-emitted AND its reverse.
@@ -1190,92 +1710,467 @@ fn a_snap_collapsed_triangle_is_skipped_by_both_readings() {
     assert_eq!(s.strict, 0, "nor any strict violation, or every far-field host would gain some");
 }
 
+/// One 2.0 x 0.1 x 3.0 m panel with one rectangular opening through it, twice:
+/// wall #50 with the opening as authored (0.5 x 1.0 m), wall #150 with the
+/// SAME opening scaled by `scale` in its own plane, centre unmoved. That is
+/// the #3219 shape as a fixture: an opening cut larger than authored, on a
+/// host that is watertight either way.
+fn over_cut_fixture(scale: f64) -> String {
+    let (w, h) = (0.5 * scale, 1.0 * scale);
+    let z0 = 1.5 - h / 2.0;
+    format!(
+        r##"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('#3422 over-cut census probe'),'2;1');
+FILE_NAME('overcut.ifc','2026-09-03T00:00:00',(''),(''),'ifc-lite','ifc-lite','');
+FILE_SCHEMA(('IFC2X3'));
+ENDSEC;
+DATA;
+#2=IFCOWNERHISTORY($,$,$,.NOCHANGE.,$,$,$,0);
+#5=IFCCARTESIANPOINT((0.,0.,0.));
+#6=IFCDIRECTION((0.,0.,1.));
+#7=IFCDIRECTION((1.,0.,0.));
+#8=IFCAXIS2PLACEMENT3D(#5,#6,#7);
+#10=IFCUNITASSIGNMENT((#11));
+#11=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#20=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-5,#8,$);
+#1=IFCPROJECT('0proj0000000000000001',#2,'P',$,$,$,$,(#20),#10);
+#30=IFCLOCALPLACEMENT($,#8);
+#40=IFCCARTESIANPOINT((0.,0.));
+#41=IFCDIRECTION((1.,0.));
+#42=IFCAXIS2PLACEMENT2D(#40,#41);
+/* --- wall #50: the panel, opening as authored --- */
+#43=IFCRECTANGLEPROFILEDEF(.AREA.,'',#42,2.,0.1);
+#44=IFCEXTRUDEDAREASOLID(#43,#8,#6,3.);
+#45=IFCSHAPEREPRESENTATION(#20,'Body','SweptSolid',(#44));
+#46=IFCPRODUCTDEFINITIONSHAPE($,$,(#45));
+#50=IFCWALLSTANDARDCASE('authoredwall00000001',#2,'wall',$,$,#30,#46,'t1');
+/* opening 0.5 wide x 0.3 deep, z from 1.0 to 2.0: centre (0, 0, 1.5) */
+#60=IFCCARTESIANPOINT((0.,0.,1.));
+#61=IFCAXIS2PLACEMENT3D(#60,#6,#7);
+#62=IFCRECTANGLEPROFILEDEF(.AREA.,'',#42,0.5,0.3);
+#63=IFCEXTRUDEDAREASOLID(#62,#61,#6,1.);
+#64=IFCSHAPEREPRESENTATION(#20,'Body','SweptSolid',(#63));
+#65=IFCPRODUCTDEFINITIONSHAPE($,$,(#64));
+#66=IFCOPENINGELEMENT('authoredopening00001',#2,'op',$,$,#30,#65,'t2');
+#70=IFCRELVOIDSELEMENT('authoredvoid0000001',#2,$,$,#50,#66);
+/* --- wall #150: the same panel, opening scaled about its centre --- */
+#143=IFCRECTANGLEPROFILEDEF(.AREA.,'',#42,2.,0.1);
+#144=IFCEXTRUDEDAREASOLID(#143,#8,#6,3.);
+#145=IFCSHAPEREPRESENTATION(#20,'Body','SweptSolid',(#144));
+#146=IFCPRODUCTDEFINITIONSHAPE($,$,(#145));
+#150=IFCWALLSTANDARDCASE('overcutwall000000001',#2,'wall',$,$,#30,#146,'t3');
+#160=IFCCARTESIANPOINT((0.,0.,{z0:?}));
+#161=IFCAXIS2PLACEMENT3D(#160,#6,#7);
+#162=IFCRECTANGLEPROFILEDEF(.AREA.,'',#42,{w:?},0.3);
+#163=IFCEXTRUDEDAREASOLID(#162,#161,#6,{h:?});
+#164=IFCSHAPEREPRESENTATION(#20,'Body','SweptSolid',(#163));
+#165=IFCPRODUCTDEFINITIONSHAPE($,$,(#164));
+#166=IFCOPENINGELEMENT('overcutopening000001',#2,'op',$,$,#30,#165,'t4');
+#170=IFCRELVOIDSELEMENT('overcutvoid00000001',#2,$,$,#150,#166);
+ENDSEC;
+END-ISO-10303-21;"##
+    )
+}
+
+/// #3422. The census row vocabulary before this change (`open`, `strict`,
+/// `tris`, `coll`, `far`, `alt`, `pre`) is COUNTS and FLAGS over topology, and
+/// the golden is a ceiling: a host may get better for free. An opening cut
+/// larger than authored on a watertight host, the #3219 shape, reads one of
+/// two ways under that vocabulary, and both are green:
+///
+/// - at 1.4x every count holds and the pair is an IDENTICAL row;
+/// - at 1.6x the cutter emits MORE triangles, and a grown `tris` files under
+///   `improved`, which requires no bless.
+///
+/// Measured on the pipeline rather than on synthetic rows: both walls go
+/// through the `process` / `edge_stats` / `max_abs_coord` path the sweep uses,
+/// and the two rows are then diffed as golden and run. Only the enclosed
+/// volume separates them, and only the volume column makes the pair require a
+/// bless.
+///
+/// Runs in the default `cargo test`: it needs no fixture and no alternate
+/// triangulator.
+#[test]
+fn an_over_cut_on_a_watertight_host_requires_a_bless() {
+    let swept: BTreeSet<String> = ["overcut.ifc".to_string()].into_iter().collect();
+
+    for (scale, tris_grow) in [(1.4, false), (1.6, true)] {
+        let ifc = over_cut_fixture(scale);
+        let voids = void_index(&ifc);
+        let frame = ModelFrame::new(&ifc);
+        let authored = process(&frame, 50, &voids).expect("authored wall meshes");
+        let over_cut = process(&frame, 150, &voids).expect("over-cut wall meshes");
+
+        let (a, b) = (edge_stats(&authored), edge_stats(&over_cut));
+        // The rows exactly as the sweep records a host, through the same
+        // builder, so this test measures the sweep's own row and not a copy.
+        let row = |mesh: &Mesh, s: &EdgeStats| {
+            row_from_mesh("overcut.ifc", 1, "SweptSolid".into(), mesh, s, Some(s.open), PreVoid::NotTaken)
+        };
+        let (wired_a, wired_b) = (row(&authored, &a), row(&over_cut, &b));
+        // Both must be WATERTIGHT, or this probes the torn-host rules instead.
+        assert_eq!(wired_a.open, 0, "{scale}x: authored wall must be watertight");
+        assert_eq!(wired_b.open, 0, "{scale}x: over-cut wall must be watertight");
+        assert_eq!(wired_a.strict, wired_b.strict, "{scale}x: strict");
+        assert_eq!(wired_a.collapsed, wired_b.collapsed, "{scale}x: collapsed");
+        assert_eq!(wired_a.far, wired_b.far, "{scale}x: far");
+        // The one count that CAN move, pinned per scale so the test says which
+        // green reading it is exercising. If either arm flips, the fixture has
+        // stopped demonstrating that reading and the test must say so rather
+        // than pass on the other one.
+        let (ta, tb) = (wired_a.tris, wired_b.tris);
+        if tris_grow {
+            assert!(tb > ta, "{scale}x: expected MORE triangles, got {ta} -> {tb}");
+        } else {
+            assert_eq!(ta, tb, "{scale}x: expected the same triangle count");
+        }
+
+        // The volume is what differs. Panel 2.0 x 0.1 x 3.0 = 0.6 m³, less the
+        // opening 0.5 x 0.1 x 1.0 = 0.05 m³ authored and 0.05 * scale² over-cut.
+        // Read to within the primitive's documented quantization floor —
+        // `mesh_to_tris` snaps every coordinate to 1/65536 m, so the reading
+        // drifts by up to surface_area * SNAP_GRID, about 14 m² * 15.3 µm =
+        // 210 cm³ here — never to the exact figure, which the 0.05 m faces
+        // (not grid-representable) would miss by a few tens of cm³.
+        const SNAP_NOISE_CM3: i64 = 250;
+        let (va, vb) = (
+            wired_a.vol.expect("watertight, so the sweep takes the reading"),
+            wired_b.vol.expect("watertight, so the sweep takes the reading"),
+        );
+        assert_eq!(va.signum(), vb.signum(), "{scale}x: both walls wound the same way");
+        assert!(
+            (va.abs() - 550_000).abs() <= SNAP_NOISE_CM3,
+            "{scale}x: authored 0.55 m³, read {va} cm³"
+        );
+        let want_drop = (50_000.0 * (scale * scale - 1.0)) as i64;
+        let drop = va.abs() - vb.abs();
+        assert!(
+            (drop - want_drop).abs() <= SNAP_NOISE_CM3,
+            "{scale}x: over-cut removes {want_drop} cm³ more, read {drop}"
+        );
+
+        // The pre-#3422 census: the over-cut requires no bless either way.
+        let blind = census_golden::diff(
+            &[HostRow { vol: None, ..wired_a.clone() }],
+            &[HostRow { vol: None, ..wired_b.clone() }],
+            &swept,
+        );
+        assert!(
+            !blind.requires_bless(),
+            "{scale}x: without a volume column the census sees nothing to bless"
+        );
+        if tris_grow {
+            assert_eq!(blind.improved.len(), 1, "{scale}x: and calls the over-cut an improvement");
+            let reasons = blind.improved[0].reasons.join("; ");
+            assert!(reasons.contains("(improved)"), "{reasons}");
+        } else {
+            assert!(blind.improved.is_empty(), "{scale}x: the over-cut is an identical row");
+        }
+
+        // With the column, the pair is a volume move and the golden must absorb it.
+        let seen = census_golden::diff(&[wired_a], &[wired_b], &swept);
+        assert!(
+            seen.requires_bless(),
+            "{scale}x: an opening cut larger than authored left the census green"
+        );
+        assert_eq!(seen.volume_moved.len(), 1, "{scale}x: the over-cut files as a volume move");
+        assert!(seen.regressed.is_empty() && seen.improved.is_empty(), "{scale}x");
+        let reasons = seen.volume_moved[0].reasons.join("; ");
+        assert!(reasons.contains(&format!("enclosed volume {va} -> {vb} cm³")), "{reasons}");
+    }
+}
+
+/// What ONE vertex rounding the other way costs the reading (#3422), measured
+/// rather than argued. `census_golden::volume_tolerance_cm3`'s doc invokes this
+/// difference to justify a tolerance, and the number it originally quoted ("a
+/// real cm³ or two") is an order of magnitude under what the shape actually
+/// gives, so the figure is pinned here instead of asserted there.
+///
+/// The shift from moving one vertex by one snap step is the incident triangle
+/// area times the step over three: it grows with the FACE, not with the host's
+/// volume, which is why the tolerance's 1e-6 relative term does not track it.
+///
+/// The second arm is the part that makes the first one meaningful: shifting
+/// EVERY vertex by the same step moves the reading by nothing, because a
+/// grid-aligned translation is exact. Only independent re-rounding costs
+/// anything, which is exactly the platform-difference case.
+#[test]
+fn one_vertex_rounding_the_other_way_moves_the_reading_by_more_than_the_tolerance() {
+    const STEP: f32 = 1.0 / 65536.0;
+    let ifc = over_cut_fixture(1.4);
+    let voids = void_index(&ifc);
+    let mesh = process(&ModelFrame::new(&ifc), 50, &voids).expect("authored wall meshes");
+    let base = volume_cm3(&mesh);
+
+    let mut worst = 0i64;
+    for v in 0..mesh.positions.len() / 3 {
+        for axis in 0..3 {
+            let mut m = mesh.clone();
+            m.positions[v * 3 + axis] += STEP;
+            worst = worst.max((volume_cm3(&m) - base).abs());
+        }
+    }
+    // The measurement, bounded on BOTH sides. Too small and the claim above is
+    // wrong in the other direction; too large and the panel has changed shape.
+    assert!(
+        (4..=40).contains(&worst),
+        "one vertex, one snap step, on a {base} cm³ panel: expected a shift of \
+         a few cm³, got {worst}"
+    );
+    // The point of the number: it is well OVER the tolerance the column diffs
+    // at, so this really is a way for the census lane to red with no defect.
+    assert!(
+        worst > census_golden::volume_tolerance_cm3(base),
+        "a single flipped vertex ({worst} cm³) must exceed the tolerance ({}) for the \
+         doc's correction to be the right one",
+        census_golden::volume_tolerance_cm3(base)
+    );
+
+    // A uniform shift is a translation, and the grid is closed under it.
+    let mut all = mesh.clone();
+    for x in all.positions.iter_mut() {
+        *x += STEP;
+    }
+    assert_eq!(volume_cm3(&all), base, "a grid-aligned translation must be exact");
+}
+
 /* -------------------------------------------------------------------- *
  * The heavy lane (#3434). See the module doc's "heavy lane" section.   *
  * -------------------------------------------------------------------- */
 
-/// Per-host golden for the heavy lane's CLEAN fixture only — ISSUE_053. Never
-/// carries ISSUE_068: see the module doc's "heavy lane" section for why.
+/// Per-host golden for BOTH heavy fixtures, diffed through the same
+/// [`census_golden`] machinery as the main corpus.
+///
+/// One file rather than one per fixture: [`census_golden::diff`] keys rows on
+/// `(model, id)` and scopes its coverage-loss check to the models a run
+/// actually swept, so a single-fixture run reads and re-writes only its own
+/// rows. Two files would be two copies of the same header and the same bless
+/// path for no separation the keys do not already give.
 const HEAVY_GOLDEN_PATH: &str = "tests/manifests/watertightness_census_heavy.tsv";
 
+/// Gates both fixtures in one pass — what
+/// `.github/workflows/geometry-census-heavy.yml` runs, spelled here so the
+/// failure messages hand back the command that reproduces them.
+const HEAVY_LANE_CMD: &str = "cargo test -p ifc-lite-geometry --features triangulation-alt \
+                              --test triangulation_invariance \
+                              -- --ignored --nocapture --test-threads=1 heavy_fixture";
+
+/// Blesses BOTH fixtures in one pass.
+///
+/// `--test-threads=1` is belt and braces over [`CENSUS_SWEEP_LOCK`], which is
+/// what actually makes running both safe. It still earns its place: it keeps
+/// the two fixtures (223 MiB of IFC, plus their entity indices) from being
+/// resident at once, and it makes the serialization visible in the command
+/// rather than only in the source.
 const HEAVY_BLESS_CMD: &str = "IFCLITE_CENSUS_BLESS=1 cargo test -p ifc-lite-geometry \
                                --features triangulation-alt --test triangulation_invariance \
-                               -- --ignored heavy_fixture_issue_053_is_watertight";
+                               -- --ignored --nocapture --test-threads=1 heavy_fixture";
 
 const ISSUE_053_MODEL: &str = "ara3d/ISSUE_053_20181220Holter_Tower_10.ifc";
 const ISSUE_068_MODEL: &str = "ara3d/ISSUE_068_ARK_NUS_skolebygg.ifc";
 
-/// #3434. ISSUE_053 (Holter Tower, 169 MB) is the exact fixture AGENTS.md's
-/// perf section names as "where every shipped regression has lived", and until
-/// this test it was invisible to the census: `discover_models` excludes it by
-/// size before ever opening the file. Measured clean — 289/289 void hosts
-/// watertight — so unlike ISSUE_068 below it gets a real per-host golden,
-/// [`HEAVY_GOLDEN_PATH`], diffed through the exact same [`census_golden`]
-/// machinery as the main corpus: a genuine, gated coverage win rather than a
-/// bare smoke check.
+/// #3435's live population: ISSUE_068 void hosts with `open > 0`.
 ///
-/// `#[ignore]`d: 169 MB is too expensive for the default `cargo test`. Run:
+/// An EQUALITY, and deliberately so in both directions. A ceiling would let the
+/// count fall without anyone tightening it — the cost [`census_golden::Diff`]
+/// documents on its `improved` bucket — and here a fall is the news, because
+/// #3435 is meant to reach zero and take this constant, and eventually the
+/// ISSUE_068 lane's special case, with it.
 ///
-///   cargo test -p ifc-lite-geometry --features triangulation-alt \
-///     --test triangulation_invariance -- --ignored --nocapture \
-///     heavy_fixture_issue_053_is_watertight
+/// Checked against the checked-in golden with no fixture and no sweep by
+/// [`the_heavy_golden_pins_the_known_3435_tear_population`], so the value
+/// cannot drift from the file it describes.
+// #3925: independently remeasured on pre-#3912 code with the loader frame.
+// #4698: 26 -> 25. #893133 closed (open 25 -> 0) once consolidation stopped
+// dropping its 2 to 6 mm wedge regions and falling back to the raw kernel mesh.
+// #5127: 25 -> 23. #640479 (open 4 -> 0) and #1401653 (3 -> 0) closed once
+// #5033 judged the conform candidate with its collinear slivers removed. The
+// same change first tore #1401204 (0 -> 6) through the stray-shard sweep,
+// which is the fix #5127 carries; that host is back on its blessed row.
+// #6379: 23 -> 19. #426780 (open 14 -> 0) closed with #5411 (no AABB fallback
+// on a kernel-disjoint opening). #144568 (26 -> 0), #891553 (10 -> 0) and
+// #892717 (27 -> 0; #5361 had already moved its no-void pass 29 -> 22) closed
+// with #5943's strictly-closed retry on quantum-snapped wall-frame operands.
+const ISSUE_068_KNOWN_TORN_HOSTS: usize = 19;
+
+/// Coverage floors, one per heavy fixture, bounding BOTH the checked-in golden
+/// and every sweep that gates or blesses against it. [`MIN_VOID_HOSTS`]'s job,
+/// for these two fixtures.
 ///
-/// Bless only after confirming a change is a genuine, reviewed fix — same rule
-/// as the main golden:
+/// Set with the same deliberate SLACK as `MIN_VOID_HOSTS` (1100 against a
+/// population of 1170), at ~94% of the measured 289 and 363. Pinning them at
+/// the exact row count would make this floor fire on a single host that stopped
+/// meshing — and it sits ABOVE the golden diff, so it would pre-empt the
+/// `COVERAGE LOSS` assert, which names every lost host, with a blunt "the
+/// fixture is truncated". The floor exists for the catastrophic case, where the
+/// tree is half-fetched and every ceiling below would be vacuous; the per-host
+/// diff is the right instrument for anything smaller.
+const ISSUE_053_MIN_HOSTS: usize = 271;
+const ISSUE_068_MIN_HOSTS: usize = 341;
+
+/// Serializes EVERY caller of [`sweep`] in this binary.
 ///
-///   IFCLITE_CENSUS_BLESS=1 cargo test -p ifc-lite-geometry \
-///     --features triangulation-alt --test triangulation_invariance \
-///     -- --ignored heavy_fixture_issue_053_is_watertight
+/// [`set_alt`] toggles a PROCESS-GLOBAL flag, so two sweeps running at once
+/// would read one sweep's edge counts under the other's triangulator, and the
+/// two heavy lanes additionally read-modify-write the one
+/// [`HEAVY_GOLDEN_PATH`] on a bless.
+///
+/// Held by all three sweeping tests, not just the two heavy ones. Being a
+/// single `#[test]` protected the main census from ITSELF, never from a
+/// sibling, and #3434 added two siblings: `--include-ignored` without
+/// `--test-threads=1` runs the main census concurrently with both heavy lanes
+/// and races the flag. The workflow passes `--test-threads=1`, so this closes a
+/// hazard for a developer running the file by hand rather than one CI can hit —
+/// which is exactly the kind that gets found late.
+///
+/// Poisoning is absorbed deliberately: a panicking sweep is this file's normal
+/// failure mode, and it must not turn a sibling's verdict into a lock-poison
+/// panic that hides what that sibling actually measured.
+static CENSUS_SWEEP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// #5012: carrying #3914's plane tags through an intermediate batch
+/// difference made consolidation merge buckets that a later opening cut still
+/// needed separately. That changed this wall from 346 watertight triangles to
+/// 252 triangles with 40 unmatched edges.
 #[test]
-#[ignore = "manual heavy-fixture lane (#3434): ISSUE_053 is 169 MB, excluded from the default sweep by MAX_FIXTURE_BYTES"]
-fn heavy_fixture_issue_053_is_watertight() {
-    if cfg!(not(feature = "triangulation-alt")) {
+#[ignore = "focused ISSUE_068 fixture regression (#5012); fetch with `pnpm fixtures`"]
+fn issue_5012_intermediate_difference_keeps_host_53374_watertight() {
+    let _serial = CENSUS_SWEEP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = crate_dir()
+        .join("..")
+        .join("..")
+        .join("tests/models")
+        .join(ISSUE_068_MODEL);
+    if !path.is_file() {
         eprintln!(
-            "SKIPPED: rerun with --features triangulation-alt to enable the \
-             differential oracle"
+            "skipping #5012 regression: {ISSUE_068_MODEL} is absent; fetch it with `pnpm fixtures`"
         );
         return;
     }
 
-    let models: Vec<(String, PathBuf)> =
-        discover_heavy_models().into_iter().filter(|(rel, _)| rel == ISSUE_053_MODEL).collect();
+    let content = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    let frame = ModelFrame::new(&content);
+    let voids = void_index(&content);
+    let mesh = process(&frame, 53_374, &voids).expect("ISSUE_068 host #53374 must process");
+    let stats = edge_stats(&mesh);
+
+    assert_eq!(mesh.triangle_count(), 346, "#5012 must not discard wall geometry");
+    assert_eq!(stats.open, 0, "#5012 wall must have no unmatched boundary edges");
+    assert_eq!(stats.strict, 0, "#5012 wall must satisfy the strict manifold rule");
+}
+
+/// Sweep one heavy fixture, report what it measured, and gate it against
+/// [`HEAVY_GOLDEN_PATH`].
+///
+/// Returns the run's totals, or `None` when `IFCLITE_CENSUS_BLESS` rewrote the
+/// golden instead of gating against it. An `Option` rather than totals plus a
+/// flag so that there is no path on which a caller can reach an assertion
+/// holding numbers from a run that measured nothing.
+fn run_heavy_lane(model: &str, min_hosts: usize) -> Option<census_golden::Totals> {
+    let _serial = CENSUS_SWEEP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    // PANICS without the feature, where the main census SKIPS and passes, and
+    // the difference is the same one that governs a missing fixture below.
+    // The main census runs inside `cargo test --workspace`, so it must not red
+    // a build that never asked for the oracle. These two are `#[ignore]`d and
+    // only ever run because something named them, and without the feature
+    // `set_alt` is a no-op: the `alt` column stops being a second opinion and
+    // silently becomes a copy of `open`. Skipping quietly there is a heavy
+    // lane reporting success for a comparison it did not make — and a workflow
+    // that lost the flag in an edit would go green, not red.
+    //
+    // Spelled as an `if` rather than `assert!(cfg!(...), ..)` because the
+    // latter is a constant assertion and `clippy::assertions_on_constants`
+    // (a `-D warnings` gate here) rejects it.
+    if cfg!(not(feature = "triangulation-alt")) {
+        panic!("the heavy lane needs the differential oracle. Run:\n  {HEAVY_LANE_CMD}");
+    }
+
+    // Named directly rather than filtered out of `discover_models`, which
+    // excludes both of these by `MAX_FIXTURE_BYTES` before opening anything —
+    // reaching an oversized fixture is the entire point of this lane.
+    //
+    // PANICS on an absent fixture, the opposite of what the rest of this
+    // repo's fixture-gated tests do, and that is the point. They skip because
+    // they run inside `cargo test --workspace`, where an absent corpus must
+    // not red the build. This lane is `#[ignore]`d and only ever runs because
+    // something asked for it BY NAME, so a silent pass here is a heavy lane
+    // reporting success over a file it never opened.
+    let path = crate_dir().join("..").join("..").join("tests/models").join(model);
     assert!(
-        !models.is_empty(),
-        "{ISSUE_053_MODEL} is not on disk under tests/models/ — fetch it with \
-         scripts/fixtures/fetch-fixtures.mjs before running this lane"
+        path.is_file(),
+        "{model} is not on disk under tests/models/ — fetch it with `pnpm fixtures` \
+         before running this lane"
     );
 
-    let (rows, swept_models) = sweep(&models);
+    let (rows, swept_models) = sweep(&[(model.to_string(), path)]);
     let run = totals(&rows);
 
-    println!("\n=== heavy lane: {ISSUE_053_MODEL} ===");
+    println!("\n=== heavy lane: {model} ===");
     println!("void hosts    : {}", run.hosts);
     println!("torn hosts    : {}", run.torn);
     println!("unmatched edges (signed) : {}", run.open_edges);
     println!("strict-rule edges        : {}", run.strict_edges);
 
-    assert!(
-        run.hosts > 0,
-        "swept {ISSUE_053_MODEL} but found no void hosts — the fixture loaded \
-         but is empty of the class this lane exists to measure, which is itself \
-         a sign something is wrong"
-    );
+    let mut torn: Vec<&HostRow> = rows.iter().filter(|r| r.open > 0).collect();
+    torn.sort_by_key(|r| std::cmp::Reverse(r.open));
+    if !torn.is_empty() {
+        println!("\n  torn hosts (worst first):");
+        for r in torn.iter().take(15) {
+            println!("  TORN  {}", fmt_host(r));
+        }
+    }
 
-    let golden_path = crate_dir().join(HEAVY_GOLDEN_PATH);
-    let golden_text = std::fs::read_to_string(&golden_path).unwrap_or_default();
-    let golden = census_golden::parse(&golden_text)
-        .unwrap_or_else(|e| panic!("{} is unreadable: {e}", golden_path.display()));
+    // Written BEFORE every assertion, for the reason [`RUN_REPORT_PATH`] is:
+    // the run that DISAGREES with the golden is exactly the run whose rows are
+    // wanted, and a report written after the gate is never written on it.
+    // Best-effort — a read-only `target/` must not red a passing lane.
+    //
+    // One report path PER FIXTURE, unlike the main census's single
+    // `RUN_REPORT_PATH`: the workflow runs both tests out of one binary, so a
+    // shared path would leave whichever finished last as the only artifact and
+    // the other run would look like it had never happened.
+    let stem = model.rsplit('/').next().unwrap_or(model).trim_end_matches(".ifc");
+    let report_path =
+        crate_dir().join(format!("../../target/watertightness_census.heavy.{stem}.tsv"));
+    if let Some(dir) = report_path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    match std::fs::write(&report_path, census_golden::render(&rows)) {
+        Ok(()) => println!("\nthis run's rows: {}", report_path.display()),
+        Err(e) => println!("\ncould not write {}: {e}", report_path.display()),
+    }
+
+    // FLOOR, and it sits above the bless path for the same reason the main
+    // census's does: an under-populated run must never be able to write a
+    // truncated golden. `> 0` would not have done that job — a run that meshed
+    // one host of 363 satisfies it, and the bless path below returns before
+    // every check, so it would write a one-row golden and delete 362 ceilings.
+    // This is `MIN_VOID_HOSTS`, per fixture.
+    assert!(
+        run.hosts >= min_hosts,
+        "swept {model} and found {} void host(s), below the floor of {min_hosts}. Either \
+         the fixture is truncated or the pipeline stopped meshing a class of host; \
+         either way the ceilings in {HEAVY_GOLDEN_PATH} would be vacuous against this \
+         run, so it must not gate and must not bless",
+        run.hosts
+    );
 
     let bless = census_golden::bless_mode(
         std::env::var_os(BLESS_ENV).is_some(),
         std::env::var_os("CI").is_some_and(|v| !v.is_empty() && v != "0" && v != "false"),
     )
     .unwrap_or_else(|e| panic!("{e}"));
+    let golden_path = crate_dir().join(HEAVY_GOLDEN_PATH);
+    let golden = read_golden(&golden_path, bless);
 
     if bless {
-        // Preserve rows of heavy models this run did not sweep (none today,
-        // since the golden only ever carries ISSUE_053, but the same rule as
-        // the main golden's bless path applies if that ever changes).
+        // Keeping the rows of models this run did not sweep is what lets the
+        // two fixtures share one golden and be blessed one at a time.
+        // `CENSUS_SWEEP_LOCK`, held for all of this function, is what makes the
+        // read-modify-write safe when both lanes bless in one invocation.
         let mut next: Vec<HostRow> =
             golden.iter().filter(|r| !swept_models.contains(&r.model)).cloned().collect();
         let kept = next.len();
@@ -1289,12 +2184,16 @@ fn heavy_fixture_issue_053_is_watertight() {
             golden_path.display(),
             rows.len()
         );
-        return;
+        return None;
     }
 
+    // Scoped to THIS model, not `!golden.is_empty()`: the two fixtures share
+    // one file, so a golden that had lost every ISSUE_068 row would still be
+    // non-empty and would gate that fixture as 363 `added` rows — red, but
+    // describing the wrong event.
     assert!(
-        !golden.is_empty(),
-        "{} is missing or empty. Generate it with:\n  {HEAVY_BLESS_CMD}",
+        golden.iter().any(|r| r.model == model),
+        "{} carries no rows for {model}. Generate them with:\n  {HEAVY_BLESS_CMD}",
         golden_path.display()
     );
 
@@ -1305,127 +2204,234 @@ fn heavy_fixture_issue_053_is_watertight() {
     println!("added (newly meshing): {}", diff.added.len());
     println!("reclassified: {}", diff.changed.len());
     println!("retessellated: {}", diff.retessellated.len());
+    // Printed under `retessellated` exactly as the main census does: that
+    // bucket can read 0 on the very run it exists for, when a reclassification
+    // outranks it, and this tally is the only thing that says so.
+    println!("  of which shrank while healing: {}", diff.shrank_while_healing);
+    println!("volume moved: {}", diff.volume_moved.len());
     println!("improved  : {}", diff.improved.len());
-    for d in &diff.improved {
-        println!("  IMPROVED  {}", fmt_delta(d));
-    }
-    for d in &diff.regressed {
-        println!("  REGRESSED  {}", fmt_delta(d));
-    }
-    for r in &diff.missing {
-        println!("  COVERAGE LOSS  {}", fmt_host(r));
-    }
-    for d in &diff.retessellated {
-        println!("  RETESSELLATED  {}", fmt_delta(d));
-    }
-    for r in &diff.added {
-        println!("  ADDED  {}", fmt_host(r));
-    }
-    for d in &diff.changed {
-        println!("  RECLASSIFIED  {}", fmt_delta(d));
-    }
+    print_buckets(&diff);
 
     assert!(
         diff.regressed.is_empty(),
-        "{} host(s) in {ISSUE_053_MODEL} REGRESSED against {HEAVY_GOLDEN_PATH}:\n{}",
+        "{} host(s) in {model} REGRESSED against {HEAVY_GOLDEN_PATH}:\n{}",
         diff.regressed.len(),
         fmt_deltas(&diff.regressed)
     );
     assert!(
         diff.missing.is_empty(),
-        "COVERAGE LOSS in {ISSUE_053_MODEL}: {} host(s) in the golden produced no \
-         geometry in this run:\n{}",
+        "COVERAGE LOSS in {model}: {} host(s) in the golden produced no geometry in \
+         this run:\n{}",
         diff.missing.len(),
         diff.missing.iter().map(fmt_host).collect::<Vec<_>>().join("\n")
     );
     assert!(
         !diff.requires_bless(),
-        "the diff against {HEAVY_GOLDEN_PATH} requires a bless (added, reclassified, or \
-         re-tessellated rows present) — review the buckets printed above, then:\n  {HEAVY_BLESS_CMD}"
+        "the diff against {HEAVY_GOLDEN_PATH} requires a bless — review the buckets \
+         printed above, then:\n  {HEAVY_BLESS_CMD}"
     );
 
-    // The fixture measured clean when #3434 added this lane (289/289 void
-    // hosts watertight). Kept as an explicit assertion alongside the golden
-    // diff above: the diff's checks are all CEILINGS, so a golden whose `open`
-    // columns silently grew from 0 to some small number on every row would
-    // still pass them while this fixture stopped being the coverage win #3434
-    // added it for.
+    Some(run)
+}
+
+/// #3434. ISSUE_053 (Holter Tower, 169 MB) is the exact fixture AGENTS.md's
+/// perf section names as "where every shipped regression has lived", and until
+/// this lane it was invisible to the census: `discover_models` excludes it by
+/// size before ever opening the file. It measures clean, so on top of the
+/// per-host golden diff [`run_heavy_lane`] performs it also asserts the
+/// aggregate.
+///
+/// That aggregate is belt and braces, and worth stating as such rather than
+/// overselling. Every check the diff makes is a per-host CEILING, so a golden
+/// whose `open` columns had all been blessed up from 0 would satisfy it while
+/// this fixture had quietly stopped being the clean-corpus coverage win it was
+/// added for. [`the_heavy_golden_pins_the_known_3435_tear_population`] already
+/// rejects exactly that golden, on every PR — but it does NOT run inside this
+/// workflow, which invokes `--ignored heavy_fixture` and so selects only the
+/// two lanes. This line is what closes that gap for a runner that gates the
+/// sweep without ever having gated the file.
+#[test]
+#[ignore = "heavy-fixture lane (#3434), run by .github/workflows/geometry-census-heavy.yml: \
+            ISSUE_053 is 169 MB, excluded from the default sweep by MAX_FIXTURE_BYTES"]
+fn heavy_fixture_issue_053_is_watertight() {
+    let Some(run) = run_heavy_lane(ISSUE_053_MODEL, ISSUE_053_MIN_HOSTS) else {
+        return;
+    };
     assert_eq!(
         run.torn, 0,
-        "{ISSUE_053_MODEL} was clean (0 torn hosts) when #3434 measured it; now {} host(s) \
-         are torn. If this is a genuine, reviewed regression, bless it into \
-         {HEAVY_GOLDEN_PATH} like any other golden change; if not, it is the exact defect \
-         class #3434 exists to surface",
+        "{ISSUE_053_MODEL} is pinned clean (0 torn hosts); now {} host(s) are torn. If \
+         this is a genuine, reviewed regression, bless it into {HEAVY_GOLDEN_PATH} like \
+         any other golden change; if not, it is the exact defect class #3434 exists to \
+         surface",
         run.torn
     );
 }
 
-/// #3434 built this lane; the tear itself is #3435. ISSUE_068 (54 MB) is
-/// torn: 29 of 363 void hosts, 285 total open edges, deterministic across two
-/// independent runs. The worst single host is `IFCWALLSTANDARDCASE #43810`:
-/// 42 open edges across 38 `IfcRelVoidsElement` cuts against one swept solid —
-/// the "many sequential boolean cuts" shape AGENTS.md's perf section warns
-/// about for this fixture class. 27 of the 29 torn hosts are confirmed
-/// CSG-caused (a `pre`-void reading of watertight going to torn `post`-void),
-/// so this is a boolean-kernel bug to fix, not corpus noise to record.
+/// #3434 built this lane; the tear it found is #3435. ISSUE_068 (54 MB) carries
+/// a live, unfixed CSG defect: a population of void hosts that read watertight
+/// before their voids are applied and torn after, concentrated on hosts taking
+/// many sequential boolean cuts against one swept solid — the shape AGENTS.md's
+/// perf section warns about for this fixture class.
 ///
-/// Deliberately asserts the CORRECT end state (`torn == 0`), not today's
-/// count, and is expected to FAIL until #3435 is fixed — the same convention
-/// `wall_opening_cut_regression.rs` and `issue_3353_boolean_tear.rs` already
-/// use for a known, unfixed defect. This fixture is NOT in any golden: writing
-/// its 29 torn rows into a checked-in baseline would freeze a live bug as
-/// expected, passing output, which is the opposite of what #3434 is for. Once
-/// #3435 is fixed, remove `#[ignore]` here — and, if the fixture is then
-/// clean, fold ISSUE_068 into [`heavy_fixture_issue_053_is_watertight`]'s
-/// golden-backed pattern instead of leaving it as a bare assertion.
-///
-/// `#[ignore]`d for the same reason `heavy_fixture_issue_053_is_watertight` is:
-/// too expensive for the default `cargo test`. Run:
-///
-///   cargo test -p ifc-lite-geometry --features triangulation-alt \
-///     --test triangulation_invariance -- --ignored --nocapture \
-///     heavy_fixture_issue_068_has_a_known_boolean_tear
+/// The tear is pinned per host in [`HEAVY_GOLDEN_PATH`] and its size in
+/// [`ISSUE_068_KNOWN_TORN_HOSTS`]; the module doc's "heavy lane" section
+/// argues why recording it beats asserting `torn == 0` on every run. What this
+/// lane therefore catches is a tear that is NEW — a host clean in the golden
+/// that tore, a host that stopped meshing, a host the golden has never seen —
+/// and a #3435 that got better or worse as a whole. What it does not catch is
+/// #3435 itself: that stays open, and this lane is what tells anyone working on
+/// it whether they moved it.
 #[test]
-#[ignore = "documents a known, unfixed CSG tear (#3434) — expected to fail until the tear is fixed"]
-fn heavy_fixture_issue_068_has_a_known_boolean_tear() {
-    if cfg!(not(feature = "triangulation-alt")) {
-        eprintln!(
-            "SKIPPED: rerun with --features triangulation-alt to enable the \
-             differential oracle"
-        );
+#[ignore = "heavy-fixture lane (#3434), run by .github/workflows/geometry-census-heavy.yml: \
+            ISSUE_068 is 54 MB, excluded from the default sweep by MAX_FIXTURE_BYTES"]
+fn heavy_fixture_issue_068_carries_the_known_3435_tear() {
+    let Some(run) = run_heavy_lane(ISSUE_068_MODEL, ISSUE_068_MIN_HOSTS) else {
         return;
-    }
-
-    let models: Vec<(String, PathBuf)> =
-        discover_heavy_models().into_iter().filter(|(rel, _)| rel == ISSUE_068_MODEL).collect();
-    assert!(
-        !models.is_empty(),
-        "{ISSUE_068_MODEL} is not on disk under tests/models/ — fetch it with \
-         scripts/fixtures/fetch-fixtures.mjs before running this lane"
-    );
-
-    let (rows, _swept_models) = sweep(&models);
-    let run = totals(&rows);
-
-    println!("\n=== heavy lane: {ISSUE_068_MODEL} ===");
-    println!("void hosts total : {}", run.hosts);
-    println!("torn hosts       : {}", run.torn);
-    println!("unmatched edges (signed) : {}", run.open_edges);
-    println!("strict-rule edges        : {}", run.strict_edges);
-    let mut torn: Vec<&HostRow> = rows.iter().filter(|r| r.open > 0).collect();
-    torn.sort_by_key(|r| std::cmp::Reverse(r.open));
-    println!("\n  torn hosts (worst first):");
-    for r in torn.iter().take(15) {
-        println!("  TORN  {}", fmt_host(r));
-    }
-
+    };
     assert_eq!(
-        run.torn, 0,
-        "{ISSUE_068_MODEL} has {} torn void host(s) / {} open edges — a known, unfixed \
-         CSG defect tracked as #3435 (surfaced by the #3434 heavy lane). This assertion \
-         pins the CORRECT end state, not today's count, so this test stays red on \
-         purpose until #3435 is fixed rather than certifying it. See the module doc's \
-         \"heavy lane\" section for why this fixture carries no golden.",
+        run.torn, ISSUE_068_KNOWN_TORN_HOSTS,
+        "{ISSUE_068_MODEL} has {} torn void host(s) / {} open edges, against a pinned \
+         #3435 population of {ISSUE_068_KNOWN_TORN_HOSTS}. FEWER means #3435 moved and \
+         the pin plus {HEAVY_GOLDEN_PATH} should be tightened to match — say which \
+         change did it. MORE means a new tear, and the per-host diff printed above \
+         names the hosts. Either way this is a real event, not a threshold to bump:\n  \
+         {HEAVY_BLESS_CMD}",
         run.torn, run.open_edges
     );
+}
+
+/// The pin that makes "quietly re-blessed away" impossible.
+///
+/// Reads the CHECKED-IN golden with `include_str!` — no fixture, no sweep, no
+/// feature — so unlike the two lanes above it runs in the default
+/// `cargo test --workspace` on every PR. The sweep that PRODUCES the golden
+/// runs weekly; this is what watches the file in between.
+///
+/// Between them: the weekly sweep is the only thing that can measure a new
+/// tear, and this test is the only thing that can catch a golden edited to
+/// absorb one. Blessing #3435 out of the file moves the golden's torn-row count
+/// and reds this test until someone edits [`ISSUE_068_KNOWN_TORN_HOSTS`], a
+/// named constant in the diff whose name says which issue is being moved.
+#[test]
+fn the_heavy_golden_pins_the_known_3435_tear_population() {
+    let rows = census_golden::parse(include_str!("manifests/watertightness_census_heavy.tsv"))
+        .expect("the checked-in heavy golden must parse");
+
+    // Both readings come from `census_golden::totals`, the same function the
+    // sweep's own numbers come from, so "torn" cannot mean one thing in the
+    // weekly lane and another in this per-PR pin.
+    let for_model = |m: &str| totals(rows.iter().filter(|r| r.model == m));
+    let t053 = for_model(ISSUE_053_MODEL);
+    let t068 = for_model(ISSUE_068_MODEL);
+
+    assert!(
+        t053.hosts >= ISSUE_053_MIN_HOSTS && t068.hosts >= ISSUE_068_MIN_HOSTS,
+        "the heavy golden is under-populated: {} rows for ISSUE_053 (floor {}), {} for \
+         ISSUE_068 (floor {}). A golden blessed against a half-fetched tests/models tree \
+         looks like this, and every ceiling in it would then be vacuous",
+        t053.hosts,
+        ISSUE_053_MIN_HOSTS,
+        t068.hosts,
+        ISSUE_068_MIN_HOSTS
+    );
+
+    assert_eq!(
+        t053.torn,
+        0,
+        "{ISSUE_053_MODEL} is the heavy lane's CLEAN fixture and its golden must carry \
+         no torn host. A torn row here means a regression was blessed in rather than \
+         fixed"
+    );
+    assert_eq!(
+        t068.torn, ISSUE_068_KNOWN_TORN_HOSTS,
+        "the heavy golden records {} torn host(s) for {ISSUE_068_MODEL}, but \
+         ISSUE_068_KNOWN_TORN_HOSTS says {ISSUE_068_KNOWN_TORN_HOSTS}. If #3435 moved, \
+         move both together and say which change did it; if it did not, this golden was \
+         edited without one",
+        t068.torn
+    );
+
+    // The same property the main golden's sibling test pins: `f != r` implies
+    // `(f, r) != (1, 1)`, so no walk can emit `strict < open`. A hand-edited or
+    // badly merged row can.
+    for r in &rows {
+        assert!(
+            r.strict >= r.open,
+            "{} #{}: strict {} < open {} — no walk can produce this row",
+            r.model,
+            r.id,
+            r.strict,
+            r.open
+        );
+    }
+}
+
+/// `true` when the fixture at `path` is readable; `false` only for a
+/// genuinely absent file (`NotFound`), which is a legitimate skip unless
+/// `IFC_LITE_REQUIRE_FIXTURES=1`, in which case it panics naming the path.
+/// Any other `io::Error` (permission denied, corrupt read, ...) means the
+/// environment is broken rather than merely missing an optional download,
+/// so it panics unconditionally. This attempts the read (rather than
+/// `Path::exists()`) because `exists()` collapses a permission error into
+/// `false` just like a genuinely absent file, and is a TOCTOU check besides
+/// — each caller performs the real read moments later.
+// Unused under `csg_topology_gate` / `csg_manifold_gate`: all callers are
+// cfg-gated off in those builds, which made this a hard `never used` error.
+// Allowed rather than cfg-gated to match the callers, because revert-oracle
+// cannot parse a `not(...)` cfg shape and aborts on it.
+#[allow(dead_code)]
+fn oracle_fixture_present(path: &std::path::Path) -> bool {
+    match std::fs::read_to_string(path) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            assert!(
+                !support::require_fixtures(),
+                "fixture {} not present and IFC_LITE_REQUIRE_FIXTURES=1 -- run `pnpm fixtures` to download (sha256 in tests/models/manifest.json)",
+                path.display()
+            );
+            false
+        }
+        Err(e) => panic!("fixture {} exists but could not be read: {e}", path.display()),
+    }
+}
+
+// #3925: independent IfcOpenShell 0.8.2 volume is 0.03938 m³. The old
+// unre-based census collapsed corners and pinned approximately 0.03844 m³.
+#[cfg(not(any(feature = "csg_topology_gate", feature = "csg_manifold_gate")))]
+#[test]
+fn census_rebases_real_covering_before_f32_geometry_3925() {
+    let _serial = CENSUS_SWEEP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    set_alt(false);
+    let path = crate_dir().join("../../tests/models/various/rvt01.ifc");
+    if !oracle_fixture_present(&path) {
+        eprintln!("Skipping #3925 covering oracle: run pnpm fixtures");
+        return;
+    }
+    let content = std::fs::read_to_string(path).expect("read rvt01 fixture");
+    let frame = ModelFrame::new(&content);
+    let mesh = process(&frame, 11232, &void_index(&content)).expect("mesh covering");
+    assert_eq!(edge_stats(&mesh).strict, 0, "covering must remain closed without doubled edges");
+    assert!((39_200..=39_500).contains(&volume_cm3(&mesh)),
+        "covering volume must agree with the independent solid: {} cm³", volume_cm3(&mesh));
+}
+
+// #3925: the one reviewed torn-to-closed reference migration. Independent
+// IfcOpenShell 0.8.2 gives 0.0756966 m³; both existing loader and repaired census
+// preserve that thin solid. An open mesh's signed volume alone is insufficient.
+#[cfg(not(any(feature = "csg_topology_gate", feature = "csg_manifold_gate")))]
+#[test]
+fn repaired_office_covering_matches_independent_solid_3925() {
+    let _serial = CENSUS_SWEEP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    set_alt(false);
+    let path = crate_dir().join("../../tests/models/ara3d/S_Office_Integrated Design Archi.ifc");
+    if !oracle_fixture_present(&path) {
+        eprintln!("Skipping #3925 office oracle: run pnpm fixtures");
+        return;
+    }
+    let content = std::fs::read_to_string(path).expect("read office fixture");
+    let frame = ModelFrame::new(&content);
+    let mesh = process(&frame, 91291, &void_index(&content)).expect("mesh office covering");
+    assert_eq!(edge_stats(&mesh).strict, 0);
+    assert!((75_500..=75_900).contains(&volume_cm3(&mesh)),
+        "office covering volume must agree with the independent solid: {} cm³", volume_cm3(&mesh));
 }

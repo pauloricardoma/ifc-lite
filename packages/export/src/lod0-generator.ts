@@ -8,8 +8,12 @@ import {
   getAttributeNamesAcrossSchemas,
   scanIfcEntities,
 } from '@ifc-lite/parser';
+import { isProperSubtypeOfAny, type HierarchyRegistry } from '@ifc-lite/codegen/schema-hierarchy';
+import * as IFC4_SCHEMA from '@ifc-lite/codegen/ifc4';
+import * as IFC4X3_SCHEMA from '@ifc-lite/codegen/ifc4x3';
 
 import type { EntityRef } from '@ifc-lite/parser';
+import { firstProjAxis } from '@ifc-lite/data';
 import type { Lod0Json, Lod0Element, LodInput, Vec3 } from './lod-geometry-types.js';
 import {
   aabbFromPoints,
@@ -59,13 +63,44 @@ function findAttrIndex(typeName: string, attrName: string): number | null {
   return idx >= 0 ? idx : null;
 }
 
+/**
+ * The schema registries `isMaterialDefinition` checks against — IFC4 and
+ * IFC4X3, unioned for the same reason as `isNonRootedClassifiableResourceType`
+ * in `@ifc-lite/ids` (ifc-lite #3999): a server-parsed store's `EntityRef.type`
+ * names an entity, not a schema version, so a type introduced in only one
+ * schema must still be recognised when the other is in play.
+ */
+const HIERARCHY_REGISTRIES: readonly HierarchyRegistry[] = [
+  IFC4_SCHEMA.SCHEMA_REGISTRY,
+  IFC4X3_SCHEMA.SCHEMA_REGISTRY,
+];
+
+/**
+ * Is `typeUpper` a concrete `IfcMaterialDefinition` subtype (`IfcMaterial`,
+ * `IfcMaterialConstituent(Set)`, `IfcMaterialLayer(Set)`,
+ * `IfcMaterialProfile(Set)`, …)? Answered from the schema hierarchy rather
+ * than `startsWith('IFCMATERIAL')`, which also matched `IfcMaterialList`,
+ * `IfcMaterialLayerSetUsage`, `IfcMaterialDefinitionRepresentation` and
+ * `IfcMaterialRelationship` — none an `IfcMaterialDefinition` — the same
+ * over-broad-prefix bug fixed for `@ifc-lite/ids`'s
+ * `isNonRootedClassifiableResourceType` (ifc-lite #3999). Those excluded
+ * non-element types were never going to reach `elements` regardless — the
+ * `ObjectPlacement`-declared check just below independently drops any
+ * non-`IfcProduct` type, materials included — so narrowing this filter is a
+ * precision fix, not a behavior change: see
+ * `lod0-generator.material-membership.test.ts` for the equivalence proof.
+ */
+export function isMaterialDefinition(typeUpper: string): boolean {
+  return isProperSubtypeOfAny(HIERARCHY_REGISTRIES, typeUpper, 'IfcMaterialDefinition');
+}
+
 function isCandidateElementType(typeUpper: string): boolean {
   // Fast prefilter: skip common non-placeable types.
   if (!typeUpper || !typeUpper.startsWith('IFC')) return false;
   if (typeUpper.startsWith('IFCREL')) return false;
   if (typeUpper.startsWith('IFCPROPERTY')) return false;
   if (typeUpper.startsWith('IFCQUANTITY')) return false;
-  if (typeUpper.startsWith('IFCMATERIAL')) return false;
+  if (isMaterialDefinition(typeUpper)) return false;
   if (typeUpper.startsWith('IFCPRESENTATION')) return false;
   if (typeUpper.startsWith('IFCREPRESENTATION')) return false;
   if (typeUpper.startsWith('IFCSTYLE')) return false;
@@ -92,6 +127,7 @@ export async function generateLod0(input: LodInput): Promise<Lod0Json> {
 
   const getEntity = (id: number): any | null => {
     if (entityCache.has(id)) return entityCache.get(id) ?? null;
+    // @raw-entity-enumeration-ok LOD0 receives only input bytes and scans its own immutable source index
     const ref = entityIndex.byId.get(id);
     const ent = ref ? extractor.extractEntity(ref) : null;
     entityCache.set(id, ent);
@@ -148,7 +184,9 @@ export async function generateLod0(input: LodInput): Promise<Lod0Json> {
       const tVec = typeof locRef === 'number' ? (getPoint(locRef) ?? [0, 0, 0]) : [0, 0, 0];
 
       const zAxis = typeof axisRef === 'number' ? (getDirection(axisRef) ?? [0, 0, 1]) : [0, 0, 1];
-      const xAxis0 = typeof refDirRef === 'number' ? (getDirection(refDirRef) ?? [1, 0, 0]) : [1, 0, 0];
+      // A `$` (or unreadable) RefDirection takes the renderer's fill (#5922).
+      const xAxis0 = (typeof refDirRef === 'number' ? getDirection(refDirRef) : null)
+        ?? firstProjAxis(zAxis as Vec3);
       const zN = vec3Normalize(zAxis as Vec3, [0, 0, 1]);
       const xN0 = vec3Normalize(xAxis0 as Vec3, [1, 0, 0]);
       const yN = vec3Normalize(vec3Cross(zN, xN0), [0, 1, 0]);
@@ -251,6 +289,7 @@ export async function generateLod0(input: LodInput): Promise<Lod0Json> {
 
   const elements: Lod0Element[] = [];
 
+  // @raw-entity-enumeration-ok this index was built from the input bytes above; no live mutation view is accepted by generateLod0
   for (const [id, ref] of entityIndex.byId) {
     const typeUpper = ref.type;
     if (!isCandidateElementType(typeUpper)) continue;

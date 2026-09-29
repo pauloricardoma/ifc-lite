@@ -1,5 +1,805 @@
 # @ifc-lite/parser
 
+## 9.0.0
+
+### Major Changes
+
+- [#5675](https://github.com/LTplus-AG/ifc-lite/pull/5675) [`7215c2a`](https://github.com/LTplus-AG/ifc-lite/commit/7215c2a9344ede37c90680e1eb2a6c2b70c0ee3d) Thanks [@louistrue](https://github.com/louistrue)! - STEP re-export no longer turns a source `FILE_NAME` author or organization of `$` (or `($)`) into `()`, which is not a valid `LIST [1:?]` and failed IfcOpenShell validation. The exporter now writes its `('')` default for those ([#5470](https://github.com/LTplus-AG/ifc-lite/issues/5470)).
+  
+  BREAKING: `IfcSourceHeader.author` and `.organization` (re-exported by `@ifc-lite/parser`, and returned by `parseSourceHeader`) are now optional. They are absent when the source wrote `$`, a list of only unset entries, or no `FILE_NAME` record. They are `[]` only for a literal `()`, which still round-trips as `()`. Code that reads them must handle `undefined`, e.g. `header.author ?? []`.
+
+### Minor Changes
+
+- [#5545](https://github.com/LTplus-AG/ifc-lite/pull/5545) [`5c02af8`](https://github.com/LTplus-AG/ifc-lite/commit/5c02af8b7fda4d2fe53f79d3f00b9d192fc664d9) Thanks [@louistrue](https://github.com/louistrue)! - **Behaviour change:** element rules now read list, enumerated and table property values member by member, in search, applicability and validation, and so in everything built on the same filter evaluator (appearance query scopes, clash set filters, chart filters). The `unit` requirement's reported value lists each member with its unit. In validation, `eq` and `ne` choose number or text comparison per member, so one text cell in a table no longer forces every number cell to a text comparison. A positive operator passes when ANY member matches. A negated operator (`ne`, `notContains`, `notMatches`) passes only when NO member has the value.
+  
+  Before, these rules compared the joined display string, so results change for existing list-valued properties. Against the list `Colors = (Red, Blue)`:
+  - `Colors = Blue` used to fail and now passes.
+  - `Colors = "Red, Blue"` used to pass and now fails.
+  - `Colors != Red` used to pass and now fails.
+  
+  Each bound of a range is checked against the members on its own, so on a table `>= 15 AND <= 5` passes when some cell is ≥ 15 and another is ≤ 5. In search, negated operators also stop passing on a single non-matching property set when a regex set name matches several sets. That is the NONE rule validation already applied.
+  
+  The set checks (`unique`, `aggregate`, `compare`) still read each property as one whole value (a list's joined text, a table's `Table (N rows)` summary), so their results do not change.
+  
+  Bounded values and complex properties keep their display value. Lens colouring, the CLI's `--where` and bulk-edit queries are not rules and keep their own matching. Models whose properties come from a server-parsed property table carry no structure marker, so they keep the joined value.
+  
+  `@ifc-lite/parser` marks each extracted property with a `structure` (`enumerated`, `bounded`, `list`, `table`, `reference`, `complex`) when it is not a single value, and exports the `ExtractedProperty` type. `@ifc-lite/data`'s `Property` declares the same field, and `MutablePropertyView` keeps it on base properties. The filter value suggestions offer list members. `propertyCandidates` and `readSubjectWhole` are exported.
+
+### Patch Changes
+
+- Updated dependencies [[`bf32c6a`](https://github.com/LTplus-AG/ifc-lite/commit/bf32c6a128d9ce1c8d9d2a0efcfe7f8754c3d01c), [`d376d2c`](https://github.com/LTplus-AG/ifc-lite/commit/d376d2c02ff35ea25efca5983626fa0b8073bc90), [`975c430`](https://github.com/LTplus-AG/ifc-lite/commit/975c43086065cc7eaaf841d18f6f5ecbe626f0bd), [`b218ab4`](https://github.com/LTplus-AG/ifc-lite/commit/b218ab440fc09011c6bb1d39524525120e119cb1), [`ccc491e`](https://github.com/LTplus-AG/ifc-lite/commit/ccc491efac18ce496af47c91b1ef4fc04ebecca5), [`7215c2a`](https://github.com/LTplus-AG/ifc-lite/commit/7215c2a9344ede37c90680e1eb2a6c2b70c0ee3d), [`5c02af8`](https://github.com/LTplus-AG/ifc-lite/commit/5c02af8b7fda4d2fe53f79d3f00b9d192fc664d9), [`6bf4181`](https://github.com/LTplus-AG/ifc-lite/commit/6bf418103e872f13666037ae4868e03468e3840c), [`d2cfb9e`](https://github.com/LTplus-AG/ifc-lite/commit/d2cfb9e66affc2674d6de5da44ecdc5d8a76b59e), [`477c1d5`](https://github.com/LTplus-AG/ifc-lite/commit/477c1d5ef5bb5057ff12f9d074270ec2359b39e1), [`db7f991`](https://github.com/LTplus-AG/ifc-lite/commit/db7f991eb63998c65389a28e7331ac984a5448ad)]:
+  - @ifc-lite/wasm@10.1.1
+  - @ifc-lite/data@6.0.0
+  - @ifc-lite/ifcx@4.2.1
+
+## 8.2.0
+
+### Minor Changes
+
+- [#5568](https://github.com/LTplus-AG/ifc-lite/pull/5568) [`579b759`](https://github.com/LTplus-AG/ifc-lite/commit/579b7590bfe79cad5689cc89ab8082f95b5d6ea3) Thanks [@louistrue](https://github.com/louistrue)! - Parsing no longer prints to the host console by default. Every `parseColumnar` call emitted ~16 unconditional `console.log` lines (`[parseLite] categorize …`, `[IfcParser] Fast scan …`), so the three-line snippet in the README produced fourteen lines of internal phase timings, and any CLI command writing JSON to stdout got them interleaved into its payload. These are telemetry, and the package already had two channels for them: the structured `onDiagnostic` callback, which is unchanged, and `@ifc-lite/data`'s `createLogger`, whose `debug` level is gated on `IFC_DEBUG` (`IFC_DEBUG=true` in Node, `localStorage.setItem('IFC_DEBUG', 'true')` in a browser). The timings are now routed through the latter, so `IFC_DEBUG=true` still prints exactly what it printed before.
+
+### Patch Changes
+
+- Updated dependencies [[`223f4d7`](https://github.com/LTplus-AG/ifc-lite/commit/223f4d71f26d074ba949f77031dc24f559da34ca), [`0576221`](https://github.com/LTplus-AG/ifc-lite/commit/0576221cbd57276bce8da8d709045e2ae398a0df), [`0f5d174`](https://github.com/LTplus-AG/ifc-lite/commit/0f5d174d2fb726536d1a3a30c7e5415603db72c0), [`69dceea`](https://github.com/LTplus-AG/ifc-lite/commit/69dceeac3743944ad476e4338d38712f5cd1f12d)]:
+  - @ifc-lite/wasm@10.0.1
+  - @ifc-lite/data@5.2.0
+
+## 8.1.0
+
+### Minor Changes
+
+- [#5305](https://github.com/LTplus-AG/ifc-lite/pull/5305) [`60f70f9`](https://github.com/LTplus-AG/ifc-lite/commit/60f70f93c9cdf9948f1a7325efb1e157a09d3a60) Thanks [@louistrue](https://github.com/louistrue)! - **Breaking (`@ifc-lite/ids`):** `PropertyValueResult.dataType` and `PropertySetInfo` properties' `dataType` are now `string | undefined`, where `undefined` means the type is unknown. Code that assumed a `string` must handle `undefined`.
+  
+  An IDS property facet that requires a `dataType` now **fails** when the property's dataType is unknown, instead of skipping the check ([#5224](https://github.com/LTplus-AG/ifc-lite/issues/5224)). A spec that demanded `IFCBOOLEAN` used to pass `"not-a-boolean-at-all"` whenever the stored property carried no dataType.
+  
+  - `@ifc-lite/ids`: the new failure type `PROPERTY_DATATYPE_UNKNOWN` holds under every optionality, `prohibited` included, so "cannot verify" is never a pass. It has messages in both formatters and in en/de/fr. Only a property flagged `dataTypeMixed` (an `IfcPropertyTableValue`, whose columns differ in type by design) is exempt, and it defers to the value match, as upstream ifctester does. The property overlay resolver no longer manufactures `''` for a correction created without a dataType. `PropertySetInfo` properties now type `dataType` as `string | undefined` and gain `dataTypeMixed`. A predefined property set's attributes (`IfcDoorPanelProperties.PanelOperation`, …) take their declared EXPRESS type as their dataType.
+  - `@ifc-lite/parser`: `IfcPropertyListValue` and `IfcPropertyEnumeratedValue` carry the one `dataType` their members share, and a table sets `dataTypeMixed`. The new export `getAttributeTypeForSchema` returns an attribute's declared EXPRESS type.
+  - `@ifc-lite/data`: `Property` gains `dataTypeMixed`.
+  - `@ifc-lite/server-client`: `Property` gains `data_type_mixed`, decoded from the server's new `data_type_mixed` column (data-model payload v7).
+
+- [#5554](https://github.com/LTplus-AG/ifc-lite/pull/5554) [`5665917`](https://github.com/LTplus-AG/ifc-lite/commit/566591746eead289fcc5aa60258ef96b30366456) Thanks [@louistrue](https://github.com/louistrue)! - Schedule reads pending entity edits, creations, deletions and retypes through export-equivalent records; the viewer refreshes cached schedule data when mutations change.
+
+- [#5298](https://github.com/LTplus-AG/ifc-lite/pull/5298) [`253cc3e`](https://github.com/LTplus-AG/ifc-lite/commit/253cc3e96ff001b3514f182a61b1be70f6a89fa5) Thanks [@louistrue](https://github.com/louistrue)! - `extractAllMaterialsOnDemand` now consults the relationship graph before it gives up on a store without source bytes, such as a server-parsed model ([#5227](https://github.com/LTplus-AG/ifc-lite/issues/5227)). The classification resolver already did this for [#3948](https://github.com/LTplus-AG/ifc-lite/issues/3948). When the graph proves a material association, it returns one `{ type: 'Material', unresolved: true }` marker per association instead of `[]`, so callers can tell "has a material this store cannot read" apart from "no material". `MaterialInfo` gains the optional `unresolved` flag.
+
+- [#5306](https://github.com/LTplus-AG/ifc-lite/pull/5306) [`4175a1e`](https://github.com/LTplus-AG/ifc-lite/commit/4175a1e0e8b055de2a5c58288a87b84c3c85c610) Thanks [@louistrue](https://github.com/louistrue)! - Rule sets can now assert the unit a value is recorded in, e.g. "Width is recorded in mm". The new `unit` requirement kind (`{ kind: 'unit', subject, unit: 'mm' }`) takes a property or quantity subject. An element passes when every value of that subject is recorded in the unit. The unit is the value's explicit unit, or the project unit for its measure type when it has none. IDS 1.0 cannot express this check. `readSubject` reports those units as `valueUnits`. A quantity's explicit `Unit` now also sets the unit label shown for it, where before the project unit was always shown. The parser's quantity records carry that explicit unit's symbol as `explicitUnit`. The Data validation editor offers the new kind as "Unit".
+
+### Patch Changes
+
+- [#5337](https://github.com/LTplus-AG/ifc-lite/pull/5337) [`45ddd91`](https://github.com/LTplus-AG/ifc-lite/commit/45ddd91d1cee1c261ca5f1b1d0087fb2e070690f) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix a broken classification chain (a dangling `ReferencedSource`, an unreadable entity, an entity of an unexpected type, or a cycle) reporting a confident `CLASSIFICATION_SYSTEM_MISMATCH` instead of `CLASSIFICATION_UNRESOLVED`. `walkClassificationChain` (`@ifc-lite/parser`) and the structurally identical `IfcExternalReferenceRelationship` walk in `@ifc-lite/ids`'s `resolveClassifications` both stopped without reporting anything when the chain could not be followed to an `IfcClassification` root, leaving `system` `undefined` — indistinguishable from a chain that legitimately ends without naming one (`ReferencedSource` omitted, which is schema-legal). Both walks now mark the classification record `unresolved` when the chain genuinely could not be resolved, so the IDS classification facet reports `CLASSIFICATION_UNRESOLVED` (the same fail-closed path [#3948](https://github.com/LTplus-AG/ifc-lite/issues/3948) already established) instead of asserting a system mismatch the data never proved.
+
+- [#5295](https://github.com/LTplus-AG/ifc-lite/pull/5295) [`dabc489`](https://github.com/LTplus-AG/ifc-lite/commit/dabc48987aca1392685218dd31641f8dbadf9590) Thanks [@louistrue](https://github.com/louistrue)! - Every schema-specific reader of the IFC4 entity table now uses `ENTITIES_IFC4_EXPRESS`, a new `@ifc-lite/data` export ([#5204](https://github.com/LTplus-AG/ifc-lite/issues/5204)). It is `ENTITIES_IFC4` checked against the IFC4 EXPRESS schema:
+  - Rows IFC4 does not declare are dropped. These are the draft alignment-extension entities such as `IfcAlignment2DHorizontal` and `IfcLinearPlacement`.
+  - Attribute lists follow EXPRESS, so `IfcCartesianPointList2D`/`3D` lose the IFC4X3-only `TagList`.
+  - The attribute-less defined-type rows are kept.
+  
+  The corrections are generated from `@ifc-lite/parser`'s EXPRESS registry by `scripts/generate-ifc4-express-corrections.mjs`, and CI checks that they are up to date. This fixes:
+  - `@ifc-lite/data`: `getEntities('IFC4')`, `findEntity('IFC4', …)` and `expandTypeNamesToDescendants`, which is what the IDS auditor reads;
+  - `@ifc-lite/parser`: `getAttributeNamesAcrossSchemas` / `isKnownType`;
+  - `@ifc-lite/mcp`: the schema tables;
+  - `@ifc-lite/export`: the subset-export attribute reader, the product/root type sets and the STEP retype re-layout. The retype re-layout could previously write a class IFC4 lacks, or a spurious `TagList` argument, into a file declaring `FILE_SCHEMA(('IFC4'))`;
+  - `@ifc-lite/ifcx`: the building-element family.
+
+- [#5281](https://github.com/LTplus-AG/ifc-lite/pull/5281) [`0d9cbc0`](https://github.com/LTplus-AG/ifc-lite/commit/0d9cbc0072baa634923623c6772500d57a63f412) Thanks [@louistrue](https://github.com/louistrue)! - Fix a corrupted STEP numeric literal (e.g. a dropped comma fusing `1.52,3.0` into `1.52.3`) silently parsing as the truncated value `1.52` instead of being refused. `parseAttributeValue`'s numeric fallback and `getNumber` now require the token to match the STEP REAL/INTEGER grammar in full before trusting `parseFloat`, and preserve the raw token otherwise — the same refuse-and-warn shape already used for an overflowing literal like `1.0E400`.
+
+- [#5432](https://github.com/LTplus-AG/ifc-lite/pull/5432) [`6314cbe`](https://github.com/LTplus-AG/ifc-lite/commit/6314cbed245efb39552487307be55b6884fd0b97) Thanks [@louistrue](https://github.com/louistrue)! - Property and quantity rules can compare in SI units: `valueUnit: 'si'`, the "SI" toggle on the chip. Each value is converted with its own unit before the comparison: an explicit `Unit`, else the project unit for its measure type. This works in search, applicability and validation. `idsToRuleSet` sets it on every imported numeric check, so an imported IDS gives the same verdicts on a millimetre model as the IDS checker does. `ruleSetToIds` takes the loaded `models` and writes model-unit numeric checks to the IDS in SI. A rule whose unit can't be settled (no models, or models that disagree) is refused with the reason. The SI-units caveat note is gone. `readSubject` now also reports `valueSiScales`. `TypePropertyInfo` now declares the `unit` / `unitSiScale` its property rows already carry.
+- Updated dependencies [[`2523acc`](https://github.com/LTplus-AG/ifc-lite/commit/2523acc5881252316439de2f69f7fab4266d559f), [`5909977`](https://github.com/LTplus-AG/ifc-lite/commit/5909977e0631cc242c421b5ded6c887acadd92ba), [`83284a9`](https://github.com/LTplus-AG/ifc-lite/commit/83284a947d9adb9e1ece28f9d5ee7166722be1e5), [`32ac1f9`](https://github.com/LTplus-AG/ifc-lite/commit/32ac1f9846a5703c63ea859e5aeaf224f164db0c), [`c8fcbfb`](https://github.com/LTplus-AG/ifc-lite/commit/c8fcbfbfcc8e45526ef93c84ee8a254df586c10b), [`52d30de`](https://github.com/LTplus-AG/ifc-lite/commit/52d30de0ae3fc8ef6322191bd1831483b93d485f), [`617da29`](https://github.com/LTplus-AG/ifc-lite/commit/617da29bc17326105dd1143385c967210e529a43), [`dabc489`](https://github.com/LTplus-AG/ifc-lite/commit/dabc48987aca1392685218dd31641f8dbadf9590), [`60f70f9`](https://github.com/LTplus-AG/ifc-lite/commit/60f70f93c9cdf9948f1a7325efb1e157a09d3a60), [`3166183`](https://github.com/LTplus-AG/ifc-lite/commit/31661831c8137f31aa6c3b0da286832ed6e16a7b), [`f942fb6`](https://github.com/LTplus-AG/ifc-lite/commit/f942fb6c48ac9be1464e49fd963340835a72945d), [`87d62bc`](https://github.com/LTplus-AG/ifc-lite/commit/87d62bca61704029b92882f2dd280dd497a77bd7), [`be636b4`](https://github.com/LTplus-AG/ifc-lite/commit/be636b414c11e7c5b77c2b98d0e916822ac39d09), [`58691b3`](https://github.com/LTplus-AG/ifc-lite/commit/58691b362d67ab87f666d76d6ee27e39d1ec45f9), [`e6f46cb`](https://github.com/LTplus-AG/ifc-lite/commit/e6f46cbaf7d2ea515296f40497556b2b31bc5bd2), [`76d1119`](https://github.com/LTplus-AG/ifc-lite/commit/76d1119fb1573ef81f50d03c04026be3c83674ce), [`0d9cbc0`](https://github.com/LTplus-AG/ifc-lite/commit/0d9cbc0072baa634923623c6772500d57a63f412), [`897eb6c`](https://github.com/LTplus-AG/ifc-lite/commit/897eb6c15342ad20a032b40fcb803559bf1a10f7), [`177f6d1`](https://github.com/LTplus-AG/ifc-lite/commit/177f6d18decd296ab6c25e7ec1d8200e461ceda0)]:
+  - @ifc-lite/wasm@10.0.0
+  - @ifc-lite/data@5.1.0
+  - @ifc-lite/ifcx@4.2.0
+
+## 8.0.0
+
+### Major Changes
+
+- [#4992](https://github.com/LTplus-AG/ifc-lite/pull/4992) [`ec114fe`](https://github.com/LTplus-AG/ifc-lite/commit/ec114fefabfd1b3a23d6a25545610652db6c5342) Thanks [@louistrue](https://github.com/louistrue)! - Release `@ifc-lite/parser` as a new major because its public store implementations now satisfy the source-breaking `@ifc-lite/data` `EntityTable` contract introduced for absent-versus-empty entity names. Consumers implementing or structurally typing the previous table contract must not receive that change through a compatible parser range.
+
+### Minor Changes
+
+- [#5009](https://github.com/LTplus-AG/ifc-lite/pull/5009) [`d38af5a`](https://github.com/LTplus-AG/ifc-lite/commit/d38af5afd36f12329fe6f33bf905d28fca65ba43) Thanks [@louistrue](https://github.com/louistrue)! - Index every schema-resolvable `IfcRelationship` subtype as an exact typed edge, expose exact inbound/outbound relationship rows through the SDK, MCP, and viewer, and allow `related()` queries for every indexed `IfcRel*` name. Bump the cache format so graphs cached before the expanded indexing are reparsed instead of silently omitting the new edge buckets. `@ifc-lite/parser` also exports `resolveEffectiveEntityRecord`, the one place a read model folds a queued retype (name-based re-layout), named and positional edits into an entity record exactly as export writes it; the CLI, MCP and viewer read surfaces use it.
+
+- [#5016](https://github.com/LTplus-AG/ifc-lite/pull/5016) [`0100a54`](https://github.com/LTplus-AG/ifc-lite/commit/0100a544d0446d2f19b5f76f37d6dc45d31da837) Thanks [@louistrue](https://github.com/louistrue)! - Add the loaded-model cost-authoring foundation: mutation-aware cost reads, effective created-record export, schema-consistent cost builders, relationship assignment, reference-safe removal, and StoreEditor entity-type/schema lookup.
+
+- [#4967](https://github.com/LTplus-AG/ifc-lite/pull/4967) [`65ea107`](https://github.com/LTplus-AG/ifc-lite/commit/65ea107b83e3d543b410721c74195562ca50bcca) Thanks [@louistrue](https://github.com/louistrue)! - Adapters for the successor-matching work (issue [#4955](https://github.com/LTplus-AG/ifc-lite/issues/4955)). **parser**: `spatialContainerPath` (an element's nearest spatial container as a name path, never GlobalIds) and `authoredKeyValue` / `parseAuthoredKeySpec` (an authored identifier: `Tag`, or `Pset.Prop`), shared by every diff adapter so three copies cannot drift. **cli**: `diff --key-from Tag|Pset.Prop` keys the comparison on an authored identifier (`prop:<value>` where present and unique, GlobalId elsewhere, shared values refused with a warning); `--lineage-out` / `--lineage-in` write and replay the 1:k lineage; `--accept <map.json>` folds a reviewed identity map into it as `replaced`; `--lineage-out` refuses to overwrite an input model like `--identity-out` does; and a new `ifc-lite rekey <table.csv|json> --lineage F --out F [--key-column] [--policy] [--orphans]` carries an external table across a revision. Every fingerprint now carries `container`. **mcp**: `model_diff` gains `key_from` and echoes `keyProperty` / `duplicateAuthoredKeys`. **viewer**: the compare adapter accepts `keyProperty` and fills `container`; a report row compared on an authored key exports it in a `Key` column (present only when one was used, so existing CSVs are byte-identical) and never in the GlobalId column; BCF text prints `Key:` for it.
+
+- [#4991](https://github.com/LTplus-AG/ifc-lite/pull/4991) [`e211790`](https://github.com/LTplus-AG/ifc-lite/commit/e211790ff4d7070d908fb519652158089652dd9c) Thanks [@louistrue](https://github.com/louistrue)! - Add distinct relationship graph edge types for IFC structural activity, member, eccentricity, and IFC2X3 structural-element connections.
+
+### Patch Changes
+
+- [#4958](https://github.com/LTplus-AG/ifc-lite/pull/4958) [`e1ace4f`](https://github.com/LTplus-AG/ifc-lite/commit/e1ace4f05a45a252d502bf72a506336185d2b157) Thanks [@louistrue](https://github.com/louistrue)! - `EntityTable` gains `getNameOrUndefined(expressId)`, a display-neutral sibling of `getName` that returns `undefined` for an entity whose `Name` attribute is genuinely absent (STEP `$`) instead of folding it into `''` the way `getName` still does for every existing display caller. **Major, not minor**: `getNameOrUndefined` is a REQUIRED interface member (not optional), so any downstream implementation of `EntityTable` (a typed mock, a third-party table) that doesn't already provide it fails to compile — a source-breaking change, not an additive one. `EntityTableBuilder.add`'s `name` parameter now accepts `string | undefined` so a builder can record that distinction in the first place, and the columnar parser (`@ifc-lite/parser`) now passes a real `undefined` through for an absent `Name` instead of coercing it to `''` before the entity table ever sees it ([#4930](https://github.com/LTplus-AG/ifc-lite/issues/4930)).
+
+- [#4957](https://github.com/LTplus-AG/ifc-lite/pull/4957) [`ab8380e`](https://github.com/LTplus-AG/ifc-lite/commit/ab8380e6b9edf1ca1f05abf343ae6040ac8aee77) Thanks [@louistrue](https://github.com/louistrue)! - `EntityTable.getTypeName()` returns the literal string `'Unknown'`, not `null`/`undefined`, for rows it can't resolve, so `getTypeName(id) || fallback` silently kept `'Unknown'` instead of falling back — breaking element duplication on imported models ([#4933](https://github.com/LTplus-AG/ifc-lite/issues/4933)) among other call sites. Added `resolvedTypeName()` to `@ifc-lite/data` (returns `undefined` for the sentinel) and switched every affected lookup in `create`/`parser`/`cli`/`mcp` to use it.
+
+- [#5005](https://github.com/LTplus-AG/ifc-lite/pull/5005) [`794986e`](https://github.com/LTplus-AG/ifc-lite/commit/794986e8fa5acec057429b49302274ac8046eefe) Thanks [@louistrue](https://github.com/louistrue)! - `lineageOfDiff` now classifies an identity-map alias whose reason carries the `successor:` prefix as `replaced`, instead of always `identity`, while `--lineage-in` preserves the incoming artifact's explicit relation even when its free-form reason suggests otherwise (issue [#4989](https://github.com/LTplus-AG/ifc-lite/issues/4989)). This fixes replay without rewriting valid version-1 lineage semantics. Keyed lineage sidecars now use version 2, matching keyed identity maps, so old readers refuse authored keys instead of mistaking them for GlobalIds. The CLI also persists case-insensitive `--key-from tag` as canonical `Tag`, keeping its sidecars compatible with the viewer. CLI and MCP comparisons now fall back on both revisions when an authored key collides on either side, and shared `Pset.Property` identity lookup searches every same-named property set.
+- Updated dependencies [[`faadbb4`](https://github.com/LTplus-AG/ifc-lite/commit/faadbb409bc67bb5ace32757db050dd0ed83814f), [`531246a`](https://github.com/LTplus-AG/ifc-lite/commit/531246a1a9f53ea6b66f7f1d140c7df268adc242), [`d38af5a`](https://github.com/LTplus-AG/ifc-lite/commit/d38af5afd36f12329fe6f33bf905d28fca65ba43), [`dce19f5`](https://github.com/LTplus-AG/ifc-lite/commit/dce19f57399b9e75901fa5c4283adf781681301e), [`0e8a421`](https://github.com/LTplus-AG/ifc-lite/commit/0e8a4217514dcfacc7c488a230de244288428e1b), [`86dafce`](https://github.com/LTplus-AG/ifc-lite/commit/86dafced6e166889514a8514a23419659d0e7ce6), [`e1ace4f`](https://github.com/LTplus-AG/ifc-lite/commit/e1ace4f05a45a252d502bf72a506336185d2b157), [`ab8380e`](https://github.com/LTplus-AG/ifc-lite/commit/ab8380e6b9edf1ca1f05abf343ae6040ac8aee77), [`bab4e30`](https://github.com/LTplus-AG/ifc-lite/commit/bab4e30f438ac0bb585ea00a62a1a98a8221bede), [`24b2416`](https://github.com/LTplus-AG/ifc-lite/commit/24b24167e7213ed8f8c8d92211ec38c7221b9a11), [`19af4c9`](https://github.com/LTplus-AG/ifc-lite/commit/19af4c9b5529a9052daf8a023ebe4e5144b9db2f), [`6e283f0`](https://github.com/LTplus-AG/ifc-lite/commit/6e283f0fb187195aae76097dd4ee1660a20ae325), [`3a47a0c`](https://github.com/LTplus-AG/ifc-lite/commit/3a47a0c2bb70966741882f8a0bae996823b9881f), [`e211790`](https://github.com/LTplus-AG/ifc-lite/commit/e211790ff4d7070d908fb519652158089652dd9c), [`50c23d4`](https://github.com/LTplus-AG/ifc-lite/commit/50c23d4321252a2fafff41e085e64e351c2cdb31)]:
+  - @ifc-lite/wasm@9.2.0
+  - @ifc-lite/data@5.0.0
+  - @ifc-lite/ifcx@4.1.2
+
+## 7.1.0
+
+### Minor Changes
+
+- [#4916](https://github.com/LTplus-AG/ifc-lite/pull/4916) [`ef42c0e`](https://github.com/LTplus-AG/ifc-lite/commit/ef42c0edeb4081e0ad9318c3a0f32301a30e6936) Thanks [@BIMvoice](https://github.com/BIMvoice)! - `bim.cost` now reports the cost graph the session would export, not the one on disk. Cost extraction read straight from a loaded model's source bytes, so an edit or a deletion staged in the model's edit overlay was invisible to `bim.cost.data()` / `items()` / `values()` / `evaluateItem()` while `bim.export.ifc()` applied it — the read model and the exported file disagreed about the same model. `extractCostOnDemand` takes an optional `CostMutationOverlay`, applied at `CostEntityReader`, the one funnel every cost extractor reads an entity through: a tombstoned entity is gone from the graph, a retyped entity is listed under its pending class, and an edited record is read from the text the exporter will write for it. Nesting, assignments, controlling schedules, unit resolution and every diagnostic recompute from that one read rather than from a second projection.
+  
+  What an edit becomes in the file is decided once, by the exporter. The new `effectiveSourceRecord` in `@ifc-lite/export` runs the exporter's own retype / named / positional mutation pipeline for one source record, and the SDK builds the cost overlay from it, so enum edits read as the enum the exporter writes, positional edits (`AppliedValue`, `UnitBasis`, `CostValues`, …) are visible, and an edit past the end of a truncated record is skipped exactly as export skips it. `ResolvedCostModel` carries the model's `mutationView`. An edit the exporter declines to write (a non-number in a REAL-typed slot, a record whose arguments do not scan) is reported as a `PENDING_EDIT_NOT_APPLIED` warning instead of the source value being passed off as current.
+  
+  A cost value deleted while an `IfcCostItem` still lists it in `CostValues` reads back as a `MISSING_REFERENCE` error against that item — the same answer the reader already gives for a file with a genuinely dangling reference — rather than being dropped from the canonical list, which would report a coherent graph the file does not contain.
+  
+  The cost reads accept `{ includeMutations: false }` for the graph as the file on disk states it. That is the file's own cost data, not an empty graph. It mirrors `bim.export.ifc`'s option of the same name, and `true` (the default) is what makes the two describe one file.
+
+- [#4889](https://github.com/LTplus-AG/ifc-lite/pull/4889) [`f24aff9`](https://github.com/LTplus-AG/ifc-lite/commit/f24aff9a7f7685af2cdf0230fe4c712d7dc37940) Thanks [@louistrue](https://github.com/louistrue)! - Let element charts bind to an exact IFC attribute or property, persist the field interpretation, normalize scalar values for aggregation, and report missing sum contributions. Resolve named attributes across every bundled IFC schema so IFC2X3-only and IFC4X3-only classes participate too (`EntityNode.allAttributes()` now consults the store's own schema version). On-demand property extraction reports a property's explicit `Unit` as `unit` plus `unitSiScale`; an unresolvable unit reference is reported as `#<id>` with no scale instead of being dropped.
+
+### Patch Changes
+
+- [#4909](https://github.com/LTplus-AG/ifc-lite/pull/4909) [`bbd3a67`](https://github.com/LTplus-AG/ifc-lite/commit/bbd3a675dbccb75e0f7c9df80c2a65a831478adf) Thanks [@BIMvoice](https://github.com/BIMvoice)! - An explicit empty `Category` (`''`) on an `IfcCostValue` with no `AppliedValue` and no `Components` is no longer evaluated as a category total; it reports `MISSING_VALUE` as before. `ifc-lite eval --type` labels an entity whose `Name` is empty by its `GlobalId` ([#4881](https://github.com/LTplus-AG/ifc-lite/issues/4881)).
+
+- [#4911](https://github.com/LTplus-AG/ifc-lite/pull/4911) [`9f34896`](https://github.com/LTplus-AG/ifc-lite/commit/9f34896cc7c8e19ce9a75367aa8b4cfa23877944) Thanks [@BIMvoice](https://github.com/BIMvoice)! - `CostItemInfo.productExpressIds`/`productGlobalIds` no longer include a task,
+  resource or actor assigned to a cost item via `IfcRelAssignsToControl`. That
+  relationship legitimately binds those objects too, not just products, so the
+  branch previously pushed every related object into fields documented (by
+  name) as an `IfcProduct` view with no type check ([#4877](https://github.com/LTplus-AG/ifc-lite/issues/4877)). The branch now
+  filters related objects to `IfcProduct` subtypes, matching the sibling
+  `IfcRelAssignsToProduct` branch, which already only ever pushed a product.
+  This is a bug fix, not a rename: the field names, types and shape are
+  unchanged, and no consumer in this repo currently reads either field. A
+  downstream consumer that was relying on the previous (undocumented,
+  type-unfiltered) behaviour will see fewer entries in these two arrays.
+
+- [#4909](https://github.com/LTplus-AG/ifc-lite/pull/4909) [`bbd3a67`](https://github.com/LTplus-AG/ifc-lite/commit/bbd3a675dbccb75e0f7c9df80c2a65a831478adf) Thanks [@BIMvoice](https://github.com/BIMvoice)! - The cost read model no longer collapses an explicit empty `IfcLabel`/`IfcText` (`''`) to absent. `IfcCostSchedule.Name`/`Identification`/`Status`, `IfcCostItem.Name`/`Description`/`ObjectType`/`Identification`, `IfcCostValue.Name`/`Description`/`Category`/`Condition`/`CostType`, `IfcCostQuantity.Name`/`Description`/`Formula`, unit `Name`/`Symbol`, and relationship `GlobalId`/`Name`/`Description` now keep `''` distinct from an unset (`$`) attribute, matching IfcOpenShell ([#4881](https://github.com/LTplus-AG/ifc-lite/issues/4881)).
+
+- [#4900](https://github.com/LTplus-AG/ifc-lite/pull/4900) [`39153d1`](https://github.com/LTplus-AG/ifc-lite/commit/39153d155e8c0a5620cdc1802837d6e0f9e7619b) Thanks [@LudwigJMarx](https://github.com/LudwigJMarx)! - Point the published worker URL at the file the package ships.
+  
+  `dist/worker-parser.js` carried `new URL('./parser.worker.ts', import.meta.url)`
+  straight from source, but the tarball contains only `dist/parser.worker.js`. So
+  `new WorkerParser()` rejected through `worker.onerror` for every npm consumer,
+  and a bundler resolving the literal at build time failed outright — `vite build`
+  stopped even when the app passed its own `workerUrl`. Affected 6.5.0 and 7.0.0.
+  
+  The build now rewrites those specifiers to the emitted `.js`, and a second step
+  re-derives from the emitted files whether every `new URL('./…', import.meta.url)`
+  resolves to something `dist` holds, failing the build when one does not.
+
+- [#4908](https://github.com/LTplus-AG/ifc-lite/pull/4908) [`84941dd`](https://github.com/LTplus-AG/ifc-lite/commit/84941dd8413a153040714968dcd684a610334c9a) Thanks [@BIMvoice](https://github.com/BIMvoice)! - `WorkerParser.terminate()` now settles the in-flight `parseColumnar` promise instead of leaving it pending forever. Calling `terminate()` (or aborting a new `signal` option) terminates the worker and rejects the pending promise with an `AbortError`, so `await parser.parseColumnar(...)` no longer hangs after the documented cancellation path is used. `parseColumnar` also accepts `signal?: AbortSignal`: aborting before the call starts rejects immediately without spawning a worker, and aborting mid-parse terminates that parse's worker and rejects with `signal.reason` (a custom `abort(reason)` is passed through as-is). Overlapping `parseColumnar` calls on one `WorkerParser` are cancelled independently: a signal cancels only its own parse, while `terminate()` rejects every in-flight parse with an `AbortError`.
+- Updated dependencies [[`37a5949`](https://github.com/LTplus-AG/ifc-lite/commit/37a5949b1ed3786b52602b62d04bf1ac451844b3), [`f24aff9`](https://github.com/LTplus-AG/ifc-lite/commit/f24aff9a7f7685af2cdf0230fe4c712d7dc37940)]:
+  - @ifc-lite/data@4.5.0
+
+## 7.0.0
+
+### Major Changes
+
+- [#4867](https://github.com/LTplus-AG/ifc-lite/pull/4867) [`e43c455`](https://github.com/LTplus-AG/ifc-lite/commit/e43c455711d4070b530436413db948fedcc34053) Thanks [@louistrue](https://github.com/louistrue)! - Expose the canonical IFC 5D cost read model and decimal evaluation through
+  `bim.cost`, CLI/headless and MCP backends, MCP tools, viewer-local SDK calls,
+  remote capability reporting, and the sandbox bridge.
+  
+  Bound public cost-evaluation precision to 1 through 10,000 significant digits
+  so caller-controlled division cannot request impractical decimal output.
+
+### Minor Changes
+
+- [#4863](https://github.com/LTplus-AG/ifc-lite/pull/4863) [`20bff7c`](https://github.com/LTplus-AG/ifc-lite/commit/20bff7c4069d267aa2662266b6213c3b2b406753) Thanks [@louistrue](https://github.com/louistrue)! - Add a schema-aware IFC cost graph and exact-decimal evaluator with exact relationships, direct CostQuantities-only rates, nested-category totals, dimensional units, currency, and IFC2X3 diagnostics.
+
+## 6.5.0
+
+### Minor Changes
+
+- [#4835](https://github.com/LTplus-AG/ifc-lite/pull/4835) [`863a60e`](https://github.com/LTplus-AG/ifc-lite/commit/863a60ea70034cb8b5c2ebd27e7153a312556c6c) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Add IfcWorkCalendar / IfcWorkTime / IfcRecurrencePattern support to the 4D scheduling pipeline: calendars and their working / exception times are now extracted, round-tripped losslessly on export, and readable from `bim.schedule.data()`. `IfcCreator.addIfcWorkCalendar` (plus the `assignCalendarToTasks` alias) authors them, exposed through `bim.create.*`. Calendars are surfaced read-only — deriving working-day-aware task dates from a recurrence pattern is not implemented.
+
+## 6.4.0
+
+### Minor Changes
+
+- [#4653](https://github.com/LTplus-AG/ifc-lite/pull/4653) [`a2bc270`](https://github.com/LTplus-AG/ifc-lite/commit/a2bc270fb652466f4bd30511aa560997637ee83b) Thanks [@louistrue](https://github.com/louistrue)! - Read `IfcMapConversionScaled` FactorX, FactorY and FactorZ and apply them per axis before the rotation, as the Rust georeference does. `MapConversion` gains optional `factorX`, `factorY` and `factorZ`, and the server-client `Georeferencing` gains optional `factor_x`, `factor_y` and `factor_z` (absent in older server responses; treat a missing factor as 1). A non-finite factor refuses the whole conversion; a zero factor reads as 1. The viewer now also applies the effective `Scale` to heights, as the IFC transform does, so a plain `IfcMapConversion` with a non-unit `Scale` after unit bridging (for example 0.9996) scales heights as well as eastings and northings.
+
+### Patch Changes
+
+- [#4717](https://github.com/LTplus-AG/ifc-lite/pull/4717) [`bb42608`](https://github.com/LTplus-AG/ifc-lite/commit/bb426086f8a3e07d1035f2baa3be973c41cba3e0) Thanks [@louistrue](https://github.com/louistrue)! - The browser and the server now report the same georeferencing for a file whose only georeference is an `IfcProjectedCRS`. A named CRS with no `IfcMapConversion`, or next to a refused one, is the georeference on both sides, with no `source`, and it takes precedence over the `ePSet_MapConversion` and `IfcSite` fallbacks. The server used to skip it and report no georeference or the site location, and it labelled the refused case `mapConversion`. An `IfcProjectedCRS` whose mandatory `Name` is unset or blank no longer counts as a georeference on its own, so the fallbacks run.
+
+- [#4725](https://github.com/LTplus-AG/ifc-lite/pull/4725) [`5a82260`](https://github.com/LTplus-AG/ifc-lite/commit/5a82260e3e0bf686851e724b24dbfa05d11d9c7c) Thanks [@BIMvoice](https://github.com/BIMvoice)! - `EntityFlags.HAS_GEOMETRY` (and `entities.hasGeometry()`) now reflects an `IfcProduct` descendant's own `Representation` attribute presence instead of a class-bucket guess. Previously every entity of a class in the geometry bucket (`IfcElement`, `IfcSpace`, `IfcSite`, …) was stamped `HAS_GEOMETRY` unconditionally, so a placement-only stub — e.g. an `IfcBuildingElementProxy` authored with `Representation` set to `$` — reported geometry it did not have ([#4666](https://github.com/LTplus-AG/ifc-lite/issues/4666)). The flag still does not cover geometry contributed only by aggregated (`IfcRelAggregates`) children: a container whose own Representation is `$` reads `false` even when its aggregated parts have geometry.
+
+- [#4672](https://github.com/LTplus-AG/ifc-lite/pull/4672) [`6d8ebeb`](https://github.com/LTplus-AG/ifc-lite/commit/6d8ebebb7cd8722534ff1ad7817cf7a7d0191aaf) Thanks [@BIMvoice](https://github.com/BIMvoice)! - `extractRelFast`'s hand-written per-STEP-keyword branch ladder (`packages/parser/src/columnar-parser-relationships.ts`) is replaced by a single schema-derived algorithm: for any `IfcRelationship` subtype, the relating (single-reference) and related (reference-or-list) attribute positions are read straight from the codegen-generated schema registries, keyed by the `Relating*`/`Related*` EXPRESS naming convention, not a hand-typed table. `HIERARCHY_REL_TYPES` (the gate that decides which STEP keywords ever reach relationship extraction) is derived the same way, from every concrete `IfcRelationship` subtype across the bundled IFC2X3/IFC4/IFC4X3 registries, replacing an enumeration that [#3964](https://github.com/LTplus-AG/ifc-lite/issues/3964), [#3237](https://github.com/LTplus-AG/ifc-lite/issues/3237) and [#1075](https://github.com/LTplus-AG/ifc-lite/issues/1075) each landed because it was missing one more class.
+  
+  17 previously wholly-unindexed relationship classes (`IfcRelAssignsToActor`, `IfcRelAssignsToResource`, `IfcRelAssignsToProcess`, `IfcRelAssignsToControl`, `IfcRelAssociatesConstraint`, `IfcRelAssociatesApproval`, `IfcRelAssociatesLibrary`, `IfcRelDeclares`, `IfcRelInterferesElements`, `IfcRelCoversBldgElements`, `IfcRelCoversSpaces`, `IfcRelServicesBuildings`, `IfcRelProjectsElement`, `IfcRelFlowControlElements`, `IfcRelSequence`, and the IFC4X3-only `IfcRelPositions`/`IfcRelAdheresToElement`) each get their own `RelationshipType` enum member and edge, instead of being invisible to the relationship graph. `RelationshipType`-keyed name maps in `relationship-graph.ts`, `parquet-exporter.ts`, `cache/sections/relationships.ts` and `duckdb-integration.ts` were extended for exhaustiveness; the last of those was also converted from a non-exhaustive `Record<number, string>` to `Record<RelationshipType, string>` (it had silently been missing `ConnectsPortToElement`, `ConnectsPorts` and `AssociatesDocument` since they were added).
+  
+  A handful of concrete relationship subtypes (`IfcRelDefinesByObject`, `IfcRelDefinesByTemplate`, `IfcRelConnectsStructuralActivity`, `IfcRelConnectsStructuralMember`, `IfcRelConnectsWithEccentricity`, `IfcRelConnectsWithRealizingElements`, `IfcRelSpaceBoundary1stLevel`/`2ndLevel`, plus ten IFC2X3-legacy classes such as `IfcRelAssignsTasks`) now pass the schema-derived gate but still have no dedicated `RelationshipType`/edge — a deliberately scoped remainder, not a regression, tracked against [#4205](https://github.com/LTplus-AG/ifc-lite/issues/4205).
+
+- [#4734](https://github.com/LTplus-AG/ifc-lite/pull/4734) [`2ecf0f0`](https://github.com/LTplus-AG/ifc-lite/commit/2ecf0f096d0f2d6079963040d3293e5964785486) Thanks [@louistrue](https://github.com/louistrue)! - The TypeScript STEP scanners (`StepTokenizer.scanEntitiesFast`, `StepTokenizer.scanEntities`, and the scan worker) no longer drop a record whose entity keyword starts with a lowercase letter. A file written as `[#1](https://github.com/LTplus-AG/ifc-lite/issues/1)=ifcwall(...)` used to yield no entities on those paths while the Rust scanner read it. Keyword case is not significant, so each record's `type` is now named in upper case: `ifcwall`, `IfcWall` and `IFCWALL` all come back as `IFCWALL`.
+
+- [#4727](https://github.com/LTplus-AG/ifc-lite/pull/4727) [`4986957`](https://github.com/LTplus-AG/ifc-lite/commit/4986957c383b88616f3807ee5fe27d41fb0380f4) Thanks [@louistrue](https://github.com/louistrue)! - A conversion-based unit whose `ConversionFactor` does not resolve (a dangling or unreadable `UnitComponent`, or a missing or non-positive factor) is no longer read as if the factor were in SI base units. `extractProjectUnits` now uses the known factor for the unit's name, the same table the model length scale reads, so FOOT given as 304.8 of a dangling unit reads as 0.3048 m instead of 304.8 m. A unit whose name has no known factor shows no unit from `unitForMeasure` rather than the SI default, and `resolvedForUnitType` returns `undefined` for it.
+- Updated dependencies [[`d03e3ce`](https://github.com/LTplus-AG/ifc-lite/commit/d03e3ce4a01dffb60d8951a3ac13f17db37c3415), [`b1a22d7`](https://github.com/LTplus-AG/ifc-lite/commit/b1a22d721e4873883badbdb637630ea0ff88ea82), [`aef7203`](https://github.com/LTplus-AG/ifc-lite/commit/aef7203665f5374f2e867aa4bd43f26ef517c578), [`2343871`](https://github.com/LTplus-AG/ifc-lite/commit/2343871ceed4f42503e770c0a4e593e8827e9f91), [`5f3a915`](https://github.com/LTplus-AG/ifc-lite/commit/5f3a915bc061d4155fb80a6f195b845f4a147a6b), [`8d6df23`](https://github.com/LTplus-AG/ifc-lite/commit/8d6df23e670fbdd771643631d8960db6af99c6da), [`d731f16`](https://github.com/LTplus-AG/ifc-lite/commit/d731f16988996bcba5f5ef01283cdf1c8ab041ba), [`b5920f3`](https://github.com/LTplus-AG/ifc-lite/commit/b5920f316c6dd27030f8b2390deb803a0b9deef8), [`74ba2f2`](https://github.com/LTplus-AG/ifc-lite/commit/74ba2f24e664b37b96e871620fbfdbab653042f3), [`c53b946`](https://github.com/LTplus-AG/ifc-lite/commit/c53b946b5411d613fb5316f48fd03949cf656f75), [`a1b2b77`](https://github.com/LTplus-AG/ifc-lite/commit/a1b2b77d7d3de6878d14e73d888e04b50295a5e2), [`b4bc7df`](https://github.com/LTplus-AG/ifc-lite/commit/b4bc7df25e9cdcd6c46f4affd289c0b3da7829fa), [`9f32c63`](https://github.com/LTplus-AG/ifc-lite/commit/9f32c63083c9341871adac1d645c533c7afcac87), [`eb1b2b1`](https://github.com/LTplus-AG/ifc-lite/commit/eb1b2b1704d0ad5c8a0ee546871e8a266eb53955), [`4091265`](https://github.com/LTplus-AG/ifc-lite/commit/4091265e59279c87444d13f1d25537c00a430797), [`ec446fd`](https://github.com/LTplus-AG/ifc-lite/commit/ec446fd10b5e09724d88be75400119c1456afe6a), [`5ae670d`](https://github.com/LTplus-AG/ifc-lite/commit/5ae670d9701623b98414aafbedc3e8606db9bfa3), [`bbedaf6`](https://github.com/LTplus-AG/ifc-lite/commit/bbedaf629c635e102a3f65e2f7ba3feb77300d98), [`5a82260`](https://github.com/LTplus-AG/ifc-lite/commit/5a82260e3e0bf686851e724b24dbfa05d11d9c7c), [`6d8ebeb`](https://github.com/LTplus-AG/ifc-lite/commit/6d8ebebb7cd8722534ff1ad7817cf7a7d0191aaf), [`9b9f2df`](https://github.com/LTplus-AG/ifc-lite/commit/9b9f2df47e0b1192fe033ca36021499af532220b), [`a4e04e7`](https://github.com/LTplus-AG/ifc-lite/commit/a4e04e7868d6950e0139145319265788699d0afd), [`1f0f2ad`](https://github.com/LTplus-AG/ifc-lite/commit/1f0f2ad8fd3476cb705b0d32e00d07f874705088), [`c3492d1`](https://github.com/LTplus-AG/ifc-lite/commit/c3492d188d9353778dcb62e491cc8b1987d93767), [`7f31b01`](https://github.com/LTplus-AG/ifc-lite/commit/7f31b014f917ac038a316867673528810d9ba46a), [`9df0f93`](https://github.com/LTplus-AG/ifc-lite/commit/9df0f936e291c509c5914a8418535b1dae505517), [`be2fed0`](https://github.com/LTplus-AG/ifc-lite/commit/be2fed0945e7dff83e3fb5d9ba810f0b5a6339a7), [`56cc096`](https://github.com/LTplus-AG/ifc-lite/commit/56cc09672219d33e094b81d419d360ca3ec6e26e), [`478b5fb`](https://github.com/LTplus-AG/ifc-lite/commit/478b5fba37108dd0cf19cd2f71d71158e204f42f), [`6f5e74b`](https://github.com/LTplus-AG/ifc-lite/commit/6f5e74b028d4e8a2b94b05ead18163dd0c46ce9a), [`be2fed0`](https://github.com/LTplus-AG/ifc-lite/commit/be2fed0945e7dff83e3fb5d9ba810f0b5a6339a7)]:
+  - @ifc-lite/wasm@9.0.0
+  - @ifc-lite/data@4.4.0
+
+## 6.3.0
+
+### Minor Changes
+
+- [#4504](https://github.com/LTplus-AG/ifc-lite/pull/4504) [`3af8c93`](https://github.com/LTplus-AG/ifc-lite/commit/3af8c938050373cf95c09502573dead0fd425467) Thanks [@BIMvoice](https://github.com/BIMvoice)! - `EntityNode.containedIn()` now resolves duplicate containment against the same reachable-node set `elementToStorey` uses, so the two APIs agree.
+  
+  When an element is duplicate-declared in more than one `IfcRelContainedInSpatialStructure` edge (a malformed file naming the same element from two different storeys) and the first-declared storey is itself an orphan with no `IfcRelAggregates` edge back to `IfcProject`, `containedIn()` used to return that orphan while `SpatialHierarchyBuilder`'s `elementToStorey` fell through to the reachable, later-declared storey — two APIs answering "which storey is this element on" with a present but different value.
+  
+  `SpatialHierarchy` gains an optional `reachableSpatialNodes` set, which `SpatialHierarchyBuilder` fills from the `computeReachableSpatialNodes` call it already made when resolving `elementToStorey`, and which survives the worker transport. `containedIn()` reads that set rather than deciding reachability for itself, so the two answers come from one computation and cannot drift. First-declared still wins among reachable containers, and `containedIn()` falls back to the first-declared candidate when no candidate is reachable or the store carries no spatial hierarchy, so a disconnected spatial tree never turns a present answer into `null`.
+
+### Patch Changes
+
+- Updated dependencies [[`3af8c93`](https://github.com/LTplus-AG/ifc-lite/commit/3af8c938050373cf95c09502573dead0fd425467)]:
+  - @ifc-lite/data@4.3.0
+
+## 6.2.1
+
+### Patch Changes
+
+- [#4638](https://github.com/LTplus-AG/ifc-lite/pull/4638) [`e46e766`](https://github.com/LTplus-AG/ifc-lite/commit/e46e766640bd37553b1f92f53bb384a47f58e66a) Thanks [@louistrue](https://github.com/louistrue)! - The legacy `IfcSite` georeference fallback reads `RefLatitude`/`RefLongitude` components by position and refuses the angle when a component is not a number. It used to drop non-numeric components and index what was left, so `($,51,30,0)` placed the site at 51°30' instead of reporting no georeference. The Rust extractor applies the same rule, and both are held to it by the shared georeferencing vectors.
+- Updated dependencies [[`1120b6a`](https://github.com/LTplus-AG/ifc-lite/commit/1120b6a3acbbbb579a4e454083b862ed1d445200), [`c5c462e`](https://github.com/LTplus-AG/ifc-lite/commit/c5c462ec54535acd818375f33ffe3ea61d5981fb)]:
+  - @ifc-lite/data@4.2.1
+  - @ifc-lite/wasm@8.0.1
+
+## 6.2.0
+
+### Minor Changes
+
+- [#4608](https://github.com/LTplus-AG/ifc-lite/pull/4608) [`53003de`](https://github.com/LTplus-AG/ifc-lite/commit/53003de1e36a956b7f51e9dffc035218477d5d3c) Thanks [@louistrue](https://github.com/louistrue)! - Add portable STEP archive metadata to collaboration slots and a bounded IFCZIP resource extractor so shared annotations retain referenced appearance resources safely. Property overlays can now delete one quantity while retaining its quantity set.
+
+### Patch Changes
+
+- [#4597](https://github.com/LTplus-AG/ifc-lite/pull/4597) [`74aa364`](https://github.com/LTplus-AG/ifc-lite/commit/74aa364a14360f2af67a1902d7760b623d95c029) Thanks [@louistrue](https://github.com/louistrue)! - Bound the STEP scan's malformed-record recovery at the next declaration ([#4573](https://github.com/LTplus-AG/ifc-lite/issues/4573)). `findEntityLength` and the Blob worker's hand-duplicate walked from a refused record to the `)` balancing it anywhere in the buffer, so a record with no `)` of its own read to end of input, the scan resumed one byte past its `#`, and the next declaration repeated the walk: a file of `[#1](https://github.com/LTplus-AG/ifc-lite/issues/1)=A(2;` repeated was O(n^2), measured 2.5s at 10 000 records and 10s at 20 000 in both `scanEntitiesFast` and the browser scan worker. The same walk balanced across a following declaration, so `[#1](https://github.com/LTplus-AG/ifc-lite/issues/1)=IFCA(2 [#2](https://github.com/LTplus-AG/ifc-lite/issues/2)=IFCWALL($));` dropped [#2](https://github.com/LTplus-AG/ifc-lite/issues/2) with nothing reported. Both walks now stop at the next top-level `=` (ISO 10303-21 has `=` only in `entity_instance_name '=' record`), answer unbalanced, and the scan re-hunts from the refused record's `#`: each refusal costs its own record's bytes, and [#2](https://github.com/LTplus-AG/ifc-lite/issues/2) is found. `scanEntities` (the balanced scan) stops and reports on that shape instead of yielding one mis-spanned record.
+- Updated dependencies [[`0bd9521`](https://github.com/LTplus-AG/ifc-lite/commit/0bd9521554b616c101ab61425d6dc46beb3e904d), [`7562e5b`](https://github.com/LTplus-AG/ifc-lite/commit/7562e5b3f62ec57ca49cd412e35489bbf9e2ee6e), [`9a7710c`](https://github.com/LTplus-AG/ifc-lite/commit/9a7710c9c66e2285aeb215aec5600dfbce1b070e), [`624bfa3`](https://github.com/LTplus-AG/ifc-lite/commit/624bfa3b7d1d636a6142af984613eb5bd79c09b4), [`535055e`](https://github.com/LTplus-AG/ifc-lite/commit/535055ed47af49a22bc04788a1ff7e5755a54933), [`4eef3be`](https://github.com/LTplus-AG/ifc-lite/commit/4eef3be61bcc6fea16fb1a4376a7d7340ab5dc69), [`94074df`](https://github.com/LTplus-AG/ifc-lite/commit/94074df5c7e53557e45dd838ce22990c19544df8), [`ad4672f`](https://github.com/LTplus-AG/ifc-lite/commit/ad4672fc9007f8ac86076f123a1e6020b04af7b6), [`6295f8b`](https://github.com/LTplus-AG/ifc-lite/commit/6295f8b58ee5f85be27470463e4f333f5aa11b35), [`0d8c5da`](https://github.com/LTplus-AG/ifc-lite/commit/0d8c5dac6175255d12ce758fe69c177af849dd03), [`6cc1b43`](https://github.com/LTplus-AG/ifc-lite/commit/6cc1b4362ed7ab2e909b81995bd7d4d99bc268d0), [`f7ea57f`](https://github.com/LTplus-AG/ifc-lite/commit/f7ea57f0555ca77695e28e41cfcfb0e9e7e3a2bb), [`a3aaaf0`](https://github.com/LTplus-AG/ifc-lite/commit/a3aaaf0832b0924237841075f37e76391ef200a2)]:
+  - @ifc-lite/wasm@8.0.0
+  - @ifc-lite/ifcx@4.1.1
+
+## 6.1.0
+
+### Minor Changes
+
+- [#4491](https://github.com/LTplus-AG/ifc-lite/pull/4491) [`3fdbc2b`](https://github.com/LTplus-AG/ifc-lite/commit/3fdbc2b599fad2b1c43ffe014d2bab5f8b8c576c) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Add a cost (5D) read model and on-demand extractor: `extractCostOnDemand` parses `IfcCostItem`, `IfcCostValue`, `IfcCostSchedule`, `IfcRelNests` (cost item breakdown) and `IfcRelAssignsToControl` (cost-schedule-to-cost-item and cost-item-to-product assignment) into a normalized `CostExtraction`. `CostItemInfo.costQuantities` resolves `CostQuantities` in place via the shared `collectQuantitiesFromRefs` walk and never falls back to a product's `Qto_` quantity sets, so a cost estimator's deliberately adjusted quantity is never silently overwritten by the geometry-derived one. IFC2X3 (whose `IfcCostItem` carries no attributes at all) is handled explicitly rather than assumed compatible with IFC4/IFC4X3.
+  
+  `CostValueInfo` now also carries `unitBasis` (`IfcAppliedValue.UnitBasis`, schema slot 3), resolved to a `{ valueComponent, unitSymbol, unitSiScale }` triple via the existing unit-resolution machinery in `project-units.ts`. `UnitBasis` is what distinguishes a rate ("$85 per hour") from a flat total ("$5,000") — without it, two cost values with the same `appliedValue` are indistinguishable, so a naive summing consumer would silently treat a unit price as a total. `unitBasis` is `undefined` when `UnitBasis` itself is absent or its reference does not resolve, matching this module's existing absent-vs-unresolved convention (`costValues`, `parentGlobalId`); the `valueComponent`/`unitSymbol` sub-fields are each individually `undefined` when that half of `IfcMeasureWithUnit` could not be resolved (e.g. an `IfcContextDependentUnit`, which carries no SI conversion) without discarding the rest of the record.
+  
+  This is the read-model + extractor slice of [#4322](https://github.com/LTplus-AG/ifc-lite/issues/4322) — no serializer, query namespace, creator API, or UI yet.
+
+- [#4496](https://github.com/LTplus-AG/ifc-lite/pull/4496) [`511e488`](https://github.com/LTplus-AG/ifc-lite/commit/511e488a8de2b90f7d5f7663911873a92b3427c7) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix two of the relationship-graph folds named in [#4205](https://github.com/LTplus-AG/ifc-lite/issues/4205) that lost information at parse time:
+  
+  - `IfcRelNests` was indexed onto the exact same `RelationshipType.Aggregates` edge as `IfcRelAggregates`, with no way to tell a nesting edge apart from a real decomposition edge once indexed. It now also lands on a distinct `RelationshipType.Nests` edge (in addition to the existing `Aggregates` edge, so every current consumer — spatial hierarchy, decomposition, the IDS `partOf`/ancestors bridge — is unaffected).
+  - `IfcRelAssignsToGroupByFactor` was indexed onto the same `RelationshipType.AssignsToGroup` edge as a plain `IfcRelAssignsToGroup`, and its `Factor` attribute was unreachable from the relationship graph. It now also lands on a distinct `RelationshipType.AssignsToGroupByFactor` edge, and `extractGroupAssignmentFactorOnDemand(store, groupId, memberId)` resolves the `Factor` value (`undefined`, not `0`, when the assignment is plain or absent).
+  
+  This is a narrow fix for the two folds the issue calls out as live defects, not the full schema-derived relationship-edge migration [#4205](https://github.com/LTplus-AG/ifc-lite/issues/4205) also scopes — the hand-written 17-value `RelationshipType` enum and the hand-written relating/related attribute slots are unchanged.
+  
+  Two follow-up fixes for consumers that don't filter by relationship type and so double-counted or mislabeled the new secondary edges:
+  
+  - `ParquetExporter`'s `Metadata.json` `statistics.relationshipCount` counted raw graph edges, so a model with `IfcRelNests`/`IfcRelAssignsToGroupByFactor` relationships reported one extra per such relationship (the new secondary edge counted alongside its broad-bucket edge). It now counts distinct `IfcRel*` records instead.
+  - The DuckDB-backed `relationships` SQL table (`@ifc-lite/query`) rendered `rel_type` as `'Unknown'` for both new types — its type→string map was missed when the other three were updated. Added, with the same display strings as those three maps.
+
+- [#4510](https://github.com/LTplus-AG/ifc-lite/pull/4510) [`53c65fe`](https://github.com/LTplus-AG/ifc-lite/commit/53c65fecdac95b4c19a661be923c225d104a7be8) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Add a structural analysis extractor: `extractStructuralOnDemand` reads IfcStructuralAnalysisModel, the IfcStructuralMember / IfcStructuralConnection / IfcStructuralActivity branches, IfcStructuralLoadGroup and IfcStructuralLoadCase, IfcStructuralResultGroup, IfcBoundaryCondition, IfcRelConnectsStructuralMember, IfcRelConnectsStructuralActivity and IfcRelAssignsToGroup into one connected `StructuralExtraction`, cross-linked by GlobalId.
+  
+  An `IfcStructuralLoadConfiguration` reports one entry per `Values` slot, each carrying the `Locations` row at that same slot, so a nested load the reader could not resolve keeps its position with `value` absent and a `dropped` reason instead of shifting every later load onto an earlier station. `configuration.truncated` and `StructuralExtraction.loadsTruncated` say when a bound of the reader — the nesting cap, the node budget or the cycle guard — stopped the walk, so a truncated configuration is distinguishable from a genuinely small one.
+  
+  Which types count is derived from each type's inheritance chain, and where each attribute sits is resolved from the generated schema registry by EXPRESS attribute name, so a subtype outside the named branches reads correctly without a table entry. Loads and boundary conditions report their components under their exact EXPRESS attribute names, keeping an `IfcBoolean` stiffness boolean rather than collapsing a rigid support to the number 1.
+
+### Patch Changes
+
+- [#4285](https://github.com/LTplus-AG/ifc-lite/pull/4285) [`3a1a322`](https://github.com/LTplus-AG/ifc-lite/commit/3a1a3229412b7822438fa5dba653f6c4e1bd239f) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `SpatialHierarchyBuilder` dropping a real spatial subtree when a malformed `IfcRelAggregates` back-edge (a parent/child pair declared in both directions by mistake) is declared before the legitimate parent edge. `computeCanonicalParent` now skips any tied candidate parent that would close an aggregation cycle back through the child, instead of always taking whichever edge was declared first — so a genuine `IfcProject` anchor can no longer lose a tie to a spurious back-edge purely by STEP declaration order. A tied candidate that does not close a cycle (the pre-existing multiple-real-parents case, [#4095](https://github.com/LTplus-AG/ifc-lite/issues/4095)) is unaffected. Each time a back-edge is skipped, a warning is logged naming the child and the disqualified candidate.
+  
+  `apps/server`'s spatial-hierarchy extraction had the same shape: `spatial.rs`'s `canonical_parent` built with a bare `entry(...).or_insert(...)` over `IFCRELAGGREGATES` edges in file order, with no check for this back-edge case, so the same malformed file orphaned the same subtree there too. Split the resolution into `spatial_canonical_parent.rs` (to stay under the module-size ratchet, mirroring this same split on the TS side) and applied the identical rule: skip a candidate parent reachable from the child by walking forward `IFCRELAGGREGATES` edges, falling back to first-declared if every candidate closes a cycle. Both languages now agree on the same fixture (direct mutual back-edge and a longer indirect 3-node cycle).
+
+- [#4310](https://github.com/LTplus-AG/ifc-lite/pull/4310) [`7f80d53`](https://github.com/LTplus-AG/ifc-lite/commit/7f80d53d2a2c158a322ec541ce064365f3f3ca8a) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `SpatialHierarchyBuilder.elementToStorey` disagreeing with `packages/query`'s `EntityNode.containedIn()` on which storey an element is on when a malformed file names the same element in more than one `IfcRelContainedInSpatialStructure` edge (from different storeys). `elementToStorey` unconditionally overwrote its map entry while walking storeys in build order, so the answer depended on storey traversal order rather than file declaration order. It now resolves the same way `containedIn()` already does — first-declared wins, read directly off the element's inverse `ContainsElements` edge order — independent of which storey the tree walk reaches first or last. One documented divergence remains: `elementToStorey` only considers storeys reachable from `IfcProject` (an orphan storey with no `IfcRelAggregates` edge is never visited, so a later-declared reachable storey wins instead of the element being dropped), while `containedIn()` still returns the raw first-declared edge even when that storey is unreachable. Non-storey containers (`IfcSpace`) never compete for the storey slot.
+  
+  `apps/server`'s spatial-hierarchy extraction had a related gap on the same malformed shape, discovered while checking this PR's own "third path" note: `spatial.rs`'s `element_to_storey` isn't a map at all — it pushed every matching `IFCRELCONTAINEDINSPATIALSTRUCTURE` pair in file order with no winner picked at that layer. `packages/server-client`'s `data-model-decoder.ts` then flattens that lookup table into the viewer's `elementToStorey` `Map` with a plain forward loop and an unconditional `map.set`, so the LAST-declared row silently won — the opposite of the ruling above, and only reachable through the server-loaded (non-wasm) path. Deduped `element_to_storey` in `spatial.rs` to keep only the first-declared row per element before serialization, so the existing decoder logic (unchanged) now agrees with the parser path on the same fixture regardless of iteration order.
+
+- [#4330](https://github.com/LTplus-AG/ifc-lite/pull/4330) [`a53bd7f`](https://github.com/LTplus-AG/ifc-lite/commit/a53bd7fd4510b8d5c992eab26234084c5bb2387e) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix a crash in `serializeScheduleToStep` when exporting a `WorkScheduleInfo`
+  built without `childScheduleGlobalIds` — the field the `IfcWorkPlan` ->
+  `IfcWorkSchedule` `IfcRelNests` grouping fix added. The viewer's standalone
+  `IfcWorkPlan` builder (`buildWorkPlanInfo` in `apps/viewer`) constructs a
+  `WorkScheduleInfo` with `kind: 'WorkPlan'` and no `childScheduleGlobalIds`,
+  which threw `TypeError: Cannot read properties of undefined (reading
+  'length')` on export.
+  
+  `childScheduleGlobalIds` is now optional on `WorkScheduleInfo`; the
+  serializer treats an absent field the same as an empty array (both mean "no
+  nested schedules to write"), so a producer that has no opinion on
+  `IfcRelNests` grouping doesn't have to populate it.
+  
+  Now that both relations round-trip, the viewer's "Generate schedule" dialog
+  also composes the grouping instead of shipping an orphan: `buildWorkPlanInfo`
+  takes the generated `IfcWorkSchedule`(s) globalIds and sets
+  `childScheduleGlobalIds` on the plan it builds, so a plan created through the
+  dialog groups its schedule on export and survives a
+  parse -> serialize -> reparse round trip. A plan generated with no schedules
+  still emits no `IfcRelNests` relation.
+
+- [#4495](https://github.com/LTplus-AG/ifc-lite/pull/4495) [`abda2d8`](https://github.com/LTplus-AG/ifc-lite/commit/abda2d8114ad17b0366f448100953d6e1972164c) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Stop silently dropping a legacy (IFC2X3/IFC4, removed-by-IFC4X3) entity's own attributes from the Rust attribute exporter.
+  
+  `rust/export/src/model_props.rs`'s `render_attributes` read `entity.ifc_type.attribute_names()`, and `entity.ifc_type` is decoded via a bare `IfcType::from_str` in the tokenizer — `Unknown` for any legacy entity, whose `attribute_names()` is `&[]`. So a legacy product or type product (`IFCDOORSTYLE`, `IFCPROXY`, `IFCSLABSTANDARDCASE`, …) already got a correctly-typed, correctly-meshed row — `model.rs` resolves the row's DISPLAY type legacy-aware — but every own-class attribute on that row (`IfcDoorType.OperationType`, `IfcBuildingElementProxy`'s attributes, …) silently vanished from the attribute export, for all 26 names `legacy_entities.rs` already resolves.
+  
+  The fix is not "use the resolved base type's attribute names" — that is unsafe. `IFCDOORSTYLE` (IFC2X3/IFC4) ends `…, OperationType, ConstructionType, ParameterTakesPrecedence, Sizeable`; its resolved base type `IfcDoorType` (IFC4X3) ends `…, PredefinedType, OperationType, ParameterTakesPrecedence, UserDefinedOperationType` — same length, different names from index 8 on, so borrowing the base type's names would rename `Sizeable`'s value to `UserDefinedOperationType` instead of merely dropping it.
+  
+  `scripts/generate-legacy-attribute-names.mjs` ([#4203](https://github.com/LTplus-AG/ifc-lite/issues/4203)) generates `rust/core/src/generated/legacy_attribute_names.rs`: each legacy entity's OWN positional attribute names, read from the same EXPRESS-derived tables the TypeScript side already generates (`packages/data/src/ifc-schema/generated/entities-ifc2x3.ts`, `entities-ifc4.ts`) — not a new EXPRESS parser, and not an approximation. `render_attributes` now consults this table first and falls back to the modern enum's `attribute_names()` unchanged for every name the generated schema already resolves, so an ordinary IFC4X3 class's export is untouched.
+  
+  This addresses one half of [#4203](https://github.com/LTplus-AG/ifc-lite/issues/4203) (generating attribute data per schema version for the classes IFC4X3's `from_str` cannot resolve). It does not change `IfcType::from_str` itself, which still returns `Unknown(u32)` for these names — only the attribute-export path now has a version-correct answer. `legacy_entities.rs` and `rooted_type.rs`'s `LEGACY_ROOTED_TYPES` are unchanged and not attempted for deletion in this PR.
+  
+  Fix a case-sensitivity gap review caught in the lookup this change added. `legacy_attribute_names` matched the STEP keyword exactly, while `legacy_aware_ifc_type` (used to resolve the row's DISPLAY type) normalises case first — so a lowercase-typed legacy entity (`ifcproxy`) resolved the same display type as its uppercase form but MISSED the exact-match lookup, falling through to the resolved base type's `attribute_names()` instead. That silently relabelled the row's own attribute values under the base type's names (`IfcBuildingElementProxy`'s `Tag`/`PredefinedType` instead of `IfcProxy`'s own `ProxyType`/`Tag`) rather than merely dropping them — worse than the pre-fix empty-list behaviour this same change set out to fix. `legacy_attribute_names` now reuses the same `normalise_uppercase` helper `legacy_aware_ifc_type` already uses, so the two legacy lookups cannot diverge on case handling again.
+
+- [#4330](https://github.com/LTplus-AG/ifc-lite/pull/4330) [`a53bd7f`](https://github.com/LTplus-AG/ifc-lite/commit/a53bd7fd4510b8d5c992eab26234084c5bb2387e) Thanks [@BIMvoice](https://github.com/BIMvoice)! - `schedule-extractor.ts` now reads an `IfcRelNests` relation whose `RelatingObject`
+  is an `IfcWorkPlan` nesting `IfcWorkSchedule`s — `WorkScheduleInfo` gained
+  `childScheduleGlobalIds` (on the plan) and `parentPlanGlobalId` (on the
+  schedule) to carry it. Previously the `IfcRelNests` pass only resolved a
+  nesting parent through the task table, so a plan grouping schedules was
+  silently dropped on load with no trace in the extraction result.
+  
+  `schedule-serializer.ts` now emits that `IFCRELNESTS` relation on export from
+  `WorkScheduleInfo.childScheduleGlobalIds`; previously it wrote `IFCRELNESTS`
+  only for task/subtask hierarchy, so an authored `IfcWorkPlan` never grouped
+  its schedules in the written STEP.
+  
+  `schedule-extractor.ts`'s `IfcRelAssignsToControl` pass now also resolves a
+  `WorkPlan` grouping a `WorkSchedule` through that relation (the SDK's
+  `assignSchedulesToWorkPlan` bridge in `packages/create/src/ifc-creator.ts`
+  emits exactly this relation, not `IfcRelNests`) into the same
+  `childScheduleGlobalIds` / `parentPlanGlobalId` fields — previously that pass
+  only resolved `RelatedObjects` through the task table too, so an
+  SDK-authored plan grouping was silently dropped on load the same way. A file
+  that groups the same pair through both relations is not double-counted. The
+  serializer still canonicalizes every grouping to `IFCRELNESTS` on write, so a
+  plan grouped via either relation survives an edit-triggered
+  strip-and-regenerate round trip.
+  
+  Found by comparing against buildingSMART's own IFC4 spec reference file for
+  `IfcTask`, which uses this exact pattern. ifc-lite's own round-trip suite
+  couldn't see the gap: it round-trips the writer through the reader, so a
+  relation the writer never emitted couldn't appear as a mismatch there.
+  
+  A CodeRabbit finding then caught an unguarded append of the same shape in
+  the `IfcWorkPlan` -> `IfcWorkSchedule` `IfcRelNests` pass (two distinct
+  `IfcRelNests` entities nesting the same pair duplicated the edge); fixed
+  with the same `includes()` guard the `IfcRelAssignsToControl` pass's
+  grouping half already used. A sweep for the same shape elsewhere in this
+  file found two more unguarded identity-list appends and fixed both: the
+  task/subtask `IfcRelNests` hierarchy (`childGlobalIds`), and
+  `IfcRelAssignsToControl`'s task-mapping half (`taskGlobalIds` /
+  `controllingScheduleGlobalIds`, guarded together on one predicate so the
+  paired arrays stay in lockstep). `IfcRelAssignsToProcess`'s
+  `productExpressIds` / `productGlobalIds` append was deliberately left
+  unguarded: that relation carries a `QuantityInProcess` attribute, so the
+  same product can legitimately repeat across relations to the same task as
+  separate quantity assignments — it is a multiset, not an identity set, and
+  guarding it would silently drop real data.
+- Updated dependencies [[`6fe4fc8`](https://github.com/LTplus-AG/ifc-lite/commit/6fe4fc8ddac8cbc18f3556fa7bfa778bf6115928), [`c952d49`](https://github.com/LTplus-AG/ifc-lite/commit/c952d497c424ec15b972d87b878b41bf0573460b), [`abda2d8`](https://github.com/LTplus-AG/ifc-lite/commit/abda2d8114ad17b0366f448100953d6e1972164c), [`c952d49`](https://github.com/LTplus-AG/ifc-lite/commit/c952d497c424ec15b972d87b878b41bf0573460b), [`511e488`](https://github.com/LTplus-AG/ifc-lite/commit/511e488a8de2b90f7d5f7663911873a92b3427c7)]:
+  - @ifc-lite/wasm@7.0.0
+  - @ifc-lite/data@4.2.0
+
+## 6.0.0
+
+### Major Changes
+
+- [#4305](https://github.com/LTplus-AG/ifc-lite/pull/4305) [`6110c0d`](https://github.com/LTplus-AG/ifc-lite/commit/6110c0d6bb0c1a96c4da4c056389ebc4dfe26631) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Remove the unused `RELATIONSHIP_TYPES` export. It carried a comment
+  asserting it "MUST include ALL RelationshipType enum values to prevent
+  semantic loss," but nothing in the codebase read the set — parsing is
+  actually gated by the internal `HIERARCHY_REL_TYPES` and
+  `PROPERTY_REL_TYPES` sets and by `REL_TYPE_MAP`.
+  
+  Anyone importing `RELATIONSHIP_TYPES` directly should switch to
+  `REL_TYPE_MAP`, which this package still exports and which covers all 15
+  `RelationshipType` values. `HIERARCHY_REL_TYPES` and `PROPERTY_REL_TYPES`
+  are named above only to describe what really gates parsing — they are
+  internal to `columnar-parser-indexes.ts` and have never been part of this
+  package's public surface, so they are not available as a migration target.
+
+### Minor Changes
+
+- [#4356](https://github.com/LTplus-AG/ifc-lite/pull/4356) [`ced8bb4`](https://github.com/LTplus-AG/ifc-lite/commit/ced8bb46c368648bd54a1bab716d049143faa036) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Surface ambiguous direct storey containment as a detectable signal ([#4311](https://github.com/LTplus-AG/ifc-lite/issues/4311)), a follow-up to the first-declared-wins tie-break from [#4248](https://github.com/LTplus-AG/ifc-lite/issues/4248)/[#4310](https://github.com/LTplus-AG/ifc-lite/issues/4310).
+  
+  An element can be named by more than one `IfcRelContainedInSpatialStructure` edge pointing at different storeys — a malformed-but-real shape both `elementToStorey` and `containedIn()` silently resolved to a single answer, with no way for a caller to tell the containment was contested in the source file.
+  
+  - `SpatialHierarchy` (`@ifc-lite/data`) gains an optional `ambiguousStorey: Set<number>` field: the element ids whose direct storey containment named more than one distinct storey. `SpatialHierarchyBuilder.build()` / `buildFromCache()` (`@ifc-lite/parser`) always populate it (empty when nothing was ambiguous); it also round-trips through the parser worker transport.
+  - `EntityNode.containedInAmbiguous()` (`@ifc-lite/query`) answers the same question per-call, for callers using `containedIn()` instead of the parser's aggregate hierarchy.
+  
+  Neither `elementToStorey`'s nor `containedIn()`'s existing resolution changes — both still return a single winner. Detection reuses the direct-containment lists (`byStorey` / inverse `ContainsElements` edges) each already builds, so it costs no extra graph traversal.
+
+- [#4218](https://github.com/LTplus-AG/ifc-lite/pull/4218) [`b5cb19a`](https://github.com/LTplus-AG/ifc-lite/commit/b5cb19ae80610107f7b3b3914efa7234dfbe4999) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Bring IFC2X3 into `@ifc-lite/codegen` ([#4202](https://github.com/LTplus-AG/ifc-lite/issues/4202)). `packages/codegen/schemas/`
+  now carries `IFC2X3_TC1.exp` (the official buildingSMART express longform
+  distribution) alongside the existing IFC4 and IFC4X3 schemas, and
+  `generateAll()` / `pnpm generate:ifc2x3` produce
+  `packages/codegen/generated/ifc2x3/` the same way the other two do — 653
+  entities, 327 types, 164 enums, 46 selects, with EXPRESS attribute types,
+  optionality, enum/select domains and inheritance chains, not just attribute
+  names. `scripts/check-codegen-sync.mjs` regenerates it in CI and fails the
+  build if the committed copy has drifted from `IFC2X3_TC1.exp`.
+  
+  `IFC2X3_TC1.exp` is the first schema in this repo sourced with CRLF line
+  endings; committed normalized to LF (matching the other two) because a raw
+  `\r` inside a multi-line `SELECT` type's underlying-type string breaks the
+  generated `schema-registry.ts`'s string literal for `tsc`. It also has 12
+  `SET/LIST … OF UNIQUE` occurrences — the syntax [#4212](https://github.com/LTplus-AG/ifc-lite/issues/4212) is filed against for
+  IFC4/IFC4X3 — which the existing UNIQUE-stripping fix already handles
+  correctly for this schema too (zero `UNIQUE` leaks into the generated
+  output).
+  
+  `@ifc-lite/parser` gains `getSchemaRegistryForVersion('IFC2X3' | 'IFC4' |
+  'IFC4X3')`, selecting the codegen-generated runtime registry by schema
+  version. `getSchemaRegistryForVersion('IFC4')` returns the exact
+  `SCHEMA_REGISTRY` object the package already exported, so every existing
+  caller's answer is unchanged. The lookup throws rather than returning an
+  empty registry if a version's `entities` map has zero keys, so a broken
+  regeneration reads as a thrown error, never as a silently empty result.
+
+- [#4261](https://github.com/LTplus-AG/ifc-lite/pull/4261) [`12e69fe`](https://github.com/LTplus-AG/ifc-lite/commit/12e69feb363ea31fb2c3513436366b01c54251e9) Thanks [@louistrue](https://github.com/louistrue)! - Expose original IFCZIP resource paths and model entry paths alongside the existing basename lookup, and report when image extraction limits omit archive resources.
+
+- [#4216](https://github.com/LTplus-AG/ifc-lite/pull/4216) [`04d7b3b`](https://github.com/LTplus-AG/ifc-lite/commit/04d7b3ba0ab64ae9e97420aa8d5c56a536272724) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Add a semantic drop census to the TypeScript parser ([#4208](https://github.com/LTplus-AG/ifc-lite/issues/4208)): every load now counts how many STEP records were scanned per class, how many entered the entity table, which classes the categoriser fell to `CAT_SKIP` for, which classes are unrecognised by the schema registry, and which `IFCREL*` classes were seen but never indexed as relationship-graph edges. The census is a pure, unit-testable computation (`buildDropCensus` in `@ifc-lite/parser`) built from counts collected during the existing single-pass categorisation, so it adds no extra scan of the file. It is always present on `store.dropCensus` after a parse — its absence, not a zero count, is what means the census did not run — and is now surfaced through `ifc-lite info` (table and `--json` output) and the MCP `model_audit` tool.
+  
+  Skipped classes are split into `expectedSkippedClasses` and `unexpectedSkippedClasses`, keyed on whether the class's EXPRESS inheritance chain includes `IfcRoot` (i.e. whether it carries a `GlobalId`). Geometry, placement, and style resource records (`IfcCartesianPoint`, `IfcAxis2Placement3D`, `IfcIndexedPolygonalFace`, …) have no `GlobalId`, are never `IfcRoot` descendants, and fall to `CAT_SKIP` on essentially every real IFC file — tessellated geometry alone can be the majority of a file's records. Reporting that at `model_audit`'s `warning` severity unconditionally, as the first cut of this census did, fires on every file and trains people to ignore the warning; `ifc-lite info`'s "In schema: yes" column gave no cue either, since these are all schema-known classes. `unexpectedSkippedClasses` (an `IfcRoot` descendant — something with its own identity — that still fell to `CAT_SKIP`) stays a `warning`; `expectedSkippedClasses` is now `info`. The split is derived from the schema's own inheritance chain, not a hand-maintained allowlist of class names, so it cannot drift as the schema grows and cannot silently reclassify a class that should have stayed loud.
+  
+  That inheritance-chain split had its own blind spot: `columnar-entity-preparation.ts`'s `RELEVANT_NON_PRODUCT_HELPERS` (`IFCMATERIAL`, `IFCSIUNIT`, `IFCCLASSIFICATION`, `IFCUNITASSIGNMENT`, and 19 other unit/material/classification/document helper classes) are retained by explicit set membership, not by `IfcRoot` descendancy — none of them reach `IfcRoot` in the schema's inheritance chain. If one were ever accidentally dropped from that set, `isRootDescendant` alone would file it under `expectedSkippedClasses` at `info` severity, worded "as expected" — indistinguishable from routine geometry noise, for the entire helper family. `buildDropCensus` now also takes `alwaysRelevantTypes` (the categoriser's own `RELEVANT_NON_PRODUCT_HELPERS` set, passed through rather than duplicated as a second hand-maintained list): a skipped class in that set now lands in `unexpectedSkippedClasses` regardless of `isRootDescendant`.
+  
+  `ifc-lite info`'s table output rendered `unexpectedSkippedClasses`, `expectedSkippedClasses`, and `unindexedRelClasses` but never `unknownClasses` (classes the bundled schema registry does not recognise at all — vendor extensions or a registry gap), even though the field was already in the `--json` payload. It is now rendered in the table output too; the JSON payload is unchanged.
+  
+  This instrument does not fix any of the drops it reveals; those are tracked as separate follow-up issues per [#4208](https://github.com/LTplus-AG/ifc-lite/issues/4208)'s scope.
+
+### Patch Changes
+
+- [#4467](https://github.com/LTplus-AG/ifc-lite/pull/4467) [`83fb539`](https://github.com/LTplus-AG/ifc-lite/commit/83fb539395e3638eb4c72a5c0fb2c508a8746adb) Thanks [@louistrue](https://github.com/louistrue)! - Say when `IfcComplexProperty` nesting was cut short instead of stopping silently at the depth cap (issue [#3972](https://github.com/LTplus-AG/ifc-lite/issues/3972)). A complex property nested deeper than 8 levels used to degrade to the bare `UsageName`, which is indistinguishable from a complex property that genuinely has no nested content; when the capped node had no `UsageName` the whole nested member vanished and its parent's own `UsageName` was shown in its place, so the reader saw a real value attributed to the wrong nesting level. The value now carries a `(truncated: nesting deeper than 8 levels)` suffix, byte-identical to the server's `resolve_complex_property_value`. The cap itself is unchanged — it is what makes a self-referencing `HasProperties` chain terminate.
+
+- [#4217](https://github.com/LTplus-AG/ifc-lite/pull/4217) [`f33ac74`](https://github.com/LTplus-AG/ifc-lite/commit/f33ac74dd0578792327f684ba5ca59f050458c65) Thanks [@louistrue](https://github.com/louistrue)! - Add the missing MPL-2.0 file headers these packages ship without ([#4087](https://github.com/LTplus-AG/ifc-lite/issues/4087)).
+  
+  `packages/renderer/src/{bvh,raycaster,snap-detector}.ts`, `packages/geometry/src/huge-file-error.ts` and three test files carried no license notice at all. `scripts/add-license-headers.mjs --check` now runs in CI, so the omission cannot recur. No behaviour, API surface or output changes: every edit is a four-line comment at the top of a file.
+
+- [#4464](https://github.com/LTplus-AG/ifc-lite/pull/4464) [`85e0351`](https://github.com/LTplus-AG/ifc-lite/commit/85e0351c6bcbc350c404176e484320baa08a1366) Thanks [@louistrue](https://github.com/louistrue)! - Fix the fast STEP entity scan swallowing the next record when one is missing its own `;`. `[#2](https://github.com/LTplus-AG/ifc-lite/issues/2)=IFCB(2)` with no terminator used to run on to the *next* record's `;`, so `[#1](https://github.com/LTplus-AG/ifc-lite/issues/1)=IFCA(1);\n#2=IFCB(2)\n#3=IFCC(3);\n#4=IFCD(4);` yielded `[#1](https://github.com/LTplus-AG/ifc-lite/issues/1)`, `[#2](https://github.com/LTplus-AG/ifc-lite/issues/2)` (with a byte span covering all of `[#3](https://github.com/LTplus-AG/ifc-lite/issues/3)`), and `[#4](https://github.com/LTplus-AG/ifc-lite/issues/4)`, with `[#3](https://github.com/LTplus-AG/ifc-lite/issues/3)` gone and `malformedRecordCount` still `0`. The same shape with a truncated last record absorbed the file's `ENDSEC;` footer into that record and still reported success.
+  
+  The scan is now bounded to the record's own body by two ISO 10303-21 grammar rules: the last significant byte before the terminator must be the `)` closing the parameter list, and no `=` may appear before it outside a string or comment (`=` occurs only in `entity_instance_name '=' record`). A record that fails either rule is dropped and reported, and the scan resumes at the `)` closing its own parameter list, so one bad record costs one record. Stopping instead would have cost far more: a shard whose scanner stops hands back no handoff, and the stitch then discards every later shard, turning one missing `;` into the loss of the whole tail of the model on the sharded viewer path (measured: 40 records in, 19 out). An unterminated string or comment still has nothing to resume from, so that case stops exactly as before.
+  
+  Applied to all three hand-duplicated copies of the scan: `tokenizer.ts`, the Web Worker's `scan-worker-source.ts`, and the Rust `EntityScanner` behind the wasm path, which is why `@ifc-lite/wasm` is bumped alongside the parser.
+  
+  A record with no closing `)` at all is dropped the same way rather than ending the scan: its literals and comments all closed, so the bytes after it are still readable and the scan re-hunts from past its `#`. Only a literal or comment that never closes leaves nothing to resume from, and that still stops the scan as before.
+
+- [#4214](https://github.com/LTplus-AG/ifc-lite/pull/4214) [`6f0078b`](https://github.com/LTplus-AG/ifc-lite/commit/6f0078bc8ae697c9e6f91ae5b36546476b0fee5b) Thanks [@BIMvoice](https://github.com/BIMvoice)! - The columnar parser now retains every `IfcRoot` descendant in the `EntityTable`, derived from the schema registry's inheritance chain, in addition to `IfcProduct` subtypes, `IfcGroup` subtypes and anything named `IfcRel*`. `IfcTask`, `IfcActor`, `IfcCostItem`, `IfcResource`, `IfcStructural*`, `IfcProjectLibrary`, `IfcPropertySetTemplate` and other non-product `IfcObject`/`IfcContext`/`IfcPropertyTemplateDefinition` classes previously fell to `CAT_SKIP` and were unaddressable: `getGlobalId` and `getTypeName` answered `''` and `'Unknown'` for them even though the scanner's byId/byType index still saw the record.
+  
+  The original `IfcRel*` name-prefix test is kept alongside the new schema-derived check, not replaced by it: it still matches lexically for `IfcRelaxation` (a real IFC2X3 material-property-resource entity, not a relationship, that is not an `IfcRoot` descendant) and for any vendor extension named `IfcRel*` that the bundled schema registry doesn't know at all, both of which the schema-derived check alone would miss. A schema-registry sanity check now throws rather than parsing silently if the inheritance walk ever fails to reach `IfcRoot`.
+
+- [#4376](https://github.com/LTplus-AG/ifc-lite/pull/4376) [`be4fdb9`](https://github.com/LTplus-AG/ifc-lite/commit/be4fdb9ffe6995c74d3629887021c98b843beadb) Thanks [@louistrue](https://github.com/louistrue)! - Resolve containing spaces from the live canonical containment index so authored annotations, Undo and Redo cannot retain stale space membership. Aggregated descendants use their nearest containing space too.
+
+- [#4306](https://github.com/LTplus-AG/ifc-lite/pull/4306) [`a6976b9`](https://github.com/LTplus-AG/ifc-lite/commit/a6976b9da44d13157533372a8def23995fcfb93f) Thanks [@BIMvoice](https://github.com/BIMvoice)! - New `@ifc-lite/wasm-lifecycle` package: extracts the WASM engine load-retry classification (`initWasmWithRetry`, `isTransientWasmLoadError`) and the cross-realm panic-location forwarder (`takeWasmPanicStash`, `restashWasmPanicLocation`) that `@ifc-lite/geometry` and `@ifc-lite/parser` each carried as an independently-editable "twin" copy, with nothing enforcing the two stayed in sync ([#4247](https://github.com/LTplus-AG/ifc-lite/issues/4247)).
+  
+  `@ifc-lite/wasm` — the one package both consumers already depend on — was deliberately not used as the shared home: it ships only the wasm-pack build output with no TypeScript build step, so a hand-written module there would gate every geometry/parser test run on a full Rust→wasm rebuild. `@ifc-lite/wasm-lifecycle` is a plain TypeScript package (its own `tsc` build, same shape as `@ifc-lite/regex-guard`) with no wasm dependency of its own, so it avoids that cost.
+  
+  `@ifc-lite/geometry` and `@ifc-lite/parser` now each re-export the shared module from their own `wasm-init-retry.ts` / `wasm-panic-forward.ts`, so existing imports are unchanged. No behavior change in either package.
+- Updated dependencies [[`ced8bb4`](https://github.com/LTplus-AG/ifc-lite/commit/ced8bb46c368648bd54a1bab716d049143faa036), [`069020f`](https://github.com/LTplus-AG/ifc-lite/commit/069020f0ef51e8908c6fe86e6c3da011418d42d8), [`c5e583e`](https://github.com/LTplus-AG/ifc-lite/commit/c5e583e3c25349753dc415184359eba08db9c8ae), [`8ccd02d`](https://github.com/LTplus-AG/ifc-lite/commit/8ccd02dfa431b9194d7936b8966b5aabf4c34694), [`e776543`](https://github.com/LTplus-AG/ifc-lite/commit/e77654353eba7281429a2dbe7c7d973b3bbf0d9f), [`934d4e8`](https://github.com/LTplus-AG/ifc-lite/commit/934d4e819a0399b8f0b7d99b9c056e595e55cca5), [`de30321`](https://github.com/LTplus-AG/ifc-lite/commit/de303215ad631d54069067682f443ef33d7d37f3), [`32429a1`](https://github.com/LTplus-AG/ifc-lite/commit/32429a1e460fc4efee4c334037ac49a8738a5e0f), [`e844910`](https://github.com/LTplus-AG/ifc-lite/commit/e844910ce1b09db412687aa1a864649b8d77e4f6), [`cd0e214`](https://github.com/LTplus-AG/ifc-lite/commit/cd0e214cccbf81787a0b9c07735982cb101bad62), [`d4648ad`](https://github.com/LTplus-AG/ifc-lite/commit/d4648adb76466633733236087e527ff3e3780d81), [`b0700f2`](https://github.com/LTplus-AG/ifc-lite/commit/b0700f25434d1cf1ec5f7438a8e27c09188208ec), [`35fa016`](https://github.com/LTplus-AG/ifc-lite/commit/35fa016128b1c660ff822e6638d3274da68ebe09), [`85e0351`](https://github.com/LTplus-AG/ifc-lite/commit/85e0351c6bcbc350c404176e484320baa08a1366), [`be64c7c`](https://github.com/LTplus-AG/ifc-lite/commit/be64c7c3e0a8895869c459a798c2d1163f23c1b9), [`37f44ac`](https://github.com/LTplus-AG/ifc-lite/commit/37f44ac632f54322b89c7813723cad7e8e2b1ba5), [`c80a6cc`](https://github.com/LTplus-AG/ifc-lite/commit/c80a6cc2450252293761bf00174703e2bfd2483f), [`be4fdb9`](https://github.com/LTplus-AG/ifc-lite/commit/be4fdb9ffe6995c74d3629887021c98b843beadb), [`994cf95`](https://github.com/LTplus-AG/ifc-lite/commit/994cf950ab7a09613460f68f9ad16196b0bb64e1), [`a1d41d8`](https://github.com/LTplus-AG/ifc-lite/commit/a1d41d8187e564606d556e46c9a96a8022797234), [`5268ba3`](https://github.com/LTplus-AG/ifc-lite/commit/5268ba33f60577d0707ac5dcfdf3ab45a16e9bd0), [`68a6af8`](https://github.com/LTplus-AG/ifc-lite/commit/68a6af8c58f27895327ca0cf2b218ea15bd14050), [`f55a14e`](https://github.com/LTplus-AG/ifc-lite/commit/f55a14ec02d5a08e22bbd06dd960edc057aa9877), [`2ab5f15`](https://github.com/LTplus-AG/ifc-lite/commit/2ab5f15a60f22cb1ed8f066ff2f41b37e4f76698), [`6ff9efa`](https://github.com/LTplus-AG/ifc-lite/commit/6ff9efaf184d466639516c2728024aa23a2f6b33), [`d39d9a4`](https://github.com/LTplus-AG/ifc-lite/commit/d39d9a499a3fbc81650bfab7562b6d89df4a53f8), [`52532e0`](https://github.com/LTplus-AG/ifc-lite/commit/52532e01ed9513cd49144f935fd282c19158339d), [`8f8b017`](https://github.com/LTplus-AG/ifc-lite/commit/8f8b0179be76fea8cb7f21b34bb6408084e410af), [`a88027b`](https://github.com/LTplus-AG/ifc-lite/commit/a88027b9ae642da850a3515d8eef83d750b655b3), [`8198c44`](https://github.com/LTplus-AG/ifc-lite/commit/8198c44e0297657f7775a3ee6bd10855bd23c132), [`7934571`](https://github.com/LTplus-AG/ifc-lite/commit/7934571755febaae5287cc4a876bcf2c8b8b2463), [`d4e7b99`](https://github.com/LTplus-AG/ifc-lite/commit/d4e7b99baa4349f1ae096fc2f194e46a8049ccb9), [`227a93c`](https://github.com/LTplus-AG/ifc-lite/commit/227a93cd166376b76c9feaa74e7f7fad27f5c941), [`379852a`](https://github.com/LTplus-AG/ifc-lite/commit/379852a658bae039f312dcb8547629703891d2f9), [`ae85338`](https://github.com/LTplus-AG/ifc-lite/commit/ae8533851faa4fe9508d36cfb1a2ca99c240ec7b), [`a6976b9`](https://github.com/LTplus-AG/ifc-lite/commit/a6976b9da44d13157533372a8def23995fcfb93f), [`6138db1`](https://github.com/LTplus-AG/ifc-lite/commit/6138db1220bd148f8226c922255441a2047d2c6b)]:
+  - @ifc-lite/data@4.1.0
+  - @ifc-lite/wasm@6.5.0
+  - @ifc-lite/wasm-lifecycle@0.2.0
+  - @ifc-lite/ifcx@4.1.0
+
+## 5.2.0
+
+### Minor Changes
+
+- [#4012](https://github.com/LTplus-AG/ifc-lite/pull/4012) [`a24b8cf`](https://github.com/LTplus-AG/ifc-lite/commit/a24b8cff9598e48c75c5f9fbebd036e72c09063e) Thanks [@louistrue](https://github.com/louistrue)! - Expose borrowed compact entity columns to compatible consumers and reuse them when writing binary cache indexes. Preserve the existing binary layout, normalized type order, generic iterable inputs and borrowed-buffer ownership while avoiding reference-object reconstruction for valid compact indexes.
+
+- [#4013](https://github.com/LTplus-AG/ifc-lite/pull/4013) [`90f4859`](https://github.com/LTplus-AG/ifc-lite/commit/90f4859b73f694114baec821721be498757b9c48) Thanks [@louistrue](https://github.com/louistrue)! - Reuse immutable entity-index publications across parser worker messages, terminate completed workers before receiver hydration, and expose constant-time maxExpressId for model ingestion without scanning all references.
+
+- [#4014](https://github.com/LTplus-AG/ifc-lite/pull/4014) [`62e41d5`](https://github.com/LTplus-AG/ifc-lite/commit/62e41d57ec5a41769b91d01e35d10113de91900b) Thanks [@louistrue](https://github.com/louistrue)! - Share an exact full-source fingerprint from the existing prepass through a fresh optional per-load cell. Preserve previous Rust and JavaScript methods, worker scheduling, parser fallback and partial/final source identity.
+
+- [#3959](https://github.com/LTplus-AG/ifc-lite/pull/3959) [`5cbe8aa`](https://github.com/LTplus-AG/ifc-lite/commit/5cbe8aac32ee1b8871357c7dcd9c1154161322d5) Thanks [@BIMvoice](https://github.com/BIMvoice)! - `extractClassificationsOnDemand` now resolves real classification attributes on a server-parsed store instead of always returning `[]`.
+  
+  The server already extracts `IfcRelAssociatesClassification` associations correctly (`system`/`identification`/`name`/`location`, walking the `IfcClassificationReference` chain server-side), but a server-parsed `IfcDataStore` carries no raw source bytes, so `extractClassificationsOnDemand`'s `EntityExtractor`-based decoding always fell through to an empty result — indistinguishable from a genuinely unclassified entity, even when the relationship graph proved otherwise.
+  
+  `IfcDataStore` gains an optional `resolvedClassifications?: Map<number, ClassificationInfo[]>` field. When present, `extractClassificationsOnDemand` consults it (for the entity itself and, via `IfcRelDefinesByType`, its type) when nonempty, otherwise preserving unresolved markers, so a viewer- or MCP-side IDS check against a server-parsed model can now resolve system- and value-constrained classification facets instead of reporting them as unclassified. The wasm/source-bearing path is unaffected — it still resolves attributes directly from `store.source`.
+
+### Patch Changes
+
+- [#4132](https://github.com/LTplus-AG/ifc-lite/pull/4132) [`68c322f`](https://github.com/LTplus-AG/ifc-lite/commit/68c322f91195adcf5b206d020025e11824b80d08) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `SpatialHierarchyBuilder` building a different spatial hierarchy depending on relationship-traversal order when a space (or spatial zone) is both aggregated under one spatial container via `IfcRelAggregates` and merely contained under a different one via `IfcRelContainedInSpatialStructure` - a malformed but real cross-linked authoring-tool export.
+  
+  Previously the builder deduped a spatial child only through a global DFS `visited` set, so whichever parent was visited first won the real node while the other received an empty stub - AND that other parent's `children` still listed the id, a dangling reference to a node that lived elsewhere in the tree. The same file loaded fresh vs. from cache, or with its relationships listed in a different order, could therefore produce two disagreeing hierarchies.
+  
+  The builder now resolves each spatial child's ONE canonical parent globally, before recursion starts: aggregation always wins over containment, and a tie between multiple edges of the same kind resolves to whichever `IfcRelAggregates`/`IfcRelContainedInSpatialStructure` was declared FIRST in the file - not the lowest express id, which an earlier version of this fix used as a proxy for declaration order. STEP does not require express ids to ascend with declaration position, so a file that declares a high-id relationship before a low-id one made that proxy disagree with the Rust server's own tie-break. The relationship graph's inverse edge list already preserves declaration order (the parser appends edges while scanning `IfcRel*` records in file order, and the CSR build's counting sort is stable per key), so the first edge in that list is used directly. A losing parent no longer builds or lists the child at all. This mirrors the Rust server's `canonical_parent` pass (`apps/server/src/services/data_model/spatial.rs`), which keeps the first `IfcRelAggregates` it sees while iterating relationships in file-scan order.
+  
+  `computeCanonicalParent` was split into `packages/parser/src/spatial-hierarchy-canonical-parent.ts` to keep `spatial-hierarchy-builder.ts` under the repo's module-size budget.
+- Updated dependencies [[`58504e7`](https://github.com/LTplus-AG/ifc-lite/commit/58504e7ad1cb5377e2ab48fe212a5d14998fccf9), [`9dd8ba1`](https://github.com/LTplus-AG/ifc-lite/commit/9dd8ba133f4d261b3ebc9d37fbf8962a63890b8c), [`2ac2d03`](https://github.com/LTplus-AG/ifc-lite/commit/2ac2d03b874bd9f58637c8c8d194b8f8a9e563af), [`62e41d5`](https://github.com/LTplus-AG/ifc-lite/commit/62e41d57ec5a41769b91d01e35d10113de91900b), [`85089b1`](https://github.com/LTplus-AG/ifc-lite/commit/85089b1ccbf43d7d9982cd8a2f7c31de8e2207df), [`165ee1f`](https://github.com/LTplus-AG/ifc-lite/commit/165ee1fa486f799f59531fe332cad6bf67bd3f10), [`e409924`](https://github.com/LTplus-AG/ifc-lite/commit/e40992485dd2a0c845225be237c65fd12603d689), [`96ea5f0`](https://github.com/LTplus-AG/ifc-lite/commit/96ea5f08e4872cb50fe9eac7a9878ff607eb3f4a)]:
+  - @ifc-lite/wasm@6.4.0
+
+## 5.1.0
+
+### Minor Changes
+
+- [#3951](https://github.com/LTplus-AG/ifc-lite/pull/3951) [`af067e5`](https://github.com/LTplus-AG/ifc-lite/commit/af067e598e64cbc8265fdcd462ac9cb9727711a2) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix a server-parsed (source-empty) store reporting a genuinely classified entity as unclassified ([#3948](https://github.com/LTplus-AG/ifc-lite/issues/3948)). `extractClassificationsOnDemand` and `extractClassificationSystemsOnDemand` (`packages/parser/src/classification-resolver.ts`) resolved classification ids via the relationship graph on server-parsed stores, then unconditionally discarded the result with `if (!store.source?.length) return [];` — a classified entity was byte-identical to an unclassified one to every caller, including the IDS bridge.
+  
+  The classification's own attributes (system name, identification code, reference chain) genuinely cannot be read without raw STEP bytes, and no equivalent precomputed table exists for them on a server-parsed store (unlike type-inherited property sets, fixed for the same shape of bug in [#1795](https://github.com/LTplus-AG/ifc-lite/issues/1795)/[#1787](https://github.com/LTplus-AG/ifc-lite/issues/1787)). So both functions now signal "classified, but unresolved" distinctly from "genuinely unclassified": `extractClassificationsOnDemand` returns one `{ unresolved: true }` entry per resolved id instead of `[]`, and `extractClassificationSystemsOnDemand`'s return type changes from `string[]` to `{ names: string[]; unresolved: boolean }` (a breaking signature change with no known external callers today).
+  
+  The IDS classification facet checker (`packages/ids/src/facets/classification-facet.ts`) now treats presence-only facets correctly (a classified entity passes an "any classification" requirement instead of a false `CLASSIFICATION_MISSING`), and reports a new `CLASSIFICATION_UNRESOLVED` failure — distinct from `CLASSIFICATION_MISSING`/`CLASSIFICATION_VALUE_MISMATCH`/`CLASSIFICATION_SYSTEM_MISMATCH` — when a system/value-constrained facet cannot be verified because the matching classification's attributes are unreadable, instead of silently passing or failing on data it never read.
+  
+  Both message formatters (`packages/ids/src/translation/service.ts` and `packages/ids/src/validation/validator.ts`) now have a case for `CLASSIFICATION_UNRESOLVED` — previously both fell through to their `default` branch and showed the raw enum ("Validation failed: CLASSIFICATION_UNRESOLVED") in the viewer's IDS panel and exported reports, indistinguishable from a genuine violation. The message now states plainly that the entity is classified but the details could not be read from this data source. `ClassificationCard.tsx` (properties panel) gets the same "unavailable on this data source" treatment already added to `ModelMetadataPanel.tsx`, instead of rendering an empty "Classification / Unknown" card for an unresolved entry.
+
+### Patch Changes
+
+- [#3921](https://github.com/LTplus-AG/ifc-lite/pull/3921) [`e1d807c`](https://github.com/LTplus-AG/ifc-lite/commit/e1d807cf4bf4f3bf25122fed4d7e3fde8296bf6d) Thanks [@louistrue](https://github.com/louistrue)! - Reduce cold IFC parsing work by reusing ordered entity references, avoiding redundant sorting, and limiting georeferencing property-set discovery without changing the parser API.
+
+- [#3984](https://github.com/LTplus-AG/ifc-lite/pull/3984) [`6094e2f`](https://github.com/LTplus-AG/ifc-lite/commit/6094e2f16f27c80bc227f73bbdf634a770f17abc) Thanks [@louistrue](https://github.com/louistrue)! - Avoid Firefox stalls while publishing large-model metadata by keeping entity-cache eviction linear across scans and preparing georeferencing and source fingerprints in the parser worker.
+- Updated dependencies [[`09f9419`](https://github.com/LTplus-AG/ifc-lite/commit/09f941947666f567cd1fd6fd362041e048868434)]:
+  - @ifc-lite/wasm@6.3.0
+
+## 5.0.0
+
+### Major Changes
+
+- [#3420](https://github.com/LTplus-AG/ifc-lite/pull/3420) [`4475e58`](https://github.com/LTplus-AG/ifc-lite/commit/4475e583ea35def444fb6d7ba92410629bd89096) Thanks [@louistrue](https://github.com/louistrue)! - Report a refused oversized express id on every load path, not just one ([#3395](https://github.com/LTplus-AG/ifc-lite/issues/3395)).
+  
+  Refusing a record whose instance name does not fit `u32` is only half a guard; the other half is saying so. The first version of this fix wired the report into one TypeScript path and one wasm entry point, which left every other consumer returning a model that was quietly short — a missing bound corrupts, a missing report returns a truncated success, and the second failure is the harder one to notice because a load with nothing to refuse looks identical.
+  
+  **The canonical viewer path.** For a file at or above 2 MB the geometry pre-pass has already scanned it and hands the parser worker its entity-index columns, so `scanIfcEntities` never scans at all. A refused record is absent from those columns by construction, so nothing downstream can recount it. The refusal now travels with them: the pre-pass `entity-index` event carries `oversizedIdCount`, `processParallel`'s `onEntityIndex` callback receives it as a fourth argument, `WorkerParser.setEntityIndex` takes it as an optional fourth parameter, and `PreScannedEntityIndex.oversizedIdCount` feeds it into the existing `console.warn` + `onDiagnostic` report. `EntityScanResult.oversizedIdCount` is therefore trustworthy on the `pre-scanned` path now, where its own documentation previously had to warn that a zero proved nothing.
+  
+  **A shard hands back offsets, not a count, and does not report.** `scanEntityIndexShard` returns `oversizedIdStarts`, the global start byte of each record that shard refused. A shard begins at an arbitrary byte, so it can start inside a quoted value, and `EntityScanner` has no quote context — its only guard is the shape `#<digits>[ws]*=`, which a string literal containing `[#4294967297](https://github.com/LTplus-AG/ifc-lite/issues/4294967297)=IFCWALL(` satisfies. A shard therefore refuses records the file never declared, arbitrarily many of them, and a per-shard report would warn "skipped N records" about a file that is fine. The main-thread stitch keeps only the offsets at or after the boundary it validated for that shard — the same boundary its records are cut at — and reports once per load. Native does the same: `build_entity_index_parallel` reports after its stitch, and `ifc_lite_processing::scan_shard_with_refusals` / `scan_shard_classified_with_refusals` hand the offsets to whoever stitches them.
+  
+  **The native and second-wasm paths.** `ifc_lite_core::report_oversized_ids` is the one place Rust words this report; `build_entity_index`, `ColumnarEntityIndex::from_scan`, `build_entity_index_parallel`, the streaming processor scan and both wasm scan entry points call it, so the CLI, server and Python wheel no longer return a model silently missing the record. It goes to stderr by default, and the wasm bindings point it at the browser console from `#[wasm_bindgen(start)] init()`, which runs when the module loads, because `wasm32` has no stderr to write to.
+  
+  A refusal stays a **diagnostic, not an error**: `[#4294967297](https://github.com/LTplus-AG/ifc-lite/issues/4294967297)` is a legal ISO 10303-21 instance name, so failing the load would turn one lost record into a lost file that is otherwise fine, and would make native refuse a file the browser still opens.
+  
+  The `@ifc-lite/geometry` and `@ifc-lite/wasm` additions are optional or additive, so their
+  callers compile and behave unchanged. `@ifc-lite/parser` is NOT: `EntityScanResult` gains a
+  REQUIRED `oversizedIdCount`, so anything constructing that shape must supply it. See the
+  `parser-express-id-u32-bound` entry for the breaking notice and migration.
+
+- [#3420](https://github.com/LTplus-AG/ifc-lite/pull/3420) [`4475e58`](https://github.com/LTplus-AG/ifc-lite/commit/4475e583ea35def444fb6d7ba92410629bd89096) Thanks [@louistrue](https://github.com/louistrue)! - Refuse an express id above 4294967295 at the parse boundary instead of letting it truncate into a real entity's key ([#3395](https://github.com/LTplus-AG/ifc-lite/issues/3395)).
+  
+  **BREAKING**, in two ways a consumer can hit. `EntityScanResult` gains a REQUIRED `oversizedIdCount: number`, so anything that constructs one against the exported shape (a test double, a custom scanner adapter) stops compiling until it supplies the field; code that only reads the result of `scanIfcEntities` is unaffected. And `CompactEntityIndexBuilder.add` / `buildCompactEntityIndex` / `buildCompactEntityIndexAsync` now throw a `RangeError` on an id outside `[0, 4294967295]` where they previously narrowed it, so a caller that fed one an out-of-contract id and got a corrupt index back now gets an exception instead. The required field is what makes this a major rather than a minor: the old narrowing was silent corruption rather than a contract anyone could depend on, but the type was not corrupt before.
+  
+  Express ids have a de-facto 32-bit representation contract. `CompactEntityIndex`, the entity/property/quantity tables, the relationship graph, the data-store transport columns, the wasm boundary and the Rust core all store them as `u32`, but nothing enforced it on the way in. Every parse-boundary guard tested `Number.isSafeInteger`, which admits ids up to 2^53, so `[#4294967297](https://github.com/LTplus-AG/ifc-lite/issues/4294967297)` was accepted and then stored as `4294967297 % 2^32 = 1`: the index held a duplicate key `1` serving the oversized record's byte range and type, and because the narrowing happened after the ids were sorted, the entry also landed out of order and broke the sorted invariant `binarySearch` relies on. Measured on a three-record file, `store.entities.getGlobalId(1)` returned the oversized record's GlobalId.
+  
+  The bound now lives in one place (`isIndexableExpressId`) and every admission and reference site routes through it: both `StepTokenizer` scans, the inline scan worker, `EntityExtractor`, `getReference`, and the byte-level `readRefId`. `[#4294967295](https://github.com/LTplus-AG/ifc-lite/issues/4294967295)` (`u32::MAX`) is still admitted, and negative ids are refused for the same reason a large one is: `new Uint32Array(1)[0] = -1` reads back as 4294967295.
+  
+  Refusals are counted and reported rather than dropped silently. `StepTokenizer.oversizedIdCount` and the new `EntityScanResult.oversizedIdCount` carry the count, and `scanIfcEntities` emits an `onDiagnostic` message plus a `console.warn` when it is nonzero. The count is one per refused *record*, matching Rust's `EntityScanner`: both TypeScript scans test the bound only once `#<digits>[ws]*=` has matched, because an accepted record is left behind by skipping to its `;` while a refused one is not, so the scan walks the refused record's argument list — where `[#4294967297](https://github.com/LTplus-AG/ifc-lite/issues/4294967297)=IFCWALL([#4294967298](https://github.com/LTplus-AG/ifc-lite/issues/4294967298),[#4294967299](https://github.com/LTplus-AG/ifc-lite/issues/4294967299),…)` would otherwise be reported as three skipped records for the one that was dropped. Behaviour change for pathological files: a record with an out-of-contract id now visibly disappears from the load instead of silently corrupting the index. `CompactEntityIndexBuilder.add` and `buildCompactEntityIndex`/`buildCompactEntityIndexAsync` now throw a `RangeError` naming the id rather than narrowing it, so a future path that forgets the boundary guard fails where the mistake is.
+  
+  This supersedes the `Float64Array` id buffer added to the inline scan worker in [#3330](https://github.com/LTplus-AG/ifc-lite/issues/3330): with the tighter bound the widening carried ids no consumer could hold, so the buffer is back to `Uint32Array`.
+  
+  ## Migrating
+  
+  - Constructing an `EntityScanResult` by hand: add `oversizedIdCount: 0`. Reading one needs no change, and the new field is the count of records the scan refused.
+  - Feeding `CompactEntityIndexBuilder.add` or `buildCompactEntityIndex`/`buildCompactEntityIndexAsync` from refs ifc-lite did not scan: bound the ids first, or catch the `RangeError`. Refs from `StepTokenizer`/`scanIfcEntities` are already bounded, and so is any `Uint32Array` id column, so neither of this repository's two non-scan call sites can reach the throw.
+
+### Minor Changes
+
+- [#3644](https://github.com/LTplus-AG/ifc-lite/pull/3644) [`2b594d2`](https://github.com/LTplus-AG/ifc-lite/commit/2b594d20616f957f7ef949aa8563274e5373a95b) Thanks [@BIMvoice](https://github.com/BIMvoice)! - New export `scaleMeasureValue(value, dataType, projectUnits)`: scales a property value declared with a project-scoped IFC measure type (`IfcLengthMeasure`, `IfcAreaMeasure`, `IfcPositiveLengthMeasure`, …) to base SI, using `ProjectUnits.unitForMeasure`. A no-op for a value with no numeric type, no `dataType`, or a `dataType` with no project-scoped unit.
+  
+  Added to fix a false positive in every model-diff adapter (`ifc-lite diff --by-content`, the viewer's compare panel, `model_diff`): an `IfcPropertySingleValue` measure is stored in the project's raw author unit exactly like an `IfcElementQuantity` (`Qto_*`) quantity, which the diff engine's quantity path already scaled — nothing scaled the property path. A wall re-exported from a metre-authored file into a millimetre-authored one, with no design edit at all, hashed to two different `dataHash` values and was reported `modified · data` on every measure-propertied element in the model.
+
+- [#3644](https://github.com/LTplus-AG/ifc-lite/pull/3644) [`2b594d2`](https://github.com/LTplus-AG/ifc-lite/commit/2b594d20616f957f7ef949aa8563274e5373a95b) Thanks [@BIMvoice](https://github.com/BIMvoice)! - New exports `roundToScale(value)` and `scaledPropertyValue(value, dataType, projectUnits)`: the exact base-SI-scale-then-round transform every model-diff fingerprint adapter (CLI, viewer, MCP) applies to a measure-typed `IfcPropertySingleValue` before hashing it, factored out of three near-identical local copies (`scaleMeasureValue` + a private 4-decimal round) so the three adapters cannot drift the way three independent copies would. No behaviour change — same scale, same rounding, same call sites.
+
+- [#3554](https://github.com/LTplus-AG/ifc-lite/pull/3554) [`d08e420`](https://github.com/LTplus-AG/ifc-lite/commit/d08e420c9f39e9c0427aba47966cc6acf12642cc) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `extractMaterialsOnDemand`/`extractAllMaterialsOnDemand` scaling an `IfcMaterialLayer.LayerThickness` by the wrong project's length unit in a multi-`IfcProject` file — the shape `MergedExporter`'s default `unitReconciliation: 'auto'` produces when it federates a model whose length unit differs from the first model's (kept in its own `IfcProject`/`IfcUnitAssignment` rather than rescaled, per that module's docs).
+  
+  The thickness scale came from `store.lengthUnitScale`, which `extractLengthUnitScale` resolves for the file's FIRST `IfcProject` only — correct for an ordinary single-project file, wrong for a layer belonging to a LATER project. A federated millimetre model's 300&nbsp;mm layer, read back through a merged file whose first project is metres, came back as a fabricated "300 m" one instead of 0.3 m.
+  
+  Adds `resolveEntityLengthUnitScale(source, entityIndex, relationships, expressId)`: for the common single-project file it is identical to `extractLengthUnitScale` (no behaviour change); for a multi-project file it walks the entity's real spatial containment (`IfcRelContainedInSpatialStructure` / `IfcRelAggregates`, and `IfcRelDefinesByType` for a type-level material assignment) up to its OWN owning `IfcProject` and answers for that project's declared unit, rather than guessing from express-id ordering.
+
+- [#3621](https://github.com/LTplus-AG/ifc-lite/pull/3621) [`96d8f41`](https://github.com/LTplus-AG/ifc-lite/commit/96d8f4126073250e079d7cdc8f77b409e70400e7) Thanks [@BIMvoice](https://github.com/BIMvoice)! - The viewer's Lens (coloring/filtering rules) resolved type-inherited PROPERTY sets but not type-inherited QUANTITY sets: `getQuantityValue`/`getQuantitySets` looked only at an occurrence's own `IfcElementQuantity` sets, so a `Qto_*` set attached to the element's `IfcTypeProduct` (e.g. `Qto_WallBaseQuantities` on `IfcWallType` rather than each `IfcWall`) was invisible to every quantity-based Lens rule and absent from the rule builder's own set/quantity discovery, even though IFC inherits quantities exactly like properties. Adds `mergeInheritedQuantitySets` (the quantity counterpart of `mergeInheritedPropertySets`: occurrence wins per quantity name, not per whole set) and uses it in `apps/viewer/src/lib/lens/adapter.ts`.
+
+- [#3549](https://github.com/LTplus-AG/ifc-lite/pull/3549) [`cb56282`](https://github.com/LTplus-AG/ifc-lite/commit/cb56282133a3349299665859b5507b739808d32e) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Add `quantitySiScale(quantityType, units)`: the SI scale factor for an `IfcElementQuantity` (`Qto_*`) Length/Area/Volume value, resolved against a file's declared `ProjectUnits`. A `Qto_` value is stored in the project's raw author unit, exactly like a length-typed property, and this is the single place a consumer converts it to base SI before comparing or hashing it — used by the model-diff CLI adapter to fix a false "modified" on a re-authored-unit re-export (see the `@ifc-lite/cli` changeset), and mirrors the conversion `[#3458](https://github.com/LTplus-AG/ifc-lite/issues/3458)` already applies on the IDS path.
+
+- [#3555](https://github.com/LTplus-AG/ifc-lite/pull/3555) [`d733175`](https://github.com/LTplus-AG/ifc-lite/commit/d733175d4ac2e8a2e94fc0bf9804d7bc03627cc1) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Add `resolveOwningIfcProjectId(entityIndex, relationships, expressId)`: resolves the express id of the specific `IFCPROJECT` that owns an entity, for a file with more than one (the shape `MergedExporter`'s documented `auto` unit-reconciliation mode produces for a federated merge of differently-unit'd models, see issue [#1332](https://github.com/LTplus-AG/ifc-lite/issues/1332)). Also add an optional `projectId` parameter to `extractLengthUnitScale` and `extractProjectUnits` so a caller can read a SPECIFIC project's declared units instead of always the file's first one; both default to the prior first-project behaviour when omitted, so this is not a breaking change.
+  
+  `@ifc-lite/ids` uses these to fix an entity in a later `IFCPROJECT` being scaled by the first project's units in IDS property/quantity comparisons (see the accompanying `@ifc-lite/ids` changeset).
+
+- [#3782](https://github.com/LTplus-AG/ifc-lite/pull/3782) [`a1069f8`](https://github.com/LTplus-AG/ifc-lite/commit/a1069f8f096fcfc5771200a2748466096c3463d5) Thanks [@louistrue](https://github.com/louistrue)! - Fix `RelationshipGraphBuilder.addEdge` double-counting a relationship that a file declares twice.
+  
+  Nothing in EXPRESS forbids two `IfcRel*` instances from naming the same (relating, related) pair — two `IfcRelContainedInSpatialStructure` records can re-relate the same element to the same storey, and `IfcRelDefinesByProperties` carries only a `NoRelatedTypeObject` WHERE rule. The builder pushed both edges, so every consumer that walks the raw edge list saw the target twice: `store.spatialHierarchy.byStorey` listed the element twice, the viewer's generated schedule reported one product too many, and `SpatialHierarchy.parquet` emitted a duplicate row (which a `GROUP BY` in an external BI tool inherits).
+  
+  `addEdge` now folds a repeat of a `(source, target, type)` triple into the surviving edge instead of dropping it: the first instance's express id becomes `relationshipId`, later repeats are kept on `shadowedRelationshipIds`. Edges that differ in source, target, or type are untouched. The parser's on-demand property/quantity/classification/document maps — which a query reads in preference to the graph — now dedup the same way, so a redundant `IfcRel*` no longer duplicates a pset, qset, classification, or document either. `onDemandMaterialMap` is deliberately left as-is: `buildMaterialUsageIndex` already dedupes per (material, entity) downstream via its own `seenPerMaterial` set, a contract pinned by `material-fraction-and-associations.test.ts` (`onDemandMaterialMap.get(100)` for two redundant `IfcRelAssociatesMaterial` records is expected to equal `[300, 300, 999]`, not `[300, 999]`) — deduping upstream too would duplicate that work, not fix a gap.
+  
+  `shadowedRelationshipIds` is stored on the wire as three small, Transferable typed arrays (`shadowedEdgeIndex`/`shadowedGroupOffsets`/`shadowedRelIds`) rather than one slot per edge, because the obvious dense shape structured-clones (instead of transferring) across the parser worker boundary — measured +1.2s / +190MB on a 12M-edge model for a field that's empty on almost every edge. The fields are optional on `RelationshipEdges`/`RelationshipEdgesColumns`: absent entirely on a graph that tracks no duplicates, read via `?.`.
+  
+  Four places needed the extra ids, not just the deduped edge itself:
+  - `related()` in both the CLI and MCP backends now treats a connection as alive as long as any one of `relationshipId` or `shadowedRelationshipIds` still exists (via a shared `edgeSurvives` helper), so deleting the surviving `IfcRel*` doesn't erase a connection a sibling instance still names.
+  - `getRelationshipsBetween` reports `shadowedRelationshipIds` on each `RelationshipInfo`.
+  - `Relationships.parquet` and the DuckDB `relationships` table (via a shared `flattenRelationshipEdges` helper) and the anonymized-subset exporter's `collectRelatedEntities` all emit one row/closure entry per shadowed id too, not just the survivor — each is a real STEP record in the source file.
+  - The on-disk model cache (`@ifc-lite/cache`, FORMAT_VERSION 17 -> 18) persists the shadowed-id columns, so a model reloaded from cache gets the same delete-then-query behavior as a fresh parse. A v17 cache entry (written before this change) is read as having no shadowed ids rather than being treated as corrupt — matches the pre-fix in-memory behaviour exactly, since those graphs never tracked them either — and the cache lookup key already embeds `FORMAT_VERSION`, so an old entry simply misses and re-parses on next load.
+  
+  `Relationships.parquet` also drops a row whose own `IfcRel*` record has been deleted through the overlay, not only rows whose source or target endpoint was — an `IfcRel*` line is a row in `Entities.parquet` too, so a `RelId` for a deleted one was a dangling reference. Because each shadowed id is its own row, a deleted survivor drops while a live sibling keeps the connection, matching `edgeSurvives`.
+  
+  One consequence to note: `Relationships.parquet` is still built from the deduped graph, so a redundant second `IfcRel*` instance appears as its own row again (via `shadowedRelationshipIds`) rather than being silently dropped — every `IfcRel*` record that backs a surviving edge appears at least once, including deduplicated duplicates. (Not a 1:1 row-to-record count: a deleted endpoint still drops rows, and one `IfcRel*` with N `RelatedObjects` has always produced N rows, one per target — unchanged by this fix.)
+
+- [#3701](https://github.com/LTplus-AG/ifc-lite/pull/3701) [`8368339`](https://github.com/LTplus-AG/ifc-lite/commit/83683393654d8c1b903f03b5c6e9e5ff111fdaf0) Thanks [@BIMvoice](https://github.com/BIMvoice)! - `byType()`, shared by `ifc-lite query --type`, MCP's `query_entities`/`count_entities` and the viewer SDK, expanded a caller's type through a fixed nine-entry table that only aliased `*StandardCase`/`*ElementedCase` pairs. An abstract EXPRESS supertype (`IfcBuildingElement`, `IfcElement`, `IfcBuiltElement`) is never a literal STEP entity type, so that table had no row for it and the query silently answered zero on a model full of walls, slabs and columns.
+  
+  `@ifc-lite/data` gains `expandTypeNamesToDescendants`, a descendant-closure resolver over the bundled `ENTITIES_IFC2X3`/`ENTITIES_IFC4`/`ENTITIES_IFC4X3` tables, and `@ifc-lite/parser`'s `expandTypes` delegates to it. Both take the queried model's `schemaVersion`, and `validate`'s scanned type lists are computed per store for the same reason.
+  
+  Three things about the resolution are deliberate:
+  
+  - **It reads the file's own schema first, and the other tables only for spellings that schema does not have.** Three parts: (a) the descendants the file's own schema table declares; (b) plus names that table does not declare *at all* and that are descendants of the requested type in the table that does declare them, which is how an IFC4X3-headered file still carrying `IFCSLABSTANDARDCASE` is found (`entityIndex.byType` is keyed by the names a file contains, not by what its `FILE_SCHEMA` header claims, and re-headered files are common); (c) plus the two alias relations below. A name the file's own schema declares under a different parent is never added: buildingSMART re-parented entities between versions, so a plain union would answer `byType('IfcBuildingElement')` on an IFC4 file with reinforcing bars, `byType('IfcObject')` with the `IfcProject`, and `byType('IfcSystem')` on IFC2X3 with an `IfcZone`.
+  - **Cross-schema renames and the aliased leaves resolve too.** `IfcBuildingElement` and `IfcBuiltElement` reach each other's subtypes, and `byType('IfcGeotechnicalStratum')` now finds `IfcSolidStratum`/`IfcVoidStratum`/`IfcWaterStratum`, which no bundled table declares.
+  - **The expansion does not cross an `IfcRoot` branch.** Descending the whole hierarchy from `IfcRoot` or `IfcObjectDefinition` would answer with every rooted record in the file (property sets, relationships, type objects), which contradicts what the same backends answer for an unfiltered query and breaks `group_by: storey`. A type named explicitly is never gated, so `byType('IfcPropertySet')` still works.
+  
+  The expansion order is now the requested type followed by its descendants sorted, rather than depth-first traversal order: callers page these results with `offset`/`limit`, and traversal order would shift a caller's page whenever the generated schema tables were regenerated.
+  
+  `expandTypes` is a published export of `@ifc-lite/parser` and of `@ifc-lite/mcp/browser`, so its `schemaVersion` parameter is optional and `expandTypes(['IfcWall'])` still compiles. Omitted, it falls back to the union across the three bundled schemas, which finds every leaf spelling but cannot tell a re-parented entity from a real subtype. Passing the queried model's `store.schemaVersion` is what makes the answer exact, and every caller in this repository passes it.
+  
+  Those two packages are minor rather than patch. The signature is compatible, but the array a surviving export returns is not: `expandTypes(['IfcWall'])` answered `['IFCWALL', 'IFCWALLSTANDARDCASE', 'IFCWALLELEMENTEDCASE']` and now answers `['IFCWALL', 'IFCWALLELEMENTEDCASE', 'IFCWALLSTANDARDCASE']`, and for an abstract supertype the set itself grows from empty to the whole closure. A consumer indexing into that array reads a different name at the same position. The old order cannot be kept — it was the nine-entry table's insertion order, and there is no table any more — so the release is labelled for what it does instead.
+  
+  IDS entity-facet matching is unchanged, per the buildingSMART IDS spec's no-automatic-inheritance rule (now cited in a code comment on `checkEntityFacet`).
+
+### Patch Changes
+
+- [#3660](https://github.com/LTplus-AG/ifc-lite/pull/3660) [`b02da88`](https://github.com/LTplus-AG/ifc-lite/commit/b02da889d60f720f1b4a868b48be12a95027f6e6) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `IfcRelAssignsToGroupByFactor` (the proportional-factor subtype of `IfcRelAssignsToGroup`) being silently dropped from the relationship graph. It matched none of the parser's relationship-type gates (`RELATIONSHIP_TYPES` / `HIERARCHY_REL_TYPES` / `REL_TYPE_MAP`) or the `extractRelFast` byte scanner, so an element assigned to a zone/system exclusively through this relationship never appeared in that group's members, and the group never appeared in the element's own group list. `extractGroupMembersOnDemand` and `extractRelationshipsOnDemand` now resolve both relationship kinds.
+
+- [#3565](https://github.com/LTplus-AG/ifc-lite/pull/3565) [`140a6d8`](https://github.com/LTplus-AG/ifc-lite/commit/140a6d8541224341835c98028dc75e6a5ccd605d) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix eight `IfcTypeProduct`/`IfcGrid`/`IfcPath`/etc. attributes carrying a
+  stray `UNIQUE` keyword (or a dropped array dimension) in `SCHEMA_REGISTRY`'s
+  attribute-type metadata, from a stale `packages/codegen` regeneration.
+  `entities.ts`'s TypeScript interfaces had been hand-patched to valid syntax
+  in a prior commit, but `schema-registry.ts` — same bug, but a string value
+  rather than a type, so `tsc` never caught it — still reported
+  `type: 'UNIQUE IfcGridAxis'` for `IfcGrid.UAxes`/`VAxes`/`WAxes` and seven
+  other attributes, and `type: 'number'` (missing a dimension) for
+  `IfcStructuralLoadConfiguration.Locations` instead of `IfcLengthMeasure[][]`.
+  See the `@ifc-lite/codegen` changeset in this release for the generator fix
+  and the full attribute list.
+
+- [#3546](https://github.com/LTplus-AG/ifc-lite/pull/3546) [`6aa2b76`](https://github.com/LTplus-AG/ifc-lite/commit/6aa2b76d4a988e7ee1fd6bcad7c46a41650704b3) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fixed the legacy `IfcSite.RefLatitude`/`RefLongitude` fallback silently flipping a southern/western site to northern/eastern when a writer carries the hemisphere sign on a zero-magnitude degree token. `IfcCompoundPlaneAngleMeasure` degrees are STEP INTEGER literals; the spec's canonical form puts the sign on the first non-zero component (0°30'S is `(0, -30, 0)`), which the extractor already honoured. Some writers instead sign the degree token itself even when it is `0`, e.g. `(-0, 30, 0)` for the same 0°30'S — a non-canonical but plausible (defensive) encoding. The STEP tokenizer parses that literal to IEEE-754 negative zero (`parseFloat('-0') === -0`), but the sign test was `degreesRaw < 0`, which evaluates `false` for `-0` in JavaScript, so the whole angle silently flipped positive. The sign check now also matches `Object.is(component, -0)` on every component (degrees, minutes, seconds, millionths).
+
+- [#3627](https://github.com/LTplus-AG/ifc-lite/pull/3627) [`b7efeac`](https://github.com/LTplus-AG/ifc-lite/commit/b7efeac2195908729d1bf571839e2607f43c8ff7) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `IfcComplexProperty` being silently mis-decoded by the on-demand STEP property extraction path (`extractPropertiesOnDemand`, `extractTypePropertiesOnDemand`, and the material-pset resolver in `on-demand-extractors.ts`).
+  
+  `IfcComplexProperty`'s EXPRESS attributes are `[Name, Description, UsageName, HasProperties]` — the last a nested list of `IfcProperty` refs. The property-value parser's default branch, written for `IfcPropertySingleValue`, read attribute index 2 as a `NominalValue`; for a complex property that slot is `UsageName`, a label, not a value. So a complex property showed its `UsageName` string as if it were the value, and every nested property in `HasProperties` vanished from the panel/query output with no error.
+  
+  `resolveComplexPropertyValue` (new, in `property-value-parser.ts`) now walks `HasProperties`, recursing into any further nested `IfcComplexProperty`, and produces a `"Name: value, ..."` display string plus a flat `values` candidate list (mirroring the existing enumerated/list/bounded/table-value handling). `parsePropertyValueWithComplex` dispatches to it for `IfcComplexProperty` and to the existing single-entity parser otherwise; both `columnar-parser.ts`'s `extractPropertiesOnDemand` and `on-demand-extractors.ts`'s pset/material-pset resolvers now call it instead of the single-entity parser directly.
+
+- [#3330](https://github.com/LTplus-AG/ifc-lite/pull/3330) [`afa717b`](https://github.com/LTplus-AG/ifc-lite/commit/afa717bcf6041ad34085626fcfac321207ce4b81) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Stop non-finite numbers entering the property table from STEP literals, and
+  stop the paths downstream of it from substituting `0` for one.
+  
+  A STEP real whose exponent overflows the IEEE-754 double range — `1.0E400` —
+  parses to `Infinity`, and `isNaN(Infinity)` is `false`, so the numeric guards in
+  `entity-extractor` and `attribute-helpers` admitted it. The value then flowed
+  into the property table and out through every writer, where `JSON.stringify`
+  turns it into `null`: the exported file silently lost the value.
+  
+  The guards now test `Number.isFinite` on value paths, and `Number.isSafeInteger`
+  on express-id / reference paths (an id is a key, not a measurement — see below):
+  
+  - An attribute literal that is not a finite number falls through to the existing
+    raw-token branch, so `1.0E400` is preserved verbatim as the string `"1.0E400"`
+    rather than being dropped or clamped. The value type reported alongside it
+    changes from number to string for that attribute.
+  - `getNumber` returns `undefined` for non-finite input on **every** branch,
+    including when a number is passed in directly — `getNumber(Infinity)` and
+    `getNumber(NaN)` previously returned the non-finite value unchanged, because
+    only the string branch was guarded.
+  - `getReference` returns `undefined` for anything that is not a safe integer,
+    on every branch, for the same reason the express-id paths below do.
+  
+  Preserving the literal as a string is only honest where the consumer's value
+  type admits a string. Several consumers type the field `number`, so the
+  preserved string failed their `typeof x === 'number'` test and they fell back to
+  `0` — converting a visibly missing value into a plausible wrong one:
+  
+  - `IfcElementQuantity` measures outside the double range are now dropped with a
+    warning instead of being reported as `0`. This matches what the sibling
+    `QuantityExtractor.extractQuantity` path already did for a non-numeric value.
+    A genuine `0.0` measure is unaffected.
+  - An `IfcMapConversion` whose `Eastings`, `Northings`, `OrthogonalHeight`,
+    `XAxisAbscissa`, `XAxisOrdinate` or `Scale` is outside the double range is
+    refused with a warning, leaving `GeoreferenceInfo.mapConversion` and
+    `transformMatrix` absent, instead of placing the model at a substituted `0`
+    origin. The three optional components are included because
+    `computeTransformMatrix` reads an absent `Scale` as `1.0` and an absent axis
+    pair as no rotation, so dropping just the field would substitute the schema
+    default for a value the file stated. An absent (`$`) optional is unchanged.
+    `IfcProjectedCRS` in the same file is still reported. A genuine `0` easting is
+    unaffected.
+  - The IFC2x3 `ePSet_MapConversion` twin of that path refuses on the same six
+    property names, keeps any `ePSet_ProjectedCRS` it found, and warns before
+    falling through to the legacy `IfcSite` fallback when nothing is left.
+  - An `IfcSite` whose `RefElevation` is outside the double range is skipped, so
+    the legacy geolocation path reports a later site or none rather than one at a
+    substituted sea level. An absent `RefElevation` still reads as `0`.
+  - An `IfcMaterialLayer` whose `LayerThickness` is outside the double range is
+    dropped with a warning rather than recorded as `0` thick, and its
+    `IfcMaterialLayerSet` reports no `totalThickness` rather than a total that is
+    quietly short by that layer.
+  
+  The last three bullets, and the optional-component half of the one above them,
+  are the same defect reached through the `?? 0` and `|| 0` fallbacks downstream of
+  `getNumber`: while it answered `Infinity` those fallbacks were unreachable, and
+  making it answer `undefined` armed every one of them.
+  The guard is shared (`isUnrepresentableNumericValue`), and it covers a
+  non-finite `number` as well as an overflowing token, so a value that arrives as
+  an actual `Infinity` — a hand-built entity map, an `IfcPropertySingleValue`
+  nominal value — cannot slip past the token check.
+  
+  An express id that is not a safe integer is now refused at the point it is
+  read, on every path that accumulates one digit-by-digit (`StepTokenizer`'s two
+  scans, the inline scan worker, `readRefId` on the byte-level relationship
+  path, `extractEntity`'s own id parse, and both `parseInt`-based reference
+  reads in `entity-extractor` and `getReference`). The guard is
+  `Number.isSafeInteger`, not `Number.isFinite`: doubles lose integer precision
+  past 2^53 (~16 digits), so two distinct ids that merely exceed that — not the
+  ~309 digits it takes to overflow to `Infinity` — already accumulate to the
+  *same* value, and one silently serves the other's data
+  (`parseInt('100000000000000001', 10) === parseInt('100000000000000002', 10)`
+  is `true`). `isFinite` alone missed this collision range entirely; it only
+  ever caught the Infinity case. Refusing at the accumulator also removes the
+  half-alive record the entity-level guard alone left behind — indexed under a
+  colliding key, its pset still answerable, its own `GlobalId` and `Name`
+  unreadable.
+
+- [#3578](https://github.com/LTplus-AG/ifc-lite/pull/3578) [`6bd2550`](https://github.com/LTplus-AG/ifc-lite/commit/6bd25508dadd14fee97ee1f7393212cdcc086fdc) Thanks [@louistrue](https://github.com/louistrue)! - Fix `resolveEntityLengthUnitScale` silently rescaling a material-layer thickness by 1000x when the entity's own `IFCPROJECT` declares no length unit in a multi-`IFCPROJECT` (federated-merge) file.
+  
+  `resolveEntityLengthUnitScale` resolved the owning project and then took `extractLengthUnitScale` for it unconditionally. That call answers `1.0` both for "this project declares metres" and "this project declares no `LENGTHUNIT` at all" - `UnitsInContext` is OPTIONAL on `IfcContext`, so a federated model can legitimately arrive with none. A 300 mm `IfcMaterialLayer.LayerThickness` owned by such a project was reported as 300 m. Only a project that actually declares a length unit now overrides the file-wide answer; an undeclared one falls back to the first project's scale, the same safe-miss direction the walk-failed fallback already takes.
+
+- [#3868](https://github.com/LTplus-AG/ifc-lite/pull/3868) [`902768e`](https://github.com/LTplus-AG/ifc-lite/commit/902768e138b595b26a47389bcea536f3f9e25b6d) Thanks [@louistrue](https://github.com/louistrue)! - The geometry pre-pass hands the parser a finished entity index, and on that path the parser never scans the file, so anything the pre-pass dropped is invisible on the parser side. [#3695](https://github.com/LTplus-AG/ifc-lite/issues/3695) made a malformed-record stop (a quoted string or block comment that opened and never closed) reportable on the paths that do their own scanning, but the pre-scanned path had no field to carry it, and the sharded stitch could not tell a scan that stopped from a scan that reached the end of the entities. Both arrive as `handoff === -1`, the merge loop breaks either way, and every later record is dropped with nothing said. That is the load path a large model takes in a browser.
+  
+  `ShardColumns` now carries `malformedStart` and `stitchShards` returns `malformedRecordCount`, attributed against the boundary each shard's records are cut at. That is the rule `oversizedIdStarts` already uses, because a shard starting inside a quoted value reports a stop the file does not contain. The flag travels on through `onEntityIndex`, `WorkerParser.setEntityIndex` and `PreScannedEntityIndex.malformedRecordCount` to `EntityScanResult.malformedRecordCount`, where the existing `onDiagnostic` message fires as it does on every other path.
+  
+  Absence is carried as absence, not as zero. A shard can only report a stop, never "I reached the end cleanly", so `stitchShards` returns `undefined` when no shard reported one and nothing on the way through coerces it to `0`. Otherwise "nothing reported" and "scanned clean" would be the same value to every consumer, which is the shape of the bug this fixes.
+  
+  No producer sets `malformedStart` yet: the Rust sharded scan has no malformed-stop offset to return until [#3699](https://github.com/LTplus-AG/ifc-lite/issues/3699) lands, so today the field is always absent. This is the wiring, ready for that offset to arrive.
+
+- [#3606](https://github.com/LTplus-AG/ifc-lite/pull/3606) [`f8e03d4`](https://github.com/LTplus-AG/ifc-lite/commit/f8e03d4d5bb620fc9e807d5233091d145a201165) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Thread `IfcElementQuantity.GlobalId` through `readQuantitySet` (`CollectedQuantitySet.globalId`) and the on-demand quantity extractors (`extractQuantitiesOnDemand`, `extractQsetsFromIds`, `TypeQuantityInfo.quantities`), so callers can distinguish two same-named-but-distinct quantity-set instances on one entity — feeding `@ifc-lite/data`'s `QuantityTable.getForEntity` identity fix. The field is optional and additive; no existing caller's behavior changes.
+
+- [#3464](https://github.com/LTplus-AG/ifc-lite/pull/3464) [`3cd1647`](https://github.com/LTplus-AG/ifc-lite/commit/3cd1647a2918ac27b903cb82bc797c2d2b288ac3) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix the legacy `RelationshipExtractor.extractRelationships()` silently dropping every `IfcRelAssociatesMaterial` relationship.
+  
+  Its "standard" attribute-slot branch assumed `RelatingObject` sits at attribute index 4 and `RelatedObjects` at index 5 — true for `IfcRelAggregates`, but backwards for `IfcRelAssociatesMaterial`: `RelatedObjects` (a list) is inherited from `IfcRelAssociates` at index 4, and `RelatingMaterial` (a single reference) is `IfcRelAssociatesMaterial`'s own attribute at index 5. Reading them swapped meant the list failed the "is this a number" check and the single reference failed the "is this an array" check, so `extractRelationship()` always returned `null` for this type — every material association vanished from the legacy `parse()` path's `relationships` array with no warning.
+  
+  `IfcRelAssociatesMaterial` now gets its own branch (`RelatedObjects` at 4, `RelatingMaterial` at 5), matching IFC4's `IfcRelAssociates`/`IfcRelAssociatesMaterial` schema.
+
+- [#3695](https://github.com/LTplus-AG/ifc-lite/pull/3695) [`b331b49`](https://github.com/LTplus-AG/ifc-lite/commit/b331b4921ff0927ee18bb78f00d2bb6e496219d8) Thanks [@BIMvoice](https://github.com/BIMvoice)! - A string literal or comment that opened and never closed (an unescaped quote from a truncated download, a failed export, or a corrupted round-trip; or a `/* ... */` with no matching close) could make the fast entity scan run off the end of the buffer with no terminator and silently end the whole scan there. So could a `#id=TYPE(` declaration cut off before its own `(`, in the HEADER section, or between two DATA records. Every entity after that point, however well-formed, was missing from the result, and nothing said so: the caller got back a shorter `entityRefs` that looked like a complete, successful scan.
+  
+  `scanIfcEntities` now reports this on `EntityScanResult.malformedRecordCount`, a single 0-or-1 flag, and on the existing `onDiagnostic` channel ("scan: stopped early, a record had a string literal or comment that never closed, or was cut off, before end of input..."). It is 0 or 1, never a count of how many, because the scan always stops at the first one it hits: there is no reliable place to resume once a string, a comment, or a declaration's own header has failed to close, so the scan does not guess.
+  
+  Covers every copy of the scan: the main-thread `StepTokenizer.scanEntitiesFast`, its balanced-parenthesis sibling `StepTokenizer.scanEntities`, and the Web Worker's inline copy of the fast scan. Both `StepTokenizer` methods now reset the flag at the start of every run, so a truncated fast scan followed by a clean balanced scan on the same instance no longer leaves a stale 1 behind. The wasm scan path clears it too, for the same reason.
+
+- [#3675](https://github.com/LTplus-AG/ifc-lite/pull/3675) [`c3bdc8f`](https://github.com/LTplus-AG/ifc-lite/commit/c3bdc8fe55536a9b27adaa7ed92fb214c975fe2e) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Every entity scanner now treats a STEP `/* ... */` comment as trivia INSIDE a record, not only between records.
+  
+  ISO 10303-21 allows a comment anywhere whitespace is allowed, and real exporters emit them mid-record. Two spec-legal shapes misparsed, silently:
+  
+  - `[#1](https://github.com/LTplus-AG/ifc-lite/issues/1) /* was [#7](https://github.com/LTplus-AG/ifc-lite/issues/7) */ = IFCWALL(...);` — the scanners wanted `=` straight after the instance name, so the record produced no entity at all.
+  - `[#1](https://github.com/LTplus-AG/ifc-lite/issues/1)=IFCWALL('a', /* pending; revise */ $);` — the semicolon-terminated scanners ended the record at the `;` inside the comment, so the byte span handed to every downstream decoder was truncated. An apostrophe inside a comment (`/* don't reuse */`) flipped the same scanners' quote parity and swallowed the terminator entirely, dropping the record.
+  
+  The fix lands on all four scanners at once, because they must agree on what a record is: `StepTokenizer.scanEntities`, `StepTokenizer.scanEntitiesFast`, the inline scan worker, and Rust's `EntityScanner` (which feeds `build_entity_index`, the sharded pre-pass, and the wasm `scanEntitiesFast`/`scanEntitiesFastBytes` entry points). The three TypeScript scanners share one `skipTrivia` helper in `step-lexing.ts`; Rust mirrors it as `skip_step_trivia`, and each side's comment names the other as its matched pair.
+  
+  The two skips compose in one direction only, and both directions are now pinned by tests: a string literal is taken first, so a `/*` inside one is literal text; a comment is then taken as a whole region, so a quote, a semicolon or a parenthesis inside it is comment text. `Rust`'s record-terminator scan widens `memchr2` to `memchr3` to see comment openers; a comment-free file costs one extra comparison per SIMD block there, and one extra byte test per whitespace run in the TypeScript scanners. Measured on `schependomlaan.ifc` (714,485 records) and `ISSUE_068_ARK_NUS_skolebygg.ifc` (945,194 records), entity counts, mesh counts, vertex and triangle counts are identical and the parse-phase timings move in both directions within run-to-run noise.
+  
+  An unterminated comment is still refused rather than run to end of input, unchanged on both sides.
+
+- [#3675](https://github.com/LTplus-AG/ifc-lite/pull/3675) [`c3bdc8f`](https://github.com/LTplus-AG/ifc-lite/commit/c3bdc8fe55536a9b27adaa7ed92fb214c975fe2e) Thanks [@BIMvoice](https://github.com/BIMvoice)! - A STEP `/* ... */` comment preceding an attribute value is now trivia when the value is decoded, not just when the entity's byte span is scanned.
+  
+  PR [#3675](https://github.com/LTplus-AG/ifc-lite/issues/3675) fixed the SCANNER: a comment inside a record no longer truncates or drops the entity. It deliberately left the ATTRIBUTE-DECODE layer unfixed (issue [#3673](https://github.com/LTplus-AG/ifc-lite/issues/3673)) — with a correct span, decoding still read the comment's own text as part of the value it precedes. `[#1](https://github.com/LTplus-AG/ifc-lite/issues/1)=IFCWALL('a', /* rev; b */ $)` decoded the second attribute as the string `"/* rev; b */ $"` instead of `null`, and a comment before a genuinely unset `$` made `has_non_null_attribute` report it as set.
+  
+  Fixed on every decoder PR [#3675](https://github.com/LTplus-AG/ifc-lite/issues/3675) named as comment-blind:
+  
+  - The TypeScript `EntityExtractor`'s attribute splitter and its nested-list parser, reusing `StepTextScan` (`step-lexing.ts`) rather than a third hand-rolled comment skip.
+  - Rust's nom tokenizer (`parse_entity`): its whitespace combinator now shares `skip_step_trivia` with the scanners, so a comment between attributes is skipped the same way whitespace always was.
+  - Rust's `EntityScanner::has_non_null_attribute`: the leading-whitespace probe and the comma-separator walk both now treat a comment as a region, so a `,`, `'` or `(` inside one no longer moves the attribute index or looks like the value.
+  
+  Composition is unchanged in both directions: a `/*` inside a string literal is still text, and a `'`, `;`, `(` or `,` inside a comment is still text, never structure. A comment-free record decodes byte-identically to before.
+
+- [#3744](https://github.com/LTplus-AG/ifc-lite/pull/3744) [`3460785`](https://github.com/LTplus-AG/ifc-lite/commit/3460785652f251f3161aa8dd6f1d247750df2715) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fixed a TS/Rust STEP scanner divergence ([#3733](https://github.com/LTplus-AG/ifc-lite/issues/3733)): a form feed (`0x0C`) or vertical tab (`0x0B`) between STEP tokens was not treated as trivia by `isSpaceByte`/`skipTrivia` in `packages/parser/src/step-lexing.ts`, and the same gap existed in every hand-duplicated copy of that byte set — the inline fast path in `StepTokenizer.scanEntitiesFast`, the Blob-worker scanner, and the entity-index-to-refs fast path that reads a type name out of a pre-computed byte span. On a source carrying one of these bytes, `scanEntities`/`scanEntitiesFast`/the worker silently dropped the entity outright, or `buildEntityRefsFromIndex` produced a type name with the stray control byte still attached, while Rust's `EntityScanner` parsed the same file correctly — same file, different answer depending on which engine ran.
+  
+  The project already resolved this exact question once, for the HEADER-section scanner (`StepTextScan.isAsciiSpace` / `rust/export/src/source_header.rs`'s `is_step_space`): both spell out the full six-byte ASCII whitespace set (space, tab, LF, CR, form feed, vertical tab) rather than trust a stdlib "ASCII whitespace" helper, after a prior regression where doing exactly that mismatched the two halves on vertical tab. `isSpaceByte` and its TS-side duplicates now carry that same six-byte set, and `rust/core/src/parser/lexical.rs::skip_step_trivia` no longer calls `u8::is_ascii_whitespace` (which follows the WhatWG set and excludes vertical tab) — it now shares a spelled-out `is_step_space` with the same six bytes, also used by `EntityScanner`'s type-name boundary check in `scanner.rs`.
+  
+  A fourth, independent copy of the same four-byte (space/tab/LF/CR) set lived in `packages/parser/src/columnar-parser-attributes.ts` (`findQuotedAttrRange`, `readRefId`, `readRefList`) — the columnar batch-extraction path that reads GlobalId/Name and every relationship reference consumed by `columnar-parser-relationships.ts`. It had the identical gap: a GlobalId, Name, or relationship ref preceded by a form feed or vertical tab was silently unreadable even on an entity the (now-fixed) entity scanner found correctly. Fixed the same way, with the same six-byte set.
+
+- [#3534](https://github.com/LTplus-AG/ifc-lite/pull/3534) [`b135862`](https://github.com/LTplus-AG/ifc-lite/commit/b1358623210867daba42ff56e97ff05733bff646) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Stop fabricating display placeholders (`Entity #<id>`, `PropertySet #<id>`, `QuantitySet #<id>`) for a spatial node, property set or quantity set the source declared no Name for.
+  
+  `SpatialHierarchyBuilder`'s `SpatialNode.name`, `store.getProperties()` and `store.getQuantities()` now leave the name empty (`''`) instead. Those placeholders were indistinguishable downstream from a genuinely-declared Name: `Ifc5Exporter` wrote an unnamed spatial node's fabricated `Entity #<id>` out as a genuinely-declared `bsi::ifc::prop::Name` on IFCX export (round-tripping back in as real on read), and `EntityNode.properties()`/`quantities()` — the surface MCP tools and the SDK's `bim.properties()`/`bim.quantities()` return verbatim — did the same for the pset/qset placeholders. A UI layer that wants a display label for an unnamed node/set now derives one at render time instead of receiving a value indistinguishable from a real one.
+  
+  Two places that composed sets from more than one source keyed on that name, and an empty name made unrelated sets compare equal there. Both now treat an absent name as evidence of nothing: `extractTypePropertiesOnDemand`, `extractTypeEntityOwnProperties` and `extractTypeQuantitiesOnDemand` dedupe a type's `HasPropertySets` list against its `IfcRelDefinesByProperties` sets by express id rather than by name, so a second unnamed set on a type is no longer dropped; and `mergeInheritedPropertySets` no longer folds an unnamed inherited set into an unrelated unnamed occurrence set.
+
+- [#3606](https://github.com/LTplus-AG/ifc-lite/pull/3606) [`f8e03d4`](https://github.com/LTplus-AG/ifc-lite/commit/f8e03d4d5bb620fc9e807d5233091d145a201165) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `extractTypeQuantitiesOnDemand` (and its property counterparts, `extractTypePropertiesOnDemand`/`extractTypeEntityOwnProperties`) silently dropping a type-level property/quantity set when it shares a literal name with one already collected from the other source ([#3722](https://github.com/LTplus-AG/ifc-lite/issues/3722)) — the same defect shape [#3603](https://github.com/LTplus-AG/ifc-lite/issues/3603) and [#3606](https://github.com/LTplus-AG/ifc-lite/issues/3606) fixed for `PropertyTable.getForEntity`/`QuantityTable.getForEntity`, in a third, independent place.
+  
+  A type can carry two distinct `IfcElementQuantity`/`IfcPropertySet` instances that share a name: one reachable via its `HasPropertySets` attribute, one via a separate `IfcRelDefinesByProperties` (the shape a federated/merged export produces). The shared merge helper `appendSetsFromSecondSource` already dedupes the second source against the first by express id, but then also dropped any second-source set whose *name* collided with a first-source name — even when the two were provably distinct instances. Anything reading type-inherited quantities or properties (quantity takeoff, an IDS facet against a type) silently lost the second instance's data.
+  
+  `appendSetsFromSecondSource` now dedupes on `(name, globalId)` identity — via a new `setIdentityKey` helper using the same NUL-separated key shape `@ifc-lite/data`'s `groupPropertySetsByInstance`/`groupQuantitySetsByInstance` use — instead of name alone, so two distinct same-named instances both survive. A genuinely duplicate set (same name AND the same GlobalId, reachable both ways) still collapses to one, as before.
+
+- [#3796](https://github.com/LTplus-AG/ifc-lite/pull/3796) [`ff292b6`](https://github.com/LTplus-AG/ifc-lite/commit/ff292b685a7c663ef3e79928a754667bb919066a) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Stop dropping an entity or typed value whose type name is separated from its opening `(` by whitespace or a `/* ... */` comment.
+  
+  `EntityExtractor.extractEntity`'s entity regex allowed whitespace around `=` but required the type name and `(` to be adjacent, so a record like `[#5](https://github.com/LTplus-AG/ifc-lite/issues/5)=IFCSURFACESTYLERENDERING\r\n([#4](https://github.com/LTplus-AG/ifc-lite/issues/4),0.);` returned `null` and the entity was invisible to every extractor keyed on it (properties, quantities, materials, units, georeferencing). The typed-value regex in the same file had the same gap one level down: `IFCPOSITIVELENGTHMEASURE\r\n(1.)` fell through to a plain-string attribute instead of a typed value, which then made a downstream conversion-unit reader default an unreadable `ValueComponent` to `conversionValue 1.0` — silently wrong scaling for an inch-based `IFCCONVERSIONBASEDUNIT`.
+  
+  The same adjacency requirement was found in several more places that read or rewrite a decoded STEP record: `@ifc-lite/export`'s `scaleTypedMeasures` (unit-normalize rewrite), `replaceStepArgument` (positional attribute rewrite), the merged-export helpers that read one attribute of a subcontext, representation context, or spatial-structure line (`merged-subcontext.ts`, `merged-context.ts`, `merged-empty-containers.ts`), the two record-splitting regexes in `reference-collector.ts` that narrow or drop a relationship line, and `subset-entity-reader.ts`'s `readEntityArgs` (whose `null` makes the anonymizer silently skip the entity). Each had the same failure mode: a wrapped or commented record read as unparseable, which degrades from a lost dangling reference or an unscaled measure to (depending on the caller) a blocked empty-container drop or a subcontext kind-match collapsing into the wrong bucket.
+  
+  ISO 10303-21 additionally permits a comment anywhere whitespace is legal, including at this exact position, and the Rust tokenizer already tolerates one there (`skip_step_trivia`). Every site above now shares one pattern (`STEP_TRIVIA`, new in `@ifc-lite/parser`) that tolerates both a run of whitespace and a non-nesting `/* ... */` comment between the type name and `(`, so the TS and Rust halves agree on the same STEP bytes.
+  
+  `STEP_TRIVIA` is a `(?:whitespace|comment)*` run, and that shape backtracks catastrophically whenever either alternative gives the outer `*` more than one way to partition the same span: a failing suffix then makes the engine enumerate them all. Both alternatives were shaped to keep that count at one, and both hazards were measured against the real `EntityExtractor` rather than argued:
+  
+  - The comment body is `(?:[^*]|\*(?!/))*`, not a lazy `[\s\S]*?`. A lazy body is retried against every later `*/` when the overall pattern fails past a comment, so one comment absorbs the ones after it and the two alternatives overlap. With it, ~120 bytes of legal, correctly paired trivia (30 empty comments) took seconds. This also brings the pattern into line with the Rust scanner, which stops a comment at its first `*/`: `/* a */ */` is a comment followed by junk, not one long comment. That is a deliberate narrowing, pinned by a shared Rust/TS vector.
+  - The whitespace alternative is a single-character class, not `[...]+`. `+` looks like it collapses a run into one iteration, but the outer `*` can still split an n-character run into any composition of `+` matches, which is the textbook `(?:A+|B)*` blowup, on the far more common input: plain whitespace is exactly what this issue is about. Measured with `+`: 26 spaces 510ms, 28 spaces 1.9s, 1000 spaces did not finish in two minutes. Without it, one million spaces match in ~4ms.
+  
+  `packages/parser/test/step-trivia-redos.test.ts` pins one case per axis.
+- Updated dependencies [[`142b84c`](https://github.com/LTplus-AG/ifc-lite/commit/142b84c41036b749e7b64418a882424b9c386edb), [`f283c62`](https://github.com/LTplus-AG/ifc-lite/commit/f283c62da53d672d590322edd3351e7b71724757), [`8904273`](https://github.com/LTplus-AG/ifc-lite/commit/890427360361fba5232bef614371fe69d9528e47), [`bcbe7b9`](https://github.com/LTplus-AG/ifc-lite/commit/bcbe7b9afa38e8dafb5900e73575c71a8fd96012), [`7b79a93`](https://github.com/LTplus-AG/ifc-lite/commit/7b79a93f80afe104ebe3e20ae742af26b48b21a2), [`82343f7`](https://github.com/LTplus-AG/ifc-lite/commit/82343f75dd2e6029946cbcd0990d3f8fd38a26ad), [`55b69fb`](https://github.com/LTplus-AG/ifc-lite/commit/55b69fbac09155f4cc9c8b2eecba17fd84067c32), [`59fae4c`](https://github.com/LTplus-AG/ifc-lite/commit/59fae4cb4c4841b27cbe26a618648407d74d2326), [`9f945d1`](https://github.com/LTplus-AG/ifc-lite/commit/9f945d1e2193cb27e5471f5272496b2791975ede), [`3d11231`](https://github.com/LTplus-AG/ifc-lite/commit/3d11231806fec3047c9ed32b9d095be3abe60c2f), [`7160b73`](https://github.com/LTplus-AG/ifc-lite/commit/7160b73d573e276e390f62c065b66eb80862c1c5), [`1000dce`](https://github.com/LTplus-AG/ifc-lite/commit/1000dce72e9ec75c59848efefc1f709d01172e72), [`1000dce`](https://github.com/LTplus-AG/ifc-lite/commit/1000dce72e9ec75c59848efefc1f709d01172e72), [`afb9725`](https://github.com/LTplus-AG/ifc-lite/commit/afb972525bb99e3056ccaa84ee7a78e0c7de81ef), [`cebcb21`](https://github.com/LTplus-AG/ifc-lite/commit/cebcb2133ef672e9199ee2f158578499d449d9e0), [`e986c81`](https://github.com/LTplus-AG/ifc-lite/commit/e986c81bf6d28fec57f1953fa53bf315dbd80a3a), [`8c181c9`](https://github.com/LTplus-AG/ifc-lite/commit/8c181c99f91964402ad352aead36d9619af5b427), [`6e48c4c`](https://github.com/LTplus-AG/ifc-lite/commit/6e48c4c5f441e8a42e4cc55440cf747ad8679f0a), [`8f08715`](https://github.com/LTplus-AG/ifc-lite/commit/8f087158a662a02c01a21dd2546fb863bb24e665), [`9b709c5`](https://github.com/LTplus-AG/ifc-lite/commit/9b709c51480fbabb68167aa4892f7e4c87b0e4e6), [`f8e03d4`](https://github.com/LTplus-AG/ifc-lite/commit/f8e03d4d5bb620fc9e807d5233091d145a201165), [`32b31bc`](https://github.com/LTplus-AG/ifc-lite/commit/32b31bc8501f04e110733289bde0389b9899bc76), [`62bb58f`](https://github.com/LTplus-AG/ifc-lite/commit/62bb58fc8364c27bcf8452ab8edbde26727f527c), [`74d76bb`](https://github.com/LTplus-AG/ifc-lite/commit/74d76bb52d03397734022855c9cbcd6bdef38632), [`89c4cf2`](https://github.com/LTplus-AG/ifc-lite/commit/89c4cf22e83d76115035f7dcbf6e34f9c06dd091), [`456d189`](https://github.com/LTplus-AG/ifc-lite/commit/456d1898cdfdc1e31b145777b0f33bad203cc62a), [`4475e58`](https://github.com/LTplus-AG/ifc-lite/commit/4475e583ea35def444fb6d7ba92410629bd89096), [`182215a`](https://github.com/LTplus-AG/ifc-lite/commit/182215a835c4beac6a776bcb4eb1d019cab9063e), [`ce8ca9f`](https://github.com/LTplus-AG/ifc-lite/commit/ce8ca9f3b8fd51ed89a9c21a275f00d63c240875), [`a1aebc8`](https://github.com/LTplus-AG/ifc-lite/commit/a1aebc822b819221258f4759edf4c82ff0d140f7), [`f8e03d4`](https://github.com/LTplus-AG/ifc-lite/commit/f8e03d4d5bb620fc9e807d5233091d145a201165), [`4b043d4`](https://github.com/LTplus-AG/ifc-lite/commit/4b043d4e77345e77532c328ddd62d58c39b6bbe8), [`a1069f8`](https://github.com/LTplus-AG/ifc-lite/commit/a1069f8f096fcfc5771200a2748466096c3463d5), [`afb9725`](https://github.com/LTplus-AG/ifc-lite/commit/afb972525bb99e3056ccaa84ee7a78e0c7de81ef), [`0b13e2d`](https://github.com/LTplus-AG/ifc-lite/commit/0b13e2d89b51608c2be3425ba2e5c95bfb8c0e5e), [`c4dafbf`](https://github.com/LTplus-AG/ifc-lite/commit/c4dafbf418810c519d49d5739bfedb2da41651b0), [`c3bdc8f`](https://github.com/LTplus-AG/ifc-lite/commit/c3bdc8fe55536a9b27adaa7ed92fb214c975fe2e), [`c3bdc8f`](https://github.com/LTplus-AG/ifc-lite/commit/c3bdc8fe55536a9b27adaa7ed92fb214c975fe2e), [`1060a30`](https://github.com/LTplus-AG/ifc-lite/commit/1060a30187c8f6bb327f9e356056f2364568e8ff), [`80a0cd9`](https://github.com/LTplus-AG/ifc-lite/commit/80a0cd9b946a5ff1aa6ca214ddb427a5d1f5303c), [`a2488e8`](https://github.com/LTplus-AG/ifc-lite/commit/a2488e858bc7792cdcc818f7759c0a6e46e7d892), [`8368339`](https://github.com/LTplus-AG/ifc-lite/commit/83683393654d8c1b903f03b5c6e9e5ff111fdaf0), [`2a2c73f`](https://github.com/LTplus-AG/ifc-lite/commit/2a2c73fc95044c5e6823f0dbc55f5e2c7a87a948), [`2213431`](https://github.com/LTplus-AG/ifc-lite/commit/22134312e50d7f2dbe5d45928740eef5f6ffa241), [`499ccf2`](https://github.com/LTplus-AG/ifc-lite/commit/499ccf2f97fe1e24728eb4eb99f895044c36f7b2), [`4475e58`](https://github.com/LTplus-AG/ifc-lite/commit/4475e583ea35def444fb6d7ba92410629bd89096), [`80a0cd9`](https://github.com/LTplus-AG/ifc-lite/commit/80a0cd9b946a5ff1aa6ca214ddb427a5d1f5303c)]:
+  - @ifc-lite/encoding@2.2.0
+  - @ifc-lite/wasm@6.2.0
+  - @ifc-lite/data@4.0.0
+  - @ifc-lite/ifcx@4.0.0
+
 ## 4.3.2
 
 ### Patch Changes

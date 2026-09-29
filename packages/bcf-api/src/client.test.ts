@@ -2,10 +2,15 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import {
+  FoundationApiClient,
+  FoundationApiError,
+  normalizeApiBaseUrl,
+} from '@ifc-lite/opencde-foundation';
 import { describe, expect, it } from 'vitest';
 import { BcfApiClient, normalizeBcfBaseUrl } from './client.js';
-import { BcfApiError } from './errors.js';
-import type { FetchLike } from './types.js';
+import { BcfApiError, BcfAuthenticationError } from './errors.js';
+import type { BcfApiVersion, FetchLike } from './types.js';
 
 interface RecordedRequest {
   url: string;
@@ -30,6 +35,34 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+describe('bcf-api builds on @ifc-lite/opencde-foundation, not a parallel copy of it', () => {
+  it('re-exports the Foundation API error and base-URL classes/functions by identity', () => {
+    // These are the SAME class/function objects, not lookalikes: a fork back
+    // to bcf-api-local implementations would keep every other test in this
+    // file green while failing only these identity checks.
+    expect(normalizeBcfBaseUrl).toBe(normalizeApiBaseUrl);
+    // The error classes are Foundation subclasses, so every BCF error is a
+    // Foundation error too.
+    expect(new BcfApiError('x', { status: 500, url: 'https://host' })).toBeInstanceOf(FoundationApiError);
+  });
+
+  it('keeps the historical error names for directly constructed BCF errors too (#5438 review)', () => {
+    const apiError = new BcfApiError('x', { status: 500, url: 'https://host' });
+    expect(apiError.name).toBe('BcfApiError');
+    const authError = new BcfAuthenticationError('y', { status: 400, url: 'https://host/token', errorCode: 'invalid_grant' });
+    expect(authError.name).toBe('BcfAuthenticationError');
+    expect(authError.errorCode).toBe('invalid_grant');
+    // As before the Foundation extraction, an authentication error is a BcfApiError.
+    expect(authError).toBeInstanceOf(BcfApiError);
+    expect(new FoundationApiError('z', { status: 500, url: 'https://host' })).not.toBeInstanceOf(BcfApiError);
+  });
+
+  it('BcfApiClient is a FoundationApiClient carrying BCF resource methods', () => {
+    const client = new BcfApiClient({ baseUrl: 'https://host/bcf', fetchFn: async () => new Response('{}') });
+    expect(client).toBeInstanceOf(FoundationApiClient);
+  });
+});
+
 describe('normalizeBcfBaseUrl', () => {
   it('strips trailing slashes and pasted version segments', () => {
     expect(normalizeBcfBaseUrl('https://host/bcf')).toBe('https://host/bcf');
@@ -42,6 +75,16 @@ describe('normalizeBcfBaseUrl', () => {
   it('keeps URLs whose last segment is not a version number', () => {
     expect(normalizeBcfBaseUrl('https://host/api/v1')).toBe('https://host/api/v1');
   });
+
+  it('drops a query or fragment, which is never part of a base path', () => {
+    expect(normalizeBcfBaseUrl('https://host/bcf?tenant=a')).toBe('https://host/bcf');
+    expect(normalizeBcfBaseUrl('https://host/#/projects')).toBe('https://host');
+    expect(normalizeBcfBaseUrl('https://host/bcf/2.1?x=1#y')).toBe('https://host/bcf');
+  });
+
+  it('leaves an address it cannot parse to the request that reports it', () => {
+    expect(normalizeBcfBaseUrl('not a url/')).toBe('not a url');
+  });
 });
 
 describe('BcfApiClient URL construction', () => {
@@ -52,8 +95,18 @@ describe('BcfApiClient URL construction', () => {
         : jsonResponse([]),
     );
     const client = new BcfApiClient({ baseUrl: 'https://host/bcf/', fetchFn });
-    const versions = await client.getVersions();
+    // Typed as BcfApiVersion[], as before the Foundation extraction: an entry
+    // with no `api_id` is a valid BCF /versions entry (#5438 review).
+    const versions: BcfApiVersion[] = await client.getVersions();
     expect(versions).toEqual([{ version_id: '2.1' }]);
+    // A caller's override (or mock) returning plain BCF entries must still
+    // type-check; with the inherited FoundationVersion[] it did not.
+    class FixedVersions extends BcfApiClient {
+      override async getVersions(): Promise<BcfApiVersion[]> {
+        return [{ version_id: '3.0' }];
+      }
+    }
+    expect(await new FixedVersions({ baseUrl: 'https://host/bcf', fetchFn }).getVersions()).toEqual([{ version_id: '3.0' }]);
     await client.getProjects();
     expect(requests[0].url).toBe('https://host/bcf/versions');
     expect(requests[1].url).toBe('https://host/bcf/2.1/projects');
@@ -111,16 +164,21 @@ describe('BcfApiClient auth handling', () => {
     expect(apiError.status).toBe(401);
     expect(apiError.isAuthError).toBe(true);
     expect(apiError.message).toBe('Not authenticated');
+    // The historical name, not the Foundation class's default: callers
+    // serialize and dispatch on `name` (#5438 review).
+    expect(apiError.name).toBe('BcfApiError');
   });
 
-  it('reports non-JSON error bodies by status line', async () => {
+  it('reports non-JSON error bodies by status line and request URL', async () => {
     const { fetchFn } = mockFetch(
       () => new Response('<html>gateway timeout</html>', { status: 504 }),
     );
     const client = new BcfApiClient({ baseUrl: 'https://host/bcf', fetchFn });
     const error = await client.getProjects().catch((e: unknown) => e);
     expect(error).toBeInstanceOf(BcfApiError);
-    expect((error as BcfApiError).message).toBe('BCF request failed (HTTP 504)');
+    expect((error as BcfApiError).message).toBe(
+      'BCF request failed (HTTP 504) at https://host/bcf/2.1/projects',
+    );
   });
 });
 

@@ -25,13 +25,23 @@ import { comparableGlobalIds } from './diff-scope.js';
 
 const USAGE =
   'Usage: ifc-lite diff <file1.ifc> <file2.ifc> [--json] [--by-entity]\n' +
-  '                     [--by-content] [--identity-out <map.json>] [--identity-in <map.json>]';
+  '                     [--by-content] [--geometry] [--split-merge] [--successors]\n' +
+  '                     [--identity-out <map.json>] [--identity-in <map.json>]\n' +
+  '                     [--lineage-out <lineage.json>] [--lineage-in <lineage.json>]\n' +
+  '                     [--accept <map.json>] [--key-from Tag|Pset.Prop]';
 
 /** Flags that consume the following argument, so it is never mistaken for a
  *  positional file path. Deliberately only the flags this command owns: the
  *  shared `args.filter(a => !a.startsWith('-'))` idiom would have swallowed
  *  `--identity-out map.json` as a third file. */
-const VALUE_FLAGS = new Set(['--identity-out', '--identity-in']);
+const VALUE_FLAGS = new Set([
+  '--identity-out',
+  '--identity-in',
+  '--lineage-out',
+  '--lineage-in',
+  '--accept',
+  '--key-from',
+]);
 
 export function diffPositionals(args: string[]): string[] {
   const positional: string[] = [];
@@ -71,12 +81,35 @@ export async function diffCommand(args: string[]): Promise<void> {
   // it rather than being silently ignored next to the type-count diff.
   const identityOut = identityPath(args, '--identity-out');
   const identityIn = identityPath(args, '--identity-in');
-  if (hasFlag(args, '--by-content') || identityOut !== undefined || identityIn !== undefined) {
+  const lineageOut = identityPath(args, '--lineage-out');
+  const lineageIn = identityPath(args, '--lineage-in');
+  const accept = identityPath(args, '--accept');
+  const keyFrom = identityPath(args, '--key-from');
+  // `--geometry` / `--split-merge` / `--successors` only mean anything on the
+  // engine path too (issue #4956), so they imply `--by-content` the same way
+  // the identity-map flags already do.
+  const geometry = hasFlag(args, '--geometry');
+  const splitMerge = hasFlag(args, '--split-merge');
+  const successors = hasFlag(args, '--successors');
+  if (
+    hasFlag(args, '--by-content') ||
+    geometry ||
+    splitMerge ||
+    successors ||
+    [identityOut, identityIn, lineageOut, lineageIn, accept, keyFrom].some((v) => v !== undefined)
+  ) {
     await contentDiffCommand({
       basePath: file1,
       headPath: file2,
       identityIn,
       identityOut,
+      lineageIn,
+      lineageOut,
+      accept,
+      keyFrom,
+      geometry,
+      splitMerge,
+      successors,
       json: jsonOutput,
     });
     return;
@@ -89,9 +122,11 @@ export async function diffCommand(args: string[]): Promise<void> {
   // Type-level comparison
   const types1 = new Map<string, number>();
   const types2 = new Map<string, number>();
+  // @raw-entity-enumeration-ok store1 was just loaded from the base file; no live overlay exists
   for (const [typeName, ids] of store1.entityIndex.byType) {
     types1.set(typeName, ids.length);
   }
+  // @raw-entity-enumeration-ok store2 was just loaded from the head file; no live overlay exists
   for (const [typeName, ids] of store2.entityIndex.byType) {
     types2.set(typeName, ids.length);
   }

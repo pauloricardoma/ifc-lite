@@ -3,43 +3,18 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * Bulk Query Engine for mass property updates
- *
- * Provides SQL-like query capabilities for selecting and modifying
- * multiple IFC entities at once.
+ * Bulk Query Engine: SQL-like selection and modification for multiple
+ * IFC entities at once.
  */
-
-import type { EntityTable, SpatialHierarchy, PropertyTable } from '@ifc-lite/data';
+import type { EntityTable, SpatialHierarchy } from '@ifc-lite/data';
 import { PropertyValueType } from '@ifc-lite/data';
 import type { MutablePropertyView } from './mutable-property-view.js';
 import type { Mutation, PropertyValue } from './types.js';
 import { checkMutationGuard, type MutationGuard } from './mutation-guard.js';
-
-/**
- * Filter operators for property values
- */
-export type FilterOperator =
-  | '='
-  | '!='
-  | '>'
-  | '<'
-  | '>='
-  | '<='
-  | 'CONTAINS'
-  | 'STARTS_WITH'
-  | 'ENDS_WITH'
-  | 'IS_NULL'
-  | 'IS_NOT_NULL';
-
-/**
- * Property filter condition
- */
-export interface PropertyFilter {
-  psetName?: string;
-  propName: string;
-  operator: FilterOperator;
-  value?: PropertyValue;
-}
+import { compileGuardedRegex } from '@ifc-lite/regex-guard';
+import { effectiveBulkCandidates, effectiveRootAttribute } from './bulk-query-candidates.js';
+import { applyBulkAttribute, bulkAttributeRefusal } from './bulk-attribute-action.js';
+import type { ModelSchema } from './schema-attribute-names.js';
 
 /**
  * Selection criteria for bulk queries
@@ -55,8 +30,6 @@ export interface SelectionCriteria {
   sites?: number[];
   /** Filter by space IDs */
   spaces?: number[];
-  /** Filter by property conditions */
-  propertyFilters?: PropertyFilter[];
   /** Filter by global IDs */
   globalIds?: string[];
   /** Filter by express IDs */
@@ -83,7 +56,12 @@ export type BulkAction =
     }
   | {
       type: 'SET_ATTRIBUTE';
-      attribute: 'name' | 'description' | 'objectType';
+      /**
+       * Exact EXPRESS attribute name, one of `BULK_WRITABLE_ATTRIBUTES`
+       * (`Name`, `Description`, `ObjectType`, `Tag`). An entity whose class
+       * does not declare it fails the run instead of being skipped.
+       */
+      attribute: string;
       value: string;
     }
   | {
@@ -127,31 +105,37 @@ export interface BulkQueryResult {
 export class BulkQueryEngine {
   private entities: EntityTable;
   private spatialHierarchy: SpatialHierarchy | null;
-  private properties: PropertyTable | null;
   private mutationView: MutablePropertyView;
   private strings: { get(idx: number): string } | null;
   /** expressId → array index lookup, built once to avoid O(n) scans */
   private expressIdIndex: Map<number, number>;
   /** See mutation-guard.ts: consulted once by `applyAction`, opt-in. */
   private canEdit: MutationGuard | undefined;
+  /** The model's declared schema, which decides the attributes SET_ATTRIBUTE may write. */
+  private schemaVersion: ModelSchema | undefined;
+  /** Live container membership supplied by a parser-aware caller. */
+  private spatialMembers: ((containerId: number) => readonly number[]) | undefined;
 
   constructor(
     entities: EntityTable,
     mutationView: MutablePropertyView,
     spatialHierarchy?: SpatialHierarchy | null,
-    properties?: PropertyTable | null,
     strings?: { get(idx: number): string } | null,
-    canEdit?: MutationGuard
+    canEdit?: MutationGuard,
+    schemaVersion?: ModelSchema,
+    spatialMembers?: (containerId: number) => readonly number[],
   ) {
     this.entities = entities;
     this.mutationView = mutationView;
     this.spatialHierarchy = spatialHierarchy || null;
-    this.properties = properties || null;
     this.strings = strings || null;
     this.canEdit = canEdit;
+    this.schemaVersion = schemaVersion;
+    this.spatialMembers = spatialMembers;
 
     // Build O(1) lookup map once instead of O(n) linear scan per query
     this.expressIdIndex = new Map<number, number>();
+    // @raw-entity-enumeration-ok source rows build an expressId-to-slot lookup; effectiveBulkCandidates applies the mutation view
     for (let i = 0; i < entities.count; i++) {
       this.expressIdIndex.set(entities.expressId[i], i);
     }
@@ -161,80 +145,27 @@ export class BulkQueryEngine {
    * Select entities matching criteria
    */
   select(criteria: SelectionCriteria): number[] {
-    let candidates: number[];
+    // The session's effective entities (#5196, #5249): tombstones out,
+    // creations in, a retyped entity under its new class.
+    let candidates = effectiveBulkCandidates(this.entities, this.expressIdIndex, this.mutationView, criteria.entityTypes);
 
-    // Fast path: filter by entity types directly during iteration instead of
-    // building the full ID list first, then filtering (avoids two passes).
-    if (criteria.entityTypes && criteria.entityTypes.length > 0) {
-      const typeSet = new Set(criteria.entityTypes);
-      candidates = [];
-      for (let i = 0; i < this.entities.count; i++) {
-        if (typeSet.has(this.entities.typeEnum[i])) {
-          candidates.push(this.entities.expressId[i]);
-        }
+    // @raw-entity-enumeration-ok these source buckets are consumed only for an unchanged session; a live resolver replaces them for edited sessions
+    for (const [ids, bucket] of [
+      [criteria.storeys, this.spatialHierarchy?.byStorey],
+      [criteria.buildings, this.spatialHierarchy?.byBuilding],
+      [criteria.sites, this.spatialHierarchy?.bySite],
+      [criteria.spaces, this.spatialHierarchy?.bySpace],
+    ] as const) {
+      if (!ids?.length) continue;
+      if (!this.spatialMembers && (this.mutationView.hasPendingChanges() || !bucket)) {
+        throw new Error('BulkQueryEngine: spatial filter requires live membership for edited or unavailable spatial data.');
       }
-    } else {
-      candidates = this.getAllEntityIds();
-    }
-
-    // Filter by storeys
-    if (criteria.storeys && criteria.storeys.length > 0 && this.spatialHierarchy) {
-      const storeySet = new Set(criteria.storeys);
-      const storeyElements = new Set<number>();
-      for (const storeyId of storeySet) {
-        const elements = this.spatialHierarchy.byStorey.get(storeyId);
-        if (elements) {
-          for (const el of elements) {
-            storeyElements.add(el);
-          }
-        }
+      const members = new Set<number>();
+      for (const containerId of ids) {
+        // @raw-entity-enumeration-ok parsed bucket is used only for a session with no pending mutation; live sessions use spatialMembers
+        for (const member of this.spatialMembers?.(containerId) ?? bucket?.get(containerId) ?? []) members.add(member);
       }
-      candidates = candidates.filter((id) => storeyElements.has(id));
-    }
-
-    // Filter by buildings
-    if (criteria.buildings && criteria.buildings.length > 0 && this.spatialHierarchy) {
-      const buildingSet = new Set(criteria.buildings);
-      const buildingElements = new Set<number>();
-      for (const buildingId of buildingSet) {
-        const elements = this.spatialHierarchy.byBuilding.get(buildingId);
-        if (elements) {
-          for (const el of elements) {
-            buildingElements.add(el);
-          }
-        }
-      }
-      candidates = candidates.filter((id) => buildingElements.has(id));
-    }
-
-    // Filter by sites
-    if (criteria.sites && criteria.sites.length > 0 && this.spatialHierarchy) {
-      const siteSet = new Set(criteria.sites);
-      const siteElements = new Set<number>();
-      for (const siteId of siteSet) {
-        const elements = this.spatialHierarchy.bySite.get(siteId);
-        if (elements) {
-          for (const el of elements) {
-            siteElements.add(el);
-          }
-        }
-      }
-      candidates = candidates.filter((id) => siteElements.has(id));
-    }
-
-    // Filter by spaces
-    if (criteria.spaces && criteria.spaces.length > 0 && this.spatialHierarchy) {
-      const spaceSet = new Set(criteria.spaces);
-      const spaceElements = new Set<number>();
-      for (const spaceId of spaceSet) {
-        const elements = this.spatialHierarchy.bySpace.get(spaceId);
-        if (elements) {
-          for (const el of elements) {
-            spaceElements.add(el);
-          }
-        }
-      }
-      candidates = candidates.filter((id) => spaceElements.has(id));
+      candidates = candidates.filter((id) => members.has(id));
     }
 
     // Filter by express IDs (direct selection)
@@ -260,32 +191,13 @@ export class BulkQueryEngine {
     // Filter by global IDs
     if (criteria.globalIds && criteria.globalIds.length > 0 && this.strings) {
       const globalIdSet = new Set(criteria.globalIds);
-      candidates = candidates.filter((id) => {
-        const idx = this.findEntityIndex(id);
-        if (idx === -1) return false;
-        const globalIdIdx = this.entities.globalId[idx];
-        const globalId = this.strings!.get(globalIdIdx);
-        return globalIdSet.has(globalId);
-      });
+      candidates = candidates.filter((id) => globalIdSet.has(this.rootAttribute(id, 'GlobalId')));
     }
 
     // Filter by name pattern
     if (criteria.namePattern && this.strings) {
-      const regex = new RegExp(criteria.namePattern, 'i');
-      candidates = candidates.filter((id) => {
-        const idx = this.findEntityIndex(id);
-        if (idx === -1) return false;
-        const nameIdx = this.entities.name[idx];
-        const name = this.strings!.get(nameIdx);
-        return regex.test(name);
-      });
-    }
-
-    // Filter by property conditions
-    if (criteria.propertyFilters && criteria.propertyFilters.length > 0) {
-      for (const filter of criteria.propertyFilters) {
-        candidates = this.filterByProperty(candidates, filter);
-      }
+      const regex = compileGuardedRegex(criteria.namePattern, 'i'); // caller-supplied: guard against ReDoS
+      candidates = candidates.filter((id) => regex.test(this.rootAttribute(id, 'Name')));
     }
 
     return candidates;
@@ -307,6 +219,9 @@ export class BulkQueryEngine {
    * Execute a bulk query
    */
   execute(query: BulkQuery): BulkQueryResult {
+    // An unwritable attribute is one refusal for the run, not one error per entity.
+    const refusal = query.action.type === 'SET_ATTRIBUTE' ? bulkAttributeRefusal(query.action.attribute) : null;
+    if (refusal) return { mutations: [], affectedEntityCount: 0, success: false, errors: [refusal] };
     const entityIds = this.select(query.select);
     const mutations: Mutation[] = [];
     const errors: string[] = [];
@@ -353,9 +268,7 @@ export class BulkQueryEngine {
         );
 
       case 'SET_ATTRIBUTE':
-        // Attribute mutations would need to be implemented
-        // For now, we'll skip these
-        return null;
+        return applyBulkAttribute(this.entities, this.mutationView, entityId, action.attribute, action.value, this.schemaVersion);
 
       case 'SET_ENTITY_TYPE':
         return this.mutationView.setEntityType(
@@ -369,125 +282,9 @@ export class BulkQueryEngine {
     }
   }
 
-  /**
-   * Filter candidates by property condition
-   */
-  private filterByProperty(candidates: number[], filter: PropertyFilter): number[] {
-    return candidates.filter((entityId) => {
-      // Get property value from mutation view (includes mutations)
-      const value = filter.psetName
-        ? this.mutationView.getPropertyValue(entityId, filter.psetName, filter.propName)
-        : this.findPropertyByName(entityId, filter.propName);
-
-      return this.matchesFilter(value, filter);
-    });
-  }
-
-  /**
-   * Find a property by name across all property sets
-   */
-  private findPropertyByName(entityId: number, propName: string): PropertyValue | null {
-    if (!this.properties) return null;
-
-    const psets = this.properties.getForEntity(entityId);
-    for (const pset of psets) {
-      for (const prop of pset.properties) {
-        if (prop.name === propName) {
-          return prop.value;
-        }
-      }
-    }
-    return null;
-  }
-
-  /**
-   * Check if a value matches a filter condition
-   */
-  private matchesFilter(value: PropertyValue | null, filter: PropertyFilter): boolean {
-    // Handle null checks
-    if (filter.operator === 'IS_NULL') {
-      return value === null || value === undefined;
-    }
-    if (filter.operator === 'IS_NOT_NULL') {
-      return value !== null && value !== undefined;
-    }
-
-    // For other operators, null values don't match
-    if (value === null || value === undefined) {
-      return false;
-    }
-
-    const filterValue = filter.value;
-
-    // String operations
-    if (typeof value === 'string' && typeof filterValue === 'string') {
-      switch (filter.operator) {
-        case '=':
-          return value === filterValue;
-        case '!=':
-          return value !== filterValue;
-        case 'CONTAINS':
-          return value.toLowerCase().includes(filterValue.toLowerCase());
-        case 'STARTS_WITH':
-          return value.toLowerCase().startsWith(filterValue.toLowerCase());
-        case 'ENDS_WITH':
-          return value.toLowerCase().endsWith(filterValue.toLowerCase());
-        default:
-          return false;
-      }
-    }
-
-    // Numeric operations
-    if (typeof value === 'number' && typeof filterValue === 'number') {
-      switch (filter.operator) {
-        case '=':
-          return value === filterValue;
-        case '!=':
-          return value !== filterValue;
-        case '>':
-          return value > filterValue;
-        case '<':
-          return value < filterValue;
-        case '>=':
-          return value >= filterValue;
-        case '<=':
-          return value <= filterValue;
-        default:
-          return false;
-      }
-    }
-
-    // Boolean operations
-    if (typeof value === 'boolean') {
-      const boolFilterValue = filterValue === true || filterValue === 'true';
-      switch (filter.operator) {
-        case '=':
-          return value === boolFilterValue;
-        case '!=':
-          return value !== boolFilterValue;
-        default:
-          return false;
-      }
-    }
-
-    return false;
-  }
-
-  /**
-   * Get all entity IDs
-   */
-  private getAllEntityIds(): number[] {
-    const ids: number[] = [];
-    for (let i = 0; i < this.entities.count; i++) {
-      ids.push(this.entities.expressId[i]);
-    }
-    return ids;
-  }
-
-  /**
-   * Find the index of an entity by ID (O(1) via pre-built map)
-   */
-  private findEntityIndex(expressId: number): number {
-    return this.expressIdIndex.get(expressId) ?? -1;
+  /** Effective GlobalId / Name of a candidate (see bulk-query-candidates.ts). */
+  private rootAttribute(expressId: number, attribute: 'GlobalId' | 'Name'): string {
+    const row = this.expressIdIndex.get(expressId);
+    return effectiveRootAttribute(this.entities, this.strings!, this.mutationView, row, expressId, attribute);
   }
 }

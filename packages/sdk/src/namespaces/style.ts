@@ -60,7 +60,7 @@ function resolveColor(color: SurfaceStyleColor | string): SurfaceStyleColor {
  *
  * @example
  * bim.style.apply(bim.query().byType('IfcDuctSegment').refs(), '#9caec9');
- * const ifc = bim.export.ifc([], { schema: 'IFC4' }); // carries the colour
+ * const ifc = bim.export.ifc(undefined, { schema: 'IFC4' }); // carries the colour
  */
 export class StyleNamespace {
   constructor(private backend: BimBackend) {}

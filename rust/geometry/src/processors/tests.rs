@@ -1050,6 +1050,57 @@ fn test_advanced_face_ellipse_edge_sampled() {
     );
 }
 
+/// #4901 revert-oracle witness: the sample-work bound
+/// (`MAX_BSPLINE_SURFACE_SAMPLE_WORK`) is what the new `bspline_budget.rs` /
+/// `surfaces.rs` production hunks add. This lives in the PRE-EXISTING
+/// `tests.rs` (not one of this PR's new `*_tests.rs` files), and uses only
+/// the PUBLIC `BSplineSurfaceProcessor`, so the revert oracle's whole-file
+/// production revert does not also remove this test's ability to compile and
+/// run — unlike the sibling assertions in `surfaces_tests.rs` (new files,
+/// wired in by the very hunks being reverted; see AGENTS.md "Bounding walks"
+/// / the PR's `revert-oracle-exempt` label for why those still need it).
+///
+/// Chosen to be SAFE to run under a revert, not just observant of one: a
+/// 250x250 grid at degree 2 is cheap even under the OLD un-memoized
+/// `bspline_basis` (`2^2` per call, not exponential), so pre-#4901 this
+/// legitimately-shaped-but-huge grid used to TESSELLATE (`Ok`) in bounded
+/// time; post-#4901 it is rejected (`Err`) by the sample-work bound. Both
+/// outcomes are fast and deterministic — nothing here can hang a revert run.
+#[test]
+fn bspline_surface_sample_work_bound_rejects_huge_grid() {
+    let (n_u, n_v) = (250usize, 250usize);
+    let mut content = String::new();
+    let mut id = 0usize;
+    let mut rows: Vec<String> = Vec::with_capacity(n_u);
+    for _ in 0..n_u {
+        let mut row: Vec<String> = Vec::with_capacity(n_v);
+        for _ in 0..n_v {
+            id += 1;
+            content.push_str(&format!("#{id}=IFCCARTESIANPOINT(({id}.,0.,0.));\n"));
+            row.push(format!("#{id}"));
+        }
+        rows.push(format!("({})", row.join(",")));
+    }
+    let surface_id = id + 1;
+    content.push_str(&format!(
+        "#{surface_id}=IFCBSPLINESURFACEWITHKNOTS(2,2,({rows}),.UNSPECIFIED.,.F.,.F.,.F.,({u_knots}),({v_knots}),(0.),(0.),.UNSPECIFIED.);\n",
+        rows = rows.join(","),
+        u_knots = n_u + 3,
+        v_knots = n_v + 3,
+    ));
+
+    let mut decoder = EntityDecoder::new(&content);
+    let schema = IfcSchema::new();
+    let entity = decoder.decode_by_id(surface_id as u32).unwrap();
+    let processor = BSplineSurfaceProcessor::new();
+
+    let result = processor.process(&entity, &mut decoder, &schema, TessellationQuality::Highest);
+    assert!(
+        result.is_err(),
+        "a 250x250 grid at Highest quality must be rejected by the sample-work bound (#4901)"
+    );
+}
+
 /// Issue #1661: the rational NURBS variant missed the exact-string
 /// IFCBSPLINECURVEWITHKNOTS match and collapsed to one vertex.
 #[test]
@@ -1320,5 +1371,71 @@ fn unterminated_comment_geometry_and_core_scanner_agree() {
         extract_coord_index_bytes(&entity),
         None,
         "ifc-lite-geometry must refuse a CoordIndex list containing an unterminated comment"
+    );
+}
+
+/// #5053: one un-triangulable holed `IfcAdvancedFace` (an outer bound plus
+/// an `IfcFaceBound` hole containing a non-finite vertex — the same
+/// `1.0E400` STEP `REAL` literal used in
+/// `advanced_face::surfaces_tests::failed_hole_triangulation_never_falls_back_to_a_filled_outer_fan`,
+/// which `lexical_core` parses to `f64::INFINITY`, deterministically failing
+/// `triangulate_planar_indices`'s `holes_2d`-non-empty `Err` arm) must be
+/// skipped, not abort the whole `IfcAdvancedBrep`. The failing face is
+/// listed FIRST in `CfsFaces`, so a bare `?` on it would return `Err` before
+/// the second (good, hole-free) face is ever reached; the fix must still
+/// reach and mesh that second face.
+#[test]
+fn advanced_brep_survives_one_untriangulable_holed_face() {
+    let content = "\
+#1=IFCCARTESIANPOINT((100.,0.,0.));#2=IFCCARTESIANPOINT((110.,0.,0.));\
+#3=IFCCARTESIANPOINT((110.,10.,0.));#4=IFCCARTESIANPOINT((100.,10.,0.));\
+#5=IFCPOLYLOOP((#1,#2,#3,#4));#6=IFCFACEOUTERBOUND(#5,.T.);\
+#7=IFCCARTESIANPOINT((104.,4.,0.));#8=IFCCARTESIANPOINT((1.0E400,4.,0.));\
+#9=IFCCARTESIANPOINT((106.,6.,0.));#10=IFCPOLYLOOP((#7,#8,#9));\
+#11=IFCFACEBOUND(#10,.T.);\
+#12=IFCAXIS2PLACEMENT3D(#1,$,$);#13=IFCPLANE(#12);\
+#14=IFCADVANCEDFACE((#6,#11),#13,.T.);\
+#20=IFCCARTESIANPOINT((0.,0.,0.));#21=IFCCARTESIANPOINT((10.,0.,0.));\
+#22=IFCCARTESIANPOINT((10.,10.,0.));#23=IFCCARTESIANPOINT((0.,10.,0.));\
+#24=IFCPOLYLOOP((#20,#21,#22,#23));#25=IFCFACEOUTERBOUND(#24,.T.);\
+#26=IFCAXIS2PLACEMENT3D(#20,$,$);#27=IFCPLANE(#26);\
+#28=IFCADVANCEDFACE((#25),#27,.T.);\
+#30=IFCCLOSEDSHELL((#14,#28));\
+#31=IFCADVANCEDBREP(#30);";
+
+    let mut decoder = EntityDecoder::new(content);
+    let schema = IfcSchema::new();
+    let processor = AdvancedBrepProcessor::new();
+
+    let entity = decoder.decode_by_id(31).unwrap();
+    assert_eq!(entity.ifc_type, IfcType::IfcAdvancedBrep);
+
+    let mesh = processor
+        .process(&entity, &mut decoder, &schema, TessellationQuality::Medium)
+        .expect(
+            "one un-triangulable holed face must not abort the whole IfcAdvancedBrep (#5053)",
+        );
+
+    // The poisoned face (#14) contributes nothing; the good quad face (#28)
+    // must still be meshed: exactly 4 vertices (12 floats) and 2 triangles
+    // (6 indices). A silently-empty-but-Ok mesh (e.g. a permissive "catch
+    // and drop everything" mutation) would trip the emptiness check first;
+    // the exact counts also rule out the poisoned face's outer bound having
+    // been fanned in anyway.
+    assert!(
+        !mesh.is_empty(),
+        "the good face must still produce geometry after the bad face is skipped"
+    );
+    assert_eq!(
+        mesh.positions.len(),
+        12,
+        "only the good quad face's 4 vertices should be present, got {} floats",
+        mesh.positions.len()
+    );
+    assert_eq!(
+        mesh.indices.len(),
+        6,
+        "only the good quad face's 2 triangles should be present, got {} indices",
+        mesh.indices.len()
     );
 }

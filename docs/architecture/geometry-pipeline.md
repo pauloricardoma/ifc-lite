@@ -27,6 +27,12 @@ prepass resolution exist exactly once, in `ifc-lite-processing`:
   incremental job emission), but they only span-stash — all semantics resolve
   in the shared module.
 
+The native scanner uses `ifc_lite_core::geometry_flags_by_name` to obtain
+`(has_geometry, representationless_spatial)` with one lookup of the existing
+immutable schema table. These are the same predicates exposed separately by
+`has_geometry_by_name` and `is_representationless_spatial_container_by_name`;
+the second still requires the instance's `Representation` to be present.
+
 Geometry/styling fixes belong in those two modules; re-inlining logic in
 `processor.rs` or `gpu_meshes.rs` re-creates the historic both-sides drift
 (#858, #913, #957, #961 each had to be fixed twice before the unification).
@@ -106,14 +112,21 @@ classDiagram
 
 ### Coverage by Type
 
-| Geometry Type | Coverage | Notes |
-|---------------|----------|-------|
-| IfcExtrudedAreaSolid | Full | Most common |
-| IfcFacetedBrep | Full | Face triangulation + source weld |
-| IfcBooleanClippingResult | Full | Exact pure-Rust CSG kernel |
-| IfcMappedItem | Full | GPU instancing |
-| IfcSurfaceModel | Partial | Surface meshes |
-| IfcTriangulatedFaceSet | Full | IFC4 triangles, zero-alloc fast parse |
+The router's processor registry (`rust/geometry/src/router/processor_registry.rs`)
+currently covers 23 distinct `IfcType` representation items across 18
+processor structs — including `IfcExtrudedAreaSolid`, `IfcFacetedBrep`,
+`IfcBooleanClippingResult`/`IfcBooleanResult`, `IfcTriangulatedFaceSet`,
+`IfcShellBasedSurfaceModel`, `IfcFaceBasedSurfaceModel` (the two concrete
+`IfcSurfaceModel` subtypes), `IfcAlignment` and more — not the six this
+section used to list by hand, which had drifted from source. `IfcMappedItem`
+is handled separately, via GPU instancing (`rust/geometry/src/router/instancing.rs`),
+not through this processor table, so it is out of scope for the per-entity
+ledger below.
+
+The full, generated, per-entity table (which processor is registered for
+which representation item, per schema version — the "Geometry" column) is
+the [coverage ledger](coverage-ledger.md) — regenerated from
+this same source file, so it cannot go stale the way the table above did.
 
 ## Extrusion Processing
 
@@ -341,7 +354,7 @@ Opening voids (`IfcRelVoidsElement`) go through ONE exact path: the prepass reso
 Every element's meshes pass through a single funnel (`build_mesh_data` in `ifc-lite-processing::element`) that applies:
 
 - **Degenerate/sliver drops**: `drop_degenerate_triangles` and `drop_thin_triangles` remove zero-area and needle triangles at every output chokepoint (kernel output, funnel backstop), so CSG residue never reaches the GPU.
-- **Source vertex weld** (`mesh_weld::weld_indexed`): collapses vertices with identical f32 position AND coinciding quantized normal (and UV). The faceted-brep mesher emits per-face geometry that duplicates every shared corner 3-6x; the weld undoes that while keeping creases split, because the normal is part of the merge key. Flat shading is preserved by construction (a cube keeps its 24 vertices), and texture seams stay split via the UV key. A naive position-only weld is deliberately NOT used, since it would smooth creases and break flat shading.
+- **Source vertex weld** (`mesh_weld`, since #4103 run from the router's placement appliers in the OBJECT frame, and at this funnel only for geometry with no cross-occurrence identity to protect — see the `mesh_weld` module doc): collapses vertices with identical f32 position AND coinciding quantized normal (and UV). The faceted-brep mesher emits per-face geometry that duplicates every shared corner 3-6x; the weld undoes that while keeping creases split, because the normal is part of the merge key. Flat shading is preserved by construction (a cube keeps its 24 vertices), and texture seams stay split via the UV key. A naive position-only weld is deliberately NOT used, since it would smooth creases and break flat shading.
 
 The weld and drops are deterministic across native and wasm32 targets.
 
@@ -394,7 +407,7 @@ fn transform_point(point: Point3<f64>, matrix: &Matrix4<f64>) -> Point3<f64> {
 
 Two mechanisms keep f32 GPU coordinates precise (details in [Coordinate Handling](coordinate-handling.md)):
 
-- **Model-level RTC offset**: the pre-pass samples placement translations of geometry-bearing elements and, when the per-axis median exceeds 10 km, subtracts that offset from every mesh.
+- **Model-level RTC offset**: the pre-pass samples placement translations of geometry-bearing elements and, when the per-axis median exceeds `LARGE_COORD_THRESHOLD_METERS` (1 km, was 10 km before #4934), subtracts that offset from every mesh.
 - **Per-element local-frame origin**: each `MeshData` carries an f64 `origin`; positions are stored as small f32 values relative to it, so building-scale translations never get baked into f32 vertices.
 
 ```mermaid

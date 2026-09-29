@@ -20,6 +20,11 @@ import type {
 import type { IfcSourceTransfer } from '@ifc-lite/parser';
 
 import type {
+  PropertyOverlaySnapshot,
+  EntityVisibilitySnapshot,
+} from '@/lib/ids/property-overlay-snapshot';
+
+import type {
   IdsWorkerRequest,
   IdsWorkerResponse,
 } from '@/workers/idsValidation.worker';
@@ -51,7 +56,25 @@ export interface RunInWorkerArgs {
   modelId: string;
   locale: 'en' | 'de' | 'fr';
   includePassingEntities: boolean;
+  /**
+   * The model's pending property edits as plain, clonable data (#3946).
+   *
+   * The worker validates the RE-PARSED source bytes, which do not carry
+   * in-memory corrections, so without this a model with edits pending had
+   * to be validated on the main thread instead. Snapshotting is
+   * O(pending edits); a model with none passes `undefined` and takes the
+   * unchanged no-overlay path.
+   */
+  propertyOverlay?: PropertyOverlaySnapshot;
+  /**
+   * The model's pending tombstones and surviving overlay-created entity
+   * ids, as plain clonable data (#5184) — see `IdsWorkerRequest`'s own
+   * field doc in the worker for why the worker needs this separately from
+   * `propertyOverlay`.
+   */
+  entityVisibility?: EntityVisibilitySnapshot;
   onProgress?: (progress: ValidationProgress) => void;
+  signal?: AbortSignal;
 }
 
 /**
@@ -65,6 +88,10 @@ export function runValidationInWorker(
   args: RunInWorkerArgs
 ): Promise<IDSValidationReport> {
   return new Promise((resolve, reject) => {
+    if (args.signal?.aborted) {
+      reject(args.signal.reason ?? new DOMException('Validation cancelled', 'AbortError'));
+      return;
+    }
     let worker: Worker;
     try {
       worker = new Worker(
@@ -84,12 +111,19 @@ export function runValidationInWorker(
 
 
     const settle = (fn: () => void) => {
+      args.signal?.removeEventListener('abort', onAbort);
       worker.onmessage = null;
       worker.onerror = null;
       worker.onmessageerror = null;
       worker.terminate();
       fn();
     };
+    const onAbort = () => settle(() => reject(args.signal?.reason ?? new DOMException('Validation cancelled', 'AbortError')));
+    args.signal?.addEventListener('abort', onAbort, { once: true });
+    if (args.signal?.aborted) {
+      onAbort();
+      return;
+    }
 
     worker.onmessage = (event: MessageEvent<IdsWorkerResponse>) => {
       const msg = event.data;
@@ -123,6 +157,8 @@ export function runValidationInWorker(
       modelId: args.modelId,
       locale: args.locale,
       includePassingEntities: args.includePassingEntities,
+      propertyOverlay: args.propertyOverlay,
+      entityVisibility: args.entityVisibility,
     };
     try {
       worker.postMessage(request);
@@ -136,4 +172,3 @@ export function runValidationInWorker(
     }
   });
 }
-

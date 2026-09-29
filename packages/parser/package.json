@@ -1,6 +1,6 @@
 {
   "name": "@ifc-lite/parser",
-  "version": "4.3.2",
+  "version": "9.0.0",
   "description": "IFC/STEP parser for IFC-Lite",
   "type": "module",
   "main": "./dist/index.js",
@@ -17,7 +17,7 @@
     }
   },
   "scripts": {
-    "build": "pnpm exec tsc",
+    "build": "pnpm exec tsc && node ./scripts/rewrite-worker-urls.mjs && node ./scripts/verify-dist-worker-urls.mjs",
     "typecheck": "node ../../scripts/typecheck-tests.mjs",
     "dev": "pnpm exec tsc --watch",
     "test": "vitest run"
@@ -27,12 +27,14 @@
     "@ifc-lite/encoding": "workspace:^",
     "@ifc-lite/ifcx": "workspace:^",
     "@ifc-lite/wasm": "workspace:^",
+    "@ifc-lite/wasm-lifecycle": "workspace:^",
+    "decimal.js": "^10.6.0",
     "fflate": "^0.8.3",
-    "jszip": "^3.10.0"
+    "jszip": "^3.10.2"
   },
   "devDependencies": {
     "typescript": "^6.0.3",
-    "vitest": "^4.1.11"
+    "vitest": "^5.0.2"
   },
   "license": "MPL-2.0",
   "author": "Louis True",

@@ -8,8 +8,9 @@
 //! it resolves an IfcSpace/IfcZone's properties on demand in the lookup phase.
 //! Two invariants are locked here end-to-end through `process_geometry`:
 //!
-//! 1. **A space's real property set still lands on its mesh.** The demand path
-//!    must decode the `IfcPropertySet` a space references and attach its values.
+//! 1. **Every grouped property set lands on the space's mesh.** The demand path
+//!    must decode every `IfcPropertySet` a grouped relationship references and
+//!    attach all of their values.
 //! 2. **The type gate holds.** The lazy path resolves the property-set id through
 //!    the entity index (`decode_by_id`), so — unlike the old scan, which only
 //!    stashed exact `IFCPROPERTYSET` matches — a malformed
@@ -22,7 +23,7 @@ use ifc_lite_processing::process_geometry;
 
 // A single IfcSpace with a tessellated body so it produces a mesh that can carry
 // `space_zone_properties`. It is linked to:
-//   * #50 — a real IfcPropertySet (RealPset / RealProp=present), and
+//   * (#50,#53) — grouped real IfcPropertySets, and
 //   * #62 — another IfcRelDefinesByProperties (NOT a property set) that lists a
 //     property atom (#52 PhantomProp=leak) in its RelatedObjects. #61 points the
 //     space at #62. A resolver without a type gate would mine #62's attribute-4
@@ -48,7 +49,9 @@ DATA;
 #43=IFCTRIANGULATEDFACESET(#8,$,.T.,((1,2,3),(1,2,4),(1,4,3),(2,3,4)),$);
 #50=IFCPROPERTYSET('0RealPset00000000000A',$,'RealPset',$,(#51));
 #51=IFCPROPERTYSINGLEVALUE('RealProp',$,IFCLABEL('present'),$);
-#60=IFCRELDEFINESBYPROPERTIES('0RelReal000000000000A',$,$,$,(#30),#50);
+#53=IFCPROPERTYSET('0SecondPset000000000A',$,'SecondPset',$,(#54));
+#54=IFCPROPERTYSINGLEVALUE('SecondProp',$,IFCLABEL('also-present'),$);
+#60=IFCRELDEFINESBYPROPERTIES('0RelReal000000000000A',$,$,$,(#30),(#50,#53));
 #52=IFCPROPERTYSINGLEVALUE('PhantomProp',$,IFCLABEL('leak'),$);
 #62=IFCRELDEFINESBYPROPERTIES('0RelInner00000000000A',$,$,$,(#52),#50);
 #61=IFCRELDEFINESBYPROPERTIES('0RelPhantom0000000A',$,$,$,(#30),#62);
@@ -79,6 +82,12 @@ fn space_real_property_set_is_resolved_on_demand() {
     );
     // The pset-scoped alias is also emitted by add_space_zone_property.
     assert_eq!(props.get("RealPset.RealProp").map(String::as_str), Some("present"));
+    assert_eq!(props.get("SecondProp").map(String::as_str), Some("also-present"));
+    assert_eq!(
+        props.get("SecondPset.SecondProp").map(String::as_str),
+        Some("also-present"),
+        "lazy resolution must retain the second member of a grouped definition"
+    );
 }
 
 #[test]

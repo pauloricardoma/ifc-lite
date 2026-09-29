@@ -10,7 +10,7 @@
 //! a structured `BoolFailure` is now recorded.
 
 use ifc_lite_geometry::{
-    BoolFailureReason, BoolOp, ClippingProcessor, Mesh, Point3, Vector3,
+    BoolFailureReason, BoolOp, ClippingProcessor, GroupCut, GroupReject, Mesh, Point3, Vector3,
 };
 
 /// Produce a unit-box mesh (12 triangles, axis-aligned, centred on `origin`).
@@ -76,9 +76,8 @@ fn subtract_records_no_bounds_overlap() {
     let void = unit_box_at(Point3::new(10.0, 10.0, 10.0));
     let p = ClippingProcessor::new();
 
-    let result = p.subtract_mesh(&host, &void).expect("subtract_mesh ok");
-    // Behaviour preserved — host returned un-cut.
-    assert_eq!(result.triangle_count(), host.triangle_count());
+    let outcome = p.subtract_mesh(&host, &void);
+    assert!(matches!(outcome, GroupCut::Rejected(GroupReject::NoOverlap)), "got {outcome:?}");
 
     let failures = p.take_failures();
     assert_eq!(failures.len(), 1);
@@ -92,8 +91,8 @@ fn subtract_records_empty_operand() {
     let void = Mesh::new();
     let p = ClippingProcessor::new();
 
-    let result = p.subtract_mesh(&host, &void).expect("subtract_mesh ok");
-    assert_eq!(result.triangle_count(), host.triangle_count());
+    let outcome = p.subtract_mesh(&host, &void);
+    assert!(matches!(outcome, GroupCut::Rejected(GroupReject::NoOverlap)), "got {outcome:?}");
 
     let failures = p.take_failures();
     assert_eq!(failures.len(), 1);
@@ -133,10 +132,20 @@ fn subtract_trips_escalation_budget_and_falls_back_deterministically() {
     let restore = budget::cap();
 
     // Unbounded first: confirm this fixture actually exercises the exact tier,
-    // or the trip assertion below would be vacuous.
+    // or the trip assertion below would be vacuous. `escalations > 0` below is
+    // the anti-vacuity guard; the default build also pins the cut itself. With
+    // `csg_manifold_gate` or `csg_topology_gate` on, the gates reject this
+    // near-coplanar host, which #4739 made visible by returning the outcome
+    // instead of the host (#4692).
     budget::set_cap(None);
     let p0 = ClippingProcessor::new();
-    let _ = p0.subtract_mesh(&host, &cutter).expect("subtract ok");
+    let uncapped = p0.subtract_mesh(&host, &cutter);
+    assert!(
+        !matches!(uncapped, GroupCut::Rejected(GroupReject::BudgetTripped)),
+        "the uncapped run must not trip the budget; got {uncapped:?}"
+    );
+    #[cfg(not(any(feature = "csg_manifold_gate", feature = "csg_topology_gate")))]
+    assert!(matches!(uncapped, GroupCut::Cut(_)), "the uncapped cut succeeds; got {uncapped:?}");
     let escalations = budget::count();
 
     // Cap of 1 → trips on the first exact evaluation → host returned un-cut and
@@ -144,16 +153,15 @@ fn subtract_trips_escalation_budget_and_falls_back_deterministically() {
     // point on every target (the #1109 parity-preserving guardrail).
     budget::set_cap(Some(1));
     let p1 = ClippingProcessor::new();
-    let result = p1.subtract_mesh(&host, &cutter).expect("subtract ok");
+    let outcome = p1.subtract_mesh(&host, &cutter);
     let failures = p1.take_failures();
 
     budget::set_cap(restore);
 
     assert!(escalations > 0, "fixture did not reach the exact tier — trip test is vacuous");
-    assert_eq!(
-        result.triangle_count(),
-        host.triangle_count(),
-        "a tripped boolean must return the host un-cut (→ #635 AABB fallback)"
+    assert!(
+        matches!(outcome, GroupCut::Rejected(GroupReject::BudgetTripped)),
+        "a tripped boolean must be rejected, leaving the host un-cut (→ #635 AABB fallback); got {outcome:?}"
     );
     assert!(
         failures.iter().any(|f| matches!(f.reason, BoolFailureReason::OperandTooLarge { .. })),
@@ -170,7 +178,9 @@ fn subtract_past_legacy_cap_succeeds() {
     let void = unit_box_at(Point3::new(0.0, 0.0, 0.0));
     let p = ClippingProcessor::new();
 
-    let result = p.subtract_mesh(&host, &void).expect("subtract_mesh ok");
+    let GroupCut::Cut(result) = p.subtract_mesh(&host, &void) else {
+        panic!("the coinciding cutter must cut the host");
+    };
     assert!(
         !result.is_empty(),
         "kernel must produce non-empty result past legacy cap"
@@ -247,7 +257,7 @@ fn happy_path_records_no_failures() {
     let void = unit_box_at(Point3::new(0.25, 0.25, 0.25));
     let p = ClippingProcessor::new();
 
-    let _ = p.subtract_mesh(&host, &void).expect("subtract_mesh ok");
+    assert!(matches!(p.subtract_mesh(&host, &void), GroupCut::Cut(_)), "the overlapping cutter cuts");
     assert_eq!(
         p.failure_count(),
         0,

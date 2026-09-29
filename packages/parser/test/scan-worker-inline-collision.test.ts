@@ -88,11 +88,12 @@ describe('scan-worker-inline express-id bound (#3395)', () => {
 
 describe('scan-worker-inline type-name cache (hash-collision safety)', () => {
     it('does not alias two type names sharing a 32-bit hash + length', () => {
-        // "Aa" and "BB" both have length 2 and the same rolling hash (4034), so
+        // "AO" and "B0" both have length 2 and the same rolling hash (4016), so
         // they map to the identical type-cache key. Without the byte-verify on a
-        // cache hit, the second type ("BB") would be misread as the first ("Aa").
-        const types = runWorkerScan('#1=Aa();\n#2=BB();\n');
-        expect(types).toEqual(['Aa', 'BB']);
+        // cache hit, the second type ("B0") would be misread as the first. The
+        // hash folds case (#4713), so "Ao" is the first's key as well.
+        const types = runWorkerScan('#1=Ao();\n#2=B0();\n');
+        expect(types).toEqual(['AO', 'B0']);
     });
 
     it('still reuses the cache for genuinely repeated type names', () => {

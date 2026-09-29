@@ -83,28 +83,47 @@ test('the REAL test.yml derives the lane names the REAL rollup publishes', () =>
   // `AGENTS.md ratchet`, added when check-agents-md-size.mjs got its own job
   // rather than riding in `Node tests` (it needs no build artifact and no
   // install, and routing it through `frontend` fanned one gate out to nine
-  // jobs). The count is a TRIPWIRE for a lane appearing or vanishing unnoticed,
+  // jobs), plus `MPL license headers` (#4087), which got its own job for the
+  // same two reasons and one more: it scans `docs/`, `tools/` and
+  // `apps/landing/`, which `frontend` deliberately does not carry, so a
+  // node-tests step could not have fired on three of the trees it reads.
+  // The count is a TRIPWIRE for a lane appearing or vanishing unnoticed,
   // so bumping it is a deliberate act: add the new name to the list below as
   // well, or the count alone would pass while asserting nothing about identity.
   const names = expandJobNames(readFileSync(join(REPO_ROOT, '.github/workflows/test.yml'), 'utf8'));
   for (const observed of [
     'Detect changes',
     'Build packages + WASM',
+    'Changed tests observe production',
     'Typecheck',
     'Lint',
     'Node tests',
+    // CI redesign step 5: the feature legs of the Rust lane, off the PR and
+    // judged in the merge queue. On a PR its check run is `skipped`.
+    'Rust tests (feature builds)',
+    // CI redesign step 4: provenance's 353 s merge battery in its own job,
+    // and the viewer suite at eight shards instead of four.
+    'Provenance tests',
     'Rust tests',
     'Rust crate semver',
-    'Viewer E2E smoke',
+    // #6361: the smoke lane is two file shards, each a distinct check run.
+    'Viewer E2E smoke (1/2)',
+    'Viewer E2E smoke (2/2)',
     'Viewer tests (shard 0)',
     'Viewer tests (shard 3)',
+    'Viewer tests (shard 7)',
     'Docs checks (docs-only PRs)',
+    // #4912: the strict docs site build, on every PR touching docs.
+    'Docs site build (mkdocs --strict)',
     'AGENTS.md ratchet',
+    'MPL license headers',
     'Build + WASM + Rust + Node',
+    // #3878: the two CSG accept gates are feature builds nothing else compiles.
+    'CSG accept gates (feature builds)',
   ]) {
     assert.ok(names.includes(observed), `derived set is missing the observed lane "${observed}"`);
   }
-  assert.equal(names.length, 17);
+  assert.equal(names.length, 28);
 });
 
 test('FAIL CLOSED: an empty workflow file is NO_WORKFLOW_TEXT, not an empty lane set', () => {
@@ -243,7 +262,7 @@ test('the REAL test.yml maps every viewer shard to the template the REAL rollup 
   const aliases = matrixSkipAliases(
     readFileSync(join(REPO_ROOT, '.github/workflows/test.yml'), 'utf8'),
   );
-  for (const shard of [0, 1, 2, 3]) {
+  for (const shard of [0, 1, 2, 3, 4, 5, 6, 7]) {
     assert.equal(
       aliases.get(`Viewer tests (shard ${shard})`),
       MATRIX_TEMPLATE,
@@ -278,7 +297,7 @@ test('`excludeJobKeys` must reach BOTH derivations, or the alias map stops cover
 
   // Asymmetric: excluding the job from the ALIASES only puts the shards back.
   const asymmetric = missingLanes(required, PR3581_ROLLUP, matrixSkipAliases(wf, { exclude: [...exclude, 'viewer-tests'] }));
-  for (const shard of [0, 1, 2, 3]) {
+  for (const shard of [0, 1, 2, 3, 4, 5, 6, 7]) {
     assert.ok(asymmetric.includes(`Viewer tests (shard ${shard})`), `shard ${shard} uncovered`);
   }
 });
@@ -596,8 +615,17 @@ test('the poll treats an EMPTY rollup as "nothing has appeared yet", never as se
  * re-measure does NOT read it -- it is a different population and carries its
  * own array, which is the whole reason the two disagree about 900 s.
  */
-/** The budget the workflow ships; asserted against the YAML below, not restated. */
-const BUDGET_SECONDS = 2400;
+/**
+ * The budget the workflow ships; asserted against the YAML below, not restated.
+ *
+ * 900 s AGAIN, after 2400 s (CI redesign, step 3). The 2026-08-31 re-measure
+ * below still stands -- eight of 56 runs breach 900 s -- but what a breach
+ * MEANS changed with #3810: a deadline that expires while the rollup is still
+ * moving is the LANE_PUBLICATION_TIMEOUT advisory (`ok` stays true), not a
+ * MISSING_LANES failure. So the extra 1500 s bought no verdict, only a runner
+ * slot held for 25 more minutes on every busy-day run, at 116 runs a day.
+ */
+const BUDGET_SECONDS = 900;
 
 const LANE_APPEARED_SECONDS = [
   161, 162, 162, 162, 163, 164, 164, 165, 165, 165, 166, 166, 167, 167, 167, 167, 167, 169, 169,
@@ -642,7 +670,7 @@ test('MEASURED on 2026-08-25/26: 900 s covered every lane APPEARANCE in THAT pop
   assert.equal(Number((900 / max).toFixed(2)), 1.07, 'tail margin, stated honestly');
 });
 
-test('RE-MEASURED 2026-08-31: 900 s BREACHED, and the budget is now 2400 s', () => {
+test('RE-MEASURED 2026-08-31: 900 s BREACHED, and a breach is an advisory, not a verdict', () => {
   // A 1.07x margin is one busy afternoon from being wrong, and this was that
   // afternoon.
   //
@@ -680,26 +708,30 @@ test('RE-MEASURED 2026-08-31: 900 s BREACHED, and the budget is now 2400 s', () 
   // their last lane may yet appear later; so far they stand at 304..1145 s, and
   // the budget would have to be wrong by more than 1255 s for one to breach.
   const STILL_QUEUED_SO_FAR = [304, 306, 324, 374, 378, 397, 435, 446, 467, 485, 1102, 1145];
-  assert.ok(Math.max(...STILL_QUEUED_SO_FAR) < BUDGET_SECONDS, 'none of the unmeasurable runs is near the cap');
+  assert.ok(Math.max(...STILL_QUEUED_SO_FAR) < 2400, 'none of the unmeasurable runs was near the 2400 s cap');
+  // Under the shipped 900 s two of them had ALREADY crossed the budget while
+  // still queued; both are the advisory timeout shape below, not a failure.
+  assert.deepEqual(STILL_QUEUED_SO_FAR.filter((t) => t > BUDGET_SECONDS), [1102, 1145]);
 
   // EIGHT breach 900 s, not the seven an earlier censored draft claimed.
-  assert.deepEqual(
-    RE_MEASURED.filter((t) => t > 900),
-    [906, 1172, 1276, 1387, 1503, 1527, 1786, 2028],
-    '900 s breaches eight of 56',
-  );
+  const BREACHES = [906, 1172, 1276, 1387, 1503, 1527, 1786, 2028];
+  assert.deepEqual(RE_MEASURED.filter((t) => t > 900), BREACHES, '900 s breaches eight of 56');
   assert.deepEqual(RE_MEASURED.filter((t) => t > 1800), [2028], '1800 s still breaches the max');
-  assert.deepEqual(RE_MEASURED.filter((t) => t > BUDGET_SECONDS), [], 'the shipped budget covers all 56');
+  // 2400 s covered all 56; that is the budget this file shipped between
+  // 2026-08-31 and the CI redesign, and it is kept as a measured fact.
+  assert.deepEqual(RE_MEASURED.filter((t) => t > 2400), [], '2400 s covered all 56');
 
-  // THE COVERING DIRECTION.
+  // THE SHIPPED BUDGET IS 900 s AND THOSE EIGHT RUNS TIME OUT UNDER IT. This is
+  // asserted, not hidden, because the reason it is acceptable is a property of
+  // the VERDICT and not of the number: at the deadline the rollup is still
+  // moving, and `evaluate` (check-pr-review-signal.test.mjs, the
+  // LANE_PUBLICATION_TIMEOUT case) reports that as an advisory with `ok: true`
+  // and a re-run remedy. What the eight runs cost under 2400 s was a runner
+  // slot held for up to 25 more minutes each; what they cost under 900 s is a
+  // re-run on the tail. The 48 that fit still get an immediate answer.
   for (const t of RE_MEASURED) {
-    assert.equal(poll(driver(completesAt(t * 1000)), { deadline: BUDGET_SECONDS * 1000 }).timedOut, false, `${t}s`);
-  }
-  // THE FAILING DIRECTION, because a budget that covers everything proves
-  // nothing on its own: the two superseded budgets genuinely time out on the
-  // runs they are claimed to.
-  for (const t of [906, 2028]) {
-    assert.equal(poll(driver(completesAt(t * 1000)), { deadline: 900_000 }).timedOut, true, `${t}s vs 900 s`);
+    const r = poll(driver(completesAt(t * 1000)), { deadline: BUDGET_SECONDS * 1000 });
+    assert.equal(r.timedOut, t > BUDGET_SECONDS, `${t}s vs the shipped ${BUDGET_SECONDS} s`);
   }
   assert.equal(poll(driver(completesAt(2028_000)), { deadline: 1800_000 }).timedOut, true, '2028s vs 1800 s');
 });
@@ -727,12 +759,14 @@ test('RE-MEASURED 2026-08-31: 900 s BREACHED, and the budget is now 2400 s', () 
  * exist -- correct, because nothing failed.
  */
 test('the budget the WORKFLOW ships is the budget this file tested', () => {
-  // WITHOUT THIS, REVERTING THE SHIPPED VALUE LEAVES THE SUITE GREEN. Measured:
-  // putting `--timeout-seconds 900` and `timeout-minutes: 20` back -- the exact
-  // regression this work exists to fix -- passed the whole suite, because the only
-  // budget any test named was a literal inside itself. Third instance today of
-  // the same shape: a value tested in one place and shipped from another. See
-  // the WIRING test in check-pr-review-signal.test.mjs.
+  // WITHOUT THIS, CHANGING THE SHIPPED VALUE LEAVES THE SUITE GREEN. Measured
+  // when the budget first moved to 2400 s: putting `--timeout-seconds 900` and
+  // `timeout-minutes: 20` back passed the whole suite, because the only budget
+  // any test named was a literal inside itself. Third instance that day of the
+  // same shape: a value tested in one place and shipped from another. See the
+  // WIRING test in check-pr-review-signal.test.mjs. (The budget has since gone
+  // back to 900 s deliberately -- see BUDGET_SECONDS -- and this pin is what
+  // makes that a one-line, reviewable change rather than a silent one.)
   const wf = readFileSync(join(REPO_ROOT, '.github/workflows/pr-review-signal.yml'), 'utf8');
   // ANCHORED, and that is load-bearing rather than tidy. Unanchored, these
   // matched the FIRST occurrence anywhere in a comment-dense file whose comments
@@ -777,14 +811,12 @@ test('the budget the WORKFLOW ships is the budget this file tested', () => {
 });
 
 test('MEASURED: excluding the aggregate matters more than any budget, and 420 s false-failed 8', () => {
-  // THE AGGREGATE EXCLUSION IS MORE LOAD-BEARING THAN ANY BUDGET EVER WAS, and
-  // the 900 s figure below no longer argues that, because 900 s is not the
-  // budget any more: at 2400 s, 0 of those 68 would breach and the evidence
-  // would be vacuous. Re-measured on the same 56 runs of 2026-08-31 as the
-  // budget above, the aggregate appeared at min 213 / median 1175 / MAX 3364 s,
-  // with TWELVE past 2400 s. So the exclusion still carries the fix at the
-  // budget actually in force, and the 68-run figure below is kept as the
-  // original finding rather than restated as a current one.
+  // THE AGGREGATE EXCLUSION IS MORE LOAD-BEARING THAN ANY BUDGET EVER WAS.
+  // Re-measured on the same 56 runs of 2026-08-31 as the budget above, the
+  // aggregate appeared at min 213 / median 1175 / MAX 3364 s, with TWELVE
+  // past 2400 s and 33 past 900 s. So the exclusion carries the fix at the
+  // budget actually in force (900 s again), and the 68-run figure below is
+  // kept as the original finding rather than restated as a current one.
   //
   // Same 68 runs, when `Build + WASM + Rust + Node` itself appeared: min 509,
   // median 894, max 2067 s. Requiring it would false-fail 33 of the 68 at a
@@ -1042,6 +1074,14 @@ test('THE ASSUMPTION, PINNED: a fan-out gap wider than the hold would defeat it'
  * it is why the scoping rule cannot drop `COMMENTED`. (The SHAs of the older
  * commits are padded to 40 hex here; the head is verbatim.)
  */
+/**
+ * When #3276's head commit was made: `commit.committer.date` on `1305f778`,
+ * read back from the API rather than plausibly invented. LATER than every
+ * `submitted_at` below, so the default fixture exercises the clock's `predates`
+ * branch; the tests that want the other branch override it (#3729).
+ */
+const HEAD_COMMITTED_AT = '2026-08-26T14:09:20Z';
+
 const SHA = {
   head: '1305f778c0dc817bb344e23f881c2a30963c14c2',
   c26e453d: 'c26e453d00000000000000000000000000000000',
@@ -1077,12 +1117,13 @@ const AUTHORS = [
 /** The status #3276's head actually carried. */
 const COMPLETED = [{ name: 'CodeRabbit', state: 'success', description: 'Review completed' }];
 
-/** The shipped default. Adjudicates nothing — see the config's premise note. */
+/** Adjudicates nothing — and therefore refuses nothing either. */
 const OFF = { headSha: SHA.head, policy: 'off', authors: AUTHORS, checks: COMPLETED };
 
 const stale = (reviews, over = {}) =>
   staleReviews(reviews, {
     headSha: SHA.head,
+    headCommittedAt: HEAD_COMMITTED_AT,
     policy: 'claimed-verdict',
     authors: AUTHORS,
     checks: COMPLETED,
@@ -1241,7 +1282,12 @@ test('POLICY: the three policies scope differently, and each is exercised', () =
       submitted_at: '2026-08-26T12:46:19Z',
     },
   ];
-  const base = { headSha: SHA.head, authors: AUTHORS, checks: [] };
+  const base = {
+    headSha: SHA.head,
+    headCommittedAt: HEAD_COMMITTED_AT,
+    authors: AUTHORS,
+    checks: [],
+  };
 
   // `claimed-verdict`: no configured context claims a verdict, so nothing.
   assert.deepEqual(staleReviews(humanApproved, { ...base, policy: 'claimed-verdict' }), []);
@@ -1260,6 +1306,47 @@ test('POLICY: the three policies scope differently, and each is exercised', () =
   // context — otherwise the two `deepEqual([])` above would prove nothing.
   const cr = staleReviews(REVIEWS_3276, { ...base, policy: 'configured-authors' });
   assert.equal(cr.length, 1, 'clause (b) is genuinely dropped by this policy');
+});
+
+test('#3729: a finding carries the CLOCK as a second, independent fact', () => {
+  // The SHA carries the finding and remains sound on THIS surface: `commit_id`
+  // on `pulls/{n}/reviews` is frozen, and it is the sibling field on
+  // `pulls/{n}/comments` that relocates (#3729; the measured rows live in
+  // scripts/lib/review-provenance.mjs). The clock is added because a SHA
+  // mismatch cannot say a review was IMPOSSIBLE, and a review submitted before
+  // the head commit existed demonstrably was.
+  const found = stale(REVIEWS_3276);
+  assert.equal(found.length, 1);
+  // 12:46:19Z against a head committed 14:09:20Z — 4981 s.
+  assert.equal(found[0].predatesHeadBy, '83m');
+});
+
+test('#3729: the clock is ONE-WAY — submitted AFTER the head commit proves nothing', () => {
+  // NOT HYPOTHETICAL — fact 4 in scripts/lib/review-provenance.mjs names the PR
+  // whose comments were created seconds AFTER its head commit while pointing at
+  // a different one. So `predatesHeadBy` is `null` here rather than a negative
+  // duration or a dropped finding: the finding stands on the SHA alone and says
+  // so.
+  const found = stale(REVIEWS_3276, { headCommittedAt: '2026-08-26T12:00:00Z' });
+  assert.equal(found.length, 1);
+  assert.equal(found[0].predatesHeadBy, null);
+  assert.equal(found[0].reviewedSha, SHA.c26e453d);
+});
+
+test('FAIL CLOSED (#3729): an unreadable `headCommittedAt` is NO_HEAD_COMMIT_TIME, never a silent skip', () => {
+  // A DEFAULT HERE WOULD BE THE WHOLE DEFECT. Substituting `now`, the review's
+  // own timestamp, or `null` drops the corroborating half of every finding
+  // while leaving prose that still reads correct — a forgotten wire-up that
+  // looks exactly like a healthy run.
+  for (const bad of [undefined, null, '', 'yesterday', 0]) {
+    assert.throws(
+      () => stale(REVIEWS_3276, { headCommittedAt: bad }),
+      (e) => e instanceof ReviewSignalError && e.reason === 'NO_HEAD_COMMIT_TIME',
+      JSON.stringify(bad),
+    );
+  }
+  // …and `off` still refuses NOTHING, because it adjudicates nothing.
+  assert.deepEqual(staleReviews(REVIEWS_3276, { ...OFF, headCommittedAt: undefined }), []);
 });
 
 test('DISMISSED and PENDING reviews are not verdicts on a commit', () => {
@@ -1324,6 +1411,7 @@ test('FAIL CLOSED: an empty reviewer identity list examines nothing, so it refus
   assert.equal(
     staleReviews(REVIEWS_3276, {
       headSha: SHA.head,
+      headCommittedAt: HEAD_COMMITTED_AT,
       policy: 'all-authors',
       authors: [],
       checks: COMPLETED,
@@ -1371,12 +1459,14 @@ test('FAIL CLOSED: a review with no usable id has no defensible "newest"', () =>
 });
 
 test('the shipped config is a valid part 3 config, and its policy is the stated default', () => {
-  // Pins the DEFAULT itself, once, so moving it is a deliberate edit here.
-  // `off`, and the premise defect that put it there is in the config's own
-  // note: CodeRabbit submits no review event when a run finds nothing
-  // actionable, so 2 of `claimed-verdict`'s 4 live fires (#3276, #3288) are
-  // false and no structured field separates them from the 2 real ones.
-  assert.equal(CFG.staleReviewPolicy, 'off');
+  // Pins the SHIPPED policy itself, once, so moving it is a deliberate edit
+  // here. `claimed-verdict` since #3730: `off` meant a REQUIRED check named
+  // "review signal" reported SUCCESS on PRs whose only reviews read a tree that
+  // no longer exists, and four PRs merged behind it on 2026-09-02 carrying real
+  // defects. The measured false-positive rate that once argued for `off` — 2 of
+  // `claimed-verdict`'s 4 live fires (#3276, #3288) — is now what keeps the
+  // SEVERITY at `warn`, which is the trade #3730 item 1 asks for.
+  assert.equal(CFG.staleReviewPolicy, 'claimed-verdict');
   assert.equal(CFG.staleReviewSeverity, 'warn');
   assert.ok(STALE_REVIEW_POLICIES.has(CFG.staleReviewPolicy));
   // The two identity spaces really are different, which is why `reviewAuthors`

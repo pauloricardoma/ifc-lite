@@ -15,13 +15,10 @@
  */
 
 import { useState, useCallback } from 'react';
-import {
-  FileBox,
-  Loader2,
-  Camera,
-  Focus,
-  Upload,
-} from 'lucide-react';
+import { FileBox, Camera, Focus, Upload } from 'lucide-react';
+import { Spinner } from '@/components/ui/spinner';
+import { useTranslation } from '@/i18n';
+import { useExportDialogOpenGuard } from '@/hooks/useExportDialogOpenGuard';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
@@ -33,6 +30,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
+import type { IDSReportInput } from '@ifc-lite/bcf';
+import { IDSExportTopicCount } from './IDSExportTopicCount';
 import {
   Dialog,
   DialogContent,
@@ -71,6 +70,8 @@ interface IDSExportDialogProps {
   hasReport: boolean;
   /** Total failing entity count for display */
   failedCount: number;
+  /** The report's specification results, to show how many topics each grouping makes (#5824). */
+  specificationResults?: IDSReportInput['specificationResults'];
   /** Called when export is confirmed */
   onExport: (settings: IDSBCFExportSettings) => Promise<void>;
   /** Export progress (controlled externally) */
@@ -89,34 +90,42 @@ export function IDSExportDialog({
   trigger,
   hasReport,
   failedCount,
+  specificationResults,
   onExport,
   progress,
   open: controlledOpen,
   onOpenChange: controlledOnOpenChange,
 }: IDSExportDialogProps) {
+  const { t } = useTranslation();
   const [internalOpen, setInternalOpen] = useState(false);
   const open = controlledOpen ?? internalOpen;
   const setOpen = controlledOnOpenChange ?? setInternalOpen;
   const [settings, setSettings] = useState<IDSBCFExportSettings>({
-    topicGrouping: 'per-entity',
+    // One topic per failing SPECIFICATION by default: per-entity scales with
+    // the model and hits the topic cap on any large failure (#5824).
+    topicGrouping: 'per-specification',
     includePassingEntities: false,
     includeCamera: true,
     includeSnapshots: false,
     loadIntoBcfPanel: false,
   });
 
-  const isExporting = progress !== null && progress.phase !== 'done';
+  // `onExport` may do async setup before it publishes a progress value, so the
+  // in-flight promise counts as exporting too, not only a non-done `progress`.
+  const [running, setRunning] = useState(false);
+  const isExporting = running || (progress !== null && progress.phase !== 'done');
 
   const handleExport = useCallback(async () => {
-    await onExport(settings);
+    setRunning(true);
+    try {
+      await onExport(settings);
+    } finally {
+      setRunning(false);
+    }
     // Don't close — let the progress indicator finish, then user closes
   }, [onExport, settings]);
 
-  const handleOpenChange = useCallback((value: boolean) => {
-    // Don't allow closing during export
-    if (isExporting) return;
-    setOpen(value);
-  }, [isExporting, setOpen]);
+  const handleOpenChange = useExportDialogOpenGuard({ busy: isExporting, setOpen });
 
   const progressPercent = progress && progress.total > 0
     ? Math.round((progress.current / progress.total) * 100)
@@ -133,18 +142,18 @@ export function IDSExportDialog({
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <FileBox className="h-5 w-5 text-green-500" />
-            Export IDS Report as BCF
+            {t('idsPanel.export.title')}
           </DialogTitle>
           <DialogDescription>
-            Create BCF topics from IDS validation failures.
-            {failedCount > 0 && ` ${failedCount} failing entities found.`}
+            {t('idsPanel.export.description')}
+            {failedCount > 0 && ` ${t('idsPanel.export.failedEntitiesFound', { count: failedCount })}`}
           </DialogDescription>
         </DialogHeader>
 
         <div className="grid gap-4 py-4">
           {/* Topic Grouping */}
           <div className="grid gap-2">
-            <Label htmlFor="grouping">Topic Grouping</Label>
+            <Label htmlFor="grouping">{t('idsPanel.export.topicGrouping')}</Label>
             <Select
               value={settings.topicGrouping}
               onValueChange={(v) => setSettings(s => ({
@@ -159,23 +168,24 @@ export function IDSExportDialog({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="per-entity">Per Entity (recommended)</SelectItem>
-                <SelectItem value="per-specification">Per Specification</SelectItem>
-                <SelectItem value="per-requirement">Per Requirement</SelectItem>
+                <SelectItem value="per-entity">{t('idsPanel.export.grouping.perEntity')}</SelectItem>
+                <SelectItem value="per-specification">{t('idsPanel.export.grouping.perSpecification')}</SelectItem>
+                <SelectItem value="per-requirement">{t('idsPanel.export.grouping.perRequirement')}</SelectItem>
               </SelectContent>
             </Select>
             <p className="text-xs text-muted-foreground">
-              {settings.topicGrouping === 'per-entity' && 'One topic per failing entity. Failed requirements listed as comments.'}
-              {settings.topicGrouping === 'per-specification' && 'One topic per failing specification. Entities listed as comments.'}
-              {settings.topicGrouping === 'per-requirement' && 'One topic per failed requirement per entity (most granular).'}
+              {settings.topicGrouping === 'per-entity' && t('idsPanel.export.groupingHint.perEntity')}
+              {settings.topicGrouping === 'per-specification' && t('idsPanel.export.groupingHint.perSpecification')}
+              {settings.topicGrouping === 'per-requirement' && t('idsPanel.export.groupingHint.perRequirement')}
             </p>
+            {specificationResults && <IDSExportTopicCount specificationResults={specificationResults} settings={settings} />}
           </div>
 
           {/* Include Passing */}
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
-              <Label htmlFor="include-passing">Include Passing Entities</Label>
-              <p className="text-xs text-muted-foreground">Add topics for entities that passed validation</p>
+              <Label htmlFor="include-passing">{t('idsPanel.export.includePassing')}</Label>
+              <p className="text-xs text-muted-foreground">{t('idsPanel.export.includePassingHint')}</p>
             </div>
             <Switch
               id="include-passing"
@@ -190,9 +200,9 @@ export function IDSExportDialog({
             <div className="space-y-0.5">
               <Label htmlFor="include-camera" className="flex items-center gap-1.5">
                 <Focus className="h-3.5 w-3.5" />
-                Per-Entity Camera
+                {t('idsPanel.export.perEntityCamera')}
               </Label>
-              <p className="text-xs text-muted-foreground">Compute camera framing each entity from its bounding box</p>
+              <p className="text-xs text-muted-foreground">{t('idsPanel.export.perEntityCameraHint')}</p>
             </div>
             <Switch
               id="include-camera"
@@ -207,10 +217,10 @@ export function IDSExportDialog({
             <div className="space-y-0.5">
               <Label htmlFor="include-snapshots" className="flex items-center gap-1.5">
                 <Camera className="h-3.5 w-3.5" />
-                Capture Snapshots
+                {t('idsPanel.export.captureSnapshots')}
               </Label>
               <p className="text-xs text-muted-foreground">
-                Render a screenshot for each entity (slow for large reports)
+                {t('idsPanel.export.captureSnapshotsHint')}
               </p>
             </div>
             <Switch
@@ -226,9 +236,9 @@ export function IDSExportDialog({
             <div className="space-y-0.5">
               <Label htmlFor="load-panel" className="flex items-center gap-1.5">
                 <Upload className="h-3.5 w-3.5" />
-                Load into BCF Panel
+                {t('idsPanel.export.loadIntoPanel')}
               </Label>
-              <p className="text-xs text-muted-foreground">Open the BCF panel with exported topics after export</p>
+              <p className="text-xs text-muted-foreground">{t('idsPanel.export.loadIntoPanelHint')}</p>
             </div>
             <Switch
               id="load-panel"
@@ -253,10 +263,10 @@ export function IDSExportDialog({
         <DialogFooter>
           <Button
             variant="outline"
-            onClick={() => setOpen(false)}
+            onClick={() => handleOpenChange(false)}
             disabled={isExporting}
           >
-            {progress?.phase === 'done' ? 'Close' : 'Cancel'}
+            {progress?.phase === 'done' ? t('idsPanel.export.close') : t('idsPanel.export.cancel')}
           </Button>
           <Button
             onClick={handleExport}
@@ -264,13 +274,13 @@ export function IDSExportDialog({
           >
             {isExporting ? (
               <>
-                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                Exporting...
+                <Spinner size="md" className="mr-2" />
+                {t('idsPanel.export.exporting')}
               </>
             ) : (
               <>
                 <FileBox className="h-4 w-4 mr-2" />
-                Export BCF
+                {t('idsPanel.export.exportBcf')}
               </>
             )}
           </Button>

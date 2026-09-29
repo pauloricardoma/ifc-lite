@@ -21,7 +21,7 @@ import {
 } from './generated/attributes.js';
 import { IFC_DATA_TYPES } from './generated/data-types.js';
 import { ENTITIES_IFC2X3 } from './generated/entities-ifc2x3.js';
-import { ENTITIES_IFC4 } from './generated/entities-ifc4.js';
+import { ENTITIES_IFC4_EXPRESS } from './entities-ifc4-express.js';
 import { ENTITIES_IFC4X3 } from './generated/entities-ifc4x3.js';
 import {
   PART_OF_RELATIONS_IFC2X3,
@@ -68,9 +68,12 @@ const ATTRIBUTES_BY_VERSION: Record<
  */
 export const RESERVED_PSET_PREFIXES: readonly string[] = ['Pset_', 'Qto_'];
 
-const ENTITIES_BY_VERSION: Record<IfcSchemaVersion, readonly IfcEntityInfo[]> = {
+// Exported within the package (not from `packages/data/src/index.ts`, whose
+// export list is explicit) so `./descendants.js` resolves versions against the
+// same map `getEntities` does.
+export const ENTITIES_BY_VERSION: Record<IfcSchemaVersion, readonly IfcEntityInfo[]> = {
   IFC2X3: ENTITIES_IFC2X3,
-  IFC4: ENTITIES_IFC4,
+  IFC4: ENTITIES_IFC4_EXPRESS, // checked against IFC4 EXPRESS (#5204)
   IFC4X3: ENTITIES_IFC4X3,
   // IFC4X3_ADD2 is the addendum-2 release of IFC4X3 — same entity list
   // for authoring purposes.

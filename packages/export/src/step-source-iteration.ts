@@ -54,11 +54,19 @@
 
 import type { IfcDataStore } from '@ifc-lite/parser';
 import { filterHiddenRefsFromRelationshipLine } from './reference-collector.js';
+import { narrowNonRelPositionalRefLists } from './nonrel-positional-ref-narrowing.js';
+import { STYLE_RESCUE_TYPES } from './style-closure.js';
+import { NONREL_REF_LIST_TYPES } from './nonrel-ref-list-types.js';
+import { styleEntityWithheldWarning } from './step-export-types.js';
+import { applySourceLineMutationsReported } from './step-attribute-mutations.js';
 import { convertStepLine, type IfcSchemaVersion } from './schema-converter.js';
 import { nominateDeliveredInPlaceEdits } from './in-place-nomination.js';
 import { decodeRange } from './source-ref-bounds.js';
-import { getPropertyIdsInSet, type PropertySetContext } from './step-property-set-readers.js';
+import type { PropertySetContext } from './step-property-set-readers.js';
+import { retainSharedAtoms } from './step-shared-atom-retention.js';
+import { detachRelatedObjects } from './step-pset-copy-on-write.js';
 import type { ExportPass, SourceLineMutations, StepExportOptions } from './step-exporter.js';
+import { IFC_ENTITY_NAMES } from '@ifc-lite/data';
 
 /**
  * The exporter state this phase cannot read off the {@link ExportPass}.
@@ -97,46 +105,6 @@ export interface SourceIterationContext {
 }
 
 /**
- * Un-skip property/quantity atoms that a surviving (non-skipped, and — under
- * visible-only export — still-included) IfcPropertySet / IfcElementQuantity
- * still references.
- *
- * When a property is edited, the modified pset is replaced and its member atoms
- * are added to `skipIds` wholesale. Because exporters deduplicate shared
- * Pset_*Common atoms (e.g. a single IsExternal / IsLoadBearing value referenced
- * by many psets), that wholesale skip can drop an atom another pset still needs.
- * This pass restores any such atom: the edited pset still emits its replacement
- * with the new value, while the shared atom stays for the psets that keep their
- * original value.
- */
-function retainSharedAtoms(
-  skipIds: Set<number>,
-  allowedEntityIds: Set<number> | null,
-  ctxOf: SourceIterationContext,
-): void {
-  if (skipIds.size === 0) return;
-  // Built once for the whole sweep rather than per container: the readers in
-  // `step-property-set-readers.ts` take the context, and this loop calls one
-  // of them once per IfcPropertySet / IfcElementQuantity in the file.
-  const ctx = ctxOf.propertySetContext();
-  const byType = ctxOf.dataStore.entityIndex.byType;
-  const containerIds = [
-    ...(byType.get('IFCPROPERTYSET') ?? []),
-    ...(byType.get('IFCELEMENTQUANTITY') ?? []),
-  ];
-  for (const containerId of containerIds) {
-    // Skipped containers are being dropped/replaced — their atoms may go.
-    if (skipIds.has(containerId)) continue;
-    // Under visible-only export a container outside the closure is not emitted,
-    // so it cannot keep an atom alive.
-    if (allowedEntityIds !== null && !allowedEntityIds.has(containerId)) continue;
-    for (const atomId of getPropertyIdsInSet(ctx, containerId)) {
-      skipIds.delete(atomId);
-    }
-  }
-}
-
-/**
  * Write every source-backed record this export keeps, into `pass.entities`.
  *
  * Mutates the pass in place and returns nothing: three later readers take its
@@ -163,7 +131,9 @@ export function writeSourceEntityLines(
   // IsExternal IfcPropertySingleValue shared by dozens of psets), so skipping a
   // shared atom would orphan every OTHER pset that still references it, leaving
   // dangling refs and an invalid file. Keep any atom a surviving container needs.
-  retainSharedAtoms(pass.skipPropertySetIds, pass.allowedEntityIds, ctx);
+  if (pass.skipPropertySetIds.size > 0) {
+    retainSharedAtoms(pass.skipPropertySetIds, pass.allowedEntityIds, pass.effective, ctx.propertySetContext());
+  }
 
   // Export original entities from source buffer, SKIPPING modified property sets
   if (!options.deltaOnly && ctx.dataStore.source) {
@@ -224,20 +194,43 @@ export function writeSourceEntityLines(
       // Shared verbatim with the type-object `HasPropertySets` rewrite in
       // `step-property-sets.ts`, which writes the line this pass would
       // otherwise have written — hence injected rather than moved here.
-      const mutated = ctx.applySourceLineMutations(
+      // Through `applySourceLineMutationsReported` rather than the injected
+      // pipeline directly, so this pass and the type-object rewrite cannot end
+      // up reporting different halves of the same refusal.
+      //
+      // Into a per-entity buffer, NOT straight into `pass.warnings`: both
+      // reports the pipeline makes are about the line this iteration is about
+      // to write, and the `IFCREL*` and style-rescue branches below can still
+      // `continue` — withholding that line entirely and pushing their own
+      // warning for it. Reported here, the unreadable-record warning would name
+      // an entity whose edits were dropped beside a warning saying that entity
+      // has no line in the export at all: two warnings for one outcome, and the
+      // reader has to guess which one is about the record they asked for. So the
+      // buffer is flushed once the withholding branches have had their say and
+      // this line is going out.
+      //
+      // The flush point is the LAST branch that can withhold, not the last thing
+      // that can change the line: `convertStepLine` below still runs on the text
+      // this produces. That is deliberate, and it is why the warning itself no
+      // longer describes what was written — see
+      // `unreadableRecordEditsDroppedWarning` (#4213).
+      const mutationWarnings: string[] = [];
+      const mutated = applySourceLineMutationsReported(
+        ctx.applySourceLineMutations,
+        mutationWarnings,
         expressId,
         entityText,
         entityRef.type,
         pass.modifiedAttributes.get(expressId),
         pass.sourceSchema,
         pass.overlayActive,
-        (attr, value) =>
-          pass.warnings.push(
-            `entity #${expressId}: attribute ${attr} not written - ` +
-              `${JSON.stringify(value)} is not a number and the slot is REAL-typed`,
-          ),
       );
       let nextEntityText = mutated.text;
+      // A shared IfcRelDefinesByProperties loses the elements that got their
+      // own copy of its set this export; the rest keep the original (#5794).
+      const narrowed = detachRelatedObjects(pass, expressId, nextEntityText);
+      if (narrowed === null) continue;
+      nextEntityText = narrowed;
 
       // A hidden PRODUCT's own line is already out of the export via
       // `allowedEntityIds`, and a TOMBSTONED entity's via `effective` — this
@@ -256,14 +249,76 @@ export function writeSourceEntityLines(
       // has to agree with what actually got written, the same way
       // `getVisibleEntityIds` already does for the visibility walk itself.
       const effectiveRelType = pass.effective.effectiveType(expressId, entityRef.type).toUpperCase();
+      // UPPERCASE is load-bearing for the `startsWith('IFCREL')` and
+      // `STYLE_RESCUE_TYPES` matching below, but a warning is read by a person,
+      // so it gets the canonical IFC EXPRESS spelling (#5533).
+      const displayRelType = IFC_ENTITY_NAMES[effectiveRelType] ?? effectiveRelType;
       if (mayNameOmittedRefs && effectiveRelType.startsWith('IFCREL')) {
         const filtered = filterHiddenRefsFromRelationshipLine(nextEntityText, isOmittedFromOutput);
         if (filtered === null) {
-          pass.warnings.push(ctx.relationshipWithheldWarning(expressId, effectiveRelType));
+          pass.warnings.push(ctx.relationshipWithheldWarning(expressId, displayRelType));
           continue;
         }
         nextEntityText = filtered;
+      } else if (mayNameOmittedRefs && STYLE_RESCUE_TYPES.has(effectiveRelType)) {
+        // A rescued IFCSTYLEDITEM/IFCSTYLEDREPRESENTATION/
+        // IFCPRESENTATIONLAYERASSIGNMENT/IFCPRESENTATIONLAYERWITHSTYLE
+        // (`style-closure.ts`) can legitimately name BOTH a kept item and one
+        // this export omits — e.g. a layer assignment shared by a visible and
+        // a hidden product's geometry, rescued because the visible one is in
+        // the closure. Unlike `IFCREL*`, these lines are otherwise never
+        // touched (`step-omission-predicates.ts` documents that as a general
+        // gap for non-relationship lines), so left alone this would ship the
+        // exact #2398 dangling-`#N` shape on a line the rescue itself just
+        // introduced into the closure. Same filter, same withhold-vs-narrow
+        // rule, applied to this line for the same reason. `pass.sourceSchema`
+        // is passed (unlike the `IFCREL*` branch above) so a narrowed list is
+        // held to its OWN declared lower bound — `IfcTextureMap.Vertices` is
+        // `LIST [3:?]`, and narrowing it without that check produced a
+        // 2-vertex list, a different invalid file than the dangling ref it
+        // replaced (#5262).
+        const filtered = filterHiddenRefsFromRelationshipLine(nextEntityText, isOmittedFromOutput, pass.sourceSchema);
+        if (filtered === null) {
+          pass.warnings.push(styleEntityWithheldWarning(expressId, displayRelType));
+          continue;
+        }
+        nextEntityText = filtered;
+      } else if (mayNameOmittedRefs && NONREL_REF_LIST_TYPES.has(effectiveRelType)) {
+        // `IfcCostItem.CostValues`, `IfcPropertySet.HasProperties`,
+        // `IfcElementQuantity.Quantities`, … (`nonrel-ref-list-types.ts`,
+        // derived from the schema registries — #5181): direct LIST/SET
+        // attributes on a non-relationship class that name other entities, outside both
+        // branches above. A session deletion of a listed member reaches this
+        // line exactly as it reaches an `IFCREL*` line's list attributes.
+        //
+        // NOT the same function as the two branches above: these classes also
+        // carry bare, single-valued positional refs inherited from `IfcRoot`
+        // (`OwnerHistory`) or their own attributes (`IfcAppliedValue
+        // .UnitBasis`), and `filterHiddenRefsFromRelationshipLine`'s bare-ref
+        // rule withholds the WHOLE line for those — correct for an `IFCREL*`
+        // association, wrong here: it would delete the cost item itself over
+        // an unrelated deleted OwnerHistory and dangle every OTHER entity
+        // that names it, a regression against the untouched line
+        // `upstream/main` ships today. `narrowNonRelPositionalRefLists`
+        // (`nonrel-positional-ref-narrowing.ts`) is the narrow sibling that only ever
+        // narrows a list — never withholds — for exactly this reason; see its
+        // doc for the full argument, including why an emptied list becomes
+        // `$` (optional attribute), or is left untouched (mandatory attribute
+        // — e.g. `HasQuantities`), rather than withholding the record. It
+        // needs `effectiveRelType` and `pass.sourceSchema` to answer that: the
+        // optional/mandatory distinction is schema- and version-dependent
+        // (`IfcCostItem` does not even declare these attributes in IFC2X3).
+        nextEntityText = narrowNonRelPositionalRefLists(
+          nextEntityText,
+          isOmittedFromOutput,
+          effectiveRelType,
+          pass.sourceSchema,
+        );
       }
+
+      // Past every branch that can withhold this line, so the pipeline's own
+      // reports are now true statements about a record this pass is writing.
+      pass.warnings.push(...mutationWarnings);
 
       // A retype or a positional edit that CHANGED the line is what makes
       // this entity count; a named attribute edit was already nominated by
@@ -283,11 +338,8 @@ export function writeSourceEntityLines(
 
       // Apply schema conversion if exporting to a different schema version
       if (pass.converting) {
-        const converted = convertStepLine(nextEntityText, pass.sourceSchema, pass.schema, options.guidRandom);
-        if (converted !== null) {
-          pass.entities.push(converted);
-        }
-        // null means entity should be skipped (no valid representation in target schema)
+        const converted = convertStepLine(nextEntityText, pass.sourceSchema, pass.schema, options.guidRandom, pass.slotFill, pass.withheldRefIds, pass.ifc4Slots, pass.enums);
+        if (converted !== null) pass.entities.push(converted);
       } else {
         pass.entities.push(nextEntityText);
       }

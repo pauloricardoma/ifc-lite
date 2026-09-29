@@ -37,6 +37,7 @@ import { useCallback } from 'react';
 import { MutablePropertyView, StoreEditor } from '@ifc-lite/mutations';
 import type { IfcDataStore } from '@ifc-lite/parser';
 import { useViewerStore } from '@/store';
+import { canMutate, mutationPermission } from '@/store/mutation-permission';
 import type { FederatedModel } from '@/store/types';
 import type { RenderFrameOffsets } from '@/components/viewer/tools/measure-modes/coordinates';
 import { resolveEntityRef } from '@/store/resolveEntityRef';
@@ -68,13 +69,14 @@ export interface ZoneEmitResult {
    *  apart from `zonesReplaced`, which is a model that got new zones back. */
   staleRemoved: number;
   /** Set when nothing was emitted anywhere, and why. */
-  blocked: 'collab-role' | 'no-members' | 'duplicate-set-name' | null;
+  blocked: 'edit-mode' | 'collab-role' | 'no-members' | 'duplicate-set-name' | null;
   elapsedMs: number;
 }
 
 /** Per-model handles the loop would otherwise re-derive. */
 interface ModelContext {
   editor: StoreEditor;
+  view: MutablePropertyView;
   store: IfcDataStore;
   name: string;
   rebased: boolean;
@@ -119,6 +121,12 @@ function contextFor(
   if (cached !== undefined) return cached;
 
   const state = useViewerStore.getState();
+  // Metadata-only/unavailable models are reported as skipped by this command.
+  // Reject before allocating a view/editor, including stale-overlay sweeps.
+  if (!canMutate(state, modelId)) {
+    cache.set(modelId, null);
+    return null;
+  }
   const model = state.models.get(modelId);
   const store = (model?.ifcDataStore ?? (modelId === 'legacy' ? state.ifcDataStore : null)) as IfcDataStore | null;
   if (!store) {
@@ -140,6 +148,7 @@ function contextFor(
 
   const context: ModelContext = {
     editor,
+    view,
     store,
     name: model?.name ?? modelId,
     rebased: model ? !geometryVolumesSurviveAlignment(model.federationAlignmentStatus) : false,
@@ -167,7 +176,8 @@ function membersByModel(zoneSet: ZoneSet): Map<string, ZoneMembership[]> {
 /** Emit `zoneSet` into every model it reaches. */
 export function emitZoneSpatialZones(zoneSet: ZoneSet): ZoneEmitResult {
   const state = useViewerStore.getState();
-  if (!state.canCollabEdit()) return { models: [], staleRemoved: 0, blocked: 'collab-role', elapsedMs: 0 };
+  const permission = mutationPermission(state);
+  if (!permission.allowed) return { models: [], staleRemoved: 0, blocked: permission.reason === 'edit-mode' ? 'edit-mode' : 'collab-role', elapsedMs: 0 };
   // The set's name is the only handle the FILE has on which run wrote which
   // zones (`LongName`), so two sets sharing one would make each emission delete
   // the other's zones. Refused for the same reason, and by the same test, as
@@ -202,6 +212,7 @@ export function emitZoneSpatialZones(zoneSet: ZoneSet): ZoneEmitResult {
     if (!context) continue;
     const result = emitSpatialZones(context.editor, context.store, zoneSet, members, context.frame, {
       rebased: context.rebased,
+      view: context.view,
     });
     outcomes.push({
       modelId,
@@ -245,7 +256,7 @@ function sweepModelsWithoutMembers(
 export interface ZoneEmitRemoval {
   /** Zones removed, across every model. */
   removed: number;
-  blocked: 'collab-role' | 'duplicate-set-name' | null;
+  blocked: 'edit-mode' | 'collab-role' | 'duplicate-set-name' | null;
 }
 
 /**
@@ -257,7 +268,8 @@ export interface ZoneEmitRemoval {
  */
 export function removeZoneSpatialZones(zoneSet: ZoneSet): ZoneEmitRemoval {
   const state = useViewerStore.getState();
-  if (!state.canCollabEdit()) return { removed: 0, blocked: 'collab-role' };
+  const permission = mutationPermission(state);
+  if (!permission.allowed) return { removed: 0, blocked: permission.reason === 'edit-mode' ? 'edit-mode' : 'collab-role' };
   // Removal sweeps by name too, so a collision here would take the other set's
   // zones with it.
   if (collidesByName(zoneSet)) return { removed: 0, blocked: 'duplicate-set-name' };

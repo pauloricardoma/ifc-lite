@@ -20,10 +20,6 @@ export interface ExportCsvOptions {
   separator?: string;
 }
 
-export interface ExportGltfOptions {
-  filename?: string;
-}
-
 export interface ExportStepOptions {
   schema?: 'IFC2X3' | 'IFC4' | 'IFC4X3';
   filename?: string;
@@ -181,9 +177,33 @@ export class ExportNamespace {
   /**
    * Export entities to IFC STEP format.
    * Supports IFC2X3, IFC4, and IFC4X3 (IFC 4.3) schemas.
+   *
+   * `refs` carries the same null-vs-empty distinction the wasm exporters got
+   * in #4364/#4386/#4659: OMIT it (or pass `undefined`/`null`) for "no
+   * isolation filter", i.e. the whole model, and pass an array for an ACTIVE
+   * filter. An active filter that matched nothing is REFUSED here rather than
+   * widened back into a whole-model export — the collapse that let a
+   * zero-match filter silently hand the caller the entire model (#4738).
+   *
+   * This is the one home for that rule: every surface (CLI, MCP, the browser
+   * playground, sandboxed scripts, the viewer) reaches a STEP export through
+   * this method, so no caller has to carry a zero-match guard for the export
+   * to fail closed (several keep one anyway, for a better message).
+   *
+   * The absence travels with the call rather than stopping here: a backend
+   * receives `undefined` for "no filter" and never an empty array, which is
+   * what `ExportBackendMethods.ifc`'s signature says and what lets a backend
+   * that cannot guess a model (`export-adapter.ts` in the viewer) answer the
+   * whole model instead of refusing.
    */
-  ifc(refs: EntityRef[], options: ExportStepOptions = {}): string | Uint8Array {
-    const content = this.backend.export.ifc(refs, options);
+  ifc(refs?: EntityRef[] | null, options: ExportStepOptions = {}): string | Uint8Array {
+    if (refs?.length === 0) {
+      throw new Error(
+        'export.ifc: the entity list is empty, so an isolation filter matched nothing. '
+        + 'Refusing to export the whole model instead. Omit the argument to export the whole model.',
+      );
+    }
+    const content = this.backend.export.ifc(refs ?? undefined, options);
     if (options.filename) {
       this.backend.export.download(content, options.filename, 'application/x-step;charset=utf-8;');
     }

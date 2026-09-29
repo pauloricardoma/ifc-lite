@@ -6,12 +6,17 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import {
   composeInstanceMatrix,
+  composeInstanceAnchor,
   writeInstanceRecord,
   prepareInstancedRender,
   foldOccurrenceWorldBox,
   INSTANCE_STRIDE_BYTES,
   INSTANCE_FLAGS_OFFSET,
   INSTANCE_FLAG_SELECTED,
+  INSTANCE_FLAG_METALLIC,
+  INSTANCE_FLAG_ROUGHNESS,
+  INSTANCE_FINISH_FLAGS_MASK,
+  packInstanceFinish,
 } from './instanced-render.js';
 import { OPAQUE_ALPHA_CUTOFF } from './overlay-routing.js';
 
@@ -87,6 +92,14 @@ function expectedRenderCoord(
 }
 
 describe('composeInstanceMatrix — frame correctness vs the flat path', () => {
+  it('keeps a canonical centimetre residual at a 5,000 km template origin (#5049)', () => {
+    const origin: [number, number, number] = [5_000_000.01, -2_000_000.02, 30.03];
+    const anchor = composeInstanceAnchor(rowMajorTranslation(0.02, 0.04, -0.06), origin);
+    // Native [5000000.03, -1999999.98, 29.97] → Y-up [x, z, -y].
+    assertClose(anchor, [5_000_000.03, 29.97, 1_999_999.98], 'f64 occurrence anchor', 1e-8);
+    const v1 = composeInstanceMatrix(rowMajorTranslation(0.02, 0.04, -0.06), origin);
+    assert.notEqual(v1[12], anchor[0], 'the V1 f32 matrix demonstrably loses the residual');
+  });
   it('identity rel_k + origin: only the Z-up→Y-up swap of (origin + p)', () => {
     const relK = rowMajorIdentity();
     const origin: [number, number, number] = [1, 2, 3];
@@ -135,13 +148,15 @@ describe('composeInstanceMatrix — frame correctness vs the flat path', () => {
 });
 
 describe('writeInstanceRecord — GPU buffer byte layout', () => {
-  it('packs mat4(0..63) + entityId(64) + rgba(68..83), little-endian', () => {
+  it('packs mat4 + entityId + rgba + flags into an 88-byte record with no anchor lanes (#6393), little-endian', () => {
     const buf = new ArrayBuffer(INSTANCE_STRIDE_BYTES);
     const dv = new DataView(buf);
     const mat = new Float32Array(16);
     for (let i = 0; i < 16; i++) mat[i] = i + 0.5;
     writeInstanceRecord(dv, 0, mat, 4242, [0.1, 0.2, 0.3, 0.4], INSTANCE_FLAG_SELECTED);
 
+    // #6393: the camera-relative anchor moved to a per-template delta stream,
+    // so the record ends at the flags lane.
     assert.strictEqual(INSTANCE_STRIDE_BYTES, 88);
     for (let i = 0; i < 16; i++) {
       assert.ok(Math.abs(dv.getFloat32(i * 4, true) - (i + 0.5)) < 1e-6, `mat[${i}]`);
@@ -203,12 +218,12 @@ describe('prepareInstancedRender — grouping + buffer assembly', () => {
     assertClose(applyColMajor(mat, p), swap([origin0[0] + p[0], origin0[1] + p[1], origin0[2] + p[2]]), 'template0 inst0');
   });
 
-  // #2985. The item id is CPU-side only: the GPU per-instance record stays 88
-  // bytes, because that layout is shading data packed identically by the
+  // #2985. The item id is CPU-side only: the GPU per-instance record has
+  // INSTANCE_STRIDE_BYTES bytes, because that layout is shading data packed identically by the
   // pipeline, shadow pass and picker, and the item id answers a host query
   // ("which entity produced this piece"), not a shading one. So it must appear
   // in `itemIds` and NOT in `instanceBuffer` — and the buffer's byte length is
-  // the check that says so, since a widened record would still "work".
+  // the check that says so, since an item-id widening would still "work".
   //
   // `carriesItemIds` comes off the shard's declared stride, and the encoder
   // derives that from the data — so a shard that says false has no ids to lose
@@ -440,5 +455,42 @@ describe('foldOccurrenceWorldBox — template cull metadata', () => {
     foldOccurrenceWorldBox(meta, box(0, 0, 0, NaN, 1, 1));
     assert.strictEqual(meta.bounds, null);
     assert.strictEqual(meta.maxOccRadius, Infinity);
+  });
+});
+
+describe('prepareInstancedRender — per-occurrence finish (#5984)', () => {
+  it('packs each occurrence finish into its flags lane, keeping an authored 0', () => {
+    const color: [number, number, number, number] = [1, 1, 1, 1];
+    const shard = {
+      templates: [{ positions: new Float32Array([0, 0, 0]), normals: new Float32Array([0, 1, 0]), indices: new Uint32Array([0]), origin: [0, 0, 0] as [number, number, number] }],
+      instances: [
+        // FZK-Haus 'Kiefer' (roughness 0.9), a mirror (metallic 1, roughness 0), and nothing.
+        { templateIndex: 0, entityId: 1, color, transform: rowMajorTranslation(0, 0, 0), roughness: 0.9 },
+        { templateIndex: 0, entityId: 2, color, transform: rowMajorTranslation(1, 0, 0), metallic: 1, roughness: 0 },
+        { templateIndex: 0, entityId: 3, color, transform: rowMajorTranslation(2, 0, 0) },
+      ],
+      carriesItemIds: false,
+      carriesFinishes: true,
+    };
+    const [t] = prepareInstancedRender(shard);
+    const dv = new DataView(t.instanceBuffer);
+    const flags = (i: number) => dv.getUint32(i * INSTANCE_STRIDE_BYTES + INSTANCE_FLAGS_OFFSET, true);
+    // What the shader decodes: bit 2/3 = authored, bits 16-23 / 24-31 = unorm8.
+    const decode = (f: number) => ({
+      metallic: f & INSTANCE_FLAG_METALLIC ? ((f >>> 16) & 255) / 255 : undefined,
+      roughness: f & INSTANCE_FLAG_ROUGHNESS ? ((f >>> 24) & 255) / 255 : undefined,
+    });
+    assert.ok(Math.abs(decode(flags(0)).roughness! - 0.9) < 1 / 255);
+    assert.strictEqual(decode(flags(0)).metallic, undefined);
+    assert.deepStrictEqual(decode(flags(1)), { metallic: 1, roughness: 0 }, 'an authored 0 still sets its bit');
+    assert.strictEqual(flags(2), 0, 'no finish, no bits: the shared default applies');
+    for (let i = 0; i < 3; i++) {
+      assert.strictEqual(flags(i) & ~INSTANCE_FINISH_FLAGS_MASK, 0, 'selection and hidden bits start clear');
+    }
+  });
+
+  it('packInstanceFinish ignores non-finite input', () => {
+    assert.strictEqual(packInstanceFinish(Number.NaN, undefined), 0);
+    assert.strictEqual(packInstanceFinish(undefined, Number.POSITIVE_INFINITY), 0);
   });
 });

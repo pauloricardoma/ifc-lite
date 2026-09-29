@@ -29,6 +29,7 @@ import {
   siUnitSymbolAndScale,
   type MeasureUnit,
 } from './project-units-symbols.js';
+import { CONVERSION_BASED_UNIT_FACTORS } from './unit-extractor.js';
 
 export type { MeasureUnit };
 export { measureUnit };
@@ -55,10 +56,12 @@ interface EntityIndexLike extends EntityByIdIndexLike {
 
 /** The file's declared units, keyed by unit-type token. */
 export class ProjectUnits {
-  private readonly byType: Map<string, ResolvedUnit>;
+  /** `null` for a declared unit whose scale could not be resolved (#4690): it
+   *  shows no unit rather than the SI default, which would mislabel it. */
+  private readonly byType: Map<string, ResolvedUnit | null>;
   private readonly monetaryUnit: ResolvedUnit | null;
 
-  constructor(byType: Map<string, ResolvedUnit>, monetary: ResolvedUnit | null) {
+  constructor(byType: Map<string, ResolvedUnit | null>, monetary: ResolvedUnit | null) {
     this.byType = byType;
     this.monetaryUnit = monetary;
   }
@@ -75,11 +78,13 @@ export class ProjectUnits {
     if (!m) return null;
     if (m.kind === 'dimensionless') return null;
     if (m.kind === 'monetary') return this.monetaryUnit;
-    return this.byType.get(m.unitType) ?? { symbol: m.defaultSymbol, siScale: 1.0 };
+    const declared = this.byType.get(m.unitType);
+    return declared !== undefined ? declared : { symbol: m.defaultSymbol, siScale: 1.0 };
   }
 
+  /** A declared unit whose scale could not be resolved is `undefined` here too. */
   resolvedForUnitType(unitType: string): ResolvedUnit | undefined {
-    return this.byType.get(unitType);
+    return this.byType.get(unitType) ?? undefined;
   }
 
   monetary(): ResolvedUnit | null {
@@ -97,6 +102,11 @@ interface UnitEntry {
   monetary: boolean;
 }
 
+/** A {@link UnitEntry} whose type is readable but whose scale is not (#4690). */
+interface DeclaredUnit extends Omit<UnitEntry, 'resolved'> {
+  resolved: ResolvedUnit | null;
+}
+
 /** Resolve a single unit entity by expressId (used for the assignment loop and
  *  for per-property / per-quantity `Unit` overrides). */
 export function resolveUnitByRef(
@@ -104,6 +114,16 @@ export function resolveUnitByRef(
   entityIndex: EntityByIdIndexLike,
   ref: number,
 ): UnitEntry | null {
+  const entry = resolveDeclaredUnit(extractor, entityIndex, ref);
+  return entry?.resolved ? { ...entry, resolved: entry.resolved } : null;
+}
+
+function resolveDeclaredUnit(
+  extractor: EntityExtractor,
+  entityIndex: EntityByIdIndexLike,
+  ref: number,
+): DeclaredUnit | null {
+  // @raw-entity-enumeration-ok resolve a declared unit from the parsed source index
   const entRef = entityIndex.byId.get(ref);
   if (!entRef) return null;
   const entity = extractor.extractEntity(entRef);
@@ -128,11 +148,16 @@ export function resolveUnitByRef(
       // [1]=UnitType, [2]=Name, [3]=ConversionFactor
       const unitType = cleanEnum(attrs[1]);
       const name = typeof attrs[2] === 'string' ? attrs[2] : '';
-      const symbol = conversionUnitSymbol(name);
-      const scale = typeof attrs[3] === 'number'
-        ? conversionFactorScale(extractor, entityIndex, attrs[3]) ?? 1.0
-        : 1.0;
-      return { unitType, resolved: { symbol, siScale: scale }, monetary: false };
+      // A factor the file does not resolve falls back to the name's known
+      // factor, from the linear table the geometry length scale reads, so only
+      // for a LENGTHUNIT; anything else is left unresolved rather than guessed
+      // at 1.0 (#4690).
+      const namedFactor = unitType === 'LENGTHUNIT' ? CONVERSION_BASED_UNIT_FACTORS[name.toUpperCase()] : undefined;
+      const scale = (typeof attrs[3] === 'number'
+        ? conversionFactorScale(extractor, entityIndex, attrs[3])
+        : null) ?? namedFactor;
+      const resolved = scale === undefined ? null : { symbol: conversionUnitSymbol(name), siScale: scale };
+      return { unitType, resolved, monetary: false };
     }
     case 'IFCDERIVEDUNIT': {
       // [0]=Elements (list of refs), [1]=UnitType
@@ -140,17 +165,20 @@ export function resolveUnitByRef(
       const elemRefs = Array.isArray(attrs[0]) ? attrs[0] : [];
       const parts: Array<[string, number]> = [];
       let scale = 1.0;
+      let incomplete = false;
       for (const er of elemRefs) {
-        if (typeof er !== 'number') continue;
+        if (typeof er !== 'number') { incomplete = true; continue; }
         const el = resolveDerivedElement(extractor, entityIndex, er);
         if (el) {
           scale *= Math.pow(el.unitScale, el.exponent);
           parts.push([el.symbol, el.exponent]);
+        } else {
+          incomplete = true; // a factor we cannot read: the product is not this unit's scale (#4833)
         }
       }
       const symbol = composeDerived(parts);
       if (symbol.length === 0) return null;
-      return { unitType, resolved: { symbol, siScale: scale }, monetary: false };
+      return { unitType, resolved: incomplete ? null : { symbol, siScale: scale }, monetary: false };
     }
     case 'IFCMONETARYUNIT': {
       // [0]=Currency (IfcLabel string in IFC4+, IfcCurrencyEnum in IFC2x3)
@@ -167,6 +195,7 @@ function resolveDerivedElement(
   entityIndex: EntityByIdIndexLike,
   elemRef: number,
 ): { symbol: string; unitScale: number; exponent: number } | null {
+  // @raw-entity-enumeration-ok resolve an element of a parsed derived unit
   const ref = entityIndex.byId.get(elemRef);
   if (!ref) return null;
   const elem = extractor.extractEntity(ref);
@@ -185,6 +214,7 @@ function conversionFactorScale(
   entityIndex: EntityByIdIndexLike,
   measureRef: number,
 ): number | null {
+  // @raw-entity-enumeration-ok read the source measure in a conversion-based unit
   const ref = entityIndex.byId.get(measureRef);
   if (!ref) return null;
   const measure = extractor.extractEntity(ref);
@@ -197,42 +227,42 @@ function conversionFactorScale(
   else if (Array.isArray(valueAttr) && valueAttr.length === 2 && typeof valueAttr[1] === 'number') value = valueAttr[1];
   if (value === undefined || !(Number.isFinite(value) && value > 0)) return null;
 
-  let componentScale = 1.0;
+  // A dangling or unreadable UnitComponent leaves the factor unknown, not SI
+  // (#4690). A component that is not an IfcSIUnit is taken at 1.0, as before:
+  // the Rust resolver follows it, this reader does not.
   const compRef = attrs[1];
-  if (typeof compRef === 'number') {
-    const cRef = entityIndex.byId.get(compRef);
-    if (cRef) {
-      const comp = extractor.extractEntity(cRef);
-      if (comp && comp.type.toUpperCase() === 'IFCSIUNIT') {
-        const cAttrs = comp.attributes ?? [];
-        const name = typeof cAttrs[3] === 'string' ? cAttrs[3] : null;
-        const prefixAttr = cAttrs[2];
-        const prefix = typeof prefixAttr === 'string' && prefixAttr !== '$' ? prefixAttr : null;
-        if (name) {
-          const res = siUnitSymbolAndScale(name, prefix);
-          if (res) componentScale = res.scale;
-        }
-      }
-    }
-  }
-  return value * componentScale;
+  // @raw-entity-enumeration-ok follow the source unit component reference
+  const cRef = typeof compRef === 'number' ? entityIndex.byId.get(compRef) : undefined;
+  const comp = cRef ? extractor.extractEntity(cRef) : null;
+  if (!comp) return null;
+  if (comp.type.toUpperCase() !== 'IFCSIUNIT') return value;
+  const cAttrs = comp.attributes ?? [];
+  const name = typeof cAttrs[3] === 'string' ? cAttrs[3] : null;
+  const prefixAttr = cAttrs[2];
+  const prefix = typeof prefixAttr === 'string' && prefixAttr !== '$' ? prefixAttr : null;
+  const res = name ? siUnitSymbolAndScale(name, prefix) : null;
+  return res ? value * res.scale : null;
 }
 
 /**
  * Resolve the file's declared units from `IFCPROJECT → IFCUNITASSIGNMENT`.
- * Never throws: an absent/malformed assignment yields an empty {@link ProjectUnits}
- * (all measures then fall back to their SI default symbols).
+ * `projectId` defaults to the file's first IFCPROJECT (pass explicitly,
+ * from `resolveOwningIfcProjectId`, for an entity owning a later one). Never
+ * throws: an absent/malformed assignment yields an empty {@link ProjectUnits}.
  */
 export function extractProjectUnits(
   source: Uint8Array | IfcSourceBytes,
   entityIndex: EntityIndexLike,
+  projectId?: number,
 ): ProjectUnits {
-  const byType = new Map<string, ResolvedUnit>();
+  const byType = new Map<string, ResolvedUnit | null>();
   let monetary: ResolvedUnit | null = null;
 
-  const projectIds = entityIndex.byType.get('IFCPROJECT') ?? [];
-  if (projectIds.length === 0) return new ProjectUnits(byType, monetary);
-  const projectRef = entityIndex.byId.get(projectIds[0]);
+  // @raw-entity-enumeration-ok project units come from the parsed IfcProject, not a live session overlay
+  const resolvedId = projectId ?? entityIndex.byType.get('IFCPROJECT')?.[0];
+  if (resolvedId === undefined) return new ProjectUnits(byType, monetary);
+  // @raw-entity-enumeration-ok dereference the parsed project whose unit assignment is being read
+  const projectRef = entityIndex.byId.get(resolvedId);
   if (!projectRef) return new ProjectUnits(byType, monetary);
 
   const extractor = new EntityExtractor(source);
@@ -242,6 +272,7 @@ export function extractProjectUnits(
   // IFCPROJECT[8] = UnitsInContext (IFCUNITASSIGNMENT)
   const unitsRef = (project.attributes ?? [])[8];
   if (typeof unitsRef !== 'number') return new ProjectUnits(byType, monetary);
+  // @raw-entity-enumeration-ok dereference the parsed IfcUnitAssignment from IfcProject
   const assignmentRef = entityIndex.byId.get(unitsRef);
   if (!assignmentRef) return new ProjectUnits(byType, monetary);
   const assignment = extractor.extractEntity(assignmentRef);
@@ -253,7 +284,7 @@ export function extractProjectUnits(
 
   for (const ref of unitList) {
     if (typeof ref !== 'number') continue;
-    const entry = resolveUnitByRef(extractor, entityIndex, ref);
+    const entry = resolveDeclaredUnit(extractor, entityIndex, ref);
     if (!entry) continue;
     if (entry.monetary) {
       monetary ??= entry.resolved;

@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import { compileNameMatcher } from '@ifc-lite/lists';
+import { selectorToQueryDescriptor } from '@ifc-lite/query';
 import type {
   BimBackend,
   EntityRef,
@@ -43,6 +44,42 @@ export class QueryBuilder {
   /** Filter by IFC class type(s) */
   byType(...types: string[]): this {
     this.descriptor.types = [...(this.descriptor.types ?? []), ...types];
+    return this;
+  }
+
+  /**
+   * Filter by IfcOpenShell-style selector text — `IfcWall, Pset_WallCommon.
+   * FireRating=2HR`, `Qto_WallBaseQuantities.NetVolume>1`, etc. Parses via
+   * `@ifc-lite/query`'s `parseSelector` and translates the AST to this
+   * builder's own `byType`/`where` shape (`selectorToQueryDescriptor` — see
+   * its doc comment for the exact lossless subset), so `.select()` cannot
+   * read a selector string differently than the CLI's `--select` flag or the
+   * MCP `query_entities` tool's `selector` param, which both call this same
+   * method rather than re-parsing.
+   *
+   * Appends into the same lists `.byType()`/`.where()` already append to, in
+   * either order — a selector's classes join `descriptor.types` (OR'd
+   * together by `entities()`, exactly like two `.byType()` calls: `.byType
+   * ('IfcDoor').select('IfcWall')` matches doors OR walls, not their
+   * intersection). The base class names remain unexpanded until execution,
+   * when each backend expands them against each model's own schema. Property
+   * comparisons join `descriptor.filters` (AND'd together, exactly like two
+   * `.where()` calls).
+   *
+   * Throws `SelectorUnsupportedError` (re-exported from this package) for
+   * any construct with no lossless target in `QueryDescriptor` — a regex
+   * pset/property name, `!*=`, `!` class negation, `+` group unions,
+   * `parent=`, `query:`, an entity-attribute comparison, `material=`,
+   * `classification=`, `location=` — rather than silently running a partial
+   * or empty filter (the #4091 defect class). Also throws on a selector that
+   * fails to parse.
+   */
+  select(text: string): this {
+    const { types, filters } = selectorToQueryDescriptor(text);
+    if (types.length > 0) this.descriptor.types = [...(this.descriptor.types ?? []), ...types];
+    if (filters.length > 0) {
+      this.descriptor.filters = [...(this.descriptor.filters ?? []), ...(filters as QueryFilter[])];
+    }
     return this;
   }
 
@@ -217,6 +254,20 @@ export class QueryNamespace {
     return result;
   }
 
+  private decompositionRefs(ref: EntityRef, direction: 'forward' | 'inverse'): EntityRef[] {
+    const result: EntityRef[] = [];
+    const seen = new Set<string>();
+    for (const relType of ['IfcRelAggregates', 'IfcRelNests']) {
+      for (const related of this.backend.query.related(ref, relType, direction)) {
+        const key = `${related.modelId}:${related.expressId}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        result.push(related);
+      }
+    }
+    return result;
+  }
+
   /** IfcRelContainedInSpatialStructure (inverse) — what spatial element contains this entity */
   containedIn(ref: EntityRef): EntityData | null {
     const refs = this.backend.query.related(ref, 'IfcRelContainedInSpatialStructure', 'inverse');
@@ -229,16 +280,21 @@ export class QueryNamespace {
     return this.related(ref, 'IfcRelContainedInSpatialStructure', 'forward');
   }
 
-  /** IfcRelAggregates (inverse) — the whole that this entity is a part of */
+  /** IfcRelAggregates / IfcRelNests (inverse) — the whole that this entity is a part of */
   decomposedBy(ref: EntityRef): EntityData | null {
-    const refs = this.backend.query.related(ref, 'IfcRelAggregates', 'inverse');
+    const refs = this.decompositionRefs(ref, 'inverse');
     if (refs.length === 0) return null;
     return this.backend.query.entityData(refs[0]);
   }
 
-  /** IfcRelAggregates (forward) — parts that this entity aggregates */
+  /** IfcRelAggregates / IfcRelNests (forward) — parts of this entity */
   decomposes(ref: EntityRef): EntityData[] {
-    return this.related(ref, 'IfcRelAggregates', 'forward');
+    const result: EntityData[] = [];
+    for (const related of this.decompositionRefs(ref, 'forward')) {
+      const data = this.backend.query.entityData(related);
+      if (data) result.push(data);
+    }
+    return result;
   }
 
   /** Navigate up to the building storey */

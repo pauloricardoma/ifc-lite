@@ -11,7 +11,26 @@ use crate::{Error, Mesh, Result, TessellationQuality};
 use ifc_lite_core::{DecodedEntity, EntityDecoder, IfcSchema, IfcType};
 
 use crate::router::GeometryProcessor;
-use super::advanced_face::{parse_rational_weights, process_advanced_face, process_bspline_face};
+use super::advanced_face::{
+    parse_rational_weights, process_advanced_face, process_bspline_face,
+};
+
+/// A face that fails to triangulate (e.g. an un-triangulable holed planar
+/// face, #5053) is skipped rather than aborting the whole solid, mirroring
+/// `FaceBasedSurfaceModelProcessor::process` in `brep/surface_model.rs`.
+/// `allow`: `diag_debug!` no-ops without a tracing subscriber (wasm
+/// release), leaving both params unused there. No legacy `eprintln!`
+/// fallback: this is a recovery path, not an anomaly, so it must stay
+/// silent on stderr in normal (non-`observability`) builds — see the
+/// `diag_debug!` docs on passing an empty `else {}` to compile out
+/// entirely.
+#[allow(unused_variables)]
+fn trace_capped_advanced_brep_face(face_id: u32, error: &Error) {
+    crate::diag::diag_debug!(
+        { face_id, error = %error, "skipping unsupported advanced face in advanced_brep" }
+        else {}
+    );
+}
 
 /// AdvancedBrep processor
 /// Handles IfcAdvancedBrep and IfcAdvancedBrepWithVoids - NURBS/B-spline surfaces
@@ -24,13 +43,14 @@ impl AdvancedBrepProcessor {
     }
 }
 
-impl GeometryProcessor for AdvancedBrepProcessor {
-    fn process(
-        &self,
+impl AdvancedBrepProcessor {
+    /// Mesh the Brep; `rtc_file_units` is removed from every face in f64
+    /// before f32 narrowing (#5698).
+    fn process_rebased(
         entity: &DecodedEntity,
         decoder: &mut EntityDecoder,
-        _schema: &IfcSchema,
         quality: TessellationQuality,
+        rtc_file_units: Option<(f64, f64, f64)>,
     ) -> Result<Mesh> {
         // IfcAdvancedBrep attributes:
         // 0: Outer (IfcClosedShell)
@@ -63,8 +83,29 @@ impl GeometryProcessor for AdvancedBrepProcessor {
             if let Some(face_id) = face_ref.as_entity_ref() {
                 let face = decoder.decode_by_id(face_id)?;
 
-                // Delegate to shared advanced face processing
-                let (positions, indices) = process_advanced_face(&face, decoder, quality)?;
+                // Delegate to shared advanced face processing. A face that
+                // fails (rather than one that meshes to nothing) is caught
+                // and skipped here too, so one un-triangulable holed face
+                // degrades to a per-face loss instead of aborting the whole
+                // solid (#5053) — and is still recorded in `empty_faces`
+                // below so the loss isn't silent.
+                let face_mesh = process_advanced_face(&face, decoder, quality, rtc_file_units);
+                let (positions, indices) = match face_mesh {
+                    Ok(result) => result,
+                    Err(ref e) => {
+                        trace_capped_advanced_brep_face(face_id, e);
+                        #[cfg(any(feature = "debug_geometry", feature = "observability"))]
+                        {
+                            let surface_kind = face
+                                .get(1)
+                                .and_then(|a| decoder.resolve_ref(a).ok().flatten())
+                                .map(|s| s.ifc_type.as_str().to_string())
+                                .unwrap_or_else(|| "<unknown>".to_string());
+                            empty_faces.push((face_id, surface_kind));
+                        }
+                        continue;
+                    }
+                };
 
                 if !positions.is_empty() {
                     // Merge into combined mesh
@@ -111,8 +152,33 @@ impl GeometryProcessor for AdvancedBrepProcessor {
             positions: all_positions,
             normals: Vec::new(),
             indices: all_indices,
-            rtc_applied: false, 
+            rtc_applied: rtc_file_units.is_some(),
+            welded_in_object_frame: false,
+            plane_tags: None,
             origin: [0.0; 3],        instance_meta: None, local_bounds: None, local_to_world: None })
+    }
+}
+
+impl GeometryProcessor for AdvancedBrepProcessor {
+    fn process(
+        &self,
+        entity: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+        _schema: &IfcSchema,
+        quality: TessellationQuality,
+    ) -> Result<Mesh> {
+        Self::process_rebased(entity, decoder, quality, None)
+    }
+
+    fn process_in_rtc_frame(
+        &self,
+        entity: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+        _schema: &IfcSchema,
+        quality: TessellationQuality,
+        rtc_file_units: (f64, f64, f64),
+    ) -> Option<Result<Mesh>> {
+        Some(Self::process_rebased(entity, decoder, quality, Some(rtc_file_units)))
     }
 
     fn supported_types(&self) -> Vec<IfcType> {
@@ -137,6 +203,40 @@ impl BSplineSurfaceProcessor {
     pub fn new() -> Self {
         Self
     }
+
+    /// Mesh the surface; `rtc_file_units` shifts the control net in f64
+    /// before f32 narrowing (#5698).
+    fn process_rebased(
+        entity: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+        quality: TessellationQuality,
+        rtc_file_units: Option<(f64, f64, f64)>,
+    ) -> Result<Mesh> {
+        let weights = if entity.ifc_type == IfcType::IfcRationalBSplineSurfaceWithKnots {
+            parse_rational_weights(entity)
+        } else {
+            None
+        };
+        let (positions, indices) = process_bspline_face(
+            entity,
+            decoder,
+            weights.as_deref(),
+            quality,
+            rtc_file_units.unwrap_or((0.0, 0.0, 0.0)),
+        )?;
+        Ok(Mesh {
+            positions,
+            normals: Vec::new(),
+            indices,
+            rtc_applied: rtc_file_units.is_some(),
+            welded_in_object_frame: false,
+            plane_tags: None,
+            origin: [0.0; 3],
+            instance_meta: None,
+            local_bounds: None,
+            local_to_world: None,
+        })
+    }
 }
 
 impl Default for BSplineSurfaceProcessor {
@@ -153,21 +253,18 @@ impl GeometryProcessor for BSplineSurfaceProcessor {
         _schema: &IfcSchema,
         quality: TessellationQuality,
     ) -> Result<Mesh> {
-        let weights = if entity.ifc_type == IfcType::IfcRationalBSplineSurfaceWithKnots {
-            parse_rational_weights(entity)
-        } else {
-            None
-        };
+        Self::process_rebased(entity, decoder, quality, None)
+    }
 
-        let (positions, indices) =
-            process_bspline_face(entity, decoder, weights.as_deref(), quality)?;
-
-        Ok(Mesh {
-            positions,
-            normals: Vec::new(),
-            indices,
-            rtc_applied: false, 
-            origin: [0.0; 3],        instance_meta: None, local_bounds: None, local_to_world: None })
+    fn process_in_rtc_frame(
+        &self,
+        entity: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+        _schema: &IfcSchema,
+        quality: TessellationQuality,
+        rtc_file_units: (f64, f64, f64),
+    ) -> Option<Result<Mesh>> {
+        Some(Self::process_rebased(entity, decoder, quality, Some(rtc_file_units)))
     }
 
     fn supported_types(&self) -> Vec<IfcType> {

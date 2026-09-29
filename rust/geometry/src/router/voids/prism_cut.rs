@@ -40,12 +40,12 @@
 //!    inside the (pre-cut) host solid by ray parity. Cap boundaries reuse the
 //!    exact seam coordinates, so caps weld to the kept host fragments.
 //!
-//! SELF-CHECKS (all hard gates — any failure defers to the exact kernel with
-//! the FULL opening set unchanged):
-//! * per-opening volume identity `vol(outside) + vol(inside) == vol(host)` in
-//!   f64 (the caps cancel; the fragments partition the host surface), plus
-//!   `0 < vol(inside) <= vol(prism)` so the caps provably close the removed
-//!   solid;
+//! SELF-CHECKS (failed candidates remain for the exact kernel; a final-surface
+//! failure defers the full opening set):
+//! * retained and discarded host fragments must conserve the source surface
+//!   within host-scale clipping tolerance, independently of the reference;
+//! * a geometric envelope and the consolidated result must permit measurable
+//!   removal; open fragment divergence is never used as a removed-solid volume;
 //! * the host must arrive as a consistently-wound closed solid and the final
 //!   emitted mesh must pass the same DIRECTED quantized closed-surface audit
 //!   (which also catches doubled coincident faces and flipped caps).
@@ -72,8 +72,18 @@ use rustc_hash::FxHashMap;
 /// kernel for every host). Default ON; read once.
 pub(crate) mod closure_checks;
 mod vertex_dedup;
-use closure_checks::{closed_or_hairline, directed_closed};
+mod finish;
+mod tjunction_close;
+mod planar_correction;
+#[cfg(test)]
+#[path = "prism_cut_tests.rs"]
+mod tests;
+use closure_checks::{closed_enough_to_emit, directed_closed, ClosureVerdict};
+#[cfg(test)]
+use closure_checks::closed_or_hairline;
 pub(crate) use vertex_dedup::dedup_cut_vertices;
+pub(in crate::router::voids) use finish::finish_cut_verdict;
+pub(super) use planar_correction::correct_planar_overlap;
 
 pub(super) fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -108,7 +118,7 @@ mod diag {
         "op_engulf",
         "op_veto_overlap",
         "cut_cdt_fail",
-        "cut_vol_fail",
+        "cut_partition_fail",
         "out_not_closed",
     ];
     static DEFERS: [AtomicU64; 10] = [
@@ -126,15 +136,19 @@ mod diag {
 
     #[inline]
     pub(super) fn defer(i: usize) {
-        DEFERS[i].fetch_add(1, Ordering::Relaxed);
+        crate::telemetry_transaction::record(move || {
+            DEFERS[i].fetch_add(1, Ordering::Relaxed);
+        });
     }
 
     /// Record one analytic-cut host: (fires, openings cut, openings residual).
     #[inline]
     pub(super) fn record_cut(committed_ops: usize, residual: usize) {
-        FIRES.fetch_add(1, Ordering::Relaxed);
-        OPENINGS_ANALYTIC.fetch_add(committed_ops as u64, Ordering::Relaxed);
-        OPENINGS_RESIDUAL.fetch_add(residual as u64, Ordering::Relaxed);
+        crate::telemetry_transaction::record(move || {
+            FIRES.fetch_add(1, Ordering::Relaxed);
+            OPENINGS_ANALYTIC.fetch_add(committed_ops as u64, Ordering::Relaxed);
+            OPENINGS_RESIDUAL.fetch_add(residual as u64, Ordering::Relaxed);
+        });
     }
 
     /// Read + reset the per-reason defer counters as (name, count) pairs.
@@ -286,11 +300,6 @@ struct PTri {
 }
 
 impl PTri {
-    /// Signed volume contribution about the origin (divergence theorem, ×6).
-    #[inline]
-    fn vol6(&self) -> f64 {
-        dot(self.p[0], cross(self.p[1], self.p[2]))
-    }
     #[inline]
     fn aabb(&self) -> (V3, V3) {
         let mut lo = self.p[0];
@@ -305,8 +314,156 @@ impl PTri {
     }
 }
 
-fn tri_volume6(tris: &[PTri]) -> f64 {
-    tris.iter().map(PTri::vol6).sum()
+/// The retained and discarded host fragments must reconstruct the source surface.
+/// Their combined divergence residual is meaningful even when either fragment
+/// set is open: this is a partition identity, not an enclosed-volume reading.
+///
+/// Check its value at the host AABB centre and its maximum variation across the
+/// AABB. The residual is affine in the reference, so twice the sum of absolute
+/// centre-to-face differences gives its exact range over all eight corners.
+/// Both checks allow the established one-part-per-million clipping error. The
+/// absolute floor uses the full host extent; a remote or long cutter cannot
+/// enlarge it. Caps are excluded because their opposite contributions cancel.
+fn partition_consistent(host: &[PTri], out: &[PTri], inside: &[PTri], bounds: &[(V3, V3)]) -> bool {
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for (a, b) in bounds {
+        for k in 0..3 {
+            lo[k] = lo[k].min(a[k]);
+            hi[k] = hi[k].max(b[k]);
+        }
+    }
+    let origin: V3 = std::array::from_fn(|k| (lo[k] + hi[k]) * 0.5);
+    let extent = (0..3).map(|k| hi[k] - lo[k]).fold(0.0, f64::max);
+    let sum = |ts: &[PTri], reference: &V3| {
+        ts.iter()
+            .map(|t| {
+                crate::kernel::signed_volume::tetra_volume6(&t.p[0], &t.p[1], &t.p[2], reference)
+            })
+            .sum::<f64>()
+            / 6.0
+    };
+    let tolerance =
+        (1.0e-12 * (1.0 + extent).powi(3) + 1.0e-9).max(sum(host, &origin).abs() * 1.0e-6);
+    let residual =
+        |reference: &V3| sum(out, reference) + sum(inside, reference) - sum(host, reference);
+    let center = residual(&origin);
+    let range = (0..3)
+        .map(|axis| {
+            let mut reference = origin;
+            reference[axis] = hi[axis];
+            2.0 * (residual(&reference) - center).abs()
+        })
+        .sum::<f64>();
+    center.is_finite() && range.is_finite() && center.abs() <= tolerance && range <= tolerance
+}
+
+/// A containing box is a geometric upper bound on any possible removed volume;
+/// it does not require the discarded fragments and caps to form a closed shell.
+/// Use a face-aligned box so an exactly planar contact has zero thickness even
+/// when it is oblique to the world axes. Keep the existing 1e-9 m³ measurable
+/// removal threshold without rejecting every thin but wide authored cut.
+fn has_measurable_region(inside: &[PTri], caps: &[PTri]) -> bool {
+    let faces: Vec<PTri> = inside.iter().chain(caps).cloned().collect();
+    let mut geometry = mesh_from_ptris(&faces, &Mesh::new());
+    geometry.clean_degenerate();
+    if geometry.indices.is_empty() {
+        return false;
+    }
+    let normal = |t: &PTri| cross(sub(t.p[1], t.p[0]), sub(t.p[2], t.p[0]));
+    let Some(face) = faces
+        .iter()
+        .max_by(|a, b| norm(normal(a)).total_cmp(&norm(normal(b))))
+    else {
+        return false;
+    };
+    let origin = face.p[0];
+    let Some(u) = normalize(sub(face.p[1], origin)) else {
+        return false;
+    };
+    let Some(n) = normalize(normal(face)) else {
+        return false;
+    };
+    let axes = [u, cross(n, u), n];
+    let mut lo = [0.0f64; 3];
+    let mut hi = [0.0f64; 3];
+    for t in &faces {
+        for p in t.p {
+            for k in 0..3 {
+                let coordinate = dot(sub(p, origin), axes[k]);
+                lo[k] = lo[k].min(coordinate);
+                hi[k] = hi[k].max(coordinate);
+            }
+        }
+    }
+    let envelope = (0..3).map(|k| hi[k] - lo[k]).product::<f64>();
+    envelope.is_finite() && envelope >= 1.0e-9
+}
+
+/// Reject a consolidated no-op before optional refinement can perturb it.
+/// Only call this after auditing the result surface. A shared host reference
+/// cancels untouched hairline flux; the AABB drift bounds any dependence left
+/// in the before/after difference. Reject only when the ENTIRE change interval
+/// is below the established 1e-9 m³ measurable-removal threshold.
+fn consolidated_change_is_measurable(before: &Mesh, after: &Mesh) -> bool {
+    let (_, delta, drift) = mesh_change_interval(before, after);
+    delta.is_finite() && drift.is_finite() && delta.abs() + drift >= 1.0e-9
+}
+
+fn mesh_change_interval(before: &Mesh, after: &Mesh) -> (f64, f64, f64) {
+    use super::geom::{mesh_signed_volume_about, volume_reference};
+    let reference = volume_reference(before);
+    let volume = mesh_signed_volume_about(before, &reference);
+    let delta = mesh_signed_volume_about(after, &reference) - volume;
+    let (_, hi) = before.bounds();
+    let drift = (0..3)
+        .map(|axis| {
+            let mut probe = reference;
+            probe[axis] = hi[axis] as f64;
+            (mesh_signed_volume_about(after, &probe)
+                - mesh_signed_volume_about(before, &probe)
+                - delta)
+                .abs()
+        })
+        .sum::<f64>();
+    (volume, delta, drift)
+}
+
+/// Final subtraction bounds use audited result/host surfaces and an independent
+/// cutter ceiling. Every committed cutter is measured AFTER cap/profile extension;
+/// summing those prism volumes conservatively bounds their union, and the host
+/// volume independently limits removal even for a very long cutter.
+///
+/// The local quantization model documented by `kernel::mesh_volume::mesh_volume`
+/// is surface_area * SNAP_GRID. Both boundaries can move, so their areas add;
+/// no world-coordinate magnitude or candidate-fragment envelope sets this bound.
+fn result_volume_within_bounds(before: &Mesh, after: &Mesh, cutter_volume: f64) -> bool {
+    let (volume, raw_delta, drift) = mesh_change_interval(before, after);
+    let delta = raw_delta * volume.signum();
+    let area = |mesh: &Mesh| {
+        let p =
+            |i: u32| -> V3 { std::array::from_fn(|k| mesh.positions[i as usize * 3 + k] as f64) };
+        mesh.indices
+            .chunks_exact(3)
+            .map(|t| norm(cross(sub(p(t[1]), p(t[0])), sub(p(t[2]), p(t[0])))) * 0.5)
+            .sum::<f64>()
+    };
+    let (lo, hi) = before.bounds();
+    let extent = (0..3)
+        .map(|k| hi[k] as f64 - lo[k] as f64)
+        .fold(0.0, f64::max);
+    let floor = (1.0e-12 * (1.0 + extent).powi(3) + 1.0e-9).max(volume.abs() * 1.0e-6);
+    let tolerance = (area(before) + area(after)) * crate::kernel::mesh_bridge::SNAP_GRID + floor;
+    let ceiling = cutter_volume.min(volume.abs());
+    volume.is_finite()
+        && volume != 0.0
+        && cutter_volume.is_finite()
+        && cutter_volume >= 0.0
+        && delta.is_finite()
+        && drift.is_finite()
+        && tolerance.is_finite()
+        && delta + drift <= tolerance
+        && -delta + drift <= ceiling + tolerance
 }
 
 /// Promote a `Mesh` to the f64 triangle list, folding nothing (the mesh is
@@ -389,6 +546,8 @@ fn mesh_from_ptris(tris: &[PTri], template: &Mesh) -> Mesh {
         instance_meta: None,
         local_bounds: None,
         local_to_world: None,
+        welded_in_object_frame: false,
+        plane_tags: None,
     }
 }
 
@@ -1626,12 +1785,6 @@ struct Seam {
     b2: V2,
 }
 
-struct PrismCutOutcome {
-    tris: Vec<PTri>,
-    /// Volume removed (host ∩ cutter), from the closed inside assembly.
-    removed: f64,
-}
-
 /// Plane of a face: (unit normal, offset) with the plane `{x : n·x = c}`.
 fn face_plane(pf: &PrismFrame, face: Face) -> Option<(V3, f64)> {
     match face {
@@ -1712,7 +1865,7 @@ fn face_coords(pf: &PrismFrame, face: Face, p: V3) -> V2 {
 /// Subtract the stepped solid `pf` from the host triangle list. `Err(defer
 /// index)` ⇒ a gate or self-check failed ⇒ the caller must leave the host
 /// untouched and route this opening to the exact kernel.
-fn cut_prism(tris: &[PTri], pf: &PrismFrame) -> Result<PrismCutOutcome, usize> {
+fn cut_prism(tris: &[PTri], pf: &PrismFrame) -> Result<Vec<PTri>, usize> {
     let faces = stack_faces(pf);
     if faces.len() > u16::MAX as usize {
         return Err(7);
@@ -1931,37 +2084,19 @@ fn cut_prism(tris: &[PTri], pf: &PrismFrame) -> Result<PrismCutOutcome, usize> {
         }
     }
 
-    // Volume self-checks (f64, exact identities up to roundoff):
-    //   vol_out + vol_in == vol_host   (caps cancel, fragments partition)
-    //   0 < vol_in <= vol(cutter)      (the caps close the removed solid)
-    let mut host_mag = pf.corner_mag();
-    for (lo, hi) in &aabbs {
-        for k in 0..3 {
-            host_mag = host_mag.max(lo[k].abs()).max(hi[k].abs());
-        }
-    }
-    let vol_host = tri_volume6(tris) / 6.0;
-    let caps_vol = tri_volume6(&caps) / 6.0; // caps oriented for the RESULT
-    let vol_out = tri_volume6(&out) / 6.0 + caps_vol;
-    let vol_in = tri_volume6(&inside) / 6.0 - caps_vol;
-    let scale3 = (1.0 + host_mag).powi(3);
-    let tol = 1.0e-12 * scale3 + 1.0e-9;
-    if (vol_out + vol_in - vol_host).abs() > tol.max(1.0e-6 * vol_host.abs()) {
+    if !partition_consistent(tris, &out, &inside, &aabbs) {
         return Err(8);
     }
-    if vol_in < 1.0e-9 {
-        return Err(8); // removed nothing measurable — leave to the exact path
-    }
-    if vol_in > pf.volume() * (1.0 + 1.0e-6) + tol {
-        return Err(8);
+    if !has_measurable_region(&inside, &caps) {
+        return Err(4);
     }
 
-    let mut tris_out = out;
-    tris_out.append(&mut caps);
-    Ok(PrismCutOutcome {
-        tris: tris_out,
-        removed: vol_in,
-    })
+    // The inside fragments and caps are not independently closed surfaces.
+    // Their divergence sums cannot measure removal (#4627). The extended
+    // cutter volumes instead bound the final audited result in the driver.
+    // The driver consolidates and audits the actual result before committing.
+    out.append(&mut caps);
+    Ok(out)
 }
 
 /// 2D point pool with tolerance merging: canonical 3D/normal = first-seen.
@@ -2671,7 +2806,7 @@ impl GeometryRouter {
         // self-check are only meaningful on a host that arrives as a
         // consistently-wound closed solid (hairline subdivision mismatches
         // tolerated — tessellated hosts routinely carry them).
-        if !directed_closed(mesh) && !closed_or_hairline(mesh) {
+        if !closed_enough_to_emit(mesh) {
             defer(0);
             return None;
         }
@@ -2741,6 +2876,7 @@ impl GeometryRouter {
 
         // ── Sequential analytic cuts ────────────────────────────────────────
         let mut committed_ops = 0usize;
+        let mut committed_cutter_volume = 0.0;
         // AABB (host-local frame) of every COMMITTED cutter prism, captured
         // post-extension: the region the cut actually re-triangulated. Feeds the
         // scoped sliver refinement below (#1007 targets rim slivers, not the
@@ -2795,8 +2931,8 @@ impl GeometryRouter {
                     } else {
                         match cut_prism(&tris, &pf) {
                             Ok(outcome) => {
-                                debug_assert!(outcome.removed > 0.0);
-                                tris = outcome.tris;
+                                committed_cutter_volume += pf.volume();
+                                tris = outcome;
                                 committed_ops += cand.ops.len();
                                 ok = true;
                                 // Committed-cutter AABB (extended pf): lift the
@@ -2850,6 +2986,13 @@ impl GeometryRouter {
         // large triangles — 2-3x fewer output triangles on the advanced_model
         // walls, matching the exact kernel's tessellation density.
         out = crate::csg::ClippingProcessor::consolidate_coplanar(out);
+        let consolidated_closure = ClosureVerdict::for_mesh(&out);
+        if consolidated_closure.closed_enough_to_emit()
+            && !consolidated_change_is_measurable(mesh, &out)
+        {
+            defer(4);
+            return None;
+        }
         // WATERTIGHT SLIVER REFINEMENT (#1007): the per-triangle CDT can emit a
         // high-aspect corner sliver at an opening rim (a far-corner triangle
         // fanned to two rim vertices) — the visible roof-slope chamfer the
@@ -2868,7 +3011,7 @@ impl GeometryRouter {
         // mismatch, and the split slivers can fall below the clean-degenerate
         // grid — so accept the refined mesh only when it is STRICTLY closed
         // and a cleaned probe stays at least hairline-closed.
-        if residual_idx.is_empty() && directed_closed(&out) {
+        if residual_idx.is_empty() && consolidated_closure.is_directed_closed() {
             // SCOPED to the committed cutters' padded AABBs: #1007's target is
             // the high-aspect corner sliver the CUT emits at an opening rim, and
             // every rim-incident sliver touches its cutter's box. The unscoped
@@ -2883,7 +3026,11 @@ impl GeometryRouter {
             // the upfront clone, the probe clean, and the closure audits decided
             // nothing. Only a fixpoint that actually split an edge pays the
             // probe + self-check audits. Same 6-refine budget as before
-            // (1 here + up to 5 below).
+            // (1 here + up to 5 below). This refinement is not a replacement
+            // for the router's source-triangle cleanup and does not promise
+            // hygienic output. The probe informs acceptance; `finish_cut`
+            // closure-audits and prefers a clean result, but may return its
+            // explicit compatibility result (#4797).
             let mut refined =
                 crate::facet_weld::refine_high_aspect_slivers_within(&out, &refine_boxes);
             if refined.indices.len() != out.indices.len() {
@@ -2897,37 +3044,27 @@ impl GeometryRouter {
                 }
                 let mut probe = refined.clone();
                 probe.clean_degenerate();
-                if directed_closed(&refined)
-                    && (directed_closed(&probe) || closed_or_hairline(&probe))
-                {
+                if directed_closed(&refined) && closed_enough_to_emit(&probe) {
                     out = refined;
                 }
             }
         }
-        // Never emit a cut that is not a consistently-wound closed surface. The
-        // analytic CONSTRUCTION itself must be closed (the DIRECTED audit also
-        // catches doubled coincident faces and flipped caps the undirected
-        // 2-manifold check cannot see); if it is not, the prism decomposition was
-        // wrong and the WHOLE host (full opening set) goes back to the exact
-        // kernel.
-        if !directed_closed(&out) && !closed_or_hairline(&out) {
+        // The finalizer cleans before the ulp weld so discarded slivers cannot
+        // choose a surviving seam coordinate, then audits the exact mesh it
+        // returns. A closed pre-clean result remains the compatibility fallback.
+        let Some((finished, directed)) = finish_cut_verdict(out, mesh) else {
             defer(9);
             return None;
-        }
-        // Apply the standard `clean_degenerate` hygiene (every void path, the
-        // exact kernel included, drops sub-grid slivers), then RE-AUDIT: the
-        // EMITTED mesh must be the audited one (#1806 review), because cleaning
-        // can drop a thin-but-counted triangle that was load-bearing for closure
-        // and crack the surface. When hygiene opens such a crack, keep the
-        // already-closed pre-clean construction rather than emitting the cracked
-        // mesh — its un-cleaned slivers are the same hairlines every other path
-        // (the exact kernel included, #1167) already carries, so this stays
-        // correct without paying the exact-kernel tax for a host the analytic
-        // path cut cleanly.
-        let mut cleaned = out.clone();
-        cleaned.clean_degenerate();
-        if directed_closed(&cleaned) || closed_or_hairline(&cleaned) {
-            out = cleaned;
+        };
+        out = finished;
+        // A host stored relative to a per-element origin can keep hairline
+        // seams its world-frame twin does not (#5739): its weld is sized by the
+        // small stored coordinates. Close them when that leaves the cut
+        // strictly closed, else keep it. World-frame cuts are untouched.
+        if mesh.origin != [0.0; 3] && !directed {
+            if let Some(closed) = tjunction_close::close_seams(&out, mesh) {
+                out = closed;
+            }
         }
 
         // Residual openings in their original classification order.
@@ -2937,6 +3074,10 @@ impl GeometryRouter {
             .map(|&i| ctx.merged_openings[i].clone())
             .collect();
 
+        if !result_volume_within_bounds(mesh, &out, committed_cutter_volume) {
+            defer(8);
+            return None;
+        }
         record_cut(committed_ops, residual.len());
 
         let residual_ctx = if residual.is_empty() {
@@ -2952,7 +3093,3 @@ impl GeometryRouter {
         Some((out, residual_ctx))
     }
 }
-
-#[cfg(test)]
-#[path = "prism_cut_tests.rs"]
-mod tests;

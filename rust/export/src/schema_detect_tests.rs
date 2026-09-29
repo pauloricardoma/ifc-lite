@@ -136,6 +136,13 @@ fn detect_schema_ignores_file_schema_literal_text_inside_a_quoted_string() {
 }
 
 #[test]
+fn detect_schema_requires_an_exact_file_schema_record_keyword() {
+    let content = "ISO-10303-21;\nHEADER;\nNOT_FILE_SCHEMA(('IFC2X3'));\n\
+                   FILE_SCHEMA_EXTRA(('IFC2X3'));\nFILE_SCHEMA(('IFC4X3'));\nENDSEC;\nDATA;\nENDSEC;\n";
+    assert_eq!(detect_schema(content.as_bytes()), "IFC4X3");
+}
+
+#[test]
 fn detect_schema_handles_doubled_apostrophe_escape_before_the_real_endsec() {
     // A header field value containing a literal apostrophe, escaped per
     // ISO 10303-21 by doubling (`''`), must not desynchronize the
@@ -162,4 +169,76 @@ fn detect_schema_handles_doubled_apostrophe_escape_before_the_real_endsec() {
 fn detect_schema_un_doubles_backslash_before_escape_re_doubles_it() {
     let source = "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\nFILE_NAME('','',(''),(''),'','','');\nFILE_SCHEMA(('IFC\\\\4'));\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n";
     assert_eq!(detect_schema(source.as_bytes()), "IFC\\4");
+}
+
+/// #3303: ISO 10303-21 keywords are case-insensitive and `find_unquoted` is
+/// not, so a header spelling the keyword in lower case read as no declaration
+/// at all and fell through to the `IFC4` default.
+///
+/// The case-sensitivity itself is not changed here (see [`super::detect_schema`]
+/// for why); the header reader, which has always been case-insensitive, now
+/// answers when the scan above has nothing.
+#[test]
+fn detect_schema_reads_a_file_schema_keyword_in_any_case() {
+    for keyword in ["file_schema", "File_Schema", "FILE_SCHEMA"] {
+        let content = format!(
+            "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\n{keyword}(('IFC2X3'));\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n"
+        );
+        assert_eq!(detect_schema(content.as_bytes()), "IFC2X3", "keyword {keyword}");
+    }
+}
+
+/// The failure #3303's own note does not name: the wrong answer is not a
+/// SKIPPED conversion, it is a MISLABELLED FILE on a plain re-export.
+///
+/// With `opts.schema == None`, `step.rs` stamps `detect_schema`'s answer into
+/// the output header. So a lower-case IFC2X3 source came back out declaring
+/// `FILE_SCHEMA(('IFC4'));` with its IFC2X3 entity records unchanged beneath
+/// it — no conversion ran, because `opts.schema.is_some()` gates that, so the
+/// only thing that changed was the label.
+#[test]
+fn a_lower_case_ifc2x3_file_is_not_relabelled_ifc4_on_a_plain_re_export() {
+    let src = "ISO-10303-21;\nHEADER;\nfile_description((''),'2;1');\n\
+               file_name('a.ifc','',(''),(''),'','','');\nfile_schema(('IFC2X3'));\nendsec;\n\
+               DATA;\n#1=IFCWALL('0abcdefghijklmnopqrstu',$,'W1',$,$,$,$,$);\n\
+               ENDSEC;\nEND-ISO-10303-21;\n";
+    let out = crate::export_step(src.as_bytes(), &crate::StepOptions::default()).unwrap();
+    assert!(out.contains("FILE_SCHEMA(('IFC2X3'));"), "{out}");
+    assert!(!out.contains("FILE_SCHEMA(('IFC4'))"), "relabelled: {out}");
+    // The records are copied through either way; the label is the whole defect.
+    assert!(out.contains("#1=IFCWALL('0abcdefghijklmnopqrstu',$,'W1',$,$,$,$,$);"), "{out}");
+}
+
+#[test]
+fn a_lower_case_schema_past_64_kib_is_still_detected_4593() {
+    let description = "x".repeat(70 * 1024);
+    let src = format!(
+        "ISO-10303-21;\nHEADER;\nfile_description(('{description}'),'2;1');\n\
+         file_schema(('IFC2X3'));\nendsec;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n"
+    );
+    assert_eq!(detect_schema(src.as_bytes()), "IFC2X3");
+}
+
+#[test]
+fn a_missing_header_endsec_does_not_borrow_a_schema_from_data_4593() {
+    let src = b"ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('x'),'2;1');\n\
+                DATA;\nFILE_SCHEMA(('IFC2X3'));\nENDSEC;\nEND-ISO-10303-21;\n";
+    assert_eq!(detect_schema(src), "IFC4");
+}
+
+/// Controls: an uppercase declaration is answered by the scan (IFC2X3, so
+/// the default cannot fake the pass), and a file that declares nothing still
+/// answers `IFC4`; the fallback may only speak where the scan is silent.
+#[test]
+fn the_header_fallback_does_not_override_a_declaration_or_invent_one() {
+    let declared = "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC2X3'));\nENDSEC;\nDATA;\nENDSEC;\n";
+    assert_eq!(detect_schema(declared.as_bytes()), "IFC2X3");
+
+    // A header with records but no FILE_SCHEMA: the reader returns a header,
+    // its `schema_identifiers` is empty, and the default still applies.
+    let none = "ISO-10303-21;\nHEADER;\nFILE_NAME('a.ifc','',(''),(''),'','','');\nENDSEC;\nDATA;\nENDSEC;\n";
+    assert_eq!(detect_schema(none.as_bytes()), "IFC4");
+
+    // Not STEP at all: the header reader returns `None`.
+    assert_eq!(detect_schema(b"not a step file"), "IFC4");
 }

@@ -47,7 +47,9 @@ impl ResolvedUnit {
 /// to the IFC-canonical SI default in [`ProjectUnits::unit_for_measure`].
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ProjectUnits {
-    by_type: BTreeMap<String, ResolvedUnit>,
+    /// `None` for a declared unit whose scale could not be resolved (#4690):
+    /// it shows no unit rather than the SI default, which would mislabel it.
+    by_type: BTreeMap<String, Option<ResolvedUnit>>,
     monetary: Option<ResolvedUnit>,
 }
 
@@ -81,9 +83,9 @@ impl ProjectUnits {
             None => return units,
         };
         for unit_ref in refs {
-            if let Some((unit_type, resolved, monetary)) = resolve_unit_by_ref(decoder, unit_ref) {
+            if let Some((unit_type, resolved, monetary)) = resolve_declared_unit(decoder, unit_ref) {
                 if monetary {
-                    units.monetary = Some(resolved);
+                    units.monetary = resolved;
                 } else if let Some(t) = unit_type {
                     // First declaration of a unit-type wins (IFC allows only one
                     // per type anyway); don't let a later duplicate clobber it.
@@ -101,20 +103,19 @@ impl ProjectUnits {
     /// measures (ratios, counts) and non-measure value types (labels, ...).
     pub fn unit_for_measure(&self, measure_type: &str) -> Option<ResolvedUnit> {
         match measure_unit(measure_type)? {
-            MeasureUnit::Typed { unit_type, default_symbol } => Some(
-                self.by_type
-                    .get(unit_type)
-                    .cloned()
-                    .unwrap_or_else(|| ResolvedUnit::new(default_symbol, 1.0)),
-            ),
+            MeasureUnit::Typed { unit_type, default_symbol } => match self.by_type.get(unit_type) {
+                Some(declared) => declared.clone(),
+                None => Some(ResolvedUnit::new(default_symbol, 1.0)),
+            },
             MeasureUnit::Monetary => self.monetary.clone(),
             MeasureUnit::Dimensionless => None,
         }
     }
 
     /// The resolved unit the file declares for a raw unit-type token, if any.
+    /// A declared unit whose scale could not be resolved is `None` here too.
     pub fn resolved_for_unit_type(&self, unit_type: &str) -> Option<&ResolvedUnit> {
-        self.by_type.get(unit_type)
+        self.by_type.get(unit_type)?.as_ref()
     }
 
     /// The resolved monetary (currency) unit, if the file declares one.
@@ -139,23 +140,109 @@ pub fn resolve_unit_by_ref(
     decoder: &mut EntityDecoder,
     unit_ref: u32,
 ) -> Option<(Option<String>, ResolvedUnit, bool)> {
-    resolve_unit_by_ref_depth(decoder, unit_ref, 0)
+    let (unit_type, resolved, monetary) = resolve_declared_unit(decoder, unit_ref)?;
+    Some((unit_type, resolved?, monetary))
+}
+
+/// `(unit_type_token, resolved, is_monetary)` where `resolved` is `None` for a
+/// unit whose type is readable but whose scale is not (#4690).
+type DeclaredUnit = (Option<String>, Option<ResolvedUnit>, bool);
+
+/// [`resolve_unit_by_ref`], keeping a declared unit whose scale is unresolved.
+fn resolve_declared_unit(decoder: &mut EntityDecoder, unit_ref: u32) -> Option<DeclaredUnit> {
+    let mut walk = UnitWalk::default();
+    let out = resolve_unit_by_ref_walk(decoder, unit_ref, &mut walk);
+    // A budget trip stops the walk part-way through some element list, so
+    // whatever was composed depends on where it stopped. Refuse the unit
+    // rather than hand back a symbol that is missing the elements it never
+    // reached.
+    if walk.was_refused() {
+        return None;
+    }
+    out
 }
 
 /// Max depth for the IFCDERIVEDUNIT -> element -> unit recursion. Real derived
 /// units nest ~2 levels; a malformed file can form a reference cycle (an
 /// IFCDERIVEDUNIT whose element's Unit points back to it), so cap the recursion
 /// to keep it from overflowing the stack, which is an uncatchable abort.
-const MAX_UNIT_RESOLVE_DEPTH: u32 = 16;
+///
+/// The cap bounds one path's LENGTH only. A cycle is refused by
+/// [`UnitWalk::path`] and a fan-out by [`UnitWalk::decodes`]; see AGENTS.md
+/// "Bounding walks over file-supplied references". With the cap alone, a
+/// cycle whose derived unit lists `k` elements costs `O(k^16)`: seconds at
+/// k=3 from a file of a few hundred bytes.
+const MAX_UNIT_RESOLVE_DEPTH: usize = 16;
 
-fn resolve_unit_by_ref_depth(
+/// Entity decodes one `resolve_unit_by_ref` call may spend before giving up.
+/// A real derived unit (`m³/s`, `W/(m·K)`) decodes under ten entities; the
+/// walk over `IfcDerivedUnit -> IfcDerivedUnitElement -> Unit` is a tree, so
+/// an ACYCLIC file that fans out `k` ways per level (which the path set cannot
+/// see) still costs `k^depth` without this.
+///
+/// Not a memo: a unit's resolution is a pure function of its id, but its
+/// SYMBOL is the concatenation of its elements' symbols, so a fan-out that a
+/// memo made cheap to walk would still compose an output exponential in the
+/// depth (`4^12` copies of `m` from twelve small records). Bounding decodes
+/// bounds the elements composed, and with them the output.
+const MAX_UNIT_RESOLVE_DECODES: u32 = 256;
+
+/// Bookkeeping for one top-level unit resolution.
+#[derive(Default)]
+struct UnitWalk {
+    /// Unit entity ids on the CURRENT chain, innermost last; pushed on entry,
+    /// popped on exit, so its length is the recursion depth and a repeat is a
+    /// cycle.
+    path: Vec<u32>,
+    /// Entity decodes spent so far; past [`MAX_UNIT_RESOLVE_DECODES`] the walk
+    /// refuses the rest, and the top level refuses the whole unit rather than
+    /// hand back a symbol missing the elements it never reached.
+    decodes: u32,
+    /// A cycle, depth trip, or decode-budget trip invalidates the whole
+    /// authored unit. Returning the sound siblings would fabricate a
+    /// truncated symbol and SI scale.
+    refused: bool,
+}
+
+impl UnitWalk {
+    /// Charge one entity decode; `false` once the budget is spent.
+    fn charge(&mut self) -> bool {
+        self.decodes += 1;
+        if self.decodes > MAX_UNIT_RESOLVE_DECODES {
+            self.refused = true;
+            return false;
+        }
+        true
+    }
+
+    fn was_refused(&self) -> bool {
+        self.refused
+    }
+}
+
+fn resolve_unit_by_ref_walk(
     decoder: &mut EntityDecoder,
     unit_ref: u32,
-    depth: u32,
-) -> Option<(Option<String>, ResolvedUnit, bool)> {
-    if depth > MAX_UNIT_RESOLVE_DEPTH {
+    walk: &mut UnitWalk,
+) -> Option<DeclaredUnit> {
+    if walk.path.len() >= MAX_UNIT_RESOLVE_DEPTH || walk.path.contains(&unit_ref) {
+        walk.refused = true;
         return None;
     }
+    if !walk.charge() {
+        return None;
+    }
+    walk.path.push(unit_ref);
+    let out = resolve_unit_entity(decoder, unit_ref, walk);
+    walk.path.pop();
+    out
+}
+
+fn resolve_unit_entity(
+    decoder: &mut EntityDecoder,
+    unit_ref: u32,
+    walk: &mut UnitWalk,
+) -> Option<DeclaredUnit> {
     let entity = decoder.decode_by_id(unit_ref).ok()?;
     match entity.ifc_type.as_str() {
         "IFCSIUNIT" => {
@@ -167,18 +254,25 @@ fn resolve_unit_by_ref_depth(
                 .filter(|a| !a.is_null())
                 .and_then(|a| a.as_enum());
             let (symbol, scale) = si_unit_symbol_and_scale(name, prefix)?;
-            Some((unit_type, ResolvedUnit::new(symbol, scale), false))
+            Some((unit_type, Some(ResolvedUnit::new(symbol, scale)), false))
         }
         "IFCCONVERSIONBASEDUNIT" => {
             // [1]=UnitType, [2]=Name, [3]=ConversionFactor (IFCMEASUREWITHUNIT)
             let unit_type = entity.get(1).and_then(|a| a.as_enum()).map(str_token);
             let name = entity.get(2).and_then(|a| a.as_string()).unwrap_or("");
-            let symbol = conversion_unit_symbol(name);
-            let conv_ref = entity.get_ref(3);
-            let scale = conv_ref
-                .and_then(|r| conversion_factor_scale(decoder, r, depth))
-                .unwrap_or(1.0);
-            Some((unit_type, ResolvedUnit::new(symbol, scale), false))
+            // A factor the file does not resolve falls back to the name's known
+            // factor, from the linear table the geometry length scale reads, so
+            // only for a LENGTHUNIT; anything else is left unresolved rather
+            // than guessed at 1.0 (#4690).
+            let scale = entity
+                .get_ref(3)
+                .and_then(|r| conversion_factor_scale(decoder, r, walk))
+                .or_else(|| match unit_type.as_deref() {
+                    Some("LENGTHUNIT") => crate::unit_labels::get_conversion_based_unit_factor(name),
+                    _ => None,
+                });
+            let resolved = scale.map(|scale| ResolvedUnit::new(conversion_unit_symbol(name), scale));
+            Some((unit_type, resolved, false))
         }
         "IFCDERIVEDUNIT" => {
             // [0]=Elements (list of IFCDERIVEDUNITELEMENT), [1]=UnitType
@@ -192,7 +286,7 @@ fn resolve_unit_by_ref_depth(
             let mut scale = 1.0f64;
             for er in elem_refs {
                 if let Some((sym, unit_scale, exponent)) =
-                    resolve_derived_element(decoder, er, depth)
+                    resolve_derived_element(decoder, er, walk)
                 {
                     scale *= unit_scale.powi(exponent);
                     parts.push((sym, exponent));
@@ -202,7 +296,7 @@ fn resolve_unit_by_ref_depth(
             if symbol.is_empty() {
                 return None;
             }
-            Some((unit_type, ResolvedUnit::new(symbol, scale), false))
+            Some((unit_type, Some(ResolvedUnit::new(symbol, scale)), false))
         }
         "IFCMONETARYUNIT" => {
             // [0]=Currency (IfcLabel string in IFC4+, IfcCurrencyEnum in IFC2x3).
@@ -210,7 +304,7 @@ fn resolve_unit_by_ref_depth(
                 .get(0)
                 .and_then(|a| a.as_string().or_else(|| a.as_enum()))
                 .unwrap_or("");
-            Some((None, ResolvedUnit::new(currency_symbol(currency), 1.0), true))
+            Some((None, Some(ResolvedUnit::new(currency_symbol(currency), 1.0)), true))
         }
         _ => None,
     }
@@ -220,16 +314,26 @@ fn resolve_unit_by_ref_depth(
 fn resolve_derived_element(
     decoder: &mut EntityDecoder,
     elem_ref: u32,
-    depth: u32,
+    walk: &mut UnitWalk,
 ) -> Option<(String, f64, i32)> {
+    if !walk.charge() {
+        return None;
+    }
     let elem = decoder.decode_by_id(elem_ref).ok()?;
     if elem.ifc_type.as_str() != "IFCDERIVEDUNITELEMENT" {
         return None;
     }
     // [0]=Unit (IfcNamedUnit), [1]=Exponent
     let unit_ref = elem.get_ref(0)?;
-    let exponent = elem.get(1).and_then(|a| a.as_int()).unwrap_or(1) as i32;
-    let (_ut, resolved, _mon) = resolve_unit_by_ref_depth(decoder, unit_ref, depth + 1)?;
+    // The file's exponent is an `i64`; saturate into `i32` rather than
+    // truncate, so an out-of-range value cannot wrap to an unrelated small
+    // exponent (or, at exactly 2^31, to `i32::MIN`).
+    let exponent = elem
+        .get(1)
+        .and_then(|a| a.as_int())
+        .unwrap_or(1)
+        .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    let resolved = resolve_unit_by_ref_walk(decoder, unit_ref, walk)?.1?;
     Some((resolved.symbol, resolved.si_scale, exponent))
 }
 
@@ -240,7 +344,14 @@ fn resolve_derived_element(
 /// (a real-world chain, e.g. YARD defined as 3 FOOT where FOOT is itself
 /// conversion-based). Resolving through the shared dispatcher folds in every
 /// case uniformly instead of silently treating a non-SI component as scale 1.0.
-fn conversion_factor_scale(decoder: &mut EntityDecoder, measure_ref: u32, depth: u32) -> Option<f64> {
+fn conversion_factor_scale(
+    decoder: &mut EntityDecoder,
+    measure_ref: u32,
+    walk: &mut UnitWalk,
+) -> Option<f64> {
+    if !walk.charge() {
+        return None;
+    }
     let measure = decoder.decode_by_id(measure_ref).ok()?;
     if measure.ifc_type.as_str() != "IFCMEASUREWITHUNIT" {
         return None;
@@ -250,12 +361,9 @@ fn conversion_factor_scale(decoder: &mut EntityDecoder, measure_ref: u32, depth:
     if !(value.is_finite() && value > 0.0) {
         return None;
     }
-    let component_scale = measure
-        .get_ref(1)
-        .and_then(|r| resolve_unit_by_ref_depth(decoder, r, depth + 1))
-        .map(|(_, resolved, _)| resolved.si_scale)
-        .unwrap_or(1.0);
-    Some(value * component_scale)
+    // An unresolved UnitComponent leaves the factor unknown, not SI (#4690).
+    let component = resolve_unit_by_ref_walk(decoder, measure.get_ref(1)?, walk)?.1?;
+    Some(value * component.si_scale)
 }
 
 /// Normalise a STEP enum token (`.LENGTHUNIT.`) to a bare uppercase token.

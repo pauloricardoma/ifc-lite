@@ -171,7 +171,8 @@ fn a_touching_cutter_never_tears_the_host_open() {
     for case in CASES {
         let a = boxed(case.a_min, case.a_size);
         let b = boxed(case.b_min, case.b_size);
-        let out = clipper.subtract_mesh(&a, &b).expect("subtract must not error");
+        // A rejection leaves the host in place.
+        let out = clipper.subtract_mesh(&a, &b).into_mesh().unwrap_or_else(|| a.clone());
         match open_edges(&out) {
             Err(why) => failures.push(format!("{}: {why}", case.name)),
             Ok(0) => {}
@@ -201,7 +202,8 @@ fn a_touching_cutter_removes_no_volume() {
     for case in CASES {
         let a = boxed(case.a_min, case.a_size);
         let b = boxed(case.b_min, case.b_size);
-        let out = clipper.subtract_mesh(&a, &b).expect("subtract must not error");
+        // A rejection leaves the host in place.
+        let out = clipper.subtract_mesh(&a, &b).into_mesh().unwrap_or_else(|| a.clone());
         if !matches!(open_edges(&out), Ok(0)) {
             continue; // torn: reported by the topology test above, not here
         }

@@ -31,6 +31,12 @@
       "@ifc-lite/wasm/*": [
         "packages/wasm/pkg/*"
       ],
+      "@ifc-lite/wasm-lifecycle": [
+        "packages/wasm-lifecycle/dist/index.d.ts"
+      ],
+      "@ifc-lite/wasm-lifecycle/*": [
+        "packages/wasm-lifecycle/dist/*"
+      ],
       "@ifc-lite/geometry": [
         "packages/geometry/dist/index.d.ts"
       ],
@@ -73,6 +79,24 @@
       "@ifc-lite/encoding/*": [
         "packages/encoding/dist/*"
       ],
+      "@ifc-lite/regex-guard": [
+        "packages/regex-guard/dist/index.d.ts"
+      ],
+      "@ifc-lite/regex-guard/*": [
+        "packages/regex-guard/dist/*"
+      ],
+      "@ifc-lite/flow": [
+        "packages/flow/dist/index.d.ts"
+      ],
+      "@ifc-lite/flow/*": [
+        "packages/flow/dist/*"
+      ],
+      "@ifc-lite/flow-nodes": [
+        "packages/flow-nodes/dist/index.d.ts"
+      ],
+      "@ifc-lite/flow-nodes/*": [
+        "packages/flow-nodes/dist/*"
+      ],
       "@ifc-lite/ids": [
         "packages/ids/dist/index.d.ts"
       ],
@@ -84,6 +108,12 @@
       ],
       "@ifc-lite/lists/*": [
         "packages/lists/dist/*"
+      ],
+      "@ifc-lite/rules": [
+        "packages/rules/dist/index.d.ts"
+      ],
+      "@ifc-lite/rules/*": [
+        "packages/rules/dist/*"
       ],
       "@ifc-lite/sdk": [
         "packages/sdk/dist/index.d.ts"

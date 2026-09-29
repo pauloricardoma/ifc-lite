@@ -24,17 +24,17 @@ import {
   extractQuantitiesOnDemand,
   type IfcDataStore,
 } from '@ifc-lite/parser';
-import { lensMaterialNames } from '../lens-material-names.js';
+import { lensMaterialNames } from '@ifc-lite/rules';
 import type { FederatedModel } from '../../store/types.js';
 import type { CompareRef } from './buildFingerprints.js';
 import { isGeometricDataName } from './geometricData.js';
 import {
   meshBounds,
   placementMoveSummary,
-  renderToWorldShift,
   summarizeGeometryChange,
   type GeometrySummary,
 } from './geometrySummary.js';
+import { totalYupOffset } from '../geo/coordinate-frame.js';
 
 /** One changed/added/removed field between the A and B revisions. */
 export interface FieldDelta {
@@ -267,10 +267,10 @@ function geometrySummary(
   // to the NaN drop must land in the same absolute frame as a side that kept
   // it (#2659).
   const ba = a?.geometryResult
-    ? meshBounds(a.geometryResult.meshes, aRef.globalId, renderToWorldShift(a.geometryResult.coordinateInfo))
+    ? meshBounds(a.geometryResult.meshes, aRef.globalId, totalYupOffset(a.geometryResult.coordinateInfo))
     : null;
   const bb = b?.geometryResult
-    ? meshBounds(b.geometryResult.meshes, bRef.globalId, renderToWorldShift(b.geometryResult.coordinateInfo))
+    ? meshBounds(b.geometryResult.meshes, bRef.globalId, totalYupOffset(b.geometryResult.coordinateInfo))
     : null;
   // No boxes to compare. For a pair that is geometry-less on BOTH sides (the
   // summary checks `ref.meshed` — missing boxes alone also describe a
@@ -349,6 +349,20 @@ export function describeChange(
         });
       }
     }
+  }
+
+  // A spatial re-parenting (#5214) is its own change kind: the element moved to
+  // another storey, space or building with no attribute or geometry change.
+  // Without this row the panel rendered nothing for an entry the list badges
+  // as modified (#5309).
+  if (entry.changeKinds.includes('container')) {
+    data.push({
+      category: 'attribute',
+      name: 'Spatial container',
+      before: entry.base.container,
+      after: entry.head.container,
+      kind: 'changed',
+    });
   }
 
   const geometry = entry.changeKinds.includes('geometry')

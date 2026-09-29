@@ -3,8 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use super::*;
-use crate::services::data_model::{DataModel, Property, PropertySet};
-use arrow::array::Array;
+use crate::services::data_model::{DataModel, MaterialAssociation, Property, PropertySet};
+use arrow::array::{Array, BooleanArray, Float64Array};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 fn read_section(section: &[u8]) -> RecordBatch {
@@ -58,7 +58,7 @@ fn empty_data_model() -> DataModel {
 /// executes the new `serialize_*_table` paths that the extraction tests don't.
 #[test]
 fn serializes_and_reads_back_association_tables() {
-    let dm = DataModel {
+    let mut dm = DataModel {
         entities: vec![],
         property_sets: vec![],
         quantity_sets: vec![],
@@ -73,18 +73,36 @@ fn serializes_and_reads_back_association_tables() {
         materials: vec![
             MaterialAssociation {
                 element_id: 7,
+                association_id: 35,
+                definition_id: 34,
+                member_count: 2,
+                kind: "IfcMaterialLayerSet".into(),
+                member_name: Some("Core".into()),
+                material_category: Some("Mineral".into()),
+                fraction: Some(0.5),
                 set_name: Some("WallSet".into()),
                 layer_index: 0,
                 material_name: "Concrete".into(),
+                material_name_present: true,
+                material_id: Some(30),
                 thickness: Some(0.2),
                 is_ventilated: Some(false),
                 category: None,
             },
             MaterialAssociation {
                 element_id: 7,
+                association_id: 35,
+                definition_id: 34,
+                member_count: 2,
+                kind: "IfcMaterialLayerSet".into(),
+                member_name: None,
+                material_category: None,
+                fraction: None,
                 set_name: Some("WallSet".into()),
                 layer_index: 1,
                 material_name: "Insulation".into(),
+                material_name_present: true,
+                material_id: Some(31),
                 thickness: None,
                 is_ventilated: None,
                 category: Some("thermal".into()),
@@ -107,8 +125,32 @@ fn serializes_and_reads_back_association_tables() {
         },
     };
 
+    let mut absent_name = dm.materials[1].clone();
+    absent_name.element_id = 8;
+    absent_name.association_id = 36;
+    absent_name.definition_id = 37;
+    absent_name.member_count = 1;
+    absent_name.kind = "IfcMaterialList".into();
+    absent_name.layer_index = 0;
+    absent_name.material_name = String::new();
+    absent_name.material_name_present = false;
+    absent_name.material_id = Some(86);
+    dm.materials.push(absent_name.clone());
+    let mut authored_blank = absent_name;
+    authored_blank.element_id = 9;
+    authored_blank.association_id = 38;
+    authored_blank.definition_id = 39;
+    authored_blank.material_id = Some(87);
+    authored_blank.material_name_present = true;
+    dm.materials.push(authored_blank);
+
     let payload = serialize_data_model_to_parquet(&dm).expect("serialize");
     let sections = split_sections(&payload);
+    // Regenerate server-client's cross-language decoder fixture by running
+    // this test with IFCLITE_MATERIAL_TABLE_OUT=<fixture path>.
+    if let Ok(path) = std::env::var("IFCLITE_MATERIAL_TABLE_OUT") {
+        std::fs::write(path, &sections[6]).expect("write material table for decoder fixture");
+    }
     // entities, properties, quantities, relationships, spatial, classifications, materials, documents
     assert_eq!(sections.len(), 8, "expected 8 length-prefixed sections");
 
@@ -116,7 +158,24 @@ fn serializes_and_reads_back_association_tables() {
     assert_eq!(classifications.num_rows(), 1);
 
     let materials = read_section(&sections[6]);
-    assert_eq!(materials.num_rows(), 2);
+    assert_eq!(materials.num_rows(), 4);
+    let name_presence = materials.column_by_name("material_name_present").unwrap().as_any()
+        .downcast_ref::<BooleanArray>().unwrap();
+    assert!(name_presence.value(0));
+    assert!(!name_presence.value(2));
+    assert!(name_presence.value(3));
+    let kinds = materials.column_by_name("kind").unwrap().as_any()
+        .downcast_ref::<StringArray>().unwrap();
+    assert_eq!(kinds.value(0), "IfcMaterialLayerSet");
+    let association_ids = materials.column_by_name("association_id").unwrap().as_any()
+        .downcast_ref::<UInt32Array>().unwrap();
+    assert_eq!(association_ids.value(0), 35);
+    let member_counts = materials.column_by_name("member_count").unwrap().as_any()
+        .downcast_ref::<UInt32Array>().unwrap();
+    assert_eq!(member_counts.value(0), 2);
+    let material_ids = materials.column_by_name("material_id").unwrap().as_any()
+        .downcast_ref::<UInt32Array>().unwrap();
+    assert_eq!(material_ids.value(0), 30);
     // Nullable thickness column survives the roundtrip (row 0 = 0.2, row 1 = null).
     let thickness = materials
         .column_by_name("thickness")
@@ -148,6 +207,7 @@ fn serializes_and_reads_back_property_values_json() {
                     property_value: "R1, R2".into(),
                     property_type: "string".into(),
                     data_type: None,
+                    data_type_mixed: true,
                     values: Some(vec!["R1".into(), "R2".into()]),
                 },
                 Property {
@@ -155,6 +215,7 @@ fn serializes_and_reads_back_property_values_json() {
                     property_value: "REI 120".into(),
                     property_type: "string".into(),
                     data_type: Some("IFCLABEL".into()),
+                    data_type_mixed: false,
                     values: None,
                 },
             ],
@@ -190,10 +251,25 @@ fn serializes_and_reads_back_property_values_json() {
         .downcast_ref::<arrow::array::StringArray>()
         .unwrap();
 
+    // #5224: the table exemption from an IDS dataType check rides its own
+    // column, so the client never infers it from an absent data_type.
+    let mixed = properties
+        .column_by_name("data_type_mixed")
+        .expect("data_type_mixed column present")
+        .as_any()
+        .downcast_ref::<arrow::array::BooleanArray>()
+        .unwrap();
+
     for i in 0..properties.num_rows() {
         match names.value(i) {
-            "AcousticRating" => assert_eq!(values_json.value(i), r#"["R1","R2"]"#),
-            "FireRating" => assert!(values_json.is_null(i), "single value → null candidates"),
+            "AcousticRating" => {
+                assert_eq!(values_json.value(i), r#"["R1","R2"]"#);
+                assert!(mixed.value(i));
+            }
+            "FireRating" => {
+                assert!(values_json.is_null(i), "single value → null candidates");
+                assert!(!mixed.value(i));
+            }
             other => panic!("unexpected property {other}"),
         }
     }
@@ -209,6 +285,7 @@ fn relationship_columns_do_not_swap_relating_and_related() {
     let mut dm = empty_data_model();
     dm.relationships = vec![Relationship {
         rel_type: "IfcRelAggregates".into(),
+        rel_id: 30,
         relating_id: 10,
         related_id: 20,
     }];
@@ -240,6 +317,34 @@ fn relationship_columns_do_not_swap_relating_and_related() {
 
     assert_eq!(relating.value(0), 10, "relating_id must carry the relating entity");
     assert_eq!(related.value(0), 20, "related_id must carry the related entity");
+}
+
+/// The relationships table must ship the `IfcRel*` express id (issue #3860):
+/// the client's relationship graph and every Parquet/DuckDB export downstream
+/// read `RelId` from this column, and without it a server-loaded model exports
+/// `RelId = 0` on every row. The value (30) differs from both id columns, so
+/// neither a constant nor a copy of a neighbour passes.
+#[test]
+fn relationships_table_writes_the_ifcrel_express_id() {
+    let mut dm = empty_data_model();
+    dm.relationships = vec![Relationship {
+        rel_type: "IfcRelAggregates".into(),
+        rel_id: 30,
+        relating_id: 10,
+        related_id: 20,
+    }];
+
+    let payload = serialize_data_model_to_parquet(&dm).expect("serialize");
+    let sections = split_sections(&payload);
+    let batch = read_section(&sections[3]);
+
+    let rel_ids = batch
+        .column_by_name("rel_id")
+        .expect("rel_id column (data-model v6 payload)")
+        .as_any()
+        .downcast_ref::<arrow::array::UInt32Array>()
+        .expect("u32 column");
+    assert_eq!(rel_ids.value(0), 30, "rel_id must carry the IfcRel express id");
 }
 
 /// `has_geometry` is the only boolean the entities table carries, and no test

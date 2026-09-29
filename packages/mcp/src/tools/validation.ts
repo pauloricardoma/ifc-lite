@@ -13,9 +13,10 @@
 
 import { readFile } from 'node:fs/promises';
 import { parseIDS, validateIDS, createTranslationService, type IDSValidationReport, type IFCDataAccessor, type SupportedLocale } from '@ifc-lite/ids';
-import { IFC_ENTITY_NAMES } from '@ifc-lite/data';
+import { IFC_ENTITY_NAMES, iterateEffectiveEntities } from '@ifc-lite/data';
 import { getInheritanceChainAcrossSchemas } from '@ifc-lite/parser';
-import { foldedTypeCounts, pendingMutationsField, pendingOverlay } from '../overlay.js';
+import { foldedTypeCounts, pendingMutationsField, pendingOverlay, stepText } from '../overlay.js';
+import { effectiveSourceIds, pendingEntityMembership } from '../effective-entity-membership.js';
 import { isProductType } from '../backend-query.js';
 import { EntityNode } from '@ifc-lite/query';
 import type { Tool } from './types.js';
@@ -24,6 +25,7 @@ import { ToolErrorCode, ToolExecutionError } from '../errors.js';
 import { resolveSafePath } from '../safe-path.js';
 import type { ToolContext } from '../context.js';
 import { buildIdsAccessor } from './ids-accessor.js';
+import { buildDropCensusIssues, dropCensusJson } from './drop-census-issues.js';
 
 const idsValidate: Tool = {
   name: 'ids_validate',
@@ -44,7 +46,11 @@ const idsValidate: Tool = {
     const xml = await loadIdsXml(input, ctx);
 
     const idsDoc = parseIDS(xml);
-    const accessor = buildIdsAccessor(m.store) as IFCDataAccessor;
+    // `m.backend.getMutationView()` is null until the first `bim.mutate.*`
+    // call (built lazily, #4857's pattern); `buildIdsAccessor` passes
+    // `undefined` on to `createDataAccessor` for that same-shape null, which
+    // is the byte-identical no-visibility-view path (#5184).
+    const accessor = buildIdsAccessor(m.store, m.backend.getMutationView() ?? undefined) as IFCDataAccessor;
     const locale = (input.locale as SupportedLocale | undefined) ?? 'en';
     const report = await validateIDS(
       idsDoc,
@@ -216,28 +222,6 @@ const modelAudit: Tool = {
       list.push(id);
       seen.set(gid, list);
     };
-    for (const [type, ids] of m.store.entityIndex.byType) {
-      if (!getInheritanceChainAcrossSchemas(type).includes('IfcRoot')) continue;
-      for (const id of ids) {
-        if (overlay?.deleted.has(id)) continue;
-        addGid(new EntityNode(m.store, id).globalId, id);
-      }
-    }
-    // Queued entities are held to the same rule, chain check included — an agent
-    // creating a second entity under an existing GlobalId is exactly the mistake
-    // this check exists to catch, and it was invisible here.
-    for (const created of overlay?.created ?? []) {
-      if (!getInheritanceChainAcrossSchemas(created.ifcType).includes('IfcRoot')) continue;
-      addGid(created.globalId, created.expressId);
-    }
-    let duplicates = 0;
-    for (const [gid, ids] of seen) {
-      if (ids.length > 1) {
-        duplicates++;
-        issues.push({ severity: 'error', category: 'identity', rule: 'duplicate-globalid', message: `Duplicate GlobalId ${gid} on ${ids.length} entities` });
-      }
-    }
-
     // 3. Naming
     let unnamed = 0;
     let totalProducts = 0;
@@ -252,20 +236,44 @@ const modelAudit: Tool = {
     // geometry it had rather than on how well its products were named. This is
     // the same rule an untyped `query_entities` uses for "a product".
     const edits = overlay?.attributesByEntity();
-    for (const [type, ids] of m.store.entityIndex.byType) {
-      if (!isProductType(type)) continue;
-      for (const id of ids) {
-        if (overlay?.deleted.has(id)) continue;
-        // The store's stored-name fast path, with the overlay consulted only for
-        // the handful of entities that actually have a queued write. Routing
-        // every id through `bim.entity` reparsed attributes on demand for the
-        // whole model to serve a rename count.
-        countName(edits?.get(id)?.get('Name') ?? new EntityNode(m.store, id).name);
+    const classFlags = new Map<string, { root: boolean; product: boolean }>();
+    for (const { expressId, type, overlayCreated } of iterateEffectiveEntities(
+      m.store, pendingEntityMembership(overlay), undefined, effectiveSourceIds(m.store),
+    )) {
+      let flags = classFlags.get(type);
+      if (!flags) {
+        flags = { root: getInheritanceChainAcrossSchemas(type).includes('IfcRoot'), product: isProductType(type) };
+        classFlags.set(type, flags);
+      }
+      if (!flags.root && !flags.product) continue;
+
+      const created = overlayCreated ? overlay?.createdEntity(expressId) : null;
+      const edited = overlayCreated ? undefined : edits?.get(expressId);
+      const positional = overlayCreated ? undefined : overlay?.positionalAttributes(expressId);
+      let node: EntityNode | undefined;
+      const sourceNode = (): EntityNode => node ??= new EntityNode(m.store, expressId);
+
+      if (flags.root) {
+        const globalId = created ? created.globalId
+          : edited?.has('GlobalId') ? edited.get('GlobalId') ?? ''
+          : positional?.has(0) ? stepText(positional.get(0)) ?? ''
+          : sourceNode().globalId;
+        addGid(globalId, expressId);
+      }
+      if (flags.product) {
+        const name = created ? created.name ?? ''
+          : edited?.has('Name') ? edited.get('Name') ?? ''
+          : positional?.has(2) ? stepText(positional.get(2)) ?? ''
+          : sourceNode().name;
+        countName(name);
       }
     }
-    for (const created of overlay?.createdAll ?? []) {
-      if (!isProductType(created.ifcType)) continue;
-      countName(edits?.get(created.expressId)?.get('Name') ?? created.name ?? '');
+    let duplicates = 0;
+    for (const [gid, ids] of seen) {
+      if (ids.length > 1) {
+        duplicates++;
+        issues.push({ severity: 'error', category: 'identity', rule: 'duplicate-globalid', message: `Duplicate GlobalId ${gid} on ${ids.length} entities` });
+      }
     }
     if (unnamed > 0) {
       issues.push({
@@ -273,6 +281,14 @@ const modelAudit: Tool = {
         message: `${unnamed.toLocaleString()} of ${totalProducts.toLocaleString()} entities have no Name attribute.`,
       });
     }
+
+    // 4. Semantic drop census (#4208): classes the loader silently skipped.
+    // dropCensus is only absent for a store built by a path that doesn't
+    // compute one (e.g. a cache-restored store) — surface that explicitly
+    // rather than rendering it the same as "nothing was dropped". Issue
+    // construction lives in drop-census-issues.ts (module-size split).
+    const dropCensus = m.store.dropCensus;
+    issues.push(...buildDropCensusIssues(dropCensus));
 
     // Lighthouse-style category scores: % of entities that pass each category check.
     const scores = {
@@ -288,6 +304,7 @@ const modelAudit: Tool = {
         scores,
         issues,
         totals: { products: totalProducts, unnamed, duplicateGlobalIds: duplicates },
+        dropCensus: dropCensusJson(dropCensus),
         ...pendingMutationsField(overlay),
       },
     );

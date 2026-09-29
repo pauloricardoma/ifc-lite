@@ -6,8 +6,9 @@
  * Gather everything the to-scale 3D-view PDF export needs from the live viewer
  * — store state, renderer camera, viewport canvas — in one place (#2042).
  *
- * DEFECT CLASS — an export that draws a different model from the screen. Two
- * ways that happens, and both are folded here rather than at the call site:
+ * DEFECT CLASS — an export that draws a different model from the screen.
+ * Two ways that happens, and both are folded here rather than at the
+ * call site:
  *
  *  1. **The instanced half goes missing** (#2558). GPU-instanced occurrences
  *     never appear in `geometryResult.meshes`; the Cesium world view read that
@@ -33,6 +34,7 @@ import type { GeometryResult, MeshData } from '@ifc-lite/geometry';
 import { getGlobalCanvas, getGlobalRenderer } from '@/hooks/useBCF';
 import { selectModelMeshes } from '@/lib/type-view-visibility';
 import { computeIsolationFilterSet } from '@/store/basketVisibleSet';
+import { activeSectionPlane } from '@/store/section-active';
 import { withInstancedMeshes, type InstancedModelRange } from '@/utils/instancedExport';
 import type { useViewerStore } from '@/store';
 import type { ViewMeshInput } from './collect-view-meshes';
@@ -79,7 +81,7 @@ export function readViewPdfSource(state: ViewerState): ViewPdfSource {
     },
     camera,
     section: resolveSectionInput(state),
-    sectionEnabled: state.sectionPlane.enabled,
+    sectionEnabled: activeSectionPlane(state) !== null,
     canvasCssHeightPx: canvas ? canvas.clientHeight : null,
   };
 }
@@ -93,7 +95,10 @@ export function readViewPdfSource(state: ViewerState): ViewPdfSource {
  * library (#2058).
  */
 function gatherDrawnMeshes(state: ViewerState): MeshData[] {
-  const results: { geometry: GeometryResult; instancedModelRange: InstancedModelRange | null }[] = [];
+  const results: {
+    geometry: GeometryResult;
+    instancedModelRange: InstancedModelRange | null;
+  }[] = [];
 
   if (state.models.size > 0) {
     for (const model of state.models.values()) {
@@ -104,7 +109,7 @@ function gatherDrawnMeshes(state: ViewerState): MeshData[] {
       // entities into this one's drawn set (#2865/#2878 follow-up).
       results.push({
         geometry: model.geometryResult,
-        instancedModelRange: { idOffset: model.idOffset ?? 0, maxExpressId: model.maxExpressId ?? 0 },
+        instancedModelRange: { modelId: model.id, idOffset: model.idOffset ?? 0, maxExpressId: model.maxExpressId ?? 0 },
       });
     }
   } else if (state.geometryResult) {
@@ -164,8 +169,9 @@ export function readViewZoom(): ViewZoomSnapshot | null {
  * never shows.
  */
 function resolveSectionInput(state: ViewerState): ViewSectionResolveInput | null {
-  const sectionPlane = state.sectionPlane;
-  if (!sectionPlane.enabled) return null;
+  // Only the cut on screen: the sheet is the view (#4910).
+  const sectionPlane = activeSectionPlane(state);
+  if (!sectionPlane) return null;
 
   const sceneBounds = getGlobalRenderer()?.getCamera()?.getSceneBounds() ?? null;
   if (!sceneBounds) return null;

@@ -29,12 +29,16 @@ import {
   orthometricTargetForTerrain,
 } from '@/lib/geo/cesium-placement';
 import { egm96Undulation } from '@/lib/geo/egm96-undulation';
+import { holdCameraY, type ViewerHeightFrame } from '@/lib/geo/viewer-up-scale';
 import { getGlobalRenderer } from '@/hooks/useBCF';
 import { getCesiumModule } from './cesium-module';
+import type { CesiumViewerLifetime } from './cesium-viewer-lifetime';
 
 export interface UseCesiumBridgeParams {
   status: 'idle' | 'loading' | 'ready' | 'error';
   viewerRef: RefObject<InstanceType<typeof import('cesium').Viewer> | null>;
+  /** Synchronously retired before the Viewer owning async terrain work dies. */
+  viewerLifetimeRef: RefObject<CesiumViewerLifetime | null>;
   /** Written by this hook; read by the model, camera and solar hooks. */
   bridgeRef: RefObject<CesiumBridge | null>;
   /** The camera-side bridge, which diverges from the model's only while a
@@ -56,6 +60,7 @@ export interface UseCesiumBridgeResult {
 export function useCesiumBridge({
   status,
   viewerRef,
+  viewerLifetimeRef,
   bridgeRef,
   cameraBridgeRef,
   mapConversion,
@@ -78,7 +83,7 @@ export function useCesiumBridge({
   // entire viewer→ECEF frame translates with it; we offset the IFC viewer's
   // camera Y by the inverse so the user perceives the model moving instead
   // of the camera being dragged along.
-  const prevPlacementRef = useRef<number | null>(null);
+  const prevPlacementRef = useRef<ViewerHeightFrame | null>(null);
 
   // Tracks bridge readiness as state (not just a ref) so dependants re-run.
   const [bridgeVersion, setBridgeVersion] = useState(0);
@@ -111,7 +116,8 @@ export function useCesiumBridge({
     (async () => {
       const Cesium = getCesiumModule();
       const viewer = viewerRef.current;
-      if (!Cesium || !viewer) return;
+      const lifetime = viewerLifetimeRef.current;
+      if (!Cesium || !viewer || !lifetime?.isLive(viewer)) return;
 
       const cameraConversion = cameraMapConversion ?? mapConversion;
       const usesSeparateCameraBridge = cameraConversion !== mapConversion;
@@ -119,7 +125,7 @@ export function useCesiumBridge({
         cameraConversion, projectedCRS, coordinateInfo, lengthUnitScale,
         undefined, heightsAreEllipsoidal,
       );
-      if (cancelled) return;
+      if (cancelled || !lifetime.isLive(viewer)) return;
       if (!cameraTentative) {
         bridgeRef.current = null;
         cameraBridgeRef.current = null;
@@ -141,10 +147,14 @@ export function useCesiumBridge({
             preferOrthometricTerrain ? 'orthometric' : 'visual-surface',
           ].join(':'),
           preferOrthometric: preferOrthometricTerrain,
+          cancellation: {
+            isCancelled: () => cancelled || !lifetime.isLive(viewer),
+            onCancel: (stop) => lifetime.onRetire(stop),
+          },
         });
       }
       catch (err) { console.warn('[CesiumOverlay] terrain query failed:', err); }
-      if (cancelled) return;
+      if (cancelled || !lifetime.isLive(viewer)) return;
       const terrainH = terrainSample?.height ?? null;
       const modelTentative = usesSeparateCameraBridge
         ? await createCesiumBridge(
@@ -152,7 +162,7 @@ export function useCesiumBridge({
             undefined, heightsAreEllipsoidal,
           )
         : cameraTentative;
-      if (cancelled) return;
+      if (cancelled || !lifetime.isLive(viewer)) return;
       if (!modelTentative) {
         bridgeRef.current = null;
         return;
@@ -175,6 +185,7 @@ export function useCesiumBridge({
         ifcOriginHeight: modelTentative.modelOrigin.height,
         terrainHeight: terrainHForFrame,
         storeyElevations,
+        viewerUpScale: modelTentative.viewerUpScale,
       });
       const cameraPlacement = usesSeparateCameraBridge
         ? computeCesiumPlacement({
@@ -183,6 +194,7 @@ export function useCesiumBridge({
             ifcOriginHeight: cameraTentative.modelOrigin.height,
             terrainHeight: terrainHForFrame,
             storeyElevations,
+            viewerUpScale: cameraTentative.viewerUpScale,
           })
         : placement;
 
@@ -228,20 +240,23 @@ export function useCesiumBridge({
       // translates with the model and edits feel like the camera is
       // moving instead of the model — exactly what the user reported.
       const prevPlacement = prevPlacementRef.current;
+      // Hold the height through the frame's Scale x FactorZ and centre, which can change too (#4675).
+      const { placementHeight, modelCenterY } = placement;
+      const nextPlacement = { placementHeight, modelCenterY, viewerUpScale: bridge.viewerUpScale };
       if (!usesSeparateCameraBridge) {
-        prevPlacementRef.current = placement.placementHeight;
+        prevPlacementRef.current = nextPlacement;
       }
       if (!usesSeparateCameraBridge && prevPlacement !== null) {
-        const dh = placement.placementHeight - prevPlacement;
+        const dh = placement.placementHeight - prevPlacement.placementHeight;
         // 5 cm threshold — rejects float jitter from cached terrain reads
         // re-flowing through the same effect, while a real placement edit
         // is always far larger.
-        if (Math.abs(dh) > 0.05) {
+        if (Math.abs(dh) > 0.05 || prevPlacement.viewerUpScale !== nextPlacement.viewerUpScale) {
           const renderer = getGlobalRenderer();
           if (renderer) {
             const cam = renderer.getCamera();
             const pos = cam.getPosition();
-            cam.setPosition(pos.x, pos.y - dh, pos.z);
+            cam.setPosition(pos.x, holdCameraY(pos.y, prevPlacement, nextPlacement), pos.z);
           }
         }
       }
@@ -257,7 +272,8 @@ export function useCesiumBridge({
       setBridgeVersion((v) => v + 1);
     })();
 
-    return () => { cancelled = true; };
+    const stop = lifetimeRefStop(viewerLifetimeRef, () => { cancelled = true; });
+    return () => { cancelled = true; stop(); };
     // terrainEnabled and ionToken intentionally omitted — Effect 1 already
     // owns those (it destroys/recreates the viewer when they change), and
     // listing them here would cause a redundant bridge rebuild while the
@@ -280,4 +296,12 @@ export function useCesiumBridge({
   ]);
 
   return { bridgeVersion };
+}
+
+/** Subscribe without retaining a stale lifetime when a new viewer replaces it. */
+function lifetimeRefStop(
+  lifetimeRef: RefObject<CesiumViewerLifetime | null>,
+  stop: () => void,
+): () => void {
+  return lifetimeRef.current?.onRetire(stop) ?? (() => {});
 }

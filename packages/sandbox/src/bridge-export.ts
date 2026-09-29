@@ -47,14 +47,16 @@ export function buildExportNamespace(): NamespaceSchema {
       },
       {
         name: 'ifc',
-        doc: 'Export entities to IFC STEP text. Pass filename to auto-download a valid .ifc file',
-        args: ['entityRefs', 'dump'],
+        doc: 'Export entities to IFC STEP text. Omit `entities` for the whole model; an empty list is a filter that matched nothing and is refused. Pass filename to auto-download a valid .ifc file',
+        // `entityRefs?`, so an omitted `entities` stays `undefined` rather than
+        // becoming an empty list, which `export.ifc` refuses (#4738).
+        args: ['entityRefs?', 'dump'],
         paramNames: ['entities', 'options'],
-        tsParamTypes: [undefined, '{ schema?: "IFC2X3" | "IFC4" | "IFC4X3"; filename?: string; includeMutations?: boolean; visibleOnly?: boolean }'],
+        tsParamTypes: ['BimEntity[] | undefined', '{ schema?: "IFC2X3" | "IFC4" | "IFC4X3"; filename?: string; includeMutations?: boolean; visibleOnly?: boolean } | undefined'],
         tsReturn: 'string | Uint8Array',
         call: (sdk, args) => {
           return sdk.export.ifc(
-            args[0] as EntityRef[],
+            args[0] as EntityRef[] | undefined,
             args[1] as {
               schema?: 'IFC2X3' | 'IFC4' | 'IFC4X3';
               filename?: string;

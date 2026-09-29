@@ -14,7 +14,22 @@
 
 use ifc_lite_core::EntityDecoder;
 
-use super::{MergedModel, UnitReconciliation};
+use super::MergedModel;
+
+/// How to reconcile models whose length unit differs from the first model's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum UnitReconciliation {
+    /// Federate an incompatible-unit model as its own `IfcProject` (JS default).
+    #[default]
+    Auto,
+    /// Request rescaling into the first model's unit. Not performed natively in
+    /// this iteration: an incompatible model is federated and
+    /// [`super::MergedStats::unit_rescale_required`] is set for the caller to gate.
+    Normalize,
+    /// Treat every model as sharing the first model's unit (no compatibility
+    /// check) — unify regardless of the declared length unit.
+    AssumeShared,
+}
 
 /// Relative tolerance for comparing two length unit scale factors (JS `1e-6`).
 const UNIT_SCALE_TOLERANCE: f64 = 1e-6;
@@ -98,6 +113,12 @@ pub fn resolve_length_scale(content: &[u8]) -> f64 {
     } else {
         1.0
     }
+}
+
+/// The unit every compatible model merges into: the first model's. One home for
+/// the emit loop and the drop plan.
+pub(super) fn primary_scale(models: &[super::MergedModel]) -> f64 {
+    models.first().map_or(1.0, |m| resolve_length_scale(m.content))
 }
 
 /// True when two length scales are equal within [`UNIT_SCALE_TOLERANCE`] (JS

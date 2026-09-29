@@ -181,13 +181,9 @@ describe('createStreamingViewerAdapter', () => {
     assert.deepEqual(received[0], { action: 'showall' });
   });
 
-  it('resetColors with an EMPTY array also sends the global showall', TO, async () => {
-    // Boundary: [] is falsy-adjacent but truthy in JS. Treating it as a
-    // scoped reset would send `resetColorEntities` with an empty id list —
-    // a no-op, so the viewer would keep every colour override.
+  it('resetColors with an EMPTY array sends nothing', TO, async () => {
     createStreamingViewerAdapter(port).resetColors([]);
-    await waitFor(1);
-    assert.deepEqual(received[0], { action: 'showall' });
+    await expectNoMore(0);
   });
 
   it('setSection(null) sends clearSection, not a section with a null payload', TO, async () => {
@@ -343,11 +339,10 @@ describe('createStreamingViewerAdapter (stubbed fetch)', () => {
     assert.deepEqual(calls[0].body, { action: 'showall' });
   });
 
-  it('resetColors with an empty refs array sends showall, not resetColorEntities', () => {
+  it('resetColors with an empty refs array sends nothing', () => {
     const adapter = createStreamingViewerAdapter(4321);
     adapter.resetColors([]);
-    assert.equal(calls.length, 1);
-    assert.deepEqual(calls[0].body, { action: 'showall' });
+    assert.equal(calls.length, 0);
   });
 
   it('flyTo posts flyto with mapped ids', () => {

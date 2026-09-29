@@ -48,6 +48,20 @@ test('resetColors() with no argument still clears everything (regression guard)'
   assert.equal(pending?.size, 0, 'resetColors() with no refs must clear ALL overrides');
 });
 
+test('resetColors([]) is a no-op that preserves every override (#4789)', () => {
+  const { store, getPending } = makeStore();
+  const adapter = createViewerAdapter(store);
+
+  adapter.colorize([refA], red);
+  adapter.colorize([refB], blue);
+  adapter.resetColors([]);
+
+  const pending = getPending();
+  assert.equal(pending?.size, 2);
+  assert.deepEqual(pending?.get(1), red);
+  assert.deepEqual(pending?.get(2), blue);
+});
+
 test('resetColors([a]) clears only a and leaves b intact', () => {
   const { store, getPending } = makeStore();
   const adapter = createViewerAdapter(store);

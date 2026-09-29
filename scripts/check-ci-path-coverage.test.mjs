@@ -331,6 +331,23 @@ test('gatingFilters reads positive terms only', () => {
   assert.equal(gatingFilters('    runs-on: x'), null);
 });
 
+test('gatingFilters: the no-op `edited` probe output is not a path filter', () => {
+  // `rust-semver` has no path filter and is gated on the probe alone; reading
+  // `noop` as a filter term would turn "runs on every path" into "reaches no
+  // path" (an empty glob set) and flag every input of check-rust-semver.mjs.
+  assert.equal(gatingFilters("    if: needs.changes.outputs.noop != 'true'"), null);
+  assert.deepEqual(
+    gatingFilters("    if: needs.changes.outputs.noop != 'true' && needs.changes.outputs.plato == 'true'"),
+    ['plato'],
+    'a real filter beside the probe term still gates the job',
+  );
+  assert.deepEqual(
+    gatingFilters("    if: needs.changes.outputs.noop == 'true'"),
+    null,
+    'the probe term never counts as a positive filter either',
+  );
+});
+
 test('parseWorkflowPrPaths distinguishes no-paths from a paths list', () => {
   assert.deepEqual(
     parseWorkflowPrPaths("on:\n  pull_request:\n    branches: [main]\n    paths:\n      - 'a/**'\n"),
@@ -383,25 +400,60 @@ test('the real repository has no gate input outside its trigger', () => {
 });
 
 /**
- * A mirror of the real repo whose `.github/` is a real copy and whose other
- * top-level entries are symlinks, so a mutation of `test.yml` costs a few
- * kilobytes instead of a full tree copy. The check resolves symlinked
+ * A mirror whose `.github/` is copied and whose tracked `tests/` files are
+ * materialized into private directories. Other top-level entries are links,
+ * avoiding a full source or fetched-corpus copy. The check resolves symlinked
  * directories through `statSync`, so the walk sees the real files.
  */
-function mirrorRepo() {
+function mirrorRepo(source = REPO) {
   const root = mkdtempSync(join(tmpdir(), 'ci-path-coverage-mirror-'));
-  for (const entry of readdirSync(REPO)) {
+  for (const entry of readdirSync(source)) {
     if (entry === '.git' || entry === 'node_modules') continue;
-    // `.github` is copied because the hole tests mutate test.yml. `tests` is
-    // copied because the fixture-cache test plants a fetched `.ifc` under
-    // `tests/models`, and writing through a symlink would land it in the real
-    // tree. Both are small; everything else stays a symlink.
-    if (entry === '.github' || entry === 'tests') {
-      cpSync(join(REPO, entry), join(root, entry), { recursive: true });
-    } else symlinkSync(join(REPO, entry), join(root, entry));
+    if (entry === 'tests') {
+      // Copy tracked test inputs into fresh directories. A fetched corpus may
+      // be symlinked at any depth; copying those links lets dummy writes escape.
+      const files = execFileSync('git', ['ls-files', '-z', '--', 'tests'], {
+        cwd: source, encoding: 'utf8',
+      }).split('\0').filter(Boolean);
+      for (const file of files) {
+        const target = join(root, file);
+        mkdirSync(dirname(target), { recursive: true });
+        writeFileSync(target, readFileSync(join(source, file)));
+      }
+    } else if (entry === '.github') {
+      cpSync(join(source, entry), join(root, entry), { recursive: true });
+    } else symlinkSync(join(source, entry), join(root, entry));
   }
   return root;
 }
+
+test('mirror dummy writes preserve external corpus bytes through directory and file links (#4026)', () => {
+  const source = mkdtempSync(join(tmpdir(), 'ci-path-linked-source-'));
+  const external = mkdtempSync(join(tmpdir(), 'ci-path-external-models-'));
+  let mirror;
+  try {
+    mkdirSync(join(source, 'tests/models'), { recursive: true });
+    writeFileSync(join(source, 'tests/models/manifest.json'), '{}\n');
+    execFileSync('git', ['init', '-q', source]);
+    execFileSync('git', ['-C', source, 'add', 'tests/models/manifest.json']);
+    writeFileSync(join(external, 'duplex.ifc'), 'external duplex canary');
+    writeFileSync(join(external, 'AB22.ifc'), 'external AB22 canary');
+    symlinkSync(external, join(source, 'tests/models/ara3d'));
+    symlinkSync(join(external, 'AB22.ifc'), join(source, 'tests/models/AB22.ifc'));
+    mirror = mirrorRepo(source);
+    mkdirSync(join(mirror, 'tests/models/ara3d'), { recursive: true });
+    writeFileSync(join(mirror, 'tests/models/ara3d/duplex.ifc'), 'dummy');
+    writeFileSync(join(mirror, 'tests/models/AB22.ifc'), 'dummy');
+    assert.equal(readFileSync(join(external, 'duplex.ifc'), 'utf8'), 'external duplex canary');
+    assert.equal(readFileSync(join(external, 'AB22.ifc'), 'utf8'), 'external AB22 canary');
+    assert.equal(readFileSync(join(mirror, 'tests/models/manifest.json'), 'utf8'), '{}\n');
+    assert.equal(readFileSync(join(mirror, 'tests/models/AB22.ifc'), 'utf8'), 'dummy');
+  } finally {
+    if (mirror) rmSync(mirror, { recursive: true, force: true });
+    rmSync(source, { recursive: true, force: true });
+    rmSync(external, { recursive: true, force: true });
+  }
+});
 
 /** Delete one `- '<glob>'` line from the mirror's filter block. */
 function dropFilterEntry(root, glob) {
@@ -494,6 +546,10 @@ test('the real ignore file is translatable -- the exclusion cannot go silently e
   assert.ok(matchesAny('node_modules', globs));
   assert.ok(matchesAny('packages/cli/dist/loader.js', globs));
   assert.ok(matchesAny('tests/models/ara3d/duplex.ifc', globs));
+  assert.ok(
+    matchesAny('tests/models/landxml/producers/alignment.xml', globs),
+    'add or update the tests/models/**/*.xml rule in .gitignore',
+  );
   // And the committed inputs under the same roots must SURVIVE it.
   assert.equal(matchesAny('tests/models/manifest.json', globs), false);
   assert.equal(matchesAny('packages/data/src/step-serializers.ts', globs), false);
@@ -521,9 +577,9 @@ test('an installed node_modules does not change the verdict -- the live #3314 CI
   rmSync(root, { recursive: true, force: true });
 });
 
-test('a warmed fixture cache does not change the verdict either', () => {
+test('a warmed IFC and LandXML fixture cache does not change the verdict either', () => {
   // `tests/models` holds two COMMITTED files and, after the fixture step runs,
-  // several hundred fetched `.ifc` files that git ignores. The walk is asked
+  // several hundred fetched model files that git ignores. The walk is asked
   // about the directory (which is a real input -- `manifest.json` lives there),
   // so the exclusion has to hold on the walk's CHILDREN, not only on the node
   // it was asked about.
@@ -534,6 +590,11 @@ test('a warmed fixture cache does not change the verdict either', () => {
   mkdirSync(join(root, 'tests/models/ara3d'), { recursive: true });
   writeFileSync(join(root, 'tests/models/ara3d/duplex.ifc'), 'ISO-10303-21;\n');
   writeFileSync(join(root, 'tests/models/AB22.ifc'), 'ISO-10303-21;\n');
+  mkdirSync(join(root, 'tests/models/landxml/producers'), { recursive: true });
+  writeFileSync(
+    join(root, 'tests/models/landxml/producers/alignment.xml'),
+    '<LandXML version="1.2"/>\n',
+  );
   const after = run(root);
 
   assert.equal(after.status, before.status, after.out);

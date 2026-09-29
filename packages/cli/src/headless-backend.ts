@@ -2,13 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-/**
- * HeadlessBackend — BimBackend implementation for CLI (no renderer).
- *
- * Wraps an IfcDataStore parsed from an IFC file and exposes it through
- * the standard BimBackend interface. Viewer-specific operations (colorize,
- * flyTo, etc.) are no-ops.
- */
+/** Headless `BimBackend` implementation for the CLI (no renderer). */
 
 import type {
   BimBackend,
@@ -27,6 +21,8 @@ import type {
   LensBackendMethods,
   FilesBackendMethods,
   ScheduleBackendMethods,
+  StructuralBackendMethods,
+  CostBackendMethods,
   EntityRef,
   EntityData,
   EntityAttributeData,
@@ -40,9 +36,11 @@ import type {
   QueryDescriptor,
   ModelInfo,
 } from '@ifc-lite/sdk';
-import { createHeadlessMutateAdapter } from '@ifc-lite/sdk';
+import { createCostBackend, createEffectiveEntityCheck, createHeadlessMutateAdapter, resolveLiveOwnerHistoryId } from '@ifc-lite/sdk';
+import { createStoreAuthoring } from './headless-backend-store-authoring.js';
 import type { IfcDataStore } from '@ifc-lite/parser';
-import { MutablePropertyView, StoreEditor } from '@ifc-lite/mutations';
+import { MutablePropertyView, StoreEditor, storeHasSourceEntity } from '@ifc-lite/mutations';
+import type { TableAccess } from '@ifc-lite/flow-nodes';
 import {
   addBeamToStore,
   addColumnToStore,
@@ -70,7 +68,7 @@ import {
   listStoreys,
   type GenerateSpacesAllOptions,
 } from '@ifc-lite/create';
-import { EntityNode, findPropertyInSets, findQuantityInSets, normalizeBooleanValue } from '@ifc-lite/query';
+import { EntityNode, findPropertyInSets, findQuantityInSets, normalizeBooleanValue, matchesPropertyFilter } from '@ifc-lite/query';
 
 import {
   extractAllEntityAttributes,
@@ -81,16 +79,18 @@ import {
   extractTypePropertiesOnDemand,
   extractDocumentsOnDemand,
   extractRelationshipsOnDemand,
+  extractExactRelatedIds,
   expandTypes,
   QUERY_REL_TYPE_MAP,
-  extractScheduleOnDemand,
   isQueryableObjectType,
 } from '@ifc-lite/parser';
 import { escapeCsvCell, exportToStep, StepExporter, type StepExportOptions } from '@ifc-lite/export';
+import { createStructuralAdapter } from './headless-backend-structural.js';
+import { createScheduleAdapter } from './headless-backend-schedule.js';
 import { exportHbjson, exportDfjson } from './energy-export.js';
-import { foldQueuedRelated } from './query-overlay-relations.js';
-import { overlayEntityData, overlayProperties, overlayQuantities, foldNewEntities } from './query-overlay.js';
-import { matchesPropertyFilter } from './property-filter-match.js';
+import { foldQueuedRelated, foldQueuedRelationshipData, supersededRelationshipIds } from './query-overlay-relations.js';
+import { applyParsedEntityOverrides, overlayEntityData, overlayProperties, overlayQuantities } from './query-overlay.js';
+import { iterateEffectiveEntityIds } from '@ifc-lite/mutations';
 
 // `expandTypes` used to be defined here; it now comes from `@ifc-lite/parser`,
 // shared with the other query backends (see `query-backend-maps.ts`). Re-exported
@@ -157,17 +157,25 @@ export class HeadlessBackend implements BimBackend {
   readonly lens: LensBackendMethods;
   readonly files: FilesBackendMethods;
   readonly schedule: ScheduleBackendMethods;
+  readonly structural: StructuralBackendMethods;
+  readonly cost: CostBackendMethods;
   readonly spaces: SpacesBackendMethods;
   readonly style: StyleBackendMethods;
 
   private dataStore: IfcDataStore;
   private modelName: string;
+  /** Every spelling of the one model this backend answers for, written once:
+   *  the schedule assert, the `bim.mutate.*` guard and the `bim.store.add*`
+   *  ref-minting sites all have to give the SAME answer, or a ref is minted
+   *  under an id the very next write refuses (#3764). */
+  private readonly acceptedModelIds: readonly string[];
   private mutationView: MutablePropertyView | null = null;
   private storeEditor: StoreEditor | null = null;
 
   constructor(store: IfcDataStore, modelName: string) {
     this.dataStore = store;
     this.modelName = modelName;
+    this.acceptedModelIds = modelName === MODEL_ID ? [MODEL_ID] : [MODEL_ID, modelName];
     this.model = this.createModelAdapter();
     this.query = this.createQueryAdapter();
     this.selection = this.createSelectionAdapter();
@@ -179,9 +187,35 @@ export class HeadlessBackend implements BimBackend {
     this.export = this.createExportAdapter();
     this.lens = this.createLensAdapter();
     this.files = this.createFilesAdapter();
-    this.schedule = this.createScheduleAdapter();
+    this.schedule = createScheduleAdapter(this.dataStore, modelId => this.assertKnownModelId(modelId));
+    this.structural = createStructuralAdapter(this.dataStore, modelId => this.assertKnownModelId(modelId));
+    this.cost = createCostBackend(modelId => {
+      if (modelId) this.assertKnownModelId(modelId);
+      // Lazily created overlay (#4857): a `bim.store.addCost*` authored
+      // entity, or any pending edit, is only visible to `bim.cost` once this
+      // is non-null, and it stays null until the first mutating call.
+      return { modelId: MODEL_ID, store: this.dataStore, mutationView: this.mutationView ?? undefined };
+    });
     this.spaces = this.createSpacesAdapter();
     this.style = this.createStyleAdapter();
+  }
+
+  /** Whether `modelId` names the one model this backend holds. */
+  private acceptsModelId(modelId: string): boolean {
+    return this.acceptedModelIds.includes(modelId);
+  }
+
+  /** The accepted spellings as an error-message clause: `'default' or 'a.ifc'`. */
+  private acceptedModelIdList(): string {
+    return this.acceptedModelIds.map(id => `'${id}'`).join(' or ');
+  }
+
+  /** Refuse an unknown model id loudly, at whichever surface was handed it. */
+  private assertKnownModelId(modelId: string): void {
+    if (this.acceptsModelId(modelId)) return;
+    throw new Error(
+      `Unknown modelId '${modelId}': this backend answers for ${this.acceptedModelIdList()}`,
+    );
   }
 
   private createStyleAdapter(): StyleBackendMethods {
@@ -204,11 +238,15 @@ export class HeadlessBackend implements BimBackend {
 
   private createSpacesAdapter(): SpacesBackendMethods {
     return {
-      listStoreys: () => listStoreys(this.dataStore),
+      // The session's edited model (#5249): deleted walls/storeys out, spaces
+      // and storeys created earlier in the session in.
+      listStoreys: () => listStoreys(this.dataStore, this.mutationView ?? undefined),
       // Spaces are written via the shared StoreEditor/MutablePropertyView, so
       // they're picked up by this backend's export adapter (StepExporter).
-      generate: (options?: GenerateSpacesAllOptions) =>
-        generateSpaces(this.getOrCreateStoreEditor(), this.dataStore, options),
+      generate: (options?: GenerateSpacesAllOptions) => {
+        const editor = this.getOrCreateStoreEditor();
+        return generateSpaces(editor, this.dataStore, options, editor.getMutationView());
+      },
     };
   }
 
@@ -242,20 +280,21 @@ export class HeadlessBackend implements BimBackend {
     const getMutationView = () => this.mutationView;
 
     function getEntityData(ref: EntityRef): EntityData | null {
-      const overlay = overlayEntityData(getMutationView(), ref);
+      const overlay = overlayEntityData(getMutationView(), ref, store.schemaVersion);
       if (overlay !== undefined) return overlay;
+      // @raw-entity-enumeration-ok overlayEntityData already handles deleted and created ids; this is source membership for one remaining ref
       if (!store.entityIndex.byId.has(ref.expressId)) return null; // not parsed either
       const node = new EntityNode(store, ref.expressId);
       const type = node.type;
       if (!type || type === 'Unknown') return null;
-      return {
+      return applyParsedEntityOverrides(getMutationView(), ref.expressId, type, store.schemaVersion, {
         ref,
         globalId: node.globalId,
         name: node.name,
         type,
         description: node.description,
         objectType: node.objectType,
-      };
+      });
     }
 
     function getProperties(ref: EntityRef): PropertySetData[] {
@@ -292,36 +331,26 @@ export class HeadlessBackend implements BimBackend {
         const results: EntityData[] = [];
         const view = getMutationView();
 
-        let entityIds: number[];
-        if (descriptor.types && descriptor.types.length > 0) {
-          entityIds = [];
-          for (const type of expandTypes(descriptor.types)) {
-            const typeIds = store.entityIndex.byType.get(type) ?? [];
-            for (const id of typeIds) entityIds.push(id);
+        const types = descriptor.types && descriptor.types.length > 0
+          ? expandTypes(descriptor.types, store.schemaVersion) : undefined;
+        for (const { expressId, type, overlayCreated } of iterateEffectiveEntityIds(store, view, types)) {
+          if (!types && !isProductType(type)) continue;
+          const ref = { modelId: MODEL_ID, expressId };
+          if (overlayCreated) {
+            const created = overlayEntityData(view, ref, store.schemaVersion);
+            if (created) results.push(created);
+            continue;
           }
-        } else {
-          entityIds = [];
-          for (const [typeName, ids] of store.entityIndex.byType) {
-            if (isProductType(typeName)) {
-              for (const id of ids) entityIds.push(id);
-            }
-          }
-        }
-
-        for (const expressId of entityIds) {
-          if (expressId === 0) continue;
-          if (view?.isDeleted(expressId)) continue; // tombstoned this session
           const node = new EntityNode(store, expressId);
           results.push({
-            ref: { modelId: MODEL_ID, expressId },
+            ref,
             globalId: node.globalId,
             name: node.name,
-            type: node.type,
+            type: view?.getEntityTypeMutation(expressId)?.newType ?? node.type,
             description: node.description,
             objectType: node.objectType,
           });
         }
-        if (view) results.push(...foldNewEntities(view, descriptor.types, expandTypes, isProductType, MODEL_ID));
         let filtered = results;
         if (descriptor.filters && descriptor.filters.length > 0) {
           const propsCache = new Map<number, PropertySetData[]>();
@@ -333,11 +362,25 @@ export class HeadlessBackend implements BimBackend {
             }
             return cached;
           };
+          // A `Qto_` filter (or any psetName with no matching property set)
+          // falls back to quantity sets — see `matchesPropertyFilter` in
+          // `@ifc-lite/query`'s `property-filter-match.ts`. Cached the same
+          // way as `propsCache`; only populated on the fallback path since
+          // most filters resolve from properties alone.
+          const qsetsCache = new Map<number, QuantitySetData[]>();
+          const getCachedQuantities = (ref: EntityRef): QuantitySetData[] => {
+            let cached = qsetsCache.get(ref.expressId);
+            if (!cached) {
+              cached = getQuantities(ref);
+              qsetsCache.set(ref.expressId, cached);
+            }
+            return cached;
+          };
 
           for (const filter of descriptor.filters) {
             filtered = filtered.filter(entity => {
               const props = getCachedProps(entity.ref);
-              return matchesPropertyFilter(props, filter);
+              return matchesPropertyFilter(props, filter, getCachedQuantities(entity.ref));
             });
           }
         }
@@ -403,7 +446,10 @@ export class HeadlessBackend implements BimBackend {
         return extractDocumentsOnDemand(store, ref.expressId);
       },
       relationships(ref: EntityRef): EntityRelationshipsData {
-        return extractRelationshipsOnDemand(store, ref.expressId);
+        const result = extractRelationshipsOnDemand(store, ref.expressId);
+        const view = getMutationView();
+        if (!view) return result;
+        return foldQueuedRelationshipData(store, view, result, ref, getEntityData);
       },
       // Folds queued `IfcRel…` creates in (query-overlay-relations.ts, mirrors #2014).
       related(ref: EntityRef, relType: string, direction: 'forward' | 'inverse'): EntityRef[] {
@@ -411,7 +457,6 @@ export class HeadlessBackend implements BimBackend {
         if (relEnum === undefined) return [];
         const view = getMutationView();
         if (view?.isDeleted(ref.expressId)) return []; // deleted relates to nothing
-        const half = direction === 'forward' ? store.relationships.forward : store.relationships.inverse;
         const out: number[] = [];
         const seen = new Set<number>();
         const take = (id: number): void => {
@@ -419,10 +464,10 @@ export class HeadlessBackend implements BimBackend {
           seen.add(id);
           out.push(id);
         };
-        for (const edge of half.getEdges(ref.expressId, relEnum)) {
-          if (!view?.isDeleted(edge.relationshipId)) take(edge.target);
-        }
-        if (view) for (const t of foldQueuedRelated(view.getNewEntities(), (id) => view.isDeleted(id), relType, direction, ref.expressId)) take(t);
+        const superseded = view ? supersededRelationshipIds(store, view) : new Set<number>();
+        const isDeleted = view ? (id: number) => view.isDeleted(id) || superseded.has(id) : () => false;
+        for (const id of extractExactRelatedIds(store, ref.expressId, relType, direction, isDeleted)) take(id);
+        if (view) for (const t of foldQueuedRelated(store, view, relType, direction, ref.expressId)) take(t);
         return out.map((expressId: number) => ({ modelId: ref.modelId, expressId }));
       },
     };
@@ -459,7 +504,15 @@ export class HeadlessBackend implements BimBackend {
   }
 
   private createMutateAdapter(): MutateBackendMethods {
-    return createHeadlessMutateAdapter(() => this.getOrCreateMutationView());
+    return createHeadlessMutateAdapter(
+      () => this.getOrCreateMutationView(),
+      createEffectiveEntityCheck({
+        acceptedModelIds: this.acceptedModelIds,
+        // Both halves of the source index (byId + deferred property atoms, #5222).
+        hasSourceEntity: id => storeHasSourceEntity(this.dataStore, id),
+        overlay: () => this.mutationView,
+      }),
+    );
   }
 
   /**
@@ -470,6 +523,16 @@ export class HeadlessBackend implements BimBackend {
     this.getOrCreateStoreEditor();
     // Non-null immediately after: both fields are assigned together and never cleared.
     return this.mutationView as MutablePropertyView;
+  }
+
+  /**
+   * The bulk entity-table access `table.joinByKey` needs to reuse
+   * `@ifc-lite/mutations`' `csv-match.ts` tag/property index (#5167, #5230)
+   * rather than re-implement it. Same lazily-created overlay as `bim.cost`.
+   */
+  tableAccess(modelId?: string): TableAccess {
+    if (modelId) this.assertKnownModelId(modelId);
+    return { entities: this.dataStore.entities, mutationView: this.getOrCreateMutationView(), strings: this.dataStore.strings ?? null };
   }
 
   private getOrCreateStoreEditor(): StoreEditor {
@@ -491,8 +554,15 @@ export class HeadlessBackend implements BimBackend {
   private createStoreAdapter(): StoreBackendMethods {
     const get = () => this.getOrCreateStoreEditor();
     const dataStore = () => this.dataStore;
+    const mutationView = () => this.getOrCreateMutationView();
+    // Every `add*` mints an `EntityRef` carrying the model id it was called
+    // with, and `bim.mutate.*` refuses one this backend does not answer for.
+    // Checking here, before the entity exists, is what keeps the two from
+    // disagreeing: no ref is handed back that the next call rejects.
+    const assertModel = (modelId: string) => this.assertKnownModelId(modelId);
     return {
       addEntity(modelId: string, def: { type: string; attributes: unknown[] }): EntityRef {
+        assertModel(modelId);
         const ref = get().addEntity(def.type, def.attributes as Parameters<StoreEditor['addEntity']>[1]);
         return { modelId, expressId: ref.expressId };
       },
@@ -503,65 +573,85 @@ export class HeadlessBackend implements BimBackend {
         get().setPositionalAttribute(ref.expressId, index, value as Parameters<StoreEditor['setPositionalAttribute']>[2]);
       },
       addColumn(modelId: string, storeyExpressId: number, params: ColumnInStoreParams): EntityRef {
+        assertModel(modelId);
         const editor = get();
-        const anchor = resolveSpatialAnchor(dataStore(), storeyExpressId);
+        const anchor = resolveSpatialAnchor(dataStore(), storeyExpressId, mutationView());
         const result = addColumnToStore(editor, anchor, params);
         return { modelId, expressId: result.columnId };
       },
       addWall(modelId: string, storeyExpressId: number, params: WallInStoreParams): EntityRef {
+        assertModel(modelId);
         const editor = get();
-        const anchor = resolveSpatialAnchor(dataStore(), storeyExpressId);
+        const anchor = resolveSpatialAnchor(dataStore(), storeyExpressId, mutationView());
         const result = addWallToStore(editor, anchor, params);
         return { modelId, expressId: result.wallId };
       },
       addSlab(modelId: string, storeyExpressId: number, params: SlabInStoreParams): EntityRef {
+        assertModel(modelId);
         const editor = get();
-        const anchor = resolveSpatialAnchor(dataStore(), storeyExpressId);
+        const anchor = resolveSpatialAnchor(dataStore(), storeyExpressId, mutationView());
         const result = addSlabToStore(editor, anchor, params);
         return { modelId, expressId: result.slabId };
       },
       addBeam(modelId: string, storeyExpressId: number, params: BeamInStoreParams): EntityRef {
+        assertModel(modelId);
         const editor = get();
-        const anchor = resolveSpatialAnchor(dataStore(), storeyExpressId);
+        const anchor = resolveSpatialAnchor(dataStore(), storeyExpressId, mutationView());
         const result = addBeamToStore(editor, anchor, params);
         return { modelId, expressId: result.beamId };
       },
       addDoor(modelId: string, storeyExpressId: number, params: DoorInStoreParams): EntityRef {
+        assertModel(modelId);
         const editor = get();
-        const anchor = resolveSpatialAnchor(dataStore(), storeyExpressId);
+        const anchor = resolveSpatialAnchor(dataStore(), storeyExpressId, mutationView());
         const result = addDoorToStore(editor, anchor, params);
         return { modelId, expressId: result.doorId };
       },
       addWindow(modelId: string, storeyExpressId: number, params: WindowInStoreParams): EntityRef {
+        assertModel(modelId);
         const editor = get();
-        const anchor = resolveSpatialAnchor(dataStore(), storeyExpressId);
+        const anchor = resolveSpatialAnchor(dataStore(), storeyExpressId, mutationView());
         const result = addWindowToStore(editor, anchor, params);
         return { modelId, expressId: result.windowId };
       },
       addSpace(modelId: string, storeyExpressId: number, params: SpaceInStoreParams): EntityRef {
+        assertModel(modelId);
         const editor = get();
-        const anchor = resolveSpatialAnchor(dataStore(), storeyExpressId);
+        const anchor = resolveSpatialAnchor(dataStore(), storeyExpressId, mutationView());
         const result = addSpaceToStore(editor, anchor, params);
         return { modelId, expressId: result.spaceId };
       },
       addRoof(modelId: string, storeyExpressId: number, params: RoofInStoreParams): EntityRef {
+        assertModel(modelId);
         const editor = get();
-        const anchor = resolveSpatialAnchor(dataStore(), storeyExpressId);
+        const anchor = resolveSpatialAnchor(dataStore(), storeyExpressId, mutationView());
         const result = addRoofToStore(editor, anchor, params);
         return { modelId, expressId: result.roofId };
       },
       addPlate(modelId: string, storeyExpressId: number, params: PlateInStoreParams): EntityRef {
+        assertModel(modelId);
         const editor = get();
-        const anchor = resolveSpatialAnchor(dataStore(), storeyExpressId);
+        const anchor = resolveSpatialAnchor(dataStore(), storeyExpressId, mutationView());
         const result = addPlateToStore(editor, anchor, params);
         return { modelId, expressId: result.plateId };
       },
       addMember(modelId: string, storeyExpressId: number, params: MemberInStoreParams): EntityRef {
+        assertModel(modelId);
         const editor = get();
-        const anchor = resolveSpatialAnchor(dataStore(), storeyExpressId);
+        const anchor = resolveSpatialAnchor(dataStore(), storeyExpressId, mutationView());
         const result = addMemberToStore(editor, anchor, params);
         return { modelId, expressId: result.memberId };
       },
+      // Cost (#4857) and structural (#5167 S.1) authoring share one resolver
+      // so an entity authored through either is visible to the next call on
+      // the other; see `headless-backend-store-authoring.ts`.
+      ...createStoreAuthoring({
+        assertModel, defaultModelId: MODEL_ID,
+        dataStore, editor: get,
+        mutationView: () => this.getOrCreateMutationView(),
+        ownerHistoryId: () => resolveLiveOwnerHistoryId(dataStore(), get(), this.getOrCreateMutationView()),
+        cost: { data: (modelId, options) => this.cost.data(modelId, options) },
+      }),
     };
   }
 
@@ -650,14 +740,14 @@ export class HeadlessBackend implements BimBackend {
         }
         return result;
       },
-      ifc: (refs: unknown, options: unknown): string => {
-        const entityRefs = refs as EntityRef[];
+      ifc: (refs: EntityRef[] | undefined, options: unknown): string => {
         const opts = (options ?? {}) as Record<string, unknown>;
         const schema = (opts.schema as 'IFC2X3' | 'IFC4' | 'IFC4X3') ?? store.schemaVersion ?? 'IFC4';
-
         const exportOpts: Partial<StepExportOptions> = { schema };
-        if (entityRefs && entityRefs.length > 0) {
-          const isolatedIds = new Set(entityRefs.map(r => r.expressId));
+        // `undefined` is the only "no isolation filter": an empty list is a filter
+        // that matched nothing, refused above in `ExportNamespace.ifc` (#4738).
+        if (refs != null) {
+          const isolatedIds = new Set(refs.map(r => r.expressId));
           exportOpts.visibleOnly = true;
           exportOpts.isolatedEntityIds = isolatedIds;
           exportOpts.hiddenEntityIds = new Set<number>();
@@ -705,35 +795,4 @@ export class HeadlessBackend implements BimBackend {
     };
   }
 
-  private createScheduleAdapter(): ScheduleBackendMethods {
-    const store = this.dataStore;
-    const modelName = this.modelName;
-    let cached: ReturnType<ScheduleBackendMethods['data']> | null = null;
-
-    const assertModel = (modelId?: string) => {
-      // Headless mode ships exactly one model — `MODEL_ID` or the configured
-      // name. Unknown ids surface a clear error instead of silently returning
-      // the wrong data.
-      if (modelId && modelId !== MODEL_ID && modelId !== modelName) {
-        throw new Error(
-          `Unknown modelId '${modelId}' — headless backend only has '${MODEL_ID}'`,
-        );
-      }
-    };
-
-    const extract = (modelId?: string) => {
-      assertModel(modelId);
-      if (!cached) {
-        cached = extractScheduleOnDemand(store) as ReturnType<ScheduleBackendMethods['data']>;
-      }
-      return cached;
-    };
-
-    return {
-      data: (modelId) => extract(modelId),
-      tasks: (modelId) => extract(modelId).tasks,
-      workSchedules: (modelId) => extract(modelId).workSchedules,
-      sequences: (modelId) => extract(modelId).sequences,
-    };
-  }
 }

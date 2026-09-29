@@ -134,6 +134,24 @@ export function cloneExtraction(src: ScheduleExtraction): ScheduleExtraction {
   return JSON.parse(JSON.stringify(src)) as ScheduleExtraction;
 }
 
+/**
+ * Normalize the Gantt's task filter to an IfcWorkSchedule globalId. Passing
+ * `undefined` chooses the first schedule; an explicit empty string means all
+ * tasks. IfcWorkPlan is deliberately excluded because it only groups schedules.
+ */
+export function resolveWorkScheduleFilter(
+  data: ScheduleExtraction | null,
+  requested?: string,
+): string {
+  if (requested === '') return '';
+  if (requested) {
+    return data?.workSchedules.some(
+      item => item.kind === 'WorkSchedule' && item.globalId === requested,
+    ) ? requested : '';
+  }
+  return data?.workSchedules.find(item => item.kind === 'WorkSchedule')?.globalId ?? '';
+}
+
 // ═════════════════════════════════════════════════════════════════════
 // Federation helpers — translate renderer globals ↔ local expressIds
 // ═════════════════════════════════════════════════════════════════════

@@ -17,15 +17,15 @@ import { federationRegistry, type GlobalIdLookup } from '@ifc-lite/renderer';
 import type { ViewerState } from '../index.js';
 import { localIdInParseRange, localIdInOverlay } from '../globalId.js';
 import { viewerTeardown } from '../teardown-registry.js';
+import { modelAppearanceAssets } from '../../lib/appearance/model-assets.js';
 import { modelRemovedScope } from '../teardown-scope.js';
-import {
-  endIdsRowFocusPresentation,
-  type IDSRowFocusPresentation,
-} from '../../lib/ids/visibility-ownership.js';
-import {
-  endClashScenePresentation,
-  type ClashSceneTeardown,
-} from '@/lib/clash/visibility-ownership';
+import { endIdsRowFocusPresentation, type IDSRowFocusPresentation } from '../../lib/ids/visibility-ownership.js';
+import { endClashScenePresentation, type ClashSceneTeardown } from '@/lib/clash/visibility-ownership';
+import { markupTransitionPatch } from './drawing2DSlice.markupTransition.js';
+import { isolateModelsPatch, modelFieldPatch, modelsVisibilityPatch } from './modelSlice.visibility.js';
+import { upsertModelPatch } from './modelSlice.upsert.js';
+import { endChartVisibilityPresentation } from '@/lib/charts/visibility-ownership';
+import { toPublishedGlobalIdFromState } from '../federation-overlay-publication.js';
 
 export interface ModelSlice {
   // State
@@ -49,6 +49,10 @@ export interface ModelSlice {
   setActiveModel: (modelId: string | null) => void;
   /** Toggle model visibility */
   setModelVisibility: (modelId: string, visible: boolean) => void;
+  /** Set visibility on many models in ONE write (`modelSlice.visibility.ts`, #4215). */
+  setModelsVisibility: (modelIds: Iterable<string>, visible: boolean) => void;
+  /** Show exactly `modelIds`, hide every other loaded model, in one write (#4215). */
+  isolateModels: (modelIds: Iterable<string>) => void;
   /** Toggle model collapsed state in hierarchy */
   setModelCollapsed: (modelId: string, collapsed: boolean) => void;
   /** Rename a model */
@@ -157,11 +161,17 @@ export const createModelSlice: StateCreator<ViewerState, [], [], ModelSlice> = (
     // If first model, make it active
     // If adding more models, collapse all existing by default
     if (state.models.size === 0) {
+      // #4159 bug 3: this branch also moves `activeModelId` (null -> model.id)
+      // and goes through the same choke point `setActiveModel` uses — see
+      // `drawing2DSlice.markupTransition.ts`'s doc. Fresh session ->
+      // `defaultMarkupPatch()`, restating the fields' own defaults: no-op.
+      const markupPatch = markupTransitionPatch(state, model.id);
       return {
         models: newModels,
         activeModelId: model.id,
         ifcDataStore: model.ifcDataStore ?? null,
         geometryResult: model.geometryResult ?? null,
+        ...markupPatch,
       };
     } else {
       // Collapse existing models when adding new ones
@@ -174,20 +184,11 @@ export const createModelSlice: StateCreator<ViewerState, [], [], ModelSlice> = (
     }
   }),
 
-  upsertModel: (model) => set((state) => {
-    const newModels = new Map(state.models);
-    const existing = newModels.get(model.id);
-    newModels.set(model.id, existing ? { ...existing, ...model } : model);
-    const activeModelId = state.activeModelId ?? model.id;
-    const activeModel = newModels.get(activeModelId) ?? null;
-
-    return {
-      models: newModels,
-      activeModelId,
-      ifcDataStore: activeModel?.ifcDataStore ?? null,
-      geometryResult: activeModel?.geometryResult ?? null,
-    };
-  }),
+  // #4159 bug 6: routed through `markupTransitionPatch` — see
+  // `modelSlice.upsert.ts`'s doc for why this is a sibling module rather
+  // than inline (this slice is at its module-size budget) and for the
+  // shape of the bug this closes.
+  upsertModel: (model) => set((state) => upsertModelPatch(state, model)),
 
   updateModel: (modelId, patch) => set((state) => {
     const model = state.models.get(modelId);
@@ -225,7 +226,7 @@ export const createModelSlice: StateCreator<ViewerState, [], [], ModelSlice> = (
       clearMutations?: (id: string) => void;
       clearMutationView?: (id: string) => void;
       clearGeneratedSchedule?: () => number;
-      idsValidationReport?: { modelInfo: { modelId: string } } | null;
+      idsValidationReport?: { modelInfo: { modelId: string }[] } | null;
       clearIdsValidationReport?: () => void;
       removeSourceTag?: (id: string) => void;
       pointCloudDeviationComputed?: boolean;
@@ -284,7 +285,6 @@ export const createModelSlice: StateCreator<ViewerState, [], [], ModelSlice> = (
     // — verified against `mutationSlice.clearMutations` — but that is a
     // property of today's implementations, not of this call site.
     endClashScenePresentation(() => get() as unknown as ClashSceneTeardown, 'model-removed');
-
     // The IDS per-row focus (#2867) owns the same two shared channels clash
     // does — `focusEntity` installs the activated row's element into
     // `isolatedEntities` or `ghostExceptEntities` — and a row isolation left
@@ -308,7 +308,7 @@ export const createModelSlice: StateCreator<ViewerState, [], [], ModelSlice> = (
     // report is stale by definition — its results reference a model that no
     // longer exists, and the panel's controlled model picker would bind to a
     // now-missing option. Drop it so the panel self-heals (#1702 C2).
-    if (cross.idsValidationReport?.modelInfo.modelId === modelId) {
+    if (cross.idsValidationReport?.modelInfo.some((m) => m.modelId === modelId)) {
       cross.clearIdsValidationReport?.();
     }
 
@@ -377,6 +377,7 @@ export const createModelSlice: StateCreator<ViewerState, [], [], ModelSlice> = (
     // through `withVisibilityOwnershipInvalidation`.
     const state = get();
     set(viewerTeardown(modelRemovedScope(state, modelId), state));
+    modelAppearanceAssets.remove(modelId);
   },
 
   clearAllModels: () => {
@@ -407,6 +408,7 @@ export const createModelSlice: StateCreator<ViewerState, [], [], ModelSlice> = (
     // nothing left for either to refer to, and `resetViewerState`
     // (store/index.ts) has always nulled the visibility fields here.
     endClashScenePresentation(() => get() as unknown as ClashSceneTeardown, 'federation-cleared');
+    endChartVisibilityPresentation(get());
     // Same claim, released the same way: with every model gone the clash
     // helper above has already cleared both channels outright, so this
     // normally just drops the record — which it must, because a record that
@@ -515,43 +517,35 @@ export const createModelSlice: StateCreator<ViewerState, [], [], ModelSlice> = (
     // stored global id is stale by definition AND the very next model loaded
     // can be handed those exact numbers back.
     set(viewerTeardown({ kind: 'all-models-cleared' }, get()));
+    modelAppearanceAssets.clear();
   },
 
   setActiveModel: (modelId) => set((state) => {
     const activeModel = modelId ? state.models.get(modelId) : null;
+    // 2D drawing markup (#4159): `measure2DResults` and friends are flat,
+    // federation-wide fields — not scoped per model — so an `activeModelId`
+    // swap must carry them along in this SAME atomic patch. Delegated to
+    // `markupTransitionPatch` (drawing2DSlice.markupTransition.ts), the one
+    // function `drawing2DSlice.teardown.ts`'s `'model-removed'` arm ALSO
+    // calls (that arm fires when `removeModel` moves `activeModelId` via
+    // `modelSlice.teardown.ts`'s own contribution) — see that module's doc
+    // for why a second, independent implementation here is exactly what kept
+    // re-breaking this. A no-op (`{}`) when the id is not actually changing,
+    // so re-selecting the already-active model touches nothing.
+    const markupPatch = markupTransitionPatch(state, modelId);
     return {
       activeModelId: modelId,
       ifcDataStore: activeModel?.ifcDataStore ?? null,
       geometryResult: activeModel?.geometryResult ?? null,
+      ...markupPatch,
     };
   }),
 
-  setModelVisibility: (modelId, visible) => set((state) => {
-    const model = state.models.get(modelId);
-    if (!model) return {};
-
-    const newModels = new Map(state.models);
-    newModels.set(modelId, { ...model, visible });
-    return { models: newModels };
-  }),
-
-  setModelCollapsed: (modelId, collapsed) => set((state) => {
-    const model = state.models.get(modelId);
-    if (!model) return {};
-
-    const newModels = new Map(state.models);
-    newModels.set(modelId, { ...model, collapsed });
-    return { models: newModels };
-  }),
-
-  setModelName: (modelId, name) => set((state) => {
-    const model = state.models.get(modelId);
-    if (!model) return {};
-
-    const newModels = new Map(state.models);
-    newModels.set(modelId, { ...model, name });
-    return { models: newModels };
-  }),
+  setModelVisibility: (modelId, visible) => set((state) => modelFieldPatch(state, modelId, { visible })),
+  setModelsVisibility: (modelIds, visible) => set((state) => modelsVisibilityPatch(state, modelIds, visible)),
+  isolateModels: (modelIds) => set((state) => isolateModelsPatch(state, modelIds)),
+  setModelCollapsed: (modelId, collapsed) => set((state) => modelFieldPatch(state, modelId, { collapsed })),
+  setModelName: (modelId, name) => set((state) => modelFieldPatch(state, modelId, { name })),
 
   // Getters (synchronous access via get())
   getModel: (modelId) => get().models.get(modelId),
@@ -572,9 +566,7 @@ export const createModelSlice: StateCreator<ViewerState, [], [], ModelSlice> = (
     return federationRegistry.registerModel(modelId, maxExpressId);
   },
 
-  toGlobalId: (modelId: string, expressId: number) => {
-    return federationRegistry.toGlobalId(modelId, expressId);
-  },
+  toGlobalId: (modelId: string, expressId: number) => toPublishedGlobalIdFromState(federationRegistry, get(), modelId, expressId),
 
   fromGlobalId: (globalId: number) => {
     return federationRegistry.fromGlobalId(globalId);

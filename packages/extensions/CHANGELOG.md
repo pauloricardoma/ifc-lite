@@ -1,5 +1,92 @@
 # @ifc-lite/extensions
 
+## 0.10.0
+
+### Minor Changes
+
+- [#5446](https://github.com/LTplus-AG/ifc-lite/pull/5446) [`e40213f`](https://github.com/LTplus-AG/ifc-lite/commit/e40213f0806bf40fcbd1a93bce68fb7ad791bcef) Thanks [@louistrue](https://github.com/louistrue)! - Add outbound network requests and environment secrets to flow graphs ([#5167](https://github.com/LTplus-AG/ifc-lite/issues/5167) phases 3.3/3.5), deny-by-default throughout.
+  
+  `@ifc-lite/extensions` gains a `secret` capability scope: `secret.read:<NAME>` grants a graph read access to one named env var, with a strict exact-match target (`[A-Z][A-Z0-9_]*`, no glob, no universal wildcard) — the one capability target grammar stricter than the general pattern grammar.
+  
+  `@ifc-lite/sandbox` gains `bim.network.fetch`, gated by a new `network` permission (off by default) plus an exact-host allow-list re-checked on every call against the running graph's actual `network.fetch:<host>` grants. Requests are restricted to `https:`, matched against `new URL(url).hostname` (never the raw URL string, so userinfo/suffix spoofing is rejected by construction), refuse every redirect, cap the response body mid-stream, enforce a combined timeout/abort signal, and strip `Host`/`Cookie`/hop-by-hop headers. The core request logic (`network-request.ts`) is the single implementation shared by the sandbox bridge and the new `HttpRequest` flow node.
+  
+  `@ifc-lite/flow-nodes` gains the `http.request` node and a `secrets.ts` module: a node param may reference `{{secret:NAME}}`, validated against the graph's declared `secret.read:<NAME>` capabilities and the real environment BEFORE a run starts (an undeclared or unset reference is a validation error, never a silently empty string), then substituted into a throwaway copy of the document. Every resolved secret at least 6 characters long is redacted (`<secret:NAME>`) from run logs, node outputs, and errors — applied at the outer boundary, so a secret that comes back inside a fetched response body is still caught.
+  
+  Secrets resolve from `process.env` ONLY in `ifc-lite flow run` (`@ifc-lite/cli`) and MCP's `run_flow` (`@ifc-lite/mcp`), which now also redact their `--json`/tool-result output. The viewer's `HostFeatures.secrets` stays always-empty (the browser has no `process.env`), so a graph referencing a secret is reported `unavailable` before it runs, not mid-run; `HostFeatures.network` is `true` there too, so `http.request` runs subject to the browser's own CORS enforcement, surfacing a blocked cross-origin request as an explicit CORS-likely error rather than a silent empty result.
+  
+  `@ifc-lite/flow` now owns the `{{secret:NAME}}` grammar (`referencedSecrets`, `replaceSecretRefs`), and `checkAvailability` reports a node whose params reference a secret the host lacks as `unavailable`, so `flow validate` no longer calls such a graph runnable.
+
+## 0.9.0
+
+### Minor Changes
+
+- [#5431](https://github.com/LTplus-AG/ifc-lite/pull/5431) [`1909a6a`](https://github.com/LTplus-AG/ifc-lite/commit/1909a6ac6b9934c8793b6e6be8f80dfece3fd44e) Thanks [@louistrue](https://github.com/louistrue)! - Add `contributes.flows` ([#5167](https://github.com/LTplus-AG/ifc-lite/issues/5167) Phase 4.2): an extension bundle can now ship one or more flow graphs (`*.flow.json`), each declared as `{ id, name, description?, path }` and cross-referenced against the bundle's file list, the same way `contributes.exporters[].handler` is. No `manifestVersion` bump: the contributions validator ignores keys it does not know, so an older host skips `flows` and loads the rest of the extension, and a bump would only have made newly authored bundles, flows or not, unloadable in older viewers. The actual `FlowDocument` content (parse + `validateFlowWiring` + capability bounding against the extension's grants) is resolved host-side, since `@ifc-lite/extensions` does not depend on `@ifc-lite/flow` — see `apps/viewer/src/services/extensions/host-flows.ts`.
+  
+  `normaliseBundlePath` is exported: the one mapping from a manifest path to its bundle file key (forward slashes, no leading `./`), shared by the loader, the cross-reference validator and host-side lookups.
+
+## 0.8.0
+
+### Minor Changes
+
+- [#4999](https://github.com/LTplus-AG/ifc-lite/pull/4999) [`b399a49`](https://github.com/LTplus-AG/ifc-lite/commit/b399a49cbccc0456eae50cc50521674336632d1a) Thanks [@louistrue](https://github.com/louistrue)! - Expose stable capability and SDK compatibility reason identifiers alongside the existing English diagnostic fields, so UI consumers can localize explanations without losing useful log and prompt text.
+
+## 0.7.0
+
+### Minor Changes
+
+- [#4505](https://github.com/LTplus-AG/ifc-lite/pull/4505) [`1878436`](https://github.com/LTplus-AG/ifc-lite/commit/1878436f58d4b11b8cd69ea4d544373ca375b9eb) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Bound how long a bundle test's `expect.regex` matcher can run instead of leaving it unbounded on whatever thread calls it. `runBundleTests` now accepts an optional `evaluateRegex` hook; the viewer wires it to a Worker with a timeout so a pathological pattern that slips past the existing length-cap and shape-heuristic guards terminates instead of hanging the main UI thread, reachable via "Run tests" and the repair queue's "Run check". CLI and other existing callers are unaffected — omitting the hook keeps the prior synchronous, in-process check.
+  
+  A rejection that isn't a genuine invalid-pattern `SyntaxError` (a worker timeout, a disposed client, a worker that failed to start) now reports as "regex: evaluation failed", distinct from "regex: invalid pattern" — previously every such rejection was mislabeled as the author's pattern being malformed. In the viewer, if the regex worker itself can't be started (a CSP blocking module workers, or no `Worker` at all), `expect.regex` checks now fall back to the same synchronous in-process evaluation used before [#4482](https://github.com/LTplus-AG/ifc-lite/issues/4482), rather than failing every check; the pattern length cap and catastrophic-backtracking shape heuristic still run unconditionally before either evaluator, so that fallback loses only the timeout bound and main-thread eviction, not those guards.
+
+## 0.6.1
+
+### Patch Changes
+
+- [#4335](https://github.com/LTplus-AG/ifc-lite/pull/4335) [`8620be3`](https://github.com/LTplus-AG/ifc-lite/commit/8620be38be0162b7cbdbe23ae7bc924763b83612) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Guard every place a caller-supplied regex pattern is compiled and run against untrusted input, closing a ReDoS (catastrophic-backtracking) hole: an IDS document's `xs:pattern` facet (four sites — the constraint matcher, the entity-type resolver, and two schema-audit sites in `@ifc-lite/ids`) and the viewer's bulk-edit "Name Pattern (Regex)" field (`@ifc-lite/mutations`'s `BulkQueryEngine.select`).
+  
+  New `@ifc-lite/regex-guard` package: a single shared guard (`assertGuardedRegexPattern`, `compileGuardedRegex`, `hasCatastrophicBacktrackingShape`) rejects a pattern over 256 characters or shaped like a known catastrophic-backtracking construct (`(a+)+`, `(.*)*`, …) before it is ever compiled. `@ifc-lite/extensions`'s bundle-test runner, which already had its own copy of this exact check, now imports the shared implementation instead of carrying a second one.
+  
+  A rejected pattern surfaces as a visible failure, not a silent non-match: an IDS specification whose pattern is rejected reports `status: 'fail'` with an `error` message (new optional field on `IDSSpecificationResult`) instead of reading as passing or not-applicable; the schema audit reports a new `E_REGEX_UNSAFE` issue; `BulkQueryEngine.select` and the entity-type resolver throw `UnsafeRegexPatternError`.
+  
+  This is a heuristic, not a complete defence — see the package's doc comment for what it does not catch.
+- Updated dependencies [[`de30321`](https://github.com/LTplus-AG/ifc-lite/commit/de303215ad631d54069067682f443ef33d7d37f3), [`8620be3`](https://github.com/LTplus-AG/ifc-lite/commit/8620be38be0162b7cbdbe23ae7bc924763b83612)]:
+  - @ifc-lite/regex-guard@0.2.0
+
+## 0.6.0
+
+### Minor Changes
+
+- [#3487](https://github.com/LTplus-AG/ifc-lite/pull/3487) [`843aefb`](https://github.com/LTplus-AG/ifc-lite/commit/843aefb9333ae1ad2af24a26fdec889b83de48ed) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix the "Promote to tool" capability inference under-granting real `bim.viewer` and `bim.store` mutations.
+  
+  `INFERENCE_CATALOGUE` in `src/inference/catalogue.ts` documents itself as kept in sync with `@ifc-lite/sandbox`'s `NAMESPACE_SCHEMAS`, and `inferCapabilities`'s own design rules say to never under-grant: if the inferred capability is wrong, an extension should fail to run rather than run with a capability it was never reviewed for. Two gaps of the same shape — a real, state-mutating bridge method missing from the catalogue and falling through to a read-only default:
+  
+  - `bim.viewer`: `colorizeAll`, `resetColors`, `resetVisibility` (`packages/sandbox/src/bridge-viewer.ts`) had no entry in the `viewer` namespace's `methods` overrides, so calling them inferred only `viewer.read` instead of `viewer.colorize`/`viewer.isolate`. A script whose only viewer call was `bim.viewer.resetColors()` would have its capability grant pre-filled as read-only on the promote review screen while actually able to mutate colors/visibility at runtime.
+  - `bim.store` (`packages/sandbox/src/bridge-store.ts`) is entirely document-level edits — `addEntity`, `removeEntity`, `setPositionalAttribute`, and ten `addWall`/`addSlab`/... element helpers — but the namespace had no `methods` overrides at all, so every one of them inferred the namespace default `model.read`. A script that only called `bim.store.addWall(...)` would be offered a read-only grant for a call that creates a new entity.
+  
+  `colorizeAll`/`resetColors` now map to `viewer.colorize` and `resetVisibility` to `viewer.isolate`. The `addEntity`/`addColumn`/`addWall`/`addSlab`/`addBeam`/`addDoor`/`addWindow`/`addSpace`/`addRoof`/`addPlate`/`addMember` methods now map to `model.create`, `removeEntity` to `model.delete`, and `setPositionalAttribute` to the wildcard `model.mutate:*` (mirroring how the `mutate` namespace already treats an unstructured attribute edit).
+  
+  Two state-changing bridge methods are still left at their namespace's read-only default and are not changed here, because the capability catalogue has no scope that fits either: `bim.model.loadIfc` (`packages/sandbox/src/bridge-model.ts`) loads a file into the viewer but infers `model.read`, and `bim.viewer.select` (`packages/sandbox/src/bridge-viewer.ts`) writes viewer selection state but infers `viewer.read`. Closing those needs a new capability, which extensions would have to declare in their manifest, so it is a change to the manifest contract rather than to this catalogue.
+
+- [#3488](https://github.com/LTplus-AG/ifc-lite/pull/3488) [`b777dbb`](https://github.com/LTplus-AG/ifc-lite/commit/b777dbb085d70f7f56c15c50b48e3c8e57c889a7) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Flag `bim.<ns>.<method>` calls the capability catalogue never classified, instead of only flagging unknown namespaces.
+  
+  `inferCapabilities` (`src/inference/capability.ts`) documents a design rule of surfacing unknowns so a reviewer can investigate, but it set `observation.unknown` from the namespace alone. `INFERENCE_CATALOGUE` (`src/inference/catalogue.ts`) resolves capability per method: a namespace maps to `defaultCapabilities` plus a `methods` map where capability varies by method. A method missing from that map found its namespace known, reported `unknown: false`, and fell through to the namespace default with nothing telling the reviewer this particular call had never been looked at.
+  
+  `unknown` now comes from a new `isRecognisedMethod(namespace, method)`. A namespace with no `methods` map is flat — one capability covers all of it, so every method is recognised. A namespace with a `methods` map is differentiated, and membership in that map is what "classified" means, so an absent method is now reported as unrecognised. The capability itself is unchanged in every case: `lookupNamespaceMethod` still returns the namespace default, so nothing is under-granted and no grant moves. What changes is what the "Promote to tool" screen tells a human, which is why this is a `minor` rather than a `patch`: `unknown` is part of the exported `InferenceObservation`, and it flips for calls that previously came back clean.
+  
+  That reading of the `methods` map only holds if the map lists every real bridge method, including the ones whose answer is the namespace default — otherwise a method that exists and is granted correctly would be reported as a gap. Three namespaces were relying on the default instead, so their real methods are now written out at the capability they already resolved to: `mutate.setProperty`, `mutate.setAttribute`, `mutate.deleteProperty`, `mutate.undo` and `mutate.redo` at the namespace's deliberate `model.mutate:*` wildcard, `export.download` at `export.create:*` (it writes caller-supplied content under a caller-supplied filename, so no format target is narrower), and `viewer.select` at `viewer.read`. None of those changes an inferred capability; they record a classification that was previously implicit.
+  
+  Nothing machine-checks a differentiated namespace's map against `@ifc-lite/sandbox`'s `NAMESPACE_SCHEMAS`, so the two can still drift — but now in the safe direction: a bridge method added without a catalogue decision warns until someone makes one. Flat namespaces stay outside this mechanism entirely; giving one a `methods` map is what opts it in.
+
+- [#3491](https://github.com/LTplus-AG/ifc-lite/pull/3491) [`858b75a`](https://github.com/LTplus-AG/ifc-lite/commit/858b75a0ef5636098452a2297277767efdc956a2) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `bim.model.loadIfc` inferring the read-only `model.read` capability instead of `model.create`.
+  
+  The inference catalogue mapped every `bim.model.*` call, including `loadIfc`, to the namespace's `model.read` default. `loadIfc` loads a whole new IFC document into the app (dispatches `ifc-lite:load-file`), which is a document-creating operation, not a read — the same distinction `host/permissions.ts` already draws for `model.create` ("creation modifies the document").
+  
+  Because `inferCapabilities` and the runtime's per-method capability gate (`host/check.ts`) both read this same catalogue, the under-grant was not just a review-screen display issue: an extension granted only `model.read` could call `bim.model.loadIfc` and the gate would allow it, since the required and granted capability were identical (`model.read`). `bim.model.loadIfc` now requires `model.create`; `bim.model.list`/`active`/`activeId` are unaffected and still require `model.read`.
+
+### Patch Changes
+
+- [#3855](https://github.com/LTplus-AG/ifc-lite/pull/3855) [`182215a`](https://github.com/LTplus-AG/ifc-lite/commit/182215a835c4beac6a776bcb4eb1d019cab9063e) Thanks [@louistrue](https://github.com/louistrue)! - Corrected the code samples on each package's npm landing page: the README fences are now typechecked against the package's real exports, so the snippets import what they call, declare the values they read, and no longer show removed options or renamed methods. Patch-bumping every package whose README changed so the corrections actually reach npmjs.com.
+
 ## 0.5.0
 
 ### Minor Changes

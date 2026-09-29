@@ -26,9 +26,9 @@
  * raw argument tokens are preserved byte-for-byte.
  */
 
-import { ENTITIES_IFC2X3, ENTITIES_IFC4, ENTITIES_IFC4X3 } from '@ifc-lite/data';
+import { ENTITIES_IFC2X3, ENTITIES_IFC4_EXPRESS, ENTITIES_IFC4X3 } from '@ifc-lite/data';
 import { escapeStepString } from './step-serialization.js';
-import { splitTopLevelArgs } from './step-argument-parser.js';
+import { splitTopLevelStepArguments } from './step-argument-parser.js';
 import type { IfcSchemaVersion } from './schema-converter.js';
 
 interface RetypeEntityInfo {
@@ -51,7 +51,10 @@ function buildSchemaMap(
 
 const SCHEMA_MAPS: Record<IfcSchemaVersion, Map<string, RetypeEntityInfo>> = {
   IFC2X3: buildSchemaMap(ENTITIES_IFC2X3),
-  IFC4: buildSchemaMap(ENTITIES_IFC4),
+  // Not the raw `ENTITIES_IFC4`: retyping into one of its phantom IFC4
+  // entities wrote a class IFC4 lacks, and into `IfcCartesianPointList3D`
+  // appended a `TagList` IFC4 never had (#5204).
+  IFC4: buildSchemaMap(ENTITIES_IFC4_EXPRESS),
   IFC4X3: buildSchemaMap(ENTITIES_IFC4X3),
   // IFC5 isn't STEP; never reached for retype, but keep the lookup total.
   IFC5: buildSchemaMap(ENTITIES_IFC4X3),
@@ -91,7 +94,7 @@ export interface RetypeArgsResult {
  * Re-lay-out an entity's STEP argument tokens for a new class.
  *
  * `argTokens` are already-serialized STEP fragments (as produced by
- * {@link splitTopLevelArgs}). Returns a fresh token array in the target
+ * {@link splitTopLevelStepArguments}). Returns a fresh token array in the target
  * class's attribute order. When source or target layout can't be resolved
  * from the schema (vendor extension, malformed), `resolved` is false and the
  * caller should fall back to a keyword-only swap.
@@ -183,7 +186,16 @@ export function retypeStepLine(
   }
 
   const idPrefix = entityText.slice(0, eq + 1); // "#123="
-  const argTokens = splitTopLevelArgs(entityText.slice(openParen + 1, closeParen));
+  // Validating, not permissive: the re-layout below maps source slot i to the
+  // attribute NAME at position i, so a mis-scanned list renames every slot
+  // after the first swallowed comma. On the #4125 record — two undoubled
+  // apostrophes, which leave quote parity even and paren depth at zero — the
+  // permissive split returned seven parts for a nine-attribute class, and the
+  // rewrite emitted ELEVEN top-level arguments because one part still carried
+  // two commas of its own. A `null` here means the line is left exactly as the
+  // source wrote it, which the caller reads as `retyped: false`.
+  const argTokens = splitTopLevelStepArguments(entityText.slice(openParen + 1, closeParen));
+  if (argTokens === null) return entityText;
   const { tokens, resolved } = retypeArgTokens(argTokens, sourceType, newType, predefinedType, schema);
 
   if (!resolved) {

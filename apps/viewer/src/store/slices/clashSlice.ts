@@ -60,6 +60,7 @@ import {
   CLASH_BOUNDS,
   clampToBounds,
   DEFAULT_CLASH_SETTINGS,
+  storedPresetToPreset,
   type ClashPreset,
   type ClashGlobalSettings,
   type ClashSettingsGroupBy,
@@ -71,13 +72,11 @@ export type ClashGroupBy = ClashSettingsGroupBy;
 export type { ClashPreset, ClashGlobalSettings, SaveResult };
 export type { ClashExclusionRule };
 
-/** Fields a user supplies when adding a custom rule (id/flags filled in here). */
-export type NewClashPreset = {
-  name: string;
+/** Fields a user supplies when adding a custom rule (id/flags filled in here).
+ *  Derived from `ClashPreset` so an optional side filter (#3902), or any later
+ *  addition, reaches `createClashPreset` without a second list to keep in step. */
+export type NewClashPreset = Omit<ClashPreset, 'id' | 'enabled' | 'builtin' | 'description'> & {
   description?: string;
-  severity: ClashPreset['severity'];
-  selectorA: string;
-  selectorB: string;
 };
 
 export interface ClashSlice {
@@ -184,9 +183,9 @@ export interface ClashSlice {
    * The focused clash's CONTACT geometry as a flat world-frame line-list (the
    * real shared-face polygon outlines / intersection lines). Preferred over the
    * AABB `clashOverlapBox` when present. `null` when no clash is focused or the
-   * contact could not be computed (then the box is used). (#1402)
+   * contact could not be computed (then the box is used). (#1402) Drawn in `clashOverlap` (#5490).
    */
-  clashContactLines: { vertices: number[]; color: [number, number, number, number] } | null;
+  clashContactLines: { vertices: number[] } | null;
   /**
    * Whether the focused clash's region box is drawn in the 3D view. On by
    * default (#1402): with the tight contact bounds (#1362 Bug B) the box marks
@@ -305,7 +304,7 @@ export interface ClashSlice {
   setClashSelectedId: (id: string | null) => void;
   setClashHighlightColors: (colors: Map<number, [number, number, number, number]> | null) => void;
   setClashOverlapBox: (box: { min: [number, number, number]; max: [number, number, number] } | null) => void;
-  setClashContactLines: (lines: { vertices: number[]; color: [number, number, number, number] } | null) => void;
+  setClashContactLines: (lines: { vertices: number[] } | null) => void;
   setShowClashRegionBox: (show: boolean) => void;
   /** `focusClash` kicked off the on-demand solid compute for the pair now focused. */
   setClashSolidComputing: () => void;
@@ -731,16 +730,15 @@ export const createClashSlice: StateCreator<ClashSlice, [], [], ClashSlice> = (s
       if (!name || !selectorA || !selectorB) {
         return { ok: false, reason: 'serialize', message: 'Name and both selectors are required.' };
       }
-      const preset: ClashPreset = {
-        id: `custom-${crypto.randomUUID()}`,
-        name,
-        description: input.description?.trim() ?? '',
-        severity: input.severity,
-        selectorA,
-        selectorB,
-        enabled: true,
-        builtin: false,
-      };
+      // Built through the same projection every READ path uses, so a preset
+      // created here and read back serializes to identical bytes —
+      // `presetsStoreIdentically` compares those bytes, key order included.
+      const id = `custom-${crypto.randomUUID()}`;
+      const description = input.description?.trim() ?? '';
+      const preset = storedPresetToPreset(
+        { ...input, id, name, description, selectorA, selectorB, enabled: true, builtin: false },
+        false,
+      );
       const next = [...get().clashPresets, preset];
       const result = savePresets(next);
       if (result.ok) set({ clashPresets: next });

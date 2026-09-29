@@ -69,6 +69,7 @@ export type CapabilityScope =
   | 'export'
   | 'storage'
   | 'network'
+  | 'secret'
   | 'command'
   | 'ui';
 
@@ -102,8 +103,19 @@ export type RiskTier = 'green' | 'yellow' | 'red';
 
 export interface CapabilityRisk {
   capability: Capability;
+  /** Stable catalogue identifier for UI localization and analytics. */
+  capabilityId: string;
   tier: RiskTier;
-  /** Plain-English description shown in the review screen. */
+  /** Stable explanation for the computed tier and description. */
+  reasonCode:
+    | 'catalogue'
+    | 'unknown-capability'
+    | 'missing-required-target'
+    | 'universal-wildcard-target'
+    | 'host-pattern-wildcard'
+    | 'target-pattern-wildcard'
+    | 'specific-network-host';
+  /** Plain-English diagnostic for logs, prompts, and non-localized consumers. */
   description: string;
 }
 
@@ -194,6 +206,16 @@ export interface ManifestContributions {
   exporters?: ExporterContribution[];
   idsValidators?: IdsValidatorContribution[];
   statusBar?: StatusBarContribution[];
+  /**
+   * Flow graphs the extension ships, distributed via the `.iflx` bundle.
+   *
+   * Added without a manifest-version bump on purpose: the contributions
+   * validator ignores keys it does not know, so an older host simply skips
+   * `flows` and loads the rest of the extension. Bumping the version would buy
+   * nothing for that, and would make every newly authored bundle — flows or
+   * not — unloadable by older viewers.
+   */
+  flows?: FlowGraphContribution[];
 }
 
 export interface CommandContribution {
@@ -287,6 +309,21 @@ export interface IdsValidatorContribution {
   id: string;
   name: string;
   handler: string;
+}
+
+/**
+ * A flow graph (`@ifc-lite/flow` `FlowDocument`) the extension ships.
+ * `packages/extensions` does not depend on `@ifc-lite/flow`, so the
+ * contribution here is structural only — `path` names the `*.flow.json`
+ * file inside the bundle; the host (which does depend on `@ifc-lite/flow`)
+ * reads, parses, and wiring-validates it, and bounds its declared
+ * capabilities against the extension's grants.
+ */
+export interface FlowGraphContribution {
+  id: string;
+  name: string;
+  description?: string;
+  path: string;
 }
 
 export type StatusBarSlot = 'statusBar.left' | 'statusBar.right';

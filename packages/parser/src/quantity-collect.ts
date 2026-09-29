@@ -26,6 +26,8 @@ export interface CollectedQuantity {
     /** SI factor of this quantity's explicit `Unit`, when it declares one.
      *  An omitted unit inherits the project's unit assignment. */
     explicitUnitSiScale?: number;
+    /** Display symbol of that explicit `Unit` (`mm`, `m²`), when it resolves. */
+    explicitUnit?: string;
 }
 
 /**
@@ -114,6 +116,7 @@ export function collectQuantitiesFromRefs(
     for (const qtyRef of refs) {
         if (typeof qtyRef !== 'number') continue;
 
+        // @raw-entity-enumeration-ok quantity parsing follows one source member reference in the supplied set
         const qtyEntityRef = store.entityIndex.byId.get(qtyRef) ?? store.deferredEntityIndex?.get(qtyRef);
         if (!qtyEntityRef) continue;
 
@@ -177,7 +180,7 @@ export function collectQuantitiesFromRefs(
             name: qtyName,
             type: qtyType,
             value,
-            ...(unit ? { explicitUnitSiScale: unit.resolved.siScale } : {}),
+            ...(unit ? { explicitUnitSiScale: unit.resolved.siScale, explicitUnit: unit.resolved.symbol } : {}),
         });
     }
 
@@ -187,13 +190,16 @@ export function collectQuantitiesFromRefs(
 /**
  * `Quantities` slot on `IfcElementQuantity`: GlobalId[0], OwnerHistory[1],
  * Name[2], Description[3] inherited from `IfcRoot`, then MethodOfMeasurement[4]
- * and Quantities[5].
+ * and Quantities[5]. GlobalId[0] is the identity of the `IfcElementQuantity`
+ * instance itself, not any of its quantities.
  */
 const QUANTITIES_SLOT = 5;
 
 /** One extracted quantity set, in the shape both call sites report. */
 export interface CollectedQuantitySet {
     name: string;
+    /** `GlobalId` of the source `IfcElementQuantity` instance, when read as a string. */
+    globalId?: string;
     quantities: CollectedQuantity[];
 }
 
@@ -243,10 +249,11 @@ export function readQuantitySet(
     // verbatim downstream (MCP tool responses, `bim.quantities()`) as though
     // the model had genuinely declared that name (#3530 census).
     const qsetName = typeof qsetAttrs[2] === 'string' ? qsetAttrs[2] : '';
+    const qsetGlobalId = typeof qsetAttrs[0] === 'string' ? qsetAttrs[0] : undefined;
     const quantities = collectQuantitiesFromRefs(store, extractor, qsetAttrs[QUANTITIES_SLOT]);
 
     if (quantities.length === 0) return null;
-    return { name: qsetName, quantities };
+    return { name: qsetName, globalId: qsetGlobalId, quantities };
 }
 
 /**

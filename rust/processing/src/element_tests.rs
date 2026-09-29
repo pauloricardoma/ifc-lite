@@ -17,6 +17,79 @@ fn refs(ids: &[u32]) -> FxHashSet<u32> {
     ids.iter().copied().collect()
 }
 
+/// #4122 — `build_mesh_data` trusts `mesh.instance_meta.is_some()` as a proxy
+/// for "already welded in the object frame" (see its doc). The debug_assert
+/// it now carries checks that trust instead of silently relying on it: a
+/// `Mesh` with `instance_meta` set but `welded_in_object_frame` still
+/// `false` — exactly the shape `router::voids::probe::get_opening_item_meshes_world`
+/// produces (it bakes with `transform_mesh_world_framed` directly, never
+/// through `weld_mesh`/`weld_sub_mesh`) — must trip it if it were ever handed
+/// to `build_mesh_data`.
+#[test]
+#[should_panic(expected = "welded_in_object_frame is false")]
+fn build_mesh_data_asserts_instance_meta_implies_welded_in_object_frame() {
+    const IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION((''),'2;1');
+FILE_NAME('m.ifc','2026-09-08T00:00:00',(''),(''),'','','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCWALL('1234567890123456789012',$,'Wall',$,$,#20,$,$,$);
+#20=IFCLOCALPLACEMENT($,#21);
+#21=IFCAXIS2PLACEMENT3D(#22,$,$);
+#22=IFCCARTESIANPOINT((0.,0.,0.));
+ENDSEC;
+END-ISO-10303-21;
+"#;
+    let mut decoder = EntityDecoder::new(IFC);
+    let entity = decoder.decode_by_id(1).expect("wall decodes");
+
+    let job = ElementMeshJob {
+        id: 1,
+        ifc_type: IfcType::IfcWall,
+        entity: &entity,
+        kind: ElementJobKind::Product,
+        element_color: None,
+        metadata: None,
+    };
+    let void_index = FxHashMap::default();
+    let geometry_style_index = FxHashMap::default();
+    let indexed_colour_full = FxHashMap::default();
+    let element_material_colors = FxHashMap::default();
+    let texture_index = FxHashMap::default();
+    let ctx = MeshProductionContext {
+        void_index: &void_index,
+        geometry_style_index: &geometry_style_index,
+        indexed_colour_full: &indexed_colour_full,
+        element_material_colors: &element_material_colors,
+        texture_index: &texture_index,
+        site_local_rotation: None,
+    };
+
+    let mut mesh = ifc_lite_geometry::Mesh::new();
+    mesh.positions = vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+    mesh.normals = vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0];
+    mesh.indices = vec![0, 1, 2];
+    mesh.instance_meta = Some(ifc_lite_geometry::InstanceMeta {
+        transform: [
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0, //
+            0.0, 0.0, 0.0, 1.0,
+        ],
+        local_transform: None,
+        canonical_transform: None,
+        rep_identity: 0,
+        instanceable: true,
+    });
+    // Deliberately left `false`: this mesh never went through
+    // `apply_placement`/`apply_submesh_placement`, matching probe.rs's shape.
+    assert!(!mesh.welded_in_object_frame);
+
+    let _ = build_mesh_data(&job, mesh, [1.0, 1.0, 1.0, 1.0], None, None, false, 0, &ctx, None);
+}
+
 #[test]
 fn plan_type_geometry_orphan_type_emits_unreferenced_maps_as_class_1() {
     for mode in [TypeGeometryMode::SuppressInstanced, TypeGeometryMode::EmitTagged] {
@@ -348,5 +421,91 @@ fn a_shared_item_resolves_via_the_shallow_branch() {
         find_geometry_item_color(200, &styles, &mut decoder),
         Some(green),
         "the shallow branch reaches the styled leaf well inside the cap"
+    );
+}
+
+#[path = "element_reference_opening_tests.rs"]
+mod reference_openings;
+
+/// A rayon worker blocked on faceted-brep meshing's nested `par_iter` can steal
+/// another element job and run `produce_element_meshes` to completion inside
+/// the element it was meshing (the #1587 re-entrancy `processor/mod.rs` guards
+/// with `try_lock`). Both per-element thread-local scopes used to open with a
+/// plain reset, so the stolen element zeroed the outer element's CSG escalation
+/// total (#1109 budget) and its degenerate-triangle tally (the #1891 closure
+/// retraction input) (#4663). The nested call below is that steal, run on
+/// one thread.
+#[test]
+fn nested_element_leaves_the_outer_elements_scopes_intact() {
+    const IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION((''),'2;1');
+FILE_NAME('m.ifc','2026-09-13T00:00:00',(''),(''),'','','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCWALL('1234567890123456789012',$,'Wall',$,$,$,$,$,$);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+    use ifc_lite_geometry::kernel::budget;
+
+    // The outer element: its scopes are open and have counted something.
+    budget::begin_element();
+    let _outer_tally = degenerate::begin_element();
+    for _ in 0..7 {
+        budget::note_escalation();
+    }
+    let mut collapsed = ifc_lite_geometry::Mesh::new();
+    collapsed.positions = vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+    collapsed.normals = vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0];
+    collapsed.indices = vec![0, 1, 2];
+    degenerate::clean(&mut collapsed);
+    assert_eq!(budget::element_count(), 7);
+    assert_eq!(degenerate::dropped_this_element(), 1);
+
+    // The stolen element runs start to finish on the same thread.
+    let mut decoder = EntityDecoder::new(IFC);
+    let entity = decoder.decode_by_id(1).expect("wall decodes");
+    let router = GeometryRouter::with_units(IFC, &mut decoder);
+    let job = ElementMeshJob {
+        id: 1,
+        ifc_type: IfcType::IfcWall,
+        entity: &entity,
+        kind: ElementJobKind::Product,
+        element_color: None,
+        metadata: None,
+    };
+    let void_index = FxHashMap::default();
+    let geometry_style_index = FxHashMap::default();
+    let indexed_colour_full = FxHashMap::default();
+    let element_material_colors = FxHashMap::default();
+    let texture_index = FxHashMap::default();
+    let ctx = MeshProductionContext {
+        void_index: &void_index,
+        geometry_style_index: &geometry_style_index,
+        indexed_colour_full: &indexed_colour_full,
+        element_material_colors: &element_material_colors,
+        texture_index: &texture_index,
+        site_local_rotation: None,
+    };
+    let inner = produce_element_meshes(
+        &job,
+        &ctx,
+        &MeshProductionOptions::default(),
+        &mut decoder,
+        &router,
+    );
+    assert_eq!(inner.degenerate_triangles_dropped, 0, "the inner element starts its own tally");
+
+    assert_eq!(
+        budget::element_count(),
+        7,
+        "the stolen element must not reset the outer element's CSG escalation total"
+    );
+    assert_eq!(
+        degenerate::dropped_this_element(),
+        1,
+        "the stolen element must not reset the outer element's degenerate tally"
     );
 }

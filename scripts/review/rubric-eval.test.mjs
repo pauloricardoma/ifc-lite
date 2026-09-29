@@ -17,6 +17,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { matches, score, validatorReason, REVIEWER_FAULT, INSTRUMENT_FAULT, JUDGE_LOG_RE } from './rubric-eval.mjs';
 import { REASONS } from './validate-findings.mjs';
+import { DEFECT_CLASSES, notApplicableClasses } from './lib/defect-classes.mjs'; // #3831
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const EXPECTED = {
@@ -87,6 +88,8 @@ test('every eval case is well-formed, and an empty one is DECLARED, never inferr
   const files = readdirSync(dir).filter((f) => f.endsWith('.json'));
   assert.ok(files.length > 0, 'no cases means a vacuous 0/0');
   let positives = 0;
+  let classified = 0;
+  let expectations = 0;
   for (const f of files) {
     const c = JSON.parse(readFileSync(join(dir, f), 'utf8'));
     assert.ok(Number.isInteger(c.pr), `${f}: needs the PR it came from`);
@@ -103,8 +106,36 @@ test('every eval case is well-formed, and an empty one is DECLARED, never inferr
         c.input.files.some((x) => x.path === e.path),
         `${f}: expects a finding in ${e.path}, which is not in the diff`,
       );
+      const patch = c.input.files.find((x) => x.path === e.path)?.patch ?? '';
+      for (const evidence of e.evidence ?? []) {
+        assert.ok(patch.includes(evidence), `${f}: expected defect evidence is absent: ${evidence}`); // @source-text-assertion-ok `patch` is a pinned eval fixture (data), the assertion guards the fixture, not a subject
+      }
+      for (const fixed of e.fixedEvidence ?? []) {
+        assert.ok(!patch.includes(fixed), `${f}: fixture includes the later fix: ${fixed}`); // @source-text-assertion-ok `patch` is a pinned eval fixture (data), the assertion guards the fixture, not a subject
+      }
+      // #3831: an expectation may name the rubric class its defect belongs to, so
+      // a miss can be attributed to a class the reviewer waved off. OPTIONAL --
+      // two of these defects (a case-sensitive repo comparison, a pair of
+      // contradictory remedies) do not belong to any class the rubric names, and
+      // inventing a class for them would attribute skips that never happened.
+      // What is NOT optional is that a class, once written, is real: a typo
+      // would attribute nothing, forever, silently.
+      expectations += 1;
+      if (e.class !== undefined) {
+        assert.ok(DEFECT_CLASSES.includes(e.class), `${f}: \`${e.class}\` is not a rubric defect class`);
+        classified += 1;
+      }
     }
   }
+  // Most of the corpus must be attributable, or the skipped-class column is
+  // measured over a handful of defects and says nothing. Three quarters, not
+  // all: the two unclassifiable defects above are real and belong in the corpus,
+  // and a rule that forced a class onto them would buy the threshold with a
+  // wrong label.
+  assert.ok(
+    classified * 4 >= expectations * 3,
+    `only ${classified} of ${expectations} known defects name a rubric class`,
+  );
   // And the set must still be mostly positive, or recall is measured over a
   // denominator small enough to move by luck.
   assert.ok(positives >= files.length / 2, `only ${positives} of ${files.length} cases carry findings`);
@@ -183,6 +214,75 @@ test('a DIFFERENT finding in the same file is an EXTRA, never silently dropped',
   assert.ok(s2.lines.some((l) => l.includes('➕ EXTRA')), 'and printed');
 });
 
+
+// ============ #3831: a miss whose CLASS the review waved off is a different miss
+
+test('#3831: a miss whose defect class was declared not-applicable is counted and NAMED', () => {
+  // Before this, the two ways a known defect goes unreported printed the same
+  // line: the reviewer walked its class and did not see it, and the reviewer
+  // wrote `not-applicable` against that class and never looked. They need
+  // opposite fixes, and three live evaluations were read as the first when
+  // 13-14 of 18 cases had produced no per-class pass at all.
+  const expected = { ...EXPECTED, class: 'duplicate-site' };
+  const s = score([{
+    pr: 1, expected: [expected], verdict: 'clean', findings: [],
+    notApplicable: ['duplicate-site', 'falsy-boundary-value'],
+  }]);
+  assert.equal(s.hits, 0, 'a skip is a miss, never a hit');
+  assert.equal(s.skippedClass, 1);
+  assert.ok(s.lines.some((l) => l.includes('CLASS SKIPPED')), 'and it is printed');
+  assert.ok(s.lines.some((l) => l.includes('duplicate-site')), 'naming the class that was waved off');
+});
+
+test('#3831: a miss the review actually LOOKED for is not counted as a skip', () => {
+  // THE CONTROL. Without it, `skippedClass` could be incremented on every miss
+  // and this suite would not notice -- the number would be a second name for
+  // "misses", which is the one thing it must not be.
+  const expected = { ...EXPECTED, class: 'duplicate-site' };
+  const s = score([{
+    pr: 1, expected: [expected], verdict: 'clean', findings: [],
+    notApplicable: ['falsy-boundary-value', 'partial-state-clear'],
+  }]);
+  assert.equal(s.hits, 0);
+  assert.equal(s.skippedClass, 0, 'the class was walked; the reviewer simply did not see it');
+  assert.ok(!s.lines.some((l) => l.includes('CLASS SKIPPED')));
+});
+
+test('#3831: a FOUND defect is never marked skipped, whatever the pass claimed', () => {
+  // A review cannot both report a defect and have declared its class
+  // inapplicable, but a scorer that tested the class before the hit would say it
+  // did -- and would then be counting hits in a column named for misses.
+  const expected = { ...EXPECTED, class: 'duplicate-site' };
+  const s = score([{
+    pr: 1, expected: [expected], verdict: 'findings',
+    findings: [{
+      path: EXPECTED.path, line: 533,
+      body: 'The comparison is case-sensitive, so a differently-cased repo reads as a fork and enforcement is disabled.',
+    }],
+    notApplicable: ['duplicate-site'],
+  }]);
+  assert.equal(s.hits, 1);
+  assert.equal(s.skippedClass, 0);
+});
+
+test('#3831: an expected class the rubric does not name STOPS the run', () => {
+  // A typo would attribute nothing forever, silently, with the recall number
+  // still printing -- the shape this repository calls a filtered population with
+  // no smell. It must be loud instead.
+  assert.throws(
+    () => score([{ pr: 1, expected: [{ ...EXPECTED, class: 'duplicat-site' }], verdict: 'clean', findings: [], notApplicable: [] }]),
+    /not one of the rubric's classes/,
+  );
+});
+
+test('#3831: an expectation with NO class scores exactly as it always did', () => {
+  // Two of the corpus's defects belong to no class the rubric names. They must
+  // stay ordinary misses rather than becoming errors or silent skips.
+  const s = score([{ pr: 1, expected: [EXPECTED], verdict: 'clean', findings: [], notApplicable: DEFECT_CLASSES }]);
+  assert.equal(s.hits, 0);
+  assert.equal(s.skippedClass, 0);
+  assert.match(s.recall, /0\/1/);
+});
 
 test('a validator refusal is blamed on the REVIEWER or the INSTRUMENT, never both', () => {
   // Every non-zero exit used to abort the whole eval as "a lane regression". Two
@@ -299,6 +399,22 @@ writeFileSync(out, ${JSON.stringify(body)});
   return p;
 }
 
+function sequentialReviewer(dir, bodies) {
+  const p = join(dir, 'sequential-reviewer.mjs');
+  const count = join(dir, 'reviewer-count');
+  writeFileSync(p, `import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+const countPath = ${JSON.stringify(count)};
+const calls = existsSync(countPath) ? Number(readFileSync(countPath, 'utf8')) : 0;
+const bodies = ${JSON.stringify(bodies)};
+const out = process.argv[process.argv.indexOf('--out') + 1];
+if (calls >= bodies.length) process.exit(91);
+if (calls > 0 && (!process.argv.includes('--retry-note') || !process.argv.includes('--retry-reason'))) process.exit(92);
+writeFileSync(out, bodies[calls]);
+writeFileSync(countPath, String(calls + 1));
+`);
+  return { path: p, count };
+}
+
 const runHarness = (dir, reviewer) => spawnSync(
   process.execPath,
   // `--no-judge`, or this unit test SPAWNS THE REAL MODEL. spawnSync inherits
@@ -312,13 +428,35 @@ const runHarness = (dir, reviewer) => spawnSync(
   { encoding: 'utf8' },
 );
 
-const fenced = (findings, verdict = 'findings') => '```json\n' + JSON.stringify({
+const fenced = (findings, verdict = 'findings', extra = {}) => '```json\n' + JSON.stringify({
   verdict,
   files_reviewed: ['src/f.ts'],
   riskiest_change: { path: 'src/f.ts', quoted_line: '  if (n > 0) return n;' },
   findings,
+  ...extra,
   end: 'ifc-lite-review-v1',
 }) + '\n```';
+
+/**
+ * A complete per-class pass (#3831), built FROM `DEFECT_CLASSES` so a class
+ * added there is exercised here instead of leaving this fixture green against a
+ * stale list.
+ *
+ * STUB_PATCH visibly carries two classes -- an unpartnered `n > 0` at src/f.ts:3
+ * and a `return 0;` at src/f.ts:4 -- so those two must be `clear` and must cite
+ * a real added line, which is what the validator requires of an applicable
+ * class. The rest are free to be `not-applicable`. `naFor` names extra classes
+ * to wave off, and it may only name classes outside that pair.
+ */
+const STUB_APPLICABLE = { 'one-ended-numeric-bound': 3, 'absence-reads-as-success': 4 };
+const classPass = (naFor = []) => {
+  const na = new Set(naFor);
+  return DEFECT_CLASSES.map((c, i) => (
+    c in STUB_APPLICABLE
+      ? { class: c, verdict: 'clear', why: `walked ${c} at src/f.ts:${STUB_APPLICABLE[c]} (${i})` }
+      : { class: c, verdict: na.has(c) ? 'not-applicable' : 'clear', why: `walked ${c} over the one changed hunk (${i})` }
+  ));
+};
 
 test('ONLY findings that survive validation are scored, and a FENCED response is read', (t) => {
   // Two findings, identical in shape. One quotes a line that is really in the
@@ -342,11 +480,12 @@ test('ONLY findings that survive validation are scored, and a FENCED response is
 
   assert.equal(r.status, 0, said);
   // Exactly one finding survived, it was the real one, and it was RECOGNISED.
-  assert.match(said, /RECALL of known findings: 1\/1/, said);
-  assert.match(said, /EXTRA findings[^:]*: 0/, said);
+  assert.match(said, /VALIDATED recall before judge\/cap: 1\/1/, said); // @source-text-assertion-ok `said` is the harness process stdout+stderr, not a source file
+  assert.match(said, /POSTED recall after judge\/cap: 1\/1/, said); // @source-text-assertion-ok `said` is the harness process stdout+stderr, not a source file
+  assert.match(said, /extra findings[^:]*: 0/i, said); // @source-text-assertion-ok `said` is the harness process stdout+stderr, not a source file
   // The drop names the FABRICATED quote, not merely the word DROPPED, which the
   // whole-output echo on the failure path also satisfies.
-  assert.match(said, /DROPPED[\s\S]*this line is nowhere in the diff/, said);
+  assert.match(said, /DROPPED[\s\S]*this line is nowhere in the diff/, said); // @source-text-assertion-ok `said` is the harness process stdout+stderr, not a source file
   assert.doesNotMatch(said, /a fabricated anchor/, 'a finding that failed validation must not reach the score');
 });
 
@@ -355,16 +494,56 @@ test('a response where NOTHING survives scores ZERO and the eval CARRIES ON', (t
   // Aborting here threw away every other case and reported a broken instrument.
   const dir = tmpCase(t);
   evalCase(dir, { expected: [{ path: 'src/f.ts', what: 'Number(raw) returns NaN and the comparison falls through, closing the session' }] });
-  const reviewer = stubReviewer(dir, fenced([
+  const bad = fenced([
     { path: 'src/f.ts', line: 3, quote: '  not in the diff at all', body: 'x', class: 'numeric-bound' },
-  ]));
-  const r = runHarness(dir, reviewer);
+  ]);
+  const reviewer = sequentialReviewer(dir, [bad, bad]);
+  const r = runHarness(dir, reviewer.path);
   const said = `${r.stdout}${r.stderr}`;
 
   assert.equal(r.status, 0, `the eval must finish and report a score:\n${said}`);
-  assert.match(said, /VALIDATION_EMPTY/, said);
-  assert.match(said, /scored ZERO/, said);
-  assert.match(said, /PRODUCED NO USABLE REVIEW/, 'the recall line must say how many cases produced nothing');
+  assert.equal(readFileSync(reviewer.count, 'utf8'), '2', 'a failed retry must not loop');
+  assert.match(said, /VALIDATION_EMPTY/, said); // @source-text-assertion-ok `said` is the harness process stdout+stderr, not a source file
+  assert.match(said, /scored ZERO/, said); // @source-text-assertion-ok `said` is the harness process stdout+stderr, not a source file
+  assert.match(said, /PRODUCED NO USABLE REVIEW/, 'the recall line must say how many cases produced nothing'); // @source-text-assertion-ok `said` is the harness process stdout+stderr, not a source file
+});
+
+test('#3936: missing findings after the retry scores an unusable review instead of aborting evaluation', (t) => {
+  const dir = tmpCase(t);
+  evalCase(dir, { expected: [{ path: 'src/f.ts', what: 'Number(raw) returns NaN and the comparison falls through, closing the session' }] });
+  // JSON serialization omits the undefined findings field; the real validator
+  // and evaluation classifier process both malformed responses.
+  const malformed = fenced(undefined);
+  const reviewer = sequentialReviewer(dir, [malformed, malformed]);
+  const r = runHarness(dir, reviewer.path);
+  const said = `${r.stdout}${r.stderr}`;
+  assert.equal(r.status, 0, said);
+  assert.equal(readFileSync(reviewer.count, 'utf8'), '2', 'one corrective retry, then finish the evaluation');
+  assert.match(said, /FINDINGS_INVALID/, said); // @source-text-assertion-ok child-process runtime output
+  assert.match(said, /scored ZERO/, said); // @source-text-assertion-ok child-process runtime output
+  assert.match(said, /PRODUCED NO USABLE REVIEW/, said); // @source-text-assertion-ok child-process runtime output
+});
+
+test('#3829: a retryable validation failure gets exactly the production corrective retry', (t) => {
+  const dir = tmpCase(t);
+  evalCase(dir, { expected: [{ path: 'src/f.ts', what: 'Number(raw) returns NaN and the comparison falls through, closing the session' }] });
+  // The first attempt quotes text that is on NO added line, so it is dropped and
+  // retried. (A real quote on the wrong line would now be re-anchored instead of
+  // retried, which is a different, cheaper path.)
+  const first = fenced([
+    { path: 'src/f.ts', line: 2, quote: '  if (n >= 0) return n;', body: 'Number(raw) returns NaN, so the comparison falls through and closes the session.', class: 'numeric-bound' },
+  ]);
+  const corrected = fenced([
+    { path: 'src/f.ts', line: 3, quote: '  if (n > 0) return n;', body: 'Number(raw) returns NaN, so the comparison falls through and closes the session.', class: 'numeric-bound' },
+  ]);
+  const reviewer = sequentialReviewer(dir, [first, corrected]);
+  const r = runHarness(dir, reviewer.path);
+  const said = `${r.stdout}${r.stderr}`;
+
+  assert.equal(r.status, 0, said);
+  assert.equal(readFileSync(reviewer.count, 'utf8'), '2', 'one initial call plus one bounded retry');
+  assert.match(said, /corrective retry ran once/, said); // @source-text-assertion-ok `said` is the harness process stdout+stderr, not a source file
+  assert.match(said, /POSTED recall after judge\/cap: 1\/1/, said); // @source-text-assertion-ok `said` is the harness process stdout+stderr, not a source file
 });
 
 test('an EMPTY response is a HARD ERROR, because the real chain cannot produce one', (t) => {
@@ -381,8 +560,8 @@ test('an EMPTY response is a HARD ERROR, because the real chain cannot produce o
   const said = `${r.stdout}${r.stderr}`;
 
   assert.notEqual(r.status, 0, `an empty response must not produce a score:\n${said}`);
-  assert.match(said, /RAW_EMPTY/, said);
-  assert.doesNotMatch(said, /RECALL of known findings/, 'no recall number may be printed from a run that produced nothing');
+  assert.match(said, /RAW_EMPTY/, said); // @source-text-assertion-ok `said` is the harness process stdout+stderr, not a source file
+  assert.doesNotMatch(said, /POSTED recall after judge\/cap/, 'no recall number may be printed from a run that produced nothing');
 });
 
 test('a VALIDATION failure on the harness\'s own input is a HARD ERROR', (t) => {
@@ -402,8 +581,8 @@ test('a VALIDATION failure on the harness\'s own input is a HARD ERROR', (t) => 
   const said = `${r.stdout}${r.stderr}`;
 
   assert.notEqual(r.status, 0, `an INPUT_INVALID refusal must stop the run:\n${said}`);
-  assert.match(said, /INPUT_INVALID/, said);
-  assert.doesNotMatch(said, /RECALL of known findings/, 'no recall number may be printed from a run that did not happen');
+  assert.match(said, /INPUT_INVALID/, said); // @source-text-assertion-ok `said` is the harness process stdout+stderr, not a source file
+  assert.doesNotMatch(said, /POSTED recall after judge\/cap/, 'no recall number may be printed from a run that did not happen');
 });
 
 test('a finding that only PARAPHRASES THE PR BODY does not score as recall', () => {
@@ -463,4 +642,133 @@ test('the eval reports a CLEAN judging, not only a lossy one', () => {
   assert.equal(shown('JUDGE NOTE: keeping all findings'), true);
   assert.equal(shown('CAPPED: 7 findings, posting 5'), true);
   assert.equal(shown('some unrelated reviewer output'), false, 'and it must not print everything');
+});
+
+// ================= #3831: the per-class pass, through the REAL chain
+
+test('#3831: a clean review that WAVED OFF the case\'s class is a NAMED miss, not a plain one', (t) => {
+  // End to end, through the real validator: the stub answers `clean` with a
+  // complete per-class pass that declares this case's defect class
+  // inapplicable. The verdict is legitimate and is accepted -- what the harness
+  // must not do is print the same MISSED line it prints for a class the
+  // reviewer actually walked.
+  const dir = tmpCase(t);
+  evalCase(dir, {
+    expected: [{
+      path: 'src/f.ts',
+      // `duplicate-site` ON PURPOSE: the applicability predicates cannot see a
+      // second site without a sibling excerpt, and this fixture has none. So the
+      // validator legitimately accepts `not-applicable` here -- and this residual
+      // between what the predicates can see and what the defect population
+      // really is, is exactly what CLASS SKIPPED exists to keep visible.
+      class: 'duplicate-site',
+      what: 'Number(raw) returns NaN so the comparison falls through and closes the session',
+    }],
+  });
+  const reviewer = stubReviewer(dir, fenced([], 'clean', { class_pass: classPass(['duplicate-site']) }));
+  const r = runHarness(dir, reviewer);
+  const said = `${r.stdout}${r.stderr}`;
+
+  assert.equal(r.status, 0, said);
+  assert.match(said, /CLASS SKIPPED/, said); // @source-text-assertion-ok asserts on the harness's own stdout from a real child process, not on any file's source text
+  assert.match(said, /duplicate-site/, said); // @source-text-assertion-ok asserts on the harness's own stdout from a real child process, not on any file's source text
+  assert.match(said, /declared NOT-APPLICABLE: 1 of 1/, said); // @source-text-assertion-ok asserts on the harness's own stdout from a real child process, not on any file's source text
+});
+
+test('#3831: a clean review that WALKED the class is a plain miss, and the count says 0', (t) => {
+  // THE CONTROL, run through the same chain. Identical fixture, identical
+  // verdict, one word different in the pass -- and the harness must say
+  // something different. Without this the assertions above are satisfied by a
+  // harness that prints CLASS SKIPPED on every miss.
+  const dir = tmpCase(t);
+  evalCase(dir, {
+    expected: [{
+      path: 'src/f.ts',
+      class: 'duplicate-site',
+      what: 'Number(raw) returns NaN so the comparison falls through and closes the session',
+    }],
+  });
+  const reviewer = stubReviewer(dir, fenced([], 'clean', { class_pass: classPass() }));
+  const r = runHarness(dir, reviewer);
+  const said = `${r.stdout}${r.stderr}`;
+
+  assert.equal(r.status, 0, said);
+  assert.doesNotMatch(said, /CLASS SKIPPED/, said);
+  assert.match(said, /declared NOT-APPLICABLE: 0 of 1/, said); // @source-text-assertion-ok asserts on the harness's own stdout from a real child process, not on any file's source text
+});
+
+test('#3831: a clean review with NO per-class pass is refused, retried once, and scores ZERO', (t) => {
+  // The shape three live evaluations produced on 13-14 of 18 pull requests: a
+  // well-formed `clean` with nothing showing the classes were ever walked. It
+  // must not be scored as a review that looked and found nothing, and the retry
+  // must be the same bounded single attempt the workflow runs -- not a loop.
+  const dir = tmpCase(t);
+  evalCase(dir, {
+    expected: [{
+      path: 'src/f.ts',
+      class: 'duplicate-site',
+      what: 'Number(raw) returns NaN so the comparison falls through and closes the session',
+    }],
+  });
+  const bare = fenced([], 'clean');
+  const reviewer = sequentialReviewer(dir, [bare, bare]);
+  const r = runHarness(dir, reviewer.path);
+  const said = `${r.stdout}${r.stderr}`;
+
+  assert.equal(r.status, 0, `the eval must finish and report a score:\n${said}`);
+  assert.equal(readFileSync(reviewer.count, 'utf8'), '2', 'one initial call plus one bounded retry');
+  assert.match(said, /CLASS_PASS_INCOMPLETE/, said); // @source-text-assertion-ok asserts on the harness's own stdout from a real child process, not on any file's source text
+  assert.match(said, /scored ZERO/, said); // @source-text-assertion-ok asserts on the harness's own stdout from a real child process, not on any file's source text
+  assert.match(said, /PRODUCED NO USABLE REVIEW/, said); // @source-text-assertion-ok asserts on the harness's own stdout from a real child process, not on any file's source text
+  // A refused review declared nothing, so nothing may be attributed to it: the
+  // document whose class_pass FAILED is the last thing to read a skip off.
+  assert.doesNotMatch(said, /CLASS SKIPPED/, said);
+});
+
+test('#3831: a clean review whose per-class pass is one sentence twelve times is refused', (t) => {
+  // The cheapest way to comply without doing the work, exercised through the
+  // real validator rather than only as a unit.
+  const dir = tmpCase(t);
+  evalCase(dir, { expected: [{ path: 'src/f.ts', what: 'Number(raw) returns NaN and the comparison falls through' }] });
+  const same = fenced([], 'clean', {
+    class_pass: DEFECT_CLASSES.map((c) => ({ class: c, verdict: 'clear', why: 'nothing of this kind here' })),
+  });
+  const reviewer = sequentialReviewer(dir, [same, same]);
+  const r = runHarness(dir, reviewer.path);
+  const said = `${r.stdout}${r.stderr}`;
+
+  assert.equal(r.status, 0, said);
+  assert.match(said, /CLASS_PASS_INCOMPLETE/, said); // @source-text-assertion-ok asserts on the harness's own stdout from a real child process, not on any file's source text
+  assert.match(said, /scored ZERO/, said); // @source-text-assertion-ok asserts on the harness's own stdout from a real child process, not on any file's source text
+});
+
+test('#3831 round 2: a per-class pass of "no such code in diff (n)" is refused through the real chain', (t) => {
+  // The evasion shape, end to end. STUB_PATCH carries an unpartnered comparison
+  // and a `return 0;`, so two classes visibly apply and cannot be waved off --
+  // and the eval must score the case zero rather than as a review that looked.
+  const dir = tmpCase(t);
+  evalCase(dir, { expected: [{ path: 'src/f.ts', what: 'Number(raw) returns NaN and the comparison falls through' }] });
+  const evasion = fenced([], 'clean', {
+    class_pass: DEFECT_CLASSES.map((c, i) => ({ class: c, verdict: 'not-applicable', why: `no such code in diff (${i})` })),
+  });
+  const reviewer = sequentialReviewer(dir, [evasion, evasion]);
+  const r = runHarness(dir, reviewer.path);
+  const said = `${r.stdout}${r.stderr}`;
+
+  assert.equal(r.status, 0, said);
+  assert.match(said, /CLASS_PASS_INCOMPLETE/, said); // @source-text-assertion-ok asserts on the harness's own stdout from a real child process, not on any file's source text
+  assert.match(said, /scored ZERO/, said); // @source-text-assertion-ok asserts on the harness's own stdout from a real child process, not on any file's source text
+  assert.doesNotMatch(said, /CLASS SKIPPED/, 'a refused review declared nothing to attribute');
+});
+
+test('#3831 round 2: notApplicableClasses reads nothing off a verdict the pass never covered', () => {
+  // The docblock promised "[] for anything that is not a validated clean pass"
+  // while the code checked only that `class_pass` was an array. A `findings`
+  // verdict is exempt from the pass entirely, so a `class_pass` riding on one
+  // was never checked against anything and must not produce a skip.
+  const rows = [{ class: 'duplicate-site', verdict: 'not-applicable', why: 'a reason nothing validated' }];
+  assert.deepEqual(notApplicableClasses({ verdict: 'clean', class_pass: rows }), ['duplicate-site']);
+  assert.deepEqual(notApplicableClasses({ verdict: 'findings', class_pass: rows }), []);
+  assert.deepEqual(notApplicableClasses({ class_pass: rows }), []);
+  assert.deepEqual(notApplicableClasses({ verdict: 'clean' }), []);
 });

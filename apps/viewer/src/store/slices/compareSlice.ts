@@ -12,8 +12,17 @@
  */
 
 import type { StateCreator } from 'zustand';
-import type { DiffScope, ModelDiff } from '@ifc-lite/diff';
+import type { DiffScope, IdentityMapEntry, ModelDiff } from '@ifc-lite/diff';
 import type { CompareRef } from '@/lib/compare/buildFingerprints';
+import {
+  addAcceptedIdentity,
+  rejectClaim,
+  removeAcceptedIdentity,
+  type AcceptedIdentity,
+  type ComparePair,
+  type RejectedClaim,
+} from '@/lib/compare/acceptedIdentity';
+import type { IfcDataStore } from '@ifc-lite/parser';
 import { defineSliceTeardown, notApplicable } from '../teardown.js';
 
 /** A completed comparison: the engine result plus the A/B context it ran on. */
@@ -31,6 +40,22 @@ export interface CompareResult {
   /** True when a compared model carries no geometry hashes (loaded outside the
    *  WASM mesh path), so geometry-scope changes can't be detected. */
   geometryUnavailable: boolean;
+  /**
+   * The authored key scheme this comparison ran under (issue #4989):
+   * `Tag` or `<PsetName>.<PropertyName>`, or `undefined` for GlobalId. Fixed
+   * at extraction time (`useCompare`'s `BuiltPair`), so it always agrees with
+   * the fingerprint keys the diff below was actually computed on. Decisions
+   * (`AcceptedIdentity` / `RejectedClaim`) are scoped to a pair carrying this
+   * same value — a GlobalId a user accepted must not replay under a
+   * different scheme, and vice versa.
+   */
+  keyProperty?: string;
+  /**
+   * Authored values more than one entity carried within either revision —
+   * resolved to GlobalId instead of `prop:<value>` for every owner on both
+   * revisions. Present only when non-empty.
+   */
+  duplicateAuthoredKeys?: ReadonlyMap<string, number[]>;
   /** `geometryUnavailable` with placement fingerprints still in play (both
    *  sides mesh-less, placements kept): the geometry channel still reports
    *  placement-driven moves, only reshapes are invisible — the warning must
@@ -46,6 +71,12 @@ export interface CompareResult {
   excludedHiddenIds: Set<number>;
   /** The engine output — entries keyed by GlobalId, with per-entity refs. */
   diff: ModelDiff<CompareRef>;
+  /** Stores the diff was computed from, for each model compared with unsaved
+   *  edits (#5312); read entry data back through `modelsAsCompared`. */
+  comparedStores?: ReadonlyMap<string, IfcDataStore>;
+  /** Store `mutationVersion` the comparison was computed at (#5312). A result
+   *  whose version is behind the store's describes a pre-edit model. */
+  mutationVersion?: number;
 }
 
 /** localStorage key for the cross-file compare blacklist (issue #1470). */
@@ -141,6 +172,14 @@ export interface CompareSlice {
    * same way as {@link compareExcludedTypes} so an opt-out survives a reload.
    */
   compareMatchByContent: boolean;
+  /**
+   * An authored key to compare on instead of GlobalId (issue #4989): `Tag`
+   * or `<PsetName>.<PropertyName>`, validated with `parseAuthoredKeySpec`
+   * before it ever lands here — an invalid spec is never applied, so this
+   * field is always `undefined` or a parseable spec. `undefined` means
+   * GlobalId, the pre-#4989 default.
+   */
+  compareKeyProperty?: string;
   /** Whether unchanged elements are drawn (ghosted) or hidden. */
   compareShowUnchanged: boolean;
   /** Last comparison result (null when idle / not yet run). */
@@ -158,6 +197,22 @@ export interface CompareSlice {
   compareError: string | null;
   /** GlobalId of the entry focused in the list (for highlight). */
   compareSelectedKey: string | null;
+  /**
+   * Identity the user accepted this session out of the Suggestions section
+   * or imported from an identity-map sidecar (issue #4955): `{ base, here,
+   * reason }` with reason `successor:<confidence>` or `accepted:ambiguous`,
+   * each tagged with the (A, B) model pair it was accepted for - a GlobalId
+   * means nothing outside its file, so a decision for A vs B is never
+   * replayed onto A vs C (`acceptedForPair`). Replayed as `keyAliases` on
+   * every diff of its pair, so an accepted pair classifies by key and leaves
+   * the suggestions. Kept 1:1 per pair by `addAcceptedIdentity`. Survives
+   * `clearCompare` (the decisions outlive one run's result) and dies with
+   * the session.
+   */
+  compareAcceptedIdentity: AcceptedIdentity[];
+  /** Suggestions the user marked "Not the same", per model pair, so they are
+   *  hidden and never re-offered this session. */
+  compareRejectedClaims: RejectedClaim[];
 
   setComparePanelVisible: (visible: boolean) => void;
   toggleComparePanel: () => void;
@@ -174,6 +229,9 @@ export interface CompareSlice {
   clearCompareExcludedTypes: () => void;
   /** Turn the content-matching pass on/off (persisted). */
   setCompareMatchByContent: (enabled: boolean) => void;
+  /** Set the authored-key scheme (`undefined` for GlobalId). Callers must
+   *  validate with `parseAuthoredKeySpec` first — the slice does not. */
+  setCompareKeyProperty: (keyProperty: string | undefined) => void;
   setCompareShowUnchanged: (show: boolean) => void;
   setCompareResult: (result: CompareResult | null) => void;
   bumpCompareRunSeq: () => void;
@@ -182,6 +240,13 @@ export interface CompareSlice {
   setCompareSelectedKey: (key: string | null) => void;
   /** Clear the run result + selection; keeps the A/B + scope choices. */
   clearCompare: () => void;
+  /** Accept identity entries for a model pair; returns the ones refused for
+   *  colliding with a pair already accepted (identity is 1:1). */
+  acceptCompareIdentity: (pair: ComparePair, entries: Iterable<IdentityMapEntry>) => IdentityMapEntry[];
+  /** Withdraw one accepted pair. */
+  removeCompareIdentity: (pair: ComparePair, base: string, here: string) => void;
+  /** Mark a suggested pair "Not the same". */
+  rejectCompareClaim: (pair: ComparePair, base: string, here: string) => void;
 }
 
 /**
@@ -205,25 +270,42 @@ function getClearedCompareState() {
   } as const;
 }
 
+/** A session reset also drops the reviewed identity (#4955): the decisions
+ *  name entities of the outgoing files. `clearCompare` keeps them. */
+function getResetCompareState() {
+  return {
+    ...getClearedCompareState(),
+    compareAcceptedIdentity: [] as AcceptedIdentity[],
+    compareRejectedClaims: [] as RejectedClaim[],
+    // A session reset drops the key scheme with the decisions it gates
+    // (#4989): both name entities/claims of the outgoing files' authored
+    // properties, which mean nothing once those files are gone.
+    compareKeyProperty: undefined as string | undefined,
+  };
+}
+
 export const compareTeardown = defineSliceTeardown(
   'compareSlice',
-  ['compareResult', 'compareSelectedKey', 'compareRunning', 'compareError'],
-  { 'session-reset': getClearedCompareState, 'model-removed': notApplicable, 'all-models-cleared': notApplicable },
+  ['compareResult', 'compareSelectedKey', 'compareRunning', 'compareError', 'compareAcceptedIdentity', 'compareRejectedClaims', 'compareKeyProperty'],
+  { 'session-reset': getResetCompareState, 'model-removed': notApplicable, 'all-models-cleared': notApplicable },
 );
 
-export const createCompareSlice: StateCreator<CompareSlice, [], [], CompareSlice> = (set) => ({
+export const createCompareSlice: StateCreator<CompareSlice, [], [], CompareSlice> = (set, get) => ({
   comparePanelVisible: false,
   compareBaseModelId: null,
   compareHeadModelId: null,
   compareScope: 'both',
   compareExcludedTypes: loadPersistedExcludedTypes(),
   compareMatchByContent: loadPersistedMatchByContent(),
+  compareKeyProperty: undefined,
   compareShowUnchanged: false,
   compareResult: null,
   compareRunSeq: 0,
   compareRunning: false,
   compareError: null,
   compareSelectedKey: null,
+  compareAcceptedIdentity: [],
+  compareRejectedClaims: [],
 
   setComparePanelVisible: (comparePanelVisible) => set({ comparePanelVisible }),
   toggleComparePanel: () => set((s) => ({ comparePanelVisible: !s.comparePanelVisible })),
@@ -265,6 +347,12 @@ export const createCompareSlice: StateCreator<CompareSlice, [], [], CompareSlice
     set({ compareMatchByContent });
   },
 
+  setCompareKeyProperty: (compareKeyProperty) => set((state) => (
+    state.compareKeyProperty === compareKeyProperty
+      ? state
+      : { ...getClearedCompareState(), compareKeyProperty }
+  )),
+
   setCompareShowUnchanged: (compareShowUnchanged) => set({ compareShowUnchanged }),
   setCompareResult: (compareResult) => set({ compareResult }),
   bumpCompareRunSeq: () => set((s) => ({ compareRunSeq: s.compareRunSeq + 1 })),
@@ -273,4 +361,21 @@ export const createCompareSlice: StateCreator<CompareSlice, [], [], CompareSlice
   setCompareSelectedKey: (compareSelectedKey) => set({ compareSelectedKey }),
 
   clearCompare: () => set(getClearedCompareState()),
+
+  acceptCompareIdentity: (pair, additions) => {
+    const { entries, refused } = addAcceptedIdentity(get().compareAcceptedIdentity, pair, additions);
+    // Same-array-when-unchanged: no subscriber re-renders for a duplicate accept.
+    if (entries !== get().compareAcceptedIdentity) set({ compareAcceptedIdentity: entries });
+    return refused;
+  },
+  removeCompareIdentity: (pair, base, here) =>
+    set((s) => {
+      const compareAcceptedIdentity = removeAcceptedIdentity(s.compareAcceptedIdentity, pair, base, here);
+      return compareAcceptedIdentity === s.compareAcceptedIdentity ? s : { compareAcceptedIdentity };
+    }),
+  rejectCompareClaim: (pair, base, here) =>
+    set((s) => {
+      const compareRejectedClaims = rejectClaim(s.compareRejectedClaims, pair, base, here);
+      return compareRejectedClaims === s.compareRejectedClaims ? s : { compareRejectedClaims };
+    }),
 });

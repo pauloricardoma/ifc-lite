@@ -59,7 +59,8 @@
  * `lib/compare/compareScope.ts`, the sibling `IfcProduct`-level predicate).
  */
 
-import { getInheritanceChainAcrossSchemas } from '@ifc-lite/parser';
+import { getInheritanceChainAcrossSchemas, type IfcDataStore } from '@ifc-lite/parser';
+import { iterateEffectiveEntityIds, type MutablePropertyView } from '@ifc-lite/mutations';
 
 /** Ancestor that makes an entity a physical object. */
 const PHYSICAL_ROOT = 'IFCELEMENT';
@@ -115,6 +116,32 @@ export function collectPhysicalEntityIds(byType: EntityIdsByType | null | undefi
   for (const [typeName, entityIds] of byType) {
     if (!isPhysicalObjectType(typeName)) continue;
     for (const id of entityIds) ids.add(id);
+  }
+  return ids;
+}
+
+/** Physical ids in a model's live overlay, including retypes and creations (#5249). */
+export function collectEffectivePhysicalEntityIds(
+  store: IfcDataStore,
+  view: MutablePropertyView | null | undefined,
+): Set<number> {
+  const ids = new Set<number>();
+  // #5477: the source index is dominated by property and geometry records.
+  // Ask the canonical overlay-aware iterator for physical exact classes only;
+  // include overlay-only classes so a retype or creation can enter the set even
+  // when its new class had no source bucket.
+  const types = new Set<string>();
+  const includePhysical = (type: string) => {
+    if (isPhysicalObjectType(type)) types.add(type.toUpperCase());
+  };
+  // @raw-entity-enumeration-ok inspect class keys only; the shared iterator below decides effective IDs and applies overlay edits
+  for (const type of store.entityIndex.byType.keys()) includePhysical(type);
+  for (const mutation of view?.getTypeMutations().values() ?? []) includePhysical(mutation.newType);
+  for (const entity of view?.getNewEntities() ?? []) includePhysical(entity.type);
+  // An empty type list means "unfiltered" to iterateEffectiveEntityIds.
+  if (types.size === 0) return ids;
+  for (const { expressId } of iterateEffectiveEntityIds(store, view, [...types])) {
+    ids.add(expressId);
   }
   return ids;
 }

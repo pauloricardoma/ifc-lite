@@ -25,7 +25,7 @@
 //! // idx_ranges: [idx_offset, idx_len] per element
 //! // aabbs: [minx, miny, minz, maxx, maxy, maxz] per element
 //! session.ingest(&[], &[], &[], &[], &[]);
-//! let result = session.run_rule(&[], &[], 0, 0.0, 0.0, false);
+//! let result = session.run_rule(&[], None, 0, 0.0, 0.0, false);
 //! assert!(result.records.is_empty());
 //! ```
 
@@ -48,3 +48,7 @@ pub use session::{ClashRecord, ClashSession, RuleResult};
 mod kernel_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod world_frame_corpus;
+#[cfg(test)]
+mod world_frame_tests;

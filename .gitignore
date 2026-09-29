@@ -81,7 +81,7 @@ nul
 # Local test models (private, never committed)
 tests/models/local
 
-# IFC test fixtures are fetched on demand via `pnpm fixtures` and listed in
+# Model test fixtures are fetched on demand via `pnpm fixtures` and listed in
 # tests/models/manifest.json. They must NOT be committed to the repo. The
 # fixture directories themselves are ignored too: in a worktree they may be
 # machine-local symlinks into the primary checkout.
@@ -91,6 +91,12 @@ tests/models/various
 tests/models/**/*.ifc
 tests/models/**/*.IFC
 tests/models/**/*.ifcx
+tests/models/**/*.ifczip
+tests/models/**/*.xml
+tests/models/**/*.XML
+tests/models/landxml/**/*.json
+tests/models/landxml/**/*.xyz
+tests/models/landxml/**/*.tif
 # Partial downloads from the fetcher.
 tests/models/**/*.part
 
@@ -143,3 +149,11 @@ apps/*/tsconfig.tests.json
 # the negation is a no-op, and scripts/check-ci-path-coverage.mjs throws on any
 # negated pattern in this file.
 .cursor/
+
+# scripts/perf/browser-cold-ab.mts (#3978): raw per-sample JSON/console-log/
+# screenshot evidence and any private local-corpus manifest. The corpus
+# manifest points at local file paths outside the repo (private, sometimes
+# multi-GB models) and must never be committed; see browser-corpus.example.json
+# for the shape.
+scripts/perf/.browser-cold-ab-results/
+scripts/perf/browser-corpus.local.json

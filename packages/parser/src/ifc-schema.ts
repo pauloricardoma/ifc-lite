@@ -10,16 +10,22 @@
  */
 
 import { SCHEMA_REGISTRY, getAllAttributesForEntity, isKnownEntity, getInheritanceChainForEntity, getEntityMetadata } from './generated/schema-registry.js';
-import { ENTITIES_IFC2X3, ENTITIES_IFC4, ENTITIES_IFC4X3, IFC_DATA_TYPES, type IfcEntityInfo } from '@ifc-lite/data';
+import { getSchemaRegistryForVersion } from './generated/schema-registry-by-version.js';
+import { ENTITIES_IFC2X3, ENTITIES_IFC4_EXPRESS, ENTITIES_IFC4X3, IFC_DATA_TYPES, type IfcEntityInfo } from '@ifc-lite/data';
 
 // Union map across every bundled IFC schema (2X3 + 4 + 4X3). The parser
 // has to categorize entities from ANY schema the user loads — so the
 // inheritance walk must consult more than the IFC4 registry the parser's
 // codegen pinned. Later schemas win on name collision (a non-issue in
 // practice because the modern schemas are supersets).
+//
+// The IFC4 table is `ENTITIES_IFC4_EXPRESS`, not the raw `ENTITIES_IFC4`: the
+// raw table carries alignment-extension entities IFC4 does not declare
+// (#5204), and folding them in made `isKnownType` answer `true` for names no
+// bundled schema has.
 const ENTITY_INFO_BY_UPPER: Map<string, IfcEntityInfo> = (() => {
     const map = new Map<string, IfcEntityInfo>();
-    for (const list of [ENTITIES_IFC2X3, ENTITIES_IFC4, ENTITIES_IFC4X3]) {
+    for (const list of [ENTITIES_IFC2X3, ENTITIES_IFC4_EXPRESS, ENTITIES_IFC4X3]) {
         for (const entity of list) {
             map.set(entity.name.toUpperCase(), entity);
         }
@@ -33,9 +39,18 @@ const ENTITY_INFO_BY_UPPER: Map<string, IfcEntityInfo> = (() => {
 // authoring tools emit the leaf. Resolving the alias to its closest
 // schema-known supertype lets the inheritance walk reach IfcProduct.
 //
-// Mirrors `rust/core/src/legacy_entities.rs` so the two sides stay in
-// lockstep — if you add a row here, add the matching Rust entry too.
-const ENTITY_NAME_ALIASES: Record<string, string> = {
+// Exported from this module (not from the package index) so
+// `query-backend-maps.test.ts` can pin every row against the DESCENDANT
+// direction: `@ifc-lite/data`'s `expandTypeNamesToDescendants` carries its own
+// copy of these rows — it cannot import this one, since the dependency runs
+// the other way — and a row honoured walking up but not walking down means
+// `byType('IfcGeotechnicalStratum')` answers zero on a file full of
+// IFCSOLIDSTRATUM records. That test is the link between the two copies.
+//
+// `rust/core/src/legacy_entities.rs` is the third home, on the other side of
+// the language boundary — if you add a row here, add the matching Rust entry
+// too.
+export const ENTITY_NAME_ALIASES: Record<string, string> = {
     // IFC4.3 stratum subtypes (issue #860) — schema only has the abstract
     // `IfcGeotechnicalStratum`, real models emit one of these three leaves
     // with a PredefinedType pinned (SOLID / VOID / WATER).
@@ -61,8 +76,9 @@ const ENTITY_NAME_ALIASES: Record<string, string> = {
  * (the STEP exporter's enum-slot resolution) have to canonicalize the SAME way
  * {@link getAttributeNamesAcrossSchemas} does, or their indices refer to a
  * different attribute list than the names they are indices into. Copying the
- * table into another package would give it a third home — this one and
- * `rust/core/src/legacy_entities.rs` are already two.
+ * table into another package would give it a further home — this one,
+ * `@ifc-lite/data`'s descendant-direction copy and
+ * `rust/core/src/legacy_entities.rs` are already three.
  */
 export function resolveEntityNameAlias(type: string): string {
     return ENTITY_NAME_ALIASES[type.toUpperCase()] ?? type;
@@ -159,6 +175,36 @@ export function getAttributeNamesAcrossSchemas(type: string): string[] {
     const canonical = resolveEntityNameAlias(type);
     const info = ENTITY_INFO_BY_UPPER.get(canonical.toUpperCase());
     return info ? [...info.attributes] : [];
+}
+
+/** Attribute names in one model schema, falling back to the bundled union. */
+export function getAttributeNamesForSchema(type: string, schema: string | undefined): string[] {
+    const normalized = schema?.toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (normalized === 'IFC2X3' || normalized === 'IFC4' || normalized === 'IFC4X3') {
+        const registry = getSchemaRegistryForVersion(normalized);
+        const canonical = Object.keys(registry.entities).find(name => name.toUpperCase() === type.toUpperCase());
+        const attributes = canonical ? registry.entities[canonical]?.allAttributes : undefined;
+        if (attributes) return attributes.map(attribute => attribute.name);
+    }
+    return getAttributeNamesAcrossSchemas(type);
+}
+
+/**
+ * The declared EXPRESS type of one attribute (`IfcDoorPanelProperties.PanelOperation`
+ * → `IfcDoorPanelOperationEnum`) in one model schema, falling back to the IFC4
+ * pin. `undefined` when the entity or attribute is unknown. IDS reads a
+ * predefined property set's attributes as properties, and this is their dataType.
+ */
+export function getAttributeTypeForSchema(type: string, attribute: string, schema: string | undefined): string | undefined {
+    const normalized = schema?.toUpperCase().replace(/[^A-Z0-9]/g, '');
+    let attributes: ReadonlyArray<{ name: string; type: string }> | undefined;
+    if (normalized === 'IFC2X3' || normalized === 'IFC4' || normalized === 'IFC4X3') {
+        const registry = getSchemaRegistryForVersion(normalized);
+        const canonical = Object.keys(registry.entities).find(name => name.toUpperCase() === type.toUpperCase());
+        attributes = canonical ? registry.entities[canonical]?.allAttributes : undefined;
+    }
+    attributes ??= getAllAttributesForEntity(type);
+    return attributes.find(a => a.name === attribute)?.type;
 }
 
 /**
@@ -290,4 +336,3 @@ export function isQueryableObjectType(type: string): boolean {
     if (!chain.includes('IfcObjectDefinition')) return false;
     return !chain.includes('IfcTypeObject');
 }
-

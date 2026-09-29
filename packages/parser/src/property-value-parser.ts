@@ -17,10 +17,55 @@ import type { EntityExtractor } from './entity-extractor.js';
 import { PropertyValueType } from '@ifc-lite/data';
 import type { PropertyValue } from '@ifc-lite/data';
 import type { IfcDataStore } from './columnar-parser.js';
+import { resolvePropertyReferenceValue } from './property-reference-value.js';
+import { resolveComplexPropertyValue } from './property-complex-value.js';
+
+export { resolveComplexPropertyValue };
 
 // ============================================================================
 // Property Value Parsing Helpers
 // ============================================================================
+
+/** One decoded `IfcProperty`. `dataType` is the IFC type of the value (for a
+ *  list or enumeration, the one type all members share). `dataTypeMixed`
+ *  marks an `IfcPropertyTableValue`, whose columns carry different types by
+ *  design, so no single `dataType` exists (#5224). */
+export interface ParsedIfcPropertyValue {
+    type: number;
+    value: PropertyValue;
+    values?: string[];
+    dataType?: string;
+    dataTypeMixed?: true;
+    /**
+     * Which `IfcProperty` subtype carried the value, when it is not a single
+     * value. `values` then holds the candidates a rule reads: every member of
+     * an enumerated or list value, every cell of a table (#5475).
+     */
+    structure?: 'enumerated' | 'bounded' | 'list' | 'table' | 'reference' | 'complex';
+    /** `IfcComplexProperty` only: each nested property, by its own `Name`, decoded the same way (#5475). */
+    members?: ExtractedProperty[];
+}
+
+/** One property as the on-demand extractors return it: the parsed value
+ *  plus its name and, when the file declares one, its explicit unit. */
+export interface ExtractedProperty extends ParsedIfcPropertyValue {
+    name: string;
+    unit?: string;
+    unitSiScale?: number;
+}
+
+/** The IFC type every typed member of a list shares, or `undefined` when a
+ *  member is untyped or the types differ. */
+function sharedMemberType(members: unknown[]): string | undefined {
+    let shared: string | undefined;
+    for (const m of members) {
+        if (!Array.isArray(m) || m.length !== 2) return undefined;
+        const t = String(m[0]).toUpperCase();
+        if (shared !== undefined && shared !== t) return undefined;
+        shared = t;
+    }
+    return shared;
+}
 
 /**
  * Parse a property entity's value based on its IFC type.
@@ -30,9 +75,9 @@ import type { IfcDataStore } from './columnar-parser.js';
  * - IfcPropertyBoundedValue: upper/lower bounds → "value [min – max]"
  * - IfcPropertyListValue: list of values → joined string
  * - IfcPropertyTableValue: defining/defined value pairs → "Table(N rows)"
- * - IfcPropertyReferenceValue: entity reference → "Reference #ID"
+ * - IfcPropertyReferenceValue: `#<id>` of the reference (slot 3); `parsePropertyValueWithComplex` reads the referenced Name instead
  */
-export function parsePropertyValue(propEntity: IfcEntity): { type: number; value: PropertyValue; values?: string[]; dataType?: string } {
+export function parsePropertyValue(propEntity: IfcEntity): ParsedIfcPropertyValue {
     const attrs = propEntity.attributes || [];
     const typeUpper = propEntity.type.toUpperCase();
 
@@ -49,7 +94,8 @@ export function parsePropertyValue(propEntity: IfcEntity): { type: number; value
                 // checks can iterate "any matching value passes". The
                 // joined display string remains the primary `value`
                 // for visualisation/property-table consumers.
-                return { type: 0, value: values.join(', ') || null, values };
+                const dataType = sharedMemberType(enumValues);
+                return { type: 0, value: values.join(', ') || null, values, structure: 'enumerated', ...(dataType ? { dataType } : {}) };
             }
             return { type: 0, value: null };
         }
@@ -88,6 +134,7 @@ export function parsePropertyValue(propEntity: IfcEntity): { type: number; value
             return {
                 type: displayValue != null ? 1 : 0,
                 value: display || null,
+                structure: 'bounded',
                 ...(candidates.length > 0 ? { values: candidates } : {}),
                 ...(dataType ? { dataType } : {}),
             };
@@ -101,7 +148,8 @@ export function parsePropertyValue(propEntity: IfcEntity): { type: number; value
                     if (Array.isArray(v) && v.length === 2) return String(v[1]);
                     return String(v);
                 }).filter(v => v !== 'null' && v !== 'undefined');
-                return { type: 0, value: values.join(', ') || null, values };
+                const dataType = sharedMemberType(listValues);
+                return { type: 0, value: values.join(', ') || null, values, structure: 'list', ...(dataType ? { dataType } : {}) };
             }
             return { type: 0, value: null };
         }
@@ -123,28 +171,31 @@ export function parsePropertyValue(propEntity: IfcEntity): { type: number; value
                     ...definingValues.map(stringify),
                     ...definedValues.map(stringify),
                 ].filter(v => v !== 'null' && v !== 'undefined');
-                // Tables mix types per column (label / length / …),
-                // so we can't surface a single representative
-                // dataType. Leaving it unset lets the IDS check fall
-                // through to a pure value match against any of the
-                // candidates — which is what upstream ifctester does
-                // for table values.
+                // Tables mix types per column (label / length / …), so
+                // there is no single dataType. Say so explicitly: an IDS
+                // dataType check then falls through to a value match
+                // against the candidates, as upstream ifctester does. An
+                // absent dataType anywhere else means "unknown" and fails
+                // such a check (#5224).
                 return {
                     type: 0,
                     value: `Table (${rowCount} rows)`,
                     values,
+                    dataTypeMixed: true,
+                    structure: 'table',
                 };
             }
             return { type: 0, value: null };
         }
 
         case 'IFCPROPERTYREFERENCEVALUE': {
-            // [Name, Description, PropertyReference]
-            const refValue = attrs[2];
-            if (typeof refValue === 'number') {
-                return { type: 0, value: `#${refValue}` };
-            }
-            return { type: 0, value: null };
+            // [Name, Description, UsageName, PropertyReference]. Without a
+            // store the referenced object cannot be read, so only its id is
+            // known; `parsePropertyValueWithComplex` reads its Name (#5475).
+            const refValue = attrs[3];
+            return typeof refValue === 'number'
+                ? { type: 0, value: `#${refValue}`, structure: 'reference' }
+                : { type: 0, value: null, structure: 'reference' };
         }
 
         default: {
@@ -229,61 +280,13 @@ export function extractNumericValue(attr: unknown): number | null {
     return null;
 }
 
-/** Guards {@link resolveComplexPropertyValue} against a pathological/cyclic
- *  HasProperties chain; real IFC nests IfcComplexProperty at most a couple of
- *  levels deep (e.g. Pset "sub-properties"). */
-const MAX_COMPLEX_PROPERTY_DEPTH = 8;
-
-/**
- * Resolve an `IfcComplexProperty`'s nested `HasProperties` (EXPRESS:
- * `[Name, Description, UsageName, HasProperties]`, index 3) into a display
- * value plus a flat `values` candidate list, recursing into any further
- * nested `IfcComplexProperty`. Without this, {@link parsePropertyValue}'s
- * default branch reads attribute index 2 as if it were a `NominalValue`,
- * which for `IfcComplexProperty` is `UsageName` — a label, not a value — and
- * every nested property silently vanishes from the panel/query output.
- */
-export function resolveComplexPropertyValue(
-    store: IfcDataStore,
-    extractor: EntityExtractor,
-    propEntity: IfcEntity,
-    depth = 0
-): { type: number; value: PropertyValue; values?: string[]; dataType?: string } {
-    const attrs = propEntity.attributes || [];
-    const usageName = typeof attrs[2] === 'string' ? attrs[2] : '';
-    const hasProperties = attrs[3];
-
-    if (!Array.isArray(hasProperties) || depth >= MAX_COMPLEX_PROPERTY_DEPTH) {
-        return { type: PropertyValueType.String, value: usageName || null };
-    }
-
-    const parts: string[] = [];
-    const values: string[] = [];
-
-    for (const ref of hasProperties) {
-        if (typeof ref !== 'number') continue;
-        const nestedRef = store.entityIndex.byId.get(ref) ?? store.deferredEntityIndex?.get(ref);
-        if (!nestedRef) continue;
-        const nestedEntity = extractor.extractEntity(nestedRef);
-        if (!nestedEntity) continue;
-
-        const nestedAttrs = nestedEntity.attributes || [];
-        const nestedName = typeof nestedAttrs[0] === 'string' ? nestedAttrs[0] : '';
-        const nestedParsed = nestedEntity.type.toUpperCase() === 'IFCCOMPLEXPROPERTY'
-            ? resolveComplexPropertyValue(store, extractor, nestedEntity, depth + 1)
-            : parsePropertyValue(nestedEntity);
-
-        const display = nestedParsed.value != null ? String(nestedParsed.value) : '';
-        if (!display) continue;
-        parts.push(nestedName ? `${nestedName}: ${display}` : display);
-        values.push(display);
-    }
-
-    return {
-        type: PropertyValueType.String,
-        value: parts.length > 0 ? parts.join(', ') : (usageName || null),
-        ...(values.length > 0 ? { values } : {}),
-    };
+/** Copy the optional parts of a decoded value onto an extracted property. */
+export function copyParsedExtras(entry: ExtractedProperty, parsed: ParsedIfcPropertyValue): void {
+    if (parsed.values) entry.values = parsed.values;
+    if (parsed.dataType) entry.dataType = parsed.dataType;
+    if (parsed.dataTypeMixed) entry.dataTypeMixed = true;
+    if (parsed.structure) entry.structure = parsed.structure;
+    if (parsed.members) entry.members = parsed.members;
 }
 
 /** Dispatch a pset member to {@link resolveComplexPropertyValue} for
@@ -292,9 +295,13 @@ export function parsePropertyValueWithComplex(
     store: IfcDataStore,
     extractor: EntityExtractor,
     propEntity: IfcEntity
-): { type: number; value: PropertyValue; values?: string[]; dataType?: string } {
-    if (propEntity.type.toUpperCase() === 'IFCCOMPLEXPROPERTY') {
+): ParsedIfcPropertyValue {
+    const type = propEntity.type.toUpperCase();
+    if (type === 'IFCCOMPLEXPROPERTY') {
         return resolveComplexPropertyValue(store, extractor, propEntity);
+    }
+    if (type === 'IFCPROPERTYREFERENCEVALUE') {
+        return resolvePropertyReferenceValue(store, extractor, propEntity);
     }
     return parsePropertyValue(propEntity);
 }

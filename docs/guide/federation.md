@@ -12,6 +12,54 @@ Model B: expressIds 1-3000    -> globalIds 5001-8000    (offset: 5000)
 Model C: expressIds 1-2000    -> globalIds 8001-10000   (offset: 8000)
 ```
 
+## Coordinates in a Federation
+
+Federated models share one **RTC frame** so their meshes align pixel-for-pixel
+instead of each model floating in its own re-based origin (see [Geometry
+Guide → Coordinate Handling](geometry.md#coordinate-handling) for what an RTC
+offset is and why the mesher applies one). One rule decides which frame that
+is, and it does not depend on load order:
+
+- **The anchor is the earliest-loaded model that has a `wasmRtcOffset`.**
+  Models without one (small, near-origin coordinates) are skipped. If no model
+  has one, every model is in the raw frame and there is nothing to share.
+- **At load**, the viewer passes that anchor to the new model as
+  `sharedRtcOffset`, so it is meshed against it
+  (`apps/viewer/src/hooks/useIfcFederation.ts`, `chooseSharedRtcOffset` in
+  `@ifc-lite/geometry/world-frame`).
+- **After every federated load settles**, the viewer converges every other
+  loaded model onto the anchor (`apps/viewer/src/hooks/ingest/federationRtcRebase.ts`,
+  `convergeGeometryOntoRtcAnchor` in `@ifc-lite/geometry/rtc-rebase`). This is
+  what covers a near-origin model loaded *before* the first anchored one, and
+  loads that overlap and finish in either order. The move is a translation of
+  each mesh's double-precision `origin` plus the model's `coordinateInfo`
+  (`wasmRtcOffset`, `wasmRtcFrame`, `originalBounds`, `shiftedBounds`); the
+  float32 vertex `positions` are never touched, so no precision is lost at
+  map-coordinate magnitudes. A model's `coordinateInfo` can therefore change
+  after it has loaded: read it when you need it rather than caching it.
+- **The frame reported to consumers.** `federationFrameInfo`
+  (`@ifc-lite/geometry/world-frame`) applies the same rule: the
+  `coordinateInfo` of the earliest-loaded model with a `wasmRtcOffset`, or,
+  when no model has one, of the earliest-loaded model with any
+  `coordinateInfo`. `renderFrameWorldOffset`, BCF viewpoint export and the
+  other world-coordinate readouts use it as the federation's frame.
+
+For every model that can be converged (see the two exceptions below),
+loading a near-origin model and a georeferenced model in either order gives
+the same scene and the same reported frame. A model that is still streaming
+does not define the reported frame until its load settles.
+
+Two kinds of model stay outside the shared frame:
+
+- **Point clouds** (LAS/LAZ and the other scan formats) are never meshed
+  against an RTC anchor in any load order; they are placed by the point-cloud
+  georeference alignment instead, so the convergence leaves them alone.
+- **Models with GPU-instanced geometry** cannot be moved after load, because
+  their instance transforms live in renderer-owned buffers. If such a model is
+  not already on the anchor, the viewer leaves it where it is, names it in a
+  warning toast, and still converges every other model. Load the
+  georeferenced model first to avoid this.
+
 ### Global vs Local IDs
 
 - **Local expressId**: The original ID within a single IFC file (e.g., `#42`)
@@ -105,6 +153,137 @@ The viewer provides controls for each loaded model:
 | **Rename** | Give a model a descriptive name |
 | **Remove** | Unload a model and free its ID range |
 | **Set Active** | Focus the properties panel on a specific model |
+
+## Repositioning models and pointclouds
+
+![Reposition panel aligning an orange diagnostic pointcloud with an Archicad IFC model](../assets/model-reposition.png)
+
+Open **Home → Reposition**, the model's hierarchy action, or the command
+palette's Reposition command. IFC models, embedded pointclouds and streamed
+scans use the same workspace translation. Either upload order is supported.
+Select one or several moving models and choose a fixed reference model.
+
+1. For a large mismatch, use **Frame moving**, **Frame reference** or **Frame
+   both** to locate the data. **Move near reference** brings the first selected
+   model's bounds centre to the reference centre; it is an approximate preview.
+2. Pick a source point on the moving model and a target point on the reference.
+   Snapping uses mesh vertices, edges and faces, and actual scan points. The
+   highlighted point and live dimensions show the proposed displacement.
+3. Refine with X/Y/Z or XY/XZ/YZ constraints, the axis and plane handles, or
+   typed values. Numbers accept a decimal dot or comma, scientific notation,
+   and `mm`, `cm`, `m`, `km`, `in` and `ft`; bare numbers mean metres. Workspace
+   coordinates use engineering axes with Z as elevation.
+4. **Move by ΔX / ΔY / ΔZ** enters a displacement from the committed position.
+   **Set source point X / Y / Z** sets the picked point's destination in the
+   workspace frame. A signed distance follows the constrained axis or current
+   move direction. Hold Shift during point picking for orthogonal movement.
+   Choose X/Y/Z and use ↑/↓ for the configured nudge increment.
+5. **Apply** creates one undo operation for the whole group. Escape or Cancel
+   discards the preview. Enter in a numeric field previews its value; Enter
+   with focus in the viewport applies. Focused buttons keep their normal keyboard
+   activation. **Reset placement** returns selected models to
+   their automatically aligned positions. Locks prevent starting new moves;
+   undo restores positions without changing subsequent lock settings.
+
+### Rotating a model
+
+**Rotate** turns the selected models about the workspace **vertical axis only**
+— the heading change that seats a building on a site. Tilting a model out of
+plumb is not offered.
+
+- **Heading** is an absolute angle in degrees, positive counter-clockwise seen
+  from above, wrapped to (-180°, 180°]. Re-entering it always turns the model
+  once from its original geometry, so an angle can be edited without
+  compounding, and `0` restores the model exactly.
+- **Pivot X / Y** is the workspace point the axis passes through, in metres —
+  one point for every selected model, whatever their translations. It defaults
+  to the model's bounds centre and is shown, never implied; elevation does not
+  affect a vertical-axis turn. Once a model has a heading it keeps the pivot it
+  was given until you change it.
+- The rotation is applied to the model **before** the translation above, so the
+  pivot is stored in each model's own frame and moves with the model when it is
+  moved afterwards. Rotating and then moving is not the same arrangement as
+  moving and then rotating.
+- Rotating creates one undo entry for the whole selection on the same stack as
+  moves, and rides **Undo placement** / **Redo placement** and **Reset
+  placement** with them. Locked models refuse to rotate.
+- Models with GPU-instanced geometry (repeated elements the viewer draws as
+  instances, such as doors, windows or columns) rotate too: the instanced
+  occurrences turn about the same axis as the model's flat geometry, from the
+  renderer's own instance data. Pointclouds cannot be rotated — they are
+  renderer handles that carry a translation but no heading. Models still in
+  `pending` or `streaming-geometry` whose kind is not known yet (no geometry,
+  no instanced shard, no pointcloud handle) are refused too, until it is. In
+  both cases the panel says why, a selection containing one is refused as a
+  whole, and a placement manifest that would give such a model a heading is
+  not imported.
+
+Unlike a move, a rotation has no drag preview: it rewrites the model's geometry,
+which is what keeps rendering, picking, bounds, spatial queries and graphical
+exports reading one set of coordinates rather than each applying the angle for
+itself. Large models therefore take a moment to turn.
+
+Manual placement composes with automatic georeference alignment. It does not
+edit `IfcLocalPlacement`, map conversion, source geometry or scan files.
+Re-aligning the federation cancels picked anchors, preserves manual translations
+as literal workspace vectors, and re-applies model rotations on top of the new
+alignment. The RTC convergence described at the top of this page moves a model
+into the shared frame without re-running a rotation: a heading and that
+translation commute, so the turned geometry is already correct. What does follow
+the model is the **pivot** — it names a workspace point rather than a distance,
+so it is re-expressed in the new frame, and the number shown in the panel can
+change when a georeferenced model joins the federation. Pointcloud handles
+follow the workspace translation but are not rotated. Scaling, CRS conversion
+and automatic scan registration are separate operations.
+
+Positions are saved locally by source contents and coordinate frame. Reloading
+an unambiguous source restores its committed position; previews are never
+saved. Matching reads every source byte using bounded SHA-256 chunks; renaming a file keeps its identity, while changed contents require a new placement. For streamed scans, matching runs after loading completes so it does not delay the first points. Automatic restore and local saving become available once that background pass finishes; moves made meanwhile are preserved and then saved. Removing the scan stops the pass. **Export placements** downloads a versioned JSON manifest. Import
+checks units, axes, frame and source identity before applying the entire group.
+Repeated copies of one source need explicit instance bindings. Import respects
+current locks. Placement is local to this browser workspace and is not shared
+with collaboration peers.
+
+Rendering, selection, snapping, bounds, section geometry and graphical exports
+use the placed geometry. Existing measurements keep their recorded workspace
+points and are labelled **Stale** after movement; remeasure them. Clash and scan
+deviation results are invalidated and must be recomputed after applying a move.
+Cancelling a preview restores prior measurement validity and analysis results;
+a deviation result whose GPU buffers were overwritten during the preview must
+be recomputed. Source-model comparison still describes authored changes rather
+than registration offsets. STEP IFC exports retain authored coordinates;
+graphical GLB and IFC5 geometry
+exports include workspace placement. Export the placement manifest alongside
+source IFC or scan files when sharing this arrangement. Transformed LAS/E57
+writing is not provided.
+
+After a completed deviation run, the Deviation panel's **Export CSV** action
+reports minimum, maximum and mean signed distance in metres for each scan asset.
+The CSV identifies the scan model when several models are loaded. The renderer's
+`readDeviationAssetStats()` method provides the same per-asset values on demand;
+it reads GPU deviation buffers only when called and reports no row for a scan
+asset added after the run. Recompute before exporting after a model change.
+
+World Context refreshes its Cesium model after movement pauses, using the same
+placed geometry. Its previous model stays visible until the replacement is ready;
+the WebGPU view updates immediately throughout the move.
+
+Both the 3D cut and the 2D drawing resolve section percentages from the same
+placed bounds, including a model moved beyond its original extent.
+Construction projection also uses the placed floor elevations. Moving a model
+and its section plane together preserves the floor/ceiling projection bands and
+the resulting drawing geometry, for either section direction. Floor bands
+refresh when the model moves or its storey membership changes; no reload is
+needed. See [2D drawings after repositioning](drawing-2d.md#drawings-after-repositioning).
+
+![A real Archicad IFC section after moving the model up 100 metres](../assets/model-reposition-section.png)
+
+Large translations and their subsequent fine corrections are retained in double
+precision. Mesh and scan vertices stay near their own decode/draw origins;
+manual correction is composed before GPU narrowing. Precision still depends on
+the source data, a scan's spatial extent and the final distance from the render
+origin. Bring distant data near the reference before millimetre adjustment;
+repositioning cannot recover detail already rounded in the source file.
 
 ## Merging to a Single File (CLI)
 

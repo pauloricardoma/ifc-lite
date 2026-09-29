@@ -31,6 +31,7 @@ import {
   typeOwnedPsetRewriteWarning,
 } from './type-owned-psets.js';
 import { recordSourceLineDelivery } from './delta-modification-ledger.js';
+import { applySourceLineMutationsReported } from './step-attribute-mutations.js';
 import { nominateDeliveredInPlaceEdits } from './in-place-nomination.js';
 import { type PropertySetContext, getPropertySetName } from './step-property-set-readers.js';
 import { generatePropertySetEntities, generateQuantitySetEntities } from './step-property-set-generators.js';
@@ -54,7 +55,11 @@ export function generatePropertyAndQuantitySetEntities(
 ): void {
   // Generate new property entities for mutations (these REPLACE the skipped ones)
   const generatedTypeOwnedPsetIds = new Map<number, Map<string, number>>();
-  for (const { entityId, psets } of pass.newPropertySets) {
+  // A reused source member must actually be written, and survive a schema
+  // downgrade, or the copy would name a line the file does not have (#5794).
+  const canReferenceSourceMember = (id: number): boolean =>
+    pass.willBeEmitted(id) && !pass.withheldRefIds.has(id) && !pass.skipPropertySetIds.has(id);
+  for (const { entityId, psets, sourceMembers } of pass.newPropertySets) {
     // Nothing may be emitted FOR an entity that gets no defining line —
     // see `willBeEmitted` (#1978, #2030, #2012).
     if (!pass.willBeEmitted(entityId)) continue;
@@ -65,7 +70,9 @@ export function generatePropertyAndQuantitySetEntities(
       pass.willBeEmitted,
       pass.effective,
       pass.typeOwnedPsetNamesByEntity.get(entityId),
-      options.guidRandom
+      options.guidRandom,
+      sourceMembers,
+      canReferenceSourceMember,
     );
     pass.entities.push(...newEntities.lines);
     pass.newEntityCount += newEntities.count;
@@ -128,18 +135,21 @@ export function generatePropertyAndQuantitySetEntities(
       );
       // The RECORD's class is the from-type: the bytes are still the source
       // class, whatever `typeOf` now says the entity effectively is.
-      mutated = ctx.applySourceLineMutations(
+      //
+      // The reporting travels with the call (`applySourceLineMutationsReported`)
+      // because this rewrite REPLACES the source-iteration pass's line for these
+      // ids (`rewrittenEntityIds`) — a refusal reported only there would be
+      // silent for exactly the entities this branch owns, and a pass that
+      // remembered one of the two warnings would be silent about the other.
+      mutated = applySourceLineMutationsReported(
+        ctx.applySourceLineMutations,
+        pass.warnings,
         entityId,
         sourceLine,
         record.type,
         pass.modifiedAttributes.get(entityId),
         pass.sourceSchema,
         pass.overlayActive,
-        (attr, value) =>
-          pass.warnings.push(
-            `entity #${entityId}: attribute ${attr} not written - ` +
-              `${JSON.stringify(value)} is not a number and the slot is REAL-typed`,
-          ),
       );
     }
     if (mutated === null) {
@@ -222,7 +232,7 @@ export function generatePropertyAndQuantitySetEntities(
   // Generate new quantity entities for mutations
   for (const { entityId, qsets } of pass.newQuantitySets) {
     if (!pass.willBeEmitted(entityId)) continue;
-    const newEntities = generateQuantitySetEntities(ctx, entityId, qsets, pass.willBeEmitted, options.guidRandom);
+    const newEntities = generateQuantitySetEntities(ctx, entityId, qsets, pass.willBeEmitted, pass.effective, options.guidRandom);
     pass.entities.push(...newEntities.lines);
     pass.newEntityCount += newEntities.count;
     if (newEntities.lines.length > 0) pass.modifications.recordEmitted(entityId, 'quantity-set');

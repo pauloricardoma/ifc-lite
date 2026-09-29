@@ -2,19 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-/**
- * HeadlessLikeBackend — minimal `BimBackend` for MCP tool execution.
- *
- * Mirrors `@ifc-lite/cli`'s HeadlessBackend but trimmed to the surface MCP
- * tools touch (model + query + selection + spatial + export + mutate +
- * store + visibility + viewer no-ops). Splitting it out of the CLI lets the
- * MCP package avoid the `@ifc-lite/viewer-core` dependency that the CLI
- * pulls in for `ifc-lite view`.
- *
- * Tools that need richer functionality (geometry mesh data, raycast,
- * heatmap evaluation) call the parser directly via the registry's
- * `LoadedModel.store`, not through this backend.
- */
+/** Minimal `BimBackend` for MCP tools over an already-loaded store. */
 
 import type {
   BimBackend,
@@ -31,16 +19,19 @@ import type {
   LensBackendMethods,
   FilesBackendMethods,
   ScheduleBackendMethods,
+  StructuralBackendMethods,
+  CostBackendMethods,
   EntityRef,
   EntityData,
   PropertySetData,
   QuantitySetData,
   ModelInfo,
 } from '@ifc-lite/sdk';
-import { createHeadlessMutateAdapter, type StyleBackendMethods } from '@ifc-lite/sdk';
+import { createCostBackend, createEffectiveEntityCheck, createHeadlessMutateAdapter, type EntityRefCheck, type StyleBackendMethods } from '@ifc-lite/sdk';
 import { applyStylesInStore } from '@ifc-lite/create';
+import { unsupportedStoreAuthoring } from './headless-backend-store-stubs.js';
 import type { IfcDataStore } from '@ifc-lite/parser';
-import { MutablePropertyView, StoreEditor } from '@ifc-lite/mutations';
+import { MutablePropertyView, StoreEditor, storeHasSourceEntity } from '@ifc-lite/mutations';
 import {
   extractPropertiesOnDemand,
   extractQuantitiesOnDemand,
@@ -48,6 +39,7 @@ import {
 } from '@ifc-lite/parser';
 import { escapeCsvCell, exportToStep, StepExporter, type StepExportOptions } from '@ifc-lite/export';
 import { findPropertyInSets, findQuantityInSets } from '@ifc-lite/query';
+import { createStructuralAdapter } from './headless-backend-structural.js';
 import { createQueryAdapter } from './backend-query.js';
 import { overlayFromView, type PendingOverlay } from './overlay.js';
 
@@ -73,10 +65,20 @@ export class HeadlessLikeBackend implements BimBackend {
   readonly lens: LensBackendMethods;
   readonly files: FilesBackendMethods;
   readonly schedule: ScheduleBackendMethods;
+  readonly structural: StructuralBackendMethods;
+  readonly cost: CostBackendMethods;
 
   private dataStore: IfcDataStore;
   private modelName: string;
   private modelId: string;
+  /** Every model id this backend answers for, so the schedule assert, the
+   *  `bim.mutate.*` guard and `bim.store.addEntity` cannot differ (#3764). The
+   *  file basename is NOT one: no other MCP site accepts one. */
+  private readonly acceptedModelIds: readonly string[];
+  /** The reference check `bim.mutate.*` is gated on (`null` when writable,
+   *  else the reason), exposed because the mutation TOOLS write into
+   *  `getMutationView()` directly and need the same gate (#3764). */
+  readonly checkEntityRef: EntityRefCheck;
   private mutationView: MutablePropertyView | null = null;
   private storeEditor: StoreEditor | null = null;
 
@@ -84,12 +86,13 @@ export class HeadlessLikeBackend implements BimBackend {
     this.dataStore = store;
     this.modelName = modelName;
     this.modelId = modelId;
+    this.acceptedModelIds = [modelId];
     this.model = this.createModelAdapter();
     // The read surface folds this session's queued mutations in (#2004). The
     // overlay is passed as a getter because it is built lazily on the first
     // mutation, so a session that is only ever read stays on the store-only
     // path and pays nothing.
-    this.query = createQueryAdapter(store, modelId, () => this.pendingOverlay());
+    this.query = createQueryAdapter(store, modelId, () => this.pendingOverlay(), () => this.getMutationView());
     this.selection = this.createSelectionAdapter();
     this.visibility = { hide() {}, show() {}, isolate() {}, reset() {} };
     this.viewer = {
@@ -97,7 +100,13 @@ export class HeadlessLikeBackend implements BimBackend {
       flyTo() {}, setSection() {}, getSection() { return null; },
       setCamera() {}, getCamera() { return { mode: 'perspective' as const }; },
     };
-    this.mutate = createHeadlessMutateAdapter(() => this.getOrCreateMutationView());
+    this.checkEntityRef = createEffectiveEntityCheck({
+      acceptedModelIds: this.acceptedModelIds,
+      // Both halves of the source index (byId + deferred property atoms, #5222).
+      hasSourceEntity: id => storeHasSourceEntity(this.dataStore, id),
+      overlay: () => this.mutationView,
+    });
+    this.mutate = createHeadlessMutateAdapter(() => this.getOrCreateMutationView(), this.checkEntityRef);
     // Same arrangement as the CLI backend: the work happens in @ifc-lite/create
     // against the shared StoreEditor, so the new entities land in the overlay
     // this backend's export adapter already reads.
@@ -119,6 +128,11 @@ export class HeadlessLikeBackend implements BimBackend {
     this.lens = { presets() { return []; }, create() { return null; }, activate() {}, deactivate() {}, getActive() { return null; } };
     this.files = { list() { return []; }, text() { return null; }, csv() { return null; }, csvColumns() { return []; } };
     this.schedule = this.createScheduleAdapter();
+    this.structural = createStructuralAdapter(this.dataStore, modelId => this.assertKnownModelId(modelId));
+    this.cost = createCostBackend(modelId => { // #4857: lazily created overlay, visible once non-null.
+      if (modelId) this.assertKnownModelId(modelId);
+      return { modelId: this.modelId, store: this.dataStore, mutationView: this.mutationView ?? undefined };
+    });
   }
 
   subscribe(_event: BimEventType, _handler: (data: unknown) => void): () => void {
@@ -148,7 +162,7 @@ export class HeadlessLikeBackend implements BimBackend {
 
   /** This session's queued edits, or null when it has none. */
   pendingOverlay(): PendingOverlay | null {
-    return overlayFromView(this.mutationView);
+    return overlayFromView(this.mutationView, this.dataStore);
   }
 
   private createSelectionAdapter(): SelectionBackendMethods {
@@ -190,7 +204,8 @@ export class HeadlessLikeBackend implements BimBackend {
    * so a read-only session still pays nothing. Built by `getOrCreateStoreEditor`
    * to keep the extractor wiring in one place.
    */
-  private getOrCreateMutationView(): MutablePropertyView {
+  /** The view `bim.mutate` writes through — public so `run_flow`'s `tables()` reads the same overlay. */
+  getOrCreateMutationView(): MutablePropertyView {
     this.getOrCreateStoreEditor();
     // Non-null immediately after: the two fields are assigned together and
     // never cleared.
@@ -218,10 +233,27 @@ export class HeadlessLikeBackend implements BimBackend {
     this.visibility = { hide() {}, show() {}, isolate() {}, reset() {} };
   }
 
+  /** Whether `modelId` names the one model this backend holds. */
+  acceptsModelId(modelId: string): boolean {
+    return this.acceptedModelIds.includes(modelId);
+  }
+
+  /** Refuse an unknown model id loudly, at whichever surface was handed it. */
+  private assertKnownModelId(modelId: string): void {
+    if (this.acceptsModelId(modelId)) return;
+    throw new Error(
+      `Unknown modelId '${modelId}': this backend answers for ${this.acceptedModelIds.map(id => `'${id}'`).join(' or ')}`,
+    );
+  }
+
   private createStoreAdapter(): StoreBackendMethods {
     const get = () => this.getOrCreateStoreEditor();
     return {
       addEntity: (modelId, def) => {
+        // The ref carries `modelId`, and `bim.mutate.*` refuses one this
+        // backend does not answer for: echoing the caller's id back would mint
+        // a ref the next write rejects, entity already created (#3764).
+        this.assertKnownModelId(modelId);
         const ref = get().addEntity(def.type, def.attributes as Parameters<StoreEditor['addEntity']>[1]);
         return { modelId, expressId: ref.expressId };
       },
@@ -242,6 +274,7 @@ export class HeadlessLikeBackend implements BimBackend {
       addRoof: () => { throw new Error('addRoof not supported in MCP v0.1; use entity_create'); },
       addPlate: () => { throw new Error('addPlate not supported in MCP v0.1; use entity_create'); },
       addMember: () => { throw new Error('addMember not supported in MCP v0.1; use entity_create'); },
+      ...unsupportedStoreAuthoring(),
     };
   }
 
@@ -321,12 +354,13 @@ export class HeadlessLikeBackend implements BimBackend {
         return result;
       },
       ifc: (refs, options): string => {
-        const entityRefs = refs as EntityRef[];
         const opts = (options ?? {}) as Record<string, unknown>;
         const schema = (opts.schema as 'IFC2X3' | 'IFC4' | 'IFC4X3') ?? store.schemaVersion ?? 'IFC4';
         const exportOpts: Partial<StepExportOptions> = { schema };
-        if (entityRefs && entityRefs.length > 0) {
-          const isolatedIds = new Set(entityRefs.map((r) => r.expressId));
+        // `undefined` is the only "no isolation filter": an empty list is a filter
+        // that matched nothing, refused in `ExportNamespace.ifc` (#4738).
+        if (refs != null) {
+          const isolatedIds = new Set(refs.map((r) => r.expressId));
           exportOpts.visibleOnly = true;
           exportOpts.isolatedEntityIds = isolatedIds;
           exportOpts.hiddenEntityIds = new Set<number>();
@@ -344,12 +378,9 @@ export class HeadlessLikeBackend implements BimBackend {
 
   private createScheduleAdapter(): ScheduleBackendMethods {
     const store = this.dataStore;
-    const id = this.modelId;
     let cached: ReturnType<ScheduleBackendMethods['data']> | null = null;
     const assert = (modelId?: string): void => {
-      if (modelId && modelId !== id) {
-        throw new Error(`Unknown modelId '${modelId}' — this backend only has '${id}'`);
-      }
+      if (modelId) this.assertKnownModelId(modelId);
     };
     const extract = (modelId?: string): ReturnType<ScheduleBackendMethods['data']> => {
       assert(modelId);
@@ -363,4 +394,5 @@ export class HeadlessLikeBackend implements BimBackend {
       sequences: (m) => extract(m).sequences,
     };
   }
+
 }

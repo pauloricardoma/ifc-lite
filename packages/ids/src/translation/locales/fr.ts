@@ -174,6 +174,7 @@ export const fr = {
     propertyValueMismatch: 'La propriété "{pset}.{property}" est "{actual}", attendu {expected}',
     propertyPatternMismatch: 'La valeur de la propriété "{pset}.{property}" "{actual}" ne correspond pas à {expected}',
     propertyDatatypeMismatch: 'Le type de données de la propriété "{pset}.{property}" est "{actual}", attendu {expected}',
+    propertyDatatypeUnknown: 'La propriété "{pset}.{property}" n\'a pas de type de données connu et ne peut donc pas être vérifiée par rapport à {expected}',
     propertyOutOfBounds: 'La valeur de la propriété "{pset}.{property}" {actual} est hors de la plage {expected}',
     propertyProhibited: 'La propriété interdite "{pset}.{property}" existe avec la valeur "{actual}"',
 
@@ -184,9 +185,12 @@ export const fr = {
     classificationValueMismatch: 'Le code de classification "{actual}" ne correspond pas à {expected} attendu',
     classificationValueMissingAvailable: 'Le code de classification {expected} n\'a pas été trouvé. Disponibles : {available}',
     classificationProhibited: 'La classification interdite "{actual}" existe dans le système "{system}"',
+    classificationUnresolved: 'L\'entité est classifiée, mais les détails de la classification ne peuvent pas être lus depuis cette source de données',
+    classificationPresenceUnresolved: 'Impossible de déterminer si cette entité est classifiée à partir de cette source de données',
 
     // Material failures
     materialMissing: 'Aucun matériau attribué',
+    materialUnresolved: 'L\'entité a un matériau, mais ses détails ne peuvent pas être lus depuis cette source de données',
     materialValueMismatch: 'Le matériau "{actual}" ne correspond pas à {expected} attendu',
     materialValueMissingAvailable: 'Le matériau {expected} n\'a pas été trouvé. Disponibles : {available}',
     materialProhibited: 'Le matériau interdit "{actual}" est attribué',

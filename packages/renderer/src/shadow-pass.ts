@@ -24,75 +24,22 @@
 
 import type { Mat4 } from './types.js';
 import { shadowShaderSource } from './shaders/shadow.wgsl.js';
+import { packRteOrigin, tryPackRteDrawableDelta } from './relative-to-eye.js';
+import { drawInstanceRuns, uploadInstancedRteDeltas, type InstanceRun } from './instanced-rte.js';
+import { INSTANCED_RTE_DELTA_SLOT, INSTANCED_VERTEX_BUFFERS } from './instanced-vertex-layout.js';
+import { packRteClipBox, rtePlaneDistance } from './rte-clip-space.js';
+import type {
+  ShadowClip,
+  ShadowDrawKind,
+  ShadowOccluderDraw,
+  ShadowRteFrame,
+} from './shadow-types.js';
 
-/** Which geometry path an occluder draw came from — selects the pipeline. */
-export type ShadowDrawKind = 'flat' | 'quantized' | 'instanced' | 'textured';
+export { resolveShadowMapResolution } from './shadow-types.js';
+export type { ShadowClip, ShadowDrawKind, ShadowOccluderDraw, ShadowRteFrame } from './shadow-types.js';
 
-/**
- * Resolve the shadow-map side length to actually allocate.
- *
- * `requested === 0` (or a non-positive / non-finite value) means **Auto**: pick
- * a sensible size from the device's 2D texture limit — a laptop iGPU capped at
- * 4096 gets a 2048 map, a discrete GPU (8192+) gets 4096 (#2670 review). A
- * manual request is honoured but never allowed to exceed the device limit,
- * since `createTexture` would otherwise fail outright on a smaller device.
- */
-export function resolveShadowMapResolution(requested: number | undefined, maxTextureDim: number): number {
-  const cap = Number.isFinite(maxTextureDim) && maxTextureDim >= 1024 ? maxTextureDim : 2048;
-  if (requested && requested > 0) {
-    // Floor + clamp to the same [256, cap] window ShadowPass allocates in, so
-    // the caller's texelWorld / texelSize (derived from this return value) match
-    // the texture actually created — a fractional or sub-256 request otherwise
-    // samples at one size and allocates at another (CodeRabbit #3053).
-    return Math.max(256, Math.floor(Math.min(requested, cap)));
-  }
-  if (cap >= 8192) return 4096;
-  if (cap >= 4096) return 2048;
-  return 1024;
-}
-
-/** One occluder draw recorded into the depth pre-pass. */
-export interface ShadowOccluderDraw {
-  kind: ShadowDrawKind;
-  /** Slot-0 vertex buffer (positions). */
-  vertexBuffer: GPUBuffer;
-  indexBuffer: GPUBuffer;
-  indexCount: number;
-  /**
-   * Column-major model matrix (16 floats). Carries the batch origin for the
-   * flat/quantized/textured paths; ignored for the instanced path.
-   */
-  model?: Float32Array;
-  /** Dequantization params [minX, minY, minZ, step]; quantized path only. */
-  quantParams?: readonly [number, number, number, number];
-  /** Slot-1 per-occurrence instance buffer; instanced path only. */
-  instanceBuffer?: GPUBuffer;
-  /** Instance count; instanced path only. */
-  instanceCount?: number;
-}
-
-/**
- * The clip this frame, mirrored from the colour pass so clipped-away geometry
- * stops casting (a sectioned-off roof must not keep shadowing the floor).
- * `null`/all-absent members mean "no clipping" and keep the fragment-less
- * depth-only pipelines.
- */
-export interface ShadowClip {
-  /** World-space plane; fragments on its + side are cut (see `flipped`). */
-  section?: {
-    normal: readonly [number, number, number];
-    distance: number;
-    flipped?: boolean;
-  } | null;
-  /** World-space crop box; fragments outside it are cut. */
-  box?: {
-    min: readonly [number, number, number];
-    max: readonly [number, number, number];
-  } | null;
-}
-
-/** Bytes of the per-draw uniform: mat4 model (64) + vec4 quantParams (16). */
-const PER_DRAW_BYTES = 80;
+/** Bytes of the per-draw uniform: linear model + quant params + split RTE origin. */
+const PER_DRAW_BYTES = 112;
 
 /** Bytes of the clip uniform: sectionPlane + boxMin + boxMax + flags (4 vec4). */
 const CLIP_BYTES = 64;
@@ -119,7 +66,8 @@ export class ShadowPass {
   private pipelineLayout: GPUPipelineLayout;
 
   private lightBuffer: GPUBuffer;
-  private lightScratch = new Float32Array(16);
+  /** Light matrix plus retained RTE-frame fields for the stable uniform ABI. */
+  private lightScratch = new Float32Array(24);
 
   /** Clip uniform (floats 0..11) with the flag word aliased as u32 (word 12). */
   private clipBuffer: GPUBuffer;
@@ -149,7 +97,7 @@ export class ShadowPass {
 
     this.lightBuffer = device.createBuffer({
       label: 'shadow-light-uniform',
-      size: 64,
+      size: 96,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
@@ -195,7 +143,7 @@ export class ShadowPass {
       flat: make('vs_shadow_flat', [this.posBuffer(28)]),
       textured: make('vs_shadow_textured', [this.posBuffer(36)]),
       quantized: make('vs_shadow_quantized', [this.quantBuffer()]),
-      instanced: make('vs_shadow_instanced', [this.posBuffer(28), this.instanceBuffer()]),
+      instanced: make('vs_shadow_instanced', INSTANCED_VERTEX_BUFFERS),
     };
   }
 
@@ -231,16 +179,37 @@ export class ShadowPass {
     lightViewProj: Mat4,
     draws: readonly ShadowOccluderDraw[],
     clip?: ShadowClip | null,
+    rte?: ShadowRteFrame | null,
   ): void {
     if (this.destroyed) return;
 
     // Shared light matrix — one write per frame.
-    this.lightScratch.set(lightViewProj.m);
+    this.lightScratch.set(lightViewProj.m, 0);
+    packRteOrigin(rte?.cameraWorld ?? [0, 0, 0], this.lightScratch, 16);
     this.device.queue.writeBuffer(this.lightBuffer, 0, this.lightScratch);
 
-    const clipping = this.writeClipUniform(clip);
+    const clipping = this.writeClipUniform(clip, rte);
     if (clipping && !this.clipPipelines) this.clipPipelines = this.createPipelineSet(true);
     const pipelines = clipping && this.clipPipelines ? this.clipPipelines : this.pipelines;
+
+    // Occluders outside the camera-relative envelope cannot be rasterised in
+    // this RTE frame (#6128): a flat draw is skipped whole (`drawable`), an
+    // instanced draw is limited to its in-envelope runs.
+    // An instanced draw without its anchors or delta stream has no valid
+    // camera-relative lanes to read, so it is skipped rather than drawn stale.
+    // The camera must be the colour pass's: the streams are shared by every
+    // pass in this submission (see `instanced-rte.ts`).
+    const drawable = new Array<boolean>(draws.length).fill(true);
+    const instanceRuns = new Array<readonly InstanceRun[]>(draws.length);
+    for (let i = 0; i < draws.length; i++) {
+      const draw = draws[i];
+      if (draw.kind !== 'instanced' || !draw.instanceBuffer || !draw.instanceCount || !draw.canonicalAnchors || !draw.rteDeltas) continue;
+      instanceRuns[i] = uploadInstancedRteDeltas(this.device, [{
+        instanceCount: draw.instanceCount,
+        canonicalAnchors: draw.canonicalAnchors,
+        rteDeltas: draw.rteDeltas,
+      }], rte?.cameraWorld ?? [0, 0, 0])[0]!;
+    }
 
     // Grow the per-draw ring if this frame needs more slots than it holds.
     if (draws.length > this.drawBufferSlots) {
@@ -259,13 +228,27 @@ export class ShadowPass {
       const d = draws[i];
       const base = i * strideFloats;
       if (d.model) this.drawScratch.set(d.model, base);
-      // else leave identity-ish zero; only the instanced path omits model and
-      // it never reads draw.model.
+      // Translation is always supplied through the f64 origin lanes below.
+      // Retaining it in the f32 model matrix would add a 5,000-km number before
+      // the RTE subtraction and erase the centimetre residual we are preserving.
+      this.drawScratch[base + 12] = 0;
+      this.drawScratch[base + 13] = 0;
+      this.drawScratch[base + 14] = 0;
+      this.drawScratch[base + 15] = 1;
       const q = d.quantParams;
       this.drawScratch[base + 16] = q ? q[0] : 0;
       this.drawScratch[base + 17] = q ? q[1] : 0;
       this.drawScratch[base + 18] = q ? q[2] : 0;
       this.drawScratch[base + 19] = q ? q[3] : 0;
+      // Instanced vertices read their per-occurrence CPU-packed submission
+      // deltas in `vs_shadow_instanced`; they deliberately have no single draw
+      // origin. Packing a fictitious [0,0,0] here rejects a valid 5,000-km
+      // camera before that shader can run.
+      if (d.kind !== 'instanced') {
+        const origin = d.origin ?? [d.model?.[12] ?? 0, d.model?.[13] ?? 0, d.model?.[14] ?? 0] as const;
+        const camera = rte?.cameraWorld ?? [0, 0, 0] as const;
+        drawable[i] = tryPackRteDrawableDelta(origin, camera, this.drawScratch, base + 20);
+      }
     }
     if (draws.length > 0) {
       this.device.queue.writeBuffer(
@@ -290,14 +273,17 @@ export class ShadowPass {
 
     for (let i = 0; i < draws.length; i++) {
       const d = draws[i];
+      if (!drawable[i]) continue;
       pass.setPipeline(pipelines[d.kind]);
       pass.setBindGroup(0, this.drawBindGroup, [i * this.drawStride]);
       pass.setVertexBuffer(0, d.vertexBuffer);
       pass.setIndexBuffer(d.indexBuffer, 'uint32');
       if (d.kind === 'instanced') {
-        if (!d.instanceBuffer || !d.instanceCount) continue;
+        const runs = instanceRuns[i];
+        if (!runs || !d.instanceBuffer || !d.rteDeltas) continue;
         pass.setVertexBuffer(1, d.instanceBuffer);
-        pass.drawIndexed(d.indexCount, d.instanceCount);
+        pass.setVertexBuffer(INSTANCED_RTE_DELTA_SLOT, d.rteDeltas.buffer);
+        drawInstanceRuns(pass, d.indexCount, runs);
       } else {
         pass.drawIndexed(d.indexCount);
       }
@@ -321,27 +307,21 @@ export class ShadowPass {
    * the caller uses that to pick the clipping pipelines. Writes only when
    * clipping: with nothing cut the uniform is never read.
    */
-  private writeClipUniform(clip: ShadowClip | null | undefined): boolean {
+  private writeClipUniform(clip: ShadowClip | null | undefined, rte?: ShadowRteFrame | null): boolean {
     const section = clip?.section;
     const box = clip?.box;
     if (!section && !box) return false;
 
     const s = this.clipScratch;
+    const camera = rte?.cameraWorld ?? [0, 0, 0] as const;
     s.fill(0);
     if (section) {
       s[0] = section.normal[0];
       s[1] = section.normal[1];
       s[2] = section.normal[2];
-      s[3] = section.distance;
+      s[3] = rtePlaneDistance(section.distance, section.normal, camera);
     }
-    if (box) {
-      s[4] = box.min[0];
-      s[5] = box.min[1];
-      s[6] = box.min[2];
-      s[8] = box.max[0];
-      s[9] = box.max[1];
-      s[10] = box.max[2];
-    }
+    packRteClipBox(box, camera, s, 4);
     // flags.x — bit 0 section enabled, bit 1 flipped, bit 2 clip box enabled.
     this.clipFlags[12] = (section ? 1 : 0) | (section?.flipped ? 2 : 0) | (box ? 4 : 0);
     this.device.queue.writeBuffer(this.clipBuffer, 0, s);
@@ -388,23 +368,6 @@ export class ShadowPass {
     return {
       arrayStride: 12,
       attributes: [{ shaderLocation: 0, offset: 0, format: 'uint16x4' }],
-    };
-  }
-
-  private instanceBuffer(): GPUVertexBufferLayout {
-    return {
-      arrayStride: 88,
-      stepMode: 'instance',
-      attributes: [
-        { shaderLocation: 3, offset: 0, format: 'float32x4' },
-        { shaderLocation: 4, offset: 16, format: 'float32x4' },
-        { shaderLocation: 5, offset: 32, format: 'float32x4' },
-        { shaderLocation: 6, offset: 48, format: 'float32x4' },
-        // Per-occurrence flags (bit 1 = hidden), so a hidden/isolated instance
-        // stops casting, matching the colour pass's discard. Offset 84 within the
-        // 88-byte INSTANCE_STRIDE_BYTES layout (mat4 + entityId + rgba + flags).
-        { shaderLocation: 9, offset: 84, format: 'uint32' },
-      ],
     };
   }
 

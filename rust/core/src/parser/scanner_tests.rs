@@ -10,6 +10,38 @@
 
 use super::*;
 
+/// The fused ASCII proof must retain the scanner's existing UTF-8 fallback:
+/// valid non-ASCII keywords survive, invalid ones become UNKNOWN, and neither
+/// case changes the original byte spans or prevents reading the next record.
+#[test]
+fn type_name_ascii_fast_path_preserves_utf8_and_invalid_byte_behavior() {
+    for keyword in [
+        b"IFCCARTESIANPOINT".as_slice(),
+        b"IfcVendor_123".as_slice(),
+        "IfcVéndor".as_bytes(),
+        "IfcVendor\u{1f600}".as_bytes(),
+        b"Ifc\xffVendor".as_slice(),
+        b"IfcVendor\xc3".as_slice(),
+        b"\x80IFCVENDOR".as_slice(),
+    ] {
+        for delimiter in [b"(".as_slice(), b"\x0b(".as_slice(), b"/* note */(".as_slice()] {
+            let mut content = b"#1=".to_vec();
+            content.extend_from_slice(keyword);
+            content.extend_from_slice(delimiter);
+            content.extend_from_slice(b"$);");
+            let first_end = content.len();
+            content.extend_from_slice(b"#2=IFCWALL($);");
+            let mut scanner = EntityScanner::new(&content);
+            let (id, name, start, end) = scanner.next_entity().unwrap();
+            assert_eq!((id, start, end), (1, 0, first_end));
+            assert_eq!(name, std::str::from_utf8(keyword).unwrap_or("UNKNOWN"));
+            assert_eq!(scanner.next_entity().map(|(id, name, _, _)| (id, name)), Some((2, "IFCWALL")));
+            assert!(scanner.next_entity().is_none());
+            assert_eq!(scanner.malformed_record_start(), None);
+        }
+    }
+}
+
 #[test]
 fn test_entity_scanner() {
     let content = r#"
@@ -221,6 +253,18 @@ fn scan_spans(content: &str) -> Vec<(u32, String, String)> {
     out
 }
 
+/// `scan_spans` without the type name, plus where the scan stopped. Separate
+/// only because the #4179 tests assert on spans and the stop TOGETHER, and
+/// borrowing `&str` out of `content` keeps their expectations literal.
+fn scan_spans_and_stop(content: &str) -> (Vec<(u32, &str)>, Option<usize>) {
+    let mut scanner = EntityScanner::new(content);
+    let mut spans = Vec::new();
+    while let Some((id, _type_name, start, end)) = scanner.next_entity() {
+        spans.push((id, &content[start..end]));
+    }
+    (spans, scanner.malformed_record_start())
+}
+
 const DATA_PREAMBLE: &str = "ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\n";
 
 fn data_file(records: &[&str]) -> String {
@@ -310,7 +354,10 @@ fn a_commented_out_record_is_still_not_a_record() {
 
 /// An unterminated comment inside a record leaves it with no terminator, so
 /// the record is refused and the scan ends — the same answer
-/// `skip_step_comment` gives, rather than inventing an end.
+/// `skip_step_comment` gives, rather than inventing an end. It must also be
+/// reported (see `unterminated_comment_inside_a_record_is_reported` below) —
+/// ending silently was the bug this scanner shared with the pre-#3695 TS
+/// tokenizer.
 #[test]
 fn unterminated_comment_inside_a_record_ends_the_scan() {
     let content = data_file(&["#11=IFCWALL('a', /* never closes $);"]);
@@ -330,52 +377,491 @@ fn comment_free_records_scan_unchanged() {
     );
 }
 
+/// Issue #3733: a form feed (0x0C) or vertical tab (0x0B) is a legal STEP
+/// token separator, matched pair of the TS-side tests in
+/// `packages/parser/test/step-trivia-form-feed-vertical-tab.test.ts`. Kept
+/// here rather than only as a `skip_step_trivia` unit test because the
+/// original defect was an END-TO-END disagreement between engines on whether
+/// an entity is found at all, not just where a byte index lands.
+#[test]
+fn entity_scanner_reads_a_type_name_preceded_by_a_form_feed() {
+    let content = "#1=\x0cIFCWALL('a',$);";
+    let mut scanner = EntityScanner::new(content);
+    let (id, type_name, _, _) = scanner.next_entity().unwrap();
+    assert_eq!(id, 1);
+    assert_eq!(type_name, "IFCWALL");
+}
+
+#[test]
+fn entity_scanner_reads_a_type_name_preceded_by_a_vertical_tab() {
+    let content = "#1=\x0bIFCWALL('a',$);";
+    let mut scanner = EntityScanner::new(content);
+    let (id, type_name, _, _) = scanner.next_entity().unwrap();
+    assert_eq!(id, 1);
+    assert_eq!(type_name, "IFCWALL");
+}
+
+/// The boundary case the fix must not get wrong the other way: a form feed
+/// INSIDE a quoted string is string content, not trivia.
+#[test]
+fn entity_scanner_does_not_treat_a_form_feed_inside_a_string_as_trivia() {
+    let content = "#1=IFCWALL('a\x0cb',$);";
+    let mut scanner = EntityScanner::new(content);
+    let (id, type_name, start, end) = scanner.next_entity().unwrap();
+    assert_eq!(id, 1);
+    assert_eq!(type_name, "IFCWALL");
+    assert_eq!(&content[start..end], content);
+}
+
 // ---------------------------------------------------------------------------
-// `has_non_null_attribute`: the scanner's span is now comment-aware (above),
-// but the attribute-decode layer -- this function included -- was still
-// comment-blind (#3673's follow-up note). A comment preceding a `$` used to
-// read as a non-null value, because the leading-whitespace skip stopped at
-// the comment's own `/` rather than treating the comment as trivia too.
+// A record whose argument list opens a `'` string that never closes must not
+// silently drop every entity after it — the Rust twin of the TS fix in
+// `packages/parser/src/tokenizer.ts` (#3695). `find_entity_end` has no byte
+// to resume from once this happens, so the scan still stops there (that part
+// is unchanged and deliberate), but it must now say why.
 // ---------------------------------------------------------------------------
 
+/// RED, pre-fix: entities #12 and #13 vanish with no trace anywhere on the
+/// scanner that anything went wrong.
 #[test]
-fn has_non_null_attribute_treats_a_comment_before_dollar_as_still_null() {
-    let content = "#1=IFCWALL(/* c1 */ $);";
-    let scanner = EntityScanner::new(content);
-    assert!(!scanner.has_non_null_attribute(0, content.len(), 0));
+fn unterminated_string_in_a_record_loses_every_entity_after_it() {
+    let content =
+        data_file(&["#11=IFCWALL('a',$);", "#12=IFCWALL('never closes);", "#13=IFCSLAB($,$);"]);
+
+    let mut scanner = EntityScanner::new(&content);
+    let mut ids = Vec::new();
+    while let Some((id, _type_name, _start, _end)) = scanner.next_entity() {
+        ids.push(id);
+    }
+
+    // Only #11 survives — #12 and #13 are gone, exactly the silent-tail-loss
+    // shape #3695 fixed on the TS side.
+    assert_eq!(ids, vec![11]);
+    // GREEN requirement: the scanner must know it stopped early, and where.
+    assert_eq!(
+        scanner.malformed_record_start(),
+        Some(content.find("#12").unwrap()),
+        "an unterminated string must be reported, not just silently end the scan"
+    );
 }
 
+/// A record after the malformed one is genuinely unrecoverable (no resync),
+/// but the scanner must still report the malformed record on its own,
+/// independent of the exact `data_file` boilerplate.
 #[test]
-fn has_non_null_attribute_treats_a_comment_before_a_value_as_non_null() {
-    let content = "#1=IFCWALL(/* c1 */ 'a');";
-    let scanner = EntityScanner::new(content);
-    assert!(scanner.has_non_null_attribute(0, content.len(), 0));
+fn unterminated_string_alone_is_reported() {
+    let content = "#1=IFCWALL('never closes);";
+    let mut scanner = EntityScanner::new(content);
+    assert_eq!(scanner.next_entity(), None);
+    assert_eq!(scanner.malformed_record_start(), Some(0));
 }
 
-/// A comma inside a comment must not count as an attribute separator: the
-/// real target attribute (index 1) is the `$` after the comment, not the
-/// comment's own `b'` fragment.
+/// A clean end of scan (no more `#<digits>=` candidates) must NOT be
+/// mistaken for a malformed-record stop — `malformed_record_start` is only
+/// for the case `find_entity_end` refused a record it had already started.
 #[test]
-fn has_non_null_attribute_comma_inside_a_comment_does_not_split_attributes() {
-    let content = "#1=IFCWALL('a', /* x, y */ $);";
-    let scanner = EntityScanner::new(content);
-    assert!(!scanner.has_non_null_attribute(0, content.len(), 1));
+fn clean_end_of_scan_reports_no_malformed_record() {
+    let content = data_file(&["#1=IFCWALL('a',$);"]);
+    let mut scanner = EntityScanner::new(&content);
+    while scanner.next_entity().is_some() {}
+    assert_eq!(scanner.malformed_record_start(), None);
 }
 
-/// A `$` written literally inside a comment must not fool the check the other
-/// way: attribute 0 here is `'a'`, not the comment's `$`.
+/// The pre-existing "unterminated comment inside a record" stop (#3303) has
+/// the identical silent-stop shape and is fixed the same way here, in the
+/// same edit, since it shares `find_entity_end`'s failure path.
 #[test]
-fn has_non_null_attribute_dollar_inside_a_comment_is_comment_text() {
-    let content = "#1=IFCWALL(/* was $ */ 'a');";
-    let scanner = EntityScanner::new(content);
-    assert!(scanner.has_non_null_attribute(0, content.len(), 0));
+fn unterminated_comment_inside_a_record_is_reported() {
+    let content = data_file(&["#11=IFCWALL('a', /* never closes $);"]);
+    let mut scanner = EntityScanner::new(&content);
+    assert_eq!(scanner.next_entity(), None);
+    assert_eq!(
+        scanner.malformed_record_start(),
+        Some(content.find("#11").unwrap())
+    );
 }
 
+/// An unterminated comment BETWEEN records (not inside one) hits the other
+/// `skip_step_comment` call site in `next_entity`'s candidate-hunt loop, and
+/// must be reported the same way.
 #[test]
-fn has_non_null_attribute_comment_free_records_unchanged() {
-    let content = "#1=IFCWALL('a',$,5);";
-    let scanner = EntityScanner::new(content);
-    assert!(scanner.has_non_null_attribute(0, content.len(), 0));
-    assert!(!scanner.has_non_null_attribute(0, content.len(), 1));
-    assert!(scanner.has_non_null_attribute(0, content.len(), 2));
+fn unterminated_comment_between_records_is_reported() {
+    let content = data_file(&["#11=IFCWALL('a',$);", "/* never closes"]);
+    let mut scanner = EntityScanner::new(&content);
+    let mut ids = Vec::new();
+    while let Some((id, _type_name, _start, _end)) = scanner.next_entity() {
+        ids.push(id);
+    }
+    assert_eq!(ids, vec![11]);
+    assert_eq!(
+        scanner.malformed_record_start(),
+        Some(content.find("/* never closes").unwrap())
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The HEADER-skip's own comment handling (`scanner_header::data_section_start`).
+// A STEP comment is legal wherever whitespace is, the HEADER included, so the
+// `DATA;` marker search has to walk past a complete `/* … */` the same way it
+// walks past a quoted string.
+// ---------------------------------------------------------------------------
+
+/// RED, pre-fix: the marker search skipped strings but not comments, so a
+/// `DATA;` written inside a HEADER comment ended the search there. The scan
+/// then started INSIDE the comment and yielded `#99`, an entity the file does
+/// not declare, on top of the real `#1`.
+#[test]
+fn data_marker_inside_a_header_comment_is_not_the_marker() {
+    let content = "ISO-10303-21;\nHEADER;\n\
+/* DATA; #99=IFCWALL($); */\n\
+ENDSEC;\nDATA;\n\
+#1=IFCWALL('a',$);\n\
+ENDSEC;\nEND-ISO-10303-21;\n";
+
+    let mut scanner = EntityScanner::new(content);
+    let mut ids = Vec::new();
+    while let Some((id, _type_name, _start, _end)) = scanner.next_entity() {
+        ids.push(id);
+    }
+
+    assert_eq!(
+        ids,
+        vec![1],
+        "the commented-out #99 is not a record this file declares"
+    );
+    assert_eq!(scanner.malformed_record_start(), None);
+}
+
+/// A HEADER comment that never closes swallows the whole file, so there is no
+/// `DATA;` marker to find and no entity to return. That is the same
+/// malformed-record condition #3695/#3699 report elsewhere, and it must reach
+/// the caller through the same channel rather than being silently skipped.
+#[test]
+fn unterminated_header_comment_is_reported() {
+    let content = "ISO-10303-21;\nHEADER;\n\
+/* never closes\n\
+ENDSEC;\nDATA;\n\
+#1=IFCWALL('a',$);\n";
+
+    let mut scanner = EntityScanner::new(content);
+    assert_eq!(scanner.next_entity(), None);
+    assert_eq!(
+        scanner.malformed_record_start(),
+        Some(content.find("/* never closes").unwrap()),
+        "an unterminated HEADER comment must be reported, not silently skipped"
+    );
+}
+
+/// #3987: a numerically oversized prefix is not reported until its entire body
+/// has a terminator. Closed prefix trivia must not affect span/quote handling.
+#[test]
+fn fused_id_prefix_retains_refusal_and_malformed_order_3987() {
+    for id in ["1", "0000000000000000001", "4294967295", "4294967296",
+        "999999999999999999999999999999999999"] {
+        for trivia in ["", " ", "/* quote' ; #7=IFCX(); */", "\r\n/* a=b */\x0b"] {
+            let prefix = format!("#{id}{trivia}=");
+            let parsed = id.parse::<u32>().ok();
+            for body in ["IFCWALL('a;''b',/* x; */$);", "/* x'; */IFCWALL($);", "IFCWALL($);"] {
+                let record = format!("{prefix}{body}");
+                let source = format!("{record}#7=IFCDOOR($);");
+                let mut scanner = EntityScanner::new(&source);
+                if let Some(expected) = parsed {
+                    let found = scanner.next_entity().unwrap();
+                    assert_eq!((found.0, found.1, found.2, found.3),
+                        (expected, "IFCWALL", 0, record.len()));
+                }
+                assert_eq!(scanner.next_entity(), Some((7, "IFCDOOR", record.len(), source.len())));
+                assert_eq!(scanner.skipped_oversized_id_starts(),
+                    if parsed.is_none() { &[0][..] } else { &[][..] });
+                assert_eq!(scanner.malformed_record_start(), None);
+            }
+            for body in ["IFCWALL('unterminated);", "IFCWALL(/* unterminated", "IFCWALL($)"] {
+                let source = format!("{prefix}{body}");
+                let mut scanner = EntityScanner::new(&source);
+                assert!(scanner.next_entity().is_none());
+                assert_eq!(scanner.malformed_record_start(), Some(0));
+                assert!(scanner.skipped_oversized_id_starts().is_empty());
+            }
+        }
+    }
+    let source = "#4294967296/* never closed";
+    let mut scanner = EntityScanner::new(source);
+    assert!(scanner.next_entity().is_none());
+    assert_eq!(scanner.malformed_record_start(), source.find("/*"));
+    assert!(scanner.skipped_oversized_id_starts().is_empty());
+    let source = "#4294967296 not-a-declaration #8=IFCWALL($);";
+    let mut scanner = EntityScanner::new(source);
+    assert_eq!(scanner.next_entity().map(|x| x.0), Some(8));
+    assert!(scanner.skipped_oversized_id_starts().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// #4179: a record with no `;` of its own must not latch onto a LATER `;`.
+// The already-fixed cluster above covers "nothing left to find at all"; these
+// cover the opposite case, where something IS left to find and the scan runs
+// past its own record boundary to reach it — swallowing the next record and
+// reporting success.
+// ---------------------------------------------------------------------------
+
+/// RED, pre-fix: `[1, 2, 4]` — #3 is gone, #2's span covers #3's bytes, and
+/// `malformed_record_start()` is `None`.
+///
+/// The broken record is DROPPED, not the rest of the file: #3 and #4 both
+/// survive. `close_step_record` (parser::lexical) argues why recovery beats
+/// stopping; `missing_terminator_does_not_cost_the_sharded_scan_its_tail_4179`
+/// is the measurement.
+#[test]
+fn unterminated_record_does_not_swallow_the_next_record_4179() {
+    let content = "#1=IFCA(1);\n#2=IFCB(2)\n#3=IFCC(3);\n#4=IFCD(4);\n";
+    let (spans, stop) = scan_spans_and_stop(content);
+    assert_eq!(spans, vec![(1, "#1=IFCA(1);"), (3, "#3=IFCC(3);"), (4, "#4=IFCD(4);")]);
+    assert_eq!(
+        stop,
+        content.find("#2"),
+        "a record whose own ';' is missing must be reported, not completed \
+         with the next record's ';'"
+    );
+}
+
+/// RED, pre-fix: #2's span swallows `ENDSEC;` and nothing is reported — the
+/// file parses as fully successful having lost the footer's structural marker.
+#[test]
+fn unterminated_last_record_does_not_swallow_the_footer_4179() {
+    let content = "#1=IFCPROJECT('a');\n#2=IFCWALL('b')\nENDSEC;\nEND-ISO-10303-21;\n";
+    let (spans, stop) = scan_spans_and_stop(content);
+    assert_eq!(spans, vec![(1, "#1=IFCPROJECT('a');")]);
+    assert_eq!(stop, content.find("#2"));
+}
+
+/// Recovery is bounded by the SAME "no resume point" rule the #3695 cluster
+/// set: `close_step_record` walks strings and comments whole, so an
+/// unterminated one leaves no balancing `)` to resume at and the scan still
+/// stops there. Without this the recovery would quietly widen #3695's
+/// contract while every one of its own tests stayed green.
+#[test]
+fn recovery_does_not_resume_past_an_unclosed_string_or_comment_4179() {
+    for body in ["IFCWALL('never closes,$)", "IFCWALL(/* never closes $)"] {
+        let content = format!("#1=IFCA(1);\n#2={body}\n#3=IFCC(3);\n");
+        let (spans, stop) = scan_spans_and_stop(&content);
+        assert_eq!(spans, vec![(1, "#1=IFCA(1);")], "body: {body}");
+        assert_eq!(stop, content.find("#2"), "body: {body}");
+    }
+}
+
+/// The guards must not FALSELY refuse a legal record — the direction a
+/// per-guard mutation check cannot answer, and the dangerous one, since a
+/// refusal now drops a record.
+///
+/// Every shape here is hand-constructed because a sweep of this repo's IFC
+/// corpus contains NONE of them, so a clean sweep over it is not evidence
+/// about these cases. `LEGAL_BODIES` in
+/// `packages/parser/src/step-record-boundary.vectors.ts` carries the counts
+/// and holds the matching TypeScript vectors.
+#[test]
+fn record_boundary_guards_accept_legal_records_4179() {
+    let mut bodies = vec![
+        // '=' outside a declaration, in every place it can legally appear.
+        "IFCWALL('a=b',$);".to_string(),
+        "IFCWALL($ /* a=b */);".to_string(),
+        "IFCDOCUMENTREFERENCE('http://h/q?a=b&c=d',$);".to_string(),
+        // Trivia between the closing ')' and the ';'.
+        "IFCWALL($)/* trailing */;".to_string(),
+        "IFCWALL($)/* one *//* two */;".to_string(),
+        "IFCWALL($) /* spaced */ \t /* twice */ ;".to_string(),
+        "IFCWALL($)/* multi\nline */;".to_string(),
+        // Shapes the corpus does cover, kept as the control.
+        "IFCWALL(('a'),(1.,2.));".to_string(),
+        "IFCWALL(\n  'a',\n  $\n);".to_string(),
+        "(IFCA(1)IFCB(2));".to_string(),
+    ];
+    // Each STEP space byte on its own: `is_step_space` includes vertical tab
+    // and form feed, and a form feed silently dropping an entity is exactly
+    // what #3733 was.
+    for space in [" ", "\t", "\r", "\n", "\x0b", "\x0c"] {
+        bodies.push(format!("IFCWALL($){space};"));
+        bodies.push(format!("IFCWALL($){space}/* c */{space};"));
+    }
+    for body in &bodies {
+        let body = body.as_str();
+        let content = format!("#1={body}\n#2=IFCDOOR($);\n");
+        let (spans, stop) = scan_spans_and_stop(&content);
+        let record = format!("#1={body}");
+        assert_eq!(spans, vec![(1, record.as_str()), (2, "#2=IFCDOOR($);")], "body: {body}");
+        assert_eq!(stop, None, "body: {body}");
+    }
+}
+
+/// A record whose parens balance only PAST a later declaration must not hand
+/// back a resume point past that declaration. `#1` here balances at the `)`
+/// closing #2's own parameter list, so the pre-fix scan resumed after it and
+/// #2 vanished from the model with nothing reported about it: the refused
+/// record took its neighbour with it. #4179 follow-up.
+#[test]
+fn recovery_does_not_resume_past_the_next_declaration_4179() {
+    let content = "#1=IFCA(2 #2=IFCWALL($));\n#3=IFCC(3);\n";
+    let (spans, stop) = scan_spans_and_stop(content);
+    assert_eq!(spans, vec![(2, "#2=IFCWALL($));"), (3, "#3=IFCC(3);")]);
+    assert_eq!(stop, content.find("#1"));
+}
+
+/// Recovery from a refused record must be MONOTONE in the file: dropping one
+/// record may not cost a walk over everything after it, because the NEXT
+/// declaration then pays for the same walk again.
+///
+/// All three bodies below are nothing but refused records, and each reaches
+/// the walk from a different side. `#1=A(2;` has no balancing `)`, so
+/// `close_step_record` ran to end of input to answer `Unbalanced`. `#1=A(`
+/// leaves no `'`, `;` or `/` anywhere after it, so `find_entity_end`'s
+/// `memchr3` ran to end of input to answer `None`. Both were clean O(n^2),
+/// measured on the release build at 80 000 records (0.6 MB and 0.5 MB): 16.2s
+/// and 11.8s, rising 4x per doubling.
+///
+/// The third and fourth bodies are the second plus a trailer: one `;` at end
+/// of file, and the `ENDSEC;` / `END-ISO-10303-21;` every real file carries.
+/// A first cut of this fix memoised "no terminator from here on" as a suffix
+/// property, which bounds the second shape and is disarmed by either trailer:
+/// the walk finds the trailing `;` every time and the memo never arms, so on
+/// a real upload it never fired at all. Measured on that cut, 80 000 records
+/// with the `ENDSEC;` trailer took 644ms and 320 000 with a lone `;` took
+/// 14.5s, both still 4x per doubling. Putting `=` in the `memchr3` triple
+/// bounds all four with one rule, because the walk can never pass the next
+/// declaration whatever lies beyond it.
+///
+/// The verdict is a RATIO against a well-formed file of the same record
+/// count, and the scan runs on its own thread so the test FAILS the moment
+/// the budget is spent rather than waiting for a quadratic walk to finish.
+/// An absolute threshold has to be sized for one build mode and one machine:
+/// the earlier cut at 80 000 records came in under its 5 s bound unfixed on a
+/// release build (a test that cannot fail there), and at 320 000 records the
+/// unfixed debug build ran for longer than the revert oracle's 20-minute job,
+/// so it "failed" by hanging, which AGENTS.md is explicit is worse than
+/// failing. Scanning the well-formed twin first gives a linear baseline in
+/// whatever mode and on whatever machine this runs; the malformed file must
+/// then cost at most a small multiple of it. Linear-vs-linear sits near 1x;
+/// the quadratic walk is far past 20x at this size in either build mode. A
+/// scan that overruns is abandoned on its thread and reported, so the whole
+/// test decides in about a second either way. Every entry point over
+/// untrusted bytes reaches this scan (`entity_count`, `build_entity_index`,
+/// `ColumnarEntityIndex::from_scan`, the wasm prepass, the server's parse
+/// routes), so the input is an ordinary upload.
+#[test]
+fn refused_records_do_not_rescan_the_remainder_4179() {
+    const RECORDS: usize = 40_000;
+
+    /// Scan on a thread; `None` if it did not finish within `cap`.
+    fn scan_within(content: String, cap: std::time::Duration) -> Option<(usize, std::time::Duration)> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let found = EntityScanner::new(&content).count();
+            let _ = tx.send((found, started.elapsed()));
+        });
+        rx.recv_timeout(cap).ok()
+    }
+
+    let mut well_formed = String::from(DATA_PREAMBLE);
+    well_formed.push_str(&"#1=A();\n".repeat(RECORDS));
+    let (found, baseline) = scan_within(well_formed, std::time::Duration::from_secs(60))
+        .expect("the well-formed baseline must scan within a minute in any build mode");
+    assert_eq!(found, RECORDS, "the baseline file is well-formed");
+    // A floor keeps a sub-millisecond release baseline from making the
+    // budget tighter than timer resolution.
+    let budget = baseline.max(std::time::Duration::from_millis(5)) * 20;
+
+    for (body, tail) in [
+        ("#1=A(2;\n", ""),
+        ("#1=A(\n", ""),
+        ("#1=A(\n", ";"),
+        ("#1=A(\n", "ENDSEC;\nEND-ISO-10303-21;\n"),
+    ] {
+        let mut content = String::from(DATA_PREAMBLE);
+        content.push_str(&body.repeat(RECORDS));
+        content.push_str(tail);
+        let bytes = content.len();
+        let Some((found, elapsed)) = scan_within(content, budget) else {
+            panic!(
+                "{RECORDS} refused records ({bytes} bytes) of {body:?}{tail:?} did not finish within \
+                 {budget:?} (20x the {baseline:?} baseline for the same count well-formed): recovery \
+                 is walking the remainder per record again"
+            );
+        };
+        assert_eq!(found, 0, "every record in {body:?} is malformed");
+        assert!(elapsed < budget, "{body:?}{tail:?} finished in {elapsed:?} but over the {budget:?} budget");
+    }
+}
+
+/// The record-body walk must also be linear in ONE record's own length. An
+/// intermediate cut of the #4179 fix took `/` out of the `memchr3` triple and
+/// looked for it on the plain span before the hit, then resumed the SIMD pass
+/// from just after each `/`: every division or comment re-scanned to the hit,
+/// so a single record dense with them was quadratic in itself. Measured on
+/// that cut through `build_entity_index`, release build: one record of
+/// `1/1/1/...` at 100 KB / 200 KB / 400 KB took 96ms / 310ms / 1.23s, and one
+/// record of repeated `/**/` at 800 KB took 2.5s, against 0.09 / 0.25 / 0.32ms
+/// and 1.5ms on the parent. Each `/` now moves `pos` past itself and the next
+/// one is searched for only in `[pos, hit)`. Same fail-fast shape as the test
+/// above: a scan that overruns 20x the slash-free baseline is abandoned and
+/// reported rather than waited for.
+///
+/// Both shapes are well-formed 10303-21 (division in a value list, comment
+/// trivia), so this is an ordinary upload, not a malformed one.
+#[test]
+fn a_record_dense_with_slashes_costs_one_walk_of_its_own_length() {
+    const BYTES: usize = 400_000;
+    let scan_within = |content: String, cap: std::time::Duration| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let found = EntityScanner::new(&content).count();
+            let _ = tx.send((found, started.elapsed()));
+        });
+        rx.recv_timeout(cap).ok()
+    };
+
+    // Baseline: one record of the same size with no '/' in it at all.
+    let mut plain = String::from(DATA_PREAMBLE);
+    plain.push_str("#1=IFCX(");
+    plain.push_str(&"1,".repeat(BYTES / 2));
+    plain.push_str("$);\n");
+    let (found, baseline) = scan_within(plain, std::time::Duration::from_secs(60))
+        .expect("the slash-free baseline must scan within a minute in any build mode");
+    assert_eq!(found, 1);
+    let budget = baseline.max(std::time::Duration::from_millis(5)) * 20;
+
+    for (name, unit) in [("division", "1/"), ("comment", "/**/")] {
+        let mut content = String::from(DATA_PREAMBLE);
+        content.push_str("#1=IFCX(");
+        content.push_str(&unit.repeat(BYTES / unit.len()));
+        content.push_str("$);\n");
+        let Some((found, _)) = scan_within(content, budget) else {
+            panic!(
+                "one {BYTES}-byte record of {name} did not finish within {budget:?} (20x the \
+                 {baseline:?} slash-free baseline): the body walk is re-scanning per '/'"
+            );
+        };
+        assert_eq!(found, 1, "the {name} record is well-formed and must scan as one entity");
+    }
+}
+
+/// A refused record must not damage its NEIGHBOUR. `#1` here is malformed (a
+/// stray `=` inside its parameter list), and the `=` bound refuses it at that
+/// byte and re-hunts from past its `#`. The hunt then meets `#5 = 3);`, which
+/// has the trivia-tolerant `#<digits> =` prefix of a declaration; before the
+/// hunt also required a record after the `=`, that scanned as entity #5 with
+/// body `3)`, and the last-wins entity index wrote it over the REAL #5 point
+/// declared a line earlier. A malformed record cost a well-formed one.
+/// Regression for #4577.
+#[test]
+fn a_stray_equals_in_a_refused_body_does_not_mint_a_phantom_neighbour() {
+    let mut content = String::from(DATA_PREAMBLE);
+    content.push_str("#5=IFCCARTESIANPOINT((0.,0.));\n#1=IFCWALL(#5 = 3);\n#6=IFCWALL($);\n");
+    let mut scanner = EntityScanner::new(&content);
+    let seen: Vec<(u32, String)> =
+        std::iter::from_fn(|| scanner.next_entity().map(|(id, name, _, _)| (id, name.to_string()))).collect();
+    assert_eq!(
+        seen,
+        vec![(5, "IFCCARTESIANPOINT".to_string()), (6, "IFCWALL".to_string())],
+        "the refused #1 must be dropped alone: no phantom #5, and #6 still found"
+    );
+    assert_eq!(scanner.malformed_record_start(), Some(DATA_PREAMBLE.len() + 31));
 }

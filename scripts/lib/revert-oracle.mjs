@@ -34,28 +34,36 @@
  * synthetic fixtures (`revert-oracle.test.mjs`) without reverting anything.
  */
 
+import { parsePython, PYTEST_MISSING_PATTERN } from './revert-oracle-python.mjs';
+import { ALL_SKIPPED, classifyExecuted, severityCandidates } from './revert-oracle-all-skipped.mjs';
+import { passVerdict } from './revert-oracle-pass-verdict.mjs';
+import { processResultGap } from './revert-oracle-process-result.mjs';
+import { isInertPath, isTestSupportPath } from './revert-oracle-inert.mjs';
+export { cargoRunner } from './revert-oracle-cargo.mjs';
 // ---------------------------------------------------------------------------
 // Diff classification
 // ---------------------------------------------------------------------------
 
-/** Paths whose change can neither be reverted usefully nor observed by a test. */
+/** Paths no test can observe: release/CI/docs. `tests/e2e/**` is test scaffolding; its Playwright specs run in a browser (#6267). */
 const IGNORED_PREFIXES = ['.changeset/', '.github/', 'docs/', '.vscode/'];
-const IGNORED_EXACT = new Set([
-  'pnpm-lock.yaml',
-  'package-lock.json',
-  'yarn.lock',
-  'Cargo.lock',
-  'CHANGELOG.md',
-]);
+const IGNORED_EXACT = new Set(['pnpm-lock.yaml', 'package-lock.json', 'yarn.lock', 'Cargo.lock', 'rust/python/Cargo.lock', 'CHANGELOG.md', 'playwright.config.ts']);
 const IGNORED_SUFFIXES = ['.md', '.mdx', '.txt', '.snap.orig'];
 
-/** A file that IS a test. */
-const TEST_FILE_RE = /(^|\/)[^/]*\.(test|spec)\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
-/** Directories whose entire contents are test scaffolding, not production. */
-const TEST_DIR_RE = /(^|\/)(__tests__|__snapshots__|__fixtures__|test-fixtures|testdata)(\/|$)/;
+/**
+ * Vercel deploy config: read by Vercel's build pipeline, imported by nothing
+ * here, so no test can observe it — the same reason `.github/` is ignored.
+ * Anchored on the basename on purpose; a blanket `scripts/**` or `*.sh` would
+ * swallow `scripts/lib/*.mjs`, which is real tested logic. Both directions are
+ * pinned in revert-oracle.test.mjs, which carries the full rationale.
+ */
+const DEPLOY_CONFIG_RE = /(^|\/)(vercel\.json|\.vercelignore|vercel-[a-z0-9-]*\.sh)$/;
+
+/** Known test entrypoint names. Unsupported families still classify as tests so planning reports a capability gap. */
+const TEST_FILE_RE = /(^|\/)(?:[^/]*\.(?:test|spec)\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)|test_[^/]*\.py|[^/]*_test\.(?:py|go))$/;
+/** Directories whose entire contents are test scaffolding, not production. `__corpus__`/`corpus`/`__test__`/`test-data` added for #4142 -- see `revert-oracle.test.mjs` for the trade-off and sibling sweep. */
+const TEST_DIR_RE = /(^|\/)(__corpus__|__fixtures__|__snapshots__|__test__|__tests__|corpus|test-data|test-fixtures|testdata)(\/|$)/;
 /** `tests/` and `test/` as a directory segment (but not `src/test-utils.ts`). */
 const TEST_SEGMENT_RE = /(^|\/)tests?(\/)/;
-
 /**
  * Rust puts unit tests INSIDE the production file behind `#[cfg(test)]`. Such a
  * file is production, but reverting it takes its tests with it — the Rust form
@@ -69,10 +77,12 @@ export function classifyPath(path) {
   if (IGNORED_EXACT.has(path)) return 'ignored';
   for (const p of IGNORED_PREFIXES) if (path.startsWith(p)) return 'ignored';
   for (const s of IGNORED_SUFFIXES) if (path.endsWith(s)) return 'ignored';
-  if (TEST_FILE_RE.test(path)) return 'test';
+  if (DEPLOY_CONFIG_RE.test(path)) return 'ignored';
+  if (TEST_FILE_RE.test(path) || /(^|\/)(?:[^/]+_tests|tests)\.rs$/.test(path)) return 'test';
   if (TEST_DIR_RE.test(path)) return 'test';
   if (TEST_SEGMENT_RE.test(path)) return 'test';
-  return 'production';
+  if (isTestSupportPath(path)) return 'test';
+  return isInertPath(path) ? 'inert' : 'production';
 }
 
 /**
@@ -82,12 +92,12 @@ export function classifyDiff(entries) {
   const production = [];
   const test = [];
   const ignored = [];
+  const inert = [];
   const warnings = [];
   for (const { status, path } of entries) {
     const kind = classifyPath(path);
-    if (kind === 'production') production.push({ status, path });
-    else if (kind === 'test') test.push({ status, path });
-    else ignored.push({ status, path });
+    const bucket = kind === 'production' ? production : kind === 'test' ? test : kind === 'inert' ? inert : ignored;
+    bucket.push({ status, path });
   }
   if (production.some((e) => isRustFile(e.path))) {
     warnings.push(
@@ -96,7 +106,7 @@ export function classifyDiff(entries) {
         'as the code — expect INCONCLUSIVE and use --mutation for a surgical revert.',
     );
   }
-  return { production, test, ignored, warnings };
+  return { production, test, ignored, inert, warnings, cargoLockChanged: entries.some((entry) => entry.path === 'Cargo.lock') };
 }
 
 /** Parse `git diff --name-status -z`-free plain output. Renames carry two paths. */
@@ -164,22 +174,16 @@ export function extractNodeFlags(script) {
  * `scripts/**` has no package of its own: the root `scripts.test` is
  * `turbo test`, which runs the workspace and not these files. CI runs each one
  * with an explicit `node --test scripts/<x>.test.mjs` step, so that is what we
- * reproduce. Only plain-JS test files qualify — anything needing a loader must
- * declare a runner rather than be guessed at.
+ * reproduce. Loader-dependent entrypoints require a declared runner.
  */
 export function rootScriptsRunner(files) {
   if (!Array.isArray(files) || files.length === 0) return null;
-  if (!files.every((f) => /^scripts\/.*\.test\.(mjs|js|cjs)$/.test(f))) return null;
-  return { family: 'node-test', bin: 'node', args: ['--test', ...files] };
+  // #4036: retain scaffolding during reversion, but execute only test entrypoints.
+  if (!files.every((f) => classifyPath(f) === 'test')) return null;
+  const entries = files.filter((f) => /\.(test|spec)\.[^/]+$/.test(f));
+  if (entries.length === 0 || !entries.every((f) => /^scripts\/.*\.test\.(mjs|js|cjs)$/.test(f))) return null;
+  return { family: 'node-test', bin: 'node', args: ['--test', ...entries] };
 }
-
-/** Cargo test invocation for a crate. */
-export function cargoRunner(crate) {
-  if (!crate) return null;
-  return { family: 'cargo', bin: 'cargo', args: ['test', '-p', crate] };
-}
-
-// ---------------------------------------------------------------------------
 // Runner output parsing — the core of the tool
 // ---------------------------------------------------------------------------
 
@@ -189,6 +193,7 @@ export const LOAD_FAILURE = 'load-failure';
 export const NO_TESTS = 'no-tests';
 export const RUNNER_MISSING = 'runner-missing';
 export const UNPARSEABLE = 'unparseable';
+export { ALL_SKIPPED };
 
 /**
  * Errors that mean the module never loaded, so no assertion was ever evaluated.
@@ -242,6 +247,7 @@ const RUNNER_MISSING_PATTERNS = [
   /Command "\w[\w-]*" not found/i,
   /No such file or directory.*\.bin/,
   /error: no such command/,
+  PYTEST_MISSING_PATTERN,
 ];
 
 export function hasLoadError(text) {
@@ -274,30 +280,29 @@ export function parseRunnerOutput(run) {
   }
 
   const parsed =
-    family === 'vitest'
-      ? parseVitest(text)
-      : family === 'node-test'
-        ? parseNodeTest(text)
-        : family === 'cargo'
-          ? parseCargo(text)
-          : null;
+    family === 'vitest' ? parseVitest(text)
+    : family === 'node-test' ? parseNodeTest(text)
+    : family === 'cargo' ? parseCargo(text)
+    : family === 'python' ? parsePython(text)
+    : null;
 
   if (!parsed) {
     return { kind: UNPARSEABLE, passed: null, failed: null, total: null, evidence: [`unknown runner family: ${family}`] };
   }
 
-  // A load error ANYWHERE outranks every other signal. Some files may have run
-  // their assertions, but at least one subject never loaded, so the run cannot
-  // be read as "the tests observed the change".
-  // Both signals are recorded: the STRUCTURAL one (the runner reported a file
-  // rather than a test) and the TEXTUAL one (the actual import/compile error).
-  // A human reading an INCONCLUSIVE needs the error text to write the surgical
-  // mutation, so it must never be shadowed by the structural summary.
-  const textualHit = firstMatch(text, LOAD_ERROR_PATTERNS);
+  const earlyProcessGap = processResultGap(parsed, run);
+  if (earlyProcessGap && (run.signal || run.exitCode === null)) return earlyProcessGap;
+
+  // Load/collection evidence outranks assertion output; green processes may
+  // contain error-shaped fixture text without becoming failures (#4109).
+  const textualHit = run.exitCode === 0 && parsed.total > 0 ? null : firstMatch(text, LOAD_ERROR_PATTERNS);
   for (const hit of [textualHit, parsed.loadEvidence]) if (hit) evidence.push(hit);
   if (evidence.length > 0) {
     return { kind: LOAD_FAILURE, passed: parsed.passed, failed: parsed.failed, total: parsed.total, evidence };
   }
+
+  const processGap = processResultGap(parsed, run);
+  if (processGap) return processGap;
 
   if (parsed.kind) return { ...parsed, evidence: parsed.evidence ?? [] };
 
@@ -307,10 +312,7 @@ export function parseRunnerOutput(run) {
   if (parsed.total === null) {
     return { kind: UNPARSEABLE, passed: null, failed: null, total: null, evidence: ['no test summary found in runner output'] };
   }
-  if (parsed.failed > 0) {
-    return { kind: ASSERTION_FAILURE, passed: parsed.passed, failed: parsed.failed, total: parsed.total, evidence: parsed.evidence ?? [] };
-  }
-  return { kind: PASS, passed: parsed.passed, failed: parsed.failed, total: parsed.total, evidence: [] };
+  return classifyExecuted(parsed);
 }
 
 function parseVitest(text) {
@@ -379,7 +381,8 @@ function parseCargo(text) {
     passed += Number(r[2]);
     failed += Number(r[3]);
   }
-  return { passed, failed, total: passed + failed, loadEvidence: null };
+  const identities = [...text.matchAll(/^test (.+?) \.\.\. (?:ok|FAILED|ignored)\r?$/gm)].map((match) => match[1]);
+  return { passed, failed, total: passed + failed, identities, loadEvidence: null };
 }
 
 function num(m) {
@@ -394,6 +397,7 @@ export const OBSERVED = 'OBSERVED';
 export const UNOBSERVED = 'UNOBSERVED';
 export const INCONCLUSIVE = 'INCONCLUSIVE';
 export const BASELINE_BROKEN = 'BASELINE-BROKEN';
+export const REVERT_BROKE_BUILD = 'REVERT-BROKE-BUILD';
 
 /**
  * @param {{baseline: object, reverted: object}} args results from parseRunnerOutput
@@ -468,16 +472,7 @@ export function verdict({ baseline, reverted }) {
     };
   }
   if (reverted.kind === PASS) {
-    return {
-      verdict: UNOBSERVED,
-      exitCode: 1,
-      reason:
-        `FINDING: with the production change fully reverted, all ${reverted.total} test(s) still PASS. ` +
-        'The branch\'s tests do not observe the branch\'s change.',
-      advice:
-        'Either the test asserts something the change does not affect, or it stubs the very module ' +
-        'the change lives in. Write a test that fails on this revert before shipping.',
-    };
+    return passVerdict(baseline, reverted);
   }
   return { verdict: INCONCLUSIVE, exitCode: 3, reason: `unhandled reverted kind: ${reverted.kind}`, advice: SURGICAL_ADVICE };
 }
@@ -496,14 +491,15 @@ export const SURGICAL_ADVICE =
  * takes the WORST kind, not the most common one: one package whose suite failed
  * to load poisons the whole conclusion, however green the others were.
  */
-const KIND_SEVERITY = [PASS, ASSERTION_FAILURE, NO_TESTS, LOAD_FAILURE, UNPARSEABLE, RUNNER_MISSING];
+const KIND_SEVERITY = [PASS, ASSERTION_FAILURE, ALL_SKIPPED, NO_TESTS, LOAD_FAILURE, UNPARSEABLE, RUNNER_MISSING];
 
 export function aggregate(results) {
   if (!Array.isArray(results) || results.length === 0) {
     return { kind: UNPARSEABLE, passed: null, failed: null, total: null, evidence: ['no packages were run'] };
   }
-  let worst = results[0];
-  for (const r of results) {
+  const candidates = severityCandidates(results);
+  let worst = candidates[0];
+  for (const r of candidates) {
     if (KIND_SEVERITY.indexOf(r.kind) > KIND_SEVERITY.indexOf(worst.kind)) worst = r;
   }
   const sum = (key) =>
@@ -513,6 +509,7 @@ export function aggregate(results) {
     passed: sum('passed'),
     failed: sum('failed'),
     total: sum('total'),
+    allSkippedRuns: results.filter((r) => r.kind === ALL_SKIPPED).length,
     evidence: results.flatMap((r) => r.evidence ?? []),
   };
 }

@@ -15,6 +15,28 @@ function makeExtraction(): ScheduleExtraction {
       finishTime: '2024-06-01T17:00:00',
       predefinedType: 'PLANNED',
       taskGlobalIds: ['task-a', 'task-b'],
+      calendarGlobalIds: ['cal-gid'],
+    }],
+    workCalendars: [{
+      expressId: 0, globalId: 'cal-gid', name: 'Site 5-day week',
+      identification: 'CAL-1', predefinedType: 'FIRSTSHIFT',
+      workingTimes: [{
+        name: 'Weekdays',
+        start: '2024-05-01', finish: '2024-12-31',
+        recurrencePattern: {
+          recurrenceType: 'WEEKLY',
+          dayComponent: [],
+          weekdayComponent: [1, 2, 3, 4, 5],
+          monthComponent: [],
+          interval: 1,
+          timePeriods: [{ start: '07:00:00', end: '16:00:00' }],
+        },
+      }],
+      exceptionTimes: [{
+        name: 'Public holiday',
+        start: '2024-05-09', finish: '2024-05-09',
+        recurrencePattern: undefined,
+      }],
     }],
     tasks: [
       {
@@ -23,6 +45,7 @@ function makeExtraction(): ScheduleExtraction {
         childGlobalIds: [],
         productExpressIds: [101, 102], productGlobalIds: ['p101', 'p102'],
         controllingScheduleGlobalIds: ['sched-gid'],
+        calendarGlobalIds: ['cal-gid'],
         taskTime: {
           scheduleStart: '2024-05-01T08:00:00',
           scheduleFinish: '2024-05-06T17:00:00',
@@ -144,7 +167,7 @@ describe('serializeScheduleToStep', () => {
 
   it('skips IfcTaskTime when no time fields are set', () => {
     const data: ScheduleExtraction = {
-      hasSchedule: true, workSchedules: [], sequences: [],
+      hasSchedule: true, workSchedules: [], sequences: [], workCalendars: [],
       tasks: [{
         expressId: 0, globalId: 'bare-task', name: 'Untimed',
         isMilestone: true, childGlobalIds: [],
@@ -273,7 +296,7 @@ describe('serializeScheduleToStep', () => {
 
   it('resolveProductExpressId still fires for globalId-only tasks (no aligned expressId)', () => {
     const data: ScheduleExtraction = {
-      hasSchedule: true, workSchedules: [], sequences: [],
+      hasSchedule: true, workSchedules: [], sequences: [], workCalendars: [],
       tasks: [{
         expressId: 0, globalId: 'task-x', name: 'Global-only task',
         isMilestone: false, childGlobalIds: [],
@@ -302,6 +325,87 @@ describe('serializeScheduleToStep', () => {
     });
     const proc = result.lines.find(l => l.includes('=IFCRELASSIGNSTOPROCESS('));
     expect(proc).toContain('(#9001,#9002)');
+  });
+});
+
+describe('serializeScheduleToStep — IfcWorkCalendar (#4830)', () => {
+  it('emits IFCWORKCALENDAR with 9 attributes, its IfcWorkTime list, and the recurrence pattern', () => {
+    const result = serializeScheduleToStep(makeExtraction(), { nextId: 1000, ownerHistoryId: 42 });
+
+    const cal = result.lines.find(l => l.includes('=IFCWORKCALENDAR('));
+    expect(cal).toBeDefined();
+    expect(cal).toContain("'cal-gid'");
+    expect(cal).toContain("'Site 5-day week'");
+    expect(cal).toContain('#42');
+    expect(cal).toContain('.FIRSTSHIFT.');
+    const calArgs = cal!.match(/=IFCWORKCALENDAR\((.+)\);$/)![1];
+    expect(countTopLevelArgs(calArgs)).toBe(9);
+    // [6] WorkingTimes and [7] ExceptionTimes are both one-element ref lists.
+    const calSplit = splitTopLevelArgs(calArgs);
+    expect(calSplit[6]).toMatch(/^\(#\d+\)$/);
+    expect(calSplit[7]).toMatch(/^\(#\d+\)$/);
+
+    const workTimes = result.lines.filter(l => l.includes('=IFCWORKTIME('));
+    expect(workTimes.length).toBe(2);
+    const weekday = workTimes.find(l => l.includes("'Weekdays'"))!;
+    // IfcWorkTime: Name, DataOrigin, UDDataOrigin, RecurrencePattern, Start, Finish.
+    const wtSplit = splitTopLevelArgs(weekday.match(/=IFCWORKTIME\((.+)\);$/)![1]);
+    expect(wtSplit.length).toBe(6);
+    expect(wtSplit[3]).toMatch(/^#\d+$/);
+    expect(wtSplit[4]).toBe("'2024-05-01'");
+
+    // The exception time carries no pattern — attribute [3] must be `$`.
+    const holiday = workTimes.find(l => l.includes("'Public holiday'"))!;
+    expect(splitTopLevelArgs(holiday.match(/=IFCWORKTIME\((.+)\);$/)![1])[3]).toBe('$');
+
+    const pattern = result.lines.find(l => l.includes('=IFCRECURRENCEPATTERN('));
+    expect(pattern).toBeDefined();
+    expect(pattern).toContain('.WEEKLY.');
+    const pSplit = splitTopLevelArgs(pattern!.match(/=IFCRECURRENCEPATTERN\((.+)\);$/)![1]);
+    expect(pSplit.length).toBe(8);
+    expect(pSplit[1]).toBe('$');            // DayComponent — empty list writes `$`
+    expect(pSplit[2]).toBe('(1,2,3,4,5)');  // WeekdayComponent
+    expect(pSplit[7]).toMatch(/^\(#\d+\)$/); // TimePeriods
+
+    const period = result.lines.find(l => l.includes('=IFCTIMEPERIOD('));
+    expect(period).toContain("'07:00:00'");
+    expect(period).toContain("'16:00:00'");
+
+    expect(result.stats.workCalendars).toBe(1);
+    expect(result.stats.workTimes).toBe(2);
+    expect(result.stats.recurrencePatterns).toBe(1);
+    expect(result.stats.timePeriods).toBe(1);
+  });
+
+  it('emits one calendar IfcRelAssignsToControl covering both the task and the schedule', () => {
+    const result = serializeScheduleToStep(makeExtraction(), { nextId: 1000, ownerHistoryId: 42 });
+    const calId = result.lines.find(l => l.includes('=IFCWORKCALENDAR('))!.match(/^#(\d+)=/)![1];
+    const rels = result.lines.filter(l => l.includes('=IFCRELASSIGNSTOCONTROL('));
+    const calRel = rels.find(l => l.endsWith(`,#${calId});`));
+    expect(calRel).toBeDefined();
+    const taskId = result.lines.find(l => l.includes("=IFCTASK('task-a'"))!.match(/^#(\d+)=/)![1];
+    const scheduleId = result.lines.find(l => l.includes("=IFCWORKSCHEDULE('sched-gid'"))!.match(/^#(\d+)=/)![1];
+    const relatedObjects = splitTopLevelArgs(calRel!.match(/=IFCRELASSIGNSTOCONTROL\((.+)\);$/)![1])[4];
+    expect(new Set(relatedObjects.slice(1, -1).split(','))).toEqual(new Set([`#${taskId}`, `#${scheduleId}`]));
+    expect(result.stats.calendarAssignments).toBe(1);
+    // The schedule -> tasks relation is still emitted and counted separately.
+    expect(result.stats.assignsToControl).toBe(1);
+  });
+
+  it('emits nothing calendar-shaped when the extraction has no calendars', () => {
+    const data: ScheduleExtraction = {
+      hasSchedule: true, workSchedules: [], sequences: [], workCalendars: [],
+      tasks: [{
+        expressId: 0, globalId: 'solo', name: 'Solo', isMilestone: false,
+        childGlobalIds: [], productExpressIds: [], productGlobalIds: [],
+        controllingScheduleGlobalIds: [],
+      }],
+    };
+    const result = serializeScheduleToStep(data, { nextId: 1 });
+    expect(result.lines.some(l => l.includes('IFCWORKCALENDAR'))).toBe(false);
+    expect(result.lines.some(l => l.includes('IFCWORKTIME'))).toBe(false);
+    expect(result.stats.workCalendars).toBe(0);
+    expect(result.stats.calendarAssignments).toBe(0);
   });
 });
 

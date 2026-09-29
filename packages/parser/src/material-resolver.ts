@@ -13,6 +13,8 @@ import { RelationshipType } from '@ifc-lite/data';
 import type { IfcDataStore } from './columnar-parser.js';
 import { isIfcTypeLikeEntity } from './columnar-parser-indexes.js';
 import { resolveEntityLengthUnitScale } from './unit-extractor.js';
+import { resolveAllMaterialDefIds, resolveMaterialOwnerAndDefIds, resolveOwnMaterialDefIds } from './material-associations.js';
+export { resolveAllMaterialDefIds } from './material-associations.js';
 
 export interface MaterialInfo {
     type: 'Material' | 'MaterialLayerSet' | 'MaterialProfileSet' | 'MaterialConstituentSet' | 'MaterialList';
@@ -29,6 +31,9 @@ export interface MaterialInfo {
      * either, so callers must propagate both.
      */
     materials?: Array<{ name: string; category?: string }>;
+    /** The graph proves a material association, but this store has no source
+     *  bytes to read it (server-parsed, #5227). Every other field is unset. */
+    unresolved?: boolean;
 }
 
 export interface MaterialLayerInfo {
@@ -63,63 +68,6 @@ export interface MaterialConstituentInfo {
 }
 
 /**
- * Resolve the OCCURRENCE-LEVEL material definition ids directly associated
- * with an entity (no type fallback): every IfcRelAssociatesMaterial that
- * targets it, deduped and ordered by the rel's express id — the same rule
- * that decides the single-entry `onDemandMaterialMap` winner, so index 0
- * always equals the map's entry. Falls back to the map when no relationship
- * graph is available (minimal/test stores).
- */
-function resolveOwnMaterialDefIds(store: IfcDataStore, entityId: number): number[] {
-    if (store.relationships) {
-        // Prefer getEdges (carries relationshipId for deterministic ordering);
-        // facade graphs (server data model, test mocks) may implement only
-        // getRelated, whose order is best-effort.
-        if (typeof store.relationships.inverse?.getEdges === 'function') {
-            const edges = store.relationships.inverse.getEdges(entityId, RelationshipType.AssociatesMaterial);
-            if (edges.length > 0) {
-                const sorted = [...edges].sort((a, b) => a.relationshipId - b.relationshipId);
-                const out: number[] = [];
-                for (const e of sorted) {
-                    if (!out.includes(e.target)) out.push(e.target);
-                }
-                return out;
-            }
-        } else {
-            const related = store.relationships.getRelated(entityId, RelationshipType.AssociatesMaterial, 'inverse');
-            if (related.length > 0) return [...new Set(related)];
-        }
-    }
-    // Map values are LISTS (all associations, file order) since #1773.
-    const mapped = store.onDemandMaterialMap?.get(entityId);
-    return mapped !== undefined ? [...mapped] : [];
-}
-
-/**
- * Resolve ALL material definition ids for an entity: every occurrence-level
- * IfcRelAssociatesMaterial (elements may legally carry more than one), or —
- * when the occurrence has none — the associations of its type
- * (IfcRelDefinesByType), matching {@link extractMaterialsOnDemand}'s
- * occurrence-overrides-type precedence. Ordered by rel express id, so
- * index 0 is the entity's deterministic "primary" material definition.
- */
-export function resolveAllMaterialDefIds(store: IfcDataStore, entityId: number): number[] {
-    const own = resolveOwnMaterialDefIds(store, entityId);
-    if (own.length > 0) return own;
-
-    // Type fallback: first type with any association wins (mirrors the
-    // single-def lookup's `break`).
-    if (store.relationships) {
-        const typeIds = store.relationships.getRelated(entityId, RelationshipType.DefinesByType, 'inverse');
-        for (const typeId of typeIds) {
-            const typeDefs = resolveOwnMaterialDefIds(store, typeId);
-            if (typeDefs.length > 0) return typeDefs;
-        }
-    }
-    return [];
-}
-
-/**
  * Extract EVERY material association for an entity ON-DEMAND, resolved to
  * full material structures (layers, profiles, constituents, lists). Most
  * entities carry one; exporters that attach e.g. a layer set *and* a plain
@@ -131,9 +79,16 @@ export function extractAllMaterialsOnDemand(
     store: IfcDataStore,
     entityId: number
 ): MaterialInfo[] {
-    if (!store.source?.length) return [];
-    const defIds = resolveAllMaterialDefIds(store, entityId);
+    const { ownerId, defIds } = resolveMaterialOwnerAndDefIds(store, entityId);
     if (defIds.length === 0) return [];
+    if (!store.source?.length) {
+        const resolved = store.resolvedMaterials?.get(ownerId);
+        // A missing or older wire row stays unverified. Never let a partial
+        // forwarding payload convert an unknown value into a confident mismatch.
+        return defIds.map((id): MaterialInfo =>
+            resolved?.get(id) ?? { type: 'Material', unresolved: true },
+        );
+    }
     const extractor = new EntityExtractor(store.source);
     const out: MaterialInfo[] = [];
     for (const defId of defIds) {
@@ -158,7 +113,10 @@ export function extractMaterialsOnDemand(
 ): MaterialInfo | null {
     const materialId = resolveAllMaterialDefIds(store, entityId)[0];
     if (materialId === undefined) return null;
-    if (!store.source?.length) return null;
+    if (!store.source?.length) {
+        const info = extractAllMaterialsOnDemand(store, entityId)[0];
+        return info?.unresolved ? null : info ?? null;
+    }
 
     const extractor = new EntityExtractor(store.source);
     return resolveMaterial(store, extractor, materialId, new Set(), entityId);
@@ -178,6 +136,7 @@ function resolveMaterial(
     if (visited.has(materialId)) return null;
     visited.add(materialId);
 
+    // @raw-entity-enumeration-ok decode the selected material definition's one source STEP record
     const ref = store.entityIndex.byId.get(materialId);
     if (!ref) return null;
 
@@ -204,6 +163,7 @@ function resolveMaterial(
             const layers: MaterialLayerInfo[] = [];
 
             for (const layerId of layerIds) {
+                // @raw-entity-enumeration-ok decode this material set's referenced layer record
                 const layerRef = store.entityIndex.byId.get(layerId);
                 if (!layerRef) continue;
                 const layerEntity = extractor.extractEntity(layerRef);
@@ -215,6 +175,7 @@ function resolveMaterial(
                 let materialName: string | undefined;
                 let materialCategory: string | undefined;
                 if (matId) {
+                    // @raw-entity-enumeration-ok decode the layer's referenced material record
                     const matRef = store.entityIndex.byId.get(matId);
                     if (matRef) {
                         const matEntity = extractor.extractEntity(matRef);
@@ -256,6 +217,7 @@ function resolveMaterial(
             const profiles: MaterialProfileInfo[] = [];
 
             for (const profId of profileIds) {
+                // @raw-entity-enumeration-ok decode this profile set's referenced profile record
                 const profRef = store.entityIndex.byId.get(profId);
                 if (!profRef) continue;
                 const profEntity = extractor.extractEntity(profRef);
@@ -267,6 +229,7 @@ function resolveMaterial(
                 let materialName: string | undefined;
                 let materialCategory: string | undefined;
                 if (matId) {
+                    // @raw-entity-enumeration-ok decode the profile's referenced material record
                     const matRef = store.entityIndex.byId.get(matId);
                     if (matRef) {
                         const matEntity = extractor.extractEntity(matRef);
@@ -299,6 +262,7 @@ function resolveMaterial(
             const constituents: MaterialConstituentInfo[] = [];
 
             for (const constId of constituentIds) {
+                // @raw-entity-enumeration-ok decode this constituent set's referenced constituent record
                 const constRef = store.entityIndex.byId.get(constId);
                 if (!constRef) continue;
                 const constEntity = extractor.extractEntity(constRef);
@@ -310,6 +274,7 @@ function resolveMaterial(
                 let materialName: string | undefined;
                 let materialCategory: string | undefined;
                 if (matId) {
+                    // @raw-entity-enumeration-ok decode the constituent's referenced material record
                     const matRef = store.entityIndex.byId.get(matId);
                     if (matRef) {
                         const matEntity = extractor.extractEntity(matRef);
@@ -347,11 +312,13 @@ function resolveMaterial(
             const materials: Array<{ name: string; category?: string }> = [];
 
             for (const matId of matIds) {
+                // @raw-entity-enumeration-ok decode this material list's referenced material record
                 const matRef = store.entityIndex.byId.get(matId);
                 if (!matRef) continue;
                 const matEntity = extractor.extractEntity(matRef);
                 if (matEntity) {
-                    const name = typeof matEntity.attributes?.[0] === 'string' ? matEntity.attributes[0] : `Material #${matId}`;
+                    const name = typeof matEntity.attributes?.[0] === 'string'
+                        ? matEntity.attributes[0] : `Material #${matId}`;
                     const category = typeof matEntity.attributes?.[2] === 'string' ? matEntity.attributes[2] : undefined;
                     materials.push({ name, ...(category ? { category } : {}) });
                 }
@@ -423,6 +390,7 @@ export interface MaterialUsage {
 
 /** Resolve an entity ref from the primary index, falling back to deferred atoms. */
 function getRef(store: IfcDataStore, id: number) {
+    // @raw-entity-enumeration-ok point lookup for one definition or member id from a parsed material attribute
     return store.entityIndex.byId.get(id) ?? store.deferredEntityIndex?.get(id);
 }
 
@@ -687,6 +655,7 @@ export function buildMaterialUsageIndex(store: IfcDataStore): Map<number, Materi
     let forward = store.onDemandMaterialMap;
     if (!forward && store.relationships) {
         const rebuilt = new Map<number, number[]>();
+        // @raw-entity-enumeration-ok the source-less server fallback has no forward material map; this index enumerates its complete immutable server entity domain
         for (const entityId of store.entityIndex.byId.keys()) {
             const defs = store.relationships.getRelated(entityId, RelationshipType.AssociatesMaterial, 'inverse');
             if (defs.length > 0) rebuilt.set(entityId, defs);

@@ -1,6 +1,6 @@
 {
   "name": "@ifc-lite/query",
-  "version": "2.0.0",
+  "version": "2.5.1",
   "description": "Query system for IFC-Lite",
   "type": "module",
   "main": "./dist/index.js",
@@ -22,11 +22,12 @@
     "@ifc-lite/parser": "workspace:^",
     "@ifc-lite/data": "workspace:^",
     "@ifc-lite/spatial": "workspace:^",
-    "@ifc-lite/geometry": "workspace:^"
+    "@ifc-lite/geometry": "workspace:^",
+    "@ifc-lite/regex-guard": "workspace:^"
   },
   "devDependencies": {
     "typescript": "^6.0.3",
-    "vitest": "^4.1.11"
+    "vitest": "^5.0.2"
   },
   "license": "MPL-2.0",
   "author": "Louis True",

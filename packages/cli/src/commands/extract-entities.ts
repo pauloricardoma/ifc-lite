@@ -14,9 +14,13 @@
  *   --detect [--top N]          the N meshes a geometry-triage pass ranks most unusual
  *
  * The output carries each selected product's full forward reference closure PLUS
- * the shared context roots (IfcProject, unit assignment, geometric contexts, the
- * spatial site/building/storey skeleton) and every spatial-containment relation
- * whose members are all kept — so the result parses and renders on its own.
+ * the shared context roots (IfcProject, unit assignment, geometric contexts, and
+ * the backward closure of the selection's spatial ancestors — only the
+ * site/building/storey/space chain actually reached by what was selected, not
+ * every spatial-structure instance in the model, see `spatial-ancestors.ts`) and
+ * every spatial-structure relation, its related-objects SET rewritten down to
+ * the kept members (see `subset-relations.ts`) — so the result parses and
+ * renders on its own.
  *
  * `--detect --report [--json]` prints the triage report WITHOUT extracting. The
  * report separates HARD defects (non-finite or |coord|>1e4 vertices after the
@@ -27,22 +31,16 @@
 import { constants as bufferConstants } from 'node:buffer';
 import { readFile, writeFile } from 'node:fs/promises';
 import { basename } from 'node:path';
-import { fatal, getFlag, getAllFlags, hasFlag } from '../output.js';
+import { expandTypes } from '@ifc-lite/parser';
+import { fatal, getFlag, getAllFlags, hasFlag, routeConsoleDiagnosticsToStderr } from '../output.js';
 import { logger } from '../logger.js';
+import { planSpatialRelations, refsOutsideStrings, type StepRecord, type Subset } from './subset-relations.js';
+import { spatialAncestors } from './spatial-ancestors.js';
+import { productsUnderPlacement, resolveStoreyPlacement } from './storey-selection.js';
 
-/** One parsed STEP instance: `#id = TYPE(<body>);`. */
-interface Instance {
-  id: number;
-  type: string;
-  /** Argument text between the outermost parentheses (references + literals). */
-  body: string;
-  /** The verbatim `#id= TYPE(...);` text, re-emitted unchanged into the subset. */
-  full: string;
-}
-
-interface ParsedStep {
+export interface ParsedStep {
   header: string;
-  instances: Map<number, Instance>;
+  instances: Map<number, StepRecord>;
   /** 22-char GlobalId → expressId, for rooted entities. */
   guidToId: Map<string, number>;
 }
@@ -61,7 +59,7 @@ export function parseStep(text: string): ParsedStep {
   const header = text.slice(0, headerEnd);
   const data = text;
 
-  const instances = new Map<number, Instance>();
+  const instances = new Map<number, StepRecord>();
   const guidToId = new Map<string, number>();
 
   let i = headerEnd;
@@ -146,120 +144,57 @@ export function resolveToId(token: string, parsed: ParsedStep): number {
   return id;
 }
 
+// Used only by the voids/fills fixpoint below — a narrower, TYPE-POSITIONAL
+// read (last N refs of a known relation shape) than forwardClosure's
+// open-ended scan. `productsUnderPlacement`/`resolveStoreyPlacement` used
+// this too, until free text tripped it; see `refsOutsideStrings` there, #4148.
 const REF_RE = /#(\d+)/g;
 
-/** Forward reference closure: every instance transitively referenced by `seeds`. */
+/**
+ * Forward reference closure: every instance transitively referenced by
+ * `seeds`.
+ *
+ * Uses `refsOutsideStrings`, not a raw `/#(\d+)/g` scan, because a record's
+ * Name/Description is free TEXT and Revit writes `#`-shaped substrings into
+ * it (`'Chair pairs with #71'`). A raw regex reads that as a reference to
+ * entity 71 and pulls it — and its own closure — into the extraction even
+ * though it was never selected. See #4148.
+ *
+ * An id NAMED but never DEFINED is not added, or a rewritten SET would emit
+ * it as a dangling `#id` (#4128).
+ */
 export function forwardClosure(seeds: Iterable<number>, parsed: ParsedStep, into: Set<number>): void {
   const stack = [...seeds];
   while (stack.length) {
     const id = stack.pop()!;
     if (into.has(id)) continue;
-    into.add(id);
     const rec = parsed.instances.get(id);
     if (!rec) continue;
-    REF_RE.lastIndex = 0;
-    let m: RegExpExecArray | null;
-    while ((m = REF_RE.exec(rec.body)) !== null) {
-      const ref = parseInt(m[1], 10);
+    into.add(id);
+    for (const ref of refsOutsideStrings(rec.body)) {
       if (!into.has(ref)) stack.push(ref);
     }
   }
 }
 
-/** Map each IfcLocalPlacement to its parent placement (or null when top-level). */
-function placementParents(parsed: ParsedStep): Map<number, number | null> {
-  const parents = new Map<number, number | null>();
-  for (const inst of parsed.instances.values()) {
-    if (inst.type !== 'IFCLOCALPLACEMENT') continue;
-    const pm = /^\s*(#\d+|\$)/.exec(inst.body);
-    parents.set(inst.id, pm && pm[1].startsWith('#') ? parseInt(pm[1].slice(1), 10) : null);
-  }
-  return parents;
-}
-
-/** Every product whose ObjectPlacement chains up through `storeyPlacementId`. */
-function productsUnderPlacement(storeyPlacementId: number, parsed: ParsedStep): Set<number> {
-  const parents = placementParents(parsed);
-  const under = new Set<number>();
-  for (const pid of parents.keys()) {
-    let cur: number | null = pid;
-    let guard = 0;
-    while (cur != null && guard++ < 128) {
-      if (cur === storeyPlacementId) {
-        under.add(pid);
-        break;
-      }
-      cur = parents.get(cur) ?? null;
-    }
-  }
-  // Products referencing a selected placement.
-  const seeds = new Set<number>();
-  for (const inst of parsed.instances.values()) {
-    REF_RE.lastIndex = 0;
-    let m: RegExpExecArray | null;
-    while ((m = REF_RE.exec(inst.body)) !== null) {
-      if (under.has(parseInt(m[1], 10))) {
-        seeds.add(inst.id);
-        break;
-      }
-    }
-  }
-  return seeds;
-}
-
-/** Resolve a --storey selector (GUID / name / expressId) to its placement id. */
-function resolveStoreyPlacement(token: string, parsed: ParsedStep): number {
-  let storeyId: number | undefined;
-  const t = token.trim();
-  if (/^#?\d+$/.test(t)) {
-    storeyId = parseInt(t.replace('#', ''), 10);
-  } else if (parsed.guidToId.has(t)) {
-    storeyId = parsed.guidToId.get(t);
-  } else {
-    // match by name (2nd-to-last-ish quoted arg); scan storeys for a Name match
-    for (const inst of parsed.instances.values()) {
-      if (inst.type !== 'IFCBUILDINGSTOREY') continue;
-      if (inst.body.includes(`'${t}'`)) {
-        storeyId = inst.id;
-        break;
-      }
-    }
-  }
-  if (storeyId === undefined) throw new Error(`Storey not found: ${token}`);
-  const storey = parsed.instances.get(storeyId);
-  if (!storey || storey.type !== 'IFCBUILDINGSTOREY') {
-    throw new Error(`#${storeyId} is ${storey?.type ?? 'missing'}, not an IfcBuildingStorey`);
-  }
-  // IfcBuildingStorey ObjectPlacement is attribute 6 (after Guid, Owner, Name,
-  // Description, ObjectType) — the last #ref before LongName/Elevation. Grab the
-  // placement ref: the storey references exactly one IfcLocalPlacement.
-  const refs = [...storey.body.matchAll(REF_RE)].map((m) => parseInt(m[1], 10));
-  const placementId = refs.find((r) => parsed.instances.get(r)?.type === 'IFCLOCALPLACEMENT');
-  if (placementId === undefined) throw new Error(`Storey #${storeyId} has no IfcLocalPlacement`);
-  return placementId;
-}
-
 /**
- * Assemble the kept-id set: the closure of `seedProducts` + context roots
- * (project/units/contexts + spatial skeleton) + spatial-containment relations
- * whose every member is kept (so no dangling references).
+ * Assemble the subset: the closure of `seedProducts` + context roots
+ * (project/units/contexts + the backward closure of spatial ancestors, not
+ * the whole skeleton) + spatial-structure relations, each rewritten down to
+ * its kept members (so no dangling references).
  */
-export function buildSubset(seedProducts: Set<number>, parsed: ParsedStep): Set<number> {
+export function buildSubset(seedProducts: Set<number>, parsed: ParsedStep): Subset {
   const keep = new Set<number>();
   forwardClosure(seedProducts, parsed, keep);
 
-  // Context roots: the project + spatial skeleton, closed forward for units,
-  // geometric contexts, and placement chains.
-  const rootSeeds: number[] = [];
+  // Context roots: IfcProject (always — units/contexts hang off it even when
+  // nothing selected reaches it) plus every spatial ancestor of what is
+  // already kept, closed forward. Backward closure, not a type list, so an
+  // unrelated storey/space is never dragged in and a product under an
+  // IfcSpace or IFC4X3 facility class keeps its parent too (#4124).
+  const rootSeeds = spatialAncestors(keep, parsed.instances);
   for (const inst of parsed.instances.values()) {
-    if (
-      inst.type === 'IFCPROJECT' ||
-      inst.type === 'IFCSITE' ||
-      inst.type === 'IFCBUILDING' ||
-      inst.type === 'IFCBUILDINGSTOREY'
-    ) {
-      rootSeeds.push(inst.id);
-    }
+    if (inst.type === 'IFCPROJECT') rootSeeds.push(inst.id);
   }
   forwardClosure(rootSeeds, parsed, keep);
 
@@ -276,47 +211,53 @@ export function buildSubset(seedProducts: Set<number>, parsed: ParsedStep): Set<
     grew = false;
     for (const inst of parsed.instances.values()) {
       if (keep.has(inst.id)) continue;
-      const refs = [...inst.body.matchAll(REF_RE)].map((m) => parseInt(m[1], 10));
-      if (inst.type === 'IFCRELVOIDSELEMENT') {
-        // refs: [OwnerHistory, RelatingBuildingElement, RelatedOpeningElement].
-        const host = refs[refs.length - 2];
-        const opening = refs[refs.length - 1];
-        if (host !== undefined && opening !== undefined && keep.has(host)) {
-          // Close over the relation itself, not just the opening: the rel's own
-          // OwnerHistory must be kept too or the subset emits a dangling ref.
-          forwardClosure([inst.id], parsed, keep);
-          grew = true;
-        }
-      } else if (inst.type === 'IFCRELFILLSELEMENT') {
-        // refs: [OwnerHistory, RelatingOpeningElement, RelatedBuildingElement(filler)].
-        const opening = refs[refs.length - 2];
-        const filler = refs[refs.length - 1];
-        if (opening !== undefined && filler !== undefined && keep.has(opening)) {
-          forwardClosure([inst.id], parsed, keep);
-          grew = true;
-        }
-      }
+      if (inst.type !== 'IFCRELVOIDSELEMENT' && inst.type !== 'IFCRELFILLSELEMENT') continue;
+      // Different meanings, one shape. `Relating` (attribute 5, the second-to-last
+      // reference) is the ANCHOR that must be kept already: the host wall for voids, the
+      // opening for fills. `Related` (attribute 6) is what the relation drags in, the
+      // opening or the filling window/door, and it is not read here because the closure
+      // below reaches it anyway.
+      const anchor = [...inst.body.matchAll(REF_RE)].map((m) => parseInt(m[1], 10)).at(-2);
+      if (anchor === undefined || !keep.has(anchor)) continue;
+      // Close over the relation itself, not just what it drags in: the rel's own
+      // OwnerHistory must be kept too or the subset emits a dangling ref.
+      forwardClosure([inst.id], parsed, keep);
+      grew = true;
     }
   }
 
-  // Spatial relationships that connect kept products into the tree — but only
-  // when EVERY referenced element is already kept, else we'd emit dangling refs.
-  for (const inst of parsed.instances.values()) {
-    if (
-      inst.type === 'IFCRELCONTAINEDINSPATIALSTRUCTURE' ||
-      inst.type === 'IFCRELAGGREGATES'
-    ) {
-      const refs = [...inst.body.matchAll(REF_RE)].map((m) => parseInt(m[1], 10));
-      if (refs.length > 0 && refs.every((r) => keep.has(r))) keep.add(inst.id);
-    }
+  // Spatial relationships that connect kept products into the tree, each
+  // relation's member SET filtered down to the kept ids rather than the whole
+  // relation being dropped. `subset-relations.ts` owns that rule and the
+  // no-dangling-reference invariant it preserves.
+  let spatial = planSpatialRelations(parsed.instances.values(), keep);
+  // A relation-private IfcOwnerHistory is reachable from nothing else, so the
+  // plan drops the relation and reports what blocked it. Close over a dropped
+  // relation's blocker group and replan (#4126), but only when EVERY id in the
+  // group is a defined IfcOwnerHistory: then the closure keeps all of them and
+  // that relation survives round two. A group holding anything else (a phantom
+  // id, or a product named in a Name or Description slot, both schema-invalid)
+  // leaves its relation dropped whatever is kept, so closing over it would only
+  // emit records nothing references and drag unselected products in (#4150).
+  // ONE replan, not a `while`: for a SCHEMA-VALID record an IfcOwnerHistory
+  // subtree names no product, container or relation, so it blocks nothing new;
+  // on invalid input a second round is discarded and the relation stays dropped
+  // (never a dangling id).
+  const owners = spatial.blockedOn
+    .filter((ids) => ids.every((id) => parsed.instances.get(id)?.type === 'IFCOWNERHISTORY'))
+    .flat();
+  if (owners.length > 0) {
+    forwardClosure(owners, parsed, keep);
+    spatial = planSpatialRelations(parsed.instances.values(), keep);
   }
-  return keep;
+  for (const id of spatial.add) keep.add(id);
+  return { keep, rewritten: spatial.rewritten };
 }
 
-/** Serialize the kept ids back into a valid STEP file (sorted, header preserved). */
-export function serializeSubset(keep: Set<number>, parsed: ParsedStep): string {
+/** Serialize the subset back into a valid STEP file (sorted, header preserved). */
+export function serializeSubset({ keep, rewritten }: Subset, parsed: ParsedStep): string {
   const kept = [...keep].filter((id) => parsed.instances.has(id)).sort((a, b) => a - b);
-  const lines = kept.map((id) => parsed.instances.get(id)!.full);
+  const lines = kept.map((id) => rewritten.get(id) ?? parsed.instances.get(id)!.full);
   return parsed.header + lines.join('\n') + '\nENDSEC;\nEND-ISO-10303-21;\n';
 }
 
@@ -402,6 +343,9 @@ async function triage(bytes: Uint8Array): Promise<TriageRow[]> {
 // ── Command ─────────────────────────────────────────────────────────────────
 
 export async function extractEntitiesCommand(args: string[]): Promise<void> {
+  // stdout carries this command's payload, so redirect console diagnostics
+  // BEFORE the first parse/geometry init (see the function's own docstring).
+  routeConsoleDiagnosticsToStderr();
   const filePath = args.find((a) => !a.startsWith('-') && !isFlagValue(args, a));
   if (!filePath) {
     fatal(
@@ -470,10 +414,23 @@ export async function extractEntitiesCommand(args: string[]): Promise<void> {
   for (const token of getAllFlags(args, '--product').flatMap((v) => v.split(','))) {
     if (token) seeds.add(resolveToId(token, parsed));
   }
-  for (const t of getAllFlags(args, '--type').flatMap((v) => v.split(','))) {
-    const want = t.trim().toUpperCase();
-    if (!want) continue;
-    for (const inst of parsed.instances.values()) if (inst.type === want) seeds.add(inst.id);
+  // `--type IfcWall` selects IfcWallStandardCase too, as `query`, `export`,
+  // `anonymize` and `mutate` all do on the same input. This command runs its
+  // own lightweight STEP parse and so has no resolved `schemaVersion`, which is
+  // exactly the case `expandTypes` documents its no-version union for: a
+  // superset across the bundled schemas, rather than picking one table on the
+  // caller's behalf and silently finding nothing in the other two.
+  const requestedTypes = getAllFlags(args, '--type')
+    .flatMap((v) => v.split(','))
+    .map((t) => t.trim())
+    .filter(Boolean);
+  const wantedTypes = new Set(
+    expandTypes(requestedTypes).map((name) => name.toUpperCase())
+  );
+  if (wantedTypes.size > 0) {
+    for (const inst of parsed.instances.values()) {
+      if (wantedTypes.has(inst.type)) seeds.add(inst.id);
+    }
   }
   for (const t of getAllFlags(args, '--storey').flatMap((v) => v.split(','))) {
     if (!t) continue;
@@ -487,7 +444,14 @@ export async function extractEntitiesCommand(args: string[]): Promise<void> {
   }
 
   if (seeds.size === 0) {
-    fatal('No entities selected. Use --product, --type, --storey, or --detect.');
+    // Naming the selector that came back empty, rather than listing the flags
+    // the caller just used: `--type IfcWall` on a model with no walls used to
+    // answer "Use --product, --type, --storey, or --detect."
+    fatal(
+      requestedTypes.length > 0
+        ? `No entities selected: nothing in this file matches --type ${requestedTypes.join(', ')} (or its subtypes).`
+        : 'No entities selected. Use --product, --type, --storey, or --detect.'
+    );
     return;
   }
   if (!outPath) {
@@ -495,11 +459,11 @@ export async function extractEntitiesCommand(args: string[]): Promise<void> {
     return;
   }
 
-  const keep = buildSubset(seeds, parsed);
-  const out = serializeSubset(keep, parsed);
+  const subset = buildSubset(seeds, parsed);
+  const out = serializeSubset(subset, parsed);
   await writeFile(outPath, out, 'latin1');
   process.stdout.write(
-    `Extracted ${seeds.size} product(s) → ${keep.size} instances → ${outPath}\n`,
+    `Extracted ${seeds.size} product(s) → ${subset.keep.size} instances → ${outPath}\n`,
   );
 
   if (hasFlag(args, '--view')) {

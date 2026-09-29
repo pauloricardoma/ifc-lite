@@ -3,33 +3,34 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * Cap-surface appearance controls shown inside the expanded Section panel.
+ * Cap-surface appearance, inside the Section bar's Cap popover (#5499):
  *
- * Layout principle (tight compact panel, ≤ 260 px wide):
- *   [Display]          Surfaces ⬛   Lines ⬛
- *   ───────────────────────────────────────────────
- *   [Hatch]            <pattern select>
- *   [Colours]          Fill ▣   Hatch ▣
- *   [Shape]            Spacing __px  Angle __°  Width __px
+ *   Display   [Surfaces] [Lines]
+ *   Hatch     <pattern>
+ *   Colours   ■ Fill  ■ Hatch
+ *   Spacing / Angle / Width
  *
- * Surfaces and Lines toggle independently so users can get a clean
- * "architectural drawing" look (outlines only), a pure hatched fill, or
- * the combination. All style inputs are hidden when Surfaces is off.
+ * Surfaces and Lines toggle independently (outlines only, a hatched fill,
+ * or both); the hatch inputs are disabled while Surfaces is off. Styled as
+ * the panels are — sans 12px labels, `tabular-nums` numbers, the shared
+ * accent wash for a pressed toggle — never a bespoke mono/uppercase bar.
  */
 
 import { useCallback, useId } from 'react';
 import { useViewerStore } from '@/store';
 import type { SectionCapHatchId } from '@/store/types';
+import { useTranslation, type TranslationKey } from '@/i18n';
+import { HudToggle } from '../../viewport-ui/hud/HudToggle';
 
-const PATTERN_LABELS: Record<SectionCapHatchId, string> = {
-  solid:      'Solid fill',
-  diagonal:   'Diagonal',
-  crossHatch: 'Cross-hatch',
-  horizontal: 'Horizontal',
-  vertical:   'Vertical',
-  concrete:   'Concrete',
-  brick:      'Brick',
-  insulation: 'Insulation',
+const PATTERN_LABEL_KEYS: Record<SectionCapHatchId, TranslationKey> = {
+  solid:      'sectionCap.pattern.solid',
+  diagonal:   'sectionCap.pattern.diagonal',
+  crossHatch: 'sectionCap.pattern.crossHatch',
+  horizontal: 'sectionCap.pattern.horizontal',
+  vertical:   'sectionCap.pattern.vertical',
+  concrete:   'sectionCap.pattern.concrete',
+  brick:      'sectionCap.pattern.brick',
+  insulation: 'sectionCap.pattern.insulation',
 };
 
 const PATTERN_IDS: SectionCapHatchId[] = [
@@ -53,35 +54,11 @@ function hexToRgba(hex: string, alpha: number): [number, number, number, number]
   ];
 }
 
-interface DisplayToggleProps {
-  active: boolean;
-  label: string;
-  onToggle: () => void;
-}
-
-function DisplayToggle({ active, label, onToggle }: DisplayToggleProps): React.JSX.Element {
-  return (
-    <button
-      type="button"
-      onClick={onToggle}
-      aria-pressed={active}
-      className={`flex items-center justify-center gap-1.5 px-2 py-1 text-[10px] font-mono uppercase tracking-wide border rounded transition-colors ${
-        active
-          ? 'bg-primary text-primary-foreground border-primary'
-          : 'bg-muted text-muted-foreground border-muted hover:border-foreground/20'
-      }`}
-      title={`${active ? 'Hide' : 'Show'} ${label.toLowerCase()}`}
-    >
-      <span
-        aria-hidden
-        className={`inline-block h-1.5 w-1.5 rounded-full ${active ? 'bg-primary-foreground' : 'bg-muted-foreground'}`}
-      />
-      {label}
-    </button>
-  );
-}
+const CAPTION = 'text-2xs font-medium uppercase tracking-wider text-muted-foreground';
+const FIELD = 'w-full rounded-sm border border-border bg-background px-1.5 py-0.5 text-xs tabular-nums outline-none focus:ring-1 focus:ring-ring';
 
 export function SectionCapControls(): React.JSX.Element {
+  const { t } = useTranslation();
   const sectionPlane       = useViewerStore((s) => s.sectionPlane);
   const setShowCap         = useViewerStore((s) => s.setSectionShowCap);
   const setShowOutlines    = useViewerStore((s) => s.setSectionShowOutlines);
@@ -132,101 +109,80 @@ export function SectionCapControls(): React.JSX.Element {
   const hatchInputsDisabled = !sectionPlane.showCap;
 
   return (
-    <div className="mt-3 border-t pt-3 space-y-3">
+    <div className="space-y-2.5" data-section-cap-controls>
       {/* Display toggles — surfaces and lines independently. */}
-      <div>
-        <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1.5">Display</div>
-        <div className="grid grid-cols-2 gap-2">
-          <DisplayToggle active={sectionPlane.showCap}      label="Surfaces" onToggle={onToggleCap} />
-          <DisplayToggle active={sectionPlane.showOutlines} label="Lines"    onToggle={onToggleOutlines} />
+      <div className="flex items-center justify-between gap-2">
+        <span className={CAPTION}>{t('sectionCap.display')}</span>
+        <div className="flex items-center gap-0.5">
+          <HudToggle pressed={sectionPlane.showCap} onPressedChange={onToggleCap}
+            title={t(sectionPlane.showCap ? 'sectionCap.hideSurfaces' : 'sectionCap.showSurfaces')}>
+            {t('sectionCap.surfaces')}
+          </HudToggle>
+          <HudToggle pressed={sectionPlane.showOutlines} onPressedChange={onToggleOutlines}
+            title={t(sectionPlane.showOutlines ? 'sectionCap.hideLines' : 'sectionCap.showLines')}>
+            {t('sectionCap.lines')}
+          </HudToggle>
         </div>
       </div>
 
-      {/* Hatch style — disabled visually when surfaces are off. */}
+      {/* Hatch style — disabled while surfaces are off. */}
       <fieldset
         disabled={hatchInputsDisabled}
         className={`space-y-2 ${hatchInputsDisabled ? 'opacity-50 pointer-events-none' : ''}`}
       >
-        <div>
-          <label htmlFor={patternId} className="text-[10px] uppercase tracking-wider text-muted-foreground block mb-1">
-            Hatch pattern
+        <div className="flex items-center justify-between gap-2">
+          <label htmlFor={patternId} className={CAPTION}>
+            {t('sectionCap.patternLabel')}
           </label>
           <select
             id={patternId}
             value={sectionPlane.capStyle.pattern}
             onChange={onPattern}
-            className="w-full text-xs bg-muted px-2 py-1.5 rounded border-none"
+            className={`${FIELD} w-36`}
           >
             {PATTERN_IDS.map((id) => (
-              <option key={id} value={id}>{PATTERN_LABELS[id]}</option>
+              <option key={id} value={id}>{t(PATTERN_LABEL_KEYS[id])}</option>
             ))}
           </select>
         </div>
 
-        <div className="grid grid-cols-2 gap-2">
-          <label htmlFor={fillId} className="flex items-center gap-2 text-[10px] uppercase tracking-wider text-muted-foreground">
+        <div className="flex items-center gap-3">
+          <label htmlFor={fillId} className="flex items-center gap-1.5 text-xs">
             <input
               id={fillId}
               type="color"
               value={rgbaToHex(sectionPlane.capStyle.fillColor)}
               onChange={onFillColor}
-              className="h-5 w-5 rounded cursor-pointer border border-muted"
-              aria-label="Fill colour"
+              className="h-5 w-5 cursor-pointer rounded-sm border border-border bg-transparent p-0"
+              aria-label={t('sectionCap.fillAriaLabel')}
             />
-            Fill
+            {t('sectionCap.fillLabel')}
           </label>
-          <label htmlFor={strokeId} className="flex items-center gap-2 text-[10px] uppercase tracking-wider text-muted-foreground">
+          <label htmlFor={strokeId} className="flex items-center gap-1.5 text-xs">
             <input
               id={strokeId}
               type="color"
               value={rgbaToHex(sectionPlane.capStyle.strokeColor)}
               onChange={onStrokeColor}
-              className="h-5 w-5 rounded cursor-pointer border border-muted"
-              aria-label="Hatch colour"
+              className="h-5 w-5 cursor-pointer rounded-sm border border-border bg-transparent p-0"
+              aria-label={t('sectionCap.hatchAriaLabel')}
             />
-            Hatch
+            {t('sectionCap.hatchLabel')}
           </label>
         </div>
 
         <div className="grid grid-cols-3 gap-2">
           <div>
-            <label htmlFor={spacingId} className="text-[10px] text-muted-foreground block mb-1">Spacing (px)</label>
-            <input
-              id={spacingId}
-              type="number"
-              min="2"
-              max="64"
-              step="1"
-              value={sectionPlane.capStyle.spacingPx}
-              onChange={onSpacing}
-              className="w-full text-xs bg-muted px-1.5 py-0.5 rounded border-none text-right"
-            />
+            <label htmlFor={spacingId} className="mb-0.5 block text-2xs text-muted-foreground">{t('sectionCap.spacingLabel')}</label>
+            <input id={spacingId} type="number" min="2" max="64" step="1" value={sectionPlane.capStyle.spacingPx} onChange={onSpacing} className={FIELD} />
           </div>
           <div>
-            <label htmlFor={angleId} className="text-[10px] text-muted-foreground block mb-1">Angle (°)</label>
-            <input
-              id={angleId}
-              type="number"
-              min="-180"
-              max="180"
-              step="5"
-              value={angleDeg}
-              onChange={onAngle}
-              className="w-full text-xs bg-muted px-1.5 py-0.5 rounded border-none text-right"
-            />
+            <label htmlFor={angleId} className="mb-0.5 block text-2xs text-muted-foreground">{t('sectionCap.angleLabel')}</label>
+            <input id={angleId} type="number" min="-180" max="180" step="5" value={angleDeg} onChange={onAngle} className={FIELD} />
           </div>
           <div>
-            <label htmlFor={widthId} className="text-[10px] text-muted-foreground block mb-1">Width (px)</label>
-            <input
-              id={widthId}
-              type="number"
-              min="1"
-              max="16"
-              step="0.5"
-              value={sectionPlane.capStyle.widthPx}
-              onChange={onWidth}
-              className="w-full text-xs bg-muted px-1.5 py-0.5 rounded border-none text-right"
-            />
+            <label htmlFor={widthId} className="mb-0.5 block text-2xs text-muted-foreground">{t('sectionCap.widthLabel')}</label>
+            <input id={widthId} type="number" min="1" max="16" step="0.5" value={sectionPlane.capStyle.widthPx} onChange={onWidth} className={FIELD} />
           </div>
         </div>
       </fieldset>

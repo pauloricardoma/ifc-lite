@@ -180,6 +180,51 @@ fn scoped_refinement_does_less_work_than_whole_mesh_region() {
     assert!(directed_closed_mesh(&scoped));
 }
 
+/// The rebuild is whole-mesh even when the sliver candidates are scoped
+/// (#4698): once anything refines, every vertex comes back on the first raw
+/// position seen in its 100 µm cell, which is what closes the near-duplicate
+/// cracks the census depends on. Here a fin hangs off the far end of the bar, outside the
+/// refined region, with one corner 30 µm from the bar's corner. It comes back
+/// on the bar's position. Documented on `refine_high_aspect_slivers`; pinned
+/// here because the scoped wrapper's own doc used to promise that everything
+/// outside the region is left exactly as authored.
+#[test]
+fn scoped_refinement_still_dedups_vertices_outside_the_region_4698() {
+    let mut mesh = slivered_box(4, 20.0);
+    let (lo, hi) = whole_mesh_box(&mesh);
+    let far_x = hi[0] as f32;
+    let near_far_corner = far_x - 3.0e-5;
+    let base = (mesh.positions.len() / 3) as u32;
+    for v in [[near_far_corner, 0.0, 0.0], [far_x, -1.0, 0.0], [far_x, -1.0, 1.0]] {
+        mesh.positions.extend_from_slice(&v);
+    }
+    mesh.indices.extend_from_slice(&[base, base + 1, base + 2]);
+    let spread = |m: &Mesh| {
+        let mut xs: Vec<i64> = m
+            .positions
+            .chunks_exact(3)
+            .filter(|p| (p[0] - far_x).abs() < 1.0e-4)
+            .map(|p| (f64::from(p[0]) * 1.0e9).round() as i64)
+            .collect();
+        xs.sort_unstable();
+        xs.dedup();
+        xs.len()
+    };
+    assert_eq!(spread(&mesh), 2, "the fixture must go in with two positions in that cell");
+
+    // A region covering only the first tenth of the bar, far from the fin.
+    let narrow = vec![(lo, [lo[0] + 0.1 * (hi[0] - lo[0]), hi[1], hi[2]])];
+    let out = refine_high_aspect_slivers_within(&mesh, &narrow);
+
+    assert!(out.indices.len() > mesh.indices.len(), "the in-region slivers must refine");
+    assert_eq!(spread(&out), 1, "the out-of-region corner must come back on one position");
+    // ...because it was deduped onto the bar's corner, not because the fin left.
+    assert!(
+        out.positions.chunks_exact(3).any(|p| (p[1] + 1.0).abs() < 1.0e-6),
+        "the fin must still be in the output"
+    );
+}
+
 #[test]
 fn empty_region_is_a_no_op() {
     let mesh = slivered_box(20, 100.0);
@@ -638,5 +683,34 @@ mod offset_anchor_tests {
                 );
             }
         }
+    }
+
+    /// `weld_near_coplanar_facets` writes back only the dedup cells it welds
+    /// (#4698, C8). A jittered slab gives it something to weld; a separate facet
+    /// pair 5 m away has two corners 20 µm apart in one 100 µm dedup cell that no
+    /// cluster welds. The weld must hand those back exactly as they came in.
+    #[test]
+    fn weld_leaves_vertices_it_did_not_weld_where_they_were_4698() {
+        let j = 15.0e-6;
+        let mesh = mesh_from_tris(&[
+            // Welded: a z = 0 slab split in two, the second triangle 15 µm high.
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            [[1.0, 0.0, j], [1.0, 1.0, j], [0.0, 1.0, j]],
+            // Not welded: two facets on distinct planes, sharing a dedup cell at
+            // (5.00002, 5, 5) and (5.00004, 5, 5).
+            [[5.00002, 5.0, 5.0], [6.0, 5.0, 5.0], [5.0, 6.0, 5.0]],
+            [[5.00004, 5.0, 5.0], [5.0, 5.0, 6.0], [6.0, 5.0, 5.5]],
+        ]);
+        let welded = weld_near_coplanar_facets(&mesh);
+        assert_eq!(
+            vert(&welded, 0)[2],
+            vert(&welded, 3)[2],
+            "the jittered slab must weld, or this test measures nothing"
+        );
+        assert_eq!(
+            welded.positions[18..],
+            mesh.positions[18..],
+            "vertices outside every welded cell moved"
+        );
     }
 }

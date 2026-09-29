@@ -33,6 +33,18 @@
 //! belong in dedicated regression test files once their behaviour has
 //! been visually verified.
 //!
+//! That soft-pass is conditioned on `IFC_LITE_REQUIRE_FIXTURES` (see
+//! `tests/support::require_fixtures`): unset/`0` (local dev, fresh
+//! clone) skips a missing fixture exactly as before; `1` (the
+//! `csg-accept-gates` CI job) turns a missing fixture into a named
+//! `panic!` instead, so this 25-fixture census can't report `ok` having
+//! examined nothing — the failure mode issue #2802 named for the
+//! per-fixture skip-shaped tests applies just as much to a census that
+//! silently shrinks to zero. A non-`NotFound` I/O error (permission
+//! denied, a truncated download, …) always panics unconditionally,
+//! flag or not — that is a broken environment, not an absent optional
+//! download.
+//!
 //! **Snapshot baseline (insta):** every *present* fixture additionally
 //! pins its stable stats (mesh count, vertex/triangle totals, rounded
 //! bbox + surface area, per-type counts) as a named `insta` snapshot in
@@ -47,6 +59,8 @@
 //! Snapshots are pinned to the pure-Rust exact CSG kernel — the only
 //! kernel on every target since #1024, so they are asserted
 //! unconditionally.
+
+mod support;
 
 use ifc_lite_core::{build_entity_index, EntityDecoder, EntityScanner};
 use ifc_lite_geometry::{propagate_voids_to_parts, GeometryRouter, Mesh};
@@ -387,13 +401,20 @@ fn run_fixture(fx: &Fixture) -> FixtureReport {
         ..Default::default()
     };
     let p = fixture_path(fx.path);
-    if !p.exists() {
-        return report;
-    }
-    report.fixture_found = true;
-    let Ok(content) = std::fs::read_to_string(&p) else {
-        return report;
+    let content = match std::fs::read_to_string(&p) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            assert!(
+                !support::require_fixtures(),
+                "fixture missing and IFC_LITE_REQUIRE_FIXTURES=1: {} \
+                 — run `pnpm fixtures` to download (sha256 in tests/models/manifest.json)",
+                p.display()
+            );
+            return report;
+        }
+        Err(err) => panic!("failed to read fixture {}: {err}", p.display()),
     };
+    report.fixture_found = true;
     let entity_index = build_entity_index(&content);
     let mut decoder = EntityDecoder::with_index(&content, entity_index);
     let router = GeometryRouter::with_units(&content, &mut decoder);
@@ -616,6 +637,27 @@ fn geometry_correctness_harness() {
     // vendored, so every snapshot is asserted there. Accept intentional
     // changes with `cargo insta review` (or `INSTA_UPDATE=auto`).
     //
+    // #3440/#3871: under either accept gate (`csg_manifold_gate`,
+    // `csg_topology_gate`) the boolean accept seam rejects torn kernel results
+    // and the router falls back, so some fixtures emit different geometry -
+    // `218_IFC-test-lite` measured 3492 tris / 21 spike triangles under each
+    // gate alone and under both together, against the default build's 3340 /
+    // 19. These snapshots are a per-fixture baseline for the DEFAULT build;
+    // blessing a second set per feature combination would be three more
+    // goldens to keep true, for configurations nothing ships. The hard
+    // invariants above (no NaN, no parse failure, no empty-when-expected)
+    // still run in every build, so a gated build is not unguarded here - it is
+    // unpinned on tessellation detail only. The per-fixture regression numbers
+    // the gates DO need pinned live in `issue_098_reveal_wall`,
+    // `issue_098_v5c` and `issue_960_segmented_roof_clip`, which assert them
+    // directly, per feature combination.
+    if cfg!(any(feature = "csg_manifold_gate", feature = "csg_topology_gate")) {
+        println!(
+            "[harness] accept-gate build: {} fixture snapshot(s) not asserted (#3440, #3871)",
+            reports.iter().filter(|r| r.fixture_found).count()
+        );
+        return;
+    }
     for r in &reports {
         if !r.fixture_found {
             continue;

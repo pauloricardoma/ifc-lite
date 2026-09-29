@@ -19,39 +19,44 @@
  */
 
 import { useCallback, useRef, useEffect, useState, type KeyboardEvent, type DragEvent } from 'react';
-import {
-  X,
-  Send,
-  Square,
-  Trash2,
-  Paperclip,
-  Loader2,
-  ArrowDown,
-  Zap,
-  Wrench,
-} from 'lucide-react';
+import { X, Send, Square, Trash2, Paperclip, ArrowDown, Zap, Wrench } from 'lucide-react';
+import { Spinner } from '@/components/ui/spinner';
 import { PromoteToolDialog } from '@/components/extensions/PromoteToolDialog';
 import { Button } from '@/components/ui/button';
+import { IconButton } from '@/components/ui/icon-button';
 import { toast } from '@/components/ui/toast';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { useTranslation } from '@/i18n';
 import { useViewerStore } from '@/store';
 import { buildErrorFeedbackContent } from '@/store/slices/chatSlice';
 import { ChatMessageComponent } from './chat/ChatMessage';
 import { ModelSelector } from './chat/ModelSelector';
-import { fetchUsageSnapshot, streamChat, type StreamMessage, type TextContentPart, type ImageContentPart, type UsageInfo } from '@/lib/llm/stream-client';
+import {
+  createAttachmentId,
+  imageFileToCompressedBase64,
+  compressDataUrlImage,
+  stripContinuationOverlap,
+  estimateTextTokens,
+  estimateMessagesTokens,
+  summarizeDroppedMessages,
+} from './chat/chatPanelHelpers';
+import { fetchUsageSnapshot, streamChat, type UsageInfo } from '@/lib/llm/stream-client';
 import { streamAnthropicChat, streamOpenAiChat } from '@/lib/llm/stream-direct';
 import { buildStreamMessagesForModel, filterAttachmentsForModel } from '@/lib/llm/message-capabilities';
 import { buildSystemPrompt } from '@/lib/llm/system-prompt';
 import { getModelContext, parseCSV } from '@/lib/llm/context-builder';
 import { collectActiveFileAttachments } from '@/lib/attachments';
+import { MAX_PDF_ATTACHMENT_BYTES } from '@/lib/llm/document-text';
+import { attachPdfDocument, createDocumentUploadGate, shouldContinueDocumentUploadBatch } from '@/lib/llm/document-upload';
 import { extractCodeBlocks } from '@/lib/llm/code-extractor';
 import { extractScriptEditOps, filterUnappliedScriptOps } from '@/lib/llm/script-edit-ops';
-import { createPatchDiagnostic, getPrimaryRootCause, type RepairScope } from '@/lib/llm/script-diagnostics';
-import type { ScriptDiagnostic } from '@/lib/llm/script-diagnostics';
+import { createPatchDiagnostic, getPrimaryRootCause, type RepairScope, type ScriptDiagnostic } from '@/lib/llm/script-diagnostics';
+import { shortcutLabel } from '@/lib/commands/shortcut-label';
+import { registerKeyboardCommand } from '@/lib/commands/dispatcher';
 import { buildRepairSessionKey, getEscalatedRepairScope, pruneMessagesForRepair } from '@/lib/llm/repair-loop';
 import type { ChatMessage, ChatRepairRequest, FileAttachment } from '@/lib/llm/types';
 import { canUsePlainCodeBlockFallback, type ScriptMutationIntent } from '@/lib/llm/script-preservation';
-import { Check, Image as ImageIcon, KeyRound } from 'lucide-react';
+import { Image as ImageIcon, KeyRound } from 'lucide-react';
 import { getModelById } from '@/lib/llm/models';
 import { resolveStreamRoute } from '@/lib/llm/byok-guard';
 import { getApiKeys, hasAnthropicKey, hasOpenaiKey, subscribeApiKeys } from '@/services/api-keys';
@@ -78,34 +83,14 @@ const EXAMPLE_PROMPTS = [
 
 const CONTINUE_PROMPT = 'Continue from exactly where your last response stopped. Do not repeat previously generated text.';
 const USAGE_REFRESH_INTERVAL_MS = 15_000;
-const EST_CHARS_PER_TOKEN = 4;
-const IMAGE_TOKEN_COST_EST = 850;
 const INPUT_BUDGET_RATIO = 0.72;
 const OUTPUT_TOKEN_RESERVE = 9_000;
 const MIN_INPUT_BUDGET = 8_000;
 const MAX_RECENT_MESSAGES = 48;
-const SUMMARY_SNIPPET_LEN = 240;
 const MAX_INLINE_IMAGE_DATA_URL_CHARS = 1_200_000;
 const MAX_ATTACHMENTS_PER_MESSAGE = 6;
 const MAX_TEXT_ATTACHMENT_BYTES = 512_000;
 const MAX_IMAGE_ATTACHMENT_BYTES = 8_000_000;
-/** Anthropic's PDF content-block limit is ~32 MB; keep our upload cap lower. */
-const MAX_PDF_ATTACHMENT_BYTES = 16_000_000;
-
-function createAttachmentId(): string {
-  return crypto.randomUUID();
-}
-
-/** Convert an ArrayBuffer (binary file) to raw base64 — no data-URL prefix. */
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  let binary = '';
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + chunk)));
-  }
-  return btoa(binary);
-}
 
 interface ChatSendOptions {
   continuationBase?: string;
@@ -115,101 +100,12 @@ interface ChatSendOptions {
   rootCauseKey?: string;
 }
 
-/** Convert a File to a base64 data URL */
-function fileToBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result as string);
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
-}
-
-async function imageFileToCompressedBase64(file: File): Promise<string> {
-  const raw = await fileToBase64(file);
-  return compressDataUrlImage(raw);
-}
-
-function compressDataUrlImage(dataUrl: string): Promise<string> {
-  return new Promise((resolve) => {
-    const img = new Image();
-    img.onload = () => {
-      const maxSide = 1400;
-      const srcW = img.naturalWidth || img.width;
-      const srcH = img.naturalHeight || img.height;
-      const scale = Math.min(1, maxSide / Math.max(srcW, srcH));
-      const outW = Math.max(1, Math.round(srcW * scale));
-      const outH = Math.max(1, Math.round(srcH * scale));
-      const canvas = document.createElement('canvas');
-      canvas.width = outW;
-      canvas.height = outH;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) {
-        resolve(dataUrl);
-        return;
-      }
-      ctx.drawImage(img, 0, 0, outW, outH);
-      resolve(canvas.toDataURL('image/jpeg', 0.72));
-    };
-    img.onerror = () => resolve(dataUrl);
-    img.src = dataUrl;
-  });
-}
-
-function stripContinuationOverlap(previous: string, continuation: string): string {
-  const prev = previous.trimEnd();
-  const next = continuation.trimStart();
-  if (!prev || !next) return continuation;
-
-  const maxOverlap = Math.min(prev.length, next.length, 1200);
-  const minOverlap = Math.min(48, maxOverlap);
-  for (let size = maxOverlap; size >= minOverlap; size--) {
-    const suffix = prev.slice(-size);
-    const prefix = next.slice(0, size);
-    if (suffix === prefix) {
-      return next.slice(size).trimStart();
-    }
-  }
-  return continuation;
-}
-
-function estimateTextTokens(text: string): number {
-  return Math.ceil(text.length / EST_CHARS_PER_TOKEN);
-}
-
-function estimateContentTokens(content: string | Array<TextContentPart | ImageContentPart>): number {
-  if (typeof content === 'string') return estimateTextTokens(content);
-  let tokens = 0;
-  for (const part of content) {
-    if (part.type === 'text') {
-      tokens += estimateTextTokens(part.text);
-    } else {
-      tokens += IMAGE_TOKEN_COST_EST;
-    }
-  }
-  return tokens;
-}
-
-function estimateMessagesTokens(messages: Array<{ role: string; content: string | Array<TextContentPart | ImageContentPart> }>): number {
-  return messages.reduce((sum, m) => sum + estimateContentTokens(m.content) + 8, 0);
-}
-
-function summarizeDroppedMessages(messages: ChatMessage[]): string {
-  if (messages.length === 0) return '';
-  const summaryParts: string[] = [];
-  for (const m of messages.slice(-14)) {
-    const body = m.content.replace(/\s+/g, ' ').trim().slice(0, SUMMARY_SNIPPET_LEN);
-    if (!body) continue;
-    summaryParts.push(`${m.role}: ${body}`);
-  }
-  return summaryParts.join('\n');
-}
-
 interface ChatPanelProps {
   onClose?: () => void;
 }
 
 export function ChatPanel({ onClose }: ChatPanelProps) {
+  const { t } = useTranslation();
   const extensionHost = useOptionalExtensionHost();
   /** Most recent chat classification; surfaced in the status bar as authoring telemetry. */
   const [authoringTelemetry, setAuthoringTelemetry] = useState<{
@@ -295,7 +191,6 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
   const consumePendingPrompt = useViewerStore((s) => s.consumeChatPendingPrompt);
   const pendingRepairRequest = useViewerStore((s) => s.chatPendingRepairRequest);
   const consumePendingRepairRequest = useViewerStore((s) => s.consumeChatPendingRepairRequest);
-  const hasByokKey = useViewerStore((s) => s.chatHasByokKey);
   const setChatHasByokKey = useViewerStore((s) => s.setChatHasByokKey);
   const usage = useViewerStore((s) => s.chatUsage);
   const setChatUsage = useViewerStore((s) => s.setChatUsage);
@@ -350,6 +245,9 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const documentUploadsRef = useRef<ReturnType<typeof createDocumentUploadGate> | null>(null);
+  documentUploadsRef.current ??= createDocumentUploadGate();
+  const documentUploads = documentUploadsRef.current;
   const dragCounterRef = useRef(0);
   const autoRepairAttemptCountsRef = useRef(new Map<string, { attempts: number; lastScope: RepairScope }>());
 
@@ -363,6 +261,7 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
   useEffect(() => {
     resizeInput();
   }, [inputText, resizeInput]);
+  useEffect(() => () => documentUploads.cancel(), [activeModel, documentUploads]);
 
   // ── Smart auto-scroll ──
   // Only auto-scroll if user hasn't scrolled up to read old messages
@@ -426,22 +325,16 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
 
   // ── Keyboard shortcuts ──
   useEffect(() => {
-    const handler = (e: globalThis.KeyboardEvent) => {
-      // Cmd+L / Ctrl+L → focus chat input
-      if ((e.ctrlKey || e.metaKey) && e.key === 'l') {
-        e.preventDefault();
-        inputRef.current?.focus();
-      }
-      // Escape → close panel (only if chat input isn't focused or is empty)
-      if (e.key === 'Escape' && onClose) {
-        const isChatFocused = document.activeElement === inputRef.current;
-        if (!isChatFocused || !inputText) {
-          onClose();
-        }
-      }
-    };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
+    const removeFocus = registerKeyboardCommand('chat.focusInput', () => {
+      inputRef.current?.focus();
+    }, { allowInTextEntry: true });
+    const removeClose = registerKeyboardCommand('chat.close', () => {
+      if (!onClose) return false;
+      const isChatFocused = document.activeElement === inputRef.current;
+      if (isChatFocused && inputText) return false;
+      onClose();
+    }, { allowInTextEntry: true, layer: 'popover' });
+    return () => { removeFocus(); removeClose(); };
   }, [onClose, inputText]);
 
   const buildRepairPromptFromLiveState = useCallback((request: ChatRepairRequest) => {
@@ -1144,6 +1037,7 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
 
   // ── Clear with confirmation ──
   const handleClearClick = useCallback(() => {
+    documentUploads.cancel();
     if (messages.length <= 2) {
       resetScriptEditorForNewChat();
       clearMessages();
@@ -1154,9 +1048,10 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
     } else {
       setShowClearConfirm(true);
     }
-  }, [messages.length, clearMessages, resetScriptEditorForNewChat, setChatToolReady]);
+  }, [messages.length, clearMessages, resetScriptEditorForNewChat, setChatToolReady, documentUploads]);
 
   const confirmClear = useCallback(() => {
+    documentUploads.cancel();
     resetScriptEditorForNewChat();
     clearMessages();
     setChatToolReady(null);
@@ -1164,7 +1059,7 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
     setInputText('');
     setLastFinishReason(null);
     setShowClearConfirm(false);
-  }, [clearMessages, resetScriptEditorForNewChat, setChatToolReady]);
+  }, [clearMessages, resetScriptEditorForNewChat, setChatToolReady, documentUploads]);
 
   // ── File upload (button + drag-drop + paste) ──
   const processFiles = useCallback(async (files: FileList | File[]) => {
@@ -1172,8 +1067,10 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
     const supportsImages = model?.supportsImages ?? false;
     const supportsFileAttachments = model?.supportsFileAttachments ?? true;
     let remainingSlots = Math.max(0, MAX_ATTACHMENTS_PER_MESSAGE - attachments.length);
+    const documentBatch = documentUploads.begin();
 
     for (const file of Array.from(files)) {
+      if (!documentBatch.current()) break;
       if (remainingSlots <= 0) {
         setChatError(`You can attach up to ${MAX_ATTACHMENTS_PER_MESSAGE} files per message.`);
         break;
@@ -1206,9 +1103,8 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
           remainingSlots -= 1;
           continue;
         }
-        // PDFs are supported by Claude as native document content blocks.
-        // Route them separately from text attachments so the chat request
-        // can emit the correct multimodal block type.
+        // Extract PDF text locally so the same bounded document context works
+        // with every configured model and with bim.files scripts.
         if (file.name.match(/\.pdf$/i) || file.type === 'application/pdf') {
           if (!supportsFileAttachments) {
             setChatError('Selected model does not support file attachments. Switch model to attach PDFs.');
@@ -1218,17 +1114,7 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
             setChatError(`PDF attachments must be smaller than ${Math.round(MAX_PDF_ATTACHMENT_BYTES / 1_000_000)} MB.`);
             continue;
           }
-          const buffer = await file.arrayBuffer();
-          const base64 = arrayBufferToBase64(buffer);
-          const attachment: FileAttachment = {
-            id: createAttachmentId(),
-            name: file.name,
-            type: 'application/pdf',
-            size: file.size,
-            pdfBase64: base64,
-            isPdf: true,
-          };
-          addAttachment(attachment);
+          await attachPdfDocument(file, documentBatch, addAttachment);
           remainingSlots -= 1;
           continue;
         }
@@ -1253,8 +1139,8 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
           remainingSlots -= 1;
           continue;
         }
-        // Text-based files — CSV, TSV, JSON, TXT
-        if (!file.name.match(/\.(csv|json|txt|tsv)$/i)) continue;
+        // Text-based files — CSV, TSV, JSON, TXT and Markdown.
+        if (!file.name.match(/\.(csv|json|txt|tsv|md|markdown)$/i)) continue;
         if (!supportsFileAttachments) {
           setChatError('Selected model does not support file attachments. Switch model to attach files.');
           continue;
@@ -1279,10 +1165,11 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
         addAttachment(attachment);
         remainingSlots -= 1;
       } catch (error) {
+        if (!shouldContinueDocumentUploadBatch(error)) break;
         setChatError(`Could not read ${file.name}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
-  }, [activeModel, addAttachment, attachments.length, setChatError]);
+  }, [activeModel, addAttachment, attachments.length, setChatError, documentUploads]);
 
   const handleFileUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
@@ -1352,7 +1239,7 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
   const modelSupportsFiles = modelForUi?.supportsFileAttachments ?? true;
   const attachmentAccept = [
     modelSupportsFiles
-      ? '.csv,.json,.txt,.tsv,.pdf,application/pdf,.xlsx,.xls,.ods,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,application/vnd.oasis.opendocument.spreadsheet'
+      ? '.csv,.json,.txt,.tsv,.md,.markdown,text/markdown,.pdf,application/pdf,.xlsx,.xls,.ods,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,application/vnd.oasis.opendocument.spreadsheet'
       : '',
     modelSupportsImages ? 'image/*' : '',
   ].filter(Boolean).join(',');
@@ -1390,76 +1277,61 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
         <div className="absolute inset-0 z-50 bg-blue-500/10 border-2 border-dashed border-blue-500 rounded-md flex items-center justify-center pointer-events-none">
           <div className="flex flex-col items-center gap-2 text-blue-500">
             <Paperclip className="h-8 w-8" />
-            <span className="text-sm font-medium">Drop files or images</span>
+            <span className="text-sm font-medium">{t('chat.panel.dropOverlay')}</span>
           </div>
         </div>
       )}
 
       {/* Header */}
       <div className="flex items-center gap-0.5 px-2 py-1 border-b shrink-0">
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              onClick={handleClearClick}
-              disabled={messages.length === 0}
-            >
-              <Trash2 className="h-3.5 w-3.5" />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent>Clear</TooltipContent>
-        </Tooltip>
+        <IconButton
+          label={t('chat.panel.clearTooltip')}
+          size="icon-xs"
+          onClick={handleClearClick}
+          disabled={messages.length === 0}
+        >
+          <Trash2 className="h-3.5 w-3.5" />
+        </IconButton>
 
         <ModelSelector />
         <ByokStreamingPill modelId={activeModel} className="ml-1" />
         {authoringTelemetry && (
           <span
-            className="ml-1 text-[10px] uppercase tracking-wide font-semibold bg-primary/15 text-primary rounded px-1.5 py-0.5"
-            title={`Authoring contract attached (${authoringTelemetry.intent})`}
+            className="ml-1 text-xs uppercase tracking-wide font-semibold bg-primary/15 text-primary rounded px-1.5 py-0.5"
+            title={t('chat.panel.authoringBadgeTooltip', { intent: authoringTelemetry.intent })}
           >
-            {authoringTelemetry.intent === 'fork' ? 'Fork' : 'Authoring'}
-            {' · '}
-            {Math.round((Date.now() - authoringTelemetry.startedAt) / 1000)}s
+            {t('chat.panel.authoringBadge', {
+              label: authoringTelemetry.intent === 'fork'
+                ? t('chat.panel.authoringBadgeFork')
+                : t('chat.panel.authoringBadgeAuthoring'),
+              seconds: Math.round((Date.now() - authoringTelemetry.startedAt) / 1000),
+            })}
           </span>
         )}
         <div className="flex-1" />
 
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              onClick={() => openByokModal(modelSource === 'openai' ? 'openai' : 'anthropic')}
-              className={keyStateAnthropic || keyStateOpenai ? 'text-emerald-500' : ''}
-              aria-label={keyStateAnthropic || keyStateOpenai ? 'Manage API keys' : 'Add API key for frontier models'}
-            >
-              <KeyRound className="h-3.5 w-3.5" />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent>
-            {keyStateAnthropic || keyStateOpenai ? 'Manage API keys' : 'Add API key for frontier models'}
-          </TooltipContent>
-        </Tooltip>
+        <IconButton
+          label={keyStateAnthropic || keyStateOpenai ? t('chat.panel.manageKeysLabel') : t('chat.panel.addKeyLabel')}
+          size="icon-xs"
+          onClick={() => openByokModal(modelSource === 'openai' ? 'openai' : 'anthropic')}
+          className={keyStateAnthropic || keyStateOpenai ? 'text-emerald-500' : ''}
+        >
+          <KeyRound className="h-3.5 w-3.5" />
+        </IconButton>
 
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              onClick={() => setAutoExecute(!autoExecute)}
-              className={autoExecute ? 'text-amber-500' : ''}
-            >
-              <Zap className="h-3.5 w-3.5" />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent>Auto-run: {autoExecute ? 'ON' : 'OFF'}</TooltipContent>
-        </Tooltip>
+        <IconButton
+          label={t('chat.panel.autoRunStatus', { state: autoExecute ? t('chat.panel.stateOn') : t('chat.panel.stateOff') })}
+          size="icon-xs"
+          onClick={() => setAutoExecute(!autoExecute)}
+          className={autoExecute ? 'text-amber-500' : ''}
+        >
+          <Zap className="h-3.5 w-3.5" />
+        </IconButton>
 
         {onClose && (
-          <Button variant="ghost" size="icon-xs" onClick={onClose}>
+          <IconButton label={t('chat.panel.closeLabel')} size="icon-xs" onClick={onClose}>
             <X className="h-3.5 w-3.5" />
-          </Button>
+          </IconButton>
         )}
       </div>
 
@@ -1473,8 +1345,12 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
         >
           <KeyRound className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400" />
           <span>
-            <strong>{needsAnthropicKey ? 'Anthropic' : 'OpenAI'} key needed</strong>{' '}
-            for this model — click to set it up
+            <strong>
+              {t('chat.panel.keyNeededStrong', {
+                provider: needsAnthropicKey ? t('chat.panel.providerAnthropic') : t('chat.panel.providerOpenai'),
+              })}
+            </strong>{' '}
+            {t('chat.panel.keyNeededSuffix')}
           </span>
         </button>
       )}
@@ -1482,14 +1358,16 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
       {/* Clear confirmation */}
       {showClearConfirm && (
         <div className="px-3 py-2 bg-destructive/5 border-b flex items-center gap-2 text-xs">
-          <span className="text-muted-foreground">Clear {messages.length} messages?</span>
+          <span className="text-muted-foreground">
+            {t('chat.panel.clearConfirmPrompt', { count: messages.length })}
+          </span>
           <Button
             variant="destructive"
             size="sm"
             onClick={confirmClear}
             className="h-5 px-2 text-xs"
           >
-            Clear
+            {t('chat.panel.clearConfirmButton')}
           </Button>
           <Button
             variant="ghost"
@@ -1497,7 +1375,7 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
             onClick={() => setShowClearConfirm(false)}
             className="h-5 px-2 text-xs"
           >
-            Cancel
+            {t('chat.panel.clearCancelButton')}
           </Button>
         </div>
       )}
@@ -1507,7 +1385,7 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
         {/* Empty state */}
         {messages.length === 0 && !streamingContent && (
           <div className="flex flex-col justify-end h-full px-3 pb-2">
-            <p className="text-xs text-muted-foreground/60 mb-2">Try something:</p>
+            <p className="text-xs text-muted-foreground mb-2">{t('chat.panel.emptyStateHint')}</p>
             <div className="flex flex-col gap-1">
               {EXAMPLE_PROMPTS.map((prompt) => (
                 <button
@@ -1548,8 +1426,8 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
         {/* Sending indicator */}
         {status === 'sending' && (
           <div className="flex items-center gap-2 px-3 py-2 text-muted-foreground">
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            <span className="text-xs">Thinking...</span>
+            <Spinner size="sm" />
+            <span className="text-xs">{t('chat.panel.sendingIndicator')}</span>
           </div>
         )}
 
@@ -1565,13 +1443,13 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
               </div>
               <div className="text-sm font-semibold">
                 {chatToolReady.kind === 'bundle'
-                  ? `"${chatToolReady.name || 'Your extension'}" is ready`
-                  : 'Your tool is ready'}
+                  ? t('chat.panel.bundleReadyTitle', { name: chatToolReady.name || t('chat.panel.defaultExtensionName') })
+                  : t('chat.panel.scriptReadyTitle')}
               </div>
             </div>
             <p className="text-xs text-muted-foreground mb-2.5 pl-9">
-              Last step — turn this into a permanent{' '}
-              <span className="font-medium text-foreground">one-click button in your toolbar</span>.
+              {t('chat.panel.installCtaPrefix')}{' '}
+              <span className="font-medium text-foreground">{t('chat.panel.installCtaHighlight')}</span>.
             </p>
             <div className="flex items-center gap-2 pl-9">
               <Button
@@ -1590,14 +1468,14 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
                 }}
               >
                 <Wrench className="mr-1 h-3.5 w-3.5" />
-                {chatToolReady.kind === 'bundle' ? 'Review & install' : 'Install as tool'}
+                {chatToolReady.kind === 'bundle' ? t('chat.panel.reviewInstallButton') : t('chat.panel.installAsToolButton')}
               </Button>
               <Button
                 size="sm"
                 variant="ghost"
                 onClick={() => setChatToolReady(null)}
               >
-                Not now
+                {t('chat.panel.notNowButton')}
               </Button>
             </div>
           </div>
@@ -1607,14 +1485,15 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
       {/* Scroll to bottom button */}
       {showScrollBtn && (
         <div className="absolute bottom-[120px] right-4 z-20">
-          <Button
+          <IconButton
+            label={t('chat.panel.scrollToBottomLabel')}
             variant="outline"
             size="icon-xs"
             onClick={scrollToBottom}
             className="rounded-full shadow-md bg-background"
           >
             <ArrowDown className="h-3.5 w-3.5" />
-          </Button>
+          </IconButton>
         </div>
       )}
 
@@ -1627,15 +1506,15 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
               <Button
                 variant="outline"
                 size="sm"
-                className="h-5 px-2 text-[10px]"
+                className="h-5 px-2 text-xs"
                 onClick={handleContinue}
               >
-                Continue
+                {t('chat.panel.continueButton')}
               </Button>
             )}
             {showSupportEmail && (
-              <a className="underline text-[10px]" href="mailto:louis@ltplus.com">
-                Contact support
+              <a className="underline text-xs" href="mailto:louis@ltplus.com">
+                {t('chat.panel.contactSupportLink')}
               </a>
             )}
           </div>
@@ -1665,12 +1544,14 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
                 <Paperclip className="h-3 w-3" />
               )}
               {a.name}
-              <button
-                className="ml-0.5 hover:text-destructive"
+              <IconButton
+                label={t('chat.panel.removeAttachment', { name: a.name })}
+                size="icon-xs"
+                className="ml-0.5 h-4 w-4 p-0 hover:text-destructive"
                 onClick={() => removeAttachment(a.id)}
               >
                 <X className="h-3 w-3" />
-              </button>
+              </IconButton>
             </span>
           ))}
         </div>
@@ -1695,35 +1576,31 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
             onChange={handleFileUpload}
             className="hidden"
           />
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                onClick={() => fileInputRef.current?.click()}
-                disabled={!canAttachInput}
-                className="shrink-0 mb-0.5"
-              >
-                <Paperclip className="h-3.5 w-3.5" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>
-              {canAttachInput
-                ? 'Attach file or image (paste, drag & drop)'
-                : 'Selected model does not support attachments'}
-            </TooltipContent>
-          </Tooltip>
+          <IconButton
+            label={canAttachInput ? t('chat.panel.attachTooltipEnabled') : t('chat.panel.attachTooltipDisabled')}
+            size="icon-xs"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={!canAttachInput}
+            className="shrink-0 mb-0.5"
+          >
+            <Paperclip className="h-3.5 w-3.5" />
+          </IconButton>
 
           <textarea
             ref={inputRef}
             value={inputText}
+            aria-label={t('chat.panel.messageLabel')}
             onChange={(e) => {
               setInputText(e.target.value);
               resizeInput();
             }}
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
-            placeholder={needsByokKey ? `Add your ${needsAnthropicKey ? 'Anthropic' : 'OpenAI'} key to chat with this model` : 'Ask anything...'}
+            placeholder={needsByokKey
+              ? t('chat.panel.placeholderNeedsKey', {
+                  provider: needsAnthropicKey ? t('chat.panel.providerAnthropic') : t('chat.panel.providerOpenai'),
+                })
+              : t('chat.panel.placeholderDefault')}
             rows={1}
             className="flex-1 resize-none rounded-md border border-input bg-background text-foreground placeholder:text-muted-foreground px-3 py-1.5 text-sm min-h-[32px] max-h-[120px] focus:outline-none focus:ring-1 focus:ring-ring"
             style={{ height: 'auto', overflow: 'hidden' }}
@@ -1731,39 +1608,30 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
           />
 
           {isActive ? (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  onClick={handleStop}
-                  className="shrink-0 mb-0.5"
-                >
-                  <Square className="h-3.5 w-3.5" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>Stop generating</TooltipContent>
-            </Tooltip>
+            <IconButton
+              label={t('chat.panel.stopGeneratingTooltip')}
+              size="icon-xs"
+              onClick={handleStop}
+              className="shrink-0 mb-0.5"
+            >
+              <Square className="h-3.5 w-3.5" />
+            </IconButton>
           ) : (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="default"
-                  size="icon-xs"
-                  onClick={handleSend}
-                  disabled={!inputText.trim() || needsByokKey}
-                  className="shrink-0 mb-0.5"
-                >
-                  <Send className="h-3.5 w-3.5" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>Send (Enter)</TooltipContent>
-            </Tooltip>
+            <IconButton
+              label={t('chat.panel.sendTooltip')}
+              variant="default"
+              size="icon-xs"
+              onClick={handleSend}
+              disabled={!inputText.trim() || needsByokKey}
+              className="shrink-0 mb-0.5"
+            >
+              <Send className="h-3.5 w-3.5" />
+            </IconButton>
           )}
         </div>
         <div className="flex items-center justify-between mt-1 px-0.5">
           {isActive ? (
-            <span className="text-[10px] text-muted-foreground/50">Streaming...</span>
+            <span className="text-xs text-muted-foreground">{t('chat.panel.streamingIndicator')}</span>
           ) : displayUsage ? (
             <Tooltip>
               <TooltipTrigger asChild>
@@ -1775,20 +1643,20 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
                       style={{ width: `${Math.min(100, displayUsage.pct)}%` }}
                     />
                   </div>
-                  <span className="text-[10px] text-muted-foreground/40 tabular-nums">{displayUsage.pct}%</span>
+                  <span className="text-xs text-muted-foreground tabular-nums">{displayUsage.pct}%</span>
                 </div>
               </TooltipTrigger>
               <TooltipContent>
                 {displayUsage.type === 'credits'
-                  ? `${displayUsage.used}/${displayUsage.limit} credits · resets ${usageResetLabel}`
-                  : `${displayUsage.used}/${displayUsage.limit} requests · resets ${usageResetLabel}`
+                  ? t('chat.panel.usageCredits', { used: displayUsage.used, limit: displayUsage.limit, resetLabel: usageResetLabel })
+                  : t('chat.panel.usageRequests', { used: displayUsage.used, limit: displayUsage.limit, resetLabel: usageResetLabel })
                 }
               </TooltipContent>
             </Tooltip>
           ) : (
-            <span className="text-[10px] text-muted-foreground/40">Shift+Enter new line</span>
+            <span className="text-xs text-muted-foreground">{t('chat.panel.shiftEnterHint')}</span>
           )}
-          <span className="text-[10px] text-muted-foreground/30">⌘L</span>
+          <span className="text-xs text-muted-foreground">{shortcutLabel('chat.focusInput')}</span>
         </div>
       </div>
 

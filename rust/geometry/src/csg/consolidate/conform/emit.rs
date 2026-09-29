@@ -29,7 +29,12 @@ pub(in crate::csg::consolidate) fn emit_plans(
     use crate::triangulation::triangulate_polygon_with_holes_refined;
     let mut output = Mesh::new();
     for plan in plans.iter_mut() {
-        for t in &plan.raw {
+        let raw = if conformed {
+            plan.raw_conformed.as_ref().unwrap_or(&plan.raw)
+        } else {
+            &plan.raw
+        };
+        for t in raw {
             emit_triangle(&mut output, t, &plan.normal);
         }
         let basis = (plan.origin, plan.u_axis, plan.v_axis, plan.normal);
@@ -105,8 +110,8 @@ fn emit_region(
     for tri in indices.chunks_exact(3) {
         // Needle backstop: drop any residual sub-weld degenerate sliver
         // ([`tri_is_needle`], the same scale-relative power-of-two rule as the
-        // single-triangle path). Cannot open a real gap — the hole/seam is framed
-        // by its non-degenerate neighbours.
+        // single-triangle path; its doc carries the no-gap argument and the
+        // long-span faces the rule also drops).
         let v = [verts_3d[tri[0]], verts_3d[tri[1]], verts_3d[tri[2]]];
         if tri_is_needle(&v) {
             continue;

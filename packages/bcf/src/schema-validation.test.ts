@@ -240,8 +240,8 @@ describe('BCF output validates against the official buildingSMART XSDs', () => {
         // If the writer stops emitting one of these, the per-entry validation
         // below would vacuously pass on the ones that remain.
         expect(names).toEqual([
-          `${TOPIC_GUID}/Viewpoint_${VIEWPOINT_GUID}.bcfv`,
           `${TOPIC_GUID}/markup.bcf`,
+          `${TOPIC_GUID}/viewpoint.bcfv`,
           'bcf.version',
           'project.bcfp',
         ]);
@@ -285,7 +285,7 @@ describe('BCF output validates against the official buildingSMART XSDs', () => {
         const { valid, messages } = await validate(
           version,
           'visinfo.xsd',
-          entries.get(`${TOPIC_GUID}/Viewpoint_${VIEWPOINT_GUID}.bcfv`)!
+          entries.get(`${TOPIC_GUID}/viewpoint.bcfv`)!
         );
         expect(messages).toEqual([]);
         expect(valid).toBe(true);
@@ -397,7 +397,7 @@ describe('BCF 3.0 AspectRatio', () => {
     const entries = await writeAndUnzip(maximalProject('2.1'));
     // The 2.1 fixture DOES set `aspectRatio` (see maximalTopic), so this
     // distinguishes "correctly suppressed for 2.1" from "never written".
-    expect(entries.get(`${TOPIC_GUID}/Viewpoint_${VIEWPOINT_GUID}.bcfv`)).not.toContain(
+    expect(entries.get(`${TOPIC_GUID}/viewpoint.bcfv`)).not.toContain(
       'AspectRatio'
     );
   });
@@ -432,7 +432,7 @@ describe('BCF 3.0 FieldOfView range', () => {
       topic.viewpoints[0].perspectiveCamera!.fieldOfView = good;
       const project: BCFProject = { version: '3.0', topics: new Map([[TOPIC_GUID, topic]]) };
       const entries = await writeAndUnzip(project);
-      const xml = entries.get(`${TOPIC_GUID}/Viewpoint_${VIEWPOINT_GUID}.bcfv`)!;
+      const xml = entries.get(`${TOPIC_GUID}/viewpoint.bcfv`)!;
       const { valid, messages } = await validate('3.0', 'visinfo.xsd', xml);
       expect(messages.join('\n')).toBe('');
       expect(valid).toBe(true);
@@ -448,7 +448,7 @@ describe('BCF 3.0 FieldOfView range', () => {
     topic.viewpoints[0].perspectiveCamera!.fieldOfView = 90;
     const project: BCFProject = { version: '2.1', topics: new Map([[TOPIC_GUID, topic]]) };
     const entries = await writeAndUnzip(project);
-    expect(entries.get(`${TOPIC_GUID}/Viewpoint_${VIEWPOINT_GUID}.bcfv`)).toContain(
+    expect(entries.get(`${TOPIC_GUID}/viewpoint.bcfv`)).toContain(
       '<FieldOfView>90</FieldOfView>'
     );
   });
@@ -582,7 +582,7 @@ describe('non-finite numbers never reach the archive', () => {
    */
   it('would have failed XSD validation had Infinity been emitted (the reported defect)', async () => {
     const entries = await writeAndUnzip(maximalProject('3.0'));
-    const good = entries.get(`${TOPIC_GUID}/Viewpoint_${VIEWPOINT_GUID}.bcfv`)!;
+    const good = entries.get(`${TOPIC_GUID}/viewpoint.bcfv`)!;
     expect((await validate('3.0', 'visinfo.xsd', good)).valid).toBe(true);
 
     const broken = good.replace(
@@ -609,7 +609,7 @@ describe('non-finite numbers never reach the archive', () => {
    */
   it('accepts NaN as a schema-valid xs:double, which is exactly why the schema cannot be the guard', async () => {
     const entries = await writeAndUnzip(maximalProject('3.0'));
-    const good = entries.get(`${TOPIC_GUID}/Viewpoint_${VIEWPOINT_GUID}.bcfv`)!;
+    const good = entries.get(`${TOPIC_GUID}/viewpoint.bcfv`)!;
     const withNaN = good.replace('<X>1.5</X>', '<X>NaN</X>');
     expect(withNaN).not.toEqual(good);
 
@@ -653,7 +653,7 @@ describe('non-finite numbers never reach the archive', () => {
 describe('BCF 3.0 places ViewSetupHints inside <Visibility>', () => {
   it('keeps the hints, with their values, nested in Visibility rather than at Components level', async () => {
     const entries = await writeAndUnzip(maximalProject('3.0'));
-    const bcfv = entries.get(`${TOPIC_GUID}/Viewpoint_${VIEWPOINT_GUID}.bcfv`)!;
+    const bcfv = entries.get(`${TOPIC_GUID}/viewpoint.bcfv`)!;
 
     // Present at all — the mutation that deleted it left the file schema-valid.
     expect(bcfv).toContain('<ViewSetupHints');
@@ -705,7 +705,7 @@ describe('the validator can fail (mutation proof)', () => {
 
   it('rejects a misspelled enum value', async () => {
     const entries = await writeAndUnzip(maximalProject('2.1'));
-    const good = entries.get(`${TOPIC_GUID}/Viewpoint_${VIEWPOINT_GUID}.bcfv`)!;
+    const good = entries.get(`${TOPIC_GUID}/viewpoint.bcfv`)!;
     // 2.1's BitmapFormat enum is {PNG, JPG} — uppercase. 3.0's is {png, jpg}.
     // Lowercasing it is exactly the cross-version mistake this catches.
     const broken = good.replace('>PNG<', '>png<');
@@ -718,7 +718,7 @@ describe('the validator can fail (mutation proof)', () => {
 
   it('rejects a wrong-typed attribute', async () => {
     const entries = await writeAndUnzip(maximalProject('2.1'));
-    const good = entries.get(`${TOPIC_GUID}/Viewpoint_${VIEWPOINT_GUID}.bcfv`)!;
+    const good = entries.get(`${TOPIC_GUID}/viewpoint.bcfv`)!;
     // `DefaultVisibility` is xs:boolean; "sometimes" is not a boolean.
     const broken = good.replace(
       /DefaultVisibility="[^"]*"/,
@@ -733,7 +733,7 @@ describe('the validator can fail (mutation proof)', () => {
 
   it('rejects a value outside a schema facet range', async () => {
     const entries = await writeAndUnzip(maximalProject('2.1'));
-    const good = entries.get(`${TOPIC_GUID}/Viewpoint_${VIEWPOINT_GUID}.bcfv`)!;
+    const good = entries.get(`${TOPIC_GUID}/viewpoint.bcfv`)!;
     // 2.1 restricts FieldOfView to [45, 60]; the fixture sits on 60.
     const broken = good.replace(
       /<FieldOfView>[^<]*<\/FieldOfView>/,
@@ -834,7 +834,7 @@ describe('BCF camera cardinality and order', () => {
     cameras: { perspective: boolean; orthogonal: boolean }
   ): Promise<string> {
     const entries = await writeAndUnzip(project(version, cameras));
-    const xml = entries.get(`${TOPIC_GUID}/Viewpoint_${VIEWPOINT_GUID}.bcfv`);
+    const xml = entries.get(`${TOPIC_GUID}/viewpoint.bcfv`);
     // Anti-vacuity: every assertion below reads this string, so a writer that
     // stopped emitting the viewpoint entry must fail here, not pass silently.
     expect(xml).toBeDefined();
@@ -937,5 +937,156 @@ describe('BCF camera cardinality and order', () => {
         writeBCF(project('3.0', { perspective: false, orthogonal: false }))
       ).rejects.toThrow(new RegExp(VIEWPOINT_GUID));
     });
+  });
+});
+
+/**
+ * Every test above validates OUR OWN output -- a maximal fixture we built by
+ * hand from `BCFTopic`, chosen because we believe it exercises what the
+ * schemas require. That belief is exactly what an externally-produced file
+ * can falsify: `reader.test.ts` already parses `test-data/PerspectiveCamera.bcf`
+ * and `test-data/OrthogonalCamera.bcf` (real `.bcf` archives sourced from
+ * buildingSMART/BCF-XML's own "Test Cases/v2.1" directory, produced by a
+ * third-party tool -- their `bcf.version` comment reads "Created with the
+ * iabi.BCF library" -- not by anything in this repository), but only for
+ * whether OUR READER can parse them. Nothing asked whether they satisfy the
+ * vendored XSDs themselves. If our copy of the schema were corrupted, or the
+ * `<xs:include>` wiring for 3.0's shared types were broken, or a facet were
+ * transcribed wrong, every "emits a schema-valid ..." test above could still
+ * pass -- because they all validate a fixture drawn from the same
+ * understanding of the schema that produced the schema check itself. A
+ * genuinely independent file has no such correlation with our schema copy or
+ * our reader; it does with buildingSMART's canonical schema, which is the
+ * same document these XSDs are vendored copies of.
+ */
+describe('a genuine buildingSMART-produced archive validates against the vendored XSDs', () => {
+  const TEST_DATA_DIR = path.join(DIR, '..', 'test-data');
+
+  /** Read one real `.bcf` archive from disk and return its governed entries. */
+  async function realArchiveEntries(fileName: string): Promise<Map<string, string>> {
+    const buffer = readFileSync(path.join(TEST_DATA_DIR, fileName));
+    const zip = await JSZip.loadAsync(buffer);
+    const out = new Map<string, string>();
+    for (const name of Object.keys(zip.files)) {
+      const entry = zip.files[name];
+      if (entry.dir) continue;
+      if (SCHEMA_FOR_ENTRY.some(([re]) => re.test(name))) {
+        out.set(name, await entry.async('string'));
+      }
+    }
+    return out;
+  }
+
+  it.each(['PerspectiveCamera.bcf', 'OrthogonalCamera.bcf'])('%s', async (fileName) => {
+    const entries = await realArchiveEntries(fileName);
+
+    // Anti-vacuity: this archive carries exactly a bcf.version, one
+    // markup.bcf and one .bcfv (plus the source .ifc and a snapshot PNG,
+    // neither XML and so not in SCHEMA_FOR_ENTRY). If a future change to
+    // this helper or to how JSZip enumerates entries stopped finding them,
+    // the loop below would validate zero entries and vacuously pass.
+    const kinds = [...entries.keys()].map((n) => n.replace(/^[^/]+\//, ''));
+    expect(kinds).toContain('bcf.version');
+    expect(kinds).toContain('markup.bcf');
+    expect(kinds.filter((n) => n.endsWith('.bcfv'))).toHaveLength(1);
+
+    const failures: string[] = [];
+    for (const [name, xml] of entries) {
+      const xsd = SCHEMA_FOR_ENTRY.find(([re]) => re.test(name))![1];
+      const { valid, messages } = await validate('2.1', xsd, xml);
+      if (!valid) failures.push(`${name} [${xsd}]: ${messages.join(' | ')}`);
+    }
+    expect(failures).toEqual([]);
+  });
+});
+
+/**
+ * Every test above validates OUR OWN output -- a maximal fixture we built by
+ * hand from `BCFTopic`, chosen because we believe it exercises what the
+ * schemas require. That belief is exactly what an externally-produced file
+ * can falsify: `reader.test.ts` parses real third-party `.bcf` archives, but
+ * only to check whether OUR READER can parse them. Nothing asks whether they
+ * satisfy the vendored XSDs themselves. If our copy of the schema were
+ * corrupted, or the `<xs:include>` wiring for 3.0's shared types were broken,
+ * or a facet were transcribed wrong, every "emits a schema-valid ..." test
+ * above could still pass -- because they all validate a fixture drawn from
+ * the same understanding of the schema that produced the schema check itself.
+ * A genuinely independent file has no such correlation with our schema copy
+ * or our reader; it does with buildingSMART's canonical schema, which is the
+ * same document these XSDs are vendored copies of.
+ *
+ * `test-data/AC20-FZK-Haus_BIMcollabZoom.bcf` is a second, independent data
+ * point: it was produced by BIMcollab Zoom (a different tool than the
+ * `test-data/{Perspective,Orthogonal}Camera.bcf` pair, both attributed to
+ * "the iabi.BCF library"), so a defect specific to one producer's
+ * understanding of the schema is unlikely to correlate across both.
+ */
+describe('a second, independently-produced archive validates against the vendored XSDs', () => {
+  const TEST_DATA_DIR = path.join(DIR, '..', 'test-data');
+
+  /** Read one real `.bcf` archive from disk and return its governed entries. */
+  async function realArchiveEntries(fileName: string): Promise<Map<string, string>> {
+    const buffer = readFileSync(path.join(TEST_DATA_DIR, fileName));
+    const zip = await JSZip.loadAsync(buffer);
+    const out = new Map<string, string>();
+    for (const name of Object.keys(zip.files)) {
+      const entry = zip.files[name];
+      if (entry.dir) continue;
+      if (SCHEMA_FOR_ENTRY.some(([re]) => re.test(name))) {
+        out.set(name, await entry.async('string'));
+      }
+    }
+    return out;
+  }
+
+  it('AC20-FZK-Haus_BIMcollabZoom.bcf', async () => {
+    const entries = await realArchiveEntries('AC20-FZK-Haus_BIMcollabZoom.bcf');
+
+    // Anti-vacuity: this archive carries a bcf.version, one project.bcfp, one
+    // markup.bcf and one .bcfv (plus the source-referencing snapshot PNG,
+    // which is not XML and so not in SCHEMA_FOR_ENTRY, and an explicit
+    // zero-length directory entry, which `entry.dir` already excludes). If a
+    // future change to this helper or to how JSZip enumerates entries
+    // stopped finding them, the loop below would validate zero entries and
+    // vacuously pass.
+    const kinds = [...entries.keys()].map((n) => n.replace(/^[^/]+\//, ''));
+    expect(kinds).toContain('bcf.version');
+    expect(kinds).toContain('project.bcfp');
+    expect(kinds).toContain('markup.bcf');
+    expect(kinds.filter((n) => n.endsWith('.bcfv'))).toHaveLength(1);
+
+    const failures: string[] = [];
+    for (const [name, xml] of entries) {
+      const xsd = SCHEMA_FOR_ENTRY.find(([re]) => re.test(name))![1];
+      const { valid, messages } = await validate('2.1', xsd, xml);
+      if (!valid) failures.push(`${name} [${xsd}]: ${messages.join(' | ')}`);
+    }
+    expect(failures).toEqual([]);
+  });
+
+  it('AC20-FZK-Haus_BIMcollabZoom-CommentOnly.bcf (same archive, top-level <Viewpoints> removed)', async () => {
+    // Derived from AC20-FZK-Haus_BIMcollabZoom.bcf by deleting only its
+    // top-level `<Viewpoints Guid="...">` element -- markup.xsd declares
+    // that element `minOccurs="0"`, so a schema-valid Markup can omit it
+    // entirely and reference a viewpoint solely through the Comment's
+    // nested `<Viewpoint Guid="..."/>`. This pins that markup.xsd still
+    // accepts the file with that element gone, independent of whether any
+    // reader code path uses the Comment's reference for lookup (it does
+    // not -- see the matching reader.test.ts describe block).
+    const entries = await realArchiveEntries('AC20-FZK-Haus_BIMcollabZoom-CommentOnly.bcf');
+
+    const kinds = [...entries.keys()].map((n) => n.replace(/^[^/]+\//, ''));
+    expect(kinds).toContain('bcf.version');
+    expect(kinds).toContain('project.bcfp');
+    expect(kinds).toContain('markup.bcf');
+    expect(kinds.filter((n) => n.endsWith('.bcfv'))).toHaveLength(1);
+
+    const failures: string[] = [];
+    for (const [name, xml] of entries) {
+      const xsd = SCHEMA_FOR_ENTRY.find(([re]) => re.test(name))![1];
+      const { valid, messages } = await validate('2.1', xsd, xml);
+      if (!valid) failures.push(`${name} [${xsd}]: ${messages.join(' | ')}`);
+    }
+    expect(failures).toEqual([]);
   });
 });

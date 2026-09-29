@@ -22,7 +22,9 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { StringTable, EntityTableBuilder, IfcTypeEnum } from '@ifc-lite/data';
 import type { EntityTable, PropertySet, PropertyTable, SpatialHierarchy } from '@ifc-lite/data';
-import type { MutablePropertyView } from '@ifc-lite/mutations';
+// Import the built view without the mutations barrel's unrelated query engine;
+// tsx's test loader resolves that engine's regex-guard types condition.
+import { MutablePropertyView } from '../../mutations/dist/mutable-property-view.js';
 import { IfcxWriter, exportToIfcx } from './writer.js';
 import type { IfcxExportData } from './writer.js';
 import type { IfcxFile } from './types.js';
@@ -637,5 +639,77 @@ describe('exportToIfcx', () => {
     const direct = writer.export({ includeProperties: false }).content;
     // Both invocations mint a fresh header id/timestamp, so compare only the data payload.
     assert.deepStrictEqual(JSON.parse(content).data, JSON.parse(direct).data);
+  });
+});
+
+describe('IfcxWriter effective entity set (#5249)', () => {
+  it('writes creations, omits tombstones and dangling child links, and honors the source-only option', () => {
+    const { strings, table } = buildTable();
+    const view = new MutablePropertyView(null, 'model');
+    view.setExpressIdWatermark(102);
+    const created = view.createEntity('IfcWindow', ['2newWindowGuid', null, 'New window', 'Authored']);
+    const property = view.createEntity('IfcPropertySingleValue', ['FireRating', 'Rated', '2h', null]);
+    const cancelled = view.createEntity('IfcWall', ['2cancelledGuid', null, 'Cancelled']);
+    view.deleteEntity(cancelled.expressId);
+    view.deleteEntity(101);
+    view.setEntityType(102, 'IfcWindow');
+
+    const hierarchy = stubHierarchy({ byStorey: new Map([[102, [101, created.expressId]]]) });
+    const writer = new IfcxWriter({ entities: table, strings, spatialHierarchy: hierarchy, mutationView: view });
+    const live = parse(writer.export().content);
+    assert.deepStrictEqual(live.data.map((node) => node.path), [
+      BUILT_DOOR_GUID, '2newWindowGuid', `ifc:IfcPropertySingleValue.${property.expressId}`,
+    ]);
+    assert.deepStrictEqual(live.data[0].attributes?.['bsi::ifc::class'], {
+      code: 'IfcWindow',
+      uri: 'https://identifier.buildingsmart.org/uri/buildingsmart/ifc/5/class/IfcWindow',
+    });
+    assert.deepStrictEqual(live.data[0].children, { [`element_${created.expressId}`]: '2newWindowGuid' });
+    assert.equal(live.data[1].attributes?.['bsi::ifc::prop::Name'], 'New window');
+    assert.equal(live.data[1].attributes?.['bsi::ifc::prop::Description'], 'Authored');
+    assert.equal(live.data[2].attributes?.['bsi::ifc::prop::Name'], 'FireRating');
+    assert.equal(live.data[2].attributes?.['bsi::ifc::prop::Description'], 'Rated');
+
+    const sourceOnly = parse(writer.export({ applyMutations: false }).content);
+    assert.deepStrictEqual(sourceOnly.data.map((node) => node.path), [BUILT_WALL_GUID, BUILT_DOOR_GUID]);
+  });
+});
+
+describe('IfcxWriter effective spatial edges (#5249)', () => {
+  it('moves a child to its live container and removes the stale parsed link', () => {
+    const { entities, strings } = makeEntities([
+      { expressId: 1, typeEnum: TYPE_STOREY },
+      { expressId: 2, typeEnum: TYPE_STOREY },
+      { expressId: 3, typeEnum: TYPE_WALL },
+    ]);
+    const spatialHierarchy = makeSpatialHierarchy({ byStorey: new Map([[1, [3]]]) });
+    const file = parse(new IfcxWriter({
+      entities, strings, spatialHierarchy,
+      effectiveSpatialEdges: [{ sourceId: 2, targetId: 3, relationshipType: 'IfcRelContainedInSpatialStructure' }],
+    }).export().content);
+    assert.equal(file.data[0].children, undefined);
+    assert.deepStrictEqual(file.data[1].children, { element_3: 'ifc:IfcWall.3' });
+  });
+
+  it('requires complete effective edges when a spatial relationship was edited', () => {
+    const { entities, strings } = makeEntities([
+      { expressId: 1, typeEnum: TYPE_STOREY },
+      { expressId: 2, typeEnum: TYPE_WALL },
+    ]);
+    const view = new MutablePropertyView(null, 'model');
+    view.setExpressIdWatermark(2);
+    view.createEntity('IfcRelContainedInSpatialStructure', [
+      '2newRelationGuid', null, null, null, ['#2'], '#1',
+    ]);
+    const spatialHierarchy = makeSpatialHierarchy({ byStorey: new Map() });
+    const writer = new IfcxWriter({ entities, strings, spatialHierarchy, mutationView: view });
+    assert.throws(() => writer.export(), /needs effectiveSpatialEdges/);
+    assert.doesNotThrow(() => writer.export({ applyMutations: false }));
+
+    const live = parse(new IfcxWriter({
+      entities, strings, spatialHierarchy, mutationView: view,
+      effectiveSpatialEdges: [{ sourceId: 1, targetId: 2, relationshipType: 'IfcRelContainedInSpatialStructure' }],
+    }).export().content);
+    assert.deepStrictEqual(live.data[0].children, { element_2: 'ifc:IfcWall.2' });
   });
 });

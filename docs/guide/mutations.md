@@ -82,6 +82,51 @@ view.clear();
 
 > **Note:** Undo/redo is handled by the viewer's store (mutationSlice), not directly on MutablePropertyView. In the viewer, use Ctrl+Z / Ctrl+Shift+Z.
 
+Whole-set edits (`createPropertySet`, `deletePropertySet`, `createQuantitySet`, `deleteQuantitySet`, `deleteQuantity`) record the set's overlay rows before and after the edit on the returned mutation's `setOverlay`. A host with its own undo history reverts or re-applies one of them with `view.restoreSetOverlay(mutation.setOverlay.before)` / `(...after)`, which is what the viewer does.
+
+### Enumerating the live entity set
+
+The parsed store's type index describes the file as loaded. After a session
+creates, deletes, or retypes entities, use the effective iterator for queries
+over that session. Pass schema-expanded, uppercase IFC type names when filtering;
+omit the third argument to visit every effective entity.
+
+```typescript
+import { iterateEffectiveEntityIds } from '@ifc-lite/mutations';
+
+for (const { expressId, type, overlayCreated } of iterateEffectiveEntityIds(dataStore, view, ['IFCWALL'])) {
+  console.log(expressId, type, overlayCreated);
+}
+```
+
+The iterator yields source entities in parsed order, followed by source entities
+retyped into a requested class, then overlay-created entities. Tombstones are
+excluded in every case.
+
+For direct members of a spatial container, `@ifc-lite/parser` also exports
+`effectiveSpatialMemberIds(store, containerId, context)`. Supply a context
+containing the model's `resolveEffectiveRelationshipOverlay` result, an
+`isDeleted` callback, and an effective `typeName` callback for a live session.
+It follows edited and created `IfcRelContainedInSpatialStructure` records,
+filters deleted products and spatial child nodes, and returns only direct
+members. Without a context it reads the parsed spatial hierarchy snapshot.
+
+`effectiveStoreyId(store, expressId, context)` uses the same context to find a
+product's containing storey through edited containment and aggregate ancestors.
+It returns `undefined` if the product is deleted or no longer contained. With
+no context, it reads the parsed `elementToStorey` snapshot.
+
+For per-class totals, `countEffectiveEntityTypes` applies the same membership
+and class changes. It returns a map keyed by uppercase IFC class and keeps a
+zero entry when all source entities of a class were deleted or retyped.
+
+```typescript
+import { countEffectiveEntityTypes } from '@ifc-lite/data';
+
+const wallCount = countEffectiveEntityTypes(dataStore, view).get('IFCWALL') ?? 0;
+console.log(wallCount);
+```
+
 ### Change Sets
 
 Change sets group related mutations for export and sharing:
@@ -107,7 +152,7 @@ const imported = manager.importChangeSet(json);
 
 ## Bulk Operations
 
-For updating many entities at once, use the `BulkQueryEngine`:
+For updating many entities at once, use the `BulkQueryEngine`. Evaluate property filters with `@ifc-lite/rules`, then pass the selected Express IDs in `select.expressIds`:
 
 ```typescript
 import { BulkQueryEngine } from '@ifc-lite/mutations';
@@ -120,12 +165,6 @@ const engine = new BulkQueryEngine(entityTable, mutationView);
 const query = {
   select: {
     entityTypes: [10],    // Type enum values (e.g., IfcWall)
-    propertyFilters: [{
-      psetName: 'Pset_WallCommon',
-      propName: 'IsExternal',
-      operator: '=' as const,
-      value: true,
-    }],
   },
   action: {
     type: 'SET_PROPERTY' as const,
@@ -143,7 +182,16 @@ console.log(`Will update ${preview.matchedCount} entities`);
 // Apply
 const result = engine.execute(query);
 console.log(`Updated ${result.affectedEntityCount} properties`);
+
+// Root attributes: one of BULK_WRITABLE_ATTRIBUTES (Name, Description, ObjectType, Tag)
+const retagged = engine.execute({
+  select: { expressIds: [42, 43] },
+  action: { type: 'SET_ATTRIBUTE' as const, attribute: 'ObjectType', value: 'Partition' },
+});
+console.log(retagged.success ? 'ObjectType set' : retagged.errors);
 ```
+
+`SET_ATTRIBUTE` takes the exact EXPRESS attribute name. An entity whose class does not declare the attribute (for example `ObjectType` on a type object) is reported in `errors` rather than skipped. Pass the model's `schemaVersion` as the engine's last constructor argument to judge that against the file's own schema.
 
 ## CSV Import
 
@@ -174,7 +222,16 @@ const mapping = {
 // Import (takes CSV string directly, not pre-parsed rows)
 const stats = connector.import(csvString, mapping);
 console.log(`Matched: ${stats.matchedRows}, Updated: ${stats.mutationsCreated}, Skipped: ${stats.unmatchedRows}`);
+
+// Async variant: yields between batches and reports each applied batch
+const asyncStats = await connector.importAsync(csvString, mapping, (progress) => {
+  console.log(`${progress.phase}: ${Math.round(progress.percent * 100)}%`);
+}, {
+  onApplied: (mutations) => console.log(`Applied ${mutations.length} writes`),
+});
 ```
+
+The importer writes straight to the view. `stats.mutations` lists every write that landed, including those applied before an error ended the import (`stats.errors`), so a host with undo history can revert them. `onApplied` lets it record that history batch by batch as the import goes.
 
 ## Viewer Integration
 
@@ -183,16 +240,22 @@ In the IFClite viewer:
 1. **Select an entity** in 3D or the hierarchy panel
 2. **Open Properties panel** — Edit properties directly in the panel
 3. **Bulk edit** — Use the Property Editor to update multiple entities
-4. **Track changes** — Modified properties are highlighted
-5. **Undo/Redo** — Ctrl+Z / Ctrl+Shift+Z to undo/redo edits
-6. **Export** — Save modified IFC with changes applied
+4. **Review changes** — Open **Changes** in the sidebar to see edits by model and entity; Bulk and CSV batches appear as one operation
+5. **Jump or revert** — Jump selects and frames an edited entity. Revert uses Undo for the newest operation; an older independent edit is reversed as a new undo step. If newer edits depend on it, the drawer refuses the reversal. Leave a shared room before reverting; room sync cannot publish these local history reversals yet.
+6. **Undo/Redo** — Ctrl+Z / Ctrl+Shift+Z to undo/redo edits
+7. **Export** — Use **Export modified IFC…** or **Changes only (JSON delta)** from Changes. Both open the viewer's existing export flow.
 
 ### Properties panel tabs
+
+Use **Find properties** to narrow attributes, property sets, and quantities by
+name or value. Matching rows are highlighted, and matching sections open while
+the search is active. Section chevrons keep your collapsed or expanded choice
+when you select another element or reopen the viewer.
 
 | Tab | Edits | Backed by |
 |---|---|---|
 | **Properties** | IfcRoot named attributes (Name, Description, …), property sets, classifications, materials, documents | `setProperty` / `setAttribute` |
-| **Quantities** | Quantity sets and individual quantities | `setQuantity` / `createQuantitySet` / `deleteQuantitySet` |
+| **Quantities** | Quantity sets and individual quantities | `setQuantity` / `deleteQuantity` / `createQuantitySet` / `deleteQuantitySet` |
 | **bSDD** | Add buildingSMART Data Dictionary properties | `setProperty` |
 | **Raw STEP** | Positional STEP arguments on the selected entity (one row per arg, inline pen-icon editor). Mutated rows show a purple dot. | `setPositionalAttribute` |
 
@@ -256,7 +319,7 @@ On submit, the dialog calls `bim.store.addColumn`, selects the newly-added colum
 |-------|-------------|
 | Modified entities | Count of entities with property changes |
 | Dirty models | Models with unsaved mutations |
-| Undo stack | Per-model undo history (covers properties, quantities, attributes, positional args, entity create/delete) |
+| Undo stack | Per-model undo history (covers properties, whole property and quantity sets, quantities, attributes, positional args, entity create/delete) |
 | Redo stack | Per-model redo history |
 | Change sets | Named groups of mutations for export |
 | Store editors | Per-model `StoreEditor` cache (created lazily on first store-level edit) |
@@ -294,6 +357,102 @@ editor.removeEntity(unwantedExpressId);
 
 Edits accumulate in the same overlay used by `setProperty` / `setAttribute`. They land in the exported file the next time you call `exportToStep(store, { applyMutations: true })` from `@ifc-lite/export`.
 
+### Atomic overlay edits
+
+Use `StoreEditor.runAtomic` to create or modify a related set of IFC entities together. The callback receives a detached editor; a thrown error leaves the live overlay, mutation history and express-ID allocator unchanged. `MutablePropertyView.runAtomic` provides the same operation with a draft view for property and quantity edits.
+
+```typescript
+import { MutablePropertyView, StoreEditor } from '@ifc-lite/mutations';
+
+const view = new MutablePropertyView(propertyTable, modelId);
+const editor = new StoreEditor(dataStore, view);
+const colour = editor.runAtomic(draft => {
+  const entity = draft.addEntity('IfcColourRgb', [null, 0.2, 0.4, 0.8]);
+  if (!draft.hasEntity(entity.expressId)) throw new Error('Missing created colour');
+  return entity;
+});
+console.log(editor.hasEntity(colour.expressId)); // true after publication
+```
+
+`hasEntity` recognizes live source, deferred-index and newly created entities, and rejects removed entities and invalid IDs. Atomic callbacks must be synchronous: prepare images, network requests and other asynchronous resources beforehand. Source tables and extractors remain shared read-only. Escaped draft editors and nested values cannot modify the published overlay. Reentering the original view is detected and preserves that independent edit rather than overwriting it.
+
+Use `editor.getMutationView()` when an in-store read must include the same live overlay that the editor writes to. For example, space generation passes it to `resolveSpatialAnchor` so deleted or replaced storey placements cannot be reused.
+
+For commands coordinating IFC with another synchronous subsystem, `view.prepareAtomic(callback)` returns `{ result, validate, commit, rollback }`. Preparation runs the callback without publishing. Validate all external resources before calling `commit`; it rejects intervening overlay edits, including edits that skip history. Repeated successful commits are harmless and never replay an old snapshot over newer edits. After a successful commit, `rollback` restores the original overlay, history and allocator only if no subsequent edit occurred; otherwise it throws and preserves those newer edits. Repeated rollback is harmless, and a rolled-back transaction cannot be committed again. Rollback before commit is a no-op.
+
+These transactions publish IFC overlay state only. They do not group application undo stacks or roll back renderer, file or network effects. The caller must coordinate those effects and handle rollback refusal explicitly. Preparation copies the existing overlay and checks it for changes, so batch related edits in one transaction rather than opening a transaction for every entity.
+
+### Cooperative owned entity operations
+
+`StoreEditor.prepareEntityOperations` prepares a bounded list of `create`,
+`setPositionalAttribute` and `remove` operations cooperatively. It is intended for
+appearance authoring's staged IFC/history publication. It does not accept an async
+callback and never exposes its mutable working view. The existing `runAtomic` and
+`prepareAtomic` behavior is unchanged.
+
+```typescript
+import { MutablePropertyView, StoreEditor } from '@ifc-lite/mutations';
+
+const view = new MutablePropertyView(propertyTable, modelId);
+const editor = new StoreEditor(dataStore, view); // establishes allocator watermark
+const abort = new AbortController();
+const operations = [{
+  kind: 'create' as const,
+  expressId: view.peekNextExpressId(),
+  type: 'IfcTextureVertexList',
+  attributes: [[[0, 0], [1, 0], [0, 1]]],
+}];
+const prepared = await editor.prepareEntityOperations(operations, { signal: abort.signal });
+try {
+  prepared.validate(); // coordinate other already-prepared resources here
+  prepared.commit();
+  console.log(prepared.effects, prepared.mutations);
+} finally {
+  prepared.dispose(); // release private checkpoints; does not undo a commit
+}
+```
+
+Construction initializes the live allocator before preparation starts; cancellation
+never advances it. Creation IDs must match the next sequential allocation. The
+operation executor uses the same `StoreEditor` rules as ordinary edits. A missing
+removal or invalid target discards the whole unpublished operation list.
+
+Copies yield inside large nested attribute arrays. The default scheduler yields to
+a host task, targeting four milliseconds per slice; `yieldTask` permits a host
+scheduler override. A microtask-only scheduler does not let browser rendering run.
+The defaults cap cumulative traversal at 16 million entries and conservatively
+account 512 MiB across the owned copies; these are work/allocation estimates, not
+measured heap use. `maxWork`, `maxBytes`, and `maxSliceMs` customize finite positive
+budgets. Budget failures and unsupported values reject without publication.
+
+The supported overlay vocabulary is strings, numbers, booleans, null and undefined (preserving negative
+zero), plain objects, sparse arrays, maps with primitive keys, and sets
+with primitive members. Aliases and cycles are preserved. Host objects, accessors,
+functions and mutable map keys/set members are rejected on this opt-in path rather
+than silently converted. Synchronous transaction support remains unchanged.
+
+The handle's effects/history records are separate owned copies: caller edits
+cannot modify the live publication or rollback checkpoint. Keep the input operation
+list stable until commit. Exact synchronous comparisons reject changes to its owned
+checkpoint or the captured live overlay, including skip-history/escaped nested SDK
+edits. A changed source-index identity or size also rejects publication. Source
+index records must otherwise follow their existing immutable-source contract.
+
+Capture itself is cooperative, so it is not an instantaneous snapshot at method
+entry. The final fence accepts only a coherent captured input equal to the live
+input at publication. Callers whose operations depend on an earlier model revision
+(such as a worker's appearance plan) must also retain and validate that earlier
+source checkpoint. Neither a revision counter alone nor a yielded comparison can
+replace the exact final fence. Its worst-case synchronous cost is linear in the
+mutable input/overlay size; this API does not promise a universal frame budget.
+
+Abort rejects preparation, including a pending scheduler wait, and abort after
+preparation prevents commit. Commit is idempotent. Rollback restores the captured
+original only while the published state still matches its private checkpoint;
+newer SDK edits are preserved and cause rollback to throw. Dispose is idempotent;
+before commit it abandons work, after commit it relinquishes rollback. No GPU,
+image, network or application undo resources are implicitly published by this API.
+
 #### STEP value conventions
 
 `addEntity` and `setPositionalAttribute` accept the same value shape that `EntityExtractor.extractEntity().attributes` produces — keeping the read/write round-trip predictable:
@@ -330,9 +489,9 @@ import { StoreEditor } from '@ifc-lite/mutations';
 import { addColumnToStore, resolveSpatialAnchor } from '@ifc-lite/create';
 
 const editor = new StoreEditor(dataStore, view);
-const anchor = resolveSpatialAnchor(dataStore, storeyExpressId);
-//   ↳ walks the parsed store for IfcOwnerHistory, the 'Body' representation
-//     context, and the storey's IfcLocalPlacement.
+const anchor = resolveSpatialAnchor(dataStore, storeyExpressId, view);
+//   ↳ reads live IfcOwnerHistory, representation context and storey placement,
+//     including overlay-created records and excluding tombstones.
 
 const result = addColumnToStore(editor, anchor, {
   Position: [1, 1, 0],     // storey-local metres
@@ -349,6 +508,61 @@ The column lands in the existing spatial hierarchy, references the model's own o
 #### IFC4 vs IFC2X3
 
 Builders read the schema from the resolved anchor (`anchor.schema`) and drop attribute-tail slots that don't exist in IFC2X3. For example `IfcWall.PredefinedType` and `IfcDoor.OperationType` are emitted on IFC4 only; on IFC2X3 the corresponding STEP records are 8 / 10 attributes wide. `USERDEFINED` enums round-trip through their companion `User-defined…` slot, so a custom `OperationType: 'USERDEFINED'` + `UserDefinedOperationType: 'Sliding-Curve'` exports as `.USERDEFINED.,'Sliding-Curve'`.
+
+#### Openings and hosted doors / windows
+
+`addOpeningToStore` cuts an `IfcOpeningElement` into an existing `IfcWall` or `IfcSlab` and links it with `IfcRelVoidsElement`; `addHostedDoorToStore` / `addHostedWindowToStore` cut the opening and fill it with an `IfcDoor` / `IfcWindow` through `IfcRelFillsElement`. The host can come from the file or from the overlay. `resolveHostAnchor` reads everything the builders need from the host: its placement, its containing storey (via `IfcRelContainedInSpatialStructure`), and the bounds of its Body geometry.
+
+```typescript
+import { StoreEditor } from '@ifc-lite/mutations';
+import { addHostedDoorToStore, addOpeningToStore, resolveHostAnchor } from '@ifc-lite/create';
+
+const editor = new StoreEditor(dataStore, view);
+const host = resolveHostAnchor(dataStore, wallExpressId, view);
+
+// Wall-local metres: Offset along the wall axis to the centre, Sill above its base.
+const door = addHostedDoorToStore(editor, host, { Offset: 2.5, Width: 0.9, Height: 2.1 });
+// → { fillingId, relFillsId, relContainedId, opening: { openingId, relVoidsId, cutDepth, … }, … }
+
+const hole = addOpeningToStore(editor, host, { Offset: 5, Sill: 1.8, Width: 0.4, Height: 0.4 });
+```
+
+The opening is placed relative to the host's own `IfcLocalPlacement` and is not contained in the storey (IFC reaches it through the element it voids). By default the cut runs through the host's body thickness plus 50 mm per face; pass `CutDepth` to override it, but never with a value thinner than the host. The door or window is placed relative to the opening, centred in the wall, and contained in the host's storey. For a slab host, pass `Position: [x, y]`, `Width` and `Depth` in the slab's local frame. Through the SDK these are `bim.store.addOpening`, `bim.store.addHostedDoor` and `bim.store.addHostedWindow` (`modelId, hostExpressId, params`). In the viewer they write the model and its export, but the host is not re-cut in 3D until overlay re-tessellation lands (#6232 M1).
+
+#### Type objects and materials
+
+`addElementTypeToStore` writes any `IfcElementType` subtype (`IfcWallType`, `IfcSlabType`, `IfcDoorType`, `IfcWindowType`, ...). Its attribute layout comes from the model's schema: IFC2X3 has no `IfcDoorType`, and IFC4 adds `OperationType`, so the same call writes a valid record in each schema or refuses the class by name. Enumeration values are checked against the schema. `assignTypeInStore` links occurrences through `IfcRelDefinesByType`. It extends the type's existing relationship, and it moves an occurrence off any other type, because an occurrence has one type.
+
+Materials follow the IFC4 practice for layered elements. The `IfcMaterialLayerSet` goes on the type, and an `IfcMaterialLayerSetUsage` of that set goes on each occurrence to say where the layers sit relative to its reference line: `AXIS2` across a wall, `AXIS3` up through a slab. `assignMaterialInStore` associates any `IfcMaterialSelect` (a plain `IfcMaterial` too) through `IfcRelAssociatesMaterial`, and it replaces an object's previous association.
+
+```typescript
+import { StoreEditor } from '@ifc-lite/mutations';
+import {
+  addElementTypeToStore, addMaterialLayerSetToStore, addMaterialLayerSetUsageToStore, addMaterialToStore,
+  assignMaterialInStore, assignTypeInStore, readRelatedLists, resolveAuthoringAnchor,
+} from '@ifc-lite/create';
+
+const editor = new StoreEditor(dataStore, view);
+const anchor = resolveAuthoringAnchor(dataStore, view);
+
+const { typeId } = addElementTypeToStore(editor, anchor, { Type: 'IfcWallType', Name: 'EW-300', PredefinedType: 'SOLIDWALL' });
+assignTypeInStore(editor, anchor, typeId, [wallExpressId], readRelatedLists(dataStore, 'IfcRelDefinesByType', view));
+
+const concrete = addMaterialToStore(editor, anchor, { Name: 'Concrete', Category: 'concrete' }).materialId;
+const wool = addMaterialToStore(editor, anchor, { Name: 'Mineral wool', Category: 'insulation' }).materialId;
+const { layerSetId } = addMaterialLayerSetToStore(editor, anchor, {
+  LayerSetName: 'EW-300',
+  MaterialLayers: [{ Material: concrete, LayerThickness: 0.2 }, { Material: wool, LayerThickness: 0.1 }],
+});
+// A wall centred on its axis: the layers start half its thickness below the reference line.
+const { usageId } = addMaterialLayerSetUsageToStore(editor, anchor, { ForLayerSet: layerSetId, OffsetFromReferenceLine: -0.15 });
+
+const associations = () => readRelatedLists(dataStore, 'IfcRelAssociatesMaterial', view);
+assignMaterialInStore(editor, anchor, layerSetId, [typeId], associations());
+assignMaterialInStore(editor, anchor, usageId, [wallExpressId], associations());
+```
+
+Layer thicknesses and offsets are metres, converted to the file's length unit. Through the SDK these are `bim.store.addElementType`, `assignType`, `addMaterial`, `addMaterialLayerSet`, `addMaterialLayerSetUsage` and `assignMaterial`. The two `assign*` methods read the model's existing relationships themselves.
 
 #### Auto Spaces — generate IfcSpace from a storey's walls
 
@@ -372,11 +586,11 @@ The detector also picks up overlay walls (placed via `addWallToStore` since the 
 
 ### `bim.store.*` — Scripting & SDK
 
-In the viewer's QuickJS sandbox and the TypeScript SDK, the same surface is exposed as `bim.store`:
+The viewer's QuickJS sandbox and the TypeScript SDK expose the core mutation surface as `bim.store`:
 
 ```typescript
 // SDK (TypeScript app)
-const profile = bim.store.addEntity('arch', {
+const profile = bim.store.addEntity('default', {
   type: 'IfcRectangleProfileDef',
   attributes: ['.AREA.', null, '#34', 0.6, 0.4],
 });
@@ -385,18 +599,22 @@ bim.store.removeEntity(unwantedRef);
 
 // High-level builder
 const storey = bim.query().byType('IfcBuildingStorey').refs()[0].expressId;
-const col = bim.store.addColumn('arch', storey, {
+const col = bim.store.addColumn('default', storey, {
   Position: [1, 1, 0],
   Width: 0.3, Depth: 0.4, Height: 3,
   Name: 'Column 1',
 });
 ```
 
+**Which `modelId`?** The headless backend behind `ifc-lite run` and `ifc-lite eval` holds exactly one model and answers for two spellings of it: `'default'` and the file's basename (`'tower.ifc'`). Any other id throws at the create call, rather than handing back a ref that the next `bim.mutate.*` write would refuse. Use the id you were given: the refs from `bim.query()` already carry it, and in the viewer it is the real model id from the model registry.
+
 The sandbox gates `bim.store.*` behind a `store: true` permission (default `false`, mirrors the existing `mutate` permission). The viewer opts in.
+
+**Cost / 5D authoring (#4857)** — `addCostSchedule`, `addCostItem`, `addCostValue`, `addCostQuantity`, `nestCostItems`, `assignCostItemsToSchedule`, `assignToCostItem`, `setCostItemValues`, `removeCostEntity` — is available through the CLI/headless and viewer SDK adapters and is registered in the viewer's QuickJS `bim.store` bridge (subject to the existing `store` permission). The viewer's cost panel stays read-only by design (see [Cost Panel → Authoring from scripts](cost-panel.md#authoring-from-scripts)). An authored `IfcCostItem`/`IfcCostValue` is visible to `bim.cost.data()` immediately, before export.
 
 ### Viewer UI
 
-The viewer surfaces store-level edits in three places — see [Viewer Integration](#viewer-integration) below for the full UX:
+The viewer surfaces store-level edits through the following controls — see [Viewer Integration](#viewer-integration) above for the full UX:
 
   - **Raw STEP tab** in the properties panel — inline pen-icon editor on every positional argument. Edited rows show a purple dot; the editor parses the same STEP literal conventions as `setPositionalAttribute`. The tab also opens for overlay-only entities (freshly added or duplicated) so newly-created walls / columns / spaces are immediately inspectable, even before export.
   - **Right-click → Delete entity** — calls `removeEntity`, surfaces a toast with undo support.
@@ -413,6 +631,8 @@ All paths route through the same `mutationSlice` actions that wrap `StoreEditor`
 | Edit a positional STEP arg on a non-IfcRoot entity (profile dim, cartesian point, …) | `setPositionalAttribute` / `bim.store.setPositionalAttribute` |
 | Inject a small raw STEP entity (a point, a profile, a unit) | `addEntity` / `bim.store.addEntity` |
 | Drop a fully-formed building element with geometry | `addColumnToStore` / `addWallToStore` / `addSlabToStore` / `addBeamToStore` / `addDoorToStore` / `addWindowToStore` / `addSpaceToStore` / `addRoofToStore` / `addPlateToStore` / `addMemberToStore` (or `bim.store.add{Column,Wall,Slab,…}`) |
+| Cut an opening, or put a door / window into an existing wall | `addOpeningToStore` / `addHostedDoorToStore` / `addHostedWindowToStore` (or `bim.store.addOpening` / `addHostedDoor` / `addHostedWindow`) |
+| Add a type object, or a material / layer set / layer set usage, and assign it | `addElementTypeToStore` + `assignTypeInStore`, `addMaterial*ToStore` + `assignMaterialInStore` (or `bim.store.addElementType` / `assignType` / `addMaterial*` / `assignMaterial`) |
 | Generate IfcSpace volumes from a storey's existing walls | `generateSpacesFromWalls` (or **Add Element → Space → Auto Spaces** in the viewer) |
 | Duplicate any IfcRoot product (psets, qsets, materials, type associations preserved) | `duplicateInStore` / right-click → Duplicate |
 | Remove an entity from an existing model | `removeEntity` / `bim.store.removeEntity` |
@@ -430,4 +650,4 @@ All paths route through the same `mutationSlice` actions that wrap `StoreEditor`
 | `BulkQueryEngine` | Query and update entities in bulk |
 | `CsvConnector` | Import property data from CSV files |
 | `addColumnToStore` | High-level anchored IfcColumn builder (`@ifc-lite/create`) |
-| `resolveSpatialAnchor` | Walks a parsed store for owner history, 'Body' context, and storey placement (`@ifc-lite/create`) |
+| `resolveSpatialAnchor` | Reads owner history, root/body/axis representation contexts, and storey placement from the parsed store plus an optional live mutation view (`@ifc-lite/create`); `rootContextId` is null when no root context exists |

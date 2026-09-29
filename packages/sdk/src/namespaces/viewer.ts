@@ -28,8 +28,9 @@ export class ViewerNamespace {
     this.backend.viewer.colorizeAll(resolved);
   }
 
-  /** Reset color overrides */
+  /** Reset color overrides. Omit refs for all; an explicit empty list is a no-op. */
   resetColors(refs?: EntityRef[]): void {
+    if (refs?.length === 0) return;
     this.backend.viewer.resetColors(refs);
   }
 

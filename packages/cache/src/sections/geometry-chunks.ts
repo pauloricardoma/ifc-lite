@@ -12,6 +12,7 @@
  *   totalVertices: u32
  *   totalTriangles: u32
  *   coordinateInfo                       // unchanged, variable length
+ *   sourceIndexPool (v19+)              // count + length-prefixed u32 arrays
  *   chunkCount: u32
  *   directory: chunkCount × 44 bytes {
  *     aabbMin f32×3, aabbMax f32×3,      // world AABB of the chunk
@@ -24,13 +25,15 @@
  *   ...chunk records at their byteOffsets
  *
  * A chunk record is a plain concatenation of per-mesh records (identical
- * layout to v12 — see geometry.ts writeMeshRecord), optionally deflate-raw
+ * versioned layout — see geometry.ts writeMeshRecord), optionally deflate-raw
  * compressed. Chunks are spatially coherent (grid cell of origin + first
  * vertex, soft byte cap; a mesh never splits), so a streamed reader paints
  * coherent regions and a future evict-to-disk residency layer can re-read
  * one chunk without touching the rest.
  */
 
+import { FORMAT_VERSION } from '../types.js';
+import { collectSourcePool, writeSourcePool, readSourcePool, type AppearanceSourcePool } from './appearance-provenance.js';
 import type { MeshData, CoordinateInfo } from '@ifc-lite/geometry';
 import { BufferWriter, BufferReader } from '../utils/buffer-utils.js';
 import {
@@ -45,9 +48,8 @@ import {
   writeMeshRecord,
   readMeshRecord,
   meshRecordByteLength,
-  writeCoordinateInfo,
-  readCoordinateInfo,
 } from './geometry.js';
+import { readCoordinateInfo, writeCoordinateInfo } from './coordinate-info.js';
 import { validateGeometryDirectory } from './geometry-directory.js';
 
 // 6×f32 AABB (24) + 5×u32 (offset, length, uncompressed, meshCount, flags).
@@ -67,21 +69,9 @@ export interface GeometryHead {
   chunks: GeometryChunkInfo[];
 }
 
-// ─── codec ────────────────────────────────────────────────────────────────
-
-async function pipeThrough(data: Uint8Array, stream: CompressionStream | DecompressionStream): Promise<Uint8Array> {
-  // Copy into a fresh standalone buffer: `data` may be a subarray view, and
-  // Response/Blob would otherwise serialize the WHOLE backing buffer.
-  const standalone = new Uint8Array(data);
-  const out = await new Response(new Blob([standalone]).stream().pipeThrough(stream)).arrayBuffer();
-  return new Uint8Array(out);
-}
-
-export const deflateRaw = (data: Uint8Array): Promise<Uint8Array> =>
-  pipeThrough(data, new CompressionStream('deflate-raw'));
-
-export const inflateRaw = (data: Uint8Array): Promise<Uint8Array> =>
-  pipeThrough(data, new DecompressionStream('deflate-raw'));
+import { chooseStoredGeometryChunk, inflateRaw } from './geometry-codec.js';
+import { GeometryCompressionSession } from '../workers/geometry-compression-client.js';
+export { deflateRaw, inflateRaw } from './geometry-codec.js';
 
 // ─── write ────────────────────────────────────────────────────────────────
 
@@ -108,14 +98,15 @@ interface PendingChunk {
 /** Group meshes into spatially coherent, byte-capped chunks (order-stable). */
 export function groupMeshesIntoChunks(
   meshes: MeshData[],
-  softBytes: number = GEOMETRY_CHUNK_SOFT_BYTES
+  softBytes: number = GEOMETRY_CHUNK_SOFT_BYTES,
+  pool?: AppearanceSourcePool
 ): MeshData[][] {
   const open = new Map<string, PendingChunk>();
   const closed: MeshData[][] = [];
   for (const mesh of meshes) {
     const key = cellKeyOf(mesh);
     let chunk = open.get(key);
-    const bytes = meshRecordByteLength(mesh);
+    const bytes = meshRecordByteLength(mesh, pool);
     if (chunk && chunk.bytes > 0 && chunk.bytes + bytes > softBytes) {
       closed.push(chunk.meshes);
       chunk = undefined;
@@ -159,11 +150,12 @@ function chunkAabb(meshes: MeshData[]): { min: [number, number, number]; max: [n
 export async function buildGeometrySectionV13(
   meshes: MeshData[],
   coordinateInfo: CoordinateInfo,
-  options: { compress?: boolean } = {}
+  options: { compress?: boolean; compressInWorker?: boolean } = {}
 ): Promise<ArrayBuffer> {
   const compress = options.compress ?? true;
   const { validMeshes, actualTotalVertices, actualTotalTriangles } = validateMeshes(meshes);
-  const groups = groupMeshesIntoChunks(validMeshes);
+  const pool = collectSourcePool(validMeshes);
+  const groups = groupMeshesIntoChunks(validMeshes, undefined, pool);
 
   // Serialize (and optionally compress) every chunk record. Concurrency is
   // BOUNDED: a large model produces hundreds of chunks, and an unbounded
@@ -178,33 +170,37 @@ export async function buildGeometrySectionV13(
     flags: GeometryChunkFlags;
     aabb: { min: [number, number, number]; max: [number, number, number] };
   };
+  const session = options.compressInWorker ? new GeometryCompressionSession() : undefined;
   const buildRecord = async (group: MeshData[]): Promise<BuiltRecord> => {
     const w = new BufferWriter(64 * 1024);
-    for (const mesh of group) writeMeshRecord(w, mesh);
+    for (const mesh of group) writeMeshRecord(w, mesh, pool);
     const raw = new Uint8Array(w.build());
+    // Worker compression transfers raw.buffer; save this before detachment.
+    const uncompressedLength = raw.byteLength;
     let bytes: Uint8Array<ArrayBufferLike> = raw;
     let flags = GeometryChunkFlags.None;
-    if (compress && raw.byteLength >= GEOMETRY_CHUNK_COMPRESS_MIN_BYTES) {
-      const deflated = await deflateRaw(raw);
-      // Keep the raw record when compression doesn't pay (already-dense data).
-      if (deflated.byteLength < raw.byteLength) {
-        bytes = deflated;
-        flags = GeometryChunkFlags.DeflateRaw;
-      }
+    if (compress && uncompressedLength >= GEOMETRY_CHUNK_COMPRESS_MIN_BYTES) {
+      const stored = await (session ? session.compress(raw) : chooseStoredGeometryChunk(raw));
+      bytes = stored.bytes;
+      if (stored.compressed) flags = GeometryChunkFlags.DeflateRaw;
     }
     return {
       bytes,
-      uncompressedLength: raw.byteLength,
+      uncompressedLength,
       meshCount: group.length,
       flags,
       aabb: chunkAabb(group),
     };
   };
   const records: BuiltRecord[] = new Array(groups.length);
-  for (let i = 0; i < groups.length; i += CHUNK_BUILD_CONCURRENCY) {
-    const slice = groups.slice(i, i + CHUNK_BUILD_CONCURRENCY);
-    const built = await Promise.all(slice.map(buildRecord));
-    for (let j = 0; j < built.length; j++) records[i + j] = built[j];
+  try {
+    for (let i = 0; i < groups.length; i += CHUNK_BUILD_CONCURRENCY) {
+      const slice = groups.slice(i, i + CHUNK_BUILD_CONCURRENCY);
+      const built = await Promise.all(slice.map(buildRecord));
+      for (let j = 0; j < built.length; j++) records[i + j] = built[j];
+    }
+  } finally {
+    session?.close();
   }
 
   // Head: counts + coordinateInfo + directory. Directory offsets need the
@@ -215,6 +211,7 @@ export async function buildGeometrySectionV13(
   headBody.writeUint32(actualTotalVertices);
   headBody.writeUint32(actualTotalTriangles);
   writeCoordinateInfo(headBody, coordinateInfo);
+  writeSourcePool(headBody, pool);
   headBody.writeUint32(records.length);
   const headLength = headBody.position + records.length * DIRECTORY_ENTRY_BYTES;
 
@@ -246,16 +243,19 @@ export async function buildGeometrySectionV13(
 
 /** Parse the v13 geometry head; `reader` must be positioned at the geometry
  *  section start. Cheap: never touches chunk records. */
-export function readGeometryHeadV13(reader: BufferReader): GeometryHead {
+export function readGeometryHeadV13(reader: BufferReader, version: number = FORMAT_VERSION): GeometryHead {
+  const start = reader.position;
   const headLength = reader.readUint32();
   const meshCount = reader.readUint32();
   const totalVertices = reader.readUint32();
   const totalTriangles = reader.readUint32();
-  const coordinateInfo = readCoordinateInfo(reader, 13);
+  const coordinateInfo = readCoordinateInfo(reader, version);
+  const appearanceSources = version >= 19 ? readSourcePool(reader, meshCount, start + 4 + headLength) : undefined;
   const chunkCount = reader.readUint32();
   const chunks: GeometryChunkInfo[] = [];
   for (let i = 0; i < chunkCount; i++) {
     chunks.push({
+      ...(appearanceSources ? { appearanceSources } : {}),
       aabbMin: [reader.readFloat32(), reader.readFloat32(), reader.readFloat32()],
       aabbMax: [reader.readFloat32(), reader.readFloat32(), reader.readFloat32()],
       byteOffset: reader.readUint32(),
@@ -285,7 +285,7 @@ export async function decodeGeometryChunk(
   const reader = new BufferReader(buffer as ArrayBuffer);
   const meshes: MeshData[] = [];
   for (let i = 0; i < info.meshCount; i++) {
-    meshes.push(readMeshRecord(reader, version, i));
+    meshes.push(readMeshRecord(reader, version, i, info.appearanceSources));
   }
   // `meshCount` and `uncompressedLength` are two independently-corruptible
   // directory fields; a lying pair (meshCount inflated, uncompressedLength
@@ -317,7 +317,7 @@ export function openGeometryChunksV13(
 ): GeometryHead & { readChunk(index: number): Promise<MeshData[]> } {
   const reader = new BufferReader(buffer);
   reader.position = sectionOffset;
-  const head = readGeometryHeadV13(reader);
+  const head = readGeometryHeadV13(reader, version);
   // `reader.position` here is a STRUCTURAL fact: it's where the parse of
   // meshCount/totalVertices/totalTriangles/coordinateInfo/chunkCount/
   // directory actually landed, none of which depend on `head.headLength`.

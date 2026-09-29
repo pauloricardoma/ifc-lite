@@ -19,10 +19,17 @@
 
 import type { WebGPUDevice } from './device.js';
 import { POINT_QUAD_VERTS, POINT_VERTEX_BYTES } from './pointcloud/point-pipeline.js';
+import type { RelativeToEyeSnapshot } from './relative-to-eye.js';
+import type { ClipBox } from './types.js';
+import { relativeToEyeWgsl } from './shaders/relative-to-eye.wgsl.js';
+import { packRteClipBox } from './rte-clip-space.js';
 
 export interface PointPickNode {
   expressId: number;
   modelIndex?: number;
+  model?: Float32Array;
+  /** Exact placement retained by the point-cloud owner until this draw. */
+  rteOrigin?: [number, number, number];
   chunks: ReadonlyArray<{ vertexBuffer: GPUBuffer; pointCount: number }>;
 }
 
@@ -70,15 +77,15 @@ export function decodePickSample(value: number): DecodedPickSample {
   return { meshIndexPlusOne: value, pointExpressId: 0, instanceExpressId: 0, kind: 'mesh' };
 }
 
-// mat4x4 (64) + vec4 viewport (16) + vec4 sizing (16) + vec4 entityIdOverride (16) + vec4 section (16)
-const UNIFORM_BYTES = 128;
+// View projection + viewport/sizing/id/section + per-asset model matrix.
+const UNIFORM_BYTES = 256;
+const IDENTITY = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
 
 export class PointPicker {
   private device: GPUDevice;
   private pipeline: GPURenderPipeline;
   private bindGroupLayout: GPUBindGroupLayout;
-  private uniformBuffer: GPUBuffer;
-  private bindGroup: GPUBindGroup;
+  private uniforms: Array<{ buffer: GPUBuffer; bindGroup: GPUBindGroup }> = [];
   private uniformScratch = new Float32Array(UNIFORM_BYTES / 4);
   private uniformU32 = new Uint32Array(this.uniformScratch.buffer);
   private destroyed = false;
@@ -96,18 +103,9 @@ export class PointPicker {
       ],
     });
 
-    this.uniformBuffer = this.device.createBuffer({
-      size: UNIFORM_BYTES,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-
-    this.bindGroup = this.device.createBindGroup({
-      layout: this.bindGroupLayout,
-      entries: [{ binding: 0, resource: { buffer: this.uniformBuffer } }],
-    });
-
     const shader = this.device.createShaderModule({
       code: `
+${relativeToEyeWgsl}
 struct U {
   viewProj: mat4x4<f32>,
   viewport: vec4<f32>,        // x, y = w, h; z, w = unused
@@ -118,6 +116,11 @@ struct U {
   // y = sectionEnabled (0/1), z = sectionFlipped (0/1).
   entityIdOverride: vec4<u32>,
   section: vec4<f32>,         // xyz = plane normal, w = plane distance
+  model: mat4x4<f32>,
+  drawableDeltaHigh: vec4<f32>,
+  drawableDeltaLow: vec4<f32>,
+  clipBoxMin: vec4<f32>,
+  clipBoxMax: vec4<f32>,
 }
 @binding(0) @group(0) var<uniform> u: U;
 
@@ -145,7 +148,17 @@ fn vs_main(input: VIn, @builtin(vertex_index) vId: u32) -> VOut {
   );
   let corner = corners[vId];
 
-  var clip = u.viewProj * vec4<f32>(input.position, 1.0);
+  let absoluteWorld = u.model * vec4<f32>(input.position, 1.0);
+  // Flag w selects the canonical RTE projection. The CPU formed the
+  // drawable-camera delta in f64; this shader never subtracts two rounded
+  // map-grid origins.
+  let rteWorld = rteWorldPosition(absoluteWorld.xyz, RteDrawableUniform(
+    u.drawableDeltaHigh,
+    u.drawableDeltaLow,
+  ));
+  let useRte = (u.entityIdOverride.w & 1u) != 0u;
+  let world = select(absoluteWorld, rteWorld, useRte);
+  var clip = u.viewProj * world;
 
   let sizeMode = u32(u.sizing.x);
   let worldRadius = u.sizing.y;
@@ -158,7 +171,7 @@ fn vs_main(input: VIn, @builtin(vertex_index) vId: u32) -> VOut {
   if (sizeMode == 0u) {
     halfPx = max(0.5, pointSizePx * 0.5);
   } else {
-    let edgePos = u.viewProj * vec4<f32>(input.position + vec3<f32>(worldRadius, 0.0, 0.0), 1.0);
+    let edgePos = u.viewProj * vec4<f32>(world.xyz + vec3<f32>(worldRadius, 0.0, 0.0), 1.0);
     let centerNdcX = clip.x / max(abs(clip.w), 1e-6);
     let edgeNdcX = edgePos.x / max(abs(edgePos.w), 1e-6);
     let projectedPx = abs(edgeNdcX - centerNdcX) * 0.5 * viewport.x;
@@ -179,7 +192,7 @@ fn vs_main(input: VIn, @builtin(vertex_index) vId: u32) -> VOut {
   o.pos = clip;
   o.entityId = input.entityId;
   o.quadUv = corner;
-  o.worldPos = input.position;
+  o.worldPos = world.xyz;
   return o;
 }
 
@@ -197,6 +210,13 @@ fn fs_main(input: VOut) -> @location(0) u32 {
     let side = select(1.0, -1.0, u.entityIdOverride.z != 0u);
     let d = (dot(u.section.xyz, input.worldPos) - u.section.w) * side;
     if (d > 0.0) {
+      discard;
+    }
+  }
+  // Crop uses the same eye-relative frame as the RTE position. Without this
+  // point click and marquee selection can return points the colour pass cut.
+  if ((u.entityIdOverride.w & 2u) != 0u) {
+    if (any(input.worldPos < u.clipBoxMin.xyz) || any(input.worldPos > u.clipBoxMax.xyz)) {
       discard;
     }
   }
@@ -253,17 +273,33 @@ fn fs_main(input: VOut) -> @location(0) u32 {
     viewport: { width: number; height: number },
     sizing: { sizeMode: 0 | 1 | 2; worldRadius: number; pointSizePx: number; clickTolerancePx: number },
     section?: { normal: [number, number, number]; distance: number; flipped: boolean } | null,
+    relativeToEye?: RelativeToEyeSnapshot,
+    clipBox?: ClipBox | null,
   ): void {
     if (this.destroyed || nodes.length === 0) return;
     pass.setPipeline(this.pipeline);
-    pass.setBindGroup(0, this.bindGroup);
+
     // Per-node uniform write so federation-relabelled IDs surface in
     // the picker too. The per-vertex `entityId` attribute is baked at
     // upload time and goes stale once the FederationRegistry assigns
     // an idOffset to the model — the override forces the picker to
     // emit the asset's CURRENT expressId regardless.
-    for (const node of nodes) {
-      this.writeUniforms(viewProj, viewport, sizing, node.expressId >>> 0, section);
+    // Each draw needs a distinct buffer: queue writes execute before the pass,
+    // so reusing one buffer would give every asset the last asset's transform/id.
+    for (const [index, node] of nodes.entries()) {
+      let uniform = this.uniforms[index];
+      if (!uniform) {
+        const buffer = this.device.createBuffer({ size: UNIFORM_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        uniform = { buffer, bindGroup: this.device.createBindGroup({ layout: this.bindGroupLayout,
+          entries: [{ binding: 0, resource: { buffer } }] }) };
+        this.uniforms.push(uniform);
+      }
+      // A node outside the snapshot's eye envelope cannot be rasterised in
+      // this frame; skip it rather than fail the whole pick (#6128).
+      if (!this.writeUniforms(
+        uniform.buffer, node, viewProj, viewport, sizing, node.expressId >>> 0, section, relativeToEye, clipBox,
+      )) continue;
+      pass.setBindGroup(0, uniform.bindGroup);
       for (const chunk of node.chunks) {
         if (chunk.pointCount === 0) continue;
         pass.setVertexBuffer(0, chunk.vertexBuffer);
@@ -273,15 +309,19 @@ fn fs_main(input: VOut) -> @location(0) u32 {
   }
 
   private writeUniforms(
+    buffer: GPUBuffer,
+    node: PointPickNode,
     viewProj: Float32Array,
     viewport: { width: number; height: number },
     sizing: { sizeMode: number; worldRadius: number; pointSizePx: number; clickTolerancePx: number },
     entityIdOverride: number,
     section?: { normal: [number, number, number]; distance: number; flipped: boolean } | null,
-  ): void {
+    relativeToEye?: RelativeToEyeSnapshot,
+    clipBox?: ClipBox | null,
+  ): boolean {
     const u = this.uniformScratch;
     const u32 = this.uniformU32;
-    u.set(viewProj.subarray(0, 16), 0);
+    u.set((relativeToEye?.getViewProjection().m ?? viewProj).subarray(0, 16), 0);
     u[16] = Math.max(1, viewport.width);
     u[17] = Math.max(1, viewport.height);
     u[18] = 0;
@@ -295,18 +335,37 @@ fn fs_main(input: VOut) -> @location(0) u32 {
     u32[24] = entityIdOverride >>> 0;
     u32[25] = section ? 1 : 0;
     u32[26] = section?.flipped ? 1 : 0;
-    u32[27] = 0;
+    u32[27] = (relativeToEye ? 1 : 0) | (clipBox?.enabled ? 2 : 0);
     // section plane (vec4<f32>) at float offset 28..31.
     u[28] = section ? section.normal[0] : 0;
     u[29] = section ? section.normal[1] : 0;
     u[30] = section ? section.normal[2] : 0;
-    u[31] = section ? section.distance : 0;
-    this.device.queue.writeBuffer(this.uniformBuffer, 0, u.buffer, u.byteOffset, UNIFORM_BYTES);
+    const camera = relativeToEye?.getCameraWorld();
+    u[31] = section
+      ? section.distance - (camera
+        ? section.normal[0] * camera[0] + section.normal[1] * camera[1] + section.normal[2] * camera[2]
+        : 0)
+      : 0;
+    u.set(node.model ?? IDENTITY, 32);
+    if (relativeToEye) {
+      // The point render path keeps translation out of the f32 matrix too.
+      // Do the same for picking, otherwise its splats drift from visible ones.
+      u[44] = 0; u[45] = 0; u[46] = 0;
+      if (!relativeToEye.tryPackDrawableOrigin(
+        node.rteOrigin ?? [node.model?.[12] ?? 0, node.model?.[13] ?? 0, node.model?.[14] ?? 0], u, 48,
+      )) return false;
+    } else {
+      u.fill(0, 48, 56);
+    }
+    packRteClipBox(clipBox, relativeToEye?.getCameraWorld() ?? [0, 0, 0], u, 56);
+    this.device.queue.writeBuffer(buffer, 0, u.buffer, u.byteOffset, UNIFORM_BYTES);
+    return true;
   }
 
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
-    this.uniformBuffer.destroy();
+    for (const { buffer } of this.uniforms) buffer.destroy();
+    this.uniforms = [];
   }
 }

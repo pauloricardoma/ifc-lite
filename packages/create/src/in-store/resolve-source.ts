@@ -13,9 +13,12 @@
  * backend layer can call it without needing parser internals.
  */
 
-import { EntityExtractor, extractLengthUnitScale, type IfcDataStore } from '@ifc-lite/parser';
-import type { IfcAttributeValue } from '@ifc-lite/mutations';
+import { EntityExtractor, effectiveStoreyId, resolveEffectiveRelationshipOverlay, type IfcDataStore } from '@ifc-lite/parser';
+import { iterateEffectiveEntityIds, type IfcAttributeValue, type StoreEditor } from '@ifc-lite/mutations';
+import { resolvedTypeName } from '@ifc-lite/data';
+import { asRef, createStyleEntityReader, refList } from './style-entity-reader.js';
 import type { SourceAttributes, SourceAssociation, Vec3 } from './duplicate.js';
+import { safeLengthUnitScale } from './length-unit-scale.js';
 
 /**
  * Rel types whose `RelatedObjects` list is replayed against a
@@ -64,10 +67,15 @@ function asNumber(v: IfcAttributeValue | undefined): number | null {
 export function resolveDuplicateSource(
   store: IfcDataStore,
   sourceExpressId: number,
+  editor?: StoreEditor,
 ): SourceAttributes {
   if (!store.source) {
     throw new Error('resolveDuplicateSource: data store has no source bytes');
   }
+  if (editor?.getMutationView().isDeleted(sourceExpressId)) {
+    throw new Error(`resolveDuplicateSource: entity #${sourceExpressId} was deleted`);
+  }
+  // @raw-entity-enumeration-ok point read of the duplicated source product's own placement chain; a deleted source was refused above and a created one has no bytes to duplicate from
   const sourceRef = store.entityIndex.byId.get(sourceExpressId);
   if (!sourceRef) {
     throw new Error(`resolveDuplicateSource: entity #${sourceExpressId} not found`);
@@ -92,6 +100,7 @@ export function resolveDuplicateSource(
     );
   }
 
+  // @raw-entity-enumeration-ok point read of the duplicated source product's own placement chain; a deleted source was refused above and a created one has no bytes to duplicate from
   const placementRef = store.entityIndex.byId.get(placementId);
   if (!placementRef) {
     throw new Error(`resolveDuplicateSource: placement #${placementId} missing from index`);
@@ -109,6 +118,7 @@ export function resolveDuplicateSource(
     );
   }
 
+  // @raw-entity-enumeration-ok point read of the duplicated source product's own placement chain; a deleted source was refused above and a created one has no bytes to duplicate from
   const axisPlacementRef = store.entityIndex.byId.get(axisPlacementId);
   if (!axisPlacementRef) {
     throw new Error(`resolveDuplicateSource: axis placement #${axisPlacementId} missing`);
@@ -124,6 +134,7 @@ export function resolveDuplicateSource(
 
   let sourceLocation: Vec3 = [0, 0, 0];
   if (locationId !== null) {
+    // @raw-entity-enumeration-ok point read of the duplicated source product's own placement chain; a deleted source was refused above and a created one has no bytes to duplicate from
     const pointRef = store.entityIndex.byId.get(locationId);
     if (pointRef) {
       const pointEntity = extractor.extractEntity(pointRef);
@@ -138,32 +149,47 @@ export function resolveDuplicateSource(
     }
   }
 
-  // Containing storey lookup via the pre-built spatial hierarchy.
-  // Falls back to null when the entity sits outside the spatial tree.
-  const storeyId = store.spatialHierarchy?.elementToStorey?.get(sourceExpressId) ?? null;
+  // The duplicate must inherit the storey that saving this session would
+  // produce, including edited/deleted containment and aggregate ancestors.
+  const view = editor?.getMutationView();
+  const createdTypes = new Map(view?.getNewEntities().map((e) => [e.expressId, e.type]) ?? []);
+  const spatialContext = view?.hasPendingChanges() ? {
+    relationships: resolveEffectiveRelationshipOverlay(store, {
+      createdEntities: () => view.getNewEntities(),
+      mutatedEntityIds: () => view.getEffectiveChanges().map((change) => change.entityId),
+      namedAttributes: (id: number) => view.getAttributeMutationsForEntity(id)
+        .map(({ name, value }) => [name, value] as const),
+      positionalAttributes: (id: number) => view.getPositionalMutationsForEntity(id) ?? [],
+      entityType: (id: number) => view.getEntityTypeMutation(id)?.newType,
+      isDeleted: (id: number) => view.isDeleted(id),
+    }),
+    isDeleted: (id: number) => view.isDeleted(id),
+    typeName: (id: number) => view.getEntityTypeMutation(id)?.newType
+      ?? createdTypes.get(id) ?? store.entities.getTypeName(id),
+  } : null;
+  const storeyId = effectiveStoreyId(store, sourceExpressId, spatialContext) ?? null;
 
   // Association rels that reference the source — replayed against
   // the duplicate by `duplicateInStore` so the exported STEP carries
   // the same psets / qsets / material / classifications / documents
   // / type binding.
-  const associations = collectSourceAssociations(store, extractor, sourceExpressId);
+  const associations = collectSourceAssociations(store, extractor, sourceExpressId, editor);
 
   // Metres per native unit (0.001 for a millimetre file) — lets the
   // duplicate flow convert its metre offset onto the native-unit
   // sourceLocation. Falls back to 1 (metres) on extraction failure.
-  let lengthUnitScale = 1.0;
-  try {
-    const s = extractLengthUnitScale(store.source, store.entityIndex);
-    if (Number.isFinite(s) && s > 0) lengthUnitScale = s;
-  } catch (error) {
-    console.warn('resolveDuplicateSource: failed to extract length unit scale; defaulting to metres', error);
+  const lengthUnitScale = safeLengthUnitScale(store.source, store.entityIndex, 'resolveDuplicateSource') ?? 1.0;
+
+  // Canonical PascalCase, or the raw STEP type as parsed (#4933).
+  const type = resolvedTypeName(store.entities, sourceExpressId) ?? sourceEntity.type;
+  if (!type) {
+    throw new Error(
+      `resolveDuplicateSource: #${sourceExpressId} has no resolvable IFC type — cannot duplicate`,
+    );
   }
 
   return {
-    // Canonical PascalCase (e.g. "IfcWall"); falls back to the raw
-    // extractor type when the entity table doesn't recognise the id
-    // (vendor extensions etc).
-    type: store.entities.getTypeName(sourceExpressId) || sourceEntity.type,
+    type,
     attributes: attrs,
     placementExpressId: placementId,
     parentPlacementId,
@@ -188,53 +214,47 @@ function collectSourceAssociations(
   store: IfcDataStore,
   extractor: EntityExtractor,
   sourceId: number,
+  editor: StoreEditor | undefined,
 ): SourceAssociation[] {
   const out: SourceAssociation[] = [];
-  for (const relType of ASSOCIATION_REL_TYPES) {
-    const ids = store.entityIndex.byType.get(relType);
-    if (!ids || ids.length === 0) continue;
-    for (const relId of ids) {
-      const ref = store.entityIndex.byId.get(relId);
-      if (!ref) continue;
-      const entity = extractor.extractEntity(ref);
-      if (!entity) continue;
+  // The session's effective relationships (#5249): one deleted this session is
+  // not replayed onto the duplicate, one created this session (a type binding,
+  // a material) is, and a queued edit to a relationship is what gets copied.
+  const view = editor?.getMutationView() ?? null;
+  const read = editor
+    ? createStyleEntityReader(store, editor)
+    : (id: number) => {
+      // @raw-entity-enumeration-ok point read of one effective candidate's source bytes when no session editor was supplied
+      const ref = store.entityIndex.byId.get(id);
+      return ref ? extractor.extractEntity(ref) : null;
+    };
+  for (const { expressId: relId, type } of iterateEffectiveEntityIds(store, view, ASSOCIATION_REL_TYPES)) {
+    const entity = read(relId);
+    if (!entity) continue;
+    // RelatedObjects: a parsed `#N` is a number, an authored one a `#N` string.
+    if (!refList(entity.attributes[4]).includes(sourceId)) continue;
 
-      const related = entity.attributes[4];
-      // RelatedObjects is a STEP set serialised as a JS array. The
-      // parser returns each `#N` as a plain number — we look for the
-      // source id by direct membership, not by string match.
-      if (!Array.isArray(related)) continue;
-      let referencesSource = false;
-      for (const member of related) {
-        if (typeof member === 'number' && member === sourceId) {
-          referencesSource = true;
-          break;
-        }
-      }
-      if (!referencesSource) continue;
+    const ownerHistoryId = asRef(entity.attributes[1]);
+    const relatingExpressId = asRef(entity.attributes[5]);
+    // RelatingPropertyDefinition / RelatingType / etc. is required
+    // by the schema, so a missing one is a hard skip. OwnerHistory
+    // is optional (IFC4) — null is fine and round-trips cleanly.
+    if (relatingExpressId === null) continue;
 
-      const ownerHistoryId = asNumber(entity.attributes[1]);
-      const relatingExpressId = asNumber(entity.attributes[5]);
-      // RelatingPropertyDefinition / RelatingType / etc. is required
-      // by the schema, so a missing one is a hard skip. OwnerHistory
-      // is optional (IFC4) — null is fine and round-trips cleanly.
-      if (relatingExpressId === null) continue;
+    const name = typeof entity.attributes[2] === 'string' ? entity.attributes[2] : null;
+    const description = typeof entity.attributes[3] === 'string' ? entity.attributes[3] : null;
 
-      const name = typeof entity.attributes[2] === 'string' ? entity.attributes[2] : null;
-      const description = typeof entity.attributes[3] === 'string' ? entity.attributes[3] : null;
-
-      // Use the entity table's canonical name so the duplicate replays
-      // a PascalCase type into the editor (e.g. "IfcRelDefinesByProperties"),
-      // not the byType map's UPPERCASE storage key.
-      const canonicalRelType = store.entities.getTypeName(relId) || relType;
-      out.push({
-        relType: canonicalRelType,
-        ownerHistoryId,
-        name,
-        description,
-        relatingExpressId,
-      });
-    }
+    // Canonical PascalCase when the table has it; association rels are
+    // usually categorised out of the `EntityTable` entirely, so the
+    // effective STEP class the iterator reports is the fallback.
+    const canonicalRelType = resolvedTypeName(store.entities, relId) ?? type;
+    out.push({
+      relType: canonicalRelType,
+      ownerHistoryId,
+      name,
+      description,
+      relatingExpressId,
+    });
   }
   return out;
 }

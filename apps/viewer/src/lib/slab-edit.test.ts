@@ -9,7 +9,7 @@ import {
   computeSlabSplitGeometry,
 } from './slab-edit.js';
 
-import { StubStoreEditor, StubView, makeStubDataStore, type OverlayEntity } from './__test__/stubs.js';
+import { StubStoreEditor, StubView, makeStubDataStore } from './__test__/stubs.js';
 
 const dataStoreStub = makeStubDataStore() as unknown as Parameters<typeof resolveSlabEditChain>[0];
 
@@ -156,19 +156,49 @@ describe('slab-edit', () => {
     assert.deepStrictEqual(chain.footprint[2], [111, 72]);
   });
 
-  it('ignores lengthUnitScale for authored (overlay) entities', () => {
-    // The in-store builders already emit metres, so a freshly-authored
-    // slab must NOT be re-scaled even on a millimetre model — otherwise
-    // re-splitting a just-cut half would shrink it 1000×. The stub serves
-    // overlay entities, so the footprint stays in its given units despite
-    // the 0.001 scale.
+  // #5922: an Axis-only solid Position (`$` RefDirection) on the X axis takes
+  // the renderer's fill (`firstProjAxis`, mirroring `build_axis2_matrix`):
+  // +X -> local X (0,1,0), -X -> local X (0,-1,0), and local Y = Z x X =
+  // (0,0,1) for both. Filling `$` with world X as-is left nothing to
+  // orthogonalise here, so the footprint silently fell back to identity.
+  const axisOnlyCases: ReadonlyArray<[string, [number, number, number], [number, number][]]> = [
+    // solidXform(p) = (100, 50 + p.x), + placement (10, 20)
+    ['+X', [1, 0, 0], [[110, 70], [110, 72], [110, 71]]],
+    // solidXform(p) = (100, 50 - p.x), + placement (10, 20)
+    ['-X', [-1, 0, 0], [[110, 70], [110, 68], [110, 69]]],
+  ];
+  for (const [label, axis, expected] of axisOnlyCases) {
+    it(`fills an absent RefDirection on a ${label} Axis as the renderer does (#5922)`, () => {
+      const entities = makePolygonSlabFixture();
+      entities.push(
+        { expressId: 70, type: 'IFCCARTESIANPOINT', attributes: [[100, 50, 0]] },
+        { expressId: 71, type: 'IFCDIRECTION', attributes: [axis] },
+        { expressId: 73, type: 'IFCAXIS2PLACEMENT3D', attributes: [70, 71, null] },
+      );
+      entities.find((e) => e.expressId === 93)!.attributes = [92, 73, null, 0.25];
+
+      const editor = new StubStoreEditor(entities) as unknown as Parameters<typeof resolveSlabEditChain>[2];
+      const view = new StubView() as unknown as Parameters<typeof resolveSlabEditChain>[1];
+      const chain = resolveSlabEditChain(dataStoreStub, view, editor, 100);
+      assert.ok(chain);
+      const rounded = chain.footprint.map((p) => p.map((v) => Math.round(v * 1e9) / 1e9 || 0));
+      assert.deepStrictEqual(rounded, expected);
+    });
+  }
+
+  it('applies lengthUnitScale to authored (overlay) entities too (#6233)', () => {
+    // The in-store builders convert their metre params to the file's
+    // native unit, so an authored slab in a millimetre file stores
+    // millimetres exactly like an imported one. Skipping the scale for
+    // overlay entities left the Split tool comparing a millimetre footprint
+    // against a metre cursor. The stub serves overlay entities.
     const entities = makePolygonSlabFixture();
     const editor = new StubStoreEditor(entities) as unknown as Parameters<typeof resolveSlabEditChain>[2];
     const view = new StubView() as unknown as Parameters<typeof resolveSlabEditChain>[1];
     const chain = resolveSlabEditChain(dataStoreStub, view, editor, 100, 0.001);
     assert.ok(chain);
-    assert.deepStrictEqual(chain.footprint[0], [10, 20]);
-    assert.strictEqual(chain.thickness, 0.25);
+    assert.deepStrictEqual(chain.footprint[0], [0.01, 0.02]);
+    assert.strictEqual(chain.thickness, 0.00025);
   });
 
   it('strips the redundant closing vertex from an IfcPolyline', () => {

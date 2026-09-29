@@ -24,6 +24,7 @@ import {
 } from './cesium-placement.js';
 import type { CoordinateInfo } from '@ifc-lite/geometry';
 import type { MapConversion } from '@ifc-lite/parser';
+import { getEffectiveAxisScales } from './geo-scale.js';
 
 describe('cesium placement helpers', () => {
   it('defaults to METRES when MapUnit is absent (overrides project length unit)', () => {
@@ -90,6 +91,7 @@ describe('cesium placement helpers', () => {
       ifcOriginHeight: 244,
       terrainHeight: 245,
       storeyElevations: new Map([[1, -3], [2, 0], [3, 3]]),
+      viewerUpScale: 1,
     });
 
     // placementHeight == authored ifcOriginHeight, NOT terrain+anchorOffset.
@@ -103,14 +105,42 @@ describe('cesium placement helpers', () => {
 
   it('keeps the authored height whether it is above OR below terrain', () => {
     // Above terrain — unchanged.
-    const above = computeCesiumPlacement({ ifcOriginHeight: 244, terrainHeight: 195.4 });
+    const above = computeCesiumPlacement({ ifcOriginHeight: 244, terrainHeight: 195.4, viewerUpScale: 1 });
     assert.strictEqual(above.placementHeight, 244);
 
     // Below terrain — the model stays sub-grade, NOT lifted to terrain.
     // (Regression: the old Math.max floor pinned it to terrain, which froze
     //  the vertical placement gizmo and lifted basements above ground.)
-    const below = computeCesiumPlacement({ ifcOriginHeight: -20, terrainHeight: 70.61 });
+    const below = computeCesiumPlacement({ ifcOriginHeight: -20, terrainHeight: 70.61, viewerUpScale: 1 });
     assert.strictEqual(below.placementHeight, -20);
+  });
+
+  it('puts the below-terrain clip plane on the terrain in a FactorZ-scaled frame (#4675)', () => {
+    // The camera frame places viewer Y at `placementHeight + viewerUpScale *
+    // (y - modelCenterY)` (cesium-bridge.ts, m21). Centre Y 3, model at 244,
+    // terrain at 250, Scale x FactorZ 2: the terrain is 6 m up, which is 3
+    // viewer units, so the plane sits at Y 6. Ignoring the scale gives 9,
+    // which the frame draws at 256, 6 m above the ground.
+    const placement = computeCesiumPlacement({
+      coordinateInfo: {
+        originShift: { x: 0, y: 0, z: 0 },
+        originalBounds: { min: { x: 0, y: -3, z: 0 }, max: { x: 10, y: 9, z: 10 } },
+        shiftedBounds: { min: { x: 0, y: -3, z: 0 }, max: { x: 10, y: 9, z: 10 } },
+        hasLargeCoordinates: false,
+      },
+      ifcOriginHeight: 244,
+      terrainHeight: 250,
+      viewerUpScale: 2,
+    });
+    assert.strictEqual(placement.terrainClipY, 6);
+    const worldHeightOfPlane = placement.placementHeight
+      + 2 * (placement.terrainClipY! - placement.modelCenterY);
+    assert.strictEqual(worldHeightOfPlane, 250);
+    // Scale 0 flattens the frame: no plane rather than a floor at infinity.
+    const flat = computeCesiumPlacement({ ifcOriginHeight: 244, terrainHeight: 250, viewerUpScale: 0 });
+    assert.strictEqual(flat.terrainClipY, null);
+    const flatAtTerrain = computeCesiumPlacement({ ifcOriginHeight: 250, terrainHeight: 250, viewerUpScale: 0 });
+    assert.strictEqual(flatAtTerrain.terrainClipY, null);
   });
 
   it('computes OrthogonalHeight from target base altitude with shift and RTC', () => {
@@ -139,6 +169,7 @@ describe('cesium placement helpers', () => {
         wasmRtcOffset: { x: 0, y: 0, z: 3 },
       },
       projectedCRS: { mapUnitScale: 0.3048 },
+      mapConversion: undefined,
       lengthUnitScale: 1,
       storeyElevations,
       targetBaseAltitude: 245,
@@ -149,6 +180,31 @@ describe('cesium placement helpers', () => {
     // must NOT be subtracted again here — only the RTC offset still needs
     // folding in: 245 - rtcYupY(3) - anchorY(5) = 237 meters; /0.3048 mapUnitScale.
     assert.strictEqual(orthogonalHeight, 777.56);
+  });
+
+  it('inverts the FactorZ-scaled read path when solving OrthogonalHeight (#4615)', () => {
+    // Read path: base altitude = OrthogonalHeight + scaleZ * (rtc + anchorY).
+    // Scale 1 x FactorZ 2, anchor storey at 5, RTC 3, target 100:
+    // 100 - 2 * (3 + 5) = 84, which the read path places at 84 + 16 = 100.
+    // Scaling only the anchor would give 87; ignoring FactorZ gives 92.
+    const orthogonalHeight = computeOrthogonalHeightForBaseAltitude({
+      coordinateInfo: {
+        originShift: { x: 0, y: 0, z: 0 },
+        originalBounds: { min: { x: 0, y: 0, z: 0 }, max: { x: 10, y: 10, z: 10 } },
+        shiftedBounds: { min: { x: 0, y: 0, z: 0 }, max: { x: 10, y: 10, z: 10 } },
+        hasLargeCoordinates: false,
+        wasmRtcOffset: { x: 0, y: 0, z: 3 },
+      },
+      projectedCRS: { mapUnitScale: 1 },
+      mapConversion: {
+        id: 1, sourceCRS: 2, targetCRS: 3, eastings: 0, northings: 0, orthogonalHeight: 0,
+        scale: 1, factorZ: 2,
+      },
+      lengthUnitScale: 1,
+      storeyElevations: new Map([[1, 5]]),
+      targetBaseAltitude: 100,
+    });
+    assert.strictEqual(orthogonalHeight, 84);
   });
 
   it('computes the IFC origin height from OrthogonalHeight and model center', () => {
@@ -173,6 +229,21 @@ describe('cesium placement helpers', () => {
     assert.strictEqual(height, 14);
   });
 
+  it('applies FactorZ to the IFC origin height (#4615)', () => {
+    const height = computeIfcOriginHeight(
+      { orthogonalHeight: 12, scale: 2, factorZ: 0.25 },
+      { mapUnitScale: 1 },
+      {
+        originShift: { x: 0, y: 0, z: 0 },
+        originalBounds: { min: { x: 0, y: 4, z: 0 }, max: { x: 0, y: 8, z: 0 } },
+        shiftedBounds: { min: { x: 0, y: 4, z: 0 }, max: { x: 0, y: 8, z: 0 } },
+        hasLargeCoordinates: false,
+      },
+      1,
+    );
+    assert.strictEqual(height, 15);
+  });
+
   it('converts viewer XY drag deltas into projected map deltas', () => {
     const projected = viewerDeltaToProjectedDelta(
       2,
@@ -195,6 +266,54 @@ describe('cesium placement helpers', () => {
     );
 
     assert.deepStrictEqual(viewer, { x: 2, z: -1 });
+  });
+
+  it('applies IfcMapConversionScaled factors per axis and round-trips the drag', () => {
+    const conversion = {
+      xAxisAbscissa: 0.6,
+      xAxisOrdinate: 0.8,
+      scale: 2,
+      factorX: 0.5,
+      factorY: 0.25,
+    };
+    const projected = viewerDeltaToProjectedDelta(3, -4, conversion, { mapUnitScale: 1 }, 1);
+
+    assert.ok(Math.abs(projected.eastings - 0.2) < 1e-9);
+    assert.ok(Math.abs(projected.northings - 3.6) < 1e-9);
+    const viewer = projectedDeltaToViewerDelta(
+      projected.eastings,
+      projected.northings,
+      conversion,
+      { mapUnitScale: 1 },
+      1,
+    );
+    assert.ok(Math.abs(viewer.x - 3) < 1e-9);
+    assert.ok(Math.abs(viewer.z - -4) < 1e-9);
+
+    const flatX = projectedDeltaToViewerDelta(
+      2,
+      1,
+      { ...conversion, factorX: 0 },
+      { mapUnitScale: 1 },
+      1,
+    );
+    assert.strictEqual(flatX.x, 0, 'a flat authored axis must not put the preview at infinity');
+    assert.ok(Number.isFinite(flatX.z));
+
+    const feetToMetres = viewerDeltaToProjectedDelta(
+      2,
+      -1,
+      { xAxisAbscissa: 1, xAxisOrdinate: 0, scale: 1, factorX: 0.3048, factorY: 0.3048 },
+      { mapUnitScale: 1 },
+      0.3048,
+    );
+    assert.deepStrictEqual(feetToMetres, { eastings: 2, northings: 1 });
+  });
+
+  it('keeps an explicit axis factor on top of a unit-bridging Scale (#4615)', () => {
+    // mm project, metre map: Scale .001 is the authored unit bridge, so the
+    // conversion is spec-strict and FactorX 1000 scales on top of it.
+    assert.strictEqual(getEffectiveAxisScales({ scale: 0.001, factorX: 1000 }, 1, 0.001).x, 1000);
   });
 
   it('rotates viewer XY drag deltas by a genuine (non-identity) grid rotation', () => {
@@ -344,6 +463,7 @@ describe('snap-to-terrain geoid round-trip (#1456)', () => {
     const appliedN = 45.3;
     const target = orthometricTargetForTerrain(ellipsoidalTerrain, appliedN);
     const orthogonalHeight = computeOrthogonalHeightForBaseAltitude({
+      mapConversion: undefined,
       lengthUnitScale: 1,
       targetBaseAltitude: target,
     });

@@ -18,7 +18,7 @@ import { createScheduleSlice, type ScheduleSlice } from './scheduleSlice.js';
 
 function makeExtraction(): ScheduleExtraction {
   return {
-    hasSchedule: true,
+    hasSchedule: true, workCalendars: [],
     workSchedules: [],
     sequences: [],
     tasks: [
@@ -72,7 +72,7 @@ describe('computeScheduleRange', () => {
 
   it('returns null for an extraction with no tasks', () => {
     assert.strictEqual(
-      computeScheduleRange({ hasSchedule: false, workSchedules: [], sequences: [], tasks: [] }),
+      computeScheduleRange({ hasSchedule: false, workCalendars: [], workSchedules: [], sequences: [], tasks: [] }),
       null,
     );
   });
@@ -86,7 +86,7 @@ describe('computeScheduleRange', () => {
 
   it('falls back to a synthetic range when no task has dates', () => {
     const range = computeScheduleRange({
-      hasSchedule: true,
+      hasSchedule: true, workCalendars: [],
       workSchedules: [],
       sequences: [],
       tasks: [{
@@ -141,7 +141,7 @@ describe('computeHiddenProductIds', () => {
 
   it('schedule filter: only tasks controlled by the active schedule contribute', () => {
     const filtered = {
-      hasSchedule: true,
+      hasSchedule: true, workCalendars: [],
       workSchedules: [],
       sequences: [],
       tasks: [
@@ -172,7 +172,7 @@ describe('computeHiddenProductIds', () => {
 
   it('schedule filter: tasks with no controllingScheduleGlobalIds are always in-scope', () => {
     const unattached = {
-      hasSchedule: true,
+      hasSchedule: true, workCalendars: [],
       workSchedules: [],
       sequences: [],
       tasks: [{
@@ -231,13 +231,13 @@ describe('countGeneratedTasks', () => {
     assert.strictEqual(countGeneratedTasks(null), 0);
     assert.strictEqual(countGeneratedTasks(undefined), 0);
     assert.strictEqual(countGeneratedTasks({
-      hasSchedule: false, workSchedules: [], sequences: [], tasks: [],
+      hasSchedule: false, workCalendars: [], workSchedules: [], sequences: [], tasks: [],
     }), 0);
   });
 
   it('counts only tasks with expressId <= 0 or missing', () => {
     const data: ScheduleExtraction = {
-      hasSchedule: true, workSchedules: [], sequences: [],
+      hasSchedule: true, workCalendars: [], workSchedules: [], sequences: [],
       tasks: [
         mkTask(42, 'parsed'),     // extracted — already in STEP
         mkTask(0, 'generated-a'),  // generated
@@ -253,7 +253,7 @@ describe('countGeneratedTasks', () => {
     // this helper, the badge count and the actual injected set get out of
     // sync. Keep them lockstep.
     const data: ScheduleExtraction = {
-      hasSchedule: true, workSchedules: [], sequences: [],
+      hasSchedule: true, workCalendars: [], workSchedules: [], sequences: [],
       tasks: [
         mkTask(1, 'a'), mkTask(2, 'b'), mkTask(3, 'c'),
       ],
@@ -289,8 +289,50 @@ function mkTask(over: Partial<ScheduleTaskInfo> & { globalId: string }): Schedul
 }
 
 function mkExtraction(tasks: ScheduleTaskInfo[]): ScheduleExtraction {
-  return { hasSchedule: true, workSchedules: [], sequences: [], tasks };
+  return { hasSchedule: true, workCalendars: [], workSchedules: [], sequences: [], tasks };
 }
+
+describe('scheduleSlice work-schedule filter', () => {
+  const planFirstExtraction = (): ScheduleExtraction => ({
+    hasSchedule: true,
+    workCalendars: [],
+    sequences: [],
+    tasks: [mkTask({ globalId: 'task', controllingScheduleGlobalIds: ['schedule'] })],
+    workSchedules: [
+      {
+        expressId: 1,
+        globalId: 'plan',
+        kind: 'WorkPlan',
+        name: 'Plan',
+        taskGlobalIds: [],
+        childScheduleGlobalIds: ['schedule'],
+      },
+      {
+        expressId: 2,
+        globalId: 'schedule',
+        kind: 'WorkSchedule',
+        name: 'Schedule',
+        taskGlobalIds: ['task'],
+        parentPlanGlobalId: 'plan',
+      },
+    ],
+  });
+
+  it('defaults to an IfcWorkSchedule when an IfcWorkPlan is first (#4834)', () => {
+    const store = bootScheduleStore();
+    store.getState().setScheduleData(planFirstExtraction());
+
+    assert.equal(store.getState().activeWorkScheduleId, 'schedule');
+  });
+
+  it('does not accept an IfcWorkPlan as a task-controlling filter (#4834)', () => {
+    const store = bootScheduleStore();
+    store.getState().setScheduleData(planFirstExtraction());
+    store.getState().setActiveWorkScheduleId('plan');
+
+    assert.equal(store.getState().activeWorkScheduleId, '');
+  });
+});
 
 describe('scheduleSlice editing — updateTask', () => {
   it('patches name / predefinedType without touching unrelated fields', () => {
@@ -409,7 +451,7 @@ describe('scheduleSlice editing — deleteTask', () => {
   it('removes the task and cascades sequences referring to it', () => {
     const store = bootScheduleStore();
     const data: ScheduleExtraction = {
-      hasSchedule: true, workSchedules: [], tasks: [
+      hasSchedule: true, workCalendars: [], workSchedules: [], tasks: [
         mkTask({ globalId: 'a' }),
         mkTask({ globalId: 'b' }),
       ],
@@ -429,7 +471,7 @@ describe('scheduleSlice editing — deleteTask', () => {
   it('cascades into descendant tasks', () => {
     const store = bootScheduleStore();
     store.getState().setScheduleData({
-      hasSchedule: true, workSchedules: [], sequences: [],
+      hasSchedule: true, workCalendars: [], workSchedules: [], sequences: [],
       tasks: [
         mkTask({ globalId: 'parent', childGlobalIds: ['child1', 'child2'] }),
         mkTask({ globalId: 'child1', parentGlobalId: 'parent' }),
@@ -635,7 +677,7 @@ describe('scheduleSlice editing — addTask', () => {
   it('synthesises a work schedule when none exists', () => {
     const store = bootScheduleStore();
     store.getState().setScheduleData({
-      hasSchedule: true, workSchedules: [], sequences: [], tasks: [],
+      hasSchedule: true, workCalendars: [], workSchedules: [], sequences: [], tasks: [],
     });
     store.getState().addTask();
     const s = store.getState().scheduleData!;
@@ -674,7 +716,7 @@ describe('scheduleSlice editing — moveTask', () => {
   it('reflects move in the work schedule taskGlobalIds', () => {
     const store = bootScheduleStore();
     store.getState().setScheduleData({
-      hasSchedule: true, sequences: [],
+      hasSchedule: true, workCalendars: [], sequences: [],
       workSchedules: [{
         expressId: 0, globalId: 'ws', kind: 'WorkSchedule', name: 'WS',
         taskGlobalIds: ['a', 'b', 'c'],

@@ -10,7 +10,7 @@
 //! edge is left unpaired. This is the true root of the visible tear; the fix
 //! lives in `kernel/retriangulate.rs` constraint recovery.
 
-use ifc_lite_geometry::{ClippingProcessor, Mesh};
+use ifc_lite_geometry::{ClippingProcessor, GroupCut, Mesh};
 
 fn parse_mesh(json: &str) -> Mesh {
     fn nums(s: &str, key: &str) -> (usize, usize) {
@@ -40,6 +40,8 @@ fn parse_mesh(json: &str) -> Mesh {
         instance_meta: None,
         local_bounds: None,
         local_to_world: None,
+        welded_in_object_frame: false,
+        plane_tags: None,
     }
 }
 
@@ -73,7 +75,9 @@ fn atomic_box_minus_reveal_cutter_is_watertight() {
     assert_eq!(open_edges(&cutter), 0, "cutter must be watertight");
 
     let clipper = ClippingProcessor::new();
-    let result = clipper.subtract_mesh(&host, &cutter).expect("subtract");
+    let GroupCut::Cut(result) = clipper.subtract_mesh(&host, &cutter) else {
+        panic!("the cutter must cut the host");
+    };
     let oe = open_edges(&result);
     println!(
         "[#098 atomic] host={} cutter={} result={} openEdges={}",

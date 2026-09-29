@@ -4,9 +4,14 @@
 
 //! GET cache fetch / check endpoints.
 
-use super::cache_keys::{parquet_cache_key, parquet_metadata_cache_key, symbolic_cache_key};
+use super::cache_keys::{
+    cache_key_from_parts, data_model_cache_key, has_current_data_model, has_cached_symbolic, has_parquet_metadata,
+    parquet_cache_key, parquet_metadata_cache_key, symbolic_cache_key,
+};
+use super::replay_header::mark_header_from_cache;
 use super::ParseQuery;
 use crate::error::ApiError;
+use crate::services::DataModelEntities;
 use crate::AppState;
 use axum::{
     body::Body,
@@ -15,22 +20,63 @@ use axum::{
     response::Response,
 };
 
+/// Query of `GET /api/v1/parse/data-model/{cache_key}`.
+///
+/// Its own struct rather than [`ParseQuery`]: this route takes one parameter,
+/// and it must be the SAME value the parse request sent, because it selects
+/// which of the two data-model entries is read (#6034).
+#[derive(serde::Deserialize, Default)]
+pub struct DataModelQuery {
+    /// "all" (default) or "rooted"; see [`DataModelEntities`].
+    #[serde(default)]
+    pub data_model_entities: DataModelEntities,
+}
+
 /// GET /api/v1/parse/data-model/:cache_key
 ///
 /// Fetch the data model for a previously parsed file.
-/// Returns the data model Parquet data if available (may still be processing).
+///
+/// `?data_model_entities=rooted` (#6034) fetches the rooted-only variant,
+/// which only a parse sent with the same parameter writes. Without it, the
+/// full table. Neither ever answers for the other.
 ///
 /// Response:
 /// - 200: Data model Parquet binary
-/// - 202: Data model still processing (client should retry)
-/// - 404: Cache key not found
+/// - 202: A fill IS running for this key right now (client should retry)
+/// - 404: Nothing cached for this key and nothing filling it (issue #5129:
+///   `/parse/parquet/optimized` never triggers a data-model write, so before
+///   this a client that called only that route polled 202 forever -- the
+///   response read as "still processing" for a key nothing was processing)
 pub async fn get_data_model(
     State(state): State<AppState>,
+    Query(query): Query<DataModelQuery>,
     axum::extract::Path(cache_key): axum::extract::Path<String>,
 ) -> Result<Response, ApiError> {
-    let data_model_cache_key = format!("{}-datamodel-v5", cache_key);
+    // Checked on BOTH sides of the (awaited, disk-I/O) cache read, not once,
+    // and answering 202 if EITHER saw it (issue #5134 review): a single
+    // check before the read leaves the read's whole await window open for a
+    // fill to begin and go unnoticed, and a single check after leaves the
+    // window before the read open the same way in the other direction --
+    // either alone can land on a 404 for a fill that is (or was, moments
+    // ago) genuinely in progress. `fetchDataModel` treats 404 as terminal, so
+    // that false negative does not just cost a retry, it stops the client
+    // from ever asking again. A real background fill's begin-to-drop span is
+    // milliseconds to seconds of real parse/serialize/write work, so the
+    // residual window -- a fill starting AND finishing its own drop entirely
+    // between these two checks -- is negligible; closing it fully would need
+    // a lock spanning both the in-memory marker and the disk read, which is
+    // disproportionate here.
+    //
+    // In-flight markers are keyed by the data-model ENTRY, not the request
+    // key (#6034): a fill of the full table says nothing about whether the
+    // rooted one will ever be written.
+    let data_model_cache_key = data_model_cache_key(&cache_key, query.data_model_entities);
+    let in_flight_before = state.data_model_in_flight.contains(&data_model_cache_key);
+    let cached = state.cache.get_bytes(&data_model_cache_key).await?;
+    let in_flight =
+        in_flight_before || state.data_model_in_flight.contains(&data_model_cache_key);
 
-    match state.cache.get_bytes(&data_model_cache_key).await? {
+    match cached {
         Some(data_model_parquet) => {
             tracing::info!(
                 cache_key = %cache_key,
@@ -47,10 +93,9 @@ pub async fn get_data_model(
 
             Ok(response)
         }
-        None => {
-            tracing::debug!(cache_key = %cache_key, "Data model not yet available");
+        None if in_flight => {
+            tracing::debug!(cache_key = %cache_key, "Data model fill in flight");
 
-            // Return 202 Accepted to indicate processing
             let response = Response::builder()
                 .status(StatusCode::ACCEPTED)
                 .header(header::CONTENT_TYPE, "application/json")
@@ -58,6 +103,12 @@ pub async fn get_data_model(
                 .map_err(|e| ApiError::Internal(e.to_string()))?;
 
             Ok(response)
+        }
+        None => {
+            tracing::debug!(cache_key = %cache_key, "No data model cached and none in flight for this key");
+            Err(ApiError::NotFound(format!(
+                "No data model cached for key: {cache_key}"
+            )))
         }
     }
 }
@@ -125,20 +176,34 @@ pub async fn get_symbolic(
 ///
 /// Response:
 /// - 200: File is cached (geometry available)
-/// - 404: File not cached (needs upload)
+/// - 404: File not cached (needs upload), in the shared error envelope
+///   (#5750; the body was empty before)
 pub async fn check_cache(
     State(state): State<AppState>,
     Query(query): Query<ParseQuery>,
     axum::extract::Path(hash): axum::extract::Path<String>,
 ) -> Result<Response, ApiError> {
-    let parquet_cache_key = parquet_cache_key(
-        &hash,
-        query.opening_filter,
-        query.resolved_tessellation_quality()?,
-    );
+    let quality = query.resolved_tessellation_quality()?;
+    // Answers for the LAYOUT the client asked about (#3888). A client that
+    // does not send `parquet_layout` is asking about v5, and a v6 entry sitting
+    // beside it must NOT report a hit: the client would skip the upload and
+    // then fetch a blob it draws wrong.
+    let parquet_cache_key =
+        parquet_cache_key(&hash, query.opening_filter, quality, query.parquet_layout);
+    // A geometry entry alone is not enough: the client skips the upload on a
+    // hit, so a data model at the current payload version has to exist too, or
+    // nothing will ever write one (issue #3869). The same holds for the
+    // metadata header: a hit sends the client to `get_cached_geometry`, which
+    // needs it at the current version, and a header version bump leaves the
+    // geometry entry behind (#4675).
+    let seed_cache_key = cache_key_from_parts(&hash, query.opening_filter, quality);
+    let sidecars_are_current =
+        has_current_data_model(&state.cache, &seed_cache_key, query.data_model_entities).await
+        && has_cached_symbolic(&state.cache, &seed_cache_key).await
+        && has_parquet_metadata(&state.cache, &seed_cache_key).await;
 
     match state.cache.get_bytes(&parquet_cache_key).await? {
-        Some(_) => {
+        Some(_) if sidecars_are_current => {
             tracing::debug!(hash = %hash, cache_key = %parquet_cache_key, "Cache check HIT");
             let response = Response::builder()
                 .status(StatusCode::OK)
@@ -146,13 +211,19 @@ pub async fn check_cache(
                 .map_err(|e| ApiError::Internal(e.to_string()))?;
             Ok(response)
         }
-        None => {
-            tracing::debug!(hash = %hash, cache_key = %parquet_cache_key, "Cache check MISS");
-            let response = Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Body::empty())
-                .map_err(|e| ApiError::Internal(e.to_string()))?;
-            Ok(response)
+        cached => {
+            tracing::debug!(
+                hash = %hash,
+                cache_key = %parquet_cache_key,
+                geometry_cached = cached.is_some(),
+                "Cache check MISS"
+            );
+            // The hash is caller-supplied and unvalidated here, so it is not
+            // echoed back (as `not_a_file_digest` does not echo it either).
+            Err(ApiError::NotFound(
+                "Nothing cached for this hash under this opening_filter / tessellation_quality / parquet_layout"
+                    .to_owned(),
+            ))
         }
     }
 }
@@ -173,10 +244,13 @@ pub async fn get_cached_geometry(
     Query(query): Query<ParseQuery>,
     axum::extract::Path(hash): axum::extract::Path<String>,
 ) -> Result<Response, ApiError> {
+    // Same layout signal as the cache check and the parse routes, so this can
+    // only ever hand back the layout the caller declared it understands.
     let parquet_cache_key = parquet_cache_key(
         &hash,
         query.opening_filter,
         query.resolved_tessellation_quality()?,
+        query.parquet_layout,
     );
     let metadata_cache_key = parquet_metadata_cache_key(
         &hash,
@@ -198,10 +272,14 @@ pub async fn get_cached_geometry(
             let response = Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "application/x-parquet-geometry")
+                // Stored as the live parse wrote it, `from_cache: false`
+                // included; this is the warm path of `parseParquet()` (#5542).
                 .header(
                     "X-IFC-Metadata",
-                    String::from_utf8(metadata)
-                        .map_err(|error| ApiError::Internal(error.to_string()))?,
+                    mark_header_from_cache(
+                        String::from_utf8(metadata)
+                            .map_err(|error| ApiError::Internal(error.to_string()))?,
+                    ),
                 )
                 .header(header::CONTENT_LENGTH, parquet.len())
                 .body(Body::from(parquet))
@@ -211,10 +289,11 @@ pub async fn get_cached_geometry(
         }
         _ => {
             tracing::debug!(hash = %hash, "Cached geometry not found");
-            Err(ApiError::NotFound(format!(
-                "Cache entry not found for hash: {}",
-                hash
-            )))
+            // Caller-supplied and unvalidated: logged, not echoed (as in
+            // `check_cache` above).
+            Err(ApiError::NotFound(
+                "No cached geometry for this hash".to_owned(),
+            ))
         }
     }
 }

@@ -24,19 +24,35 @@
  * scans first 100 K bytes → meta → first chunk → first batch).
  */
 
+import type { ProcessParallelOptions } from './geometry-parallel-options.js';
+import { postGeometryWorkerInit } from './geometry-worker-init.js';
+import type { BatchSizingConfig } from './batch-sizing.js';
 import type { CoordinateHandler } from './coordinate-handler.js';
-import type { MeshData, TessellationQuality } from './types.js';
+import type { MeshData } from './types.js';
 import type { StreamingGeometryEvent } from './index.js';
 import { mergeGeometryDiagnostics, type GeometryDiagnostics } from './diagnostics.js';
 import { computeWorkerCount } from './worker-count.js';
-import type { BatchSizingConfig } from './batch-sizing.js';
 import { notifyIfWasmAssetUnavailable, notifyIfWorkerScriptUnavailable } from './wasm-asset-error.js';
 import { restashWasmPanicLocation } from './wasm-panic-forward.js';
+import { mergeShardStyleSlices, type MergedShardStyles, type StylesSlice } from './shard-style-merge.js';
 // The compiled-module memo lives in its own module so the main-thread
 // `IfcLiteBridge.init()` path can reuse whatever this pool already compiled
 // (and vice versa) instead of fetching the same binary a second time.
 import { compileSharedWasmModule } from './wasm-shared-module.js';
 import { stitchShards, type ShardColumns } from './shard-stitch.js';
+import { resolveRtcFrame } from './rtc-frame.js';
+import {
+  emptyStylesPrepassEvent,
+  frozenStallPhase,
+  GateTracker,
+  PhaseBoundTimers,
+  preWorkerPhaseFailureDiagnostics,
+} from './stall-phase.js';
+import {
+  SkippedHungElementsCollector,
+  startHungJobMonitor,
+  WorkerJobLedger,
+} from './hung-job-recovery.js';
 
 /**
  * Prepass class-byte layout, mirroring the `PREPASS_CLASS_*` definitions in
@@ -202,6 +218,25 @@ function terminateWorkerQuietly(worker: Worker, label: string): void {
   }
 }
 
+/**
+ * A recorded `set-entity-index` setup (#4884). Built OUTSIDE `deliverEntityIndex`
+ * on purpose: a replay closure created in that scope would keep the pre-pass's
+ * transferred id/start/length columns (12 B per entity, ~180 MB on a 1 GB file)
+ * alive for the whole load, where before they were collectable right after the
+ * copy into the shared buffers. This one captures only its `columns` factory.
+ */
+function entityIndexSetup(
+  columns: () => { ids: Uint32Array; starts: Uint32Array; lengths: Uint32Array },
+): (w: Worker) => void {
+  return (w) => {
+    try {
+      w.postMessage({ type: 'set-entity-index' as const, ...columns() });
+    } catch (err) {
+      console.warn('[stream] set-entity-index dispatch failed:', err);
+    }
+  };
+}
+
 interface PrepassMeta {
   /** Prepass-resolved plane-angle→radians scale; seeds worker batch decoders. */
   planeAngleToRadians?: number;
@@ -211,97 +246,9 @@ interface PrepassMeta {
   buildingRotation?: number | null;
 }
 
-export interface ProcessParallelOptions {
-  /**
-   * Fires when the streaming pre-pass finishes building the entity index
-   * (after styles), with SAB-backed Uint32Array views over the shared
-   * column buffers. The parser worker uses this to skip its own
-   * `scanEntitiesFastBytes` call (~10 s on 1 GB files under WASM
-   * contention with the geometry workers).
-   */
-  onEntityIndex?: (
-    ids: Uint32Array,
-    starts: Uint32Array,
-    lengths: Uint32Array, oversizedIdCount?: number, // #3395 refused records
-  ) => void;
-  /**
-   * Issue #540 — "Merge Multilayer Walls" load-time toggle. When
-   * `true`, the geometry workers' IfcAPI receive
-   * `setMergeLayers(true)` before the first stream-chunk lands, so
-   * Revit-style multilayer-wall part meshes are suppressed at the
-   * Rust layer. Default `false` keeps existing behaviour.
-   */
-  mergeLayers?: boolean;
-  /**
-   * GPU-instancing partition toggle (default true). Set false for FEDERATED loads:
-   * the instanced render path is primary-model only, so a federated model must keep
-   * all geometry on the flat path or its opaque repeated occurrences are dropped.
-   */
-  enableInstancing?: boolean;
-  /**
-   * Issue #924 — per-entity geometry-hash tolerance in metres. When a
-   * positive value is given, each geometry worker's IfcAPI receives
-   * `setComputeGeometryHashes(tol)` before the first stream-chunk, so the
-   * RTC-invariant `geometryHash` lands on every emitted mesh for the
-   * model-diff / compare feature. `undefined`/`null` ⇒ off (zero overhead).
-   */
-  geometryHashTolerance?: number | null;
-  /**
-   * Issue #976 — tessellation detail level for curved geometry. When set,
-   * each geometry worker's IfcAPI receives `setTessellationQuality(level)`
-   * before the first stream-chunk. `undefined`/`null` ⇒ engine default
-   * (`'medium'`, output identical to the pre-quality pipeline).
-   */
-  tessellationQuality?: TessellationQuality | null;
-  /**
-   * Issue #1286 — tier-independent small-cut skip. When true, each geometry
-   * worker's IfcAPI receives `setSkipSmallCuts(true)` before the first
-   * stream-chunk, dropping tiny `IfcBooleanResult` detail cuts while keeping the
-   * tessellation tier. `undefined`/`false` ⇒ every cut runs (default).
-   */
-  skipSmallCuts?: boolean;
-  /**
-   * Explicit URL for the wasm-bindgen `.wasm` binary. When provided,
-   * forwarded to the geometry workers' init messages so they call
-   * `init(wasmUrl)` instead of relying on wasm-bindgen's default
-   * `import.meta.url`-based resolution.
-   *
-   * Vite + webpack 5 consumers don't need to set this — the bundler
-   * rewrites the `new URL('ifc-lite_bg.wasm', import.meta.url)` literal
-   * inside the wasm-bindgen glue at build time. This option exists for
-   * consumers whose bundler doesn't transform that pattern, or who
-   * serve the wasm from a CDN at a different origin (e.g., self-hosted
-   * deployments, Tauri custom protocols, embedded usage).
-   */
-  wasmUrls?: {
-    wasm?: string;
-  };
-  /**
-   * Issue #1097 — optional override for the worker's adaptive batch sizing
-   * (the watchdog↔throughput knob). Takes precedence over the `globalThis`
-   * tuning hook; omitted ⇒ `DEFAULT_BATCH_SIZING`. Forwarded to every worker
-   * in its `stream-start` message and validated there.
-   */
-  batchSizing?: Partial<BatchSizingConfig>;
-  /**
-   * #1097 load-time visibility filter. `disabledTypes` (uppercase STEP keywords)
-   * and `skipTypeGeometry` are forwarded to the prepass so the matching geometry
-   * jobs are never produced — cutting decode + CSG + tessellation + upload for
-   * hidden types (spaces/annotations/grids/type-library). Takes precedence over
-   * the `globalThis.__IFC_LITE_VISIBILITY_FILTER` hook. Toggling a type back on
-   * requires a reload.
-   */
-  visibilityFilter?: { disabledTypes?: string[]; skipTypeGeometry?: boolean };
-  /**
-   * Explicit geometry-worker count for A/B tuning (the viewer's
-   * `?geomWorkers=N` knob). Overrides the cores-tier heuristic but stays
-   * clamped to the memory budget — see {@link computeWorkerCount}. `undefined`
-   * ⇒ use the heuristic. Lets a user measure their host's true thermal optimum
-   * (which is machine-specific). Geometry output is unaffected by the count
-   * (workers process disjoint, deterministic element slices).
-   */
-  workerCountOverride?: number;
-}
+export type { ProcessParallelOptions } from './geometry-parallel-options.js';
+
+let nextSourceSessionId = 0;
 
 export async function* processParallel(
   buffer: Uint8Array,
@@ -311,11 +258,10 @@ export async function* processParallel(
   existingSab?: SharedArrayBuffer,
   options?: ProcessParallelOptions,
 ): AsyncGenerator<StreamingGeometryEvent> {
+  const sourceSessionId = `geometry-source-${++nextSourceSessionId}`;
   coordinator.reset();
-
   yield { type: 'start', totalEstimate: buffer.length / 1000 };
   yield { type: 'model-open', modelID: 0 };
-
   // Kick off the ONE shared wasm compile immediately so it overlaps the SAB
   // setup + worker-count planning below; awaited just before the workers init
   // (see `compileSharedWasmModule`). Null ⇒ each worker self-inits (unchanged).
@@ -363,6 +309,13 @@ export async function* processParallel(
     }
   };
 
+  // Which pre-worker gate is still open (#4902) — see stall-phase.ts.
+  const gateTracker = new GateTracker();
+  if (options?.stallPhaseHandle) options.stallPhaseHandle.getStallPhase = () => gateTracker.getStallPhase();
+  // Bounded waits for those gates (#4902); cleared in the `finally` below so
+  // none outlives this load's teardown — see stall-phase.ts.
+  const phaseBoundTimers = new PhaseBoundTimers();
+
   // Pre-pass worker drives the entire pipeline via streaming events.
   let prepassMeta: PrepassMeta | null = null;
   let prepassJobsTotal = 0;
@@ -376,8 +329,8 @@ export async function* processParallel(
   let workerError: Error | null = null;
   let workersCompleted = 0;
   let totalMeshes = 0;
-  // CSG / opening diagnostics merged across all workers, forwarded on the final
-  // completion event so loadFile callers can read a typed per-load summary.
+  let wasmFrameResolved = false;
+  // CSG/opening diagnostics merged across workers for the final load summary.
   let diagnostics: GeometryDiagnostics | null = null;
   let endSentToWorkers = false;
   let streamStartSentToWorkers = false;
@@ -408,11 +361,11 @@ export async function* processParallel(
   const shardResults: (ShardColumns | null)[] = [];
   let shardResultsRemaining = 0;
   let shardScanDispatchedAt = -1;
+  // #4902: settles once, normally or via the bounded-wait timeout below.
+  let shardScanSettled = false;
+  let stylesSlicesSettled = false;
+  let finalizeSettled = false;
   // Shard-resolved styled-item slices (see onAllStyleSlicesReceived).
-  interface StylesSlice {
-    orphanIds: Uint32Array; orphanColors: Float32Array;
-    geomIds: Uint32Array; geomColors: Float32Array; error?: string;
-  }
   const stylesSliceResults: (StylesSlice | null)[] = [];
   let stylesSlicesRemaining = 0;
   // Support spans extracted from the shard classes (sharded mode only).
@@ -424,10 +377,7 @@ export async function* processParallel(
   // Deferred finalize: needs BOTH the merged style slices and the meta event's
   // planeAngleToRadians (finalize seeds its decoder with it, exactly like the
   // serial styles block).
-  let mergedStylesForFinalize: {
-    orphanIds: Uint32Array; orphanColors: Float32Array;
-    geomIds: Uint32Array; geomColors: Float32Array;
-  } | null = null;
+  let mergedStylesForFinalize: MergedShardStyles | null = null;
   let finalizeDispatched = false;
   // Forward ref: assigned at the pre-pass dispatch site (which executes during
   // synchronous setup, long before any shard result can arrive).
@@ -455,7 +405,10 @@ export async function* processParallel(
     // crash from the worker SCRIPT failing to load (stale-deploy 404, #1251).
     let workerSpoke = false;
     worker.onmessage = (e: MessageEvent) => {
+      // A worker replaced after a hang (#4884) may still flush queued messages.
+      if (workers[workerIndex] !== worker) return;
       workerSpoke = true;
+      ledger.onHeard(workerIndex, performance.now());
       const msg = e.data;
       if (msg.type === 'ready') {
         console.log(`[stream] worker[${workerIndex}] WASM ready @ ${elapsed()}ms`);
@@ -474,6 +427,8 @@ export async function* processParallel(
           // Absent on an older wasm build: "does not report", which is not the
           // same claim as zero, but zero is all a host with no offsets can say.
           oversizedIdStarts: (msg.oversizedIdStarts as Uint32Array | undefined) ?? new Uint32Array(0),
+          // Absent = "no stop reported". TODO(#3699): no wasm build sets it yet.
+          malformedStart: msg.malformedStart as number | undefined,
         };
         shardResultsRemaining--;
         console.log(`[stream][shard] worker[${workerIndex}] shard ${si} done @ ${elapsed()}ms (${(msg.ids as Uint32Array).length} entities, remaining=${shardResultsRemaining})`);
@@ -483,6 +438,9 @@ export async function* processParallel(
         return;
       }
       if (msg.type === 'styles-final') {
+        // A late reply after the #4902 finalize bound already drained with
+        // default colours must not reopen that gate.
+        if (finalizeSettled) return;
         // Finalized styles payload from worker 0 — feed it through the SAME
         // prepass styles-event path (gates, logging, distribution) by
         // synthesizing a prepass-stream message. The handler is a plain
@@ -499,6 +457,7 @@ export async function* processParallel(
           orphanColors: msg.orphanColors as Float32Array,
           geomIds: msg.geomIds as Uint32Array,
           geomColors: msg.geomColors as Float32Array,
+          geomFinishes: msg.geomFinishes as Float32Array | undefined, // #5582
           error: msg.error as string | undefined,
         };
         stylesSlicesRemaining--;
@@ -523,8 +482,16 @@ export async function* processParallel(
         // Forward it so the consumer's stall watchdog measures "one WASM
         // call went silent", not "no meshes lately" — a CSG-heavy stretch
         // can keep every worker busy past the watchdog with nothing to show.
+        if (typeof msg.seq === 'number') {
+          ledger.onCallStart(workerIndex, msg.seq, msg.processedJobs, msg.callJobs ?? 1, performance.now());
+        }
+        if (msg.diagnostics) diagnostics = mergeGeometryDiagnostics(diagnostics, msg.diagnostics);
         eventQueue.push({ type: 'progress', phase: 'workers' });
         wake();
+        return;
+      }
+      if (msg.type === 'slice-done') {
+        ledger.onSliceDone(workerIndex, msg.seq, performance.now());
         return;
       }
       if (msg.type === 'batch') {
@@ -539,15 +506,12 @@ export async function* processParallel(
         // ~one wrapper object per mesh (~110k per large load) on the main
         // thread. Pass the transferred objects straight through.
         const meshes: MeshData[] = msg.meshes as MeshData[];
-        // GPU-instancing: per-batch IFNS shards ride alongside the flat meshes.
-        // Opaque repeated occurrences render ONLY via these shards (taken off the
-        // flat `meshes` array), so their count must be folded into the running
-        // total for an accurate `totalSoFar`.
+        // Opaque repeated occurrences render only through per-batch IFNS shards;
+        // include them in the running total even though they are not flat meshes.
         const instancedShards = (msg as { instancedShards?: ArrayBuffer[] }).instancedShards;
         const instancedOccurrences =
           (msg as { instancedOccurrences?: number }).instancedOccurrences ?? 0;
-        // #924 compare parity: geometry-diff hashes for instanced-only entities
-        // (no flat mesh carries them). Forward straight through to the consumer.
+        // #924: forward geometry-diff hashes for instanced-only entities.
         const instancedGeometryHashIds =
           (msg as { instancedGeometryHashIds?: Uint32Array }).instancedGeometryHashIds;
         const instancedGeometryHashValues =
@@ -566,16 +530,18 @@ export async function* processParallel(
           (instancedShards && instancedShards.length > 0) ||
           (instancedGeometryHashIds && instancedGeometryHashIds.length > 0)
         ) {
-          // Update totalMeshes per batch so consumers see a live
-          // running count via `totalSoFar`. The `complete` event
-          // below used to be the only updater, leaving streamed
-          // batches reporting a stale total until the worker exited.
+          if (!wasmFrameResolved) {
+            workerError ??= new Error('Geometry worker emitted a batch before the RTC frame was resolved');
+            workersCompleted++;
+            worker.terminate();
+            wake();
+            return;
+          }
           if (meshes.length > 0) {
             totalMeshes += meshes.length;
             coordinator.processMeshesIncremental(meshes);
           }
-          // Instanced occurrences left the flat array but are still rendered
-          // geometry — count them so totalSoFar reflects the full model.
+          // Count rendered instanced occurrences omitted from the flat array.
           totalMeshes += instancedOccurrences;
           const coordinateInfo = coordinator.getCurrentCoordinateInfo();
           eventQueue.push({
@@ -628,6 +594,7 @@ export async function* processParallel(
       }
     };
     worker.onerror = (err) => {
+      if (workers[workerIndex] !== worker) return;
       // A hard worker crash (e.g. the wasm thread aborting under memory
       // pressure) fires an ErrorEvent with an empty `message`. Emitting the
       // literal "undefined" produced a cryptic, unclassifiable error in tracking
@@ -677,8 +644,24 @@ export async function* processParallel(
   }
 
   const workers: Worker[] = [];
+  // Hung-call recovery (#4884): unfinished slices per worker, and every per-load
+  // state message in order (never per-worker work) to rebuild a replacement.
+  // Opt-in: without a budget nothing is recorded, so the pool costs what it did.
+  const hungJobTimeoutMs = Math.max(0, options?.hungJobTimeoutMs ?? 0);
+  const ledger = new WorkerJobLedger(workerCount, performance.now(), hungJobTimeoutMs > 0);
+  // Always recorded (#4902 review): a pre-worker phase bound below may need
+  // to replace a worker regardless of whether #4884's in-call recovery is
+  // enabled, and replaying this log is how a replacement reaches the same
+  // state every other worker is in.
+  const workerSetup: Array<(w: Worker) => void> = [];
+  const broadcastSetup = (setup: (w: Worker) => void) => {
+    workerSetup.push(setup);
+    for (const w of workers) setup(w);
+  };
+  const postInitMessages = (worker: Worker) => postGeometryWorkerInit(worker, options, sharedWasmModule);
+  workerSetup.push(postInitMessages);
   // This loop runs BEFORE the try/finally below (which owns teardown for the
-  // rest of the pipeline), so it needs its own: `postMessage` below can throw
+  // rest of the pipeline), so it needs its own: `postInitMessages` can throw
   // (e.g. a `wasmModule` structured-clone failure — the same class of error
   // `dispatchJobsChunkInternal` already guards against further down), and
   // without this try/catch any worker already pushed to `workers` before the
@@ -688,64 +671,35 @@ export async function* processParallel(
       const worker = makeGeometryWorker();
       workers.push(worker);
       installWorkerHandlers(worker, i);
-      // Instantiate WASM. When the host compiled the module once (above), each
-      // worker `initSync`s it (cheap); otherwise it falls back to compiling from
-      // bytes. The worker's tail-promise serialiser guarantees this `init`
-      // completes before any subsequent `stream-start`/`stream-chunk` runs.
-      //
-      // `wasmUrl` is forwarded only when the consumer explicitly provided one AND
-      // no shared module is available — undefined leaves the worker on
-      // wasm-bindgen's default `import.meta.url`-based resolution (Vite + webpack).
-      const wasmUrlForWorker = options?.wasmUrls?.wasm;
-      worker.postMessage(
-        {
-          type: 'init',
-          ...(sharedWasmModule
-            ? { wasmModule: sharedWasmModule }
-            : wasmUrlForWorker
-              ? { wasmUrl: wasmUrlForWorker }
-              : {}),
-        },
-      );
-      // Issue #540: forward the user's "Merge Multilayer Walls" toggle
-      // BEFORE any stream-start so the worker's IfcAPI has the flag set
-      // before its first parse call. The tail-promise serialiser inside
-      // each worker preserves this order even though the messages are
-      // posted back-to-back. We always send the message so the controller
-      // path doesn't have to remember whether the host called it — the
-      // default `false` is a cheap no-op.
-      worker.postMessage({
-        type: 'set-merge-layers',
-        enabled: options?.mergeLayers === true,
-      });
-      // GPU-instancing partition toggle — default ON; the host sets false for federated
-      // loads so a federated model's geometry stays flat (instancing is primary-only).
-      worker.postMessage({
-        type: 'set-instancing-enabled',
-        enabled: options?.enableInstancing !== false,
-      });
-      // Issue #924: forward the geometry-hash tolerance the same way — always
-      // sent so the controller path stays uniform; null is a cheap no-op.
-      worker.postMessage({
-        type: 'set-compute-geometry-hashes',
-        tolerance: options?.geometryHashTolerance ?? null,
-      });
-      // Issue #976: forward the tessellation-quality level the same way —
-      // null keeps the Rust default (Medium / historical densities).
-      worker.postMessage({
-        type: 'set-tessellation-quality',
-        level: options?.tessellationQuality ?? null,
-      });
-      // Issue #1286: forward the small-cut skip the same way — always sent so a
-      // worker reused by a later export (which omits it) resets to false.
-      worker.postMessage({
-        type: 'set-skip-small-cuts',
-        enabled: options?.skipSmallCuts === true,
-      });
+      postInitMessages(worker);
     }
   } catch (err) {
     for (const w of workers) terminateWorkerQuietly(w, 'process worker (init)');
     throw err;
+  }
+
+  /**
+   * Terminate and replace pool worker `index` (#4902 review). A silent
+   * `scan-shard` / `resolve-styles-shard` / `finalize-styles` reply means
+   * that worker is wedged inside ONE synchronous WASM call —
+   * `geometry.worker.ts` serializes every message behind its tail promise, so
+   * continuing the fallback without replacing it would queue the fallback's
+   * own `stream-start`/chunks/`stream-end` forever behind the stuck call, and
+   * `workersCompleted` would never reach `workers.length`. None of the three
+   * bounds fires after any `stream-chunk` has reached a worker (they all sit
+   * strictly before `dispatchJobsChunk`'s gate can open), so there is no
+   * in-flight slice to replay — replaying `workerSetup` alone brings the
+   * replacement to the same state every other worker is in.
+   */
+  function replacePreWorkerPhaseWorker(index: number, reason: string): void {
+    const hung = workers[index];
+    const replacement = makeGeometryWorker();
+    workers[index] = replacement; // swap first — the stale-worker guard then drops anything the hung one flushes
+    terminateWorkerQuietly(hung, `process worker (${reason})`);
+    installWorkerHandlers(replacement, index);
+    for (const setup of workerSetup) setup(replacement);
+    if (endSentToWorkers) replacement.postMessage({ type: 'stream-end' });
+    console.warn(`[stream] worker[${index}] replaced: silent past its #4902 ${reason} bound`);
   }
 
   const sendStreamEnd = () => {
@@ -780,19 +734,19 @@ export async function* processParallel(
     if (streamStartSentToWorkers || !prepassMeta) return;
     streamStartSentToWorkers = true;
 
-    const useSharedRtc = sharedRtcOffset != null;
-    const rtcX = useSharedRtc ? sharedRtcOffset.x : prepassMeta.rtcOffset[0];
-    const rtcY = useSharedRtc ? sharedRtcOffset.y : prepassMeta.rtcOffset[1];
-    const rtcZ = useSharedRtc ? sharedRtcOffset.z : prepassMeta.rtcOffset[2];
-    const effectiveNeedsShift = useSharedRtc ? true : prepassMeta.needsShift;
+    // The federation-override rule (shared offset wins, and forces needsShift)
+    // is shared with the sync and streaming paths in index.ts — see rtc-frame.ts.
+    const frame = resolveRtcFrame(prepassMeta, sharedRtcOffset);
+    const { x: rtcX, y: rtcY, z: rtcZ, needsShift: effectiveNeedsShift } = frame;
 
-    // Surface the world→render metadata (unit scale + the effective applied
-    // RTC, which is the shared offset under federation) on coordinateInfo for
-    // downstream consumers (issue #945).
+    // Publish the exact producer frame and legacy applied offset for
+    // georeferencing and externally-resolved geometry consumers.
     coordinator.setWasmMetadata(
       prepassMeta.unitScale,
       effectiveNeedsShift ? { x: rtcX, y: rtcY, z: rtcZ } : null,
+      frame,
     );
+    wasmFrameResolved = true;
 
     eventQueue.push({
       type: 'rtcOffset',
@@ -804,12 +758,13 @@ export async function* processParallel(
     const emptyU32 = new Uint32Array(0);
     const emptyU8 = new Uint8Array(0);
     const batchSizing = options?.batchSizing ?? readBatchSizingOverride();
-    for (const worker of workers) {
+    const frameMeta = prepassMeta;
+    broadcastSetup((worker) => {
       worker.postMessage({
-        type: 'stream-start' as const,
+        type: 'stream-start' as const, sourceSessionId,
         sharedBuffer,
-        unitScale: prepassMeta.unitScale,
-        planeAngleToRadians: prepassMeta.planeAngleToRadians,
+        unitScale: frameMeta.unitScale,
+        planeAngleToRadians: frameMeta.planeAngleToRadians,
         rtcX, rtcY, rtcZ,
         needsShift: effectiveNeedsShift,
         voidKeys: emptyU32,
@@ -819,7 +774,7 @@ export async function* processParallel(
         styleColors: emptyU8,
         ...(batchSizing ? { batchSizing } : {}),
       });
-    }
+    });
 
     // Don't drain queued chunks here — wait for the `styles` event so
     // every chunk gets processed with resolved colours. The styles
@@ -853,11 +808,17 @@ export async function* processParallel(
         sub[o + 1] = jobs[src + 1];
         sub[o + 2] = jobs[src + 2];
       }
-      workers[i].postMessage(
-        { type: 'stream-chunk' as const, jobsFlat: sub },
-        [sub.buffer],
-      );
+      postChunk(i, sub);
     }
+  }
+
+  /** Record a slice in the ledger, then transfer it to worker `i` (#4884). */
+  function postChunk(i: number, jobs: Uint32Array, maxBatchJobs?: number): void {
+    const seq = ledger.recordDispatch(i, jobs, maxBatchJobs);
+    workers[i].postMessage(
+      { type: 'stream-chunk' as const, jobsFlat: jobs, seq, ...(maxBatchJobs !== undefined ? { maxBatchJobs } : {}) },
+      [jobs.buffer],
+    );
   }
 
   function dispatchJobsChunkInternal(jobs: Uint32Array, affinity: Uint32Array | null): void {
@@ -886,10 +847,7 @@ export async function* processParallel(
           sub[j + 1] = jobs[src + 1];
           sub[j + 2] = jobs[src + 2];
         }
-        workers[i].postMessage(
-          { type: 'stream-chunk' as const, jobsFlat: sub },
-          [sub.buffer],
-        );
+        postChunk(i, sub);
       }
     } catch (err) {
       workerError = new Error(`Failed to dispatch jobs chunk: ${err instanceof Error ? err.message : String(err)}`);
@@ -933,6 +891,14 @@ export async function* processParallel(
       streamEndPendingQueueDrain = false;
       sendStreamEnd();
     }
+    // Every pre-worker gate is open, so no #4902 phase-bound timeout can still
+    // need `workerSetup` to replace a worker (each of the three settles at or
+    // before this point — see stall-phase.ts). With #4884 in-call recovery
+    // OFF, nothing else ever replays it either: release the closures (styles/
+    // prepass-columns retain the large prepass arrays) instead of holding them
+    // for the rest of the load. Recovery ON still needs the full log to bring
+    // a LATER in-call replacement up to date, so it is left alone.
+    if (!(hungJobTimeoutMs > 0)) workerSetup.length = 0;
   };
 
   // Step-by-step timing so we can tell exactly where time goes.
@@ -957,6 +923,10 @@ export async function* processParallel(
     // #3395: the parser worker builds the model from these columns alone, so
     // without the count it reports a clean load that is short by that many.
     oversizedIdCount: number,
+    // #3790: 1, or undefined when nothing reported (never coerced to 0 -- no
+    // producer can say "I ran clean" yet). Worse than a refusal: not "one
+    // record the parser will not find" but "every record after it is missing".
+    malformedRecordCount: number | undefined,
   ) => {
     console.log(`[stream] entity-index (${source}) @ ${elapsed()}ms (${ids.length} entries)`);
     if (typeof SharedArrayBuffer !== 'undefined') {
@@ -983,18 +953,9 @@ export async function* processParallel(
         new Uint32Array(sabStarts).set(starts);
         new Uint32Array(sabLengths).set(lengths);
       }
-      for (const w of workers) {
-        try {
-          w.postMessage({
-            type: 'set-entity-index' as const,
-            ids: new Uint32Array(sabIds),
-            starts: new Uint32Array(sabStarts),
-            lengths: new Uint32Array(sabLengths),
-          });
-        } catch (err) {
-          console.warn('[stream] set-entity-index dispatch failed:', err);
-        }
-      }
+      broadcastSetup(entityIndexSetup(() => ({
+        ids: new Uint32Array(sabIds), starts: new Uint32Array(sabStarts), lengths: new Uint32Array(sabLengths),
+      })));
       if (options?.onEntityIndex) {
         try {
           options.onEntityIndex(
@@ -1002,31 +963,29 @@ export async function* processParallel(
             new Uint32Array(sabStarts),
             new Uint32Array(sabLengths),
             oversizedIdCount,
+            malformedRecordCount,
           );
         } catch (err) {
           console.warn('[stream] onEntityIndex callback failed:', err);
         }
       }
     } else {
-      for (const w of workers) {
-        try {
-          w.postMessage({
-            type: 'set-entity-index' as const,
-            ids: ids.slice(), starts: starts.slice(), lengths: lengths.slice(),
-          });
-        } catch (err) {
-          console.warn('[stream] set-entity-index dispatch failed:', err);
-        }
-      }
+      const copyIds = ids, copyStarts = starts, copyLengths = lengths;
+      broadcastSetup(entityIndexSetup(() => ({
+        ids: copyIds.slice(), starts: copyStarts.slice(), lengths: copyLengths.slice(),
+      })));
       if (options?.onEntityIndex) {
         try {
-          options.onEntityIndex(ids.slice(), starts.slice(), lengths.slice(), oversizedIdCount);
+          options.onEntityIndex(
+            ids.slice(), starts.slice(), lengths.slice(), oversizedIdCount, malformedRecordCount,
+          );
         } catch (err) {
           console.warn('[stream] onEntityIndex callback failed:', err);
         }
       }
     }
     entityIndexReceived = true;
+    gateTracker.markEntityIndexReceived();
     drainQueuedChunksIfReady();
   };
 
@@ -1039,6 +998,10 @@ export async function* processParallel(
    * the serial pre-pass path — identical to flag-off behaviour.
    */
   const onAllShardsReceived = () => {
+    // A late straggler shard result may land after the #4902 bound already fell back.
+    if (shardScanSettled) return;
+    shardScanSettled = true;
+    gateTracker.markShardScanDone();
     const shards = shardResults as ShardColumns[];
     const stitched = stitchShards(shards);
     if (!stitched) {
@@ -1057,9 +1020,12 @@ export async function* processParallel(
     // refusals a discarded speculative prefix invented, which on a file with
     // nothing oversized in it is a warning about a file that is fine (#3430).
     const oversizedIdCount = stitched.oversizedIdCount;
+    // Attributed by the stitch for the same reason (#3790): a shard that began
+    // inside a quoted value reports a stop the file does not contain.
+    const malformedRecordCount = stitched.malformedRecordCount;
     // set-entity-index reaches every worker FIRST (FIFO), so the style-shard
     // messages below always find the index installed.
-    deliverEntityIndex(ids, starts, lengths, 'sharded', oversizedIdCount);
+    deliverEntityIndex(ids, starts, lengths, 'sharded', oversizedIdCount, malformedRecordCount);
 
     // Extract the styled-item span triples (class 4) in FILE ORDER from the
     // stitched columns, split into one contiguous slice per worker, and
@@ -1090,10 +1056,26 @@ export async function* processParallel(
       const to = i + 1 === sliceCount ? styledCount * 3 : Math.floor(((i + 1) * styledCount) / sliceCount) * 3;
       const slice = styledSpans.slice(from, to);
       workers[i % workers.length].postMessage(
-        { type: 'resolve-styles-shard' as const, sharedBuffer, sliceIndex: i, spans: slice },
+        { type: 'resolve-styles-shard' as const, sourceSessionId, sharedBuffer, sliceIndex: i, spans: slice },
         [slice.buffer],
       );
     }
+    // #4902 bound: a missing slice at the deadline is treated as empty
+    // (`onAllStyleSlicesReceived` already skips a `null` entry) — see stall-phase.ts.
+    phaseBoundTimers.arm(fileSizeMB, () => stylesSlicesSettled, () => {
+      console.warn(`[stream][shard] ${stylesSlicesRemaining}/${sliceCount} style slice(s) silent — proceeding with the slices that answered (#4902)`);
+      diagnostics = mergeGeometryDiagnostics(diagnostics, preWorkerPhaseFailureDiagnostics('style-slice-timeout'));
+      // Replace every worker owning a still-silent slice BEFORE continuing —
+      // same reasoning as the shard-scan bound above: `resolve-styles-shard`
+      // is synchronous WASM work on that worker's own FIFO queue.
+      const hungWorkers = new Set<number>();
+      for (let i = 0; i < sliceCount; i++) {
+        if (!stylesSliceResults[i]) hungWorkers.add(i % workers.length);
+      }
+      for (const idx of hungWorkers) replacePreWorkerPhaseWorker(idx, 'style-slice-timeout');
+      stylesSlicesRemaining = 0;
+      onAllStyleSlicesReceived();
+    });
 
     // Start the sharded pre-pass with the stitched index columns + classes
     // (stage 2: the pre-pass discovers jobs/spans from the class column and
@@ -1111,37 +1093,11 @@ export async function* processParallel(
    * canonical flatten emits the styles event through the same channel.
    */
   const onAllStyleSlicesReceived = () => {
-    const orphan = new Map<number, number>(); // id -> base float index (slice,i)
-    const geom = new Map<number, number>();
-    // First pass: count winners to size the merged columns.
-    const orphanWin: Array<[number, Float32Array, number]> = [];
-    const geomWin: Array<[number, Float32Array, number]> = [];
-    for (const slice of stylesSliceResults) {
-      if (!slice) continue;
-      if (slice.error) console.warn(`[stream][shard] style slice failed (degraded colours possible): ${slice.error}`);
-      for (let i = 0; i < slice.orphanIds.length; i++) {
-        const id = slice.orphanIds[i];
-        if (!orphan.has(id)) { orphan.set(id, 1); orphanWin.push([id, slice.orphanColors, i * 4]); }
-      }
-      for (let i = 0; i < slice.geomIds.length; i++) {
-        const id = slice.geomIds[i];
-        if (!geom.has(id)) { geom.set(id, 1); geomWin.push([id, slice.geomColors, i * 4]); }
-      }
-    }
-    const orphanIds = new Uint32Array(orphanWin.length);
-    const orphanColors = new Float32Array(orphanWin.length * 4);
-    orphanWin.forEach(([id, colors, o], i) => {
-      orphanIds[i] = id;
-      orphanColors.set(colors.subarray(o, o + 4), i * 4);
-    });
-    const geomIds = new Uint32Array(geomWin.length);
-    const geomColors = new Float32Array(geomWin.length * 4);
-    geomWin.forEach(([id, colors, o], i) => {
-      geomIds[i] = id;
-      geomColors.set(colors.subarray(o, o + 4), i * 4);
-    });
-    console.log(`[stream][shard] styles merged: ${geomWin.length} geometry + ${orphanWin.length} orphan @ ${elapsed()}ms`);
-    mergedStylesForFinalize = { orphanIds, orphanColors, geomIds, geomColors };
+    // A late straggler slice may land after the #4902 bound already merged.
+    if (stylesSlicesSettled) return;
+    stylesSlicesSettled = true;
+    mergedStylesForFinalize = mergeShardStyleSlices(stylesSliceResults);
+    console.log(`[stream][shard] styles merged: ${mergedStylesForFinalize.geomIds.length} geometry + ${mergedStylesForFinalize.orphanIds.length} orphan @ ${elapsed()}ms`);
     maybeDispatchFinalize();
   };
 
@@ -1158,18 +1114,31 @@ export async function* processParallel(
     const m = mergedStylesForFinalize;
     workers[0].postMessage(
       {
-        type: 'finalize-styles' as const,
+        type: 'finalize-styles' as const, sourceSessionId,
         sharedBuffer,
         orphanIds: m.orphanIds,
         orphanColors: m.orphanColors,
         geomIds: m.geomIds,
         geomColors: m.geomColors,
+        geomFinishes: m.geomFinishes,
         ...supportSpans,
         planeAngleToRadians: prepassMeta.planeAngleToRadians ?? 1,
       },
-      [m.orphanIds.buffer, m.orphanColors.buffer, m.geomIds.buffer, m.geomColors.buffer],
+      [m.orphanIds.buffer, m.orphanColors.buffer, m.geomIds.buffer, m.geomColors.buffer, m.geomFinishes.buffer],
     );
     console.log(`[stream][shard] styles finalize dispatched to worker[0] @ ${elapsed()}ms`);
+    // #4902 bound: replay the empty-styles event (stall-phase.ts) so every
+    // held chunk drains with default colours instead of never draining.
+    phaseBoundTimers.arm(fileSizeMB, () => finalizeSettled, () => {
+      finalizeSettled = true;
+      console.warn('[stream][shard] styles finalize silent — draining with default colours (#4902)');
+      diagnostics = mergeGeometryDiagnostics(diagnostics, preWorkerPhaseFailureDiagnostics('styles-finalize-timeout'));
+      // worker[0] is the sole target of `finalize-styles`; replace it before
+      // the fallback drains chunks, or its still-wedged FIFO queue would
+      // never consume the `stream-chunk`/`stream-end` the drain sends it.
+      replacePreWorkerPhaseWorker(0, 'styles-finalize-timeout');
+      (prepassWorker.onmessage as (e: MessageEvent) => void)({ data: emptyStylesPrepassEvent() } as MessageEvent);
+    });
   };
 
   // SPIKE: kick off the shard scans on the idle workers NOW (before the pre-pass
@@ -1186,29 +1155,68 @@ export async function* processParallel(
     shardResults.length = n;
     shardResultsRemaining = n;
     shardScanDispatchedAt = elapsed();
+    gateTracker.markShardScanStarted();
     console.log(`[stream][shard] dispatching ${n} shard scans over ${(len / (1024 * 1024)).toFixed(1)}MB @ ${shardScanDispatchedAt}ms`);
     for (let i = 0; i < n; i++) {
       const rangeStart = Math.floor((i * len) / n);
       const rangeEnd = i + 1 === n ? len : Math.floor(((i + 1) * len) / n);
       workers[i].postMessage({
-        type: 'scan-shard' as const,
+        type: 'scan-shard' as const, sourceSessionId,
         sharedBuffer,
         shardIndex: i,
         rangeStart,
         rangeEnd,
       });
     }
+    // #4902 bound: falls back to the serial pre-pass, same as an unresolved
+    // stitch (`onAllShardsReceived`'s `!stitched` branch) — see stall-phase.ts.
+    phaseBoundTimers.arm(fileSizeMB, () => shardScanSettled, () => {
+      shardScanSettled = true;
+      gateTracker.markShardScanDone();
+      console.warn(`[stream][shard] ${shardResultsRemaining}/${n} shard scan(s) silent — falling back to the serial pre-pass (#4902)`);
+      diagnostics = mergeGeometryDiagnostics(diagnostics, preWorkerPhaseFailureDiagnostics('shard-scan-timeout'));
+      // Replace every worker still silent on scan-shard BEFORE continuing:
+      // `scan-shard` is a synchronous WASM call, so a missing reply means
+      // that worker is wedged, not just slow — and the fallback's own
+      // stream-start/chunks/stream-end would queue forever behind it.
+      for (let i = 0; i < n; i++) {
+        if (!shardResults[i]) replacePreWorkerPhaseWorker(i, 'shard-scan-timeout');
+      }
+      startPrepass(false);
+    });
   }
 
   const prepassWorker = makePrepassWorker();
+
   // Wrap the rest of the pipeline so worker teardown runs not only on
   // normal completion / error / zero-jobs branches, but also when the
   // consumer abandons the generator via `.return()` / `.throw()` while it
   // is suspended at a `yield` or the `resolveWaiting` await. The viewer's
   // `watchedGeometryStream` relies on this `finally` to tear down workers
   // on break / abort / watchdog (see boundedIteratorReturn). The existing
-  // branch-local `terminate()` calls remain — `terminate()` is idempotent.
+  // Abandonment and hung-call recovery (#4884). `return()` cannot reach this
+  // `finally` while the loop is parked on a silent worker, so a stalled load
+  // leaked its pool (hung worker included) into the retry: abort terminates it.
+  let aborted = false;
+  const onAbort = () => {
+    aborted = true;
+    for (const w of workers) terminateWorkerQuietly(w, 'process worker (abort)');
+    terminateWorkerQuietly(prepassWorker, 'pre-pass worker (abort)');
+    wake();
+  };
+  const skippedHungElements = new SkippedHungElementsCollector();
+  let stopHungJobMonitor = () => {};
   try {
+  if (options?.signal?.aborted) onAbort();
+  else options?.signal?.addEventListener('abort', onAbort, { once: true });
+  stopHungJobMonitor = startHungJobMonitor({
+    workers, ledger, makeWorker: makeGeometryWorker, installHandlers: installWorkerHandlers,
+    setup: workerSetup, postChunk, streamEndSent: () => endSentToWorkers,
+    terminate: terminateWorkerQuietly, source: new Uint8Array(sharedBuffer), skipped: skippedHungElements,
+    isLive: () => !aborted && !workerError && !prepassError,
+    onLiveness: () => { eventQueue.push({ type: 'progress', phase: 'workers' }); wake(); },
+    onFailed: (error) => { workerError ??= error; wake(); },
+  }, hungJobTimeoutMs);
   // Forward the consumer-supplied wasm URL to the pre-pass worker so it
   // doesn't fall back to wasm-bindgen's `import.meta.url` default. The
   // pre-pass worker uses the same `geometry.worker.ts` bundle and the
@@ -1277,6 +1285,8 @@ export async function* processParallel(
         // resolved colors — uniform shading across the whole stream.
         const styleIds = evt.styleIds as Uint32Array;
         const styleColors = evt.styleColors as Uint8Array;
+        // #5582: absent from an older wasm ⇒ empty ⇒ no finishes.
+        const styleFinishes = (evt.styleFinishes as Float32Array | undefined) ?? new Float32Array(0);
         const voidKeys = evt.voidKeys as Uint32Array;
         const voidCounts = evt.voidCounts as Uint32Array;
         const voidValues = evt.voidValues as Uint32Array;
@@ -1285,13 +1295,14 @@ export async function* processParallel(
         const materialColors = (evt.materialColors as Uint8Array | undefined) ?? new Uint8Array(0);
         console.log(`[stream] styles @ ${elapsed()}ms (${styleIds.length} styled, ${voidKeys.length} void hosts), draining ${queuedChunks.length} queued chunks`);
 
-        for (const w of workers) {
+        broadcastSetup((w) => {
           // Slice each typed array per-worker so each can be in its own
           // transfer list without conflict. The slice cost is bounded by
           // `styleIds.length * 4` bytes — under 1 MB for ~250K styles.
           try {
             const sIds = styleIds.slice();
             const sColors = styleColors.slice();
+            const sFinishes = styleFinishes.slice();
             const vKeys = voidKeys.slice();
             const vCounts = voidCounts.slice();
             const vValues = voidValues.slice();
@@ -1303,6 +1314,7 @@ export async function* processParallel(
                 type: 'set-styles' as const,
                 styleIds: sIds,
                 styleColors: sColors,
+                styleFinishes: sFinishes,
                 voidKeys: vKeys,
                 voidCounts: vCounts,
                 voidValues: vValues,
@@ -1311,16 +1323,18 @@ export async function* processParallel(
                 materialColors: mColors,
               },
               [
-                sIds.buffer, sColors.buffer, vKeys.buffer, vCounts.buffer, vValues.buffer,
+                sIds.buffer, sColors.buffer, sFinishes.buffer, vKeys.buffer, vCounts.buffer, vValues.buffer,
                 mIds.buffer, mCounts.buffer, mColors.buffer,
               ],
             );
           } catch (err) {
             console.warn('[stream] set-styles dispatch failed:', err);
           }
-        }
+        });
 
         stylesReceived = true;
+        finalizeSettled = true; // reached via the real path — the #4902 bound is moot now
+        gateTracker.markStylesReceived();
         // Drain only when ALL gates are open (entity-index too). The
         // worker's tail-promise serialiser ensures any set-* runs
         // before any subsequent stream-chunk.
@@ -1340,7 +1354,11 @@ export async function* processParallel(
           // entity-index event); guard against double delivery regardless.
           console.log(`[stream] pre-pass entity-index arrived @ ${elapsed()}ms (already delivered via shards; ignoring)`);
         } else {
-          deliverEntityIndex(ids, starts, lengths, 'prepass', (evt.oversizedIdCount as number | undefined) ?? 0);
+          // TODO(#3699): the Rust pre-pass emits no malformed count yet, so
+          // this is undefined ("nothing reported"), carried as such.
+          deliverEntityIndex(ids, starts, lengths, 'prepass',
+            (evt.oversizedIdCount as number | undefined) ?? 0,
+            evt.malformedRecordCount as number | undefined);
         }
       } else if (evt.type === 'prepass-columns') {
         // Pre-pass computed the referenced-repmaps + instantiated-type-id sets
@@ -1365,7 +1383,7 @@ export async function* processParallel(
         const mliLayerThicknesses = evt.mliLayerThicknesses as Float64Array;
         console.log(`[stream] prepass-columns @ ${elapsed()}ms (${referencedRepmaps.length} repmaps, ${instantiatedTypeIds.length} inst-types, ${mliElementIds.length} layer-elems)`);
 
-        for (const w of workers) {
+        broadcastSetup((w) => {
           try {
             const rRepmaps = referencedRepmaps.slice();
             const rTypeIds = instantiatedTypeIds.slice();
@@ -1399,7 +1417,7 @@ export async function* processParallel(
           } catch (err) {
             console.warn('[stream] set-prepass-columns dispatch failed:', err);
           }
-        }
+        });
 
         // Not a dispatch gate (see dispatchJobsChunk); the pre-pass emits this
         // before the first jobs chunk, so drain here only for symmetry with the
@@ -1467,6 +1485,7 @@ export async function* processParallel(
   // After we see the Rust `complete` event we can sendStreamEnd.
   const onPrepassComplete = () => {
     prepassDone = true;
+    gateTracker.markPrepassDone();
     // Only signal stream-end to workers if they actually got
     // stream-start (which gates on `meta`). Zero-geometry files
     // never trigger meta → workers never start → no stream-end
@@ -1488,7 +1507,7 @@ export async function* processParallel(
   // Dispatch the streaming pre-pass.
   // chunk_size = 50K is a deliberate compromise:
   //   • small enough that the FIRST chunk (always a tiny one — bounded by
-  //     RTC_SAMPLE_THRESHOLD ≈ 50 jobs from the Rust side) reaches workers
+  //     META_EMIT_JOB_THRESHOLD ≈ 50 jobs from the Rust side) reaches workers
   //     within ~1.5 s for fast TTFG;
   //   • large enough that subsequent chunks make few Rust→JS callbacks
   //     and few worker postMessages — each call into processGeometryBatch
@@ -1523,6 +1542,7 @@ export async function* processParallel(
       }
       prepassWorker.postMessage({
         type: 'prepass-streaming-sharded',
+        sourceFingerprint: options?.sourceFingerprint,
         sharedBuffer,
         chunkSize: 50_000,
         ...(visibilityFilter?.disabledTypes ? { disabledTypes: visibilityFilter.disabledTypes } : {}),
@@ -1535,6 +1555,7 @@ export async function* processParallel(
     } else {
       prepassWorker.postMessage({
         type: 'prepass-streaming',
+        sourceFingerprint: options?.sourceFingerprint,
         sharedBuffer,
         chunkSize: 50_000,
         ...(visibilityFilter?.disabledTypes ? { disabledTypes: visibilityFilter.disabledTypes } : {}),
@@ -1559,9 +1580,11 @@ export async function* processParallel(
   let prepassCompleteSeen = false;
 
   while (true) {
+    if (aborted) return;
     while (eventQueue.length > 0) {
       yield eventQueue.shift()!;
     }
+    if (aborted) return;
     if (workerError) {
       for (const w of workers) {
         terminateWorkerQuietly(w, 'process worker');
@@ -1616,13 +1639,25 @@ export async function* processParallel(
         `diagnostics.failuresByReason; not every reason leaves an opening/void uncut`,
     );
   }
+  const skippedReport = skippedHungElements.report();
   yield {
     type: 'complete',
     totalMeshes,
     coordinateInfo,
     ...(loadDiagnostics ? { diagnostics: loadDiagnostics } : {}),
+    ...(skippedReport ? { skippedHungElements: skippedReport } : {}),
   };
   } finally {
+    phaseBoundTimers.clearAll();
+    // Re-seat the caller's handle to a frozen snapshot (#4979 review): the
+    // live reader closes over `gateTracker`, and transitively this whole
+    // generator's scope (including `sharedBuffer`) — the caller may still
+    // hold the handle long after this teardown runs.
+    if (options?.stallPhaseHandle) {
+      options.stallPhaseHandle.getStallPhase = frozenStallPhase(gateTracker.getStallPhase());
+    }
+    stopHungJobMonitor();
+    options?.signal?.removeEventListener('abort', onAbort);
     for (const w of workers) {
       terminateWorkerQuietly(w, 'process worker');
     }

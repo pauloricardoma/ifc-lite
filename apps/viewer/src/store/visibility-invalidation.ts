@@ -41,8 +41,8 @@
  * A record field the patch ITSELF carries is left exactly as the patch has it.
  * An installer committing the channel and its claim in one `set()` is stating
  * both at once and must not have the claim eaten by the write that created it.
- * (Today's installers write the channel first and the record second, two
- * `set()`s — this makes the atomic form safe too rather than a latent trap.)
+ * (The clash and IDS installers write the channel first and the record second,
+ * two `set()`s; the basket commits both in one patch, `basketVisibilityOwned`.)
  *
  * A patch touching NEITHER channel is returned by reference, so the common
  * case adds no keys, allocates nothing, and preserves the identity-return
@@ -60,7 +60,7 @@ import {
 /** The state surface this middleware reads: the two shared channels plus every
  *  ownership record over them. */
 type ChannelState = Pick<VisibilityChannels, 'isolatedEntities' | 'ghostExceptEntities'> &
-  OwnedVisibilityRecords;
+  OwnedVisibilityRecords & { visibilityRevision?: number };
 
 type SetState<T> = (
   partial: T | Partial<T> | ((state: T) => T | Partial<T>),
@@ -128,7 +128,8 @@ export function applyOwnershipInvalidation<T extends ChannelState>(
     if (field in patch) delete reset[field];
     else stale = true;
   }
-  if (!stale) return patch;
+  const revision = (state.visibilityRevision ?? 0) + 1;
+  if (!stale) return { ...patch, visibilityRevision: revision };
 
-  return { ...patch, ...reset };
+  return { ...patch, ...reset, visibilityRevision: revision };
 }

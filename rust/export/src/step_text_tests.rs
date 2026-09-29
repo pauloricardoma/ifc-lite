@@ -18,7 +18,7 @@ fn export_step_round_trips_a_backslash_carrying_schema_label_through_source_sche
 
     let source = b"ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\nFILE_NAME('','',(''),(''),'','','');\nFILE_SCHEMA(('IFC\\\\4'));\nENDSEC;\nDATA;\n#1=IFCPROJECT('guid',$,$,$,$,$,$,$,$);\nENDSEC;\nEND-ISO-10303-21;\n";
 
-    let (step, _stats) = export_step_with_stats(source, &StepOptions::default());
+    let (step, _stats) = export_step_with_stats(source, &StepOptions::default()).unwrap();
     let schema_line = step
         .lines()
         .find(|l| l.starts_with("FILE_SCHEMA("))
@@ -27,15 +27,6 @@ fn export_step_round_trips_a_backslash_carrying_schema_label_through_source_sche
         schema_line, "FILE_SCHEMA(('IFC\\\\4'));",
         "source schema label must round-trip, not compound its escaping"
     );
-}
-
-#[test]
-fn split_top_level_args_respects_nesting() {
-    let args = "'a',$,(#1,#2,#3),IFCBOOLEAN(.T.),#9";
-    let parts = split_top_level_args(args);
-    assert_eq!(parts.len(), 5);
-    assert_eq!(parts[2], "(#1,#2,#3)");
-    assert_eq!(parts[3], "IFCBOOLEAN(.T.)");
 }
 
 // The `escape()` literal-table tests that used to live here (backslash
@@ -132,7 +123,7 @@ fn property_synthesis_round_trips_apostrophe_and_backslash_per_spec() {
             }],
             ..StepOptions::default()
         },
-    );
+    ).unwrap();
 
     // Locate the synthesized IFCPROPERTYSET line and pull its (still-quoted)
     // name field: `IFCPROPERTYSET('<guid>',$,'<pset_name>',$,(...))` — the
@@ -179,5 +170,274 @@ fn property_synthesis_round_trips_apostrophe_and_backslash_per_spec() {
         spec_unescape(raw_quoted_body),
         original_pset_name,
         "raw written bytes {raw_quoted_body:?} must spec-un-escape back to the original"
+    );
+}
+
+/// Control: an ordinary express id is collected unchanged (issue #3421).
+/// `refs_in_line` collects every `#<digits>` in the line, including the
+/// record's own leading `#<id>=` — callers are expected to filter that
+/// themselves, the same as `parse_express_id`'s contract upstream.
+#[test]
+fn refs_in_line_collects_an_ordinary_ref() {
+    let mut out = Vec::new();
+    refs_in_line(b"#1=IFCWALL(#42,#137924);", &mut out);
+    assert_eq!(out, vec![1, 42, 137924]);
+}
+
+/// Boundary: a ref at exactly `u32::MAX` is not refused (issue #3421).
+#[test]
+fn refs_in_line_accepts_a_ref_at_exactly_u32_max() {
+    let mut out = Vec::new();
+    refs_in_line(b"#1=IFCWALL(#4294967295);", &mut out);
+    assert_eq!(out, vec![1, u32::MAX]);
+}
+
+/// RED for issue #3421: a ref one past `u32::MAX` used to wrap
+/// (`4294967296` accumulated onto `0`, and `4294967297` onto `1`) and bind to
+/// a real low-numbered entity instead of refusing. It must now be dropped
+/// from the reference list rather than aliased onto id 0 or 1.
+#[test]
+fn refs_in_line_refuses_a_ref_above_u32_max_instead_of_wrapping_onto_a_real_entity() {
+    let mut out = Vec::new();
+    refs_in_line(b"#1=IFCWALL(#4294967296,#4294967297,#42);", &mut out);
+    assert_eq!(
+        out,
+        vec![1, 42],
+        "an oversized ref must be dropped, never aliased onto id 0 or 1 (id 1 here is the record's own leading id, not an alias)"
+    );
+}
+
+/// RED for issue #3752: `refs_in_line` silently dropped an oversized ref with
+/// no trace. `refs_in_line_counted` must count exactly the two refused refs
+/// from the fixture above (`#4294967296` and `#4294967297`), not the two
+/// accepted ones (`#1`, `#42`).
+#[test]
+fn refs_in_line_counted_counts_the_refused_refs_not_the_accepted_ones() {
+    let mut out = Vec::new();
+    let mut refused = 0usize;
+    refs_in_line_counted(b"#1=IFCWALL(#4294967296,#4294967297,#42);", &mut out, &mut refused);
+    assert_eq!(out, vec![1, 42]);
+    assert_eq!(refused, 2, "both oversized refs must be counted (#3752)");
+}
+
+/// Control: an ordinary line reports zero refusals.
+#[test]
+fn refs_in_line_counted_reports_no_refusals_for_an_ordinary_line() {
+    let mut out = Vec::new();
+    let mut refused = 0usize;
+    refs_in_line_counted(b"#1=IFCWALL(#42,#137924);", &mut out, &mut refused);
+    assert_eq!(refused, 0, "an ordinary line must not be counted as refused");
+}
+
+/// Boundary: a ref at exactly `u32::MAX` is not counted as refused.
+#[test]
+fn refs_in_line_counted_reports_no_refusals_at_exactly_u32_max() {
+    let mut out = Vec::new();
+    let mut refused = 0usize;
+    refs_in_line_counted(b"#1=IFCWALL(#4294967295);", &mut out, &mut refused);
+    assert_eq!(refused, 0, "a ref at exactly u32::MAX must not be counted as refused");
+}
+
+/// End-to-end RED for issue #3752, through the real `export_step_with_stats`
+/// entry point: a filtered export (`opts.included`) whose root references an
+/// oversized id must surface it in `StepStats.refused_refs`, not just drop it
+/// from the reference closure with no trace.
+#[test]
+fn export_step_with_stats_reports_refused_refs_in_a_filtered_export() {
+    use crate::step::{export_step_with_stats, StepOptions};
+
+    let source = b"ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\nFILE_NAME('','',(''),(''),'','','');\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
+                   #1=IFCWALL('g',$,$,$,$,#4294967297,$,$,$);\n\
+                   #2=IFCWALL('g2',$,$,$,$,#42,$,$,$);\n\
+                   #42=IFCLOCALPLACEMENT($,$);\nENDSEC;\nEND-ISO-10303-21;\n";
+
+    let (_step, stats) = export_step_with_stats(
+        source,
+        &StepOptions { included: Some(vec![1]), ..StepOptions::default() },
+    ).unwrap();
+    assert_eq!(
+        stats.refused_refs, 1,
+        "the oversized reference on #1 must be counted, not silently dropped (#3752)"
+    );
+
+    // Control: the same shape rooted at #2 (an ordinary reference) reports zero.
+    let (_step, control_stats) = export_step_with_stats(
+        source,
+        &StepOptions { included: Some(vec![2]), ..StepOptions::default() },
+    ).unwrap();
+    assert_eq!(
+        control_stats.refused_refs, 0,
+        "an ordinary reference must not be counted as refused"
+    );
+}
+
+/// #4125: a record whose argument list does not scan into slots must NOT be
+/// edited by index. Before the validating splitter, writing `Description`
+/// (index 3) on this line landed on `ObjectPlacement`, deleted the `#5` that
+/// was there, and returned a `String` the caller read as a success.
+#[test]
+fn apply_attr_mutations_refuses_a_record_whose_slots_do_not_scan() {
+    let line = "#1=IFCWALL('g',$,IFCLABEL('a's'),$,IFCLABEL('b's'),#5,#6,'T',.SOLIDWALL.);";
+    let mut muts = BTreeMap::new();
+    muts.insert(3usize, "'NEWDESC'".to_string());
+    let mut refused = 0usize;
+    assert_eq!(
+        apply_attr_mutations_counted(line, &muts, &mut refused),
+        line,
+        "an edit by index into a mis-scanned list must refuse, not land on another attribute"
+    );
+    assert_eq!(refused, 1, "and the refusal must be counted, not silent");
+
+    // The control: the SAME record with its apostrophes doubled, where slot 3
+    // really is `Description`, still takes the edit.
+    let control = "#1=IFCWALL('g',$,IFCLABEL('a''s'),$,IFCLABEL('b''s'),#5,#6,'T',.SOLIDWALL.);";
+    assert_eq!(
+        apply_attr_mutations_counted(control, &muts, &mut refused),
+        "#1=IFCWALL('g',$,IFCLABEL('a''s'),'NEWDESC',IFCLABEL('b''s'),#5,#6,'T',.SOLIDWALL.);",
+        "a scannable record must still take the edit"
+    );
+    assert_eq!(refused, 1, "and must not be counted as a refusal");
+}
+
+/// The refusal above must be VISIBLE. An unchanged line is what a no-op edit
+/// also produces, so the export counts the refusal into its stats.
+#[test]
+fn export_step_counts_a_refused_attribute_edit() {
+    use crate::step::{export_step_with_stats, AttrMutation, StepOptions};
+
+    let source = b"ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\nFILE_NAME('','',(''),(''),'','','');\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n#1=IFCWALL('g',$,IFCLABEL('a's'),$,IFCLABEL('b's'),#5,#6,'T',.SOLIDWALL.);\nENDSEC;\nEND-ISO-10303-21;\n";
+    let opts = StepOptions {
+        attribute_mutations: vec![AttrMutation {
+            express_id: 1,
+            index: 3,
+            value: "'NEWDESC'".to_string(),
+        }],
+        ..Default::default()
+    };
+    let (step, stats) = export_step_with_stats(source, &opts).unwrap();
+    assert_eq!(stats.attribute_edits_refused, 1);
+    assert!(
+        step.contains("#1=IFCWALL('g',$,IFCLABEL('a's'),$,IFCLABEL('b's'),#5,#6,'T',.SOLIDWALL.);"),
+        "the source line ships unedited rather than corrupted; got:\n{step}"
+    );
+    assert!(
+        !step.contains("NEWDESC"),
+        "the refused edit must not appear anywhere; got:\n{step}"
+    );
+
+    // The control, so a zero above is not merely "this export never edits".
+    let control_source = b"ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\nFILE_NAME('','',(''),(''),'','','');\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n#1=IFCWALL('g',$,IFCLABEL('a''s'),$,IFCLABEL('b''s'),#5,#6,'T',.SOLIDWALL.);\nENDSEC;\nEND-ISO-10303-21;\n";
+    let (control_step, control_stats) = export_step_with_stats(control_source, &opts).unwrap();
+    assert_eq!(control_stats.attribute_edits_refused, 0);
+    assert!(
+        control_step.contains("'NEWDESC'"),
+        "the control edit must land; got:\n{control_step}"
+    );
+}
+
+/// An edit whose `index` is past the record's arity used to be dropped with
+/// no count: the record came back as a `String` the caller read as success,
+/// and every `StepStats` refusal counter stayed at zero. The edit was not in
+/// the file. `index` is caller-supplied JSON on the wasm bridge, so this is
+/// reachable input, not a typo in a test. The other edits on the record still
+/// apply; the record counts once.
+#[test]
+fn apply_attr_mutations_counts_an_edit_past_the_records_arity_as_refused() {
+    let line = "#1=IFCWALL('g',$,'W',$,$,$,$,$,.SOLIDWALL.);";
+    let mut muts = BTreeMap::new();
+    muts.insert(12usize, "'New Name'".to_string());
+    let mut refused = 0usize;
+    let out = apply_attr_mutations_counted(line, &muts, &mut refused);
+    assert_eq!(out, line, "an edit past the arity must not change the record");
+    assert_eq!(refused, 1, "and the dropped edit must be counted, not silent");
+
+    // Mixed: one edit lands, one is out of range. The record still counts
+    // once, and the in-range edit is in the output.
+    muts.insert(2usize, "'Renamed'".to_string());
+    let mut refused = 0usize;
+    let out = apply_attr_mutations_counted(line, &muts, &mut refused);
+    assert_eq!(out, "#1=IFCWALL('g',$,'Renamed',$,$,$,$,$,.SOLIDWALL.);");
+    assert_eq!(refused, 1, "one record with a dropped edit is one refusal");
+
+    // Control: the same edit at the last valid index is not a refusal.
+    let mut muts = BTreeMap::new();
+    muts.insert(8usize, ".NOTDEFINED.".to_string());
+    let mut refused = 0usize;
+    let out = apply_attr_mutations_counted(line, &muts, &mut refused);
+    assert_eq!(out, "#1=IFCWALL('g',$,'W',$,$,$,$,$,.NOTDEFINED.);");
+    assert_eq!(refused, 0, "an in-range edit must not be counted as refused");
+}
+
+/// The same refusal through the public `export_step_with_stats` path the
+/// wasm bridge's `export_step_json` reaches: `attribute_edits_refused` must
+/// be non-zero when a caller's `index` is past the record's arity.
+#[test]
+fn export_step_counts_an_attribute_edit_past_the_arity() {
+    use crate::step::{export_step_with_stats, AttrMutation, StepOptions};
+
+    let source = b"ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\nFILE_NAME('','',(''),(''),'','','');\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n#1=IFCWALL('g',$,'W',$,$,$,$,$,.SOLIDWALL.);\nENDSEC;\nEND-ISO-10303-21;\n";
+    let opts = StepOptions {
+        attribute_mutations: vec![AttrMutation {
+            express_id: 1,
+            index: 12,
+            value: "'New Name'".to_string(),
+        }],
+        ..Default::default()
+    };
+    let (step, stats) = export_step_with_stats(source, &opts).unwrap();
+    assert_eq!(stats.attribute_edits_refused, 1, "the out-of-range edit must be reported");
+    assert!(!step.contains("New Name"), "and must not be in the output; got:\n{step}");
+    assert!(
+        step.contains("#1=IFCWALL('g',$,'W',$,$,$,$,$,.SOLIDWALL.);"),
+        "the record ships as the source wrote it; got:\n{step}"
+    );
+}
+
+/// A control character has a faithful ISO 10303-21 encoding (`\X2\000A\X0\`
+/// for a newline), and `escape` used to throw it away: the whole C0 range and
+/// DEL became a space, so a header field that arrived properly encoded as
+/// `line1\X2\000A\X0\line2` was re-exported as `line1 line2`. Every other
+/// character class already round-trips through `decode_ifc_string`; this pins
+/// the one that did not.
+#[test]
+fn escape_round_trips_control_characters_through_the_decoder() {
+    use ifc_lite_core::decode_ifc_string;
+
+    for (input, expected) in [
+        ("line1\nline2", "line1\\X2\\000A\\X0\\line2"),
+        ("a\tb", "a\\X2\\0009\\X0\\b"),
+        ("\u{7F}", "\\X2\\007F\\X0\\"),
+        ("\0", "\\X2\\0000\\X0\\"),
+    ] {
+        let escaped = escape(input);
+        assert_eq!(escaped, expected, "escape({input:?})");
+        assert!(
+            escaped.bytes().all(|b| (0x20..=0x7E).contains(&b)),
+            "no raw byte outside 32-126 may reach the literal: {escaped:?}"
+        );
+        assert_eq!(
+            decode_ifc_string(&escaped).as_ref(),
+            input,
+            "decode(escape(x)) must be x for a control character too"
+        );
+    }
+}
+
+/// The same loss through the public path: a source `FILE_DESCRIPTION` whose
+/// text carries an encoded newline must come back with the newline encoded,
+/// not flattened to a space.
+#[test]
+fn export_step_keeps_an_encoded_newline_in_a_header_field() {
+    use crate::step::{export_step_with_stats, StepOptions};
+
+    let source = b"ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('line1\\X2\\000A\\X0\\line2'),'2;1');\nFILE_NAME('','',(''),(''),'','','');\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n#1=IFCPROJECT('guid',$,$,$,$,$,$,$,$);\nENDSEC;\nEND-ISO-10303-21;\n";
+    let (step, _stats) = export_step_with_stats(source, &StepOptions::default()).unwrap();
+    let line = step
+        .lines()
+        .find(|l| l.starts_with("FILE_DESCRIPTION("))
+        .expect("a FILE_DESCRIPTION header line");
+    assert_eq!(
+        line, "FILE_DESCRIPTION(('line1\\X2\\000A\\X0\\line2'),'2;1');",
+        "the encoded newline must survive a re-export, not become a space"
     );
 }

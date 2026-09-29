@@ -4,15 +4,52 @@
 
 //! Disk-based cache service using cacache.
 
+use super::cache_remove::classify_index_walk_error;
 use crate::error::ApiError;
 use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::{RwLock, Semaphore};
 
 /// Content-addressable disk cache.
 #[derive(Debug, Clone)]
 pub struct DiskCache {
-    cache_dir: PathBuf,
+    pub(super) cache_dir: PathBuf,
+    // Excludes a `set`/`set_bytes` write from `remove_by_key_prefix`'s GC
+    // pass, and nothing else. `cacache::write` commits in two steps -- the
+    // content blob is finalized first, the index entry inserted second
+    // (`Writer::commit` in the vendored cacache) -- so a write and a GC pass
+    // CAN interleave: the GC pass's "list index, drop blobs nothing
+    // references" scan can run between those two halves of a concurrent
+    // write, see the blob but no index entry pointing at it yet, and unlink
+    // it out from under the writer that is about to insert that very entry.
+    // The blob is content-addressed, so this only bites when the concurrent
+    // write's bytes hash to a blob the GC pass just unreferenced -- exactly
+    // the case `remove_by_key_prefix`'s own docstring calls out (two source
+    // files sharing one output blob) -- but when it does, the surviving
+    // entry then reads as corrupt on every later `get`/`get_bytes`, which is
+    // the one failure mode that method's ordering was written to prevent.
+    // `read()` here is shared among concurrent writers (they may still race
+    // each other inside `cacache::write`, which is safe on its own); only
+    // the BLOB-RECLAIM half of `remove_by_key_prefix` takes `write()`, so it
+    // runs with no write in flight and no write can start until it finishes.
+    // Its index-entry removals need no exclusion at all -- removing an index
+    // entry can only orphan a blob, never unlink one out from under a
+    // writer -- and are deliberately left outside the lock.
+    pub(super) write_gc_lock: Arc<RwLock<()>>,
+    /// One `remove_by_key_prefix` at a time, process-wide.
+    ///
+    /// The removal walks the whole index twice, and the second walk holds
+    /// `write_gc_lock.write_owned()` for its duration. tokio's `RwLock` is
+    /// write-preferring, so overlapping removals starve every cache write in
+    /// the process, and a walk costs exactly the same for a key nothing was
+    /// ever stored under. Lives on the cache, not on `Admission`, so every
+    /// caller gets the bound without learning it exists, and the permit is
+    /// carried INTO both blocking closures the same way the GC guard is: a
+    /// permit held by the async fn would be released when a client drops the
+    /// request mid-walk, while the walk itself runs on.
+    pub(crate) index_walk: Arc<Semaphore>,
 }
 
 impl DiskCache {
@@ -29,7 +66,11 @@ impl DiskCache {
             );
         }
 
-        Self { cache_dir: path }
+        Self {
+            cache_dir: path,
+            write_gc_lock: Arc::new(RwLock::new(())),
+            index_walk: Arc::new(Semaphore::new(1)),
+        }
     }
 
     /// Generate a cache key from file content (SHA256 hash).
@@ -52,16 +93,29 @@ impl DiskCache {
     }
 
     /// Set a cached value.
+    ///
+    /// Serializes and then delegates to [`Self::set_bytes`], so there is
+    /// exactly one body that takes the `write_gc_lock` read guard around a
+    /// `cacache::write` -- the invariant cannot drift between the two entry
+    /// points.
     pub async fn set<T: Serialize>(&self, key: &str, value: &T) -> Result<(), ApiError> {
         let data = serde_json::to_vec(value)?;
-        cacache::write(&self.cache_dir, key, &data).await?;
-        tracing::debug!(key = %key, size = data.len(), "Cached result");
-        Ok(())
+        self.set_bytes(key, &data).await
     }
 
-    /// Check if a key exists in the cache.
-    pub async fn has(&self, key: &str) -> bool {
-        cacache::metadata(&self.cache_dir, key).await.is_ok()
+    /// Whether the index holds an entry for `key`. An index lookup only: the
+    /// content is not read, so this is the cheap pre-filter, never the
+    /// decision a reader acts on.
+    ///
+    /// `Ok(false)` is "absent"; a lookup that FAILS is an error, not an
+    /// absence, so a caller answering `404` on `false` still answers a broken
+    /// cache store with `500 CACHE_ERROR` (#5750 review). `cacache::metadata`
+    /// answers `Ok(None)` for a key it has no entry for.
+    pub async fn has(&self, key: &str) -> Result<bool, ApiError> {
+        match cacache::metadata(&self.cache_dir, key).await {
+            Ok(entry) => Ok(entry.is_some()),
+            Err(e) => Err(ApiError::Cache(e.to_string())),
+        }
     }
 
     /// Remove a cached entry.
@@ -89,124 +143,51 @@ impl DiskCache {
 
     /// Set raw bytes in cache.
     pub async fn set_bytes(&self, key: &str, data: &[u8]) -> Result<(), ApiError> {
+        // Excludes `remove_by_key_prefix`'s GC pass, not other concurrent
+        // writers -- see `write_gc_lock`'s docstring.
+        let _guard = self.write_gc_lock.read().await;
         cacache::write(&self.cache_dir, key, data).await?;
         tracing::debug!(key = %key, size = data.len(), "Cached raw bytes");
         Ok(())
     }
+
+    /// Cache-wide entry count and total content size in bytes, for the
+    /// `/api/v1/metrics` gauges (issue #3636). Sums `Metadata::size` across
+    /// every index entry; entries sharing a deduplicated content blob are
+    /// each counted once (as stored), matching what `remove_by_key_prefix`
+    /// treats as "still referenced".
+    pub async fn stats(&self) -> Result<CacheStats, ApiError> {
+        let cache_dir = self.cache_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut stats = CacheStats::default();
+            for entry in cacache::list_sync(&cache_dir) {
+                // Never `flatten()` here: a walk that cannot complete (an
+                // unmounted or permission-denied `CACHE_DIR`) would then be
+                // indistinguishable from an empty cache, and the gauges would
+                // report `entries=0 bytes=0` as if the cache were healthy.
+                let meta = match entry {
+                    Ok(meta) => meta,
+                    Err(e) => match classify_index_walk_error(&cache_dir, e) {
+                        Some(err) => return Err(err),
+                        None => break,
+                    },
+                };
+                stats.entries += 1;
+                stats.bytes += meta.size as u64;
+            }
+            Ok::<_, ApiError>(stats)
+        })
+        .await?
+    }
+}
+
+/// Cache-wide totals reported by [`DiskCache::stats`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CacheStats {
+    pub entries: u64,
+    pub bytes: u64,
 }
 
 #[cfg(test)]
-mod cache_tests {
-    use super::*;
-
-    /// Build a fresh, uniquely-named cache directory for a test.
-    async fn fresh_cache(label: &str) -> (DiskCache, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "ifc-lite-server-cache-test-{}-{}",
-            std::process::id(),
-            label
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        let cache = DiskCache::new(dir.to_str().unwrap()).await;
-        (cache, dir)
-    }
-
-    /// Corrupt the underlying content-addressed blob for `key` (index entry
-    /// stays intact) so a subsequent read fails with something other than
-    /// `EntryNotFound` — e.g. an integrity/IO error.
-    async fn corrupt_stored_content(dir: &std::path::Path, key: &str) {
-        let entry = cacache::index::find_async(dir, key)
-            .await
-            .unwrap()
-            .expect("index entry must exist before corrupting content");
-        // Mirror cacache's own content-addressed layout (private `content`
-        // module, so we can't call into it directly): `content-v2/<algo>/<hex[0..2]>/<hex[2..4]>/<rest>`.
-        let (algo, hex) = entry.integrity.to_hex();
-        let mut content_path = dir.to_path_buf();
-        content_path.push("content-v2");
-        content_path.push(algo.to_string());
-        content_path.push(&hex[0..2]);
-        content_path.push(&hex[2..4]);
-        content_path.push(&hex[4..]);
-        tokio::fs::remove_file(&content_path)
-            .await
-            .expect("content blob should exist to be removed");
-    }
-
-    /// A missing entry is reported as `Ok(None)`, not an error.
-    #[tokio::test]
-    async fn get_bytes_reports_a_missing_key_as_none_not_error() {
-        let (cache, _dir) = fresh_cache("get-bytes-missing").await;
-        let result = cache.get_bytes("does-not-exist").await;
-        assert!(matches!(result, Ok(None)), "expected Ok(None), got {result:?}");
-    }
-
-    /// Once the index says an entry exists but the backing content blob is
-    /// gone/corrupt, that is a real cache failure and must propagate as an
-    /// error — it must NOT be swallowed into a cache-miss `Ok(None)`, which
-    /// would silently mask disk corruption as "never cached".
-    #[tokio::test]
-    async fn get_bytes_propagates_non_missing_errors_instead_of_reporting_none() {
-        let (cache, dir) = fresh_cache("get-bytes-corrupt").await;
-        let key = "corrupt-key";
-        cache.set_bytes(key, b"hello world").await.unwrap();
-        corrupt_stored_content(&dir, key).await;
-
-        let result = cache.get_bytes(key).await;
-        assert!(
-            matches!(result, Err(ApiError::Cache(_))),
-            "expected a propagated Cache error for a corrupted entry, got {result:?}"
-        );
-    }
-
-    /// Same asymmetry as `get_bytes`, pinned for the typed `get::<T>` path.
-    #[tokio::test]
-    async fn get_propagates_non_missing_errors_instead_of_reporting_none() {
-        let (cache, dir) = fresh_cache("get-typed-corrupt").await;
-        let key = "corrupt-typed-key";
-        cache.set(key, &"hello".to_string()).await.unwrap();
-        corrupt_stored_content(&dir, key).await;
-
-        let result: Result<Option<String>, ApiError> = cache.get(key).await;
-        assert!(
-            matches!(result, Err(ApiError::Cache(_))),
-            "expected a propagated Cache error for a corrupted entry, got {result:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn get_reports_a_missing_key_as_none_not_error() {
-        let (cache, _dir) = fresh_cache("get-typed-missing").await;
-        let result: Result<Option<String>, ApiError> = cache.get("does-not-exist").await;
-        assert!(matches!(result, Ok(None)), "expected Ok(None), got {result:?}");
-    }
-
-    /// The cache is content-addressable: different content MUST map to
-    /// different keys, or unrelated files would collide and one would
-    /// silently serve another's cached data.
-    #[test]
-    fn generate_key_differs_for_different_content() {
-        let a = DiskCache::generate_key(b"hello world");
-        let b = DiskCache::generate_key(b"goodbye world");
-        assert_ne!(a, b);
-    }
-
-    /// Deterministic: hashing the same bytes twice must produce the same key.
-    #[test]
-    fn generate_key_is_deterministic_for_the_same_content() {
-        let a = DiskCache::generate_key(b"same content");
-        let b = DiskCache::generate_key(b"same content");
-        assert_eq!(a, b);
-    }
-
-    /// Pins the concrete algorithm (SHA256, hex-encoded) since callers
-    /// (e.g. `routes/parse/cache_keys.rs`) rely on the exact digest shape.
-    #[test]
-    fn generate_key_matches_the_sha256_hex_digest() {
-        let key = DiskCache::generate_key(b"hello world");
-        assert_eq!(
-            key,
-            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
-        );
-    }
-}
+#[path = "cache_tests.rs"]
+mod cache_tests;

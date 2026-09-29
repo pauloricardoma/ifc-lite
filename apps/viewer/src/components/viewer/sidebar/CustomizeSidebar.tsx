@@ -19,20 +19,23 @@
  */
 
 import { useEffect, useRef, useState } from 'react';
-import { GripVertical, Eye, EyeOff, RotateCcw, Lock, ChevronUp, ChevronDown, Plus } from 'lucide-react';
+import { GripVertical, EyeOff, RotateCcw, Lock, ChevronUp, ChevronDown, Plus } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useViewerStore } from '@/store';
+import { useTranslation } from '@/i18n';
 import { getPanelDef, type WorkspacePanelId } from '@/lib/panels/registry';
+import { resetLayout } from '@/store/layoutReset';
+import { registerKeyboardCommand } from '@/lib/commands/dispatcher';
 
 export function CustomizeSidebar({ onClose }: { onClose: () => void }) {
+  const { t } = useTranslation();
   const order = useViewerStore((s) => s.sidebarOrder);
   const hiddenIds = useViewerStore((s) => s.sidebarHiddenIds);
   const reorder = useViewerStore((s) => s.reorderSidebarPanel);
   const setShown = useViewerStore((s) => s.setPanelShownInSidebar);
-  const resetLayout = useViewerStore((s) => s.resetSidebarLayout);
 
   const hidden = new Set(hiddenIds);
-  const ref = useRef<HTMLDivElement>(null);
+  const ref = useRef<HTMLFieldSetElement>(null);
   const restoreFocusRef = useRef<HTMLElement | null>(null);
   const [dragId, setDragId] = useState<string | null>(null);
   const [overId, setOverId] = useState<string | null>(null);
@@ -67,38 +70,36 @@ export function CustomizeSidebar({ onClose }: { onClose: () => void }) {
         onClose();
       }
     };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
+    const removeEscape = registerKeyboardCommand('ui.closeOverlay', () => { onClose(); }, {
+      layer: 'popover', allowInTextEntry: true, ignoreModifiers: true,
+    });
     // Defer the mousedown listener a tick so the click that opened us doesn't close us.
     const t = window.setTimeout(() => document.addEventListener('mousedown', onDown), 0);
-    document.addEventListener('keydown', onKey);
     return () => {
       window.clearTimeout(t);
       document.removeEventListener('mousedown', onDown);
-      document.removeEventListener('keydown', onKey);
+      removeEscape();
     };
   }, [onClose]);
 
   return (
-    <div
+    <fieldset
       ref={ref}
-      role="group"
       tabIndex={-1}
-      aria-label="Customize sidebar panels"
-      className="absolute bottom-2 right-14 z-40 w-64 rounded-lg border border-border bg-popover text-popover-foreground shadow-2xl overflow-hidden outline-none"
+      aria-label={t('shellChrome.customizeSidebar.ariaLabel')}
+      className="absolute bottom-2 right-14 z-40 min-w-0 w-64 rounded-lg border border-border bg-popover text-popover-foreground shadow-2xl overflow-hidden outline-none"
     >
       <div className="flex items-center justify-between px-3 h-9 border-b border-border bg-muted/40">
-        <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-          Customize sidebar
+        <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+          {t('shellChrome.shared.customizeSidebar')}
         </span>
         <button
           type="button"
           onClick={() => resetLayout()}
-          title="Reset to default order + show all"
-          className="inline-flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground transition-colors"
+          title={t('shellChrome.customizeSidebar.resetTitle')}
+          className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
         >
-          <RotateCcw className="h-3 w-3" /> Reset
+          <RotateCcw className="h-3 w-3" /> {t('shellChrome.customizeSidebar.resetLabel')}
         </button>
       </div>
 
@@ -107,6 +108,7 @@ export function CustomizeSidebar({ onClose }: { onClose: () => void }) {
         {shownIds.map((id, index) => {
           const def = getPanelDef(id);
           if (!def) return null;
+          const title = t(def.titleKey);
           const Icon = def.Icon;
           const locked = id === 'properties';
           const prevShown = shownIds[index - 1];
@@ -121,6 +123,8 @@ export function CustomizeSidebar({ onClose }: { onClose: () => void }) {
                 setOverId(null);
               }}
               onDragOver={(e) => {
+                // Only a row reorder claims the drag; a file is the window's (#5845).
+                if (!dragId) return;
                 e.preventDefault();
                 if (overId !== id) setOverId(id);
               }}
@@ -137,12 +141,12 @@ export function CustomizeSidebar({ onClose }: { onClose: () => void }) {
             >
               <GripVertical className="h-3.5 w-3.5 text-muted-foreground/60 shrink-0" aria-hidden />
               <Icon className="h-4 w-4 text-muted-foreground shrink-0" aria-hidden />
-              <span className="text-xs flex-1 truncate">{def.title}</span>
+              <span className="text-xs flex-1 truncate">{title}</span>
               <button
                 type="button"
                 disabled={index === 0}
                 onClick={() => prevShown && reorder(id, order.indexOf(prevShown))}
-                aria-label={`Move ${def.title} up`}
+                aria-label={t('shellChrome.customizeSidebar.moveUp', { title })}
                 className="h-6 w-5 inline-flex items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-25 disabled:pointer-events-none transition-colors"
               >
                 <ChevronUp className="h-3.5 w-3.5" />
@@ -151,7 +155,7 @@ export function CustomizeSidebar({ onClose }: { onClose: () => void }) {
                 type="button"
                 disabled={index === shownIds.length - 1}
                 onClick={() => nextShown && reorder(id, order.indexOf(nextShown))}
-                aria-label={`Move ${def.title} down`}
+                aria-label={t('shellChrome.customizeSidebar.moveDown', { title })}
                 className="h-6 w-5 inline-flex items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-25 disabled:pointer-events-none transition-colors"
               >
                 <ChevronDown className="h-3.5 w-3.5" />
@@ -160,8 +164,16 @@ export function CustomizeSidebar({ onClose }: { onClose: () => void }) {
                 type="button"
                 disabled={locked}
                 onClick={() => setShown(id, false)}
-                aria-label={locked ? `${def.title} is always shown` : `Hide ${def.title}`}
-                title={locked ? 'Always shown' : 'Hide from sidebar'}
+                aria-label={
+                  locked
+                    ? t('shellChrome.customizeSidebar.alwaysShownAriaLabel', { title })
+                    : t('shellChrome.customizeSidebar.hideAriaLabel', { title })
+                }
+                title={t(
+                  locked
+                    ? 'shellChrome.customizeSidebar.alwaysShownTitle'
+                    : 'shellChrome.customizeSidebar.hideFromSidebarTitle',
+                )}
                 className={cn(
                   'h-6 w-6 inline-flex items-center justify-center rounded transition-colors',
                   locked ? 'opacity-30' : 'text-muted-foreground hover:bg-muted hover:text-foreground',
@@ -176,27 +188,28 @@ export function CustomizeSidebar({ onClose }: { onClose: () => void }) {
         {/* Hidden: removed from the rail; the only control is Show (restore). */}
         {hiddenList.length > 0 && (
           <>
-            <div className="mt-1 px-3 pt-2 pb-1 border-t border-border/60 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/70">
-              Hidden
+            <div className="mt-1 px-3 pt-2 pb-1 border-t border-border/60 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+              {t('shellChrome.customizeSidebar.hiddenSectionHeader')}
             </div>
             {hiddenList.map((id) => {
               const def = getPanelDef(id);
               if (!def) return null;
+              const title = t(def.titleKey);
               const Icon = def.Icon;
               return (
                 <div key={id} className="flex items-center gap-1.5 px-2 py-1.5 mx-1 rounded-md text-muted-foreground">
                   <span className="w-3.5 shrink-0" aria-hidden />
                   <Icon className="h-4 w-4 shrink-0 opacity-60" aria-hidden />
-                  <span className="text-xs flex-1 truncate opacity-70">{def.title}</span>
+                  <span className="text-xs flex-1 truncate opacity-70">{title}</span>
                   <button
                     type="button"
                     onClick={() => setShown(id, true)}
-                    aria-label={`Show ${def.title}`}
-                    title="Show in sidebar"
-                    className="h-6 inline-flex items-center gap-1 rounded px-1.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+                    aria-label={t('shellChrome.customizeSidebar.showAriaLabel', { title })}
+                    title={t('shellChrome.customizeSidebar.showInSidebarTitle')}
+                    className="h-6 inline-flex items-center gap-1 rounded px-1.5 text-xs text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
                   >
                     <Plus className="h-3.5 w-3.5" />
-                    Show
+                    {t('shellChrome.customizeSidebar.showLabel')}
                   </button>
                 </div>
               );
@@ -205,9 +218,9 @@ export function CustomizeSidebar({ onClose }: { onClose: () => void }) {
         )}
       </div>
 
-      <div className="px-3 py-1.5 border-t border-border text-[10px] text-muted-foreground select-none">
-        Drag a row to reorder. Hide moves a panel to Hidden; Show brings it back.
+      <div className="px-3 py-1.5 border-t border-border text-xs text-muted-foreground select-none">
+        {t('shellChrome.customizeSidebar.footerHint')}
       </div>
-    </div>
+    </fieldset>
   );
 }

@@ -9,6 +9,8 @@
  * Focus on structural invariants, not exact values.
  */
 
+import { runAppearanceContracts } from './lib/wasm-appearance-contracts.mjs';
+import { runColdLoadContracts } from './lib/wasm-cold-load-contracts.mjs';
 import { readFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -28,7 +30,12 @@ import {
 import { parseMeshesViaPrePass } from './lib/mesh-via-prepass.mjs';
 import { runPrepassClassBoundaryTests } from './lib/prepass-class-boundary.mjs';
 import { runShardRefusalBoundaryTests } from './lib/shard-refusal-boundary.mjs';
-
+import { runClassToggleShardContract } from './lib/class-toggle-shard-contract.mjs';
+import { runOverlayFrameContracts } from './lib/wasm-overlay-frame-contracts.mjs';
+import { runRtcPrecisionContracts } from './lib/wasm-rtc-precision-contracts.mjs';
+import { finishContractRun, runLandXmlContracts } from './lib/wasm-landxml-contracts.mjs';
+import { runStepLogContracts } from './lib/wasm-step-log-contracts.mjs';
+import { runSweptDiskContracts } from './lib/wasm-swept-disk-contracts.mjs';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = join(__dirname, '..');
 const FIXTURES_DIR = join(ROOT_DIR, 'tests/models');
@@ -56,31 +63,24 @@ if (!existsSync(WASM_BIN)) {
   console.log('⚠️  wasm runtime missing — run `bash scripts/build-wasm.sh`. Skipping.');
   process.exit(0);
 }
-if (!existsSync(COLUMN_IFC)) {
-  console.log('⚠️  column fixture missing — run `pnpm fixtures`. Skipping.');
-  process.exit(0);
+/** Whether a fixture is present, warning once (naming what is skipped) when it is not. */
+function fixtureAvailable(path, what, skipped) {
+  if (existsSync(path)) return true;
+  console.log(`⚠️  ${what} fixture missing — run \`pnpm fixtures\`. ${skipped} will be skipped.`);
+  return false;
 }
-const GEOREF_AVAILABLE = existsSync(GEOREF_IFC);
-if (!GEOREF_AVAILABLE) {
-  console.log('⚠️  georef fixture missing — run `pnpm fixtures`. Georef tests will be skipped.');
-}
-const LAYERED_AVAILABLE = existsSync(LAYERED_IFC);
-if (!LAYERED_AVAILABLE) {
-  console.log('⚠️  layered-wall fixture missing — run `pnpm fixtures`. geometryClass pin will be skipped.');
-}
-const SPACES_AVAILABLE = existsSync(SPACES_IFC);
-if (!SPACES_AVAILABLE) {
-  console.log('⚠️  spaces fixture missing — run `pnpm fixtures`. Energy-model tests will be skipped.');
-}
+const COLUMN_AVAILABLE = existsSync(COLUMN_IFC);
+const GEOREF_AVAILABLE = fixtureAvailable(GEOREF_IFC, 'georef', 'Georef tests');
+const LAYERED_AVAILABLE = fixtureAvailable(LAYERED_IFC, 'layered-wall', 'geometryClass pin');
+const SPACES_AVAILABLE = fixtureAvailable(SPACES_IFC, 'spaces', 'Energy-model tests');
 
 // Initialize WASM
 console.log('📦 Loading WASM...');
 const wasmBuffer = readFileSync(WASM_BIN);
-initSync(wasmBuffer);
+const ownershipWasmExports = initSync(wasmBuffer);
 console.log('✅ WASM initialized\n');
 
-// Load fixture files
-const columnContent = readFileSync(COLUMN_IFC, 'utf-8');
+const columnContent = COLUMN_AVAILABLE ? readFileSync(COLUMN_IFC, 'utf-8') : '';
 
 // Create API
 const api = new IfcAPI();
@@ -115,7 +115,16 @@ function test(name, fn) {
     failed++;
   }
 }
-
+runAppearanceContracts(IfcAPI, test);
+runLandXmlContracts(api, test);
+runStepLogContracts(api, test);
+runSweptDiskContracts(api, test, ROOT_DIR);
+await (await import('./lib/wasm-extrusion-bridge-contracts.mjs')).runExtrusionBridgeContracts(test, ROOT_DIR); // #6306
+if (!COLUMN_AVAILABLE) {
+  skip('IFC-backed WASM contracts', `column fixture missing — ${FIXTURES_HINT}`);
+  finishContractRun(api, passed, failed, skipped);
+  process.exit(failed > 0 ? 1 : 0);
+}
 // ===== IfcAPI initialization =====
 console.log('📋 IfcAPI initialization');
 
@@ -127,6 +136,8 @@ test('should have a version string', () => {
   assert.equal(typeof api.version, 'string');
   assert.ok(api.version.length > 0);
 });
+
+runOverlayFrameContracts(api, test);
 
 // ===== parseMeshes =====
 console.log('\n📋 parseMeshes');
@@ -468,29 +479,8 @@ if (LAYERED_AVAILABLE) {
     `${LAYERED_IFC} missing \u2014 ${FIXTURES_HINT}`);
 }
 
-test('processGeometryBatchFromSource returns empty when no source is installed (defensive)', () => {
-  const freshApi = new IfcAPI();
-  const bytes = new TextEncoder().encode(columnContent);
-  try {
-    const pre = freshApi.buildPrePassOnce(bytes);
-    // No setSourceBytes: the held bytes are empty → zero meshes, and crucially
-    // NO panic (the decoder validates every byte span). The JS worker gates the
-    // *FromSource path on a successful setSourceBytes, so this is unreachable in
-    // production, but it must degrade gracefully rather than corrupt/crash.
-    const col = freshApi.processGeometryBatchFromSource(
-      pre.jobs, pre.unitScale,
-      pre.rtcOffset[0], pre.rtcOffset[1], pre.rtcOffset[2], pre.needsShift,
-      pre.voidKeys, pre.voidCounts, pre.voidValues, pre.styleIds, pre.styleColors,
-    );
-    try {
-      assert.equal(col.length, 0, 'FromSource without setSourceBytes must produce no meshes');
-    } finally {
-      col.free();
-    }
-  } finally {
-    freshApi.clearPrePassCache();
-    freshApi.free();
-  }
+await runColdLoadContracts({
+  IfcAPI, ownershipWasmExports, columnContent, FIXTURES_DIR, FIXTURES_HINT, SPACES_AVAILABLE, SPACES_IFC, test, skip
 });
 
 // ===== Pre-pass contract (viewer boundary) =====
@@ -631,17 +621,14 @@ test('mesh output is metre-normalized (column fits a sane bbox)', () => {
   collection.free();
 });
 
-// ===== RTC rebase (>10km national-grid coordinates) =====
-console.log('\n📋 RTC rebase (>10km)');
+// ===== RTC rebase (>1km national-grid coordinates) =====
+console.log('\n📋 RTC rebase (>1km)');
 
 // The wasm pre-pass flags `needsShift` when the detected RTC offset exceeds
-// 10 km on any axis. The threshold constant is `10000.0` (metres, after
-// unit-scaling) in:
-//   - rust/wasm-bindings/src/api/gpu_meshes.rs (`needs_shift = rtc_offset.N.abs() > 10000.0`)
-//   - rust/geometry/src/router/processing.rs (`rtc_offset_from_translations`,
-//     `const THRESHOLD: f64 = 10000.0` — median element translation gate)
-//   - rust/core/src/model_bounds.rs (`has_large_coordinates`, `THRESHOLD = 10000.0`)
-const RTC_THRESHOLD_M = 10000.0;
+// the gate on any axis. Single Rust home (#4934, was 10 km): `rust/core/src/
+// limits.rs` `LARGE_COORD_THRESHOLD_METERS = 1000.0`, read by every consumer
+// (the median sampler `rtc_offset.rs`, the bounds fallback `model_bounds.rs`).
+const RTC_THRESHOLD_M = 1000.0;
 
 // The column fixture is authored in INCHES (IFCCONVERSIONBASEDUNIT 0.0254 m);
 // the RTC offset is detected in unit-scaled METRES, so planted coordinates
@@ -710,18 +697,18 @@ test('national-grid coordinates (Swiss LV95) should trigger the RTC rebase', () 
   collection.free();
 });
 
-test('coordinates just under the 10km threshold should NOT trigger the shift', () => {
-  // needs_shift uses a strict `> 10000.0` comparison on the unit-scaled
-  // median element translation. Plant the site so the COMPOSED column
-  // translation (site + ~10.97m local) lands just under 10_000 m.
-  const NEAR_X_M = 9_950; // composed ≈ 9_960.97 m < 10_000 m
-  const NEAR_Y_M = 9_950; // composed ≈ 9_957.32 m < 10_000 m
+test('coordinates just under the 1km threshold should NOT trigger the shift', () => {
+  // needs_shift uses a strict `> 1000.0` comparison on the unit-scaled median
+  // element translation. Site + ~10.97m local lands just under 1_000 m —
+  // #4934 lowered the gate from 10 km, pinning the NEW just-under edge.
+  const NEAR_X_M = 900; // composed ≈ 910.97 m < 1_000 m
+  const NEAR_Y_M = 900; // composed ≈ 907.32 m < 1_000 m
   const moved = withSiteOriginMetres(NEAR_X_M, NEAR_Y_M);
   assert.notEqual(moved, columnContent, 'Placement transplant must change the content');
 
   const collection = parseMeshesViaPrePass(api, moved);
 
-  assert.equal(collection.hasRtcOffset(), false, 'needsShift must stay false under 10km');
+  assert.equal(collection.hasRtcOffset(), false, 'needsShift must stay false under 1km');
   assert.equal(collection.rtcOffsetX, 0, 'rtcOffset must stay [0,0,0] under threshold');
   assert.equal(collection.rtcOffsetY, 0, 'rtcOffset must stay [0,0,0] under threshold');
   assert.equal(collection.rtcOffsetZ, 0, 'rtcOffset must stay [0,0,0] under threshold');
@@ -742,8 +729,8 @@ test('coordinates just under the 10km threshold should NOT trigger the shift', (
     mesh.free();
   }
   assert.ok(
-    maxAbs > 9000,
-    `Unshifted geometry should stay near its 9.95km placement, got max |world| = ${maxAbs}`,
+    maxAbs > 900,
+    `Unshifted geometry should stay near its 900m placement, got max |world| = ${maxAbs}`,
   );
 
   collection.free();
@@ -757,6 +744,8 @@ test('unmodified small-coordinate model keeps needsShift=false', () => {
   assert.equal(collection.rtcOffsetZ, 0);
   collection.free();
 });
+
+runRtcPrecisionContracts(api, test, columnContent, withSiteOriginMetres, COLUMN_LOCAL_X_M, COLUMN_LOCAL_Y_M);
 
 // ===== scanEntitiesFast =====
 console.log('\n📋 scanEntitiesFast');
@@ -795,10 +784,12 @@ test('should handle truncated IFC content gracefully', () => {
 });
 
 // ===== export boundary (Rust ifc-lite-export) =====
-console.log('\n📋 export (exportGlb / exportKmz)');
+console.log('\n📋 export (exportGlb)');
 
-// A real GLB from the column fixture — also the input the KMZ packer consumes.
-const glbBytes = api.exportGlb(new TextEncoder().encode(columnContent), false, new Uint32Array(), new Uint32Array(), '');
+// A real GLB from the column fixture (also the KMZ packer's input). `isolated` undefined = no filter (#4328).
+const glbBytes = api.exportGlb(new TextEncoder().encode(columnContent), false, new Uint32Array(), undefined, '');
+test('exportGlb: an empty isolation array is an ACTIVE filter and fails closed (NO_RENDER_GEOMETRY), not "no filter"', () =>
+  assert.throws(() => api.exportGlb(new TextEncoder().encode(columnContent), false, new Uint32Array(), new Uint32Array(), ''), /NO_RENDER_GEOMETRY/));
 
 test('exportGlb returns a binary glTF (GLB magic "glTF") with real meshes', () => {
   assert.ok(glbBytes instanceof Uint8Array, 'GLB should be a Uint8Array');
@@ -937,17 +928,12 @@ test('exportGlbFromMeshes output is spec-conformant glTF 2.0 (0 errors, 0 warnin
   assert.equal(fromMeshesReport.info.totalTriangleCount, 1, 'the one triangle handed in');
 });
 
-// ===== legacy keywords keep their type across the wasm boundary (#3179) =====
+// ===== schema-local keywords keep their exact type across WASM (#4203) =====
 //
-// The native pipeline resolves a legacy keyword through `legacy_entities.rs`
-// and labels the node with its real base type. The BROWSER path did not: the
-// jobs wire carries only (id, start, end), so `batch.rs` rebuilt the type from
-// `entity.ifc_type` -- the decoder's bare `IfcType::from_str` -- and a legacy
-// keyword that reached that path arrived as `Unknown` with the Unknown default
-// colour. Not every keyword IFC4X3 dropped: an arm with `has_geometry: false`
-// in `legacy_entities.rs` does not reach that path today, so this test does
-// not cover those. #3187 carries the trace: which producers gate on the flag,
-// and the type-geometry gate that does not.
+// The generated schema registry now owns entity recognition. The jobs wire
+// carries only (id, start, end), so this boundary must retain the exact
+// schema-local keyword rather than collapsing it through a legacy base-type
+// table or losing it as Unknown.
 //
 // It is silent in the same way a wrong geometryClass is: the mesh renders, it
 // is simply mislabelled, and type-exact visibility rules and styling quietly
@@ -957,12 +943,11 @@ test('exportGlbFromMeshes output is spec-conformant glTF 2.0 (0 errors, 0 warnin
 // defect lived in the wasm binding specifically -- the native path was correct
 // the whole time, so any test that did not cross the boundary agreed with the
 // half that already worked.
-console.log('\n📋 legacy keyword labelling (Rust → JS, #3179)');
+console.log('\n📋 schema-local keyword labelling (Rust → JS, #4203)');
 
-test('a legacy keyword crosses as its resolved type, not "Unknown"', () => {
-  // IFCCOLUMN is modern; IFCBEAMSTANDARDCASE is IFC4-removed and sits in
-  // `legacy_entities.rs` mapping to IfcBeam. Respelling the fixture's columns
-  // changes ONE keyword and nothing else, so the label is the only variable.
+test('a schema-local keyword crosses as its exact type, not "Unknown" (#4203)', () => {
+  // Respelling the fixture's columns changes ONE keyword and nothing else, so
+  // the label is the only variable.
   const modern = columnContent;
   assert.ok(modern.includes('IFCCOLUMN('), 'fixture lost its columns — the respelling would test nothing');
   const legacy = modern.replace(/IFCCOLUMN\(/g, 'IFCBEAMSTANDARDCASE(');
@@ -985,12 +970,11 @@ test('a legacy keyword crosses as its resolved type, not "Unknown"', () => {
 
   assert.ok(before.length > 0, 'the fixture must produce meshes, or this pins nothing');
   assert.equal(after.length, before.length, 'the respelling changed how many meshes are produced');
-  // The RESOLVED type specifically, not merely "not Unknown", which any
-  // other wrong label would also satisfy. The message prints the distinct
-  // labels seen, so a regression to "Unknown" names itself.
+  // The exact schema-local type specifically, not merely "not Unknown", which
+  // any other label would also satisfy.
   assert.ok(
-    after.every((t) => t === 'IfcBeam'),
-    `expected every mesh to label as IfcBeam, saw ${JSON.stringify([...new Set(after)])}`,
+    after.every((t) => t === 'IfcBeamStandardCase'),
+    `expected every mesh to label as IfcBeamStandardCase, saw ${JSON.stringify([...new Set(after)])}`,
   );
 });
 
@@ -1426,24 +1410,6 @@ if (SPACES_AVAILABLE) {
   skip('energy model (exportHbjson / exportDfjson)',
     `${SPACES_IFC} missing — ${FIXTURES_HINT}`);
 }
-
-test('exportKmz packs a stored-zip KMZ (PK header, doc.kml + model.glb, axis-derived heading)', () => {
-  const kmz = api.exportKmz(glbBytes, 47.5, 8.5, 412, 1, 0, 'Contract Bldg');
-  assert.ok(kmz instanceof Uint8Array, 'KMZ should be a Uint8Array');
-  assert.deepEqual(Array.from(kmz.slice(0, 4)), [0x50, 0x4b, 0x03, 0x04]); // "PK\x03\x04"
-  const text = Buffer.from(kmz).toString('latin1');
-  assert.ok(text.includes('doc.kml'), 'archive names doc.kml');
-  assert.ok(text.includes('model.glb'), 'archive names model.glb');
-  assert.ok(text.includes('<heading>0</heading>'), 'heading derived from grid axis (1,0) → 0');
-  assert.ok(text.includes('Contract Bldg'), 'placemark name present');
-});
-
-test('exportKmz accepts undefined optional grid axes at the JS boundary (heading 0)', () => {
-  // Exercises the Rust Option<f64> params as `undefined` (the shim detail Codex flagged).
-  const kmz = api.exportKmz(glbBytes, 0, 0, 0, undefined, undefined, '');
-  assert.ok(kmz instanceof Uint8Array);
-  assert.ok(Buffer.from(kmz).toString('latin1').includes('<heading>0</heading>'), 'undefined axes → heading 0');
-});
 
 // ===== OpenUSD (.usda) export boundary =====
 // The vitest suites all MOCK the wasm boundary (AGENTS.md §Geometry & WASM), so
@@ -2185,11 +2151,12 @@ await runPrepassClassBoundaryTests(api, test);
 // into "this file refused nothing". Same module split, same reason.
 await runShardRefusalBoundaryTests(api, test);
 
-
-// Summary
-console.log('\n' + '═'.repeat(50));
-console.log(`📊 Results: ${passed} passed, ${failed} failed, ${skipped} skipped`);
-console.log('═'.repeat(50));
+// ===== Class-toggled classes never ride the instanced shard (#5409) =====
+// The fixture is built from the viewer's class-toggle table, so a class added
+// there and not to the Rust partition fails here.
+await runClassToggleShardContract(IfcAPI, test);
+await (await import('./lib/wasm-remesh-contracts.mjs')).runRemeshContracts({ IfcAPI, FIXTURES_DIR, FIXTURES_HINT, test, skip }); // #6232
+finishContractRun(api, passed, failed, skipped);
 
 if (failed > 0) {
   process.exit(1);

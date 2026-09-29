@@ -40,7 +40,7 @@ const STUB_STORE: IfcDataStore = {
 
 function genSchedule(): ScheduleExtraction {
   return {
-    hasSchedule: true,
+    hasSchedule: true, workCalendars: [],
     workSchedules: [{
       expressId: 0, globalId: 'ws', kind: 'WorkSchedule',
       name: 'Gen', startTime: '2024-05-01T08:00:00',

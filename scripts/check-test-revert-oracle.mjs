@@ -29,7 +29,7 @@
  * VERDICTS.
  *   OBSERVED      assertions went red -> the change is covered. Exit 0.
  *   UNOBSERVED    everything still passes -> THE FINDING. Exit 1.
- *   INCONCLUSIVE  the reverted tests never loaded / never ran. Exit 3.
+ *   INCONCLUSIVE  the reverted tests never ran (REVERT-BROKE-BUILD: never loaded). Exit 3.
  *
  * THE INCONCLUSIVE CASE IS THE POINT. A blunt revert usually also deletes
  * test-only exports (`__resetCacheForTests`), so the test file dies at import
@@ -48,12 +48,9 @@
  * indistinguishable from a real RED, so that text is read as a load failure
  * too — see `LOAD_ERROR_PATTERNS` in `lib/revert-oracle.mjs`.
  *
- * NOT A CI CHECK, DELIBERATELY. It mutates the working tree and it is slow.
- * See the LIMITATIONS block at the bottom of this file, and `--help`, for what
- * wiring it into CI would require.
- *
- * @unwired-by-design it reverse-applies patches to the working tree and reruns
- * a branch's suites twice; a pre-push interrogation tool, not a required check.
+ * CI runs it only in a throwaway, read-only checkout with a hard timeout. An
+ * capability gaps, UNOBSERVED, and broken baselines all block, through
+ * distinguishable result channels.
  *
  * USAGE
  *   node scripts/check-test-revert-oracle.mjs [options]
@@ -72,6 +69,7 @@
  *                       Lets you point a version of the oracle you trust at a
  *                       checkout that predates it.
  *   --json              emit a machine-readable result alongside the report
+ *   --ci                block UNOBSERVED, broken baselines and capability gaps
  */
 
 import { spawnSync } from 'node:child_process';
@@ -79,29 +77,47 @@ import { readFileSync, writeFileSync, existsSync, mkdtempSync, rmSync } from 'no
 import { join, dirname, resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
-
+import { randomUUID } from 'node:crypto';
+import { cargoLockPatchPaths, normalizeRestoredPaths, partialCargoManifestSelection } from './lib/revert-oracle-cargo-lock.mjs';
+import { parseRevertOracleArgs } from './lib/revert-oracle-args.mjs';
 import {
   parseNameStatus,
   classifyDiff,
-  detectRunner,
-  cargoRunner,
-  rootScriptsRunner,
-  parseRunnerOutput,
   aggregate,
-  verdict,
+  OBSERVED,
   UNOBSERVED,
-  SURGICAL_ADVICE,
 } from './lib/revert-oracle.mjs';
+import { partitionBrowserSpecs } from './lib/revert-oracle-inert.mjs';
+import { planBrowserSpecs } from './lib/revert-oracle-browser-run.mjs';
+import { measure } from './lib/revert-oracle-measure.mjs';
+import { isDependabotDependencyOnly } from './lib/revert-oracle-dependabot.mjs';
+import { isVersionOnlyManifestDiff } from './lib/revert-oracle-version-bump.mjs';
+import { isCommentOnlyDiff } from './lib/revert-oracle-comment-only.mjs';
+import { ciExitCode } from './lib/revert-oracle-ci.mjs';
+import {
+  createResultEmitter,
+  ORACLE_CHANNEL,
+  PULL_REQUEST_CHANNEL,
+  resultRecord,
+} from './lib/revert-oracle-result.mjs';
+import { planRuns } from './lib/revert-oracle-plan-runs.mjs';
+import { loadTypeScript, typeOnlyProduction, typecheckPlans, gitShow } from './lib/revert-oracle-type-only.mjs';
+import { realRoot } from './lib/revert-oracle-run-plan.mjs';
+import { printHumanReport } from './lib/revert-oracle-human-report.mjs';
+import { buildExecutionLedger, ledgerVerdict, partitionRunnablePlans } from './lib/revert-oracle-ledger.mjs';
 
 const SELF_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const rootFlag = process.argv.indexOf('--root');
-const ROOT = rootFlag === -1 ? SELF_ROOT : resolve(process.argv[rootFlag + 1] ?? SELF_ROOT);
+const ROOT = realRoot(rootFlag === -1 ? SELF_ROOT : resolve(process.argv[rootFlag + 1] ?? SELF_ROOT));
 
 // Restoration state, declared before the first abort path can fire: `die()`
 // consults it, and a `let` in the temporal dead zone would throw instead.
-let reverted = false;
-let restoreVerified = false;
-let patchPath = null;
+let restoration = 'not-required', patchPath = null, restorationPaths = [];
+let resultContext = { base: null, head: null, production: [], tests: [] };
+const resultEmitter = createResultEmitter(process.argv.includes('--json'));
+const invocationId = randomUUID();
+const startedAt = new Date().toISOString();
+let cleaningUp = false;
 
 // Exit codes. 0 is reserved for OBSERVED and nothing else.
 const EXIT_OBSERVED = 0;
@@ -111,18 +127,71 @@ const EXIT_INCONCLUSIVE = 3;
 const EXIT_REVERT_FAILED = 4;
 const EXIT_RESTORE_FAILED = 5;
 
-function die(code, message, extra = []) {
+function emitResult(channel, verdict, code, reason, details = {}) {
+  resultEmitter.emit(resultRecord({
+    ...details,
+    ...resultContext,
+    channel,
+    verdict,
+    exitCode: code,
+    reason,
+    invocationId,
+    startedAt,
+    finishedAt: new Date().toISOString(),
+    restoration,
+  }));
+}
+
+function die(code, message, extra = [], details = {}) {
   // `process.exit` skips the `finally` block, so every abort path restores the
   // tree itself. `restore` is a no-op until the revert has actually landed.
-  if (typeof restore === 'function') restore('abort');
+  const restored = typeof restore !== 'function' || restore('abort');
+  let channel = details.channel ?? ORACLE_CHANNEL;
+  let outcome = details.verdict ?? 'ERROR';
+  if (!restored) {
+    code = EXIT_RESTORE_FAILED;
+    message = `the oracle could not restore the working tree after: ${message}`;
+    channel = ORACLE_CHANNEL;
+    outcome = 'RESTORE-FAILED';
+  }
   console.error(`\n[revert-oracle] ABORT: ${message}`);
   for (const line of extra) console.error(`  ${line}`);
   console.error('');
+  if (!resultEmitter.emitted) {
+    emitResult(channel, outcome, code, message, details);
+  }
   process.exit(code);
 }
 
+function emergency(signal) {
+  if (cleaningUp) return;
+  cleaningUp = true;
+  console.error(`\n[revert-oracle] interrupted by ${signal} — restoring the tree before exiting`);
+  const ok = restore(signal);
+  emitResult(ORACLE_CHANNEL, ok ? 'INTERRUPTED' : 'RESTORE-FAILED', ok ? EXIT_INCONCLUSIVE : EXIT_RESTORE_FAILED, `the oracle was interrupted by ${signal}`);
+  process.exit(ok ? EXIT_INCONCLUSIVE : EXIT_RESTORE_FAILED);
+}
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => emergency(sig));
+
+process.on('uncaughtException', (error) => {
+  console.error(error?.stack ?? String(error));
+  die(EXIT_NOTHING_CHECKED, `the oracle crashed: ${error?.message ?? String(error)}`, [], {
+    error: { name: error?.name ?? 'Error' },
+  });
+});
+
+function notApplicable(message) {
+  console.log(`  NOT APPLICABLE: ${message}`);
+  emitResult(PULL_REQUEST_CHANNEL, 'NOT-APPLICABLE', 0, message);
+  process.exit(0);
+}
+
+function rawGit(args, opts = {}) {
+  return spawnSync(process.env.IFC_LITE_ORACLE_GIT_BIN ?? 'git', [...(process.env.IFC_LITE_ORACLE_GIT_PREFIX ? [process.env.IFC_LITE_ORACLE_GIT_PREFIX] : []), ...args], { cwd: ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...opts });
+}
+
 function git(args, opts = {}) {
-  const r = spawnSync('git', args, { cwd: ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...opts });
+  const r = rawGit(args, opts);
   if (r.error) die(EXIT_NOTHING_CHECKED, `git ${args.join(' ')} could not run: ${r.error.message}`);
   return r;
 }
@@ -135,153 +204,23 @@ function gitOrDie(args) {
   return r.stdout;
 }
 
-// ---------------------------------------------------------------------------
-// Args
-// ---------------------------------------------------------------------------
-
-function parseArgs(argv) {
-  const opts = { base: 'upstream/main', head: 'HEAD', only: [], tests: [], mutation: null, json: false };
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    const next = () => {
-      const v = argv[++i];
-      if (v === undefined) die(EXIT_NOTHING_CHECKED, `${a} needs a value`);
-      return v;
-    };
-    if (a === '--base') opts.base = next();
-    else if (a === '--head') opts.head = next();
-    else if (a === '--only') opts.only.push(next());
-    else if (a === '--test') opts.tests.push(next());
-    else if (a === '--mutation') opts.mutation = next();
-    else if (a === '--root') next(); // already consumed above, before ROOT is frozen
-    else if (a === '--json') opts.json = true;
-    else if (a === '--help' || a === '-h') {
-      console.log(readFileSync(fileURLToPath(import.meta.url), 'utf8').split('*/')[0]);
-      process.exit(0);
-    } else die(EXIT_NOTHING_CHECKED, `unknown argument: ${a}`);
-  }
-  return opts;
-}
-
-// ---------------------------------------------------------------------------
-// Package / runner resolution
-// ---------------------------------------------------------------------------
-
-function findUp(startDir, filename) {
-  let dir = startDir;
-  for (;;) {
-    const candidate = join(dir, filename);
-    if (existsSync(candidate)) return dir;
-    const parent = dirname(dir);
-    if (parent === dir || !parent.startsWith(ROOT)) return null;
-    dir = parent;
-  }
-}
-
-function crateNameFor(absFile) {
-  const dir = findUp(dirname(absFile), 'Cargo.toml');
-  if (!dir) return null;
-  const toml = readFileSync(join(dir, 'Cargo.toml'), 'utf8');
-  const m = /^\s*\[package\][\s\S]*?^\s*name\s*=\s*"([^"]+)"/m.exec(toml);
-  return m ? { dir, crate: m[1] } : null;
-}
-
-/** Group test files by the package that owns them and pick each one's runner. */
-function planRuns(testPaths) {
-  /** @type {Map<string, {dir: string, files: string[], script: string|undefined, crate: string|null}>} */
-  const groups = new Map();
-  const unassigned = [];
-
-  for (const rel of testPaths) {
-    const abs = join(ROOT, rel);
-    if (rel.endsWith('.rs')) {
-      const c = crateNameFor(abs);
-      if (!c) { unassigned.push(rel); continue; }
-      const key = `cargo:${c.crate}`;
-      if (!groups.has(key)) groups.set(key, { dir: c.dir, files: [], script: undefined, crate: c.crate });
-      groups.get(key).files.push(rel);
-      continue;
-    }
-    const pkgDir = findUp(dirname(abs), 'package.json');
-    if (!pkgDir) { unassigned.push(rel); continue; }
-    if (!groups.has(pkgDir)) {
-      let script;
-      try {
-        script = JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8')).scripts?.test;
-      } catch {
-        script = undefined;
-      }
-      groups.set(pkgDir, { dir: pkgDir, files: [], script, crate: null });
-    }
-    groups.get(pkgDir).files.push(rel);
-  }
-
-  const plans = [];
-  for (const [key, g] of groups) {
-    const relFiles = g.files.map((f) => relative(g.dir, join(ROOT, f)) || f);
-    const runner = g.crate
-      ? cargoRunner(g.crate)
-      : (g.dir === ROOT ? rootScriptsRunner(g.files) : null) ?? detectRunner(g.script, relFiles);
-    plans.push({ key, dir: g.dir, files: g.files, relFiles, runner, script: g.script, crate: g.crate });
-  }
-  return { plans, unassigned };
-}
-
-/** Resolve a runner binary the way the package itself would. */
-function resolveBin(bin, pkgDir) {
-  if (bin === 'node') return process.execPath;
-  if (bin === 'cargo') return 'cargo';
-  let dir = pkgDir;
-  for (;;) {
-    const candidate = join(dir, 'node_modules', '.bin', bin);
-    if (existsSync(candidate)) return candidate;
-    const parent = dirname(dir);
-    if (parent === dir || !parent.startsWith(ROOT)) return null;
-    dir = parent;
-  }
-}
-
-function runPlan(plan, label) {
-  const cwd = plan.crate ? ROOT : plan.dir;
-  const binPath = resolveBin(plan.runner.bin, plan.dir);
-  if (!binPath) {
-    return {
-      kind: 'runner-missing',
-      passed: null,
-      failed: null,
-      total: null,
-      evidence: [`runner binary "${plan.runner.bin}" not found from ${relative(ROOT, plan.dir) || '.'} — run pnpm install`],
-    };
-  }
-  const started = Date.now();
-  const r = spawnSync(binPath, plan.runner.args, {
-    cwd,
-    encoding: 'utf8',
-    maxBuffer: 64 * 1024 * 1024,
-    env: { ...process.env, CI: '1', FORCE_COLOR: '0', NO_COLOR: '1' },
-  });
-  const parsed = parseRunnerOutput({
-    family: plan.runner.family,
-    stdout: r.stdout ?? '',
-    stderr: r.stderr ?? '',
-    exitCode: r.status,
-    spawnError: r.error ? `${r.error.message}` : undefined,
-  });
-  parsed.rawExitCode = r.status;
-  parsed.durationMs = Date.now() - started;
-  parsed.tail = `${r.stdout ?? ''}\n${r.stderr ?? ''}`.trim().split('\n').slice(-25).join('\n');
-  console.log(
-    `  [${label}] ${relative(ROOT, plan.dir) || '.'} (${plan.runner.family}) -> ${parsed.kind}` +
-      ` (pass ${parsed.passed ?? '?'}, fail ${parsed.failed ?? '?'}, total ${parsed.total ?? '?'}, exit ${r.status}, ${parsed.durationMs}ms)`,
-  );
-  return parsed;
-}
+// planRuns() (./lib/revert-oracle-plan-runs.mjs, #4090), the browser planner
+// and the measurement sequence (#6267) live in siblings: this file sits at its
+// module-size budget with zero headroom.
 
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
-const opts = parseArgs(process.argv.slice(2));
+const opts = parseRevertOracleArgs(
+  process.argv.slice(2),
+  (message) => die(EXIT_NOTHING_CHECKED, message),
+);
+if (opts.help) {
+  console.log(readFileSync(fileURLToPath(import.meta.url), 'utf8').split('*/')[0]);
+  emitResult(ORACLE_CHANNEL, 'HELP', 0, 'help requested');
+  process.exit(0);
+}
 
 console.log('[revert-oracle] does this branch\'s test actually observe this branch\'s change?');
 console.log(`  repo:  ${ROOT}`);
@@ -298,6 +237,7 @@ if (preStatus !== '') {
 
 const baseSha = gitOrDie(['rev-parse', '--verify', `${opts.base}^{commit}`]).trim();
 const headSha = gitOrDie(['rev-parse', '--verify', `${opts.head}^{commit}`]).trim();
+resultContext = { ...resultContext, base: baseSha, head: headSha };
 const checkedOut = gitOrDie(['rev-parse', 'HEAD']).trim();
 if (headSha !== checkedOut) {
   die(EXIT_NOTHING_CHECKED, `--head ${opts.head} (${headSha.slice(0, 9)}) is not the checked-out commit (${checkedOut.slice(0, 9)}). Check it out first; this tool patches the working tree in place.`);
@@ -308,8 +248,55 @@ const mergeBase = gitOrDie(['merge-base', baseSha, headSha]).trim();
 const entries = parseNameStatus(gitOrDie(['diff', '--name-status', `${mergeBase}`, headSha]));
 if (entries.length === 0) die(EXIT_NOTHING_CHECKED, 'the diff is empty; nothing to check.');
 
-const { production, test: testEntries, ignored, warnings } = classifyDiff(entries);
+if (opts.ci && isDependabotDependencyOnly(process.env.PR_AUTHOR_LOGIN, entries)) {
+  notApplicable(
+    'Dependabot changed dependency manifests/lockfiles only; ' +
+      'the normal build and test lanes provide the compatibility verdict.',
+  );
+}
+const { production, test: testEntries, ignored, inert, warnings, cargoLockChanged } = classifyDiff(entries);
+resultContext = {
+  ...resultContext,
+  production: production.map((entry) => entry.path),
+  tests: testEntries.map((entry) => entry.path),
+};
 for (const w of warnings) console.log(`  WARNING: ${w}`);
+
+// The changesets release PR ("chore: version packages") changes only
+// package.json `"version"` fields and the matching Cargo.toml version
+// literals — no test can observe a version bump. `isVersionOnlyManifestDiff`
+// checks the actual diff content of every `production` file (not just its
+// name), so a real dependency/scripts/exports edit in the same file still
+// requires a test as before. See revert-oracle-version-bump.mjs for the
+// full rationale and the false-negative it is written against.
+if (
+  opts.ci &&
+  production.length > 0 &&
+  production.every((e) => isVersionOnlyManifestDiff(e.path, gitOrDie(['diff', '-U0', mergeBase, headSha, '--', e.path]), e.path === 'rust-major-offset.json' ? { beforeText: gitOrDie(['show', `${mergeBase}:${e.path}`]), afterText: gitOrDie(['show', `${headSha}:${e.path}`]) } : undefined))
+) {
+  notApplicable(
+    'every production file is a package.json/Cargo.toml/rust-major-offset.json version-only bump ' +
+      '(release PR shape); nothing a test could observe.',
+  );
+}
+
+// A diff whose every changed line is a JS/TS comment changes no runtime
+// behaviour, so no test can ever observe it -- reverting a comment cannot
+// make any test go red, by construction (#4165: a paragraph added above
+// INERT_SUFFIXES documenting the .svg exception, nothing else, was
+// UNOBSERVED even after a test file was added to the branch). See
+// revert-oracle-comment-only.mjs for the full rationale and the
+// must-not-regress case (a real line change in the same diff still counts).
+if (
+  opts.ci &&
+  production.length > 0 &&
+  production.every((e) => isCommentOnlyDiff(e.path, gitOrDie(['diff', '-U0', mergeBase, headSha, '--', e.path])))
+) {
+  notApplicable(
+    'every production file\'s diff is comment-only (no code changed); ' +
+      'nothing a test could observe.',
+  );
+}
 
 let prodPaths = production.map((e) => e.path);
 if (opts.only.length > 0) {
@@ -319,37 +306,77 @@ if (opts.only.length > 0) {
   if (prodPaths.length === 0) die(EXIT_NOTHING_CHECKED, `--only matched none of the ${before} changed production files.`);
 }
 
-let testPaths = testEntries.map((e) => e.path).filter((p) => existsSync(join(ROOT, p)));
-if (opts.tests.length > 0) {
-  testPaths = testPaths.filter((p) => opts.tests.includes(p));
-  if (testPaths.length === 0) die(EXIT_NOTHING_CHECKED, '--test matched none of the branch\'s changed test files.');
+const partialCargoSelection = partialCargoManifestSelection(
+  cargoLockChanged, production.map((entry) => entry.path), prodPaths,
+);
+if (partialCargoSelection) {
+  die(
+    EXIT_NOTHING_CHECKED,
+    '--only selected some changed Cargo.toml files, but Cargo.lock can be reverted only with every changed Cargo.toml.',
+    partialCargoSelection,
+  );
 }
 
-console.log(`  files: ${production.length} production, ${testEntries.length} test, ${ignored.length} ignored`);
+// #6267: Playwright specs run in a browser, and only when no cheaper test observes the revert.
+let { runnable: testPaths, browser: browserSpecs } = partitionBrowserSpecs(testEntries.map((e) => e.path).filter((p) => existsSync(join(ROOT, p))), (p) => readFileSync(join(ROOT, p), 'utf8'));
+if (opts.tests.length > 0) {
+  [testPaths, browserSpecs] = [testPaths, browserSpecs].map((paths) => paths.filter((p) => opts.tests.includes(p)));
+  if (testPaths.length + browserSpecs.length === 0) die(EXIT_NOTHING_CHECKED, '--test matched none of the branch\'s changed test files.');
+}
+resultContext = { ...resultContext, production: prodPaths, tests: [...testPaths, ...browserSpecs] };
+
+console.log(
+  `  files: ${production.length} production, ${testEntries.length} test, ${ignored.length} ignored, ${inert.length} inert`,
+);
 
 if (prodPaths.length === 0) {
-  die(EXIT_NOTHING_CHECKED, 'this branch changes no production files; there is nothing whose absence a test could notice.');
+  const message = 'this branch changes no production files; there is nothing whose absence a test could notice.';
+  if (opts.ci) notApplicable(message);
+  die(EXIT_NOTHING_CHECKED, message);
 }
-if (testPaths.length === 0) {
+if (testPaths.length + browserSpecs.length === 0) {
   die(
-    EXIT_NOTHING_CHECKED,
+    opts.ci ? EXIT_UNOBSERVED : EXIT_NOTHING_CHECKED,
     'this branch changes production code and adds/changes NO test file. That is itself the finding: nothing can observe the change.',
     production.map((e) => `changed: ${e.path}`),
+    opts.ci ? { channel: PULL_REQUEST_CHANNEL, verdict: UNOBSERVED } : {},
   );
 }
 
-const { plans, unassigned } = planRuns(testPaths);
-if (unassigned.length > 0) {
-  die(EXIT_NOTHING_CHECKED, 'could not find an owning package for some test files', unassigned);
+// #4472: when every production file erases to the same JavaScript, no test
+// RUN can observe the change -- only the type-checker can. Decided on the
+// revert set (after --only), at base vs head, with the repo's own typescript.
+const typeOnly = typeOnlyProduction(loadTypeScript(ROOT), prodPaths, (side, p) => gitShow(ROOT, side === 'base' ? mergeBase : headSha, p));
+const observer = typeOnly.typeOnly ? 'typecheck' : 'tests';
+console.log(`  observer: ${observer} (${typeOnly.reason})`);
+let plans;
+let unassigned;
+let support = [];
+if (observer === 'typecheck') {
+  const t = typecheckPlans(testPaths, ROOT);
+  for (const s of t.skipped) console.log(`  skipped: ${s} is not TypeScript, so it cannot observe a type-only change`);
+  if (t.plans.length === 0 && t.unassigned.length === 0) {
+    die(
+      opts.ci ? EXIT_UNOBSERVED : EXIT_NOTHING_CHECKED,
+      'type-only production change, and none of the changed test files is TypeScript: nothing can observe it.',
+      prodPaths.map((p) => `changed: ${p}`),
+      opts.ci ? { channel: PULL_REQUEST_CHANNEL, verdict: UNOBSERVED } : {},
+    );
+  }
+  ({ plans, unassigned } = t);
+  support = t.skipped;
+  for (const s of browserSpecs) console.log(`  set aside: ${s} is a Playwright spec; a browser cannot observe a type-only change`);
+} else {
+  ({ plans, unassigned, support } = planRuns(testPaths, ROOT));
+  const browser = planBrowserSpecs(browserSpecs, ROOT, { prodPaths });
+  plans.push(...browser.plans);
+  unassigned.push(...browser.gaps);
 }
-const runnerless = plans.filter((p) => !p.runner);
-if (runnerless.length > 0) {
-  die(
-    EXIT_NOTHING_CHECKED,
-    'no runner could be derived for some packages — refusing to report a clean result for tests that were never run',
-    runnerless.map((p) => `${relative(ROOT, p.dir) || '.'}: scripts.test = ${JSON.stringify(p.script)}`),
-  );
-}
+const partitioned = partitionRunnablePlans(plans, unassigned);
+plans = partitioned.runnable;
+const { gaps } = partitioned;
+for (const gap of gaps) console.log(`  capability gap: ${gap.file}: ${gap.reason}`);
+for (const file of support) console.log(`  support: ${file} (not an independently executable test entrypoint)`);
 for (const p of plans) {
   console.log(`  runner: ${relative(ROOT, p.dir) || '.'} -> ${p.runner.bin} ${p.runner.args.join(' ')}`);
 }
@@ -363,7 +390,9 @@ if (opts.mutation) {
   patchText = readFileSync(resolve(opts.mutation), 'utf8');
   console.log(`  mutation: ${opts.mutation} (${patchText.split('\n').length} lines, reverse-applied)`);
 } else {
-  patchText = gitOrDie(['diff', '--binary', mergeBase, headSha, '--', ...prodPaths]);
+  const patchPaths = cargoLockPatchPaths(cargoLockChanged, prodPaths, entries.map((entry) => entry.path));
+  restorationPaths = patchPaths;
+  patchText = gitOrDie(['diff', '--binary', mergeBase, headSha, '--', ...patchPaths]);
 }
 if (patchText.trim() === '') {
   rmSync(tmp, { recursive: true, force: true });
@@ -371,49 +400,43 @@ if (patchText.trim() === '') {
 }
 writeFileSync(patchPath, patchText);
 
-// --- restoration, guaranteed ------------------------------------------------
-//
-// Restoration is a FORWARD re-apply of the identical patch, never `git
-// checkout --` / `git restore` / `git reset --hard` / `git stash`: those
-// commands would also erase anything else in the tree if an assumption were
-// wrong, and they cannot be verified against the patch that was applied.
-
 function restore(context) {
-  if (!reverted || !patchPath) return true;
-  const r = git(['apply', patchPath]);
-  if (r.status !== 0) {
+  if (restoration === 'not-required' || restoration === 'verified') return true;
+  if (restoration === 'failed' || !patchPath) return false;
+  const r = rawGit(['-c', 'core.autocrlf=false', 'apply', patchPath]);
+  if (r.error || r.status !== 0) {
+    restoration = 'failed';
     console.error(`\n[revert-oracle] !!! RESTORE FAILED (${context}) !!!`);
-    console.error((r.stderr || '').trim());
+    console.error(r.error?.message ?? (r.stderr || '').trim());
     console.error(`The reverse patch is still on disk: ${patchPath}`);
     console.error(`Re-apply it by hand:  git apply ${patchPath}`);
     return false;
   }
-  reverted = false;
-  const status = git(['status', '--porcelain']).stdout.trim();
+  const checkoutError = normalizeRestoredPaths(rawGit, headSha, restorationPaths);
+  if (checkoutError) {
+    restoration = 'failed';
+    console.error(`\n[revert-oracle] !!! RESTORE NORMALISATION FAILED (${context}) !!!\n${checkoutError}\nPreserve the post-test edit by committing or stashing it, then rerun from a clean working tree.`);
+    return false;
+  }
+  const statusRun = rawGit(['status', '--porcelain']);
+  if (statusRun.error || statusRun.status !== 0) {
+    restoration = 'failed';
+    console.error(`\n[revert-oracle] !!! RESTORE VERIFICATION FAILED (${context}) !!!`);
+    console.error(statusRun.error?.message ?? (statusRun.stderr || '').trim());
+    return false;
+  }
+  const status = statusRun.stdout.trim();
   if (status !== '') {
+    restoration = 'failed';
     console.error(`\n[revert-oracle] !!! TREE NOT BYTE-IDENTICAL AFTER RESTORE (${context}) !!!`);
     console.error(status);
     console.error(`Patch kept at: ${patchPath}`);
     return false;
   }
-  restoreVerified = true;
+  restoration = 'verified';
   console.log(`  restored: forward re-applied the patch; \`git status --porcelain\` is empty`);
   return true;
 }
-
-let cleaningUp = false;
-function emergency(signal) {
-  if (cleaningUp) return;
-  cleaningUp = true;
-  console.error(`\n[revert-oracle] interrupted by ${signal} — restoring the tree before exiting`);
-  const ok = restore(signal);
-  process.exit(ok ? EXIT_INCONCLUSIVE : EXIT_RESTORE_FAILED);
-}
-for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => emergency(sig));
-process.on('uncaughtException', (err) => {
-  console.error(err?.stack ?? String(err));
-  emergency('uncaughtException');
-});
 
 // --- run ---------------------------------------------------------------------
 
@@ -421,31 +444,38 @@ let exitCode = EXIT_INCONCLUSIVE;
 let result = null;
 
 try {
-  console.log('\n[1/3] baseline: running the branch\'s own tests, unmodified');
-  const baselineResults = plans.map((p) => runPlan(p, 'baseline'));
+  const measured = measure({
+    plans,
+    root: ROOT,
+    revert: () => {
+      const applyR = git(['-c', 'core.autocrlf=false', 'apply', '-R', '--verbose', patchPath]);
+      if (applyR.status !== 0) {
+        die(EXIT_REVERT_FAILED, 'the production patch would not reverse-apply — nothing was checked.', [
+          ...(applyR.stderr || '').trim().split('\n'),
+          'The tree is untouched (git apply is all-or-nothing).',
+        ]);
+      }
+      restoration = 'required';
+      for (const p of prodPaths) console.log(`  reverted: ${p}`);
+    },
+    restore: () => restore('before the browser baseline') || die(EXIT_RESTORE_FAILED, 'could not restore production before the browser baseline.'),
+    assertClean: () => gitOrDie(['status', '--porcelain']).trim() === '' || die(EXIT_RESTORE_FAILED, 'the browser baseline build left the working tree dirty.', [], { verdict: 'RESTORE-FAILED' }),
+  });
+  plans = measured.plans;
+  const { baselineResults, revertedResults } = measured;
   const baseline = aggregate(baselineResults);
-
-  console.log(`\n[2/3] reverting ${prodPaths.length} production file(s)`);
-  const applyR = git(['apply', '-R', '--verbose', patchPath]);
-  if (applyR.status !== 0) {
-    die(EXIT_REVERT_FAILED, 'the production patch would not reverse-apply — nothing was checked.', [
-      ...(applyR.stderr || '').trim().split('\n'),
-      'The tree is untouched (git apply is all-or-nothing).',
-    ]);
-  }
-  reverted = true;
-  for (const p of prodPaths) console.log(`  reverted: ${p}`);
-
-  console.log('\n[3/3] re-running the same tests with production reverted');
-  const revertedResults = plans.map((p) => runPlan(p, 'reverted'));
   const revertedAgg = aggregate(revertedResults);
 
-  result = verdict({ baseline, reverted: revertedAgg });
+  const ledger = buildExecutionLedger({ plans, gaps, support, deferred: measured.deferred, baselineResults, revertedResults });
+  result = ledgerVerdict(ledger);
   result.baseline = baseline;
   result.revertedRun = revertedAgg;
+  result.ledger = ledger;
   result.prodPaths = prodPaths;
-  result.testPaths = testPaths;
-  exitCode = result.exitCode === 0 ? EXIT_OBSERVED : result.verdict === UNOBSERVED ? EXIT_UNOBSERVED : EXIT_INCONCLUSIVE;
+  result.testPaths = [...testPaths, ...browserSpecs];
+  exitCode = opts.ci
+    ? ciExitCode(result.verdict)
+    : result.exitCode === 0 ? EXIT_OBSERVED : result.verdict === UNOBSERVED ? EXIT_UNOBSERVED : EXIT_INCONCLUSIVE;
 
   if (revertedAgg.kind !== 'pass' && revertedAgg.kind !== 'assertion-failure') {
     const worst = revertedResults.find((r) => r.kind === revertedAgg.kind);
@@ -459,66 +489,33 @@ try {
     const ok = restore('normal exit');
     if (!ok) {
       console.error('[revert-oracle] the working tree was NOT restored. Do not push. Fix the tree first.');
+      emitResult(ORACLE_CHANNEL, 'RESTORE-FAILED', EXIT_RESTORE_FAILED, 'the oracle could not restore the working tree after measurement');
       process.exit(EXIT_RESTORE_FAILED);
     }
   }
 }
 
-if (!restoreVerified && reverted) {
+if (restoration === 'required' || restoration === 'failed') {
   die(EXIT_RESTORE_FAILED, 'restoration was never verified.');
 }
 
 // --- report -------------------------------------------------------------------
 
-const banner = {
-  OBSERVED: '  ✔ OBSERVED',
-  UNOBSERVED: '  ✘ UNOBSERVED  <-- FINDING',
-  INCONCLUSIVE: '  ? INCONCLUSIVE',
-  'BASELINE-BROKEN': '  ! BASELINE-BROKEN',
-}[result.verdict];
-
-console.log('\n' + '='.repeat(78));
-console.log(banner);
-console.log('='.repeat(78));
-console.log(`  reverted:  ${result.prodPaths.join('\n             ')}`);
-console.log(`  tests run: ${result.testPaths.join('\n             ')}`);
-console.log(`  baseline:  ${result.baseline.kind} — ${result.baseline.passed ?? '?'} passed / ${result.baseline.total ?? '?'} collected`);
-console.log(`  reverted:  ${result.revertedRun.kind} — ${result.revertedRun.passed ?? '?'} passed, ${result.revertedRun.failed ?? '?'} failed / ${result.revertedRun.total ?? '?'} collected`);
-console.log(`\n  ${result.reason}`);
-if (result.advice) console.log(`\n  NEXT: ${result.advice}`);
-// An OBSERVED earned by reverting many files at once can be carried by a single
-// line of the change while the rest is unobserved -- the shape of the
-// `device.ts` case this tool was written for. Say so rather than let the tick
-// read as a verdict on the whole branch.
-if (result.verdict === 'OBSERVED' && result.prodPaths.length > 1 && opts.only.length === 0) {
-  console.log(
-    `\n  NOTE: ${result.prodPaths.length} production files were reverted together, so this tick may be ` +
-      'earned by one of them. Re-run with --only <path> per file to find the unobserved ones.',
-  );
-}
-if (result.verdict === 'INCONCLUSIVE' && result.advice !== SURGICAL_ADVICE) console.log(`\n  ALSO: ${SURGICAL_ADVICE}`);
-console.log('');
-
-if (opts.json) {
-  console.log(
-    JSON.stringify(
-      {
-        verdict: result.verdict,
-        reason: result.reason,
-        base: baseSha,
-        head: headSha,
-        production: result.prodPaths,
-        tests: result.testPaths,
-        baseline: { kind: result.baseline.kind, passed: result.baseline.passed, total: result.baseline.total },
-        reverted: { kind: result.revertedRun.kind, passed: result.revertedRun.passed, failed: result.revertedRun.failed, total: result.revertedRun.total, evidence: result.revertedRun.evidence },
-      },
-      null,
-      2,
-    ),
-  );
-}
+printHumanReport(result, observer, opts.only.length > 0);
 
 rmSync(tmp, { recursive: true, force: true });
+emitResult(
+  result.verdict === OBSERVED || result.verdict === UNOBSERVED ? PULL_REQUEST_CHANNEL : ORACLE_CHANNEL,
+  result.verdict,
+  exitCode,
+  result.reason,
+  {
+    observer,
+    baseline: { kind: result.baseline.kind, passed: result.baseline.passed, total: result.baseline.total },
+    reverted: { kind: result.revertedRun.kind, passed: result.revertedRun.passed, failed: result.revertedRun.failed, total: result.revertedRun.total, evidence: result.revertedRun.evidence },
+    ledger: result.ledger,
+  },
+);
 process.exit(exitCode);
 
 /* ---------------------------------------------------------------------------
@@ -591,22 +588,16 @@ process.exit(exitCode);
  *
  * 8. RUST IS COARSER STILL. `#[cfg(test)] mod tests` lives inside the file
  *    being reverted, so the automatic mode on a Rust branch will usually report
- *    INCONCLUSIVE (compile error). That is correct, not a bug; use --mutation.
+ *    REVERT-BROKE-BUILD (compile error). That is correct, not a bug; use --mutation.
  *
  * 9. NO WORKSPACE BUILD. If a package needs a built dependency (`dist/`), the
  *    baseline run fails and you get BASELINE-BROKEN. Build first.
  *
  * ---------------------------------------------------------------------------
- * WIRING IT INTO CI — deliberately NOT done
+ * CI POLICY
  * ---------------------------------------------------------------------------
- * This is a thing a person runs before pushing. It reverse-applies production
- * code into the working tree, which is a bad property for a required check, and
- * it runs each affected suite twice. If someone later wants it in CI it would
- * need: (a) its own job on a throwaway checkout, never sharing a workspace with
- * another job; (b) a hard timeout and a concurrency cap, since cost is 2x the
- * affected suites; (c) a policy decision on INCONCLUSIVE, which is common and
- * benign and must NOT fail the build or it will be disabled within a week;
- * (d) `--base origin/main` and a fetch depth that reaches the merge base;
- * (e) an opt-out label, because legitimate refactor-only branches exist.
- * Until those five are decided, leaving it manual is the honest choice.
+ * `test.yml` supplies the five required bounds: its own throwaway checkout, a
+ * hard timeout and workflow concurrency, blocking capability gaps, a full clone
+ * with `--base origin/main`, and the maintainer-only `revert-oracle-exempt`
+ * label for legitimate refactors. `--ci` implements that verdict policy.
  * --------------------------------------------------------------------------- */

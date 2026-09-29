@@ -23,7 +23,8 @@
 use ifc_lite_core::{DecodedEntity, EntityDecoder, EntityScanner, IfcType};
 
 mod raster;
-pub use raster::decode_step_binary;
+mod raster_header;
+pub use raster::{decode_step_binary, embedded_raster_dimensions, MAX_TEX_DIM as MAX_TEXTURE_DIMENSION};
 use raster::{decode_raster_image, MAX_TEX_DIM};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
@@ -314,13 +315,13 @@ pub fn build_texture_index(
     decoder: &mut EntityDecoder,
 ) -> FxHashMap<u32, ResolvedTextureMap> {
     let mut index = FxHashMap::default();
-    if memchr::memmem::find(content, b"IFCINDEXEDTRIANGLETEXTUREMAP").is_none() {
+    if ifc_lite_core::find_keyword(content, b"IFCINDEXEDTRIANGLETEXTUREMAP").is_none() {
         return index;
     }
     let mut texture_cache: FxHashMap<u32, Option<TextureSource>> = FxHashMap::default();
     let mut scanner = EntityScanner::new(content);
     while let Some((id, type_name, start, end)) = scanner.next_entity() {
-        if type_name != "IFCINDEXEDTRIANGLETEXTUREMAP" {
+        if !ifc_lite_core::keyword_eq(type_name, "IFCINDEXEDTRIANGLETEXTUREMAP") {
             continue;
         }
         if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {

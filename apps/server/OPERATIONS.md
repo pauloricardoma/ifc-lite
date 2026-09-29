@@ -14,6 +14,7 @@ replica.
 | `IFC_MEM_BUDGET_MB` | 70% of the tightest readable ceiling (cgroup, else physical RAM), else 0 | Total admitted upload bytes at once; `0` is an explicit opt-out that disables the byte gate |
 | `IFC_ADMISSION_QUEUE_DEPTH` | `2 * WORKER_THREADS` | Requests allowed to wait for a slot before immediate 503 |
 | `IFC_ADMISSION_QUEUE_TIMEOUT_SECS` | `5` | Longest a queued request waits before 503 |
+| `IFC_STREAM_IDLE_TIMEOUT_SECS` | `600` | Close a connection whose socket write makes no progress for this long; `0` disables |
 | `IFC_MEM_SHED_PCT` | `85` | RSS percentage of the budget above which new work is shed |
 | `IFC_METRICS_ENABLED` | off | Expose `GET /api/v1/metrics` (Prometheus text; behind the bearer token when one is set) |
 
@@ -53,7 +54,52 @@ your corpus. Concretely for a single-replica box:
 - `GET /api/v1/metrics` - admission gauges/counters + resident memory
   (`ifc_server_resident_bytes`, `ifc_server_admission_in_flight`,
   `ifc_server_admission_queued`, `ifc_server_admission_rejected_total{reason}`,
-  `ifc_server_mem_budget_bytes`), when `IFC_METRICS_ENABLED=1`.
+  `ifc_server_mem_budget_bytes`), plus cache size gauges
+  (`ifc_server_cache_entries`, `ifc_server_cache_bytes`), when
+  `IFC_METRICS_ENABLED=1`.
+
+## Cache
+
+The disk cache (`CACHE_DIR`) has no size limit and NEVER self-prunes.
+`CACHE_MAX_AGE_DAYS` is parsed into `Config` and read by nothing else -- no
+code path evicts on age, so an entry written today is still there next year
+unless something removes it. `DELETE /api/v1/cache/{cache_key}` is the only
+removal path the server offers (short of deleting `CACHE_DIR` on disk). It
+takes the `cache_key` a parse returned (`{sha256}-{opening_filter}`, plus
+`-q{quality}` for a non-default tessellation quality), the same key
+`GET /api/v1/cache/{cache_key}` takes, and removes every cache entry derived
+from the source file that key names (the
+request, `-json-v2`, `-parquet-vN`, `-parquet-metadata-vN` and `-symbolic-v1`
+entries, across every opening-filter/tessellation-quality combination) and
+reclaims any content blob none of them, or any unrelated entry, still
+references. It
+is idempotent: deleting a key nothing is cached under is a `200` with
+`{"key": "<cache_key>", "deleted": 0}`, not a `404`, so a caller can invoke it
+unconditionally (e.g. "the model behind this key was removed, drop whatever is
+cached for it")
+without checking existence first. Use it to bound cache size from an
+external job, or to invalidate the geometry for a model an application has
+deleted.
+
+Like every other route, `DELETE` is UNAUTHENTICATED when
+`IFC_SERVER_API_TOKEN` is unset -- anyone who can reach the port can empty
+the cache file by file. Set the token on any deployment whose port is not
+already private.
+
+The path segment must be a request `cache_key`; anything else is a `400` and
+never touches the index. That includes the bare 64-character sha256 this
+route took before #5750: pass the `cache_key` a parse returned instead. Each call
+walks the whole cache index (twice, the second pass under the cache's write
+lock), so one such walk runs at a time: a `DELETE` that arrives while another
+is in flight is shed with `503` and a `Retry-After` header rather than
+queued. The route is idempotent, so retrying is always safe.
+
+`DELETE` does not cancel or outrank an in-flight parse for the same hash: a
+cache fill that is already running (or queued behind the reclaim lock)
+re-inserts its entries after the `200` returns. If you are invalidating
+because the source bytes changed, note that different bytes hash to a
+different key anyway; if you are invalidating to reclaim space, re-issue the
+`DELETE` once the in-flight parse has finished.
 
 ## Behavior notes
 

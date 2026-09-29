@@ -5,111 +5,36 @@
 import { useMemo, useState, useCallback, useEffect } from 'react';
 import type { IfcDataStore } from '@ifc-lite/parser';
 import type { GeometryResult } from '@ifc-lite/geometry';
-import { useViewerStore, type FederatedModel, type HierarchyMode } from '@/store';
+import { useViewerStore, type FederatedModel } from '@/store';
 import type { TreeNode, UnifiedStorey, HierarchySortMode } from './types';
-import { HIERARCHY_SORT_MODES, DEFAULT_HIERARCHY_SORT } from './types';
+import { readStoredSortMode, persistSortMode } from './hierarchy-sort-storage';
+import { useEffectiveMaterialStores } from '@/hooks/useEffectiveMaterialStores';
 import {
   buildUnifiedStoreys,
   getUnifiedStoreyElements as getUnifiedStoreyElementsFn,
-  buildTreeData,
-  buildTypeTree,
-  buildIfcTypeTree,
-  buildMaterialTree,
-  buildGroupTree,
   filterNodes,
   splitNodes,
   type AuthoredProduct,
   type GroupSubFilter,
 } from './treeDataBuilder';
+import { buildTreeForGrouping, useRevealGlobalId } from './revealGlobalId';
+import {
+  buildGeometricIdSet,
+  collectAnnotationEntityIds,
+  collectGeometryReadyModelIds,
+} from './hierarchyGeometry';
+import { flattenVisibleHierarchy, indexHierarchyTree } from './treeProjection';
+import { effectiveSpatialMembers } from '@/lib/effective-spatial-members';
 
 export type { HierarchyMode } from '@/store';
 
-const SORT_STORAGE_KEY = 'hierarchy-sort';
-
-/** Read the persisted sort mode, falling back to the default for missing or
- *  stale (e.g. renamed) localStorage values. Reads can throw (private mode,
- *  opaque origin), so guard and fall back rather than break the panel mount. */
-function readStoredSortMode(): HierarchySortMode {
-  if (typeof window === 'undefined') return DEFAULT_HIERARCHY_SORT;
-  try {
-    const stored = localStorage.getItem(SORT_STORAGE_KEY);
-    return stored && (HIERARCHY_SORT_MODES as readonly string[]).includes(stored)
-      ? (stored as HierarchySortMode)
-      : DEFAULT_HIERARCHY_SORT;
-  } catch {
-    return DEFAULT_HIERARCHY_SORT;
-  }
-}
+const EXPAND_ALL = { has: () => true };
 
 interface UseHierarchyTreeParams {
   models: Map<string, FederatedModel>;
   ifcDataStore: IfcDataStore | null | undefined;
   isMultiModel: boolean;
   geometryResult?: GeometryResult | null;
-}
-
-/**
- * Build a stable Set of global IDs that have geometry.
- * Only rebuilds when the actual set of IDs changes, NOT when mesh colors change.
- */
-function buildGeometricIdSet(
-  models: Map<string, FederatedModel>,
-  legacyGeometry: GeometryResult | null | undefined,
-): Set<number> {
-  const ids = new Set<number>();
-  if (models.size > 0) {
-    for (const [, model] of models) {
-      if (model.geometryResult) {
-        for (const mesh of model.geometryResult.meshes) {
-          ids.add(mesh.expressId);
-        }
-      }
-    }
-  } else if (legacyGeometry) {
-    for (const mesh of legacyGeometry.meshes) {
-      ids.add(mesh.expressId);
-    }
-  }
-  return ids;
-}
-
-/**
- * Global IDs of `IfcAnnotation` entities. Their 2D curves (plot boundaries,
- * "Model Lines", leaders) render through the symbolic overlay, not the mesh
- * pipeline, so they never enter `buildGeometricIdSet` and were absent from the
- * "By Class" tree — the user could see them in 3D but not select or hide them
- * (issue #1480). Folding them into the tree's inclusion set makes each an
- * ordinary, hideable row; the overlay honours that hide (see
- * `useSymbolicAnnotations`). Text annotations that carry a real brep mesh are
- * already in the geometric set, so the union is idempotent for them.
- */
-function collectAnnotationEntityIds(
-  models: Map<string, FederatedModel>,
-  legacyStore: IfcDataStore | null | undefined,
-): Set<number> {
-  const ids = new Set<number>();
-  const addFrom = (store: IfcDataStore | null | undefined, toGlobal: (localId: number) => number) => {
-    // `getEntitiesByType` is a lazy accessor; guard for the rare
-    // cache-restored store whose accessors have not been reattached yet.
-    if (typeof store?.getEntitiesByType !== 'function') return;
-    for (const ent of store.getEntitiesByType('IfcAnnotation')) {
-      ids.add(toGlobal(ent.expressId));
-    }
-  };
-  if (models.size > 0) {
-    const state = useViewerStore.getState();
-    for (const [modelId, model] of models) {
-      // modelId comes straight from `models`, so it is always resolvable —
-      // only the legacy sentinel needs the raw local id (matches the id the
-      // tree builder assigns via `resolveTreeGlobalId`).
-      addFrom(model.ifcDataStore, (localId) =>
-        modelId === 'legacy' ? localId : state.toGlobalId(modelId, localId),
-      );
-    }
-  } else {
-    addFrom(legacyStore, (localId) => localId);
-  }
-  return ids;
 }
 
 export function useHierarchyTree({ models, ifcDataStore, isMultiModel, geometryResult }: UseHierarchyTreeParams) {
@@ -123,10 +48,50 @@ export function useHierarchyTree({ models, ifcDataStore, isMultiModel, geometryR
   // deliberately not persisted (#1622).
   const [groupFilter, setGroupFilter] = useState<GroupSubFilter>('all');
 
+  // Stable mesh count — only changes when models are added/removed, not on color updates.
+  // Used as a dep proxy so the geometric ID set doesn't rebuild on every color change.
+  const meshCount = useMemo(() => {
+    if (models.size > 0) {
+      let count = 0;
+      for (const [, model] of models) {
+        count += model.geometryResult?.meshes.length ?? 0;
+      }
+      return count;
+    }
+    return geometryResult?.meshes.length ?? 0;
+  }, [models, geometryResult?.meshes.length]);
+
+  // Pre-computed set of global IDs with geometry — stable across color changes.
+  // PERF: Skip when no geometry source exists (during initial streaming before
+  // any data is ready). Gate on models OR ifcDataStore so federated scenarios
+  // (models.size > 0 but ifcDataStore is null) still build the set correctly.
+  const hasGeometrySource = models.size > 0 || !!ifcDataStore;
+  const geometricIds = useMemo(
+    () => hasGeometrySource ? buildGeometricIdSet(models, geometryResult) : new Set<number>(),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- meshCount is a stable proxy; hasGeometrySource gates streaming
+    [models, hasGeometrySource ? meshCount : 0]
+  );
+
+  // Geometry readiness is per model: one streamed federation member must not
+  // make an unstreamed sibling look known-empty. A completed model with zero
+  // meshes is still known, so its physical-object count legitimately becomes 0.
+  const geometryReadyModelIds = useMemo(
+    () => collectGeometryReadyModelIds(models, geometryResult),
+    [models, geometryResult],
+  );
+
+  const georefMutations = useViewerStore((state) => state.georefMutations); // storey badges only (#4843)
+  // The session's edits; the trees read authored rows' name and class through them (#5249, #6233).
+  const mutationViews = useViewerStore((s) => s.mutationViews);
+  const mutationVersion = useViewerStore((s) => s.mutationVersion);
+
   // Build unified storey data for multi-model mode (moved before useEffect that depends on it)
   const unifiedStoreys = useMemo(
-    (): UnifiedStorey[] => buildUnifiedStoreys(models, sortMode),
-    [models, sortMode]
+    (): UnifiedStorey[] => buildUnifiedStoreys(models, sortMode, geometricIds, geometryReadyModelIds, georefMutations,
+      (modelId) => mutationViews.get(modelId)),
+    // mutationVersion: the views mutate in place, so their identity alone never changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [models, sortMode, geometricIds, geometryReadyModelIds, georefMutations, mutationViews, mutationVersion]
   );
 
   // Auto-expand nodes on initial load based on model count
@@ -216,30 +181,6 @@ export function useHierarchyTree({ models, ifcDataStore, isMultiModel, geometryR
     [models]
   );
 
-  // Stable mesh count — only changes when models are added/removed, not on color updates.
-  // Used as a dep proxy so the geometric ID set doesn't rebuild on every color change.
-  const meshCount = useMemo(() => {
-    if (models.size > 0) {
-      let count = 0;
-      for (const [, model] of models) {
-        count += model.geometryResult?.meshes.length ?? 0;
-      }
-      return count;
-    }
-    return geometryResult?.meshes.length ?? 0;
-  }, [models, geometryResult?.meshes.length]);
-
-  // Pre-computed set of global IDs with geometry — stable across color changes.
-  // PERF: Skip when no geometry source exists (during initial streaming before
-  // any data is ready). Gate on models OR ifcDataStore so federated scenarios
-  // (models.size > 0 but ifcDataStore is null) still build the set correctly.
-  const hasGeometrySource = models.size > 0 || !!ifcDataStore;
-  const geometricIds = useMemo(
-    () => hasGeometrySource ? buildGeometricIdSet(models, geometryResult) : new Set<number>(),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- meshCount is a stable proxy; hasGeometrySource gates streaming
-    [models, hasGeometrySource ? meshCount : 0]
-  );
-
   // `IfcAnnotation` entities are a fixed set per loaded model (independent of
   // streaming mesh count), so this is keyed on model identity only. Unioned
   // into the "By Class" inclusion set so curve-only annotations appear as
@@ -266,8 +207,9 @@ export function useHierarchyTree({ models, ifcDataStore, isMultiModel, geometryR
   // not the columnar parse the class/type builders scan, so a baked IfcSpace was
   // absent from the "By Class" tree. Filtering by geometricIds keeps it to real
   // products (the space has a mesh; its helper points/placements/solids don't).
-  const mutationViews = useViewerStore((s) => s.mutationViews);
-  const mutationVersion = useViewerStore((s) => s.mutationVersion);
+  const { stores: materialSourceStores, ready: materialReady } = useEffectiveMaterialStores(
+    models, ifcDataStore, groupingMode === 'material',
+  );
   const authoredProducts = useMemo<AuthoredProduct[]>(() => {
     const out: AuthoredProduct[] = [];
     const state = useViewerStore.getState();
@@ -293,33 +235,31 @@ export function useHierarchyTree({ models, ifcDataStore, isMultiModel, geometryR
     // mutationVersion bumps on every authoring edit; geometricIds tracks the mesh.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mutationViews, models, geometricIds, mutationVersion]);
-
-  // Build the tree data structure based on grouping mode
-  // Note: hiddenEntities intentionally NOT in deps - visibility computed lazily for performance
+  // Build the structural tree once per model/mode/mutation input. Search uses
+  // this same complete tree; reveal uses it too. A chevron click only projects
+  // visible rows and never calls the builder.
+  // hiddenEntities intentionally NOT in deps - visibility computed lazily.
+  const structuralTree = useMemo(
+    (): TreeNode[] => groupingMode === 'material' && !materialReady ? [] : buildTreeForGrouping(
+      groupingMode, models, ifcDataStore, EXPAND_ALL, isMultiModel, unifiedStoreys, sortMode,
+      geometricIds, classTreeIds, authoredProducts, groupFilter, geometryReadyModelIds,
+      georefMutations, mutationViews, materialSourceStores,
+    ),
+    [groupingMode, models, ifcDataStore, isMultiModel, unifiedStoreys, sortMode,
+      geometricIds, classTreeIds, authoredProducts, groupFilter, geometryReadyModelIds,
+      georefMutations, mutationViews, mutationVersion, materialSourceStores, materialReady],
+  );
+  const treeIndex = useMemo(() => indexHierarchyTree(structuralTree), [structuralTree]);
+  const getExpandedTreeForReveal = useCallback(() => structuralTree, [structuralTree]);
+  const revealGlobalId = useRevealGlobalId(getExpandedTreeForReveal, expandedNodes, setExpandedNodes);
   const treeData = useMemo(
-    (): TreeNode[] => {
-      if (groupingMode === 'type') {
-        return buildTypeTree(models, ifcDataStore, expandedNodes, isMultiModel, classTreeIds, authoredProducts);
-      }
-      if (groupingMode === 'ifc-type') {
-        return buildIfcTypeTree(models, ifcDataStore, expandedNodes, isMultiModel, geometricIds);
-      }
-      if (groupingMode === 'material') {
-        return buildMaterialTree(models, ifcDataStore, expandedNodes, isMultiModel, geometricIds);
-      }
-      if (groupingMode === 'groups') {
-        return buildGroupTree(models, ifcDataStore, expandedNodes, isMultiModel, geometricIds, groupFilter);
-      }
-      return buildTreeData(models, ifcDataStore, expandedNodes, isMultiModel, unifiedStoreys, sortMode);
-    },
-    [models, ifcDataStore, expandedNodes, isMultiModel, unifiedStoreys, sortMode, groupingMode, geometricIds, classTreeIds, authoredProducts, groupFilter]
+    () => searchQuery.trim()
+      ? filterNodes(structuralTree, searchQuery)
+      : flattenVisibleHierarchy(treeIndex, expandedNodes),
+    [structuralTree, treeIndex, searchQuery, expandedNodes],
   );
 
-  // Filter nodes based on search
-  const filteredNodes = useMemo(
-    () => filterNodes(treeData, searchQuery),
-    [treeData, searchQuery]
-  );
+  const filteredNodes = treeData;
 
   // Split filtered nodes into storeys and models sections (for multi-model mode)
   const { storeysNodes, modelsNodes } = useMemo(
@@ -328,6 +268,7 @@ export function useHierarchyTree({ models, ifcDataStore, isMultiModel, geometryR
   );
 
   const toggleExpand = useCallback((nodeId: string) => {
+    if (searchQuery.trim()) return;
     setExpandedNodes(prev => {
       const next = new Set(prev);
       if (next.has(nodeId)) {
@@ -337,7 +278,7 @@ export function useHierarchyTree({ models, ifcDataStore, isMultiModel, geometryR
       }
       return next;
     });
-  }, []);
+  }, [searchQuery]);
 
   // Get all elements for a node (handles type groups, ifc-type, unified storeys, single storeys, model contributions, and elements)
   const getNodeElements = useCallback((node: TreeNode): number[] => {
@@ -359,7 +300,7 @@ export function useHierarchyTree({ models, ifcDataStore, isMultiModel, geometryR
       const modelId = node.modelIds[0];
       const model = models.get(modelId);
       if (model?.ifcDataStore?.spatialHierarchy) {
-        const localIds = (model.ifcDataStore.spatialHierarchy.byStorey.get(storeyId) as number[]) || [];
+        const localIds = effectiveSpatialMembers(model.ifcDataStore, mutationViews.get(modelId), storeyId);
         return toGlobalIdsForModel(modelId, localIds);
       }
     } else if (node.type === 'IfcBuildingStorey') {
@@ -368,13 +309,13 @@ export function useHierarchyTree({ models, ifcDataStore, isMultiModel, geometryR
       const modelId = node.modelIds[0];
 
       if (modelId === 'legacy' && ifcDataStore?.spatialHierarchy) {
-        const elements = ifcDataStore.spatialHierarchy.byStorey.get(storeyId);
-        if (elements) return elements as number[];
+        const elements = effectiveSpatialMembers(ifcDataStore, mutationViews.get('legacy'), storeyId);
+        if (elements.length) return elements;
       }
 
       const model = models.get(modelId);
       if (model?.ifcDataStore?.spatialHierarchy) {
-        const localIds = (model.ifcDataStore.spatialHierarchy.byStorey.get(storeyId) as number[]) || [];
+        const localIds = effectiveSpatialMembers(model.ifcDataStore, mutationViews.get(modelId), storeyId);
         return toGlobalIdsForModel(modelId, localIds);
       }
     } else if (node.type === 'IfcSpace' || node.type === 'IfcSpatialZone') {
@@ -382,13 +323,13 @@ export function useHierarchyTree({ models, ifcDataStore, isMultiModel, geometryR
       const modelId = node.modelIds[0];
 
       if (modelId === 'legacy' && ifcDataStore?.spatialHierarchy) {
-        const elements = ifcDataStore.spatialHierarchy.bySpace.get(spaceId) ?? [];
-        return [spaceId, ...(elements as number[])];
+        const elements = effectiveSpatialMembers(ifcDataStore, mutationViews.get('legacy'), spaceId);
+        return [spaceId, ...elements];
       }
 
       const model = models.get(modelId);
       if (model?.ifcDataStore?.spatialHierarchy) {
-        const localIds = (model.ifcDataStore.spatialHierarchy.bySpace.get(spaceId) as number[]) || [];
+        const localIds = effectiveSpatialMembers(model.ifcDataStore, mutationViews.get(modelId), spaceId);
         return [...node.globalIds, ...toGlobalIdsForModel(modelId, localIds)];
       }
     } else if (node.type === 'element') {
@@ -400,18 +341,14 @@ export function useHierarchyTree({ models, ifcDataStore, isMultiModel, geometryR
     }
     // Spatial containers (Project, Site, Building) and top-level models don't have direct element visibility toggle
     return [];
-  }, [models, ifcDataStore, unifiedStoreys, getUnifiedStoreyElements, toGlobalIdsForModel]);
+  // Views mutate in place; mutationVersion refreshes this callback after edits.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [models, ifcDataStore, unifiedStoreys, getUnifiedStoreyElements, toGlobalIdsForModel, mutationViews, mutationVersion]);
 
   // Persist storey sort-order preference (issue #1296)
   const handleSetSortMode = useCallback((mode: HierarchySortMode) => {
     setSortMode(mode);
-    if (typeof window !== 'undefined') {
-      try {
-        localStorage.setItem(SORT_STORAGE_KEY, mode);
-      } catch {
-        // Private mode / quota — keep the in-memory choice, just don't persist.
-      }
-    }
+    persistSortMode(mode);
   }, []);
 
   return {
@@ -424,6 +361,7 @@ export function useHierarchyTree({ models, ifcDataStore, isMultiModel, geometryR
     groupFilter,
     setGroupFilter,
     unifiedStoreys,
+    materialReady,
     treeData,
     filteredNodes,
     storeysNodes,
@@ -431,5 +369,6 @@ export function useHierarchyTree({ models, ifcDataStore, isMultiModel, geometryR
     toggleExpand,
     getNodeElements,
     getUnifiedStoreyElements,
+    revealGlobalId,
   };
 }

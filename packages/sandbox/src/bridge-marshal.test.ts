@@ -20,7 +20,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import type { BimContext, EntityRef } from '@ifc-lite/sdk';
+import { createBimContext, type BimBackend, type BimContext, type EntityRef } from '@ifc-lite/sdk';
 import { createSandbox } from './sandbox.js';
 
 /** Permissions for a sandbox that only needs `bim.export`. */
@@ -33,6 +33,13 @@ const EXPORT_ONLY = {
   lens: false,
   export: true,
   files: false,
+} as const;
+
+const VIEWER_AND_QUERY = {
+  ...EXPORT_ONLY,
+  query: true,
+  viewer: true,
+  export: false,
 } as const;
 
 /** Build a stub BimContext whose `export` namespace records and answers. */
@@ -59,6 +66,18 @@ async function withSandbox<T>(
   fn: (evalCode: (code: string) => Promise<unknown>) => Promise<T>,
 ): Promise<T> {
   const sandbox = await createSandbox(sdk, { permissions: EXPORT_ONLY });
+  try {
+    return await fn(async (code) => (await sandbox.eval(code, { typescript: false })).value);
+  } finally {
+    sandbox.dispose();
+  }
+}
+
+async function withViewerSandbox<T>(
+  sdk: BimContext,
+  fn: (evalCode: (code: string) => Promise<unknown>) => Promise<T>,
+): Promise<T> {
+  const sandbox = await createSandbox(sdk, { permissions: VIEWER_AND_QUERY });
   try {
     return await fn(async (code) => (await sandbox.eval(code, { typescript: false })).value);
   } finally {
@@ -103,6 +122,56 @@ describe('entityRefs argument unmarshalling', () => {
       await run(`bim.export.csv()`);
     });
     expect(calls.csvRefs[0]).toEqual([]);
+  });
+});
+
+describe('resetColors optional entity refs (#4789)', () => {
+  it('preserves omitted, undefined, empty, and nonempty values through the real VM', async () => {
+    const calls: Array<EntityRef[] | undefined> = [];
+    const sdk = {
+      viewer: { resetColors: (refs?: EntityRef[]) => calls.push(refs) },
+    } as unknown as BimContext;
+
+    await withViewerSandbox(sdk, async (run) => {
+      await run('bim.viewer.resetColors()');
+      await run('bim.viewer.resetColors(undefined)');
+      await run('bim.viewer.resetColors([])');
+      await run("bim.viewer.resetColors([{ ref: { modelId: 'm', expressId: 7 } }])");
+      await expect(run('bim.viewer.resetColors(null)')).rejects.toThrow(/map/);
+    });
+
+    expect(calls).toEqual([
+      undefined,
+      undefined,
+      [],
+      [{ modelId: 'm', expressId: 7 }],
+    ]);
+  });
+
+  it('keeps a zero-match query from clearing real SDK color state', async () => {
+    const overrides = new Set([1, 2]);
+    const calls: Array<EntityRef[] | undefined> = [];
+    const backend = {
+      query: { entities: () => [] },
+      viewer: {
+        resetColors: (refs?: EntityRef[]) => {
+          calls.push(refs);
+          if (!refs) overrides.clear();
+          else for (const ref of refs) overrides.delete(ref.expressId);
+        },
+      },
+    } as unknown as BimBackend;
+    const sdk = createBimContext({ backend });
+
+    await withViewerSandbox(sdk, async (run) => {
+      await run("bim.viewer.resetColors(bim.query.byType('IfcDoesNotExist'))");
+      expect([...overrides]).toEqual([1, 2]);
+      expect(calls).toEqual([]);
+
+      await run('bim.viewer.resetColors()');
+      expect([...overrides]).toEqual([]);
+      expect(calls).toEqual([undefined]);
+    });
   });
 });
 
@@ -235,5 +304,72 @@ describe('marshalValue hostile typed-array inputs', () => {
       run(`const r = bim.export.json([], []); JSON.stringify({ isArray: Array.isArray(r), r })`),
     );
     expect(value).toBe('{"isArray":false,"r":{}}');
+  });
+});
+
+/**
+ * #4738: `export.ifc` now reads an empty ref list as "an isolation filter
+ * matched nothing" and refuses it, so the bridge has to keep "the script
+ * passed nothing" distinguishable from "the script passed an empty array".
+ * The `entityRefs` unmarshaller answered `[]` for both, which turned a
+ * sandboxed `bim.export.ifc()` — the documented way to export the whole model
+ * — into the refusal.
+ *
+ * These run the real `ExportNamespace` behind the real bridge: only the
+ * backend below it is a recorder, so the guard, the marshalling and the
+ * generated parameter list are all the shipping ones. `bim.export.csv()`
+ * keeps answering `[]` (pinned above), which is what bounds this change to
+ * the one method whose contract needs the distinction.
+ */
+describe('an omitted entity list survives the bridge for export.ifc (#4738)', () => {
+  /** A real BimContext whose backend records what the namespace passed down. */
+  function realSdk(): { sdk: BimContext; seen: unknown[] } {
+    const seen: unknown[] = [];
+    const backend = {
+      export: {
+        ifc: (refs: unknown) => { seen.push(refs); return 'ISO-10303-21;WHOLE'; },
+        download: () => {},
+      },
+    } as unknown as Parameters<typeof createBimContext>[0]['backend'];
+    return { sdk: createBimContext({ backend }), seen };
+  }
+
+  it('bim.export.ifc() exports the whole model instead of being refused', async () => {
+    const { sdk, seen } = realSdk();
+    // RED before the fix: the call threw
+    // "export.ifc: the entity list is empty, so an isolation filter matched
+    // nothing", because the bridge handed the namespace `[]`.
+    const value = await withSandbox(sdk, (run) => run(`bim.export.ifc()`));
+    expect(value).toBe('ISO-10303-21;WHOLE');
+    // `undefined`, not `[]`: the absence reaches the backend, which is what lets
+    // a backend that cannot guess a model (the viewer's) answer the whole model.
+    expect(seen).toEqual([undefined]);
+  });
+
+  it('an explicit undefined is the same absence — the documented migration', async () => {
+    // `ifc(undefined, options)` is what the guide tells callers to write in
+    // place of `ifc([], options)`. The handle exists and dumps to `undefined`,
+    // so an arity-only check would have run `.map` on it and thrown a
+    // TypeError inside the one environment the optional arg type is for.
+    const { sdk, seen } = realSdk();
+    const value = await withSandbox(sdk, (run) => run(`bim.export.ifc(undefined, { schema: 'IFC4' })`));
+    expect(value).toBe('ISO-10303-21;WHOLE');
+    expect(seen).toEqual([undefined]);
+  });
+
+  it('leaves the non-optional entityRefs methods loud on an explicit null', async () => {
+    // Scoping the new absence to `export.ifc` matters in both directions: for
+    // `csv`/`json`/`viewer.*` an explicit null is a script bug, and answering
+    // `[]` would turn it into a header-only CSV or a silent no-op. Only an
+    // OMITTED argument is `[]` for those (pinned above).
+    const { sdk } = stubSdk({});
+    await expect(withSandbox(sdk, (run) => run(`bim.export.csv(null, { columns: ['Name'] })`)))
+      .rejects.toThrow(/map/);
+  });
+
+  it('bim.export.ifc([]) is still refused, so the distinction is real', async () => {
+    const { sdk, seen } = realSdk();
+    await expect(withSandbox(sdk, (run) => run(`bim.export.ifc([])`))).rejects.toThrow(/matched nothing/);
+    expect(seen).toEqual([]);
   });
 });

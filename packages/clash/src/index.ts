@@ -13,7 +13,9 @@
  */
 
 export * from './types.js';
+export { clashTableRows, bareIfcGuid, CLASH_TABLE_COLUMNS, type ClashTableRow, type ClashTableOptions } from './export/table.js';
 export { matchesSelector } from './selectors.js';
+export { clashMemberKey, clashMemberSet, inClashSet } from './members.js';
 export {
   DISCIPLINES,
   CLASH_RULE_PRESETS,
@@ -25,6 +27,7 @@ export {
   type ClashRulePreset,
 } from './disciplines.js';
 export { createClashEngine, type ClashEngine, type ClashBackend, type CreateClashEngineOptions } from './engine.js';
+export { NonFiniteToleranceError } from './engine-ts/orchestrator.js';
 export { makeExclusionSet, isExcluded, pairKey, qualifiedKey } from './exclude.js';
 export {
   buildTriageSystemPrompt,
@@ -41,6 +44,12 @@ export {
 } from './review.js';
 export { compareClashRuns, type ClashRevisionDiff } from './lifecycle.js';
 export {
+  compareClashRevisions,
+  type ClashRevisionSide,
+  type ClashRevisionComparison,
+  type ClashRevisionReasons,
+} from './revision.js';
+export {
   SEVERITY_RANK,
   TOUCHING_EPSILON,
   penetrationDepth,
@@ -49,6 +58,7 @@ export {
   summarizeClashes,
   ruleHadNoMatch,
   classifyRuleCoverage,
+  describeEmptyRuleSides,
   type ClashSortBy,
   type RuleCoverageOutcome,
 } from './analysis.js';

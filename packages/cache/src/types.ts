@@ -130,8 +130,36 @@ export const MAGIC = 0x4C434649; // "IFCL" in little-endian
  *   looks for v16. This is the ONE bump here that is deliberately destructive
  *   -- every existing entry re-meshes once -- because the alternative is a
  *   silent partial render on a bundle nobody can update.
+ *
+ * v16->v17: the QuantityTable gains a `qsetGlobalId` column (#3606),
+ *   mirroring PropertyTable's `psetGlobalId` — `QuantityTable.getForEntity`
+ *   now groups on (qsetName, qsetGlobalId) instead of qsetName alone, so
+ *   two distinct `IfcElementQuantity` instances sharing a literal name
+ *   (federated merge, or an exporter emitting the same Qto_ set twice)
+ *   stay separate instead of the second instance's quantities landing
+ *   under the first instance's GlobalId.
+ *
+ * v17->v18: the Relationships section gains a trailing shadowed-rel-ids
+ *   trailer per direction (#3782): `RelationshipGraphBuilder.addEdge` now
+ *   folds a repeat (source, target, type) triple into the surviving edge
+ *   instead of dropping it, keeping the extra `IfcRel*` express ids so a
+ *   delete of the surviving one doesn't erase a connection a sibling
+ *   instance still names. Appended AFTER `edgeRelIds` so the v17 prefix
+ *   stays byte-identical; a v18 reader handed a v17 section simply stops
+ *   there and never emits `shadowedRelationshipIds` — matches the pre-v18
+ *   in-memory behaviour exactly, since those graphs never tracked them
+ *   either. Not the destructive kind of bump: no existing cache entry is
+ *   wrong to read, only silent about a rare case until it is re-parsed.
  */
-export const FORMAT_VERSION = 16;
+/** v19: optional canonical appearance provenance per mesh and a shared source-index
+ * pool in the geometry head. Earlier records remain unmarked; viewer cache keys
+ * include the version, so old entries reparse once rather than invent provenance. */
+/** v20: optional exact WASM RTC frame provenance in CoordinateInfo. Older
+ * records remain readable with that provenance absent. */
+/** v21: relationship indexing covers every schema-resolvable exact IfcRel*
+ * class (#4205). The bytes are unchanged, but cache keys must miss v20 graphs
+ * that were produced before those buckets existed. */
+export const FORMAT_VERSION = 23; // v22: per-mesh IFC finish (NaN = absent), #5582; v23: finishes on type geometry, mapped-item styles and instanced shards (IFNS field 2), #5984
 
 /** Geometry chunking parameters (v13+). Grouping is a WRITE-side layout
  *  policy: readers only trust the directory, so these can change without a
@@ -152,6 +180,8 @@ export enum GeometryChunkFlags {
 
 /** One entry of the v13 geometry chunk directory. */
 export interface GeometryChunkInfo {
+  /** v19 decoded header pool shared across chunks; not a directory wire field. */
+  appearanceSources?: readonly Uint32Array[];
   /** World AABB of the chunk's meshes (f32, for future priority/culling). */
   aabbMin: [number, number, number];
   aabbMax: [number, number, number];
@@ -261,6 +291,10 @@ export interface CacheWriteOptions {
    * latency matters more than entry size.
    */
   compressGeometryChunks?: boolean;
+  /** Use one lazy browser module worker for geometry compression (default false).
+   * Requires Worker support and a bundled worker asset; failure rejects the write.
+   * Has no effect when compression is disabled or all chunks are below its floor. */
+  compressGeometryChunksInWorker?: boolean;
 }
 
 /**
@@ -321,7 +355,16 @@ export interface CacheEntityRef {
 }
 
 export interface CacheEntityIndex {
-  byId: Iterable<[number, CacheEntityRef]>;
+  byId: Iterable<[number, CacheEntityRef]> & {
+    /** Optional borrowed columns equivalent to iteration; never mutated/transferred. */
+    getColumns?(): {
+      expressIds: Uint32Array;
+      byteOffsets: Uint32Array;
+      byteLengths: Uint32Array;
+      typeIndices: Uint16Array;
+      typeStrings: string[];
+    };
+  };
 }
 
 export interface CachedEntityIndexColumns {

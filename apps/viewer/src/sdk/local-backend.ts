@@ -24,6 +24,8 @@ import type {
   LensBackendMethods,
   FilesBackendMethods,
   ScheduleBackendMethods,
+  StructuralBackendMethods,
+  CostBackendMethods,
 } from '@ifc-lite/sdk';
 import type { StoreApi } from './adapters/types.js';
 import { LEGACY_MODEL_ID } from './adapters/model-compat.js';
@@ -39,6 +41,9 @@ import { createLensAdapter } from './adapters/lens-adapter.js';
 import { createExportAdapter } from './adapters/export-adapter.js';
 import { createFilesAdapter } from './adapters/files-adapter.js';
 import { createScheduleAdapter } from './adapters/schedule-adapter.js';
+import { createStructuralAdapter } from './adapters/structural-adapter.js';
+import { createCostAdapter } from './adapters/cost-adapter.js';
+import { withBackendWriteTracking } from './adapters/backend-write-capture.js';
 
 export class LocalBackend implements BimBackend {
   readonly model: ModelBackendMethods;
@@ -53,23 +58,30 @@ export class LocalBackend implements BimBackend {
   readonly lens: LensBackendMethods;
   readonly files: FilesBackendMethods;
   readonly schedule: ScheduleBackendMethods;
+  readonly structural: StructuralBackendMethods;
+  readonly cost: CostBackendMethods;
 
   private storeApi: StoreApi;
 
   constructor(store: StoreApi) {
     this.storeApi = store;
-    this.model = createModelAdapter(store);
-    this.query = createQueryAdapter(store);
-    this.selection = createSelectionAdapter(store);
-    this.visibility = createVisibilityAdapter(store);
-    this.viewer = createViewerAdapter(store);
+    // Every namespace attributes the mutations its calls push to the open
+    // batch / flow-run captures (#5634); the mutate adapter tracks its own.
+    const tracked = <T extends object>(adapter: T): T => withBackendWriteTracking(store, adapter);
+    this.model = tracked(createModelAdapter(store));
+    this.query = tracked(createQueryAdapter(store));
+    this.selection = tracked(createSelectionAdapter(store));
+    this.visibility = tracked(createVisibilityAdapter(store));
+    this.viewer = tracked(createViewerAdapter(store));
     this.mutate = createMutateAdapter(store);
-    this.store = createStoreAdapter(store);
-    this.spatial = createSpatialAdapter(store);
-    this.lens = createLensAdapter(store);
-    this.export = createExportAdapter(store);
-    this.files = createFilesAdapter(store);
-    this.schedule = createScheduleAdapter(store);
+    this.store = tracked(createStoreAdapter(store));
+    this.spatial = tracked(createSpatialAdapter(store));
+    this.lens = tracked(createLensAdapter(store));
+    this.export = tracked(createExportAdapter(store));
+    this.files = tracked(createFilesAdapter(store));
+    this.schedule = tracked(createScheduleAdapter(store));
+    this.structural = tracked(createStructuralAdapter(store));
+    this.cost = tracked(createCostAdapter(store));
   }
 
   subscribe(event: BimEventType, handler: (data: unknown) => void): () => void {
@@ -86,6 +98,7 @@ export class LocalBackend implements BimBackend {
           if (state.models.size > prev.models.size) {
             for (const [id, model] of state.models) {
               if (!prev.models.has(id)) {
+                // @raw-entity-enumeration-ok model:loaded reports the initial parsed source count before session edits
                 handler({
                   model: {
                     id: model.id,
@@ -101,6 +114,7 @@ export class LocalBackend implements BimBackend {
             }
           }
           if (state.ifcDataStore && !prev.ifcDataStore && state.models.size === 0) {
+            // @raw-entity-enumeration-ok legacy model:loaded reports the initial parsed source count before session edits
             handler({
               model: {
                 id: LEGACY_MODEL_ID,
@@ -130,8 +144,7 @@ export class LocalBackend implements BimBackend {
         return this.storeApi.subscribe((state, prev) => {
           if (
             state.hiddenEntities !== prev.hiddenEntities ||
-            state.isolatedEntities !== prev.isolatedEntities ||
-            state.hiddenEntitiesByModel !== prev.hiddenEntitiesByModel
+            state.isolatedEntities !== prev.isolatedEntities
           ) {
             handler({});
           }

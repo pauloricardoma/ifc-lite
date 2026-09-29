@@ -15,22 +15,13 @@ import type { MutablePropertyView } from './mutable-property-view.js';
 import type { Mutation, PropertyValue } from './types.js';
 import { checkMutationGuard, type MutationGuard } from './mutation-guard.js';
 import { PARSE_INVALID, parseValue } from './csv-parse-value.js';
+import { buildMatchContext, matchRowAgainstContext, type CsvRow, type MatchStrategy, type MatchResult } from './csv-match.js';
 
-/**
- * A parsed CSV row
- */
-export interface CsvRow {
-  [column: string]: string;
-}
-
-/**
- * Match strategy for linking CSV rows to IFC entities
- */
-export type MatchStrategy =
-  | { type: 'globalId'; column: string }
-  | { type: 'expressId'; column: string }
-  | { type: 'name'; column: string }
-  | { type: 'property'; psetName: string; propName: string; column: string };
+// `CsvRow`, `MatchStrategy`, `MatchResult` and the indexed matching engine
+// live in csv-match.ts (#5167 task 3.1) so this file stays within its
+// module-size budget; re-exported here so the public import path
+// (`@ifc-lite/mutations`, via index.ts) is unaffected.
+export type { CsvRow, MatchStrategy, MatchResult } from './csv-match.js';
 
 /**
  * Mapping from CSV column to IFC property
@@ -59,17 +50,6 @@ export interface DataMapping {
 }
 
 /**
- * Result of matching a CSV row to entities
- */
-export interface MatchResult {
-  row: CsvRow;
-  rowIndex: number;
-  matchedEntityIds: number[];
-  confidence: number; // 0-1, how confident the match is
-  warnings?: string[];
-}
-
-/**
  * Statistics from CSV import
  */
 export interface ImportStats {
@@ -77,6 +57,11 @@ export interface ImportStats {
   matchedRows: number;
   unmatchedRows: number;
   mutationsCreated: number;
+  /**
+   * The mutations the import applied to the view, in order. A host with an
+   * undo history records these (the connector writes the view directly).
+   */
+  mutations: Mutation[];
   errors: string[];
   warnings: string[];
 }
@@ -176,92 +161,43 @@ export class CsvConnector {
   }
 
   /**
-   * Match CSV rows to IFC entities
+   * Match CSV rows to IFC entities.
+   *
+   * Builds the strategy's index once (see csv-match.ts) and reuses it across
+   * every row — the fix for #5167 task 3.1's O(rows × entities) linear scan.
    */
   match(rows: CsvRow[], mapping: DataMapping): MatchResult[] {
-    return rows.map((row, rowIndex) => this.matchRow(row, rowIndex, mapping.matchStrategy));
-  }
-
-  /**
-   * Match a single row to entities
-   */
-  private matchRow(row: CsvRow, rowIndex: number, strategy: MatchStrategy): MatchResult {
-    const matchValue = row[strategy.column];
-    const matchedEntityIds: number[] = [];
-    const warnings: string[] = [];
-
-    if (!matchValue || matchValue.trim() === '') {
-      warnings.push(`Empty match value in column "${strategy.column}"`);
-      return { row, rowIndex, matchedEntityIds, confidence: 0, warnings };
-    }
-
-    switch (strategy.type) {
-      case 'globalId':
-        // Match by GlobalId
-        for (let i = 0; i < this.entities.count; i++) {
-          const globalIdIdx = this.entities.globalId[i];
-          const globalId = this.strings?.get(globalIdIdx) || '';
-          if (globalId === matchValue) {
-            matchedEntityIds.push(this.entities.expressId[i]);
-          }
-        }
-        break;
-
-      case 'expressId':
-        // Match by Express ID
-        const expressId = parseInt(matchValue, 10);
-        if (!isNaN(expressId)) {
-          for (let i = 0; i < this.entities.count; i++) {
-            if (this.entities.expressId[i] === expressId) {
-              matchedEntityIds.push(expressId);
-              break;
-            }
-          }
-        } else {
-          warnings.push(`Invalid Express ID: ${matchValue}`);
-        }
-        break;
-
-      case 'name':
-        // Match by name (case-insensitive)
-        const searchName = matchValue.toLowerCase();
-        for (let i = 0; i < this.entities.count; i++) {
-          const nameIdx = this.entities.name[i];
-          const name = (this.strings?.get(nameIdx) || '').toLowerCase();
-          if (name === searchName) {
-            matchedEntityIds.push(this.entities.expressId[i]);
-          }
-        }
-        break;
-
-      case 'property':
-        // Match by existing property value
-        // This would require access to the property table
-        warnings.push('Property matching not yet implemented');
-        break;
-    }
-
-    const confidence = matchedEntityIds.length === 1 ? 1 : matchedEntityIds.length > 1 ? 0.5 : 0;
-
-    if (matchedEntityIds.length > 1) {
-      warnings.push(`Multiple entities (${matchedEntityIds.length}) matched for value "${matchValue}"`);
-    }
-
-    return { row, rowIndex, matchedEntityIds, confidence, warnings };
+    const context = buildMatchContext(this.entities, this.mutationView, this.strings, mapping.matchStrategy, rows);
+    return rows.map((row, rowIndex) => matchRowAgainstContext(row, rowIndex, mapping.matchStrategy, context));
   }
 
   /**
    * Generate mutations from matched data.
    *
-   * `warnings`, when passed, collects one message per skipped cell — a
-   * malformed Real/Integer value (see {@link parseValue}) that would
-   * otherwise have silently written `0`. Optional and additive: existing
+   * `warnings`, when passed, collects one message per skipped cell — one
+   * that is not exactly a value of its column's type (see {@link parseValue}),
+   * such as `12,5` in a Real column or `ja` in a Boolean one. Optional and additive: existing
    * callers that only want the mutation list are unaffected.
+   *
+   * On a throw, the writes already applied stay in the view but cannot be
+   * returned; `import()` / `importAsync()` report them in `stats.mutations` (#5958).
    */
   generateMutations(matches: MatchResult[], mapping: DataMapping, warnings?: string[]): Mutation[] {
-    checkMutationGuard(this.canEdit);
     const mutations: Mutation[] = [];
+    this.applyMatches(matches, mapping, warnings, mutations);
+    return mutations;
+  }
 
+  /**
+   * Write `matches` to the view, pushing each mutation into `applied` the
+   * moment it is written. The sink is the caller's, not a local array
+   * returned at the end, so a transform or `setProperty` that throws partway
+   * leaves every write that DID land in the caller's hands: the view already
+   * holds them, and a host that records undo history must be able to revert
+   * them (#5958).
+   */
+  private applyMatches(matches: MatchResult[], mapping: DataMapping, warnings: string[] | undefined, applied: Mutation[]): void {
+    checkMutationGuard(this.canEdit);
     for (const match of matches) {
       if (match.matchedEntityIds.length === 0) continue;
 
@@ -283,20 +219,16 @@ export class CsvConnector {
             continue;
           }
 
-          const mutation = this.mutationView.setProperty(
+          applied.push(this.mutationView.setProperty(
             entityId,
             propMapping.targetPset,
             propMapping.targetProperty,
             value,
             propMapping.valueType
-          );
-
-          mutations.push(mutation);
+          ));
         }
       }
     }
-
-    return mutations;
   }
 
   /**
@@ -314,6 +246,7 @@ export class CsvConnector {
       matchedRows: 0,
       unmatchedRows: 0,
       mutationsCreated: 0,
+      mutations: [],
       errors: [],
       warnings: [],
     };
@@ -337,12 +270,12 @@ export class CsvConnector {
         }
       }
 
-      // Generate and apply mutations
-      const mutations = this.generateMutations(matches, mapping, stats.warnings);
-      stats.mutationsCreated = mutations.length;
+      // Generate and apply mutations; a throw keeps what was applied (#5958).
+      this.applyMatches(matches, mapping, stats.warnings, stats.mutations);
     } catch (error) {
       stats.errors.push(error instanceof Error ? error.message : 'Unknown error');
     }
+    stats.mutationsCreated = stats.mutations.length;
 
     return stats;
   }
@@ -355,7 +288,16 @@ export class CsvConnector {
     content: string,
     mapping: DataMapping,
     onProgress: (progress: ImportProgress) => void,
-    options: CsvParseOptions & { batchSize?: number } = {}
+    options: CsvParseOptions & {
+      batchSize?: number;
+      /**
+       * Called after each apply batch with the mutations it wrote, including
+       * the part of a batch that landed before a throw. Lets a host record
+       * undo history as the import goes, so an edit made while it yields
+       * stays in commit order with it (#5958).
+       */
+      onApplied?: (mutations: readonly Mutation[]) => void;
+    } = {}
   ): Promise<ImportStats> {
     const batchSize = options.batchSize || 200;
 
@@ -364,6 +306,7 @@ export class CsvConnector {
       matchedRows: 0,
       unmatchedRows: 0,
       mutationsCreated: 0,
+      mutations: [],
       errors: [],
       warnings: [],
     };
@@ -378,12 +321,15 @@ export class CsvConnector {
       const rows = this.parse(content, options);
       stats.totalRows = rows.length;
 
-      // Phase 2: Match in batches (0–60%)
+      // Phase 2: Match in batches (0–60%). The index is built once, over the
+      // full row set, before batching starts — not per batch — so batching
+      // stays a progress-reporting slice, not an extra O(entities) rebuild.
+      const matchContext = buildMatchContext(this.entities, this.mutationView, this.strings, mapping.matchStrategy, rows);
       const allMatches: MatchResult[] = [];
       for (let i = 0; i < rows.length; i += batchSize) {
         const batch = rows.slice(i, i + batchSize);
         for (let j = 0; j < batch.length; j++) {
-          const match = this.matchRow(batch[j], i + j, mapping.matchStrategy);
+          const match = matchRowAgainstContext(batch[j], i + j, mapping.matchStrategy, matchContext);
           allMatches.push(match);
 
           if (match.matchedEntityIds.length > 0) {
@@ -410,17 +356,22 @@ export class CsvConnector {
       }
 
       // Phase 3: Apply mutations in batches (60–100%)
-      let mutationCount = 0;
       for (let i = 0; i < allMatches.length; i += batchSize) {
         const batch = allMatches.slice(i, i + batchSize);
-        const mutations = this.generateMutations(batch, mapping, stats.warnings);
-        mutationCount += mutations.length;
+        const applied: Mutation[] = [];
+        try {
+          this.applyMatches(batch, mapping, stats.warnings, applied);
+        } finally {
+          // Also on a throw: these writes are in the view already (#5958).
+          for (const mutation of applied) stats.mutations.push(mutation);
+          if (applied.length > 0) reportApplied(options.onApplied, applied, stats.errors);
+        }
 
         const applyProgress = Math.min(i + batchSize, allMatches.length) / allMatches.length;
         onProgress({
           phase: 'applying',
           percent: MATCH_WEIGHT + applyProgress * APPLY_WEIGHT,
-          mutationsCreated: mutationCount,
+          mutationsCreated: stats.mutations.length,
           matchedRows: stats.matchedRows,
           totalRows: rows.length,
         });
@@ -429,10 +380,10 @@ export class CsvConnector {
         await new Promise((r) => setTimeout(r, 0));
       }
 
-      stats.mutationsCreated = mutationCount;
     } catch (error) {
       stats.errors.push(error instanceof Error ? error.message : 'Unknown error');
     }
+    stats.mutationsCreated = stats.mutations.length;
 
     return stats;
   }
@@ -554,5 +505,21 @@ export class CsvConnector {
       .replace(/[^a-zA-Z0-9_]/g, '_')
       .replace(/_+/g, '_')
       .replace(/^_|_$/g, '');
+  }
+}
+
+/**
+ * Hand an applied batch to the host. A throwing callback is reported as an
+ * import error rather than replacing the error that ended the batch (#5958).
+ */
+function reportApplied(
+  onApplied: ((mutations: readonly Mutation[]) => void) | undefined,
+  applied: readonly Mutation[],
+  errors: string[],
+): void {
+  try {
+    onApplied?.(applied);
+  } catch (error) {
+    errors.push(`onApplied: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
 }

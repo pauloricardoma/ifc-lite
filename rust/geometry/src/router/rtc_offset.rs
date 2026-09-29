@@ -6,8 +6,10 @@
 //! and first geometry vertices to decide whether a model needs re-basing.
 
 use super::GeometryRouter;
-use crate::LARGE_COORD_THRESHOLD_METERS;
-use ifc_lite_core::{has_geometry_by_name, DecodedEntity, EntityDecoder, IfcType};
+use crate::coord_is_large;
+use ifc_lite_core::{geometry_flags_by_name, DecodedEntity, EntityDecoder, IfcType, RtcVerdict};
+
+mod raw_coordinate;
 
 /// Whether a near-origin element with this `RepresentationType` may cast a
 /// "no-shift" `(0,0,0)` RTC vote when the vertex probe can't cheaply read a
@@ -31,12 +33,9 @@ fn is_rtc_votable_representation(rep_type: &str) -> bool {
 
 impl GeometryRouter {
     /// Compute median-based RTC offset from sampled translations.
-    /// Returns `(0,0,0)` if empty or coordinates are within 10km of origin.
+    /// Returns `(0,0,0)` if the median is within
+    /// [`LARGE_COORD_THRESHOLD_METERS`](crate::LARGE_COORD_THRESHOLD_METERS) of the origin.
     fn rtc_offset_from_translations(translations: &[(f64, f64, f64)]) -> (f64, f64, f64) {
-        if translations.is_empty() {
-            return (0.0, 0.0, 0.0);
-        }
-
         let mut x: Vec<f64> = translations.iter().map(|(x, _, _)| *x).collect();
         let mut y: Vec<f64> = translations.iter().map(|(_, y, _)| *y).collect();
         let mut z: Vec<f64> = translations.iter().map(|(_, _, z)| *z).collect();
@@ -52,11 +51,7 @@ impl GeometryRouter {
             *z.get(mid).unwrap_or(&0.0),
         );
 
-        const THRESHOLD: f64 = 10000.0;
-        if centroid.0.abs() > THRESHOLD
-            || centroid.1.abs() > THRESHOLD
-            || centroid.2.abs() > THRESHOLD
-        {
+        if coord_is_large(centroid) {
             return centroid;
         }
 
@@ -65,10 +60,11 @@ impl GeometryRouter {
 
     /// Sample a building element's world-space position for RTC offset detection.
     ///
-    /// First checks the placement transform translation. If placement is near
-    /// the origin (< 100 m), also probes the first geometry vertex — infrastructure
-    /// models (12d Model, Civil 3D) embed large world coordinates directly in
-    /// Brep/tessellated geometry with an identity placement.
+    /// First checks the placement transform translation. If the placement
+    /// alone is not already [`coord_is_large`], also probes the first
+    /// geometry vertex — infrastructure models (12d Model, Civil 3D) embed
+    /// large world coordinates directly in Brep/tessellated geometry with an
+    /// identity placement.
     fn sample_element_translation(
         &self,
         entity: &DecodedEntity,
@@ -89,12 +85,20 @@ impl GeometryRouter {
             return None;
         }
 
-        // If placement is near origin, also check actual geometry vertex coordinates.
-        // Infrastructure models embed world coords (e.g. 280 000, 6 214 000) directly
-        // in geometry vertices with identity placement — placement-only sampling
-        // would miss the large coordinates and fail to detect the need for RTC.
-        const NEAR_ORIGIN: f64 = 1000.0;
-        if tx.abs() < NEAR_ORIGIN && ty.abs() < NEAR_ORIGIN && tz.abs() < NEAR_ORIGIN {
+        // If the placement alone would not already answer "large", also check
+        // actual geometry vertex coordinates. Infrastructure models embed world
+        // coords (e.g. 280 000, 6 214 000) directly in geometry vertices with
+        // identity placement — placement-only sampling would miss the large
+        // coordinates and fail to detect the need for RTC.
+        //
+        // Gated on `!coord_is_large`, the SAME predicate the median vote below
+        // is judged by (not a separate `< NEAR_ORIGIN` cutoff): a placement
+        // exactly AT the threshold used to read as "not near origin" (skip the
+        // probe) under a strict `<` comparison, fall through unprobed, and
+        // then read as "not large" under `coord_is_large`'s strict `>` — one
+        // coordinate, one comparison direction wrong, but disagreeing on
+        // whether the probe should have run at all (#4934 review).
+        if !coord_is_large((tx, ty, tz)) {
             if let Some((vx, vy, vz)) = self.sample_first_geometry_vertex(entity, decoder) {
                 // Transform vertex by placement to get world-space position.
                 // The vertex is in raw file units but the placement transform is
@@ -132,12 +136,12 @@ impl GeometryRouter {
         Some((tx, ty, tz))
     }
 
-    /// True when the element carries at least one RTC-votable body shape
-    /// representation (see [`is_rtc_votable_representation`]), as opposed to
-    /// only curve/axis/footprint reps (e.g. an IfcAlignmentSegment) OR a
-    /// `Surface3D` rep whose coordinates the vertex probe cannot read. Used to
-    /// decide whether an origin-placed element with no cheaply-samplable vertex
-    /// may still cast a "no shift" (0,0,0) vote during RTC detection.
+    /// True when the element carries at least one RTC-votable body shape or
+    /// structural Face topology representation, as opposed to only
+    /// curve/axis/footprint reps (e.g. an IfcAlignmentSegment) OR a `Surface3D`
+    /// rep whose coordinates the vertex probe cannot read. Used to decide
+    /// whether an origin-placed element with no cheaply-samplable vertex may
+    /// still cast a "no shift" (0,0,0) vote during RTC detection.
     ///
     /// NOTE: this uses [`is_rtc_votable_representation`], NOT
     /// [`is_body_representation`](super::is_body_representation) — the two
@@ -167,10 +171,13 @@ impl GeometryRouter {
             return false;
         };
         reps.iter().any(|sr| {
-            sr.ifc_type == IfcType::IfcShapeRepresentation
-                && super::effective_rep_type(sr)
-                    .map(is_rtc_votable_representation)
-                    .unwrap_or(false)
+            super::effective_element_rep_type(entity, sr).is_some_and(|rep_type| {
+                (sr.ifc_type == IfcType::IfcShapeRepresentation
+                    && is_rtc_votable_representation(rep_type))
+                    || (sr.ifc_type == IfcType::IfcTopologyRepresentation
+                        && rep_type == "Face"
+                        && super::structural::accepts(entity, rep_type))
+            })
         })
     }
 
@@ -204,10 +211,7 @@ impl GeometryRouter {
         let reps_attr = rep.get(2)?;
         let reps = decoder.resolve_ref_list(reps_attr).ok()?;
 
-        for shape_rep in &reps {
-            if shape_rep.ifc_type != IfcType::IfcShapeRepresentation {
-                continue;
-            }
+        for shape_rep in super::meshed_representations(entity, &reps) {
             // attr 3 = Items (list of geometry items)
             let items = match shape_rep.get(3).and_then(|a| a.as_list()) {
                 Some(list) => list,
@@ -233,7 +237,10 @@ impl GeometryRouter {
                 match item.ifc_type {
                     // ── Brep path ──
                     // IfcFacetedBrep attr 0 = Outer (IfcClosedShell)
-                    IfcType::IfcFacetedBrep | IfcType::IfcFacetedBrepWithVoids => {
+                    IfcType::IfcFacetedBrep
+                    | IfcType::IfcFacetedBrepWithVoids
+                    | IfcType::IfcAdvancedBrep
+                    | IfcType::IfcAdvancedBrepWithVoids => {
                         if let Some(pt) = self.brep_first_vertex(&item, decoder) {
                             return Some(pt);
                         }
@@ -270,6 +277,13 @@ impl GeometryRouter {
                         }
                     }
 
+                    // ── Structural topology path ──
+                    IfcType::IfcFaceSurface | IfcType::IfcAdvancedFace => {
+                        if let Some(pt) = self.face_first_vertex(&item, decoder) {
+                            return Some(pt);
+                        }
+                    }
+
                     _ => continue,
                 }
             }
@@ -298,6 +312,14 @@ impl GeometryRouter {
         let faces = shell.get(0)?.as_list()?;
         let face_id = faces.first()?.as_entity_ref()?;
         let face = decoder.decode_by_id(face_id).ok()?;
+        self.face_first_vertex(&face, decoder)
+    }
+
+    fn face_first_vertex(
+        &self,
+        face: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+    ) -> Option<(f64, f64, f64)> {
         let bounds = face.get(0)?.as_list()?;
         let bound_id = bounds.first()?.as_entity_ref()?;
         let bound = decoder.decode_by_id(bound_id).ok()?;
@@ -314,6 +336,18 @@ impl GeometryRouter {
             let polygon = loop_entity.get(0)?.as_list()?;
             let pt_id = polygon.first()?.as_entity_ref()?;
             return decoder.get_cartesian_point_fast(pt_id);
+        }
+        if loop_entity.ifc_type == IfcType::IfcEdgeLoop {
+            let edge_id = loop_entity.get(0)?.as_list()?.first()?.as_entity_ref()?;
+            let oriented = decoder.decode_by_id(edge_id).ok()?;
+            let edge = oriented
+                .get(2)
+                .and_then(|attr| decoder.resolve_ref(attr).ok().flatten())?;
+            let vertex = edge
+                .get(0)
+                .and_then(|attr| decoder.resolve_ref(attr).ok().flatten())?;
+            let point_id = vertex.get_ref(0)?;
+            return decoder.get_cartesian_point_fast(point_id);
         }
         None
     }
@@ -335,101 +369,22 @@ impl GeometryRouter {
         Some((x, y, z))
     }
 
-    fn raw_coordinate_is_large(&self, point: (f64, f64, f64)) -> bool {
-        let max_abs = point.0.abs().max(point.1.abs()).max(point.2.abs());
-        max_abs * self.unit_scale > LARGE_COORD_THRESHOLD_METERS
-    }
-
-    pub(super) fn representation_item_uses_raw_large_coordinates(
+    /// [`Self::detect_rtc_offset_for_file`]'s window with no placement-bounds
+    /// fallback. `None` when no usable translation sample was found, so a caller
+    /// can tell "no shift needed" from "detection had no data" — the distinction
+    /// the streaming ladder in `ifc_lite_processing::stream_meta` climbs.
+    pub fn detect_rtc_anchor_for_file(
         &self,
-        item: &DecodedEntity,
+        content: &[u8],
         decoder: &mut EntityDecoder,
-    ) -> bool {
-        let first_vertex = match item.ifc_type {
-            IfcType::IfcFacetedBrep | IfcType::IfcFacetedBrepWithVoids => {
-                self.brep_first_vertex(item, decoder)
-            }
-            IfcType::IfcTriangulatedFaceSet
-            | IfcType::IfcTriangulatedIrregularNetwork
-            | IfcType::IfcPolygonalFaceSet => self.tessellated_first_vertex(item, decoder),
-            IfcType::IfcFaceBasedSurfaceModel | IfcType::IfcShellBasedSurfaceModel => {
-                let Some(shells_attr) = item.get(0) else {
-                    return false;
-                };
-                let Some(shells) = shells_attr.as_list() else {
-                    return false;
-                };
-                let Some(shell_ref) = shells.first() else {
-                    return false;
-                };
-                let Some(shell_id) = shell_ref.as_entity_ref() else {
-                    return false;
-                };
-                match decoder.decode_by_id(shell_id) {
-                    Ok(shell) => self.shell_first_vertex(&shell, decoder),
-                    Err(_) => None,
-                }
-            }
-            _ => None,
-        };
-
-        first_vertex
-            .map(|point| self.raw_coordinate_is_large(point))
-            .unwrap_or(false)
+    ) -> Option<(f64, f64, f64)> {
+        self.sample_rtc_offset(content, decoder)
     }
 
-    /// Detect RTC offset by scanning the file for building elements.
-    /// Used by synchronous parse paths.
-    pub fn detect_rtc_offset_from_first_element<T>(
+    /// The median sampler behind both detectors here, over the canonical window.
+    fn sample_rtc_offset(
         &self,
-        content: &T,
-        decoder: &mut EntityDecoder,
-    ) -> (f64, f64, f64)
-    where
-        T: AsRef<[u8]> + ?Sized,
-    {
-        let content = content.as_ref();
-        use ifc_lite_core::EntityScanner;
-
-        let mut scanner = EntityScanner::new(content);
-        let mut translations: Vec<(f64, f64, f64)> = Vec::new();
-        const MAX_SAMPLES: usize = 50;
-
-        while let Some((_id, type_name, start, end)) = scanner.next_entity() {
-            if translations.len() >= MAX_SAMPLES {
-                break;
-            }
-            // Use the canonical has_geometry_by_name check from the schema
-            // instead of a hardcoded list — any entity class with geometry
-            // is a valid candidate for RTC offset sampling. #1910: also let
-            // through a spatial container `has_geometry_by_name` blocks by
-            // name (`IfcBuilding` et al.) when THIS instance exceptionally
-            // carries a non-null Representation — mirrors the identical
-            // exception in the entity-job scans
-            // (`rust/processing/src/processor/mod.rs`,
-            // `rust/wasm-bindings/src/api/gpu_meshes/prepass.rs`) so RTC
-            // detection and meshing agree on what counts as geometry.
-            let is_exceptional_spatial_container = ifc_lite_core::is_representationless_spatial_container_by_name(type_name)
-                && ifc_lite_core::nth_attribute_is_present(&content[start..end], 6);
-            if !has_geometry_by_name(type_name) && !is_exceptional_spatial_container {
-                continue;
-            }
-            if let Ok(entity) = decoder.decode_at(start, end) {
-                if let Some(t) = self.sample_element_translation(&entity, decoder) {
-                    translations.push(t);
-                }
-            }
-        }
-
-        Self::rtc_offset_from_translations(&translations)
-    }
-
-    /// Detect RTC offset using pre-collected geometry jobs (avoids re-scanning the file).
-    /// Returns `None` when no usable translation samples were found, allowing
-    /// callers to distinguish "no shift needed" from "detection had no data".
-    pub fn detect_rtc_offset_from_jobs(
-        &self,
-        jobs: &[(u32, usize, usize, IfcType)],
+        content: &[u8],
         decoder: &mut EntityDecoder,
     ) -> Option<(f64, f64, f64)> {
         const MAX_SAMPLES: usize = 50;
@@ -439,41 +394,59 @@ impl GeometryRouter {
         // budget. Otherwise a file that emits 50+ alignment segments before its
         // real large-coordinate solids would fill the window with abstentions,
         // sample zero positions, and miss the re-basing the solids need.
-        // Matches `detect_rtc_offset_from_first_element`, which likewise counts
-        // pushed samples rather than scanned entities.
-        let translations: Vec<(f64, f64, f64)> = jobs
-            .iter()
-            .filter_map(|&(id, start, end, _)| {
+        let translations: Vec<(f64, f64, f64)> = file_geometry_spans(content)
+            .filter_map(|(id, start, end)| {
                 let entity = decoder.decode_at_with_id(id, start, end).ok()?;
                 self.sample_element_translation(&entity, decoder)
             })
             .take(MAX_SAMPLES)
             .collect();
-
-        if translations.is_empty() {
-            return None;
-        }
-        Some(Self::rtc_offset_from_translations(&translations))
+        (!translations.is_empty()).then(|| Self::rtc_offset_from_translations(&translations))
     }
 
-    /// Detect the RTC offset from sampled jobs, falling back to a full-file
-    /// placement-bounds scan when no usable translation samples were found.
+    /// The RTC verdict for `content`: the median over the canonical sample
+    /// window, or the full-file placement-bounds scan when that window yielded
+    /// no usable translation.
     ///
-    /// Single shared entry point for the server processing path and the wasm
-    /// prepasses so both sides make the identical needs-shift decision: a
-    /// model whose sampled placements fail to decode while raw geometry
-    /// carries >10 km coordinates must be re-based identically everywhere
-    /// (previously the wasm prepasses silently fell back to (0,0,0) and the
-    /// browser rendered f32 vertex jitter that the server never saw).
-    pub fn detect_rtc_offset_with_fallback(
-        &self,
-        jobs: &[(u32, usize, usize, IfcType)],
-        decoder: &mut EntityDecoder,
-        content: &[u8],
-    ) -> (f64, f64, f64) {
-        match self.detect_rtc_offset_from_jobs(jobs, decoder) {
-            Some(offset) => offset,
-            None => ifc_lite_core::scan_placement_bounds(content).rtc_offset(),
-        }
+    /// Single shared entry point for the server processing path, the wasm
+    /// prepasses and the overlays, so every one of them makes the identical
+    /// needs-shift decision: a model whose sampled placements fail to decode
+    /// while raw geometry carries coordinates past
+    /// [`crate::LARGE_COORD_THRESHOLD_METERS`] (1 km, was 10 km before
+    /// #4934) must be re-based
+    /// identically everywhere (previously the wasm prepasses silently fell
+    /// back to (0,0,0) and the browser rendered f32 vertex jitter that the
+    /// server never saw).
+    ///
+    /// The spans are [`file_geometry_spans`] — every geometry-bearing entity of
+    /// `content`, in file order, sampled lazily to the sampler's usable-sample
+    /// cap. They are deliberately NOT a job list the caller passes in: a job
+    /// list is a SCHEDULE, and every pipeline schedules differently, so a
+    /// caller-supplied window made the median anchor a function of the
+    /// scheduler rather than of the model and one file resolved to several
+    /// anchors (#4611, pinned by
+    /// `wasm-bindings/src/api/gpu_meshes/prepass_tests.rs`).
+    ///
+    /// `None` means neither ladder found a coordinate to judge; `MeshFrame::select`
+    /// in `ifc_lite_processing` decides what that means.
+    pub fn detect_rtc_offset_for_file(&self, content: &[u8], decoder: &mut EntityDecoder) -> Option<RtcVerdict> {
+        self.detect_rtc_anchor_for_file(content, decoder)
+            .map(RtcVerdict::of_anchor)
+            .or_else(|| ifc_lite_core::scan_placement_bounds(content).rtc_offset(self.unit_scale))
     }
+}
+
+/// The `(id, start, end)` span of every entity the mesh pre-passes schedule,
+/// in file order: the canonical `geometry_flags_by_name` check, plus (#1910) a
+/// spatial container it blocks by name (`IfcBuilding` et al.) whose instance
+/// carries a non-null Representation, mirroring the entity-job scans in
+/// `rust/processing/src/processor/mod.rs` and
+/// `rust/wasm-bindings/src/api/gpu_meshes/prepass.rs`.
+fn file_geometry_spans(content: &[u8]) -> impl Iterator<Item = (u32, usize, usize)> + '_ {
+    let mut scanner = ifc_lite_core::EntityScanner::new(content);
+    std::iter::from_fn(move || scanner.next_entity()).filter_map(move |(id, type_name, start, end)| {
+        let (geometry, spatial) = geometry_flags_by_name(type_name);
+        let has_representation = || ifc_lite_core::nth_attribute_is_present(&content[start..end], 6);
+        (geometry || (spatial && has_representation())).then_some((id, start, end))
+    })
 }

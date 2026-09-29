@@ -5,11 +5,15 @@
 use crate::mesh::Mesh;
 use nalgebra::{Point3, Vector3};
 mod conform;
+mod plane_merge;
 mod ring_ops;
 
 use super::ClippingProcessor;
 use conform::{build_seam_map, conform_plans, count_open_boundary_edges_at, emit_plans, PlanBucket, PlanRegion};
-use ring_ops::{floor_pow2, simplify_2d_collinear, weld_near_coincident_2d};
+use plane_merge::{merge_rounding_split_buckets, tag_for, PlaneTri};
+use ring_ops::{clean_ring, floor_pow2};
+#[cfg(test)]
+use ring_ops::{ring_is_noise, weld_near_coincident_2d};
 
 /// Is `v` a degenerate NEEDLE — its shortest edge a hairline relative to its
 /// longest? Such a triangle is a zero-area-intended sliver: the exact kernel
@@ -19,10 +23,24 @@ use ring_ops::{floor_pow2, simplify_2d_collinear, weld_near_coincident_2d};
 ///
 /// The test is `min_edge < floor_pow2(max_edge) · 2⁻¹³` — POWER-OF-TWO and
 /// scale-relative, so it is bit-deterministic AND catches the needle (min 6.6 µm
-/// vs max ~5 m ⇒ threshold ~5·10⁻⁴) while never touching a real thin sliver
-/// (e.g. a 0.2 m × 2 m face, min 0.2 m ≫ 2·10⁻⁴). Dropping a needle cannot open a
-/// real gap — the hole/seam is already framed by the neighbouring non-degenerate
-/// triangles, exactly as Manifold (which welds the near-duplicate) produces.
+/// vs max ~5 m ⇒ threshold ~5·10⁻⁴) while never touching a real thin sliver at
+/// that scale (e.g. a 0.2 m × 2 m face, min 0.2 m ≫ 2·10⁻⁴). Dropping such a
+/// needle cannot open a gap: the hole/seam is already framed by the neighbouring
+/// non-degenerate triangles, exactly as Manifold (which welds the near-duplicate)
+/// produces.
+///
+/// The cost of scale-relativity, documented behaviour rather than a defect
+/// (#4698): a REAL face thinner than `floor_pow2(max_edge) / 8192` is dropped
+/// with the needles — 7.8 mm across a 64 m span, so a 64 m × 5 mm plate edge
+/// does not survive the needle filter, on any of the paths that call it, and its
+/// removal DOES leave a gap — the framing argument above covers a needle, not a
+/// face. No absolute floor is threaded here: this runs in the CALLER's unit
+/// (metres on the void path, millimetres on the file-unit boolean path, #2684),
+/// and the corpus needles it must keep dropping reach 1.7 mm (ISSUE_129
+/// #296868) and 0.054 file units (S_Office #92642) — within 3× of a plausible
+/// real thin face. Every absolute floor from 2⁻¹² to 2⁻²⁰ re-tore both hosts.
+/// #4744 did thread a metres-per-unit scale into the sibling RING gate; doing the
+/// same here would still need that call, since the `aabb_clip` site has no scale.
 pub(crate) fn tri_is_needle(v: &[Point3<f64>; 3]) -> bool {
     let d = |a: &Point3<f64>, b: &Point3<f64>| (a - b).norm();
     let (e0, e1, e2) = (d(&v[0], &v[1]), d(&v[1], &v[2]), d(&v[2], &v[0]));
@@ -40,7 +58,8 @@ pub(crate) fn tri_is_needle(v: &[Point3<f64>; 3]) -> bool {
 /// 2D-union round-trip (single-triangle buckets and the union-collapse fallback);
 /// the needle drop here is what removes the #1007 diagonal sliver, since each
 /// tilted opening face lands in its own single-triangle plane bucket and would
-/// otherwise pass the raw kernel needle through verbatim.
+/// otherwise pass the raw kernel needle through verbatim. See [`tri_is_needle`]
+/// for what else the rule drops at long spans.
 pub(super) fn emit_triangle(mesh: &mut Mesh, v: &[Point3<f64>; 3], normal: &Vector3<f64>) {
     if tri_is_needle(v) {
         return;
@@ -108,6 +127,20 @@ impl ClippingProcessor {
     /// Returns the input mesh unchanged if the consolidate fails or yields
     /// nothing — never worse than the raw kernel output.
     pub(crate) fn consolidate_coplanar(mesh: Mesh) -> Mesh {
+        Self::consolidate_coplanar_with_unit_scale(mesh, 1.0)
+    }
+
+    /// Construct a clipper for operands that are still expressed in file units.
+    pub(crate) fn with_unit_scale(length_unit_scale: f64) -> Self {
+        Self { length_unit_scale, ..Self::new() }
+    }
+
+    /// Consolidate using this processor's caller-unit-to-metre scale.
+    pub(crate) fn consolidate(&self, mesh: Mesh) -> Mesh {
+        Self::consolidate_coplanar_with_unit_scale(mesh, self.length_unit_scale)
+    }
+
+    fn consolidate_coplanar_with_unit_scale(mesh: Mesh, length_unit_scale: f64) -> Mesh {
         use crate::grid::NORMAL_QUANT_F64 as NORMAL_QUANT;
         use crate::triangulation::project_to_2d_with_basis;
         use i_overlay::core::fill_rule::FillRule;
@@ -135,12 +168,10 @@ impl ClippingProcessor {
         let qnorm = |n: f64| (n * NORMAL_QUANT).round() as i64;
 
         // Step 1 — group input triangles by plane.
-        struct PlaneTri {
-            v: [Point3<f64>; 3],
-            normal: Vector3<f64>,
-        }
         let positions = &mesh.positions;
         let vertex_count = positions.len() / 3;
+        let triangle_count = mesh.indices.len() / 3;
+        let plane_tags = mesh.plane_tags.as_deref();
         // BTreeMap, NOT FxHashMap: step 2 emits the output mesh in bucket
         // iteration order, and FxHasher mixes usize-wide chunks, so its
         // iteration order differs between 64-bit native and 32-bit wasm32 -
@@ -149,9 +180,13 @@ impl ClippingProcessor {
         // determinism manifest. Ord-keyed iteration is target-independent
         // (same pattern as facet_weld's normal_buckets); bucket counts per
         // cut are small, so the tree overhead is noise.
+        //
+        // Bucketing itself is UNCHANGED (today's geometric re-derivation):
+        // #3914's fix is a separate merge pass below, not a different key
+        // here — see that pass for why.
         let mut buckets: std::collections::BTreeMap<(i64, i64, i64, i64), Vec<PlaneTri>> =
             std::collections::BTreeMap::new();
-        for chunk in mesh.indices.chunks_exact(3) {
+        for (tri_idx, chunk) in mesh.indices.chunks_exact(3).enumerate() {
             let (i0, i1, i2) = (chunk[0] as usize, chunk[1] as usize, chunk[2] as usize);
             if i0 >= vertex_count || i1 >= vertex_count || i2 >= vertex_count {
                 continue;
@@ -186,11 +221,21 @@ impl ClippingProcessor {
                 qnorm(normal.z),
                 qpos(offset),
             );
+            let tri_v = [v0, v1, v2];
+            let tag = tag_for(plane_tags, triangle_count, tri_idx, &tri_v);
             buckets.entry(key).or_default().push(PlaneTri {
-                v: [v0, v1, v2],
+                v: tri_v,
                 normal,
+                tag,
             });
         }
+
+        // Issue #3914 fix: stitch a `POS_QUANT`-rounding bucket split
+        // back together using the kernel's own f64 plane tags — see
+        // `plane_merge::merge_rounding_split_buckets` for the mechanism,
+        // why it is a narrow adjacent-pair merge rather than a global
+        // re-key, and the scale-relative/-capped tolerances involved.
+        let merged_bucket_keys = merge_rounding_split_buckets(&mut buckets);
 
         // Step 2 — three phases over the SAME bucket map.
         //
@@ -213,14 +258,25 @@ impl ClippingProcessor {
         let mut plans: Vec<PlanBucket> = Vec::with_capacity(buckets.len());
 
         // Phase A.
-        for (bid, tris) in buckets.values().enumerate() {
+        for (bid, (bucket_key, tris)) in buckets.iter().enumerate() {
             if tris.is_empty() {
                 continue;
             }
             let bid = bid as u32;
             // Use the FIRST triangle's normal/anchor for a stable 2D basis;
-            // all tris in this bucket share the plane by construction.
-            let normal = tris[0].normal;
+            // all tris in this bucket share the plane by construction. EXCEPT
+            // (#3914): a bucket the merge pass above just folded a straddling
+            // neighbour into — `tris[0]`'s own recomputed cross-product
+            // normal is one specific member's noise, not the shared plane
+            // both original buckets' tags agreed on; use that tag's normal
+            // instead. An ordinary, non-merged bucket (the overwhelming
+            // majority) is untouched: this is `tris[0].normal` exactly as
+            // before the fix.
+            let normal = if merged_bucket_keys.contains(bucket_key) {
+                tris[0].tag.map(|(n, _)| n).unwrap_or(tris[0].normal)
+            } else {
+                tris[0].normal
+            };
             let origin = tris[0].v[0];
             let abs = (normal.x.abs(), normal.y.abs(), normal.z.abs());
             let reference = if abs.0 <= abs.1 && abs.0 <= abs.2 {
@@ -244,6 +300,7 @@ impl ClippingProcessor {
                 u_axis,
                 v_axis,
                 raw: Vec::new(),
+                raw_conformed: None,
                 regions: Vec::new(),
             };
 
@@ -259,6 +316,8 @@ impl ClippingProcessor {
             }
             let mut subject: Vec<Vec<[f64; 2]>> = Vec::with_capacity(1);
             let mut clip: Vec<Vec<[f64; 2]>> = Vec::with_capacity(tris.len() - 1);
+            // The plane's total area, for `ring_is_noise`'s share test.
+            let mut plane_area = 0.0_f64;
             for (idx, tri) in tris.iter().enumerate() {
                 let pts_2d = project_to_2d_with_basis(&tri.v, &u_axis, &v_axis, &origin);
                 // Force CCW for i_overlay's NonZero fill — kernel output
@@ -268,6 +327,7 @@ impl ClippingProcessor {
                     * (pts_2d[2].y - pts_2d[0].y)
                     - (pts_2d[2].x - pts_2d[0].x)
                         * (pts_2d[1].y - pts_2d[0].y);
+                plane_area += 0.5 * signed_area.abs();
                 let path: Vec<[f64; 2]> = if signed_area >= 0.0 {
                     pts_2d.iter().map(|p| [p.x, p.y]).collect()
                 } else {
@@ -290,74 +350,17 @@ impl ClippingProcessor {
                 continue;
             }
 
-            // Total bucket area — used to filter sub-resolution shapes /
-            // holes (f64 noise leaves tiny spurious cavities after the
-            // i_overlay union).
-            let bucket_area: f64 = tris
-                .iter()
-                .map(|t| {
-                    let pts =
-                        project_to_2d_with_basis(&t.v, &u_axis, &v_axis, &origin);
-                    0.5_f64
-                        * ((pts[1].x - pts[0].x) * (pts[2].y - pts[0].y)
-                            - (pts[2].x - pts[0].x) * (pts[1].y - pts[0].y))
-                            .abs()
-                })
-                .sum();
-            let min_significant = (bucket_area * 1.0e-4).max(1.0e-8);
-
-            let signed_area_2d = |ring: &[nalgebra::Point2<f64>]| -> f64 {
-                let n = ring.len();
-                if n < 3 {
-                    return 0.0;
-                }
-                let mut s = 0.0;
-                for i in 0..n {
-                    let j = (i + 1) % n;
-                    s += ring[i].x * ring[j].y - ring[j].x * ring[i].y;
-                }
-                s * 0.5
-            };
-
             for shape in shapes {
-                if shape.is_empty() {
+                let Some(outer_simplified) =
+                    shape.first().and_then(|c| clean_ring(c, plane_area, length_unit_scale))
+                else {
                     continue;
-                }
-                let outer_2d: Vec<nalgebra::Point2<f64>> = shape[0]
-                    .iter()
-                    .map(|p| nalgebra::Point2::new(p[0], p[1]))
-                    .collect();
-                // Weld µm-scale near-coincident rim duplicates FIRST (the #1007
-                // diagonal-sliver source), THEN drop collinear phantoms.
-                let outer_welded = weld_near_coincident_2d(&outer_2d);
-                let outer_simplified = simplify_2d_collinear(&outer_welded);
-                if outer_simplified.len() < 3 {
-                    continue;
-                }
-                let outer_area = signed_area_2d(&outer_simplified).abs();
-                if outer_area < min_significant {
-                    continue;
-                }
-                let holes_simplified: Vec<Vec<nalgebra::Point2<f64>>> = shape
-                    .iter()
-                    .skip(1)
-                    .filter_map(|c| {
-                        let pts: Vec<_> = c
-                            .iter()
-                            .map(|p| nalgebra::Point2::new(p[0], p[1]))
-                            .collect();
-                        let welded = weld_near_coincident_2d(&pts);
-                        let simplified = simplify_2d_collinear(&welded);
-                        if simplified.len() < 3 {
-                            return None;
-                        }
-                        let area = signed_area_2d(&simplified).abs();
-                        if area < min_significant {
-                            return None;
-                        }
-                        Some(simplified)
-                    })
-                    .collect();
+                };
+                let holes_simplified: Vec<Vec<nalgebra::Point2<f64>>> =
+                    shape[1..]
+                        .iter()
+                        .filter_map(|c| clean_ring(c, plane_area, length_unit_scale))
+                        .collect();
 
                 plan.regions.push(PlanRegion {
                     changed: false,
@@ -406,12 +409,26 @@ impl ClippingProcessor {
                 // to triangulate is skipped, and if it was its own closed component
                 // the remainder still balances — so a watertight-LOOKING candidate
                 // can be missing a whole surface. Reject unless every region landed.
+                let raw_conformed = plans.iter().any(|plan| plan.raw_conformed.is_some());
                 let (candidate, complete) = emit_plans(&mut plans, true);
-                if complete
-                    && !candidate.is_empty()
-                    && count_open_boundary_edges_at(&candidate, 1.0e4) == 0
+                if let Some(candidate) =
+                    complete_conformed_candidate(candidate, complete, raw_conformed)
                 {
                     output = candidate;
+                } else if raw_conformed {
+                    // Preserve the established region-only conform when a new raw
+                    // split does not pair exactly. This is the #3913 N-ary sweep
+                    // safety valve: raw additions may improve the 0.1 mm metric
+                    // while introducing an exact-coordinate tear.
+                    for plan in &mut plans {
+                        plan.raw_conformed = None;
+                    }
+                    let (candidate, complete) = emit_plans(&mut plans, true);
+                    if let Some(candidate) =
+                        complete_conformed_candidate(candidate, complete, false)
+                    {
+                        output = candidate;
+                    }
                 }
             }
         }
@@ -489,6 +506,58 @@ impl ClippingProcessor {
     }
 }
 
+/// Apply the same mesh hygiene as the router before judging the all-or-nothing
+/// conform candidate. Triangulation can emit sub-grid collinear slivers beside
+/// an otherwise paired seam; they are not geometry and must not make a closed
+/// candidate look open at the acceptance bar.
+fn complete_conformed_candidate(
+    mut candidate: Mesh,
+    complete: bool,
+    require_exact: bool,
+) -> Option<Mesh> {
+    candidate.clean_degenerate();
+    (complete
+        && !candidate.is_empty()
+        && count_open_boundary_edges_at(&candidate, 1.0e4) == 0
+        && (!require_exact || count_open_boundary_edges_exact(&candidate) == 0))
+        .then_some(candidate)
+}
+
+fn count_open_boundary_edges_exact(mesh: &Mesh) -> usize {
+    let mut vertices: rustc_hash::FxHashMap<[u32; 3], u32> = Default::default();
+    let mut id_of = |index: usize| -> u32 {
+        let base = index * 3;
+        let key = [
+            mesh.positions[base].to_bits(),
+            mesh.positions[base + 1].to_bits(),
+            mesh.positions[base + 2].to_bits(),
+        ];
+        let next = vertices.len() as u32;
+        *vertices.entry(key).or_insert(next)
+    };
+    let mut balance: rustc_hash::FxHashMap<(u32, u32), i32> = Default::default();
+    for triangle in mesh.indices.chunks_exact(3) {
+        let ids = [
+            id_of(triangle[0] as usize),
+            id_of(triangle[1] as usize),
+            id_of(triangle[2] as usize),
+        ];
+        for (a, b) in [(ids[0], ids[1]), (ids[1], ids[2]), (ids[2], ids[0])] {
+            let (edge, sign) = if a < b { ((a, b), 1) } else { ((b, a), -1) };
+            *balance.entry(edge).or_default() += sign;
+        }
+    }
+    balance.values().filter(|&&value| value != 0).count()
+}
+
+#[cfg(test)]
+#[path = "consolidate_threshold_tests.rs"]
+mod threshold_tests;
+
+#[cfg(test)]
+#[path = "consolidate_3977_tests.rs"]
+mod issue_3977_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn tri_is_needle_flags_hairline_slivers_not_real_thin_faces() {
+    fn tri_is_needle_flags_slivers_hairline_for_their_own_span() {
         // The #1007 needle: 6.6 µm base, ~5 m apex span → drop.
         let needle = [
             Point3::new(4.672253608703613, -1.0, 12.385885238647461),
@@ -528,6 +597,15 @@ mod tests {
             Point3::new(2.0, 0.2, 0.0),
         ];
         assert!(!tri_is_needle(&real_thin), "a real 0.2×2 m sliver was wrongly flagged");
+        // The documented cost of the scale-relative rule (#4698): the same
+        // 5 mm width IS a needle once the span is 64 m, so a long plate edge
+        // does not survive. Stated on `tri_is_needle`, pinned here.
+        let long_plate_edge = [
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(64.0, 0.0, 0.0),
+            Point3::new(64.0, 0.005, 0.0),
+        ];
+        assert!(tri_is_needle(&long_plate_edge), "a 64 m × 5 mm face is a needle by this rule");
         // A healthy near-equilateral triangle is kept.
         let healthy = [
             Point3::new(0.0, 0.0, 0.0),

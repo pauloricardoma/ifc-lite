@@ -1,5 +1,47 @@
 # ifc-lite-collab-3d-demo
 
+## 1.0.8
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @ifc-lite/collab@0.9.1
+
+## 1.0.7
+
+### Patch Changes
+
+- Updated dependencies [[`dec98a2`](https://github.com/LTplus-AG/ifc-lite/commit/dec98a2c97e03e70e8b78c55bb27e87b5b4013a6), [`074178f`](https://github.com/LTplus-AG/ifc-lite/commit/074178f651c21dacbfbec33534701a59a7e81ace), [`f942fb6`](https://github.com/LTplus-AG/ifc-lite/commit/f942fb6c48ac9be1464e49fd963340835a72945d), [`685b541`](https://github.com/LTplus-AG/ifc-lite/commit/685b5414f57eec64c74e056b9b51b6b8ffe3a88f)]:
+  - @ifc-lite/collab@0.9.0
+
+## 1.0.6
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @ifc-lite/collab@0.8.1
+
+## 1.0.5
+
+### Patch Changes
+
+- Updated dependencies [[`e18a434`](https://github.com/LTplus-AG/ifc-lite/commit/e18a434ec2258e474728bd9a90146486b38efedb), [`53003de`](https://github.com/LTplus-AG/ifc-lite/commit/53003de1e36a956b7f51e9dffc035218477d5d3c), [`4ab63cd`](https://github.com/LTplus-AG/ifc-lite/commit/4ab63cd72e374dbdc98b6f59599fb9d2050f0f85)]:
+  - @ifc-lite/collab@0.8.0
+
+## 1.0.4
+
+### Patch Changes
+
+- Updated dependencies [[`7179a9c`](https://github.com/LTplus-AG/ifc-lite/commit/7179a9c6c2d0620f6bd3260e37b80c771697ce85), [`dbf513b`](https://github.com/LTplus-AG/ifc-lite/commit/dbf513b785f1dbc2f2dce5c173d28fd5ab65aa0c)]:
+  - @ifc-lite/collab@0.7.0
+
+## 1.0.3
+
+### Patch Changes
+
+- Updated dependencies [[`53a92b1`](https://github.com/LTplus-AG/ifc-lite/commit/53a92b1f7cc5770f164dc4867fc2adc33470e245), [`c78ce8c`](https://github.com/LTplus-AG/ifc-lite/commit/c78ce8c3f1da3b8b2c6fa0f982595adc8c48b7d6), [`4735f1c`](https://github.com/LTplus-AG/ifc-lite/commit/4735f1cbb6635016e83c7890f670e615bbdc48c3), [`182215a`](https://github.com/LTplus-AG/ifc-lite/commit/182215a835c4beac6a776bcb4eb1d019cab9063e)]:
+  - @ifc-lite/collab@0.6.1
+
 ## 1.0.2
 
 ### Patch Changes

@@ -13,7 +13,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as Y from 'yjs';
-import { geometryMap } from '@ifc-lite/collab';
+import { createModelSlot, geometryMap } from '@ifc-lite/collab';
 import { FilePersistence } from '../src/persistence.js';
 import { FsBlobStorage } from '../src/blob-route.js';
 import {
@@ -30,14 +30,28 @@ const C = H('c');
 
 let dataDir: string;
 let blobsDir: string;
+const storages: FsBlobStorage[] = [];
+
+/** An `FsBlobStorage` on this test's `dataDir`, awaited in `afterEach`. */
+function fsStorage(): FsBlobStorage {
+  const storage = new FsBlobStorage(dataDir);
+  storages.push(storage);
+  return storage;
+}
 
 beforeEach(() => {
   dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'blob-gc-'));
   blobsDir = path.join(dataDir, 'blobs');
   fs.mkdirSync(blobsDir, { recursive: true });
 });
-afterEach(() => {
-  fs.rmSync(dataDir, { recursive: true, force: true });
+afterEach(async () => {
+  try {
+    // The constructor's mkdir may still be pending when a test never called a
+    // storage method; removing the tree under it made it reject (#6286).
+    await Promise.all(storages.splice(0).map((s) => s.ready));
+  } finally {
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
 });
 
 /** A Y update whose geometry map references `hashes`. */
@@ -50,6 +64,14 @@ function updateReferencing(hashes: string[]): Uint8Array {
       (geom.get(`g${i}`) as Y.Map<unknown>).set('blobHash', h);
     });
   });
+  const update = Y.encodeStateAsUpdate(doc);
+  doc.destroy();
+  return update;
+}
+
+function updateReferencingSidecar(hash: string): Uint8Array {
+  const doc = new Y.Doc();
+  createModelSlot(doc, 'm0', { name: 'annotation.ifc', order: 0, stepSourceBlobHash: hash });
   const update = Y.encodeStateAsUpdate(doc);
   doc.destroy();
   return update;
@@ -123,6 +145,12 @@ describe('blob gc', () => {
     expect([...scan.refs]).toEqual([A]);
   });
 
+  it('keeps a sidecar referenced only by a persisted model slot (#4604)', async () => {
+    await new FilePersistence({ dataDir }).append('idle-sidecar-room', updateReferencingSidecar(A));
+    writeBlob(A, 3 * DAY);
+    expect((await plan()).deleteHashes).toEqual([]);
+  });
+
   it('aborts when a non-empty room log parses to nothing', async () => {
     // `FilePersistence.load` returns null - it does NOT throw - for a corrupt
     // log. Treating that as "references nothing" would delete every blob of a
@@ -171,7 +199,7 @@ describe('blob gc', () => {
   });
 
   it('deleteIfOlderThan refuses a blob whose mtime was refreshed', async () => {
-    const storage = new FsBlobStorage(dataDir);
+    const storage = fsStorage();
     await storage.put(A, new Uint8Array([9]));
     // Cutoff in the past relative to the just-written file: this is the
     // re-check that makes a plan-then-apply race safe.
@@ -185,7 +213,7 @@ describe('blob gc', () => {
   it('a concurrent re-upload survives a delete issued against it', async () => {
     // The real race: GC planned against an OLD blob (so a past cutoff, exactly
     // as the worker computes `now - graceMs`) while a client re-uploads it.
-    const storage = new FsBlobStorage(dataDir);
+    const storage = fsStorage();
     writeBlob(A, 3 * DAY);
     const cutoff = Date.now() - 1000;
 
@@ -214,7 +242,7 @@ describe('blob gc', () => {
     let sweeps = 0;
     const worker = new BlobGcWorker({
       dataDir,
-      storage: new FsBlobStorage(dataDir),
+      storage: fsStorage(),
       graceMs: DAY,
       counters: { sweep: () => (sweeps += 1) },
     });
@@ -253,7 +281,7 @@ describe('blob gc', () => {
 
     const worker = new BlobGcWorker({
       dataDir,
-      storage: new FsBlobStorage(dataDir),
+      storage: fsStorage(),
       roomManager,
       graceMs: DAY,
     });

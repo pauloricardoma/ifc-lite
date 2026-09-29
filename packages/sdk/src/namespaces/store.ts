@@ -4,6 +4,17 @@
 
 import { isInstantiable, isKnownType, normalizeIfcTypeName } from '@ifc-lite/parser';
 import type {
+  CostItemParams, CostQuantityParams, CostScheduleParams, CostValueParams,
+  HostedDoorInStoreParams, HostedWindowInStoreParams, OpeningInStoreParams, ElementTypeInStoreParams,
+  MaterialInStoreParams, MaterialLayerSetInStoreParams, MaterialLayerSetUsageInStoreParams,
+  StructuralAnalysisModelInStoreParams,
+  StructuralCurveMemberInStoreParams,
+  StructuralLinearActionInStoreParams,
+  StructuralLoadGroupInStoreParams,
+  StructuralPointActionInStoreParams,
+  StructuralPointConnectionInStoreParams,
+} from '@ifc-lite/create';
+import type {
   AddBeamInStoreParams,
   AddColumnInStoreParams,
   AddDoorInStoreParams,
@@ -54,8 +65,12 @@ export class StoreNamespace {
    *   - arrays → STEP list `(a,b,c)` (recursed)
    *   - any other string → quoted STEP string
    *
+   * `modelId` must be one the backend answers for: the headless CLI backend
+   * takes `'default'` or the file basename and throws on anything else, rather
+   * than minting a ref that `bim.mutate.*` would then refuse.
+   *
    * @example
-   *   const profile = bim.store.addEntity('arch', {
+   *   const profile = bim.store.addEntity('default', {
    *     type: 'IfcRectangleProfileDef',
    *     attributes: ['.AREA.', null, '#34', 0.6, 0.4],
    *   });
@@ -125,7 +140,7 @@ export class StoreNamespace {
    *
    * @example
    *   const storeyId = bim.query.byType('IfcBuildingStorey')[0].ref.expressId;
-   *   const col = bim.store.addColumn('arch', storeyId, {
+   *   const col = bim.store.addColumn('default', storeyId, {
    *     Position: [1, 1, 0],
    *     Width: 0.3, Depth: 0.4, Height: 3,
    *     Name: 'Column 1',
@@ -141,7 +156,7 @@ export class StoreNamespace {
    * and is extruded upward by `Height`.
    *
    * @example
-   *   bim.store.addWall('arch', storeyId, {
+   *   bim.store.addWall('default', storeyId, {
    *     Start: [0, 0, 0], End: [5, 0, 0],
    *     Thickness: 0.2, Height: 3, Name: 'North Wall',
    *   });
@@ -213,5 +228,172 @@ export class StoreNamespace {
    */
   addMember(modelId: string, storeyExpressId: number, params: AddMemberInStoreParams): EntityRef {
     return this.backend.store.addMember(modelId, storeyExpressId, params);
+  }
+
+  // -- Openings, hosted fillings, types and materials (#6232 M3) -------------
+  // Hosts are existing IfcWall/IfcSlab; params are metres in the host's frame.
+  /** Cut an IfcOpeningElement (IfcRelVoidsElement) into a wall (`Offset`, `Sill`, `Width`, `Height`) or
+   *  slab (`Position` [x, y], `Width`, `Depth`); the cut spans the host body + 50 mm per face unless `CutDepth`. */
+  addOpening(modelId: string, hostExpressId: number, params: OpeningInStoreParams): EntityRef {
+    return this.backend.store.addOpening(modelId, hostExpressId, params);
+  }
+
+  /** Add an IfcDoor filling a new opening in a wall (IfcRelFillsElement). `Sill` defaults to 0. */
+  addHostedDoor(modelId: string, hostExpressId: number, params: HostedDoorInStoreParams): EntityRef {
+    return this.backend.store.addHostedDoor(modelId, hostExpressId, params);
+  }
+
+  /** Add an IfcWindow filling a new opening in a wall (IfcRelFillsElement), bottom edge at `Sill`. */
+  addHostedWindow(modelId: string, hostExpressId: number, params: HostedWindowInStoreParams): EntityRef {
+    return this.backend.store.addHostedWindow(modelId, hostExpressId, params);
+  }
+
+  // IFC4 practice: IfcMaterialLayerSet on the type, a usage of it on each occurrence.
+  /** Add an IfcElementType subtype (e.g. `{ Type: 'IfcWallType', Name, PredefinedType }`), laid out for the model's schema. */
+  addElementType(modelId: string, params: ElementTypeInStoreParams): EntityRef {
+    return this.backend.store.addElementType(modelId, params);
+  }
+
+  /** Type objects via IfcRelDefinesByType; an object already typed moves to this type. Returns the relationship. */
+  assignType(modelId: string, typeExpressId: number, objectExpressIds: number[]): EntityRef {
+    return this.backend.store.assignType(modelId, typeExpressId, objectExpressIds);
+  }
+
+  /** Add an IfcMaterial. */
+  addMaterial(modelId: string, params: MaterialInStoreParams): EntityRef {
+    return this.backend.store.addMaterial(modelId, params);
+  }
+
+  /** Add an IfcMaterialLayerSet of IfcMaterialLayers (`MaterialLayers[i].LayerThickness` in metres). */
+  addMaterialLayerSet(modelId: string, params: MaterialLayerSetInStoreParams): EntityRef {
+    return this.backend.store.addMaterialLayerSet(modelId, params);
+  }
+
+  /** Add an IfcMaterialLayerSetUsage (default AXIS2/POSITIVE; `OffsetFromReferenceLine` in metres). */
+  addMaterialLayerSetUsage(modelId: string, params: MaterialLayerSetUsageInStoreParams): EntityRef {
+    return this.backend.store.addMaterialLayerSetUsage(modelId, params);
+  }
+
+  /** Associate a material with objects via IfcRelAssociatesMaterial, replacing their previous one. Returns the relationship. */
+  assignMaterial(modelId: string, materialExpressId: number, objectExpressIds: number[]): EntityRef {
+    return this.backend.store.assignMaterial(modelId, materialExpressId, objectExpressIds);
+  }
+
+  // -- Cost / 5D authoring on a loaded model (#4857 PR A) --------------------
+  // Panel is read-only by design; these methods are for scripts (SDK / CLI /
+  // MCP / sandbox). See docs/guide/cost-panel.md "Authoring from scripts".
+
+  /** Add an IfcCostSchedule. Refused for IFC2X3 (different attribute layout). */
+  addCostSchedule(modelId: string, params: CostScheduleParams): EntityRef {
+    return this.backend.store.addCostSchedule(modelId, params);
+  }
+
+  /** Add an IfcCostItem. `CostValues`/`CostQuantities` are optional; an empty array is refused. */
+  addCostItem(modelId: string, params: CostItemParams): EntityRef {
+    return this.backend.store.addCostItem(modelId, params);
+  }
+
+  /** Add an IfcCostValue. `AppliedValue` and `AppliedValueRef` are mutually exclusive. */
+  addCostValue(modelId: string, params: CostValueParams): EntityRef {
+    return this.backend.store.addCostValue(modelId, params);
+  }
+
+  /** Add an IfcPhysicalSimpleQuantity for `IfcCostItem.CostQuantities`. */
+  addCostQuantity(modelId: string, params: CostQuantityParams): EntityRef {
+    return this.backend.store.addCostQuantity(modelId, params);
+  }
+
+  /**
+   * Nest `childExpressIds` (IfcCostItem) under `parentExpressId` via
+   * IfcRelNests. A child already nested elsewhere is reparented: detached
+   * from its old rel (which is tombstoned if that empties it) first.
+   */
+  nestCostItems(modelId: string, parentExpressId: number, childExpressIds: number[]): EntityRef {
+    return this.backend.store.nestCostItems(modelId, parentExpressId, childExpressIds);
+  }
+
+  /** Assign `itemExpressIds` to `scheduleExpressId`'s control via IfcRelAssignsToControl. */
+  assignCostItemsToSchedule(modelId: string, scheduleExpressId: number, itemExpressIds: number[]): EntityRef {
+    return this.backend.store.assignCostItemsToSchedule(modelId, scheduleExpressId, itemExpressIds);
+  }
+
+  /** Assign `objectExpressIds` (products AND/OR tasks) to `costItemExpressId`'s control. */
+  assignToCostItem(modelId: string, costItemExpressId: number, objectExpressIds: number[]): EntityRef {
+    return this.backend.store.assignToCostItem(modelId, costItemExpressId, objectExpressIds);
+  }
+
+  /** Replace an IfcCostItem's `CostValues`. Pass `[]` to clear it (written as `$`, never `()`). */
+  setCostItemValues(modelId: string, itemExpressId: number, valueExpressIds: number[]): void {
+    this.backend.store.setCostItemValues(modelId, itemExpressId, valueExpressIds);
+  }
+
+  /**
+   * Safe-delete an IfcCostSchedule / IfcCostItem / IfcCostValue. Throws,
+   * naming referrers, if a value is still listed in another item's
+   * `CostValues` or another value's `Components` — pass `{ detach: true }`
+   * to rewrite those lists first. Deleting an item cascades to values it
+   * alone references.
+   */
+  removeCostEntity(modelId: string, expressId: number, options?: { detach?: boolean }): void {
+    this.backend.store.removeCostEntity(modelId, expressId, options);
+  }
+
+  // -- Structural analysis authoring on a loaded model (#5167 task S.1) ------
+  // `bim.structural.*` is read-only; these methods are the write side, for
+  // scripts (SDK / CLI / MCP / sandbox) that author an analytical model.
+
+  /** Add an IfcStructuralAnalysisModel. Not storey-anchored (IfcGroup, no geometry). */
+  addStructuralAnalysisModel(modelId: string, params: StructuralAnalysisModelInStoreParams): EntityRef {
+    return this.backend.store.addStructuralAnalysisModel(modelId, params);
+  }
+
+  /**
+   * Add an IfcStructuralCurveMember between `params.Start` and `params.End`,
+   * anchored to a storey for its ObjectPlacement. Emits an
+   * IfcTopologyRepresentation (IfcEdge between two IfcVertexPoints) as its
+   * analytical line geometry.
+   */
+  addStructuralCurveMember(modelId: string, storeyExpressId: number, params: StructuralCurveMemberInStoreParams): EntityRef {
+    return this.backend.store.addStructuralCurveMember(modelId, storeyExpressId, params);
+  }
+
+  /** Add an IfcStructuralPointConnection at `params.Position`, optionally with an IfcBoundaryNodeCondition. */
+  addStructuralPointConnection(modelId: string, storeyExpressId: number, params: StructuralPointConnectionInStoreParams): EntityRef {
+    return this.backend.store.addStructuralPointConnection(modelId, storeyExpressId, params);
+  }
+
+  /** Add an IfcStructuralLoadGroup, or an IfcStructuralLoadCase when `params.SelfWeightCoefficients` is given. */
+  addStructuralLoadGroup(modelId: string, params: StructuralLoadGroupInStoreParams): EntityRef {
+    return this.backend.store.addStructuralLoadGroup(modelId, params);
+  }
+
+  /** Add an IfcStructuralPointAction carrying an IfcStructuralLoadSingleForce. */
+  addStructuralPointAction(modelId: string, params: StructuralPointActionInStoreParams): EntityRef {
+    return this.backend.store.addStructuralPointAction(modelId, params);
+  }
+
+  /** Add an IfcStructuralLinearAction carrying an IfcStructuralLoadLinearForce. */
+  addStructuralLinearAction(modelId: string, params: StructuralLinearActionInStoreParams): EntityRef {
+    return this.backend.store.addStructuralLinearAction(modelId, params);
+  }
+
+  /** Link a structural member to a structural connection via IfcRelConnectsStructuralMember. */
+  connectStructuralMemberToConnection(modelId: string, memberExpressId: number, connectionExpressId: number): EntityRef {
+    return this.backend.store.connectStructuralMemberToConnection(modelId, memberExpressId, connectionExpressId);
+  }
+
+  /** Apply a structural action/reaction to the member or connection it acts on via IfcRelConnectsStructuralActivity. */
+  connectStructuralActivityToItem(modelId: string, itemExpressId: number, activityExpressId: number): EntityRef {
+    return this.backend.store.connectStructuralActivityToItem(modelId, itemExpressId, activityExpressId);
+  }
+
+  /**
+   * Assign members/connections into an analysis model, or activities into a
+   * load group, via IfcRelAssignsToGroup — the relationship
+   * `bim.structural.analysisModels()[i].itemGlobalIds` and
+   * `bim.structural.loadGroups()[i].activityGlobalIds` read back.
+   */
+  assignToStructuralGroup(modelId: string, groupExpressId: number, objectExpressIds: number[]): EntityRef {
+    return this.backend.store.assignToStructuralGroup(modelId, groupExpressId, objectExpressIds);
   }
 }

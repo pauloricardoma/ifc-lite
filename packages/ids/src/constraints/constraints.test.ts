@@ -182,6 +182,32 @@ describe('matchConstraint — pattern', () => {
     expect(matchConstraint(pat('\\p{IsBasicLatin}+'), 'Hello')).toBe(true);
   });
 
+  it('evaluates XSD character-class subtraction exactly instead of dropping the exclusion (#5183)', () => {
+    // `[a-z-[aeiou]]` is "lowercase, excluding vowels". Dropping the
+    // exclusion made a consonants-only pattern accept "aeiou".
+    const consonants = pat('[a-z-[aeiou]]+');
+    expect(matchConstraint(consonants, 'aeiou')).toBe(false);
+    expect(matchConstraint(consonants, 'xyz')).toBe(true);
+    expect(matchConstraint(consonants, 'xaz')).toBe(false);
+    // Nested: a-z minus (b-y minus c) = a, c, z.
+    const nested = pat('[a-z-[b-y-[c]]]+');
+    expect(matchConstraint(nested, 'acz')).toBe(true);
+    expect(matchConstraint(nested, 'b')).toBe(false);
+    // XSD escapes in either set, and the rest of the pattern around it.
+    expect(matchConstraint(pat('W-[\\w-[\\d]]{2}'), 'W-ab')).toBe(true);
+    expect(matchConstraint(pat('W-[\\w-[\\d]]{2}'), 'W-a1')).toBe(false);
+  });
+
+  it('refuses a subtraction it cannot delimit rather than guessing (#5183)', () => {
+    expect(() => matchConstraint(pat('[a-z-[aeiou]+'), 'xyz')).toThrow(
+      /XSD character-class subtraction is not supported in JS regex/
+    );
+    // Even behind an earlier approximated construct (review on #5286).
+    expect(() => matchConstraint(pat('\\p{IsBasicLatin}[a-z-[b]'), 'Ab')).toThrow(
+      /XSD character-class subtraction is not supported in JS regex/
+    );
+  });
+
   it('anchors top-level alternation across the whole value', () => {
     // `^a|b$` would match a left-anchored "a" or right-anchored "b";
     // the matcher wraps the pattern so the alternation spans the value.
@@ -337,6 +363,36 @@ describe('matchConstraint — bounds', () => {
   it('no bounds specified accepts any number', () => {
     expect(matchConstraint(bounds({}), 999)).toBe(true);
     expect(matchConstraint(bounds({}), -999)).toBe(true);
+  });
+
+  // `unparseableFacets` is what `parseRestriction` attaches when a facet
+  // element was present in the source XML but its `@value` failed to
+  // parse (see `parser/xml-parser.test.ts` for the full XML-to-matcher
+  // round trip). At the matcher level, its mere presence must flip an
+  // otherwise-unbounded constraint from an unconditional pass to an
+  // unconditional fail — regardless of which other facets are set.
+  it('a non-empty unparseableFacets fails closed even with no other facets set', () => {
+    const c = bounds({ unparseableFacets: [{ facet: 'minInclusive', rawValue: 'abc' }] });
+    expect(matchConstraint(c, 999)).toBe(false);
+    expect(matchConstraint(c, -999)).toBe(false);
+    expect(matchConstraint(c, 0)).toBe(false);
+  });
+
+  it('a non-empty unparseableFacets fails closed even when other facets on the SAME constraint are well-formed', () => {
+    // e.g. `<xs:minInclusive value="60"/>` parsed fine but a sibling
+    // `<xs:maxInclusive value="not-a-number"/>` did not — the whole
+    // restriction is unverifiable, not "just the min half".
+    const c = bounds({
+      minInclusive: 0,
+      unparseableFacets: [{ facet: 'maxInclusive', rawValue: 'not-a-number' }],
+    });
+    expect(matchConstraint(c, 50)).toBe(false);
+  });
+
+  it('an empty unparseableFacets array behaves exactly like it being absent', () => {
+    const c = bounds({ minInclusive: 0, maxInclusive: 100, unparseableFacets: [] });
+    expect(matchConstraint(c, 50)).toBe(true);
+    expect(matchConstraint(c, -1)).toBe(false);
   });
 });
 

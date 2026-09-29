@@ -26,7 +26,7 @@ function task(over: Partial<ScheduleTaskInfo>): ScheduleTaskInfo {
 }
 
 function schedule(tasks: ScheduleTaskInfo[]): ScheduleExtraction {
-  return { hasSchedule: true, workSchedules: [], sequences: [], tasks };
+  return { hasSchedule: true, workCalendars: [], workSchedules: [], sequences: [], tasks };
 }
 
 describe('collectProductLocalIdsForTasks', () => {

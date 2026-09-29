@@ -1,4 +1,28 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
 import { defineConfig, devices } from '@playwright/test';
+
+// One preview server per run. Every project shares it; `reuseExistingServer`
+// means a server another checkout already runs on the port would be tested
+// instead, so a host with several checkouts sets PLAYWRIGHT_PORT per run.
+const PORT = process.env.PLAYWRIGHT_PORT ?? '3000';
+const BASE_URL = `http://localhost:${PORT}`;
+
+/**
+ * `playwright test --project=viewer-collab-e2e` (and nothing else): that
+ * project serves its own private preview, so the shared webServer below
+ * would only be started — or, with `reuseExistingServer`, silently borrowed
+ * from whichever checkout holds the port — to sit unused.
+ */
+function onlyCollabProject(): boolean {
+  const argv = process.argv;
+  const projects = argv.flatMap((arg, i) =>
+    arg.startsWith('--project=') ? [arg.slice('--project='.length)] : arg === '--project' && argv[i + 1] ? [argv[i + 1]] : [],
+  );
+  return projects.length > 0 && projects.every((p) => p === 'viewer-collab-e2e');
+}
 
 export default defineConfig({
   // Covers tests/benchmark (perf) and tests/e2e (functional smoke);
@@ -12,23 +36,26 @@ export default defineConfig({
   // ignored by Playwright (latent: those projects are run manually
   // against an already-running server). The e2e projects rely on this
   // one; reuseExistingServer keeps local dev-server workflows working.
-  webServer: {
-    command: 'pnpm --filter @ifc-lite/viewer exec vite preview --port 3000',
-    port: 3000,
-    reuseExistingServer: true,
-    timeout: 90000,
-    env: {
-      BROWSER: 'none',
-    },
-  },
+  // Skipped when only viewer-collab-e2e runs (it brings its own preview).
+  webServer: onlyCollabProject()
+    ? undefined
+    : {
+        command: `pnpm --filter @ifc-lite/viewer exec vite preview --port ${PORT}`,
+        port: Number(PORT),
+        reuseExistingServer: true,
+        timeout: 90000,
+        env: {
+          BROWSER: 'none',
+        },
+      },
   projects: [
     {
       name: 'viewer-e2e',
-      testMatch: /(viewer-smoke|usd-export|laz-wasm)\.e2e\.spec\.ts/,
+      testMatch: /(viewer-smoke|mobile-page-zoom|mobile-panels|mobile-long-press|mobile-journey|usd-export|laz-wasm|model-reposition|document-text|rte-gpu-witness|federation-control-triplet|landxml-units-smoke|ribbon-labels|ribbon-classic-migration|panel-groups-5873|ribbon-reachability-5874|hierarchy-names|hierarchy-row-selection|bulk-target-sources|bulk-filter-groups|entity-context-menu|ribbon-entity-actions|viewport-hud|command-palette-entry|navigation-presets|sticky-overrides|orbit-pivot-marker|target-size-focus-5826|visibility-chips|visibility-empty-result|visibility-scenarios|section-measure-lasting-5893|lens-filter-groups|keyboard-dispatcher|lists-value-rules|swept-disk-centreline|swept-disk-inspection|swept-disk-source-snap)\.e2e\.spec\.ts/,
       timeout: 240000,
       use: {
         ...devices['Desktop Chrome'],
-        baseURL: 'http://localhost:3000',
+        baseURL: BASE_URL,
         actionTimeout: 60000,
         headless: false,
         channel: 'chrome',
@@ -45,12 +72,21 @@ export default defineConfig({
     },
     {
       name: 'viewer-e2e-ci',
-      testMatch: /(viewer-smoke|usd-export|laz-wasm)\.e2e\.spec\.ts/,
+      testMatch: /(viewer-smoke|mobile-page-zoom|mobile-panels|mobile-long-press|mobile-journey|usd-export|laz-wasm|model-reposition|document-text|rte-gpu-witness|federation-control-triplet|landxml-units-smoke|ribbon-labels|ribbon-classic-migration|panel-groups-5873|ribbon-reachability-5874|hierarchy-names|hierarchy-row-selection|bulk-target-sources|bulk-filter-groups|entity-context-menu|ribbon-entity-actions|viewport-hud|command-palette-entry|navigation-presets|sticky-overrides|orbit-pivot-marker|target-size-focus-5826|visibility-chips|visibility-empty-result|visibility-scenarios|section-measure-lasting-5893|lens-filter-groups|keyboard-dispatcher|lists-value-rules|swept-disk-centreline|swept-disk-inspection|swept-disk-source-snap)\.e2e\.spec\.ts/,
       timeout: 240000,
       use: {
-        baseURL: 'http://localhost:3000',
+        baseURL: BASE_URL,
         actionTimeout: 60000,
         headless: true,
+        // A failed test leaves a trace (DOM snapshots per action, console,
+        // network) and a screenshot under test-results/, which the workflow
+        // already uploads. The recurring model-reposition flake — `#file-
+        // input-add` absent for 60 s after a point-cloud-first load — had been
+        // diagnosed blind from the store snapshot alone, four reruns in a row
+        // on 2026-09-21; the trace is what shows what the page looked like.
+        // Retained only on failure, so a green run costs nothing extra.
+        trace: 'retain-on-failure',
+        screenshot: 'only-on-failure',
         // Real Chrome, not Playwright's headless shell — the shell's
         // WebGPU device is broken under software rendering (createBuffer
         // fails for KB-sized buffers, popErrorScope instance drops).
@@ -70,12 +106,61 @@ export default defineConfig({
       },
     },
     {
+      // Opt-in browser acceptance for appearance authoring (#4404 face masks):
+      // real wasm planner + WebGPU renderer on a real GPU. Not in CI's default
+      // lane; the spec skips unless APPEARANCE_E2E=1. Real Chrome like the
+      // other viewer projects, so no Playwright browser download is needed.
+      name: 'viewer-appearance-e2e',
+      testMatch: /appearance-face-mask\.e2e\.spec\.ts/,
+      timeout: 600000,
+      use: {
+        ...devices['Desktop Chrome'],
+        baseURL: BASE_URL,
+        actionTimeout: 60000,
+        headless: true,
+        channel: 'chrome',
+        launchOptions: {
+          args: [
+            '--enable-gpu',
+            '--enable-webgpu',
+            '--enable-unsafe-webgpu',
+            '--use-angle=default',
+            '--ignore-gpu-blocklist',
+          ],
+        },
+      },
+    },
+    {
+      // Opt-in relay acceptance (#4446, #4444): needs the built viewer, a built
+      // @ifc-lite/collab-server and the AC20 fixture. Each spec spawns its own
+      // signed relay AND its own `vite preview` of this checkout's dist, both
+      // on ephemeral ports (the shared webServer above, PLAYWRIGHT_PORT / :3000,
+      // is reused from whatever process holds it — a sibling checkout's preview
+      // would test the wrong build — so this project sets no baseURL, and it is
+      // not started at all when this is the only project selected, see
+      // onlyCollabProject), and enables collab through the viewer's localStorage
+      // overrides. Real Google Chrome (`channel: 'chrome'`) is required for
+      // WebGPU. Not in CI's default lanes (no relay there) — `pnpm test:e2e:collab`, see
+      // docs/contributing/collaboration-testing.md.
+      name: 'viewer-collab-e2e',
+      testMatch: /collab-(share-seed|federation-scope|pdf-vector-room)\.e2e\.spec\.ts/,
+      timeout: 600000,
+      use: {
+        actionTimeout: 60000,
+        headless: true,
+        channel: 'chrome',
+        launchOptions: {
+          args: ['--enable-unsafe-webgpu', '--ignore-gpu-blocklist', '--enable-gpu'],
+        },
+      },
+    },
+    {
       name: 'viewer-benchmark',
       testMatch: /viewer-benchmark\.spec\.ts/,
       timeout: 600000, // 10 min for very large files (327MB)
       webServer: {
-        command: 'pnpm --filter @ifc-lite/viewer exec vite preview --port 3000',
-        port: 3000,
+        command: `pnpm --filter @ifc-lite/viewer exec vite preview --port ${PORT}`,
+        port: Number(PORT),
         reuseExistingServer: true,
         timeout: 60000,
         env: {
@@ -84,7 +169,7 @@ export default defineConfig({
       },
       use: {
         ...devices['Desktop Chrome'],
-        baseURL: 'http://localhost:3000',
+        baseURL: BASE_URL,
         actionTimeout: 300000,
         // Run headed for realistic GPU/WebGPU performance
         headless: false,
@@ -107,8 +192,8 @@ export default defineConfig({
       testMatch: /viewer-benchmark\.spec\.ts/,
       timeout: 600000,
       webServer: {
-        command: 'pnpm --filter @ifc-lite/viewer exec vite preview --port 3000',
-        port: 3000,
+        command: `pnpm --filter @ifc-lite/viewer exec vite preview --port ${PORT}`,
+        port: Number(PORT),
         reuseExistingServer: true,
         timeout: 60000,
         env: {
@@ -116,7 +201,7 @@ export default defineConfig({
         },
       },
       use: {
-        baseURL: 'http://localhost:3000',
+        baseURL: BASE_URL,
         actionTimeout: 300000,
         // CI mode: headless but with GPU flags
         headless: true,

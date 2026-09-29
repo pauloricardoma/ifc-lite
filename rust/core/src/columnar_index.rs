@@ -23,11 +23,12 @@
 //! # `u32` offsets
 //!
 //! `starts`/`lengths` are `u32`, which is only sound while the source file is
-//! < 4 GiB. This type is used **exclusively on the wasm ingestion path**
-//! (`setEntityIndex` and the wasm `cached_entity_index`), where the whole file
-//! already lives in the < 4 GiB wasm32 linear address space and the delivered
-//! columns are themselves `&[u32]`. Native / server paths that can exceed 4 GiB
-//! keep the `usize`-carrying [`EntityIndex`](crate::EntityIndex) hashmap.
+//! < 4 GiB. WASM ingestion (`setEntityIndex` and `cached_entity_index`) already
+//! lives in that linear address space and delivers `&[u32]` columns. The native
+//! processor also uses this representation for large sources with sparse ids,
+//! after checking their byte length fits `u32`; dense ids may use
+//! [`crate::DenseEntityIndex`]. Wider native sources keep the `usize`-carrying
+//! [`EntityIndex`](crate::EntityIndex) hashmap.
 //!
 //! # Duplicate express ids
 //!
@@ -43,6 +44,14 @@ use crate::decoder::EntityIndex;
 use crate::parser::EntityScanner;
 use std::sync::Arc;
 
+fn check_lengths(ids: usize, starts: usize, lengths: usize) -> Result<(), ColumnLengthMismatch> {
+    if starts == ids && lengths == ids {
+        Ok(())
+    } else {
+        Err(ColumnLengthMismatch { ids, starts, lengths })
+    }
+}
+
 /// Compact, sorted, binary-searched entity index. Columns are kept sorted by
 /// `ids` (strictly ascending, unique) so [`Self::lookup`] can `binary_search`.
 ///
@@ -56,7 +65,32 @@ pub struct ColumnarEntityIndex {
     ids: Vec<u32>,
     starts: Vec<u32>,
     lengths: Vec<u32>,
+    // One source-scoped inverse lookup shared by native jobs and WASM batches.
+    pub(crate) styled_item_index: std::sync::OnceLock<crate::decoder::StyledItemIndexResult>,
 }
+
+/// The three columns handed to [`ColumnarEntityIndex::from_columns`] or
+/// [`ColumnarEntityIndex::from_owned_columns`] were not all the same length.
+/// A caller-facing error, not an empty index: an empty index is also what an
+/// empty file produces, so folding the two together hid a malformed payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnLengthMismatch {
+    pub ids: usize,
+    pub starts: usize,
+    pub lengths: usize,
+}
+
+impl std::fmt::Display for ColumnLengthMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "entity index columns disagree in length: ids {}, starts {}, lengths {}",
+            self.ids, self.starts, self.lengths
+        )
+    }
+}
+
+impl std::error::Error for ColumnLengthMismatch {}
 
 impl ColumnarEntityIndex {
     /// Build from the three delivered columns (`setEntityIndex` ingestion).
@@ -68,27 +102,22 @@ impl ColumnarEntityIndex {
     /// single stable argsort permutation is applied and duplicate ids are
     /// collapsed last-in-input-order-wins.
     ///
-    /// Mismatched column lengths yield an empty index (the wasm caller guards
-    /// this too), so a malformed payload never panics a worker.
-    pub fn from_columns(ids: &[u32], starts: &[u32], lengths: &[u32]) -> Self {
-        let n = ids.len();
-        if n == 0 || starts.len() != n || lengths.len() != n {
-            return Self {
-                ids: Vec::new(),
-                starts: Vec::new(),
-                lengths: Vec::new(),
-            };
+    /// Columns of unequal length are a [`ColumnLengthMismatch`], checked before
+    /// any is read, so a malformed payload never panics a worker. Empty
+    /// columns are a valid, empty index.
+    pub fn from_columns(ids: &[u32], starts: &[u32], lengths: &[u32]) -> Result<Self, ColumnLengthMismatch> {
+        check_lengths(ids.len(), starts.len(), lengths.len())?;
+        Self::from_owned_columns(ids.to_vec(), starts.to_vec(), lengths.to_vec())
+    }
+
+    /// Consume binding-owned columns without another full allocation (#3989).
+    /// Validation and last-in-input-order duplicate precedence match `from_columns`.
+    pub fn from_owned_columns(ids: Vec<u32>, starts: Vec<u32>, lengths: Vec<u32>) -> Result<Self, ColumnLengthMismatch> {
+        check_lengths(ids.len(), starts.len(), lengths.len())?;
+        if is_strictly_ascending(&ids) {
+            return Ok(Self { ids, starts, lengths, styled_item_index: std::sync::OnceLock::new() });
         }
-        if is_strictly_ascending(ids) {
-            // Already sorted AND unique — the common case once the producer
-            // emits sorted columns. No permutation, no dedup: just adopt them.
-            return Self {
-                ids: ids.to_vec(),
-                starts: starts.to_vec(),
-                lengths: lengths.to_vec(),
-            };
-        }
-        Self::from_unsorted(ids.to_vec(), starts.to_vec(), lengths.to_vec())
+        Ok(Self::from_unsorted(ids, starts, lengths))
     }
 
     /// Build from an already-scanned [`EntityIndex`](crate::EntityIndex)
@@ -111,8 +140,8 @@ impl ColumnarEntityIndex {
         // asymptotic peak once the vec fills.
         let mut rows: Vec<(u32, u32, u32)> = Vec::with_capacity(n);
         for (id, (start, end)) in map {
-            // u32 offsets are sound only under the wasm32 <4GiB address space
-            // (module docs); see `from_hashmap`.
+            // Offsets must fit u32, as required by the module contract;
+            // see `from_hashmap`.
             debug_assert!(end <= u32::MAX as usize, "entity offset exceeds the u32 column ceiling");
             rows.push((id, start as u32, (end - start) as u32));
         }
@@ -126,7 +155,7 @@ impl ColumnarEntityIndex {
             starts.push(start);
             lengths.push(len);
         }
-        Self { ids, starts, lengths }
+        Self { ids, starts, lengths, styled_item_index: std::sync::OnceLock::new() }
     }
 
     /// Build from an already-scanned [`EntityIndex`](crate::EntityIndex)
@@ -178,7 +207,10 @@ impl ColumnarEntityIndex {
             starts.push(start as u32);
             lengths.push((end - start) as u32);
         }
-        crate::parser::report_oversized_ids(scanner.skipped_oversized_ids());
+        crate::parser::report_scan_diagnostics(
+            scanner.skipped_oversized_ids(),
+            scanner.malformed_record_start().is_some(),
+        );
         Self::from_unsorted(ids, starts, lengths)
     }
 
@@ -222,6 +254,7 @@ impl ColumnarEntityIndex {
             ids: out_ids,
             starts: out_starts,
             lengths: out_lengths,
+            styled_item_index: std::sync::OnceLock::new(),
         }
     }
 
@@ -233,7 +266,9 @@ impl ColumnarEntityIndex {
         match self.ids.binary_search(&id) {
             Ok(i) => {
                 let start = self.starts[i] as usize;
-                Some((start, start + self.lengths[i] as usize))
+                // A wasm32 overflow must not panic a build with overflow checks;
+                // the decoder refuses the span past the content either way (#4697).
+                Some((start, start.saturating_add(self.lengths[i] as usize)))
             }
             Err(_) => None,
         }
@@ -283,6 +318,7 @@ fn is_strictly_ascending(ids: &[u32]) -> bool {
 pub(crate) enum EntityIndexStore {
     Hash(Arc<EntityIndex>),
     Columnar(Arc<ColumnarEntityIndex>),
+    Dense(Arc<crate::DenseEntityIndex>),
 }
 
 impl EntityIndexStore {
@@ -292,6 +328,7 @@ impl EntityIndexStore {
         match self {
             EntityIndexStore::Hash(m) => m.get(&id).copied(),
             EntityIndexStore::Columnar(c) => c.lookup(id),
+            EntityIndexStore::Dense(d) => d.lookup(id),
         }
     }
 }

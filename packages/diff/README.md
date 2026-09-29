@@ -18,12 +18,13 @@ npm install @ifc-lite/diff
 ## Usage
 
 ```ts
-import {
-  diffModels,
-  buildDataFingerprint,
-  identityMapFromContentMatches,
-  type EntityFingerprint,
-} from '@ifc-lite/diff';
+import { diffModels, type EntityFingerprint } from '@ifc-lite/diff';
+
+// Your adapter walks a store and emits one fingerprint per entity, per model.
+declare function extractFingerprints(model: unknown): EntityFingerprint<number>[];
+declare const baseModel: unknown;
+declare const headModel: unknown;
+declare const gid: string; // the GlobalId you picked in the viewer
 
 // One fingerprint per entity, per model. `key` is the stable cross-revision
 // identity (the IFC GlobalId). `dataHash` comes from buildDataFingerprint;
@@ -85,6 +86,10 @@ for (const claim of diff.splitMerges ?? []) {
 }
 ```
 
+Candidates are bucketed by class *family* (`classFamilies`), so a wall republished
+as `IfcWallStandardCase` pieces or `IfcBuildingElementPart` layers is a split like
+any other, flagged `crossClass: true`.
+
 **Purely additive**: a claim never retires a `DiffEntry` and never touches
 `counts`, because one claim binding `k + 1` entities on a single evidence chain
 must not be able to delete `k + 1` real changes. It also has no non-geometric
@@ -101,6 +106,15 @@ fall back to the weaker tier. See
 [the guide](https://ifclite.dev/docs/guide/model-diff/#split-and-merge-detection)
 for the knobs and for what the pass deliberately cannot see.
 
+### Successor claims
+
+A wall whose buildup changed, or a chair swapped for another family, agrees on
+nothing a hash can see. `detectSuccessors` reports **suggestions** from position
+alone — `footprint` (heavy box overlap, unique both ways) or `position` (same
+family, same container, mutual nearest with a ×2 margin) — on
+`ModelDiff.successors`. A claim retires nothing; `identityMapFromSuccessors`
+mints identity only from the claims you pass it as accepted.
+
 ### Identity maps — remembering an accepted match
 
 Content-keyed matching (`matchUnpairedByContent`) recognises a re-GUIDed element
@@ -109,17 +123,20 @@ same `{ base, here, reason }` vocabulary a published layer carries in its
 provenance manifest:
 
 ```ts
+import { diffModels, identityMapFromContentMatches } from '@ifc-lite/diff';
+
 const first = diffModels(base, head, { matchUnpairedByContent: true });
 const claims = identityMapFromContentMatches(first.contentMatches);
 // [{ base: 'oldGid', here: 'newGid', reason: 'content-match:renamed' }]
 
-const aliases = new Map(claims.map((c) => [c.here, c.base]));
+const aliases = new Map(claims.map((c) => [c.here, c.base] as const));
 const second = diffModels(base, head, { matchUnpairedByContent: true, keyAliases: aliases });
 second.appliedKeyAliases; // what actually took effect
 ```
 
 Claims come only from matches the engine *committed to* — a 1:1 `renamed`,
-`moved`, or `reshaped`. `ambiguous` / `duplicated` / `deduplicated` groups and
+`moved`, `reshaped`, or `respecified` (same geometry and place, changed data:
+the redrawn-and-renamed element). `ambiguous` / `duplicated` / `deduplicated` groups and
 N:N `renamed` groups mint nothing: they are the engine saying it could not tell,
 and a claim derived from an abstention is a fabrication.
 
@@ -139,6 +156,14 @@ different pair. A document claiming two different `base` identities for one
 files say, and applying either claim would pick an arbitrary winner. See the
 [Model Diff guide](https://ifclite.dev/docs/guide/model-diff/#identity-maps).
 
+### Lineage — carrying external data across a split
+
+`lineageFromDiff` turns committed matches, split/merge claims and *accepted*
+successor claims into 1:k `{ base[], head[], relation, reason, shares? }`
+entries; `rekeyByLineage` answers "where does the row keyed on this old key
+go" under a `copy-to-all` / `largest-share` / `orphan-on-split` policy; the
+`ifc-lite/lineage` sidecar pins both model digests like the identity map does.
+
 ### Building a data fingerprint
 
 `buildDataFingerprint` canonicalizes (sorts) property sets, quantity sets, and
@@ -146,9 +171,20 @@ type assignments, so collection ordering never produces a spurious diff. Feed it
 a plain `DataFingerprintInput` extracted from your store:
 
 ```ts
+import { buildDataFingerprint, type DataFingerprintInput } from '@ifc-lite/diff';
+
+// Whatever your store hands back for one entity.
+declare const entity: DataFingerprintInput;
+
 const dataHash = buildDataFingerprint({
-  ifcType, name, description, objectType, predefinedType,
-  propertySets, quantitySets, typeAssignments,
+  ifcType: entity.ifcType,
+  name: entity.name,
+  description: entity.description,
+  objectType: entity.objectType,
+  predefinedType: entity.predefinedType,
+  propertySets: entity.propertySets,
+  quantitySets: entity.quantitySets,
+  typeAssignments: entity.typeAssignments,
 });
 ```
 

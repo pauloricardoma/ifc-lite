@@ -3,45 +3,55 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * Compact panel that exposes point cloud rendering controls (color mode,
- * size mode, point size, EDL). Renders only when point cloud assets are
- * loaded — sits over the canvas without affecting layout for IFC-only
- * models.
+ * Point cloud rendering controls (color mode, size mode, point size, EDL)
+ * plus the BIM↔scan deviation heatmap. Docked in the sidebar's `pointclouds`
+ * side panel (#5507). It stays reachable before an asset loads and explains
+ * what is needed (#5873). Used to be a floating
+ * card pinned at `bottom-4 left-4`, which collided with the axis/scale
+ * cluster in that corner.
  */
 
+import { Scan, X } from 'lucide-react';
+import { IconButton } from '@/components/ui/icon-button';
 import { useViewerStore } from '@/store';
 import type { PointColorModeUi, PointSizeModeUi } from '@/store/slices/pointCloudSlice';
 import { cn } from '@/lib/utils';
+import { useTranslation } from '@/i18n';
+import type { TranslationKey } from '@/i18n';
 import { PointCloudLegend } from './PointCloudLegend';
 import { PointCloudClasses } from './PointCloudClasses';
 import { DeviationPanel } from './DeviationPanel';
 import { applyPointCloudAlignmentToggle } from '@/hooks/ingest/pointCloudAlignment';
 import { getGlobalRenderer } from '@/hooks/useBCF';
 
-const COLOR_MODES: Array<{ value: PointColorModeUi; label: string; hint: string }> = [
-  { value: 'rgb',            label: 'RGB',            hint: 'Per-point colour from the source' },
-  { value: 'classification', label: 'Classification', hint: 'ASPRS class palette (ground, vegetation, building...)' },
-  { value: 'intensity',      label: 'Intensity',      hint: 'Greyscale ramp from per-point intensity' },
-  { value: 'height',         label: 'Height',         hint: 'Cool-warm ramp by Y-up world height' },
-  { value: 'fixed',          label: 'Solid',          hint: 'Single colour override' },
-  { value: 'deviation',      label: 'Deviation',      hint: 'Signed distance to nearest BIM surface (compute below)' },
+const COLOR_MODES: Array<{ value: PointColorModeUi; labelKey: TranslationKey; hintKey: TranslationKey }> = [
+  { value: 'rgb',            labelKey: 'pointCloudPanel.colorMode.rgb.label',            hintKey: 'pointCloudPanel.colorMode.rgb.hint' },
+  { value: 'classification', labelKey: 'pointCloudPanel.colorMode.classification.label', hintKey: 'pointCloudPanel.colorMode.classification.hint' },
+  { value: 'intensity',      labelKey: 'pointCloudPanel.colorMode.intensity.label',      hintKey: 'pointCloudPanel.colorMode.intensity.hint' },
+  { value: 'height',         labelKey: 'pointCloudPanel.colorMode.height.label',         hintKey: 'pointCloudPanel.colorMode.height.hint' },
+  { value: 'fixed',          labelKey: 'pointCloudPanel.colorMode.fixed.label',          hintKey: 'pointCloudPanel.colorMode.fixed.hint' },
+  { value: 'deviation',      labelKey: 'pointCloudPanel.colorMode.deviation.label',      hintKey: 'pointCloudPanel.colorMode.deviation.hint' },
 ];
 
-const SIZE_MODES: Array<{ value: PointSizeModeUi; label: string; hint: string }> = [
-  { value: 'fixed-px',       label: 'Fixed',    hint: 'Always render at the slider value (in pixels)' },
-  { value: 'attenuated',     label: 'Auto',     hint: 'Adaptive (closer = bigger), clamped to the slider as max' },
-  { value: 'adaptive-world', label: 'World',    hint: 'Pure world-space radius — splat covers N mm in source space' },
+const SIZE_MODES: Array<{ value: PointSizeModeUi; labelKey: TranslationKey; hintKey: TranslationKey }> = [
+  { value: 'fixed-px',       labelKey: 'pointCloudPanel.sizeMode.fixedPx.label',       hintKey: 'pointCloudPanel.sizeMode.fixedPx.hint' },
+  { value: 'attenuated',     labelKey: 'pointCloudPanel.sizeMode.attenuated.label',     hintKey: 'pointCloudPanel.sizeMode.attenuated.hint' },
+  { value: 'adaptive-world', labelKey: 'pointCloudPanel.sizeMode.adaptiveWorld.label',  hintKey: 'pointCloudPanel.sizeMode.adaptiveWorld.hint' },
 ];
 
 export interface PointCloudPanelProps {
-  /** Number of currently-loaded point cloud assets — panel hides when 0. */
+  /** Number of currently loaded point cloud assets. */
   assetCount: number;
   /** Total triangle count across the scene (gates the BIM↔scan deviation
    *  compute button — useless without a BIM model loaded). */
   triangleCount: number;
+  /** Docked-panel close handler. Omitted in standalone/test renders, where
+   *  the header simply carries no close button. */
+  onClose?: () => void;
 }
 
-export function PointCloudPanel({ assetCount, triangleCount }: PointCloudPanelProps) {
+export function PointCloudPanel({ assetCount, triangleCount, onClose }: PointCloudPanelProps) {
+  const { t } = useTranslation();
   const colorMode = useViewerStore((s) => s.pointCloudColorMode);
   const setColorMode = useViewerStore((s) => s.setPointCloudColorMode);
   const sizeMode = useViewerStore((s) => s.pointCloudSizeMode);
@@ -61,22 +71,43 @@ export function PointCloudPanel({ assetCount, triangleCount }: PointCloudPanelPr
   const alignmentEnabled = useViewerStore((s) => s.pointCloudAlignmentEnabled);
   const setAlignmentEnabled = useViewerStore((s) => s.setPointCloudAlignmentEnabled);
 
-  if (assetCount <= 0) return null;
+  const header = (
+    <div className="flex items-center gap-2 border-b p-3">
+      <Scan className="h-4 w-4 text-teal-600" />
+      <span className="font-medium text-sm">{t('pointCloudPanel.title')}</span>
+      {assetCount > 0 && (
+        <span className="text-2xs text-muted-foreground">
+          {t('pointCloudPanel.assetCount', { count: assetCount })}
+        </span>
+      )}
+      <span className="flex-1" />
+      {onClose && (
+        <IconButton label={t('pointCloudPanel.close')} variant="ghost" size="icon" className="h-6 w-6" onClick={onClose}>
+          <X className="h-3.5 w-3.5" />
+        </IconButton>
+      )}
+    </div>
+  );
+
+  if (assetCount <= 0) {
+    return (
+      <div className="flex h-full flex-col">
+        {header}
+        <output className="block p-3 text-sm text-muted-foreground">
+          {t('shellChrome.panelGroups.noPointCloud')}
+        </output>
+      </div>
+    );
+  }
 
   return (
-    <div className="absolute bottom-4 left-4 z-10 pointer-events-auto bg-background/90 backdrop-blur-sm rounded-lg border shadow-lg p-2 flex flex-col gap-2 min-w-[200px]">
-      <div className="flex items-center justify-between gap-2">
-        <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-          Point Cloud
-        </span>
-        <span className="text-[10px] text-muted-foreground">
-          {assetCount} asset{assetCount === 1 ? '' : 's'}
-        </span>
-      </div>
+    <div className="flex h-full flex-col">
+      {header}
+      <div className="flex-1 overflow-y-auto p-2 flex flex-col gap-2">
 
       {/* Color mode */}
       <div className="flex flex-col gap-0.5">
-        <span className="text-[9px] uppercase text-muted-foreground tracking-wider">Colour</span>
+        <span className="text-2xs uppercase text-muted-foreground tracking-wider">{t('pointCloudPanel.colourSectionLabel')}</span>
         {COLOR_MODES.map((mode) => {
           const active = colorMode === mode.value;
           return (
@@ -84,7 +115,7 @@ export function PointCloudPanel({ assetCount, triangleCount }: PointCloudPanelPr
               key={mode.value}
               aria-pressed={active}
               onClick={() => setColorMode(mode.value)}
-              title={mode.hint}
+              title={t(mode.hintKey)}
               className={cn(
                 'flex items-center gap-2 px-2 py-1 rounded text-xs transition-colors text-left',
                 active
@@ -92,7 +123,7 @@ export function PointCloudPanel({ assetCount, triangleCount }: PointCloudPanelPr
                   : 'text-muted-foreground hover:bg-muted hover:text-foreground',
               )}
             >
-              {mode.label}
+              {t(mode.labelKey)}
             </button>
           );
         })}
@@ -103,10 +134,10 @@ export function PointCloudPanel({ assetCount, triangleCount }: PointCloudPanelPr
           // compare. Until "Compute deviation" runs, that buffer is all
           // zeros, so every point maps to the ramp centre (grey). Nudge
           // the user toward the compute button below.
-          <span className="text-[10px] text-amber-500 px-2 leading-tight">
+          <span className="text-2xs text-amber-500 px-2 leading-tight">
             {triangleCount > 0
-              ? 'Run “Compute deviation” below to populate the heatmap.'
-              : 'Load a BIM model to compare the scan against.'}
+              ? t('pointCloudPanel.deviation.computeHint')
+              : t('pointCloudPanel.deviation.needsModelHint')}
           </span>
         )}
         {colorMode === 'fixed' && (
@@ -116,12 +147,12 @@ export function PointCloudPanel({ assetCount, triangleCount }: PointCloudPanelPr
           // on display. Alpha stays 1 since fixed-mode opacity is
           // controlled by the splat shape, not the colour swatch.
           <label className="flex items-center justify-between gap-2 mt-1 px-2 py-1 rounded bg-muted/40">
-            <span className="text-[10px] text-muted-foreground">Solid colour</span>
+            <span className="text-2xs text-muted-foreground">{t('pointCloudPanel.solidColourLabel')}</span>
             <input
               type="color"
               value={rgbToHex(fixedColor)}
               onChange={(e) => setFixedColor(hexToRgba(e.target.value, fixedColor[3]))}
-              aria-label="Pick the solid colour applied in fixed mode"
+              aria-label={t('pointCloudPanel.solidColourPickerAriaLabel')}
               className="h-6 w-10 rounded border-0 cursor-pointer bg-transparent"
             />
           </label>
@@ -134,10 +165,10 @@ export function PointCloudPanel({ assetCount, triangleCount }: PointCloudPanelPr
       {alignmentAvailable && (
         <label className="flex items-center justify-between gap-2 cursor-pointer px-2 py-1 rounded bg-muted/40">
           <span
-            className="text-[10px] text-muted-foreground"
-            title="Applies the inverse IfcMapConversion so the scan's absolute map coordinates (eastings/northings/height) line up with the IFC model. Turn off to see the scan at its raw, un-transformed coordinates."
+            className="text-2xs text-muted-foreground"
+            title={t('pointCloudPanel.alignToModel.hint')}
           >
-            Align to model georeference
+            {t('pointCloudPanel.alignToModel.label')}
           </span>
           <input
             type="checkbox"
@@ -148,7 +179,7 @@ export function PointCloudPanel({ assetCount, triangleCount }: PointCloudPanelPr
               applyPointCloudAlignmentToggle(getGlobalRenderer(), enabled);
             }}
             className="accent-teal-600"
-            title="Align to model georeference (IfcMapConversion)"
+            title={t('pointCloudPanel.alignToModel.checkboxTitle')}
           />
         </label>
       )}
@@ -160,7 +191,7 @@ export function PointCloudPanel({ assetCount, triangleCount }: PointCloudPanelPr
 
       {/* Size mode */}
       <div className="flex flex-col gap-0.5">
-        <span className="text-[9px] uppercase text-muted-foreground tracking-wider">Size</span>
+        <span className="text-2xs uppercase text-muted-foreground tracking-wider">{t('pointCloudPanel.sizeSectionLabel')}</span>
         <div className="grid grid-cols-3 gap-0.5">
           {SIZE_MODES.map((mode) => {
             const active = sizeMode === mode.value;
@@ -169,21 +200,21 @@ export function PointCloudPanel({ assetCount, triangleCount }: PointCloudPanelPr
                 key={mode.value}
                 aria-pressed={active}
                 onClick={() => setSizeMode(mode.value)}
-                title={mode.hint}
+                title={t(mode.hintKey)}
                 className={cn(
-                  'px-1.5 py-1 rounded text-[11px] transition-colors',
+                  'px-1.5 py-1 rounded text-2xs transition-colors',
                   active
                     ? 'bg-teal-600 text-white'
                     : 'text-muted-foreground hover:bg-muted hover:text-foreground',
                 )}
               >
-                {mode.label}
+                {t(mode.labelKey)}
               </button>
             );
           })}
         </div>
         <label className="flex items-center gap-2 mt-1">
-          <span className="text-[10px] text-muted-foreground w-8 shrink-0">{pointSize.toFixed(0)}px</span>
+          <span className="text-2xs text-muted-foreground w-8 shrink-0">{t('pointCloudPanel.pointSizePx', { value: pointSize.toFixed(0) })}</span>
           <input
             type="range"
             min={1}
@@ -192,13 +223,13 @@ export function PointCloudPanel({ assetCount, triangleCount }: PointCloudPanelPr
             value={pointSize}
             onChange={(e) => setPointSize(Number(e.target.value))}
             className="flex-1 h-1 accent-teal-600 cursor-pointer"
-            title="Splat size in pixels (or upper cap in Auto mode)"
+            title={t('pointCloudPanel.splatSizeTitle')}
           />
         </label>
         {sizeMode !== 'fixed-px' && (
           <label className="flex items-center gap-2">
-            <span className="text-[10px] text-muted-foreground w-8 shrink-0">
-              {(worldRadius * 1000).toFixed(0)}mm
+            <span className="text-2xs text-muted-foreground w-8 shrink-0">
+              {t('pointCloudPanel.worldRadiusMm', { value: (worldRadius * 1000).toFixed(0) })}
             </span>
             <input
               type="range"
@@ -208,7 +239,7 @@ export function PointCloudPanel({ assetCount, triangleCount }: PointCloudPanelPr
               value={Math.round(worldRadius * 1000)}
               onChange={(e) => setWorldRadius(Number(e.target.value) / 1000)}
               className="flex-1 h-1 accent-teal-600 cursor-pointer"
-              title="World-space splat radius in millimetres"
+              title={t('pointCloudPanel.worldRadiusTitle')}
             />
           </label>
         )}
@@ -217,18 +248,18 @@ export function PointCloudPanel({ assetCount, triangleCount }: PointCloudPanelPr
       {/* EDL */}
       <div className="flex flex-col gap-0.5">
         <label className="flex items-center justify-between gap-2 cursor-pointer">
-          <span className="text-[9px] uppercase text-muted-foreground tracking-wider">EDL</span>
+          <span className="text-2xs uppercase text-muted-foreground tracking-wider">{t('pointCloudPanel.edlSectionLabel')}</span>
           <input
             type="checkbox"
             checked={edlEnabled}
             onChange={(e) => setEdlEnabled(e.target.checked)}
             className="accent-teal-600"
-            title="Eye-Dome Lighting — adds depth perception via screen-space depth gradient"
+            title={t('pointCloudPanel.edlCheckboxTitle')}
           />
         </label>
         {edlEnabled && (
           <label className="flex items-center gap-2">
-            <span className="text-[10px] text-muted-foreground w-8 shrink-0">
+            <span className="text-2xs text-muted-foreground w-8 shrink-0">
               {edlStrength.toFixed(1)}
             </span>
             <input
@@ -239,7 +270,7 @@ export function PointCloudPanel({ assetCount, triangleCount }: PointCloudPanelPr
               value={edlStrength}
               onChange={(e) => setEdlStrength(Number(e.target.value))}
               className="flex-1 h-1 accent-teal-600 cursor-pointer"
-              title="EDL strength multiplier"
+              title={t('pointCloudPanel.edlStrengthTitle')}
             />
           </label>
         )}
@@ -249,6 +280,7 @@ export function PointCloudPanel({ assetCount, triangleCount }: PointCloudPanelPr
           and points are loaded. The panel renders nothing when there
           are no triangles in the scene. */}
       <DeviationPanel triangleCount={triangleCount} />
+      </div>
     </div>
   );
 }

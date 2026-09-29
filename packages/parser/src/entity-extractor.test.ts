@@ -44,6 +44,18 @@ describe('EntityExtractor typed-value unwrapping', () => {
   });
 });
 
+describe('EntityExtractor record boundary', () => {
+  it('ignores closing parentheses in trailing STEP comments', () => {
+    const ent = extract("#1=IFCPROPERTYSINGLEVALUE('Head',$,(#2))/* ) */;");
+    expect(ent?.attributes).toEqual(['Head', null, [2]]);
+  });
+
+  it('ignores structural characters in strings and nested comments', () => {
+    const ent = extract("#1=IFCPROPERTYSINGLEVALUE(') /* text',/* ) */(#2),'Tail')/* ) */;");
+    expect(ent?.attributes).toEqual([') /* text', [2], 'Tail']);
+  });
+});
+
 describe('EntityExtractor MAX_PARSE_DEPTH guard', () => {
   // parseAttributeValue recurses once per nesting level of a parenthesised
   // list/typed-value attribute. Unguarded, a hostile or corrupted file can

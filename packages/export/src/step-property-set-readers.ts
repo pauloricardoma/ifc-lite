@@ -25,6 +25,7 @@ import { findLengthUnitReference, normalizeMapUnitName } from './step-map-unit.j
 import { authoredEntityRefs, type EffectiveEntityIndex } from './effective-index.js';
 import { HAS_PROPERTY_SETS_SLOT } from './type-owned-psets.js';
 import type { IfcSchemaVersion } from './schema-converter.js';
+import { firstWrittenOwnerHistoryRef } from './schema-converter-owner-history.js';
 import type { SourceLineMutations } from './step-exporter.js';
 
 /**
@@ -65,8 +66,8 @@ export interface PropertySetContext {
  */
 export interface OwnerHistoryCache {
   /** Lazily-resolved fallback `#id` of an IfcOwnerHistory that survives the
-   *  current export closure (or `$` when the file has none). */
-  fallbackRef: string | undefined;
+   *  current export closure (or null when none does). */
+  fallbackRef: string | null | undefined;
   /** Per-host cache of an element's own OwnerHistory ref (`#id` or null). */
   readonly byEntity: Map<number, string | null>;
 }
@@ -130,6 +131,7 @@ const OWNER_HISTORY_SLOT = 1;
  * an interface of its privates; an export is the same access, stated.
  */
 export function entityLineText(ctx: PropertySetContext, entityId: number): string | null {
+  // @raw-entity-enumeration-ok point lookup for the source line being decoded; authored entities have no source bytes and use overlay readers
   const entityRef = ctx.dataStore.entityIndex.byId.get(entityId);
   if (!entityRef || !ctx.isReadableSourceRef(entityRef)) return null;
   return decodeRange(
@@ -202,6 +204,7 @@ export function getTypeOwnedHasPropertySetIds(ctx: PropertySetContext, entityId:
     return authoredEntityRefs(overlaySlotValue(ctx, entityId, HAS_PROPERTY_SETS_SLOT, authored));
   }
   if (!ctx.entityExtractor) return [];
+  // @raw-entity-enumeration-ok point lookup for this type's source HasPropertySets; overlay-created types were handled above
   const entityRef = ctx.dataStore.entityIndex.byId.get(entityId);
   if (!entityRef) return [];
 
@@ -261,6 +264,7 @@ function getOwnerHistoryRefOfEntity(ctx: PropertySetContext, entityId: number): 
     ctx.ownerHistory.byEntity.set(entityId, result);
     return result;
   }
+  // @raw-entity-enumeration-ok point lookup for the host's source OwnerHistory slot; effective fallback checks deletion and retype below
   const entityRef = ctx.dataStore.entityIndex.byId.get(entityId);
   // Readability rather than presence, as everywhere else (#2491). A clamped
   // decode would match nothing here, so this is tidiness rather than a bug —
@@ -297,20 +301,36 @@ function getOwnerHistoryRefOfEntity(ctx: PropertySetContext, entityId: number): 
  * only the `visibleOnly` closure, so an overlay-created OwnerHistory that was
  * later deleted still got referenced — a dangling `#N`, reached through the
  * one attribute the generators fill in for themselves.
+ *
+ * And it must still BE an owner history: a record the session retyped to
+ * another class is written under that class, so both paths ask
+ * {@link isWrittenOwnerHistory} (PR #4729 review).
  */
-export function resolveOwnerHistoryRef(ctx: PropertySetContext, hostEntityId: number, willBeEmitted: (id: number) => boolean): string {
+export function resolveOwnerHistoryRef(ctx: PropertySetContext, hostEntityId: number, willBeEmitted: (id: number) => boolean, effective: EffectiveEntityIndex): string {
   const own = getOwnerHistoryRefOfEntity(ctx, hostEntityId);
-  if (own !== null) {
-    const ownId = parseInt(own.slice(1), 10);
-    if (willBeEmitted(ownId)) return own;
-  }
+  if (own !== null && isWrittenOwnerHistory(parseInt(own.slice(1), 10), willBeEmitted, effective)) return own;
+  return resolveFallbackOwnerHistoryRef(ctx, willBeEmitted, effective) ?? '$';
+}
+
+/** `id` is written by this export AND is an IfcOwnerHistory after the
+ *  session's retypes. The one test both owner-history paths use. */
+function isWrittenOwnerHistory(id: number, willBeEmitted: (id: number) => boolean, effective: EffectiveEntityIndex): boolean {
+  return willBeEmitted(id) && effective.typeOf(id) === 'IFCOWNERHISTORY';
+}
+
+/**
+ * The first source IfcOwnerHistory that survives this export, as `#id`, or
+ * null when none does. The fallback of {@link resolveOwnerHistoryRef}, and
+ * the owner history an IFC2X3 downgrade writes into `$` OwnerHistory slots
+ * (#4686).
+ */
+export function resolveFallbackOwnerHistoryRef(ctx: PropertySetContext, willBeEmitted: (id: number) => boolean, effective: EffectiveEntityIndex): string | null {
   if (ctx.ownerHistory.fallbackRef === undefined) {
     // Source-only: the fallback is a best-effort "some owner history the file
     // still has", and the host's OWN history above is the path that resolves
     // an overlay-created one.
-    const ids = ctx.dataStore.entityIndex.byType.get('IFCOWNERHISTORY') ?? [];
-    const surviving = ids.find((id: number) => willBeEmitted(id));
-    ctx.ownerHistory.fallbackRef = surviving !== undefined ? `#${surviving}` : '$';
+    // @raw-entity-enumeration-ok source OwnerHistory candidates are filtered by isWrittenOwnerHistory; a created host's own history resolves above
+    ctx.ownerHistory.fallbackRef = firstWrittenOwnerHistoryRef(ctx.dataStore.entityIndex.byType.get('IFCOWNERHISTORY'), (id) => isWrittenOwnerHistory(id, willBeEmitted, effective), 0);
   }
   return ctx.ownerHistory.fallbackRef;
 }

@@ -2,11 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Issue #3353 (`sweep_261`), Vid-space instrument — NOT a fix.
+//! Issue #3353 (`sweep_261`), Vid-space instrument — and, since #4439, the
+//! Vid-space health check for the classification-level tear it used to pin.
 //!
 //! `issue_3353_sweep_261_classification_tear.rs` (a `tests/` integration
-//! test, `#[ignore]`d because it documents a known-open defect) records that
-//! a prior instrumented run found, for this exact operand pair under
+//! test, `#[ignore]`d until #4439 because it documented a known-open defect)
+//! records that a prior instrumented run found, for this exact operand pair under
 //! `Union`: `arr.unrecovered == 0` (the arrangement fully recovers every
 //! input constraint — not a missing-constraint failure) alongside a
 //! KEPT-triangle set that is non-manifold in pure Vid space, before any
@@ -53,52 +54,243 @@
 //!    classification (see `origin_of`'s doc comment for why this is valid
 //!    for `Union`).
 //!
+//! ## Which regime decides each implicated triangle (measured)
+//!
+//! The edge census below says WHICH triangles disagree. This section records
+//! WHY, from an instrumented run of `boolean_vids_components`'s own three-regime
+//! chain over this exact arrangement. Every triangle on an over-used edge:
+//!
+//! ```text
+//! edge (13,17)   A[17] [15,13,17] |n|=6.11e-1  R3 inside_b=true    keep=false
+//!                A[22] [17,13,14] |n|=6.56e-5  R1 dot=1.19e-4      keep=true
+//! edge (13,14)   A[15] [13,10,14] |n|=6.01e-6  R3 inside_b=false   keep=true
+//!                B[17] [13,39,14] |n|=1.62e-4  R3 inside_a=true    keep=false
+//!                B[18] [41,13,14] |n|=3.66e-5  R3 inside_a=false   keep=true
+//! edge (14,17)   A[21] [14,11,17] |n|=1.03e0   R3 inside_b=false   keep=true
+//!                B[66] [14,39,17] |n|=1.62e0   R3 inside_a=true    keep=false
+//!                B[67] [42,14,17] |n|=1.15e0   R3 inside_a=false   keep=true
+//! ```
+//!
+//! The last column is the DECIDING test, so the B rows name the ray cast that
+//! actually decided them. `c_on_or_near_a` — the B loop's dedup drop, which runs
+//! first — returned false for all four, so none of them reached it.
+//!
+//! `A[22]` is the whole defect, and it is the ONLY triangle here decided by
+//! regime 1. Edge `(13,17)` is bounded by exactly two A sub-triangles, `A[17]`
+//! and `A[22]`, and they lie in ONE A face plane — Vids 13, 14, 15 and 17 are
+//! exactly coplanar (`orient3d == 0`, not merely within a tolerance), on the
+//! plane the original `a[2]` and `a[3]` share as the diagonal split of one box
+//! face. Two sub-triangles of one flat face, and they disagree: the well-formed
+//! one is dropped as inside B by the ray cast, the needle is kept by the
+//! coincident-face regime. Dropping `A[22]` alone repairs all three edges:
+//! `(13,17)` goes to 0, since `A[22]` is its only user, and the other two to 2.
+//! So it is the single wrong verdict, not a symptom of several.
+//!
+//! And the ray cast agrees it should be dropped. Probed directly, `A[22]` has
+//! `R3 inside_b == true` and `R2 solid_side == (true, true)`: regime 1 is
+//! OVERRIDING a fallback that already had the right answer.
+//!
+//! ## Why regime 1 fires on it, and why that is the root cause
+//!
+//! `classify.rs`'s `on_surface_tri`/`near_on_surface_tri` establish "this is a
+//! coincident SHARED face of the other operand" from the sub-triangle's CENTROID
+//! alone: on the other face's plane (or within `NearBand`) and inside its
+//! outline. `boolean_vids_components` then resolves that by NORMAL AGREEMENT,
+//! `dot3(tri_normal, n_other) > 0.0`.
+//!
+//! A sub-triangle need not have its parent's plane. Retriangulation can leave
+//! one DEGENERATE onto the line where the two parent planes MEET, at which point
+//! its whole extent sits within the NEAR band of the other operand's plane
+//! however transversal the two faces are. (Measured: the exact
+//! `on_surface_normal` returns `None` here; only `near_on_surface_normal`
+//! accepts it, at 1.86e-5 off the B face.) `A[22]` is exactly that: a needle whose two ends are
+//! 8.4e-5 apart, sitting on the A-B plane intersection line, centroid 1.86e-5
+//! from a B face and inside its outline. So regime 1 fires on a face pair that
+//! is not coincident, and resolves it by the sign of a cross product a
+//! near-collinear triple does not pin down (`|own_n| = 6.56e-5` against
+//! `|n_other| = 3.4`). What it happens to yield is `cos = 5.32e-1`, 58 degrees:
+//! nowhere near parallel, so there is no shared face to be co-oriented with.
+//!
+//! ## What was tried against that, and why none of it landed
+//!
+//! Coincidence is a property of the two INPUT faces, so the natural fix is to
+//! ask it of the sub-triangle's PARENT face: carry the originating triangle on
+//! the `Arrangement` and require the whole parent to lie on, or be flush within
+//! the band of, the candidate face's plane. That is exact, threshold-free, and
+//! strictly stricter than the centroid test, so a genuine shared face keeps its
+//! verdict. Measured, against a corpus census whose baseline matches the golden
+//! exactly:
+//!
+//! A second shape drops out of the same reading. Only the NEAR test accepts
+//! `A[22]`, and `coplanar_a[22] == false`, so gating the A-side near call on the
+//! coplanar-parent flag also takes it out of regime 1 — and that is what
+//! `near_on_surface_normal`'s own doc claimed the code already did.
+//!
+//! ```text
+//!                                sweep_261   union sweep    census
+//! parent-flush, A and B sides    passes      98 -> 72       39 hosts regressed
+//! parent-flush, A side only      passes      98 -> 77       20 hosts regressed
+//! near test gated on coplanar_a  passes      98 -> 77       20 hosts regressed
+//! parent NORMAL for the dot      FAILS       not run        not run
+//! flush test on the sub-tri      FAILS       not run        not run
+//! parent-flush, A side, 3 verts  passes      98 -> 77       26 regressed, 9 improved
+//! needle refused (area < 1e-6 parent) FAILS   98 -> 92       12 regressed, 3 improved
+//! ```
+//!
+//! The last two rows were re-measured on 2026-09-04 with the parent index
+//! carried on the `Arrangement` (patches kept off-tree). The all-vertex flush
+//! gate fixes the target but also refuses the #1007 tilted-flush caps whose far
+//! vertices leave the band: one host doubles its open edges (622 -> 1333) and
+//! seven read "geometry lost". The needle gate is scale-free but a 1e-12 cut
+//! in |n|^2 misses the very needle in `sweep_261` (its ratio is 3.7e-10), and
+//! loosening it to catch that would be tuning a constant on one case. What a
+//! fix still needs: a coincidence criterion that is a property of the parent
+//! face yet tolerates a tilt of a few um across the face's extent, measured
+//! against the corpus golden, with the 26-host row as the first thing to beat.
+//!
+//! (The two that fail `sweep_261` were not carried further; "not run" is not a
+//! null result.)
+//!
+//! ## What landed (#4439)
+//!
+//! The eighth shape is none of the above: it is a property of the SUB-TRIANGLE's
+//! own plane, not of its parent and not of vertex distances.
+//! `arrangement::coincident::coincident_planes` requires the candidate face to
+//! be within 45° of parallel to the sub-triangle (`cos² ≥ ½`, evaluated FMA-free
+//! on the raw normals) before regime 1 may fire — on the A side and on the
+//! B-side dedup drop alike. A genuine shared or flush face has `cos ≈ 1`; `A[22]`
+//! above sits at 58° and the #4439 needle at exactly 90°, so both leave regime 1
+//! for the ray cast that already had them right. The #1007 flush caps keep their
+//! verdict (their snap tilt is < 1e-3 rad), and so do the two
+//! `clash_intersection_oracle.rs` near-band invariants, because nothing is
+//! gated on `coplanar_a`. Measured: `sweep_261` passes end-to-end (its `tests/`
+//! file is no longer `#[ignore]`d) and the census below reads 0 over-used edges
+//! of 123. The corpus golden verdict is recorded in the #4439 PR.
+//!
+//! Why the rows read as they do:
+//!
+//! 1. The B side must NOT require it. `c_on_or_near_a` is a DEDUP drop, not an
+//!    orientation verdict, so making coincidence harder there leaves B copies of
+//!    genuinely shared faces alive next to the A copy — the 39-host run's
+//!    reasons are dominated by hosts GAINING triangles and open edges.
+//! 2. The sliver has to LEAVE regime 1, not be re-oriented inside it: the
+//!    parent's normal gives the same sign, so substituting it changes nothing.
+//! 3. Gating the near test costs MORE than the census row shows: it also breaks
+//!    two pinned near-band invariants in `tests/clash_intersection_oracle.rs`,
+//!    `no_surviving_near_band_triangle_has_an_x_facing_normal` and
+//!    `the_near_band_shortfall_is_a_missing_face_pair_not_a_shape_dependent_wedge`,
+//!    which need that path ungated. So the doc claiming the gate exists is
+//!    describing an intent the corpus has since contradicted, not a lost
+//!    invariant to restore.
+//! 4. Both shapes that fix `sweep_261` improve every aggregate — the A-side
+//!    parent-flush one reads corpus unmatched edges 17863 -> 15992, strict-rule
+//!    edges 19344 -> 17612, torn hosts 165 -> 161 — while still regressing 20
+//!    pinned per-host rows, most of them reading "geometry lost". That is the
+//!    per-host golden doing its job: those hosts were watertight BECAUSE regime 1
+//!    kept a zero-area sliver on an arbitrary sign, and they have a pre-existing
+//!    tear the sliver was patching. Two independent shapes landing on the same
+//!    20 is itself evidence the cost is that population, not either criterion.
+//!
+//! So the remaining work is not another criterion for regime 1. It is the tear
+//! those hosts already carry, which today is masked. `various/rvt01.ifc` #7295,
+//! #7544, #16805 and `ISSUE_129_...` #34385, #295370, #296868 are the ones that
+//! lose the most geometry and are the place to start.
+//!
 //! ## Deliberately NOT changed
 //!
 //! No production function's signature, behaviour, or visibility changes.
 //! This file only CALLS existing `pub(super)`/`pub(crate)` functions from a
 //! new vantage point and post-processes their unmodified return values.
 //!
-//! ## CI-visible pin, not a `#[ignore]`d printout
+//! ## CI-visible health check (was: a pin of the defective state)
 //!
-//! `sweep_261_kept_triangles_are_nonmanifold_in_vid_space` (below) runs in
-//! normal `cargo test` (no `--ignored`) and asserts the DEFECT SHAPE
-//! described above: `unrecovered == 0` together with at least one
-//! kept-triangle edge whose Vid-space multiplicity is not 2.
+//! `sweep_261_kept_triangles_are_manifold_in_vid_space` (below) runs in normal
+//! `cargo test` (no `--ignored`) and asserts the FIXED shape: `unrecovered == 0`
+//! together with EVERY kept-triangle edge having Vid-space multiplicity exactly
+//! 2. Until #4439 it asserted the opposite — at least one over-used edge, the
+//! defect signature above — so that a green tick meant "the defect still
+//! reproduces exactly as documented", and a failure was the documented trigger
+//! to re-diagnose both files together. That trigger fired: the #4439 gate made
+//! the kept set manifold, so the assertion was flipped rather than loosened,
+//! together with un-ignoring `sweep_261_overlapping_rotated_union_never_tears`
+//! in the sibling `tests/` file (the end-to-end reading of the same case).
 //!
 //! It deliberately does NOT assert the exact Vid numbers
-//! `(13,17)`/`(14,17)`/`(13,14)` quoted above from the sibling file's doc
-//! comment — those are Vid-interner allocation labels, not geometry, and
-//! this file's reproduction was not executed against that prior run before
-//! this patch was written (no `cargo test` was run to produce this file —
-//! the workstation that wrote it was disk-constrained and cargo was
-//! off-limits). Pinning unverified literals would risk failing on the very
-//! first CI run for a labelling reason unrelated to the defect.
+//! `(13,17)`/`(14,17)`/`(13,14)` — those are Vid-interner allocation labels,
+//! not geometry, and pinning them would fail on any relabelling for a reason
+//! unrelated to the defect. The assertion stays on the SHAPE.
 //!
-//! The full kept set and edge census are printed, but CI will NOT show
+//! Every number in the regime table above comes from an instrumented run of
+//! this exact reproduction at the pre-#4439 code, and the labels matched; the
+//! table is kept as the record of WHY regime 1 was wrong, not as a description
+//! of current output.
+//!
+//! The full kept set and edge census are still printed, but CI will NOT show
 //! them: `.github/workflows/test.yml` runs `cargo test --workspace` with no
-//! `--nocapture`, and cargo suppresses stdout for a PASSING test — which
-//! this is by design while the defect exists. Confirmed absent from the
-//! first green run's log rather than assumed. To read the numbers:
+//! `--nocapture`, and cargo suppresses stdout for a passing test. To read them:
 //!
 //!   cargo test -p ifc-lite-geometry --lib issue_3353_vid_census -- --nocapture
 //!
-//! Once observed they can be pinned as assertions, which WOULD surface in
-//! CI on any change.
+//! ## Issue #3915: is this a vertex-IDENTITY defect? (measured, ruled out)
 //!
-//! This is a characterisation pin of a KNOWN-DEFECTIVE state, not a health
-//! check: a green tick on this test means "the defect still reproduces
-//! exactly as documented," NOT "issue #3353 is fixed." Read together with
-//! `sweep_261_overlapping_rotated_union_never_tears`'s `#[ignore]` in the
-//! sibling file (which this patch does not touch and does not un-ignore),
-//! the pair is meant to be unambiguous: that file documents the defect
-//! end-to-end (ignored, because it fails outright), this one documents its
-//! Vid-space signature (not ignored, because — until the defect is fixed —
-//! it is expected to keep finding one). If `classify.rs` changes and this
-//! test starts failing, that is the expected trigger to re-diagnose BOTH
-//! files together, not to loosen either assertion.
+//! #3915 asked whether the interner should be CANONICALIZING near-coincident
+//! constraint-intersection vertices during per-face retriangulation, on the
+//! theory that this run interns three separate Vids for what should be one
+//! shared corner. Instrumented directly (`kernel::interner::Interner::intern`
+//! called from THIS reproduction, positions read via `to_f64_pt`), that
+//! theory does not hold:
 //!
-//! Refs #3353
+//! ```text
+//! Vid 10 = [-1.7237091064453125, -0.3524627685546875, 1.6377716064453125]
+//! Vid 11 = [ 1.1296997070312500, -0.3524627685546875, 1.6377716064453125]
+//! Vid 13 = [-1.6740500545616240, -0.2988684570207063,  1.6377716064453125]
+//! Vid 14 = [-1.6739785390123234, -0.2989121991848813,  1.6377716064453125]
+//! Vid 17 = [-0.7426012079060830,  0.0489949180186103,  1.6377716064453125]
+//! dist(10,11) = 2.853  dist(10,17) = 1.060  dist(11,17) = 1.915
+//! ```
+//!
+//! Vids 10, 11 and 17 are ordinary A-face vertices, none within a metre of
+//! either of the others — not a near-coincident trio. The ONLY near-coincident
+//! pair in this arrangement is Vid 13 / Vid 14, 83.85 um apart (matches the
+//! issue's own headline measurement exactly), and there are two of them, not
+//! three. So there is no third redundant Vid for an intern-time canonical form
+//! to fold away.
+//!
+//! What edge (13,14) actually is: a hairline retriangulation seam on A's
+//! face, correctly used by TWO real triangles — `kept[11]=[13,10,14]`
+//! (`A[15]`, kept by the ray cast) and `kept[56]=[41,13,14]` (`B[18]`, also
+//! kept by the ray cast) — one sliver per operand, each a legitimate
+//! consequence of where that operand's OWN retriangulation happened to place
+//! its constraint split. Both slivers share the tiny edge because they meet
+//! along it; neither vertex is spurious, and merging Vid 13 into Vid 14 (or
+//! vice versa) would collapse both real slivers, not remove a duplicate.
+//!
+//! The edge's multiplicity is 3, not 2, because a THIRD triangle also claims
+//! it: `kept[16]=[17,13,14]` (`A[22]`), the needle already named above as
+//! "the whole defect" — decided by regime 1 overriding a ray cast (`R3
+//! inside_b == true`) that had already rejected it correctly. That is a
+//! triangle-ACCEPTANCE defect in `classify.rs`, not a vertex-IDENTITY one:
+//! there is no pair of "independently-derived exact intersection points
+//! denoting one logical corner" here to canonicalize. Vid 13 and Vid 14 are
+//! two distinct, correctly-derived corners; the bug is that a third,
+//! wrongly-accepted triangle happens to use the tiny edge between them.
+//!
+//! The interner itself is exonerated by its own contract (`kernel::interner`
+//! module doc): "Two points that are EXACTLY coincident (`cmp_lex == Zero`)
+//! get the SAME `Vid`, regardless of construction (LPI vs TPI vs Explicit) or
+//! insertion order" — already construction-independent, already exercised by
+//! `Interner::tests::coincident_points_weld_to_one_vid` (an LPI and a TPI at
+//! the same point weld today). Vid 13 and Vid 14 do NOT collide under that
+//! rule because they are not the same exact rational point; inventing a
+//! second, coarser identity criterion to fold them together would need a
+//! distance threshold, which is exactly the "coincidence criterion" the
+//! "What was tried against that" section above already measured — at the
+//! classification layer, framed as a parent-plane/parent-flush gate rather
+//! than a vertex-merge — and found to regress 20 to 39 golden corpus hosts.
+//! Moving the identical threshold decision into the interner does not avoid
+//! that cost; it relocates it. No canonicalization is proposed here.
+//!
+//! Refs #3353, #3915
 
 use super::boolean_vids;
 use crate::kernel::arrangement::{arrange, Arrangement, BoolOp, Tri};
@@ -358,13 +550,13 @@ fn edge_census(
 }
 
 /// See the module doc for the full rationale. Runs in normal `cargo test`
-/// (no `--ignored`) and PINS the current, known-defective Vid-space shape:
-/// a fully-recovered arrangement (`unrecovered == 0`) whose kept triangles
-/// are nonetheless non-manifold in Vid space. A green tick here means "the
-/// #3353 classification-level tear still reproduces exactly as documented,"
-/// NOT "issue #3353 is fixed."
+/// (no `--ignored`) and checks the FIXED Vid-space shape (#4439): a fully-
+/// recovered arrangement (`unrecovered == 0`) whose kept triangles are
+/// manifold in Vid space — every edge used by exactly two kept triangles.
+/// Until #4439 this pinned the opposite (the #3353 classification-level
+/// tear); a failure here now is a regression of that fix.
 #[test]
-fn sweep_261_kept_triangles_are_nonmanifold_in_vid_space() {
+fn sweep_261_kept_triangles_are_manifold_in_vid_space() {
     let (mesh_a, mesh_b) = sweep_261_operands();
     // Same construction `kernel::mesh_bridge::union` runs internally, so the
     // arrangement below is the one production actually computes for this
@@ -436,23 +628,31 @@ fn sweep_261_kept_triangles_are_nonmanifold_in_vid_space() {
         }
     }
 
-    // Centroid-to-opposite-surface proximity. MEASUREMENT ONLY — no assertion,
-    // because no threshold is known yet and pinning an unverified one is how a
-    // diagnostic turns into a false signal.
+    // Centroid-to-opposite-surface proximity. MEASUREMENT ONLY — no assertion
+    // on the distances themselves, because no threshold is known and pinning
+    // an unverified one is how a diagnostic turns into a false signal.
     //
-    // `classify::centroid` rounds each Vid to f64 and then averages in IEEE.
-    // For this fixture no face pair is within 28 degrees of parallel, so the
-    // coincident-face regime never fires and every triangle is classified by
-    // the ray cast, which uses that centroid as its ray ORIGIN. Rounding can
-    // flip a parity verdict only if the true centroid sits within a few ULP of
-    // the other operand's surface. These numbers say whether it does.
+    // CORRECTION (measured, see this file's "Which regime decides" section):
+    // this block used to claim that "no face pair is within 28 degrees of
+    // parallel, so the coincident-face regime never fires and every triangle is
+    // classified by the ray cast". That was FALSE, and it was false about the
+    // one triangle that mattered. Before #4439, `kept[16] = [17, 13, 14]` WAS
+    // classified by regime 1 — coincidence was established from the CENTROID
+    // alone, which needs no face pair to be parallel at all. The
+    // `coincident_planes` gate now rejects it (its plane is 58° off the
+    // candidate face), so it falls to the ray cast. Leaving the old claim in
+    // place would send the next reader looking at the ray cast for a defect
+    // that was never there.
     //
-    // NOTE: `cargo test --workspace` CAPTURES stdout for a passing test, and
-    // this test passes while the defect exists, so CI will not show these
-    // lines. Run it directly:
+    // What the distances below still say: whether a centroid sits close enough
+    // to the other operand's surface for the f64 rounding in `centroid` to
+    // matter. `kept[16]`'s 1.86e-5 is the one that did.
+    //
+    // NOTE: the assertion at the end of this test requires `overused` to be
+    // empty, so this block only has anything to print when a regression
+    // re-opens an edge; `cargo test` captures stdout for a passing test. On a
+    // failure, run it directly to see the census:
     //   cargo test -p ifc-lite-geometry --lib issue_3353_vid_census -- --nocapture
-    // Once the values are known they can be pinned as an assertion, which
-    // would then surface in CI on any change.
     let implicated: BTreeSet<usize> = overused
         .iter()
         .flat_map(|(_, users)| users.iter().map(|(idx, _)| *idx))
@@ -487,16 +687,14 @@ fn sweep_261_kept_triangles_are_nonmanifold_in_vid_space() {
         }
     }
 
-    // The defect itself: a fully-recovered arrangement (asserted above)
-    // whose KEPT triangles are still non-manifold in pure Vid space. See the
-    // module doc for why this is a defect PIN, not a health check.
+    // The fixed shape (#4439): a fully-recovered arrangement (asserted above)
+    // whose KEPT triangles are manifold in pure Vid space. Before #4439 this
+    // asserted the opposite — see the module doc.
     assert!(
-        !overused.is_empty(),
-        "expected sweep_261's kept-triangle set to be non-manifold in Vid space \
-         (issue #3353's classification-level tear) but every edge had multiplicity \
-         2 — either the defect is fixed (in which case: un-ignore \
-         `issue_3353_sweep_261_classification_tear.rs` too, and delete or repurpose \
-         this test) or this file's reproduction no longer matches the documented \
-         case and needs re-diagnosing before trusting either outcome"
+        overused.is_empty(),
+        "sweep_261's kept-triangle set is non-manifold in Vid space again: {} edge(s) \
+         with multiplicity != 2 (issue #3353's classification-level tear, closed by \
+         the #4439 `coincident_planes` gate) — see the census printed above",
+        overused.len()
     );
 }

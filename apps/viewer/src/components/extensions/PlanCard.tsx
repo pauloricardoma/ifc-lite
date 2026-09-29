@@ -14,7 +14,7 @@
  */
 
 import { useMemo, useState } from 'react';
-import { Check, ChevronRight, Edit3, ShieldAlert, Sparkles, X } from 'lucide-react';
+import { Check, ChevronRight, ShieldAlert, Sparkles, X } from 'lucide-react';
 import {
   computeRisks,
   overallTier,
@@ -24,9 +24,12 @@ import {
   type RiskTier,
 } from '@ifc-lite/extensions';
 import { Button } from '@/components/ui/button';
+import { IconButton } from '@/components/ui/icon-button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { useTranslation } from '@/i18n';
 import { cn } from '@/lib/utils';
+import { localizeCapabilityRisk, localizeRiskTier } from './localized-capability-risk';
 
 interface PlanCardProps {
   /** The plan to show. Editable copy is stored in component state. */
@@ -40,6 +43,7 @@ interface PlanCardProps {
 }
 
 export function PlanCard({ plan, onApprove, onCancel, readOnly }: PlanCardProps) {
+  const { t } = useTranslation();
   const [draft, setDraft] = useState<AuthoringPlan>(plan);
   const risks = useMemo<CapabilityRisk[]>(() => {
     const parsed = draft.capabilities
@@ -81,7 +85,7 @@ export function PlanCard({ plan, onApprove, onCancel, readOnly }: PlanCardProps)
         </div>
         <div className="flex-1 min-w-0">
           <div className="text-xs uppercase tracking-wide font-semibold text-muted-foreground">
-            Authoring plan
+            {t('extensionsPanels.planCard.heading')}
           </div>
           {readOnly ? (
             <div className="text-sm font-medium">{draft.summary}</div>
@@ -90,7 +94,7 @@ export function PlanCard({ plan, onApprove, onCancel, readOnly }: PlanCardProps)
               value={draft.summary}
               onChange={(e) => setDraft((p) => ({ ...p, summary: e.target.value }))}
               className="mt-1 text-sm font-medium"
-              aria-label="Plan summary"
+              aria-label={t('extensionsPanels.planCard.summaryAriaLabel')}
             />
           )}
         </div>
@@ -99,28 +103,27 @@ export function PlanCard({ plan, onApprove, onCancel, readOnly }: PlanCardProps)
       <p className="text-xs text-muted-foreground leading-relaxed">{draft.rationale}</p>
 
       <div className="space-y-1.5">
-        <Label className="text-[11px] uppercase tracking-wide">Contributions</Label>
+        <Label className="text-2xs uppercase tracking-wide">{t('extensionsPanels.planCard.contributionsLabel')}</Label>
         {draft.contributions.length === 0 ? (
-          <div className="text-xs text-muted-foreground italic">No contributions.</div>
+          <div className="text-xs text-muted-foreground italic">{t('extensionsPanels.planCard.noContributions')}</div>
         ) : (
           <ul className="space-y-1">
             {draft.contributions.map((c, i) => (
               <li key={i} className="flex items-center gap-2 text-xs rounded-md border bg-muted/30 px-2 py-1.5">
                 <ChevronRight className="h-3 w-3 text-muted-foreground shrink-0" />
-                <span className="font-mono uppercase text-[10px] text-muted-foreground shrink-0">{c.kind}</span>
+                <span className="font-mono uppercase text-2xs text-muted-foreground shrink-0">{c.kind}</span>
                 <span className="flex-1 min-w-0 truncate">{c.label}</span>
                 {c.slot && (
-                  <code className="text-[10px] text-muted-foreground font-mono">{c.slot}</code>
+                  <code className="text-2xs text-muted-foreground font-mono">{c.slot}</code>
                 )}
                 {!readOnly && (
-                  <Button
+                  <IconButton
+                    label={t('extensionsPanels.planCard.removeContributionAriaLabel', { index: i })}
                     size="icon-xs"
-                    variant="ghost"
                     onClick={() => removeContribution(i)}
-                    aria-label={`Remove contribution ${i}`}
                   >
                     <X className="h-3 w-3" />
-                  </Button>
+                  </IconButton>
                 )}
               </li>
             ))}
@@ -129,9 +132,9 @@ export function PlanCard({ plan, onApprove, onCancel, readOnly }: PlanCardProps)
       </div>
 
       <div className="space-y-1.5">
-        <Label className="text-[11px] uppercase tracking-wide">Capabilities</Label>
+        <Label className="text-2xs uppercase tracking-wide">{t('extensionsPanels.planCard.capabilitiesLabel')}</Label>
         {draft.capabilities.length === 0 ? (
-          <div className="text-xs text-muted-foreground italic">No capabilities requested.</div>
+          <div className="text-xs text-muted-foreground italic">{t('extensionsPanels.planCard.noCapabilitiesRequested')}</div>
         ) : (
           <ul className="space-y-1">
             {risks.map((risk) => (
@@ -145,16 +148,16 @@ export function PlanCard({ plan, onApprove, onCancel, readOnly }: PlanCardProps)
                     className="mt-0.5"
                     checked={draft.capabilities.includes(risk.capability.raw)}
                     onChange={() => toggleCapability(risk.capability.raw)}
-                    aria-label={`Toggle capability ${risk.capability.raw}`}
+                    aria-label={t('extensionsPanels.planCard.toggleCapabilityAriaLabel', { raw: risk.capability.raw })}
                   />
                 )}
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2">
-                    <code className="font-mono text-[10px]">{risk.capability.raw}</code>
+                    <code className="font-mono text-2xs">{risk.capability.raw}</code>
                     <RiskBadge tier={risk.tier} />
                   </div>
-                  <div className="mt-0.5 text-[11px] text-muted-foreground">
-                    {risk.description}
+                  <div className="mt-0.5 text-2xs text-muted-foreground">
+                    {localizeCapabilityRisk(risk, t)}
                   </div>
                 </div>
               </li>
@@ -164,26 +167,26 @@ export function PlanCard({ plan, onApprove, onCancel, readOnly }: PlanCardProps)
       </div>
 
       <div className="space-y-1.5">
-        <Label className="text-[11px] uppercase tracking-wide">Triggers</Label>
+        <Label className="text-2xs uppercase tracking-wide">{t('extensionsPanels.planCard.triggersLabel')}</Label>
         <div className="flex flex-wrap gap-1">
-          {draft.triggers.map((t) => (
-            <code key={t} className="text-[10px] font-mono rounded bg-muted px-1.5 py-0.5">{t}</code>
+          {draft.triggers.map((trigger) => (
+            <code key={trigger} className="text-2xs font-mono rounded bg-muted px-1.5 py-0.5">{trigger}</code>
           ))}
         </div>
       </div>
 
       {draft.tests.length > 0 && (
         <div className="space-y-1.5">
-          <Label className="text-[11px] uppercase tracking-wide">Tests</Label>
+          <Label className="text-2xs uppercase tracking-wide">{t('extensionsPanels.planCard.testsLabel')}</Label>
           <ul className="space-y-1">
-            {draft.tests.map((t, i) => (
+            {draft.tests.map((test, i) => (
               <li key={i} className="text-xs rounded-md border bg-muted/30 px-2 py-1.5">
-                <div className="font-medium">{t.name}</div>
-                <div className="text-[11px] text-muted-foreground">
-                  Fixture: <code className="font-mono">{t.fixture}</code>
+                <div className="font-medium">{test.name}</div>
+                <div className="text-2xs text-muted-foreground">
+                  {t('extensionsPanels.planCard.fixtureLabel')} <code className="font-mono">{test.fixture}</code>
                 </div>
-                <div className="text-[11px] text-muted-foreground italic mt-0.5">
-                  {t.assertionSummary}
+                <div className="text-2xs text-muted-foreground italic mt-0.5">
+                  {test.assertionSummary}
                 </div>
               </li>
             ))}
@@ -192,7 +195,7 @@ export function PlanCard({ plan, onApprove, onCancel, readOnly }: PlanCardProps)
       )}
 
       {draft.notes && (
-        <div className="text-[11px] text-muted-foreground italic border-l-2 border-muted pl-2">
+        <div className="text-2xs text-muted-foreground italic border-l-2 border-muted pl-2">
           {draft.notes}
         </div>
       )}
@@ -201,11 +204,11 @@ export function PlanCard({ plan, onApprove, onCancel, readOnly }: PlanCardProps)
         <div className="flex items-center justify-end gap-2 pt-1">
           <Button variant="ghost" size="sm" onClick={onCancel}>
             <X className="mr-1 h-3.5 w-3.5" />
-            Cancel
+            {t('extensionsPanels.planCard.cancelButton')}
           </Button>
           <Button size="sm" onClick={() => onApprove(draft)}>
             <Check className="mr-1 h-3.5 w-3.5" />
-            Author it
+            {t('extensionsPanels.planCard.authorItButton')}
           </Button>
         </div>
       )}
@@ -214,14 +217,15 @@ export function PlanCard({ plan, onApprove, onCancel, readOnly }: PlanCardProps)
 }
 
 function RiskBadge({ tier }: { tier: RiskTier }) {
+  const { t } = useTranslation();
   return (
     <span className={cn(
-      'inline-flex items-center rounded-full px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide',
+      'inline-flex items-center rounded-full px-1.5 py-0.5 text-2xs font-medium uppercase tracking-wide',
       tier === 'red' && 'bg-destructive/20 text-destructive',
       tier === 'yellow' && 'bg-amber-500/20 text-amber-600 dark:text-amber-400',
       tier === 'green' && 'bg-emerald-500/20 text-emerald-700 dark:text-emerald-400',
     )}>
-      {tier}
+      {localizeRiskTier(tier, t)}
     </span>
   );
 }

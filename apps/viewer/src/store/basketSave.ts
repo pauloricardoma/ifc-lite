@@ -14,6 +14,8 @@ interface SelectionSnapshot {
   selectedEntitiesSet: Set<string>;
   selectedEntities: ReturnType<typeof useViewerStore.getState>['selectedEntities'];
   selectedModelId: string | null;
+  chartOwned: boolean;
+  selectionRevision: number;
 }
 
 function hasSelection(snapshot: SelectionSnapshot): boolean {
@@ -35,6 +37,9 @@ function snapshotSelectionState(): SelectionSnapshot {
     selectedEntitiesSet: new Set(state.selectedEntitiesSet),
     selectedEntities: state.selectedEntities.map((ref) => ({ ...ref })),
     selectedModelId: state.selectedModelId,
+    chartOwned: state.chartSelectionRevision != null
+      && state.chartSelectionRevision === state.selectionRevision,
+    selectionRevision: state.selectionRevision,
   };
 }
 
@@ -46,6 +51,22 @@ function restoreSelectionState(snapshot: SelectionSnapshot): void {
     selectedEntitiesSet: new Set(snapshot.selectedEntitiesSet),
     selectedEntities: snapshot.selectedEntities.map((ref) => ({ ...ref })),
     selectedModelId: snapshot.selectedModelId,
+    selectionRevision: snapshot.selectionRevision,
+    ...(snapshot.chartOwned
+      ? { chartSelectionRevision: snapshot.selectionRevision }
+      : {}),
+  });
+}
+
+/** Hide the outline for capture without publishing a new selection write. */
+function temporarilyClearSelectionState(): void {
+  useViewerStore.setState({
+    selectedEntity: null,
+    selectedEntitiesSet: new Set(),
+    selectedEntities: [],
+    selectedEntityId: null,
+    selectedEntityIds: new Set(),
+    selectedModelId: null,
   });
 }
 
@@ -110,16 +131,18 @@ export async function saveBasketViewWithThumbnailFromStore(
 ): Promise<string | null> {
   const before = snapshotSelectionState();
   const hadSelection = hasSelection(before);
+  let clearedSelectionRevision: number | null = null;
 
   if (hadSelection) {
-    useViewerStore.getState().clearEntitySelection();
+    temporarilyClearSelectionState();
+    clearedSelectionRevision = useViewerStore.getState().selectionRevision;
   }
 
   try {
     const thumbnailDataUrl = await captureCanvasThumbnail();
     return useViewerStore.getState().saveCurrentBasketView({ source, thumbnailDataUrl });
   } finally {
-    if (hadSelection) {
+    if (hadSelection && useViewerStore.getState().selectionRevision === clearedSelectionRevision) {
       restoreSelectionState(before);
     }
   }

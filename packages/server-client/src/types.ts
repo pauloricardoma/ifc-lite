@@ -2,6 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+import type { Georeferencing } from './georeferencing.js';
+export type { Georeferencing } from './georeferencing.js';
+import type { MeshCoordinateSpace } from './mesh-coordinate-space.js';
+export { MESH_COORDINATE_SPACES, asMeshCoordinateSpace, withNarrowedCoordinateSpace, type MeshCoordinateSpace } from './mesh-coordinate-space.js';
+
 /**
  * Configuration options for the IFC server client.
  */
@@ -68,6 +73,18 @@ export interface MeshData {
    * `IfcMaterial #0`, which is not an entity anyone can navigate to (#3199).
    */
   material_id?: number;
+  /**
+   * IFC-authored metallic factor in `[0, 1]` (#5984), from the
+   * `IfcSurfaceStyleRendering` the mesh's colour came from. Absent when the
+   * file authored no metal evidence; the renderer then keeps its default.
+   */
+  metallic?: number;
+  /**
+   * IFC-authored roughness in `[0, 1]` (#5984), same source as `metallic`.
+   * Absent when unauthored. `0` is a real value (mirror-smooth glass), so test
+   * it with `!== undefined`, never for truthiness.
+   */
+  roughness?: number;
   /** Space/zone properties attached to the element, when extracted. */
   properties?: Record<string, string>;
   /**
@@ -110,49 +127,6 @@ export interface ModelMetadata {
    * model carries no map-conversion data.
    */
   georeferencing?: Georeferencing;
-}
-
-/**
- * Georeferencing metadata (`IfcMapConversion` + `IfcProjectedCRS`).
- *
- * Surfaced on every geometry endpoint's `ModelMetadata`, matching the browser
- * parser's `extractGeoreferencing`.
- */
-export interface Georeferencing {
-  /** Projected CRS name from `IfcProjectedCRS.Name` (e.g. "EPSG:32632"). */
-  crs_name?: string;
-  /** Geodetic datum (e.g. "WGS84"). */
-  geodetic_datum?: string;
-  /** Vertical datum (e.g. "NAVD88"). */
-  vertical_datum?: string;
-  /** Map projection (e.g. "UTM"). */
-  map_projection?: string;
-  /** False easting — X offset to the map CRS, in the project's length unit. */
-  eastings: number;
-  /** False northing — Y offset to the map CRS, in the project's length unit. */
-  northings: number;
-  /** Orthogonal height — Z offset to the map CRS. */
-  orthogonal_height: number;
-  /** X-axis abscissa: cosine of the rotation to grid north. */
-  x_axis_abscissa: number;
-  /** X-axis ordinate: sine of the rotation to grid north. */
-  x_axis_ordinate: number;
-  /** Scale factor applied during the local→map transform (default 1). */
-  scale: number;
-  /** Rotation to grid north in degrees, derived from the X-axis direction. */
-  rotation_degrees: number;
-  /** Local→map transform as a column-major 4×4 matrix (16 values). */
-  transform_matrix: number[];
-  /** CRS description from `IfcProjectedCRS.Description`. */
-  crs_description?: string;
-  /** Map zone (e.g. "32N") from `IfcProjectedCRS.MapZone`. */
-  map_zone?: string;
-  /** Map unit name from `IfcProjectedCRS.MapUnit` (e.g. "MILLIMETRE"). */
-  map_unit?: string;
-  /** Scale converting MapConversion values to metres (0.001 for mm). */
-  map_unit_scale?: number;
-  /** Provenance: "mapConversion" | "ePSetMapConversion" | "siteLocation". */
-  source?: string;
 }
 
 /**
@@ -206,43 +180,12 @@ export interface ProcessingStats {
   geometry_diagnostics?: GeometryDiagnostics;
 }
 
-/**
- * CSG / opening diagnostics for a geometry pass. Mirrors the Rust
- * `GeometryDiagnostics` (camelCase serde) the server and the WASM batch path both
- * emit. `totalCsgFailures` and the classification counts are exact;
- * `productsWithFailures`, `hostsWithOpenings` and `silentNoOps` are batch-summed
- * upper bounds.
- */
-export interface GeometryDiagnostics {
-  totalCsgFailures: number;
-  productsWithFailures: number;
-  hostsWithOpenings: number;
-  classification: {
-    rectangular: number;
-    diagonal: number;
-    nonRectangular: number;
-    total: number;
-  };
-  failuresByReason: Array<{ reason: string; count: number }>;
-  silentNoOps: number;
-  rectFast: {
-    fired: number;
-    openingsCut: number;
-    deferHostNotBox: number;
-    deferNotThrough: number;
-    deferOffFace: number;
-    deferNearEdge: number;
-    deferNoOpenings: number;
-    deferTooManyOpenings?: number;
-  };
-  worstHosts: Array<{
-    productId: number;
-    ifcType: string;
-    openings: number;
-    csgFailures: number;
-    firstFailureLabel?: string;
-  }>;
-}
+// The `GeometryDiagnostics` wire shape lives in `geometry-diagnostics-types.ts`
+// and is re-exported here, so this module's public surface is unchanged (#3857).
+// `export *` re-exports without binding locally, so the name this file still
+// REFERENCES above is imported too.
+import type { GeometryDiagnostics } from './geometry-diagnostics-types.js';
+export * from './geometry-diagnostics-types.js';
 
 // ============================================
 // 2D Symbol Data (IfcAnnotation + IfcGrid)
@@ -265,7 +208,6 @@ export interface GeometryDiagnostics {
 import type { SymbolicData } from './symbolic-types.js';
 export * from './symbolic-types.js';
 
-
 /**
  * Full parse response with all meshes.
  */
@@ -275,10 +217,12 @@ export interface ParseResponse {
   /** All meshes extracted from the IFC file */
   meshes: MeshData[];
   /**
-   * Coordinate space of serialized mesh vertices: `site_local`,
-   * `model_rtc`, or `raw_ifc`. Absent on older servers.
+   * Coordinate space of serialized mesh vertices. Absent on older servers,
+   * and on a server that sent a value outside the three tiers (see
+   * [`MeshCoordinateSpace`]): the client refuses to pass an unrecognised tag
+   * off as one of them.
    */
-  mesh_coordinate_space?: string;
+  mesh_coordinate_space?: MeshCoordinateSpace;
   /** IfcSite ObjectPlacement as a column-major 4×4 matrix (metres). */
   site_transform?: number[];
   /** IfcBuilding ObjectPlacement as a column-major 4×4 matrix (metres). */
@@ -294,9 +238,7 @@ export interface ParseResponse {
   symbolic_data?: SymbolicData;
 }
 
-/**
- * Metadata-only response (no geometry).
- */
+/** Metadata-only response (no geometry). */
 export interface MetadataResponse {
   /** Total number of entities */
   entity_count: number;
@@ -306,11 +248,13 @@ export interface MetadataResponse {
   schema_version: string;
   /** File size in bytes */
   file_size: number;
+  /** Records refused for a `u32`-overflowing name (#3395). Absent on older servers: "not scanned for", never "clean". */
+  oversized_id_count?: number;
+  /** The scan stopped at a record with no `;` (#3695), so `entity_count` is partial. Absent on older servers, as above. */
+  malformed_record_found?: boolean;
 }
 
-/**
- * Health check response.
- */
+/** Health check response. */
 export interface HealthResponse {
   /** Server status */
   status: string;
@@ -321,12 +265,13 @@ export interface HealthResponse {
 }
 
 /**
- * Error response from the server.
+ * The body of every error response from the server, on every route and
+ * status. The client decodes it into an `IfcServerError`.
  */
 export interface ErrorResponse {
-  /** Error message */
+  /** Human-readable message. */
   error: string;
-  /** Error code */
+  /** Stable identifier to branch on (`NOT_FOUND`, `BAD_REQUEST`, `OVERLOADED`, ...). */
   code: string;
 }
 
@@ -410,8 +355,9 @@ export interface ParquetMetadataHeader {
   metadata: ModelMetadata;
   /** Processing statistics */
   stats: ProcessingStats;
-  /** Declares the coordinate space used by serialized mesh vertices. */
-  mesh_coordinate_space?: string;
+  /** Declares the coordinate space used by serialized mesh vertices; absent
+   *  when the server did not say, or said something outside the three tiers. */
+  mesh_coordinate_space?: MeshCoordinateSpace;
   /** IfcSite ObjectPlacement as a column-major 4x4 matrix (in meters). */
   site_transform?: number[];
   /** IfcBuilding ObjectPlacement as a column-major 4x4 matrix (in meters). */
@@ -433,8 +379,9 @@ export interface ParquetParseResponse {
   cache_key: string;
   /** All meshes extracted from the IFC file */
   meshes: MeshData[];
-  /** Declares the coordinate space used by serialized mesh vertices. */
-  mesh_coordinate_space?: string;
+  /** Declares the coordinate space used by serialized mesh vertices; absent
+   *  when the server did not say, or said something outside the three tiers. */
+  mesh_coordinate_space?: MeshCoordinateSpace;
   /** IfcSite ObjectPlacement as a column-major 4x4 matrix (in meters). */
   site_transform?: number[];
   /** IfcBuilding ObjectPlacement as a column-major 4x4 matrix (in meters). */
@@ -480,8 +427,9 @@ export interface OptimizedParquetMetadataHeader {
   metadata: ModelMetadata;
   /** Processing statistics */
   stats: ProcessingStats;
-  /** Declares the coordinate space used by serialized mesh vertices. */
-  mesh_coordinate_space?: string;
+  /** Declares the coordinate space used by serialized mesh vertices; absent
+   *  when the server did not say, or said something outside the three tiers. */
+  mesh_coordinate_space?: MeshCoordinateSpace;
   /** IfcSite ObjectPlacement as a column-major 4x4 matrix (in meters). */
   site_transform?: number[];
   /** IfcBuilding ObjectPlacement as a column-major 4x4 matrix (in meters). */
@@ -500,8 +448,9 @@ export interface OptimizedParquetParseResponse {
   cache_key: string;
   /** All meshes extracted from the IFC file */
   meshes: MeshData[];
-  /** Declares the coordinate space used by serialized mesh vertices. */
-  mesh_coordinate_space?: string;
+  /** Declares the coordinate space used by serialized mesh vertices; absent
+   *  when the server did not say, or said something outside the three tiers. */
+  mesh_coordinate_space?: MeshCoordinateSpace;
   /** IfcSite ObjectPlacement as a column-major 4x4 matrix (in meters). */
   site_transform?: number[];
   /** IfcBuilding ObjectPlacement as a column-major 4x4 matrix (in meters). */
@@ -568,6 +517,15 @@ export interface ParquetStreamBatchEvent {
   mesh_count: number;
   /** Batch sequence number (1-indexed) */
   batch_number: number;
+  /**
+   * Cross-batch streams only (`stream_shapes=cross-batch`, #5407): where this
+   * batch's vertex rows start in the whole stream. Its mesh rows may point
+   * below it, at a shape an earlier batch carried. Absent on a batch that
+   * decodes on its own.
+   */
+  vertex_base?: number;
+  /** Companion of `vertex_base`, in indices (three per triangle). */
+  index_base?: number;
 }
 
 /**

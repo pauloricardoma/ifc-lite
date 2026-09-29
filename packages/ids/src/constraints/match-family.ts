@@ -9,6 +9,13 @@
  * Split out of `constraints/index.ts` so that module is the matching
  * entry point and this one holds the primitives, letting the reporting
  * module (`describe.ts`) reach them without an import cycle.
+ *
+ * `matchSimpleValue`/`matchEnumeration` try string equality first, then
+ * fall back to numeric (1e-6 tolerance) / boolean coercion. `stringOnly`
+ * (set by the property facet from the value's declared IFC type) skips
+ * that fallback: a string-flavoured value (`IfcLabel`, …) must compare
+ * as an exact string even when it looks numeric — `IFCLABEL('1.0000001')`
+ * must NOT match a requirement of `1` (#6117).
  */
 
 import type {
@@ -23,13 +30,13 @@ import {
   compareBoolean,
   compareNumeric,
   compareString,
-  numericEpsilon,
   isStrictNumericLiteral,
   isBooleanLiteral,
 } from './comparators.js';
 import { isNumericXsdBase, isBooleanXsdBase } from './xsd-cast.js';
-import { translateXsdRegex } from './xsd-regex.js';
+import { translateXsdRegex, SUBTRACTION_UNSUPPORTED_REASON } from './xsd-regex.js';
 import { matchDigitFacets } from './digit-facets.js';
+import { assertGuardedRegexPattern, UnsafeRegexPatternError } from '@ifc-lite/regex-guard';
 
 /** Tolerance for the bounds matcher's exclusive comparators. */
 export const NUMERIC_TOLERANCE = 1e-6;
@@ -49,15 +56,16 @@ export function conjunctiveFacetsOf(
 export function matchOneFamily(
   constraint: IDSConstraint,
   actualValue: string | number | boolean,
-  ci: boolean
+  ci: boolean,
+  stringOnly = false
 ): boolean {
   switch (constraint.type) {
     case 'simpleValue':
-      return matchSimpleValue(constraint, actualValue, ci);
+      return matchSimpleValue(constraint, actualValue, ci, stringOnly);
     case 'pattern':
       return matchPattern(constraint, actualValue, ci);
     case 'enumeration':
-      return matchEnumeration(constraint, actualValue, ci);
+      return matchEnumeration(constraint, actualValue, ci, stringOnly);
     case 'bounds':
       return matchBounds(constraint, actualValue);
     default:
@@ -94,11 +102,14 @@ function isCoercibleSimpleValue(constraint: IDSSimpleValue): boolean {
 function matchSimpleValue(
   constraint: IDSSimpleValue,
   actualValue: string | number | boolean,
-  caseInsensitive: boolean
+  caseInsensitive: boolean,
+  stringOnly = false
 ): boolean {
   const expected = constraint.value;
   const stringResult = compareString(expected, actualValue, caseInsensitive);
   if (stringResult !== undefined) return stringResult;
+  // A string-typed IFC value only matches through string equality (#6117).
+  if (stringOnly) return false;
   // A non-numeric, non-boolean literal can only match through string
   // equality — skip the comparators that would return undefined anyway.
   if (!isCoercibleSimpleValue(constraint)) return false;
@@ -178,17 +189,32 @@ function buildPatternRegex(
   xsdPattern: string,
   caseInsensitive: boolean
 ): RegExp | null {
-  // XSD char-class subtraction `[a-z-[aeiou]]` has no JS equivalent;
-  // approximate as the positive class (drop the exclusion) so the rest
-  // of the pattern still evaluates, matching long-standing behaviour.
-  const desubtracted = xsdPattern.replace(
-    /\[([^\]]+)-\[[^\]]+\]\]/g,
-    '[$1]'
-  );
+  // Reject a catastrophic-backtracking or over-long pattern BEFORE any
+  // translation/compilation is attempted. This throws (rather than
+  // returning null like the malformed-syntax cases below) because a
+  // rejected pattern must surface as a validation failure the caller
+  // can see, not silently evaluate to "no match" — see
+  // `@ifc-lite/regex-guard`'s doc comment and this package's
+  // `validateSpecification`, which turns the thrown error into a
+  // failed specification result.
+  assertGuardedRegexPattern(xsdPattern);
   // Shared XSD → JS translation: `\i`/`\c`/`\d`/`\w` (and their
   // negations) map to Unicode property escapes, and verbatim `\p{…}`
   // classes pass through — both require the `u` flag for full fidelity.
-  const { pattern } = translateXsdRegex(desubtracted);
+  // XSD character-class subtraction (`[a-z-[aeiou]]`) is translated
+  // exactly (a negative lookahead, see `translateSubtraction`). One that
+  // cannot be delimited is refused rather than approximated: dropping the
+  // exclusion would make the pattern accept exactly the values it was
+  // written to exclude (#5183). `UnsafeRegexPatternError` becomes a failed
+  // specification result in `validateSpecification`, never a silent pass.
+  // Other unsupported constructs (an unrepresentable `\p{…}` block escape,
+  // a negated class escape inside `[ … ]`) keep their permissive
+  // any-character placeholder: they over-match rather than invert intent,
+  // and the coherence auditor flags them.
+  const { pattern, supported, reason } = translateXsdRegex(xsdPattern);
+  if (!supported && reason === SUBTRACTION_UNSUPPORTED_REASON) {
+    throw new UnsafeRegexPatternError(xsdPattern, reason);
+  }
   // IDS patterns must match the entire lexical value. Wrapping in a
   // non-capturing group anchors top-level alternation correctly
   // (`a|b` → `^(?:a|b)$`, not `^a|b$`). Case-insensitive matching is
@@ -249,7 +275,8 @@ function getEnumValueSets(constraint: IDSEnumerationConstraint): {
 function matchEnumeration(
   constraint: IDSEnumerationConstraint,
   actualValue: string | number | boolean,
-  caseInsensitive: boolean
+  caseInsensitive: boolean,
+  stringOnly = false
 ): boolean {
   // O(1) fast path: a set hit is exactly the condition under which
   // `compareString` would have returned true for some value, so this
@@ -259,6 +286,8 @@ function matchEnumeration(
   const actualStr = String(actualValue);
   if (sets.exact.has(actualStr)) return true;
   if (caseInsensitive && sets.upper.has(actualStr.toUpperCase())) return true;
+  // Same string-only rule as `matchSimpleValue` (#6117).
+  if (stringOnly) return false;
   // Pure-string enumerations are fully decided by the set lookups —
   // only numeric/boolean literals can still match in the slow walk.
   if (!sets.anyCoercible) return false;
@@ -281,6 +310,21 @@ function matchBounds(
   constraint: IDSBoundsConstraint,
   actualValue: string | number | boolean
 ): boolean {
+  // A facet element was present in the source `<xs:restriction>` but
+  // its `@value` could not be parsed (typo, wrong decimal separator, a
+  // negative digit-count facet, …). `parseRestriction` dropped it to
+  // `undefined` the same as a facet that was never present at all —
+  // which would otherwise make this an unconditional pass (an
+  // all-`undefined` bounds constraint satisfies every numeric value).
+  // Fail closed instead: we cannot verify compliance against a
+  // restriction we could not fully parse, so no value passes until the
+  // IDS is corrected. See `getBoundsMismatchReason` for the
+  // author-facing explanation and `audit/coherence` for the
+  // corresponding lint diagnostic.
+  if (constraint.unparseableFacets !== undefined && constraint.unparseableFacets.length > 0) {
+    return false;
+  }
+
   // String-length facets (xs:length / xs:minLength / xs:maxLength)
   // operate on the textual length, not on numeric magnitude. When any
   // of them are present, evaluate the length constraints first.

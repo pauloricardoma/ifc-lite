@@ -51,6 +51,13 @@
 import { applyDxfPlacement, type DxfPlacement, type Point2D } from '@ifc-lite/drawing-2d';
 import type { GeometryResult } from '@ifc-lite/geometry';
 import type { DxfUnderlayState } from '@/store/slices/drawing2DSlice';
+import { ifcToViewerAxes } from '@/lib/geo/coordinate-frame';
+import {
+  dxfUnderlayToWorldLines3D as toWorldLines3D,
+  dxfUnderlayToWorldLines3DAnchored as toWorldLines3DAnchored,
+} from './dxfUnderlayWorldLines.js';
+import type { RendererLineVertices } from '@/lib/renderer/line-overlay-rte';
+export type { AnchoredDxfLines3D } from './dxfUnderlayWorldLines.js';
 
 export interface DxfUnderlayRenderLine {
   points: Point2D[];
@@ -185,9 +192,11 @@ export function dxfElevationRenderY(
   coordinateInfo: GeometryResult['coordinateInfo'] | undefined,
   elevationIfcZ = 0,
 ): number {
-  const rtc = coordinateInfo?.wasmRtcOffset;
   const shift = coordinateInfo?.originShift;
-  return elevationIfcZ - (shift?.y ?? 0) - (rtc?.z ?? 0);
+  const rtcYup = ifcToViewerAxes(
+    coordinateInfo?.wasmRtcOffset ?? { x: 0, y: 0, z: 0 },
+  );
+  return elevationIfcZ - (shift?.y ?? 0) - rtcYup.y;
 }
 
 /**
@@ -297,7 +306,7 @@ export function dxfUnderlayToDrawing(
  * Returns `null` (not NaN bounds) whenever any corner is non-finite (PR
  * #1965 review): a malformed `IfcMapConversion` that slips a NaN into
  * `mapToWorld` used to make `Math.min`/`Math.max` return NaN silently, and
- * the caller (`Section2DPanel.handleCenterDxfUnderlay`) would then write
+ * the caller (`useDrawingLayers`'s `handleCenterDxfUnderlay`) would then write
  * `offsetX: NaN, offsetY: NaN` straight into the stored placement — a
  * corruption that survives even toggling georeferencing back off, since the
  * NaN is now IN the placement, not just in the transform. A NaN bound is a
@@ -355,9 +364,10 @@ export function dxfUnderlayDrawingBounds(
  * this first iteration; fills (hatches) and text labels are not (tracked as
  * follow-up, not silently dropped — see the PR description). Per-DXF-layer
  * color is also not carried through: the renderer's 3D reference-line
- * pipeline (`setLineOverlay('dxf', …)` / `Renderer.setOverlayLineColor`) shares one
- * color across the grid/alignment/annotation/DXF overlay family, the same
- * way grid and alignment already do — see `section-2d-overlay.ts`.
+ * pipeline (`setLineOverlay('dxf', …)` / `Renderer.setOverlayTheme`'s
+ * `overlayLine` field) shares one color across the grid/alignment/annotation/DXF
+ * overlay family, the same way grid and alignment already do — see
+ * `section-2d-overlay.ts`.
  */
 export function dxfUnderlayToWorldLines3D(
   entry: DxfUnderlayState,
@@ -366,31 +376,20 @@ export function dxfUnderlayToWorldLines3D(
   mapToWorld: (p: Point2D) => Point2D = (p) => p,
   georeferenceAvailable = false,
 ): Float32Array {
-  const t: WorldToDrawingParams = {
-    shiftX: shift.x,
-    shiftY: shift.y,
-    mirrorX: false,
-    placement: entry.placement,
-    mapToWorld: resolveEffectiveGeoreferenced(entry, georeferenceAvailable) ? mapToWorld : undefined,
-  };
-  const verts: number[] = [];
-  for (const layer of entry.underlay.layers) {
-    if (!(entry.layerVisibility[layer.name] ?? layer.visible)) continue;
-    for (const path of layer.paths) {
-      if (path.points.length < 2) continue;
-      const mapped = path.points.map((p) => worldToDrawing(p, t));
-      for (let i = 0; i < mapped.length - 1; i++) {
-        verts.push(mapped[i].x, elevationRenderY, mapped[i].y);
-        verts.push(mapped[i + 1].x, elevationRenderY, mapped[i + 1].y);
-      }
-      if (path.closed && mapped.length > 2) {
-        const a = mapped[mapped.length - 1];
-        const b = mapped[0];
-        verts.push(a.x, elevationRenderY, a.y);
-        verts.push(b.x, elevationRenderY, b.y);
-      }
-    }
-  }
-  return new Float32Array(verts);
+  return toWorldLines3D(entry, shift, elevationRenderY, mapToWorld, resolveEffectiveGeoreferenced(entry, georeferenceAvailable));
 }
 
+/**
+ * Build one DXF underlay directly into a local frame. Both DXF paths share
+ * the same georeference/mirror/placement walk; only this final render-boundary
+ * variant avoids narrowing national-grid coordinates before RTE can rebase.
+ */
+export function dxfUnderlayToWorldLines3DAnchored(
+  entry: DxfUnderlayState,
+  shift: { x: number; y: number },
+  elevationRenderY: number,
+  mapToWorld: (p: Point2D) => Point2D = (p) => p,
+  georeferenceAvailable = false,
+): RendererLineVertices | null {
+  return toWorldLines3DAnchored(entry, shift, elevationRenderY, mapToWorld, resolveEffectiveGeoreferenced(entry, georeferenceAvailable));
+}

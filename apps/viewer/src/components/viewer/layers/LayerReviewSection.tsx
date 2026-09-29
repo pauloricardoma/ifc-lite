@@ -11,11 +11,13 @@
  * synthetic per parse and never persisted.
  */
 
+import { trackExportCompleted } from '@/lib/analytics';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Download, MessageSquarePlus, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { toast } from '@/components/ui/toast';
 import { useViewerStore } from '@/store';
+import { useTranslation } from '@/i18n';
 import { useBCF } from '@/hooks/useBCF';
 import {
   addTopicToProject,
@@ -32,22 +34,30 @@ import { getBrowserLayerStore } from '@/lib/layers/browser-store';
 import { pathTail } from '@/lib/layers/stack';
 
 function TopicRow({ topic, onSelect }: { topic: RegistryReviewTopic; onSelect: (entity: string) => void }) {
+  const { t } = useTranslation();
+  const tail = pathTail(topic.entity);
+  const author = topic.author ?? t('layersPanel.review.anonymousAuthor');
+  const date = topic.createdAt.slice(0, 10);
+  const metaKey = topic.componentKey
+    ? topic.viewpoint
+      ? 'layersPanel.review.topicMetaComponentViewpoint'
+      : 'layersPanel.review.topicMetaComponent'
+    : topic.viewpoint
+      ? 'layersPanel.review.topicMetaViewpoint'
+      : 'layersPanel.review.topicMeta';
   return (
     <button
       type="button"
       onClick={() => onSelect(topic.entity)}
       className="rounded border bg-card/40 px-1.5 py-1 text-left hover:bg-muted/60"
-      title="Select the commented entity in 3D"
+      title={t('layersPanel.review.selectEntityTitle')}
     >
-      <span className="block truncate text-[11px] font-medium">{topic.title}</span>
+      <span className="block truncate text-2xs font-medium">{topic.title}</span>
       {topic.description && (
-        <span className="block truncate text-[10px] text-muted-foreground">{topic.description}</span>
+        <span className="block truncate text-2xs text-muted-foreground">{topic.description}</span>
       )}
-      <span className="block text-[10px] text-muted-foreground">
-        {pathTail(topic.entity)}
-        {topic.componentKey ? ` · ${topic.componentKey}` : ''} · {topic.author ?? 'anonymous'} ·{' '}
-        {topic.createdAt.slice(0, 10)}
-        {topic.viewpoint ? ' · viewpoint' : ''}
+      <span className="block text-2xs text-muted-foreground">
+        {t(metaKey, { tail, author, date, ...(topic.componentKey ? { componentKey: topic.componentKey } : {}) })}
       </span>
     </button>
   );
@@ -62,6 +72,7 @@ export function LayerReviewSection({
   candidateId: string;
   refName: string;
 }) {
+  const { t } = useTranslation();
   const { createViewpointFromState } = useBCF();
   const selectedEntityIds = useViewerStore((s) => s.selectedEntityIds);
   const activeEntityId = useViewerStore((s) => s.selectedEntityId);
@@ -145,7 +156,7 @@ export function LayerReviewSection({
       setTitle('');
       setDescription('');
       await refresh();
-      toast.success('Review comment posted.');
+      toast.success(t('layersPanel.review.postedToast'));
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
@@ -178,6 +189,7 @@ export function LayerReviewSection({
         if (t.viewpoint) addViewpointToTopic(topic, t.viewpoint as unknown as BCFViewpoint);
       }
       downloadBlob(await writeBCF(project), `review-${review.id.slice(0, 8)}.bcfzip`);
+      trackExportCompleted({ format: 'bcfzip', surface: 'layer_review' });
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
@@ -187,15 +199,15 @@ export function LayerReviewSection({
 
   return (
     <div className="flex flex-col gap-1 rounded border bg-card/40 px-1.5 py-1">
-      <div className="flex items-center gap-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-        <span>Review</span>
+      <div className="flex items-center gap-1 text-2xs font-medium uppercase tracking-wide text-muted-foreground">
+        <span>{t('layersPanel.review.title')}</span>
         {review && <span className="normal-case">({review.status})</span>}
         <Button
           variant="ghost"
           size="sm"
           className="ml-auto h-5 px-1"
           onClick={() => void refresh()}
-          aria-label="Refresh review"
+          aria-label={t('layersPanel.review.refreshAriaLabel')}
         >
           <RefreshCw className="size-3" aria-hidden />
         </Button>
@@ -203,19 +215,19 @@ export function LayerReviewSection({
           <Button
             variant="ghost"
             size="sm"
-            className="h-5 gap-0.5 px-1 text-[10px]"
+            className="h-5 gap-0.5 px-1 text-2xs"
             onClick={() => void exportBcf()}
             disabled={busy}
-            aria-label="Export review comments as BCF"
+            aria-label={t('layersPanel.review.exportAriaLabel')}
           >
             <Download className="size-3" aria-hidden />
-            .bcf
+            {t('layersPanel.review.exportButtonLabel')}
           </Button>
         )}
       </div>
       {!review && (
-        <Button size="sm" variant="outline" className="h-6 self-start px-2 text-[11px]" disabled={busy} onClick={() => void openReview()}>
-          Open review
+        <Button size="sm" variant="outline" className="h-6 self-start px-2 text-2xs" disabled={busy} onClick={() => void openReview()}>
+          {t('layersPanel.review.openReviewButton')}
         </Button>
       )}
       {review && (
@@ -227,35 +239,39 @@ export function LayerReviewSection({
             type="text"
             value={title}
             onChange={(e) => setTitle(e.target.value)}
-            placeholder={selectedPath ? `Comment on ${pathTail(selectedPath)}` : 'Select an entity in 3D to comment'}
-            aria-label="Review comment title"
-            className="h-6 rounded border bg-background px-1.5 text-[11px] placeholder:text-muted-foreground/60"
+            placeholder={
+              selectedPath
+                ? t('layersPanel.review.commentPlaceholderWithEntity', { tail: pathTail(selectedPath) })
+                : t('layersPanel.review.commentPlaceholderNoEntity')
+            }
+            aria-label={t('layersPanel.review.commentTitleAriaLabel')}
+            className="h-6 rounded border bg-background px-1.5 text-2xs placeholder:text-muted-foreground/60"
           />
           <textarea
             value={description}
             onChange={(e) => setDescription(e.target.value)}
             rows={2}
-            placeholder="Description (optional)"
-            aria-label="Review comment description"
-            className="resize-y rounded border bg-background px-1.5 py-1 text-[11px] placeholder:text-muted-foreground/60"
+            placeholder={t('layersPanel.review.descriptionPlaceholder')}
+            aria-label={t('layersPanel.review.descriptionAriaLabel')}
+            className="resize-y rounded border bg-background px-1.5 py-1 text-2xs placeholder:text-muted-foreground/60"
           />
           <div className="flex items-center gap-1.5">
-            <label className="flex items-center gap-1 text-[10px] text-muted-foreground">
+            <label className="flex items-center gap-1 text-2xs text-muted-foreground">
               <input
                 type="checkbox"
                 checked={withViewpoint}
                 onChange={(e) => setWithViewpoint(e.target.checked)}
               />
-              viewpoint
+              {t('layersPanel.review.viewpointLabel')}
             </label>
             <Button
               size="sm"
-              className="ml-auto h-6 gap-1 px-2 text-[11px]"
+              className="ml-auto h-6 gap-1 px-2 text-2xs"
               disabled={busy || !selectedPath || title.trim().length === 0}
               onClick={() => void postComment()}
             >
               <MessageSquarePlus className="size-3" aria-hidden />
-              Comment
+              {t('layersPanel.review.commentButton')}
             </Button>
           </div>
         </>

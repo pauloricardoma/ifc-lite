@@ -22,6 +22,10 @@
 
 use crate::vec3::{cross, dot, Vec3};
 
+#[path = "obb_detect.rs"]
+mod obb_detect;
+pub use obb_detect::{detect_obb, MeshLike};
+
 #[cfg(test)]
 #[path = "obb_tests.rs"]
 mod obb_tests;
@@ -39,174 +43,35 @@ pub struct Obb {
     pub half: [f64; 3],
 }
 
-fn normalize(v: Vec3) -> Option<Vec3> {
-    let len = dot(v, v).sqrt();
-    if !(len > OBB_EPS) {
-        return None;
-    }
-    Some([v[0] / len, v[1] / len, v[2] / len])
-}
-
-/// Flip `n` so its largest-magnitude component is positive, so a face and its
-/// antipodal opposite face collapse to the same canonical axis direction.
-/// Ties broken in x, y, z order — identical to the TS `canonical`.
-fn canonical(n: Vec3) -> Vec3 {
-    let (ax, ay, az) = (n[0].abs(), n[1].abs(), n[2].abs());
-    let mut idx = 0usize;
-    if ay > ax && ay >= az {
-        idx = 1;
-    } else if az > ax && az > ay {
-        idx = 2;
-    }
-    if n[idx] < 0.0 {
-        [-n[0], -n[1], -n[2]]
-    } else {
-        n
-    }
-}
-
-/// Minimal structural view of `TriMesh` this module needs.
-pub trait MeshLike {
-    fn tri_count(&self) -> usize;
-    fn tri_verts(&self, t: usize) -> [Vec3; 3];
-}
-
-/// Detect whether `mesh` is a rectangular box. See the TS `detectObb` doc
-/// comment for the full rationale — this is a faithful, bit-identical port.
-pub fn detect_obb<M: MeshLike>(mesh: &M) -> Option<Obb> {
-    let count = mesh.tri_count();
-    if count == 0 {
-        return None;
-    }
-    let mut groups: Vec<Vec3> = Vec::with_capacity(3);
-    let mut group_of_tri: Vec<i32> = vec![-1; count];
-    // `t` also drives `mesh.tri_verts(t)`, not just `group_of_tri`, and must
-    // keep the TS reference's iteration order, so an `enumerate()` over the
-    // flag vec is not the shape we want here (mirrors `narrow.rs`).
-    #[allow(clippy::needless_range_loop)]
-    for t in 0..count {
-        let [a, b, c] = mesh.tri_verts(t);
-        let n = match normalize(cross(
-            [b[0] - a[0], b[1] - a[1], b[2] - a[2]],
-            [c[0] - a[0], c[1] - a[1], c[2] - a[2]],
-        )) {
-            Some(n) => n,
-            None => continue, // degenerate triangle: no face-normal evidence
-        };
-        let cn = canonical(n);
-        let mut gi: i32 = -1;
-        for (g, rep) in groups.iter().enumerate() {
-            if dot(*rep, cn) > 1.0 - OBB_EPS {
-                gi = g as i32;
-                break;
-            }
-        }
-        if gi == -1 {
-            if groups.len() >= 3 {
-                return None; // a 4th face-normal family: not a box
-            }
-            groups.push(cn);
-            gi = (groups.len() - 1) as i32;
-        }
-        group_of_tri[t] = gi;
-    }
-    if groups.len() != 3 {
-        return None;
-    }
-    for i in 0..3 {
-        for j in (i + 1)..3 {
-            if dot(groups[i], groups[j]).abs() > OBB_EPS {
-                return None;
-            }
-        }
-    }
-
-    let mut min_off = [f64::INFINITY; 3];
-    let mut max_off = [f64::NEG_INFINITY; 3];
-    #[allow(clippy::needless_range_loop)]
-    for t in 0..count {
-        let gi = group_of_tri[t];
-        if gi == -1 {
-            continue;
-        }
-        let gi = gi as usize;
-        let [a, b, c] = mesh.tri_verts(t);
-        for v in [a, b, c] {
-            let o = dot(v, groups[gi]);
-            if o < min_off[gi] {
-                min_off[gi] = o;
-            }
-            if o > max_off[gi] {
-                max_off[gi] = o;
-            }
-        }
-    }
-    // Reject a 3rd offset plane on any axis (e.g. an L-shaped footprint).
-    #[allow(clippy::needless_range_loop)]
-    for t in 0..count {
-        let gi = group_of_tri[t];
-        if gi == -1 {
-            continue;
-        }
-        let gi = gi as usize;
-        let [a, b, c] = mesh.tri_verts(t);
-        for v in [a, b, c] {
-            let o = dot(v, groups[gi]);
-            let scale = 1.0f64.max(min_off[gi].abs()).max(max_off[gi].abs());
-            let near_min = (o - min_off[gi]).abs() <= OBB_EPS * scale;
-            let near_max = (o - max_off[gi]).abs() <= OBB_EPS * scale;
-            if !near_min && !near_max {
-                return None;
-            }
-        }
-    }
-
-    let mut half = [0.0f64; 3];
-    let mut c0 = [0.0f64; 3];
-    for i in 0..3 {
-        half[i] = (max_off[i] - min_off[i]) / 2.0;
-        c0[i] = (max_off[i] + min_off[i]) / 2.0;
-        // Reject a zero-thickness "box": a face family whose triangles are
-        // all coplanar passes the 2-plane test above (`min_off == max_off`,
-        // so both `near_min` and `near_max` hold for every vertex) with no
-        // positive extent along that axis. An open shell (a slab exported
-        // without its top face, or partial `IfcTriangulatedFaceSet`
-        // geometry) can produce exactly this. Faithful port of the same
-        // guard in the TS `detectObb` (review: #2536).
-        if !(half[i] > OBB_EPS) {
-            return None;
-        }
-    }
-    let center: Vec3 = [
-        c0[0] * groups[0][0] + c0[1] * groups[1][0] + c0[2] * groups[2][0],
-        c0[0] * groups[0][1] + c0[1] * groups[1][1] + c0[2] * groups[2][1],
-        c0[0] * groups[0][2] + c0[1] * groups[1][2] + c0[2] * groups[2][2],
-    ];
-    Some(Obb {
-        center,
-        axes: [groups[0], groups[1], groups[2]],
-        half,
-    })
-}
-
 /// Bound, in f64 ulps, on the absolute error of one component of the cross
 /// product of two UNIT vectors, with headroom for the normalisation and the
 /// per-projection dot rounding it feeds. Same literal in the TS kernel's
 /// `AXIS_NOISE_ULPS`.
 pub const AXIS_NOISE_ULPS: f64 = 8.0;
 
+/// An OBB-OBB minimum translation depth and its unit axis.
+#[derive(Clone, Copy, Debug)]
+pub struct ObbPenetration {
+    pub depth: f64,
+    pub axis: Vec3,
+}
+
 /// Exact penetration depth between two oriented boxes: the minimum overlap
 /// over the 15 canonical OBB-OBB separating-axis candidates. See the TS
-/// `obbPenetrationDepth` doc comment for the full rationale, including the
+/// `obbPenetration` doc comment for the full rationale, including the
 /// scale-relative conditioning guard on cross-product candidates (review:
 /// #2536): a candidate whose overlap verdict falls inside its own noise band
 /// — `extent_sum * AXIS_NOISE_ULPS * EPS / len`, the projection error the
-/// `1/len` normalisation can amplify at the operands' scale — is SKIPPED
-/// (never a separation: dropping a SAT candidate can only fail to find a
-/// separation, each remaining axis being a valid upper bound on the true
-/// depth, so the result stays conservative; do not "harden" the skip into a
-/// failure).
-pub fn obb_penetration_depth(a: &Obb, b: &Obb) -> Option<f64> {
+/// `1/len` normalisation can amplify at the operands' scale — is never
+/// allowed to SEPARATE (dropping a SAT candidate can only fail to find a
+/// separation, so the boolean result stays conservative; do not "harden" the
+/// skip into a failure). It still contributes a depth candidate of ZERO,
+/// because the depth is a minimum and an unresolvable axis is the smallest
+/// candidate present — see the guard body and #5355.
+///
+/// Returns the depth with the UNIT axis it was measured along: the depth's
+/// precision floor is the pair's f32 noise projected onto that axis (#5405).
+pub fn obb_penetration(a: &Obb, b: &Obb) -> Option<ObbPenetration> {
     let t: Vec3 = [
         b.center[0] - a.center[0],
         b.center[1] - a.center[1],
@@ -227,6 +92,7 @@ pub fn obb_penetration_depth(a: &Obb, b: &Obb) -> Option<f64> {
         + t[1].abs()
         + t[2].abs();
     let mut depth = f64::INFINITY;
+    let mut depth_axis: Vec3 = [0.0, 0.0, 0.0];
 
     let mut test_axis = |l: Vec3| -> bool {
         let len = dot(l, l).sqrt();
@@ -249,6 +115,22 @@ pub fn obb_penetration_depth(a: &Obb, b: &Obb) -> Option<f64> {
         // `testAxis` (review: #2536); rationale in the TS doc comment.
         let noise = extent_sum * ((AXIS_NOISE_ULPS * f64::EPSILON) / len);
         if overlap.abs() <= noise {
+            // Not a separation (see the doc comment) — but this axis IS a
+            // depth candidate, and it must be CLAMPED IN rather than dropped
+            // (#5355). The MTD is a MINIMUM over candidates, so an axis whose
+            // overlap is indistinguishable from zero is the smallest
+            // candidate there is. Dropping it hands the minimum to the
+            // next-smallest axis, which for two boxes in flush face contact
+            // is a FACE DIMENSION of one of them: a 0.05 m curtain-wall panel
+            // meeting a mullion reported 0.85 m of "penetration".
+            //
+            // "Each remaining axis is a valid upper bound, so the result
+            // stays conservative" is true of the BOOLEAN verdict and false of
+            // the DEPTH: deleting the minimising axis can only over-report.
+            if depth > 0.0 {
+                depth = 0.0;
+                depth_axis = u;
+            }
             return true;
         }
         if overlap <= 0.0 {
@@ -256,6 +138,7 @@ pub fn obb_penetration_depth(a: &Obb, b: &Obb) -> Option<f64> {
         }
         if overlap < depth {
             depth = overlap;
+            depth_axis = u;
         }
         true
     };
@@ -280,12 +163,15 @@ pub fn obb_penetration_depth(a: &Obb, b: &Obb) -> Option<f64> {
     if depth == f64::INFINITY {
         None
     } else {
-        Some(depth)
+        Some(ObbPenetration {
+            depth,
+            axis: depth_axis,
+        })
     }
 }
 
 /// Projected radius of `o` onto unit axis `u`: half the length of `o`'s
-/// shadow on `u`. The same per-axis projection `obb_penetration_depth`'s
+/// shadow on `u`. The same per-axis projection `obb_penetration`'s
 /// `test_axis` computes for the 15-candidate SAT — factored out here so the
 /// through-penetration containment test below can reuse it for ANY axis,
 /// not only one drawn from a frame shared by both boxes.
@@ -356,14 +242,14 @@ fn pierces_along(p: &Obb, q: &Obb, center_delta: Vec3) -> bool {
 /// X-junction, each piercing the other clean through in thickness.
 ///
 /// Faithful port of the TS `isThroughPenetration` (review: #2536) — see its
-/// doc comment for the full rationale: `obb_penetration_depth` reports the
+/// doc comment for the full rationale: `obb_penetration` reports the
 /// minimum translation distance to separate the pair, which for this shape
 /// is dominated by the piercing member's own extent along the piercing
 /// axis, not by how much material it actually crossed.
 ///
 /// Tests containment against EACH box's own axes independently (via
 /// `pierces_along`'s general per-axis projection, the same projection
-/// `obb_penetration_depth` already computes for its 15 SAT candidates) —
+/// `obb_penetration` already computes for its 15 SAT candidates) —
 /// unlike an earlier version restricted to a frame shared by both boxes'
 /// axes up to sign, this also catches a member piercing through at a
 /// generic relative rotation (review: #2536 follow-up).

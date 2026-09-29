@@ -3,8 +3,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * Leaving a room mid-join must not leave the reconstructed `room:<id>` model
- * behind. (#3016)
+ * Leaving a room mid-join must not leave the reconstructed `room:<id>:<slot>`
+ * model behind. (#3016; one model per slot since #4444 — an empty room is one
+ * legacy slot, `m0`)
  *
  * The recipient path registers a real model record for the room, and installs
  * `recipientLiveTeardown` — which removes it — only AFTER `await reconstruct()`
@@ -92,8 +93,6 @@ async function buildState() {
     isolatedEntities: null,
     ghostExceptEntities: null,
     classFilter: null,
-    hiddenEntitiesByModel: new Map(),
-    isolatedEntitiesByModel: new Map(),
     pinboardEntities: new Set(),
     hierarchyBasketSelection: new Set(),
   } as TestState;
@@ -144,7 +143,7 @@ describe('collabSlice — leaving after the room model was reconstructed', () =>
     const s = await buildState();
 
     // Recipient path: no `seed`, so `startCollab` reconstructs the model from
-    // the (empty) CRDT and registers it as `room:<roomId>`.
+    // the (empty) CRDT and registers it as `room:<roomId>:m0`.
     const pending = s.get().startCollab({
       roomId: 'room-3016',
       role: 'viewer',
@@ -156,7 +155,7 @@ describe('collabSlice — leaving after the room model was reconstructed', () =>
     // Precondition: the model this test is about really exists, and the join
     // is still in flight.
     assert.ok(
-      s.get().models.has('room:room-3016'),
+      s.get().models.has('room:room-3016:m0'),
       'the recipient model was never registered — this test would pass vacuously',
     );
     assert.equal(s.get().collabRoomId, 'room-3016');
@@ -170,7 +169,7 @@ describe('collabSlice — leaving after the room model was reconstructed', () =>
 
     try {
       assert.equal(
-        s.get().models.has('room:room-3016'),
+        s.get().models.has('room:room-3016:m0'),
         false,
         'the room model outlived the session the user left',
       );
@@ -252,7 +251,7 @@ describe('collabSlice — leaving after the room model was reconstructed', () =>
     await live;
 
     assert.equal(s.get().collabRoomId, 'room-new');
-    assert.ok(s.get().models.has('room:room-new'), 'the second join registered its model');
+    assert.ok(s.get().models.has('room:room-new:m0'), 'the second join registered its model');
 
     // Only now does the abandoned join resume and hit the guard.
     first.release();
@@ -260,11 +259,11 @@ describe('collabSlice — leaving after the room model was reconstructed', () =>
 
     try {
       assert.ok(
-        s.get().models.has('room:room-new'),
+        s.get().models.has('room:room-new:m0'),
         'the abandoned join tore down the room the user is actually in',
       );
       assert.equal(
-        s.get().models.has('room:room-old'),
+        s.get().models.has('room:room-old:m0'),
         false,
         'the abandoned join left its own room model behind',
       );
@@ -273,7 +272,7 @@ describe('collabSlice — leaving after the room model was reconstructed', () =>
       // remove its model.
       s.get().stopCollab();
       assert.equal(
-        s.get().models.has('room:room-new'),
+        s.get().models.has('room:room-new:m0'),
         false,
         'the live session lost its teardown to the abandoned join',
       );

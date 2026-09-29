@@ -23,27 +23,48 @@ import type { CoordinateInfo, GeometryResult, MeshData } from '@ifc-lite/geometr
 import { isCurrentFor, readGeometryContentVersion } from './useCompare.js';
 import { useViewerStore } from '../store/index.js';
 import { buildEntityFingerprints } from '../lib/compare/buildFingerprints.js';
-import { alignGeometryToReference, type ModelGeoref } from './ingest/federationAlign.js';
+import { alignGeometryToReference, type ModelSpatialPlacement } from './ingest/federationAlign.js';
+import { spatialReferenceFromIfc } from '../lib/geo/ifc-spatial-reference.js';
 
 describe('isCurrentFor — the compare fingerprint cache key (#1891)', () => {
-  const built = { baseModelId: 'a', headModelId: 'b', contentVersion: 3 };
+  const built = {
+    baseModelId: 'a', headModelId: 'b', contentVersion: 3, keyProperty: undefined,
+    mutationVersion: useViewerStore.getState().mutationVersion,
+  };
 
   it('reuses fingerprints for the same pair at the same content version', () => {
-    assert.equal(isCurrentFor(built, 'a', 'b', 3), true);
+    assert.equal(isCurrentFor(built, 'a', 'b', 3, undefined), true);
   });
 
   it('refuses to reuse them once mesh content was mutated in place', () => {
     // `geometryContentVersion` is bumped by exactly one caller — federation
     // re-alignment — and only when something actually moved. Reusing across
     // that bump is the defect: the meshes moved, the fingerprints did not.
-    assert.equal(isCurrentFor(built, 'a', 'b', 4), false);
+    assert.equal(isCurrentFor(built, 'a', 'b', 4, undefined), false);
   });
 
   it('refuses to reuse them for a different pair', () => {
-    assert.equal(isCurrentFor(built, 'a', 'c', 3), false);
-    assert.equal(isCurrentFor(built, 'c', 'b', 3), false);
+    assert.equal(isCurrentFor(built, 'a', 'c', 3, undefined), false);
+    assert.equal(isCurrentFor(built, 'c', 'b', 3, undefined), false);
     // Order matters: A/B is not B/A.
-    assert.equal(isCurrentFor(built, 'b', 'a', 3), false);
+    assert.equal(isCurrentFor(built, 'b', 'a', 3, undefined), false);
+  });
+
+  it('refuses to reuse them once the key scheme changed (#4989)', () => {
+    // A cached fingerprint's `key` is `prop:<value>` or a GlobalId depending
+    // on the scheme it was extracted under; reusing across a scheme change
+    // would hand the engine keys from the wrong scheme entirely.
+    assert.equal(isCurrentFor(built, 'a', 'b', 3, 'Tag'), false);
+    const keyed = { ...built, keyProperty: 'Tag' };
+    assert.equal(isCurrentFor(keyed, 'a', 'b', 3, 'Tag'), true);
+    assert.equal(isCurrentFor(keyed, 'a', 'b', 3, undefined), false);
+  });
+
+  it('refuses to reuse them once any model was edited since extraction (#5312)', () => {
+    const extractedAt = { ...built, mutationVersion: useViewerStore.getState().mutationVersion };
+    assert.equal(isCurrentFor(extractedAt, 'a', 'b', 3, undefined), true);
+    const stale = { ...extractedAt, mutationVersion: extractedAt.mutationVersion - 1 };
+    assert.equal(isCurrentFor(stale, 'a', 'b', 3, undefined), false);
   });
 });
 
@@ -86,14 +107,12 @@ describe('why the content version belongs in that key', () => {
     };
   }
 
-  function georef(eastings: number): ModelGeoref {
+  function georef(eastings: number): ModelSpatialPlacement {
     return {
-      mapConversion: {
+      spatialReference: spatialReferenceFromIfc({ mapConversion: {
         id: 1, sourceCRS: 2, targetCRS: 3, eastings, northings: 0, orthogonalHeight: 0,
         xAxisAbscissa: 1, xAxisOrdinate: 0, scale: 1,
-      } as MapConversion,
-      projectedCRS: { id: 4, name: 'EPSG:2056', mapUnitScale: 1 } as ProjectedCRS,
-      lengthUnitScale: 1,
+      } as MapConversion, projectedCRS: { id: 4, name: 'EPSG:2056', verticalDatum: 'EPSG:5729', mapUnitScale: 1 } as ProjectedCRS, lengthUnitScale: 1 }),
     };
   }
 

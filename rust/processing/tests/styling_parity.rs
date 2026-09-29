@@ -42,7 +42,7 @@ const NEUTRAL_GRAY: [f32; 4] = [0.8, 0.8, 0.8, 1.0];
 /// Snapshot of the historical `wasm-bindings` table
 /// (`rust/wasm-bindings/src/api/styling.rs:970`, 2026-06).
 /// `None` => the type fell through to the neutral-gray default.
-fn wasm_default(t: IfcType) -> [f32; 4] {
+fn wasm_default(t: &IfcType) -> [f32; 4] {
     match t {
         IfcType::IfcWall | IfcType::IfcWallStandardCase => [0.85, 0.85, 0.85, 1.0],
         IfcType::IfcSlab => [0.7, 0.7, 0.7, 1.0],
@@ -65,7 +65,7 @@ fn wasm_default(t: IfcType) -> [f32; 4] {
 
 /// Snapshot of the historical `processing` table
 /// (`rust/processing/src/processor.rs:2140`, 2026-06).
-fn processing_default(t: IfcType) -> [f32; 4] {
+fn processing_default(t: &IfcType) -> [f32; 4] {
     match t {
         IfcType::IfcWall | IfcType::IfcWallStandardCase => [0.85, 0.85, 0.85, 1.0],
         IfcType::IfcSlab => [0.7, 0.7, 0.7, 1.0],
@@ -118,17 +118,17 @@ const CONTESTED: &[IfcType] = &[
     IfcType::IfcBuildingElementProxy,
 ];
 
-fn is_contested(t: IfcType) -> bool {
-    CONTESTED.contains(&t)
+fn is_contested(t: &IfcType) -> bool {
+    CONTESTED.contains(t)
 }
 
 #[test]
 fn union_agrees_with_both_tables_on_uncontested_types() {
-    for &t in MAPPED_TYPES {
+    for t in MAPPED_TYPES {
         if is_contested(t) {
             continue;
         }
-        let canonical = default_color_for_type(t).to_array();
+        let canonical = default_color_for_type(t.clone()).to_array();
         assert_eq!(
             canonical,
             wasm_default(t),
@@ -154,13 +154,13 @@ fn union_picks_the_documented_winner_for_contested_types() {
     ];
 
     for (t, expected, from_wasm) in cases {
-        let canonical = default_color_for_type(t).to_array();
+        let canonical = default_color_for_type(t.clone()).to_array();
         assert_eq!(canonical, expected, "{t:?}: unexpected canonical value");
 
         let winner = if from_wasm {
-            wasm_default(t)
+            wasm_default(&t)
         } else {
-            processing_default(t)
+            processing_default(&t)
         };
         assert_eq!(canonical, winner, "{t:?}: canonical must equal the chosen source table");
     }
@@ -168,7 +168,7 @@ fn union_picks_the_documented_winner_for_contested_types() {
     // FurnishingElement specifically must NOT keep processing's darker brown.
     assert_ne!(
         default_color_for_type(IfcType::IfcFurnishingElement).to_array(),
-        processing_default(IfcType::IfcFurnishingElement),
+        processing_default(&IfcType::IfcFurnishingElement),
         "furnishing must change away from processing's [0.5,0.35,0.2,1]"
     );
 }
@@ -178,13 +178,13 @@ fn exactly_four_types_change_per_table() {
     // Guard rail: the migration must touch ONLY the four contested types.
     let wasm_deltas: Vec<IfcType> = MAPPED_TYPES
         .iter()
-        .copied()
-        .filter(|&t| default_color_for_type(t).to_array() != wasm_default(t))
+        .filter(|&t| default_color_for_type(t.clone()).to_array() != wasm_default(t))
+        .cloned()
         .collect();
     let processing_deltas: Vec<IfcType> = MAPPED_TYPES
         .iter()
-        .copied()
-        .filter(|&t| default_color_for_type(t).to_array() != processing_default(t))
+        .filter(|&t| default_color_for_type(t.clone()).to_array() != processing_default(t))
+        .cloned()
         .collect();
 
     // vs wasm: StairFlight + BuildingElementProxy gain a non-default value.
@@ -232,14 +232,44 @@ fn repo_root() -> Option<std::path::PathBuf> {
 /// nothing and passes anyway - which is what they did before #3200, over an
 /// empty directory and over a directory that does not exist alike.
 ///
-/// MEASURED, not guessed: the walk over `rust/` + `apps/` reaches
-/// 659 `.rs` files on a healthy tree (raise the floor and
-/// run the test to see the real figure in the failure message). The floor sits
-/// at roughly two thirds of that. It only has to separate "the walk works" from
-/// "the walk went blind", and every way it can go blind - a wrong scan root, a
-/// `read_dir` that fails, a crate tree that moved - takes the count to zero or
-/// to a handful, never to a plausible-looking fraction.
-const SCANNED_FLOOR: usize = 440;
+/// MEASURED, not guessed: set at roughly two thirds of what the walk over
+/// `rust/` + `apps/` reached when it was last raised (about 1280 files in late
+/// September 2026, when the #5941 stack pushed the walk past twice the old
+/// floor of 640; about 970 earlier that month; 659 at #3200). A wrong scan root or a failing `read_dir`
+/// takes the count to zero or a handful. Losing a large subtree takes it to a
+/// fraction, and the floor catches a loss of about a third of the tree. It
+/// does not catch losing `apps/` alone (under a tenth of the files).
+///
+/// The number AGES: the tree grows and the floor does not. At 440 against a
+/// tree of about 960 files the guard would have passed with more than half of
+/// `rust/` + `apps/` gone. [`assert_walk_is_live`] therefore also refuses a
+/// walk that reaches more than TWICE the floor: that failure is not a defect
+/// in the code under test, it is the signal to re-measure and raise this
+/// constant.
+const SCANNED_FLOOR: usize = 855;
+
+/// Anti-vacuity (#3200) in BOTH directions: `scanned` must reach
+/// [`SCANNED_FLOOR`] (the walk is alive), and [`SCANNED_FLOOR`] must still be
+/// at least half of `scanned` (the floor is alive). Each guard below concludes
+/// from an empty offender list, so the walk having reached a real tree is
+/// part of its evidence, not a precondition someone else checks.
+fn assert_walk_is_live(scanned: usize, concludes: &str) {
+    assert!(
+        scanned >= SCANNED_FLOOR,
+        "styling parity walked rust/ and apps/ and reached only {scanned} .rs file(s); \
+         the floor is {SCANNED_FLOOR}. Refusing a vacuous pass: this guard \
+         concludes that {concludes}, and a scan that examined this little has \
+         established no such thing."
+    );
+    assert!(
+        scanned <= SCANNED_FLOOR * 2,
+        "styling parity walked rust/ and apps/ and reached {scanned} .rs files, more \
+         than twice the floor of {SCANNED_FLOOR}. The floor has gone stale: raise \
+         SCANNED_FLOOR to about two thirds of {scanned} and update its comment, so \
+         that the guard which concludes that {concludes} cannot pass again after \
+         losing half the tree."
+    );
+}
 
 /// Walk `dir`, collecting every `.rs` file underneath it.
 ///
@@ -385,17 +415,7 @@ fn no_duplicate_default_color_tables() {
     collect_rs_files(&root.join("rust"), &mut files);
     collect_rs_files(&root.join("apps"), &mut files);
 
-    // Anti-vacuity (#3200): this guard concludes from an empty `offenders`, so
-    // the walk having reached a real tree is part of its evidence, not a
-    // precondition someone else checks.
-    assert!(
-        files.len() >= SCANNED_FLOOR,
-        "styling parity walked rust/ and apps/ and reached only {} .rs file(s); \
-         the floor is {SCANNED_FLOOR}. Refusing a vacuous pass: this guard \
-         concludes that no second default-color table exists, and a scan that \
-         examined this little has established no such thing.",
-        files.len()
-    );
+    assert_walk_is_live(files.len(), "no second default-color table exists");
 
     let mut offenders = Vec::new();
     for path in files {
@@ -453,14 +473,7 @@ fn no_duplicate_surface_style_color_extraction() {
     collect_rs_files(&root.join("rust"), &mut files);
     collect_rs_files(&root.join("apps"), &mut files);
 
-    assert!(
-        files.len() >= SCANNED_FLOOR,
-        "styling parity walked rust/ and apps/ and reached only {} .rs file(s); \
-         the floor is {SCANNED_FLOOR}. Refusing a vacuous pass: this guard \
-         concludes that no second surface-style colour extractor exists, and a \
-         scan that examined this little has established no such thing.",
-        files.len()
-    );
+    assert_walk_is_live(files.len(), "no second surface-style colour extractor exists");
 
     let scanned = files.len();
     let mut offenders = Vec::new();

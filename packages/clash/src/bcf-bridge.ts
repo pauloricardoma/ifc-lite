@@ -25,6 +25,7 @@ import {
   addViewpointToTopic,
   addTopicToProject,
   toARGBColor,
+  translateViewpoint,
   type BCFProject,
   type BCFTopic,
   type BCFHeaderFile,
@@ -70,6 +71,8 @@ export interface ClashBcfOptions {
   maxMembersPerTopic?: number;
   cameraDistanceFactor?: number;
   snapshotProvider?: (group: ClashGroup) => Promise<Uint8Array | undefined>;
+  /** Clash-bounds (render) frame -> IFC world, Z-up metres: `renderFrameWorldOffset(coordinateInfo)` from `@ifc-lite/geometry/world-frame` (#4806, #4879). */
+  worldOffset?: { x: number; y: number; z: number };
 }
 
 const DEFAULT_MAX_TOPICS = 1000;
@@ -301,13 +304,8 @@ async function buildTopicForGroup(
   const bounds = toViewerBounds(group.bounds);
   const snapshotData = opts.snapshotProvider ? await opts.snapshotProvider(group) : undefined;
 
-  const viewpoint = createViewpoint({
-    camera,
-    bounds,
-    selectedGuids,
-    coloredGuids,
-    snapshotData,
-  });
+  const localViewpoint = createViewpoint({ camera, bounds, selectedGuids, coloredGuids, snapshotData });
+  const viewpoint = opts.worldOffset ? translateViewpoint(localViewpoint, opts.worldOffset) : localViewpoint;
 
   addViewpointToTopic(topic, viewpoint);
   addTopicToProject(project, topic);

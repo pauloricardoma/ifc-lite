@@ -8,7 +8,8 @@
  */
 
 import type { MapConversion } from '@ifc-lite/parser';
-import type { CoordinateInfo } from '@ifc-lite/geometry';
+import { NORMAL_COORD_THRESHOLD_M, type CoordinateInfo } from '@ifc-lite/geometry';
+import { ifcToViewerAxes, viewerToIfcAxes } from './coordinate-frame';
 
 /**
  * Compute the model's center in IFC Z-up metres from coordinate info.
@@ -29,25 +30,19 @@ export function computeModelCenterInIfcMeters(
   // `world_yup = bounds_center + originShift`, from the VIEWER bounds.
   const bounds = coordinateInfo.shiftedBounds;
   const shift = coordinateInfo.originShift;
-  const rtc = coordinateInfo.wasmRtcOffset;
-
-  const rtcYup = rtc
-    ? { x: rtc.x, y: rtc.z, z: -rtc.y }
-    : { x: 0, y: 0, z: 0 };
+  const rtcYup = ifcToViewerAxes(coordinateInfo.wasmRtcOffset ?? { x: 0, y: 0, z: 0 });
 
   const cx = (bounds.min.x + bounds.max.x) / 2;
   const cy = (bounds.min.y + bounds.max.y) / 2;
   const cz = (bounds.min.z + bounds.max.z) / 2;
 
-  const worldYupX = cx + shift.x + rtcYup.x;
-  const worldYupY = cy + shift.y + rtcYup.y;
-  const worldYupZ = cz + shift.z + rtcYup.z;
-
-  return {
-    ifcX: worldYupX,
-    ifcY: -worldYupZ,
-    ifcZ: worldYupY,
+  const worldYup = {
+    x: cx + shift.x + rtcYup.x,
+    y: cy + shift.y + rtcYup.y,
+    z: cz + shift.z + rtcYup.z,
   };
+  const worldIfc = viewerToIfcAxes(worldYup);
+  return { ifcX: worldIfc.x, ifcY: worldIfc.y, ifcZ: worldIfc.z };
 }
 
 /**
@@ -60,14 +55,21 @@ export function computeModelCenterInIfcMeters(
 const MAP_ABSOLUTE_MIN_ANCHOR_METERS = 100_000;
 /**
  * How close (metres) the geometry centre must be to the declared anchor to
- * count as "already sitting at it". Matches the wasm RTC re-base threshold
- * (10 km): a compliant file's geometry lives near the LOCAL origin, so its
- * centre is `anchorDistance` (>100 km) away from the anchor and stays outside
- * this radius. (A file that intentionally draws its local geometry right at
- * the anchor's magnitude AND means the conversion to apply on top would be
- * misread — that coincidence is treated as the absolute-placement signature.)
+ * count as "already sitting at it". This IS the wasm RTC re-base threshold
+ * (10 km), not a separate number that happens to equal it: a compliant file's
+ * geometry lives near the LOCAL origin because the re-base put it there, so
+ * its centre is `anchorDistance` (>100 km) away from the anchor and stays
+ * outside this radius. (A file that intentionally draws its local geometry
+ * right at the anchor's magnitude AND means the conversion to apply on top
+ * would be misread — that coincidence is treated as the absolute-placement
+ * signature.)
+ *
+ * Until #4611 this was its own `10_000` literal, with the agreement stated in
+ * the sentence above and nothing enforcing it; moving the re-base threshold
+ * would have left this radius behind. `map-absolute.test.ts` derives its
+ * boundary cases from the imported constant, so the two cannot part again.
  */
-const MAP_ABSOLUTE_MAX_CENTER_DISTANCE_METERS = 10_000;
+const MAP_ABSOLUTE_MAX_CENTER_DISTANCE_METERS = NORMAL_COORD_THRESHOLD_M;
 
 /**
  * Detect geometry that is ALREADY in absolute map coordinates and neutralise
@@ -128,5 +130,10 @@ export function effectiveMapConversionForGeometry(
     xAxisAbscissa: 1,
     xAxisOrdinate: 0,
     scale: 1,
+    // Clear the subtype factors as well: an authored factor would rescale the
+    // already-absolute coordinates exactly as an authored Scale would.
+    factorX: undefined,
+    factorY: undefined,
+    factorZ: undefined,
   };
 }

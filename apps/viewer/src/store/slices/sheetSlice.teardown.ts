@@ -30,9 +30,9 @@ export const sheetTeardown = defineSliceTeardown(
     // Destructuring and rebuilding it here would be a second list to keep in
     // step with the first.
     'session-reset': getClearedSheetState,
-    // A sheet is a document laid out over the drawing, not a per-model
-    // artefact: removing one model from a federation, or clearing them all,
-    // leaves it alone. Only a file swap tears it down.
+    // The persistence bridge owns model transitions: it selects the next
+    // active model's sheet, or clears the sheet when none remains. Removing
+    // an inactive model must not tear down the current drawing (#4836).
     'model-removed': notApplicable,
     'all-models-cleared': notApplicable,
   },

@@ -11,8 +11,9 @@
  * that compared nothing — so every way it could go false-green is an
  * executable case here: no crates, a crate list that silently shrank, a crate
  * with no baseline on crates.io, a `cargo-semver-checks` run that produced no
- * verdict, and an unreadable workspace version. Each must FAIL, and fail with
- * its own named reason.
+ * verdict, an unreadable workspace version, and a run whose clean verdict was
+ * reached over zero executed lints (#4786). Each must FAIL, and fail with its
+ * own named reason.
  *
  * The expensive half (`cargo semver-checks`, minutes per crate, network for
  * the baseline) is injected, so the decision logic is tested at unit speed and
@@ -31,14 +32,18 @@ import { spawnSync } from 'node:child_process';
 import { join, dirname, delimiter } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import {
+import * as rustSemver from './check-rust-semver.mjs';
+const {
   readVersionOrNull,
   bumpLevel,
-  interpretRun,
   isVersionAdvanced,
   checkRustSemver,
   CRATE_FLOOR,
-} from './check-rust-semver.mjs';
+  interpretRun,
+  executedCheckCount,
+  semverChecksArgv,
+  loadPublishedBaselines,
+} = rustSemver;
 import { CRATES } from './lib/crates-io.mjs';
 
 const SCRIPTS = dirname(fileURLToPath(import.meta.url));
@@ -70,7 +75,76 @@ const NEEDS_MAJOR = {
 };
 const NEEDS_MINOR = {
   status: 1,
-  output: '     Summary semver requires new minor version: 0 major and 1 minor checks failed',
+  output: [
+    '     Checked [   0.006s] 223 checks: 222 pass, 1 fail, 0 warn, 31 skip',
+    '     Summary semver requires new minor version: 0 major and 1 minor checks failed',
+  ].join('\n'),
+};
+
+/**
+ * A run that executed NOTHING and exited 0 saying so (#4786). Transcribed from
+ * the real thing: the gate's own argv on main at 15.0.0 against the published
+ * 14.0.0, cargo-semver-checks 0.50.0, which infers a major, has nothing left to
+ * refuse, skips its entire lint set and reports the same Summary line a healthy
+ * comparison reports.
+ */
+const SKIPPED_EVERY_LINT = {
+  status: 0,
+  output: [
+    '    Checking ifc-lite-clash v14.0.0 -> v15.0.0 (major change)',
+    '     Checked [   0.000s] 0 checks: 0 pass, 254 skip',
+    '     Summary no semver update required',
+    '    Finished [   1.705s] ifc-lite-clash',
+  ].join('\n'),
+};
+
+/**
+ * A run that DETECTED a break but at warn level (#4800), so `required_bumps`
+ * — which drives the `Summary` line — never sees it: only `suggested_bumps`
+ * does, on the `Warning produced ...` / `produced warnings suggest ...` lines
+ * beneath a clean Summary. Transcribed from a real run, cargo-semver-checks
+ * 0.50.0, `--baseline-root` against a two-crate fixture with a `#[repr(C)]`
+ * struct whose fields were reordered between versions — the exact hazard
+ * check-rust-semver.mjs's own header names as ifc-lite-ffi's blind spot:
+ *
+ *   $ cargo +stable semver-checks --baseline-root ../old --release-type patch --color never
+ *        Checked [   0.010s] 223 checks: 222 pass, 0 fail, 1 warn, 31 skip
+ *   --- warning repr_c_plain_struct_fields_reordered: ... ---
+ *        Summary no semver update required
+ *        Warning produced 1 major and 0 minor level warnings
+ *                produced warnings suggest new major version
+ *       Finished [   1.346s] repro
+ *   $ echo $?
+ *   0
+ */
+const WARN_MAJOR = {
+  status: 0,
+  output: [
+    '     Checked [   0.010s] 223 checks: 222 pass, 0 fail, 1 warn, 31 skip',
+    '',
+    '--- warning repr_c_plain_struct_fields_reordered: struct fields reordered in repr(C) struct ---',
+    '',
+    'Failed in:',
+    '  Point.x moved from position 1 to 2, in src/lib.rs:4',
+    '  Point.y moved from position 2 to 1, in src/lib.rs:3',
+    '',
+    '     Summary no semver update required',
+    '     Warning produced 1 major and 0 minor level warnings',
+    '             produced warnings suggest new major version',
+    '    Finished [   1.346s] repro',
+  ].join('\n'),
+};
+
+/** Same shape, a warn-level MINOR suggestion instead of a major one. */
+const WARN_MINOR = {
+  status: 0,
+  output: [
+    '     Checked [   0.010s] 223 checks: 222 pass, 0 fail, 1 warn, 31 skip',
+    '     Summary no semver update required',
+    '     Warning produced 0 major and 1 minor level warnings',
+    '             produced warnings suggest new minor version',
+    '    Finished [   1.346s] repro',
+  ].join('\n'),
 };
 
 /** Defaults every case starts from: all seven crates published at 6.0.1. */
@@ -175,6 +249,28 @@ test('VACUITY: a registry lookup that fails for EVERY crate is not a pass', () =
   assert.equal(result.checked.length, 0);
 });
 
+test('#6407: registry lookup failure stops baseline collection instead of becoming NO_BASELINE', async () => {
+  const visited = [];
+  await assert.rejects(
+    () => loadPublishedBaselines(SEVEN, async (crate) => {
+      visited.push(crate);
+      if (crate === 'ifc-lite-ffi') throw new Error('crates.io returned 503');
+      return '19.1.2';
+    }),
+    /REGISTRY_LOOKUP_FAILED: ifc-lite-ffi: crates\.io returned 503/
+  );
+  assert.deepEqual(visited, SEVEN.slice(0, SEVEN.indexOf('ifc-lite-ffi') + 1));
+
+  const baselines = await loadPublishedBaselines(SEVEN, async () => '19.1.2');
+  assert.equal(baselines.get('ifc-lite-ffi'), '19.1.2');
+  assert.equal(baselines.size, SEVEN.length);
+
+  await assert.rejects(
+    () => loadPublishedBaselines(['ifc-lite-ffi'], async () => undefined),
+    /REGISTRY_LOOKUP_FAILED: ifc-lite-ffi: registry returned no usable baseline answer/
+  );
+});
+
 test('VACUITY: output with no Summary line fails with NO_VERDICT', () => {
   const unreadable = {
     status: 1,
@@ -190,6 +286,182 @@ test('VACUITY: an empty run output is NO_VERDICT, never a pass', () => {
   const result = run({ runSemverChecks: () => ({ status: 0, output: '' }) });
   assert.equal(result.ok, false);
   assert.match(result.failures[0], /NO_VERDICT/);
+});
+
+test('VACUITY: a run that executed ZERO lints fails with NO_CHECKS_EXECUTED', () => {
+  // #4786, the live case. The manifests carry 15.0.0 and crates.io carries
+  // 14.0.0, so the carried bump is a `major` — RANK 3, which no `required`
+  // verdict can exceed — and cargo-semver-checks, asked about a major, skips
+  // all 254 lints and exits 0. Before this floor the gate printed
+  // `ifc-lite-clash 14.0.0 -> 15.0.0 (major; requires patch)` for all seven
+  // crates and called the release checked. Nothing had been compared.
+  const result = run({
+    workspaceVersion: '15.0.0',
+    latestPublished: () => '14.0.0',
+    runSemverChecks: () => SKIPPED_EVERY_LINT,
+  });
+  assert.equal(result.ok, false, 'a scan that examined nothing reported a pass');
+  assert.equal(result.failures.length, SEVEN.length);
+  for (const f of result.failures) assert.match(f, /NO_CHECKS_EXECUTED: /);
+  assert.match(result.failures[0], /reported 0 executed lints/);
+  // And the reassuring comparison line must not have been printed for any of
+  // them: `checked` is what the success line counts.
+  assert.deepEqual(result.checked, []);
+});
+
+test('the floor guards EVERY verdict that could clear a crate, not the clean-reading one', () => {
+  // The axis matters. A crate is cleared when RANK[required] <= RANK[carried],
+  // so under a carried major a `requires minor` verdict clears it exactly as a
+  // `requires patch` does. A floor keyed on the summary line reading clean
+  // would leave every verdict below the carried bump free to pass over a scan
+  // that examined nothing.
+  //
+  // HARDENING, not a fixed live defect: cargo-semver-checks says a bump is
+  // required only because a lint FAILED, so it is not known to produce this
+  // combination. The gate refuses it anyway rather than resting on that.
+  const minorOverNothing = {
+    status: 1,
+    output: [
+      '     Checked [   0.000s] 0 checks: 0 pass, 254 skip',
+      '     Summary semver requires new minor version: 0 major and 1 minor checks failed',
+    ].join('\n'),
+  };
+  const result = run({
+    workspaceVersion: '15.0.0',
+    latestPublished: () => '14.0.0',
+    runSemverChecks: () => minorOverNothing,
+  });
+  assert.equal(result.ok, false);
+  for (const f of result.failures) assert.match(f, /NO_CHECKS_EXECUTED: /);
+  assert.deepEqual(result.checked, []);
+});
+
+test('the floor is on EXECUTED lints, not on skipped ones', {
+  skip: typeof executedCheckCount !== 'function',
+}, () => {
+  // A healthy run skips lints every time (31 of 254 at --release-type patch on
+  // this workspace), so a floor written against `skip` would refuse every real
+  // release. COMPATIBLE is a real 223-pass/31-skip transcript.
+  assert.equal(executedCheckCount(COMPATIBLE.output), 223);
+  assert.equal(executedCheckCount(SKIPPED_EVERY_LINT.output), 0);
+  // The colon is the discriminator: the summary line's own "0 major and 1
+  // minor checks failed" is not a tally.
+  assert.equal(
+    executedCheckCount('Summary semver requires new minor version: 0 major and 1 minor checks failed'),
+    null
+  );
+});
+
+test('a verdict with no tally line at all is NO_CHECKS_EXECUTED, not a pass', {
+  skip: typeof interpretRun !== 'function',
+}, () => {
+  // If the tool's output format moves, the gate must not read the absence of
+  // evidence as evidence that a comparison happened.
+  const noTally = { status: 0, output: '     Summary no semver update required' };
+  assert.equal(interpretRun(noTally).executed, null);
+
+  const result = run({ runSemverChecks: () => noTally });
+  assert.equal(result.ok, false);
+  assert.match(result.failures[0], /NO_CHECKS_EXECUTED: /);
+  assert.match(result.failures[0], /printed no "N checks:" tally/);
+  // The remedy for a missing tally is not the remedy for a zero one, and the
+  // message must not hand over the wrong one.
+  assert.match(result.failures[0], /executedCheckCount/);
+});
+
+test('interpretRun reports the executed count as a fact and judges nothing', {
+  skip: typeof interpretRun !== 'function',
+}, () => {
+  // The split the floor's placement rests on: reading the tally is the tool
+  // adapter's job, deciding what a zero means is the gate's.
+  assert.equal(interpretRun(COMPATIBLE).executed, 223);
+  assert.equal(interpretRun(COMPATIBLE).reason, null);
+  assert.equal(interpretRun(SKIPPED_EVERY_LINT).executed, 0);
+  assert.equal(
+    interpretRun(SKIPPED_EVERY_LINT).reason,
+    null,
+    'the adapter must not refuse on the gate’s behalf'
+  );
+  assert.equal(interpretRun(SKIPPED_EVERY_LINT).required, 'patch');
+});
+
+test('RED (#4800): a detected warn-level break is not discarded as patch', {
+  skip: typeof interpretRun !== 'function',
+}, () => {
+  // Before the fix, interpretRun reads only the Summary line, which is driven
+  // by required_bumps (errors only). WARN_MAJOR carries a full 223-lint tally
+  // AND a real detected break — cargo-semver-checks' own
+  // repr_c_plain_struct_fields_reordered lint, at warn level — so the
+  // NO_CHECKS_EXECUTED floor from #4786 does not and cannot catch this: the
+  // scan executed, and still returned a verdict that throws away what it
+  // found. `required` must be `major`, not `patch`.
+  assert.equal(
+    interpretRun(WARN_MAJOR).required,
+    'major',
+    'a warn-level repr(C) field reorder was read as "patch", exactly the ' +
+      'ifc-lite-ffi hazard check-rust-semver.mjs names as unclosed'
+  );
+  assert.equal(interpretRun(WARN_MINOR).required, 'minor');
+  // The executed count and reason are untouched by folding the warning in.
+  assert.equal(interpretRun(WARN_MAJOR).executed, 223);
+  assert.equal(interpretRun(WARN_MAJOR).reason, null);
+});
+
+test('a warn-level suggestion never LOWERS a verdict an error already forced higher', {
+  skip: typeof interpretRun !== 'function',
+}, () => {
+  // NEEDS_MAJOR already requires major from a failing lint; layering a
+  // warn-level minor suggestion on top of it must not read as a downgrade.
+  const majorErrorPlusMinorWarn = {
+    status: 1,
+    output:
+      NEEDS_MAJOR.output +
+      '\n     Warning produced 0 major and 1 minor level warnings\n' +
+      '             produced warnings suggest new minor version',
+  };
+  assert.equal(interpretRun(majorErrorPlusMinorWarn).required, 'major');
+});
+
+test('a warn-level suggestion RAISES a verdict an error alone set lower', () => {
+  // NEEDS_MINOR requires only minor from its failing lint; a warn-level
+  // major suggestion on the same run must still win, in this branch too
+  // (the error-verdict branch of interpretRun, not just the clean-Summary
+  // one WARN_MAJOR exercises).
+  const minorErrorPlusMajorWarn = {
+    status: 1,
+    output:
+      NEEDS_MINOR.output +
+      '\n     Warning produced 1 major and 0 minor level warnings\n' +
+      '             produced warnings suggest new major version',
+  };
+  assert.equal(interpretRun(minorErrorPlusMajorWarn).required, 'major');
+});
+
+test('the run is forced to the smallest release type, so the lint set is selected', {
+  skip: typeof semverChecksArgv !== 'function',
+}, () => {
+  // The other half of #4786. Letting cargo-semver-checks infer the release
+  // size from the manifest version is what produced the zero-lint pass: it
+  // only runs the lints that could refuse the release it thinks it is judging.
+  // Measured on ifc-lite-clash against the published 14.0.0 with the manifests
+  // at 15.0.0 (cargo-semver-checks 0.50.0):
+  //   inferred      0 checks, 254 skip
+  //   minor       196 checks,  58 skip   (the 27 minor lints still skipped)
+  //   patch       223 checks,  31 skip
+  // `patch` and not `minor`: at minor a minor-requiring change comes back as
+  // "no semver update required", which interpretRun reads as `patch` and the
+  // gate would then wave through under a patch release.
+  const argv = semverChecksArgv('ifc-lite-clash', '14.0.0');
+  const at = argv.indexOf('--release-type');
+  assert.notEqual(at, -1, 'the gate lets cargo-semver-checks infer the release size again');
+  assert.equal(argv[at + 1], 'patch');
+  assert.deepEqual(argv.slice(1, 6), [
+    'semver-checks',
+    '--package',
+    'ifc-lite-clash',
+    '--baseline-version',
+    '14.0.0',
+  ]);
 });
 
 test('VACUITY: an unreadable workspace version fails with BAD_VERSION', () => {

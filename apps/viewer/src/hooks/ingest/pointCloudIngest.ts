@@ -19,22 +19,25 @@ import {
   createClassificationCounts,
   streamPointCloud,
   type DecodedPointChunk,
+  type StreamPointCloudOptions,
   type StreamHandle,
+  type PointSourceSpatialMetadata,
 } from '@ifc-lite/pointcloud';
-import type { CoordinateInfo, GeometryResult, PointCloudAsset } from '@ifc-lite/geometry';
+import type { CoordinateInfo, GeometryResult, ModelSpatialReference, PointCloudAsset } from '@ifc-lite/geometry';
 import { createSyntheticDataStore, type IfcDataStore } from '@ifc-lite/parser';
 import type { SchemaVersion } from '../../store/types.js';
 import { createCoordinateInfo } from '../../utils/localParsingUtils.js';
 import {
-  registerPointCloudAlignment,
+  registerPointCloudAlignment, retargetPointCloudDecodeOrigin,
   unregisterPointCloudAlignment,
   type PointCloudAlignmentTransform,
 } from './pointCloudAlignment.js';
 import {
   addPointsToScanCache,
   registerPointCloudScanCache,
-  removePointCloudScanCache,
+  removePointCloudScanCache, setPointCloudScanCacheOrigin,
 } from './pointCloudScanCache.js';
+import { swapZupChunkToYup } from './pointCloudFrame.js';
 
 export type PointCloudFormat = 'las' | 'laz' | 'ply' | 'pcd' | 'e57' | 'pts' | 'xyz';
 
@@ -109,6 +112,8 @@ export interface PointCloudIngestOptions {
   maxScanCachePoints?: number;
   /** Progress callback shared with the existing UI. */
   onProgress?: (progress: { phase: string; percent: number }) => void;
+  /** Source-declared CRS metadata, delivered before the first GPU chunk. */
+  onSpatialMetadata?: (metadata: PointSourceSpatialMetadata | undefined) => void;
   /** Notified with +1 when streaming starts and -1 if it errors. */
   onAssetCountDelta?: (delta: number) => void;
   /**
@@ -122,6 +127,8 @@ export interface PointCloudIngestOptions {
   onClassCounts?: (handleId: number, counts: Record<number, number> | null) => void;
   /** Abort signal to cancel ingest. */
   signal?: AbortSignal;
+  /** In-process decoder seam used by integration tests; production uses the worker source. */
+  createSource?: StreamPointCloudOptions['createSource'];
   /**
    * IfcMapConversion-derived alignment transform for this scan (issue
    * #1804), computed by the caller from the reference model's
@@ -129,9 +136,9 @@ export interface PointCloudIngestOptions {
    * loaded model has no usable `IfcMapConversion` — the scan streams at
    * its raw native coordinates, exactly as before this feature existed.
    * When present:
-   *   - `decodeOriginOffset` is threaded into `streamPointCloud` so every
-   *     format's decoder subtracts it in f64 before narrowing to f32 (all
-   *     seven point-cloud formats consume it, not just LAS/LAZ).
+   *   - decoding subtracts a nearby scan origin in f64 before narrowing,
+   *     then retargets this alignment to that origin before the first chunk.
+   *     This preserves detail even when the scan is far from the IFC.
    *   - the asset defaults to the ALIGNED matrix (alignment ON) and is
    *     registered so the panel's toggle can flip every loaded scan
    *     between aligned/unaligned without re-streaming.
@@ -141,6 +148,8 @@ export interface PointCloudIngestOptions {
    *  (aligned) — matches the issue's "on by default" requirement. Only
    *  consulted when `alignment` is provided. */
   alignmentEnabled?: boolean;
+  /** Declared scan CRS retained even when no compatible anchor exists yet. */
+  spatialReference?: ModelSpatialReference;
 }
 
 /**
@@ -214,30 +223,9 @@ export function detectPointCloudFormat(
   return null;
 }
 
-/**
- * Map common unsupported formats to a user-facing explanation. Drop
- * handlers call this when nothing else recognises a dropped file so the
- * user sees "this is a Recap project, export to E57" instead of nothing
- * happening.
- */
-export function describeUnsupportedFormat(fileName: string): string | null {
-  const lower = fileName.toLowerCase();
-  if (lower.endsWith('.zip')) {
-    return 'ZIP archive — please extract first. .ply / .las / .laz / .e57 files inside will load.';
-  }
-  if (
-    lower.endsWith('.rwp') || lower.endsWith('.rwi')
-    || lower.endsWith('.rwcx') || lower.endsWith('.dmt')
-    || lower.endsWith('.lay') || lower.endsWith('.db1')
-  ) {
-    return 'Autodesk ReCap (.rwp/.rwi/.rwcx) is a proprietary format we cannot decode. Export to E57 or LAS from ReCap.';
-  }
-  if (lower.endsWith('.skp')) return 'SketchUp model — not a point cloud.';
-  if (lower.endsWith('.fls') || lower.endsWith('.lsproj')) {
-    return 'Faro Scene project — export to E57 from Scene to load it here.';
-  }
-  return null;
-}
+// `describeUnsupportedFormat` moved to ./unsupportedFormat.ts (#4099) — this
+// module was at its module-size budget and that function has no dependency
+// on the point-cloud pipeline below.
 
 /**
  * Counter for synthetic expressIds when callers don't supply one.
@@ -349,12 +337,19 @@ export function ingestPointCloud(opts: PointCloudIngestOptions): PointCloudInges
   // (originally LAS/LAZ-only; extended to E57/PLY/PCD/PTS/XYZ), so the
   // matrix is valid for any format here — no gate needed.
   const alignment = opts.alignment;
+  const alignmentEnabled = opts.alignmentEnabled ?? true;
+  // Register every scan, even before a compatible anchor exists. The registry
+  // retains its explicit source CRS and can atomically realign it when an IFC
+  // anchor loads later; omitting raw scans made model-after-scan order depend
+  // on a manual reload.
+  registerPointCloudAlignment(handle, alignment, alignmentEnabled, {
+    sourceSpatialReference: opts.spatialReference,
+    sourceUnit: opts.format === 'las' || opts.format === 'laz' ? 'mapUnit' : 'metre',
+  });
   if (alignment) {
-    registerPointCloudAlignment(handle, alignment);
-    const enabled = opts.alignmentEnabled ?? true;
     opts.renderer.setPointCloudTransform(
       handle,
-      enabled ? alignment.alignedMatrix : alignment.unalignedMatrix,
+      alignmentEnabled ? alignment.alignedMatrix : alignment.unalignedMatrix,
     );
   }
 
@@ -398,8 +393,11 @@ export function ingestPointCloud(opts: PointCloudIngestOptions): PointCloudInges
       maxPointsInMemory: opts.maxPointsInMemory,
       maxFileSize: opts.maxFileSize,
       signal: opts.signal,
-      originOffset: alignment?.decodeOriginOffset,
+      createSource: opts.createSource,
+      autoOrigin: true,
       onOpen: (info) => {
+        opts.onSpatialMetadata?.(info.spatialMetadata);
+        if (info.originOffset) { retargetPointCloudDecodeOrigin(opts.renderer, handle, info.originOffset); setPointCloudScanCacheOrigin(handle.id, info.originOffset); }
         opts.onProgress?.({
           phase: info.stride > 1
             ? `Streaming (${info.stride}× downsampled, ${info.totalPointCount.toLocaleString()} pts)`
@@ -507,39 +505,5 @@ export function ingestPointCloud(opts: PointCloudIngestOptions): PointCloudInges
     rendererHandle: handle,
     streamHandle: stream,
     done: stream.done,
-  };
-}
-
-/**
- * Re-orient a Z-up chunk into the renderer's Y-up convention.
- *   Z-up: X=right, Y=forward, Z=up
- *   Y-up: X=right, Y=up,      Z=back   (negate Y to keep right-hand rule)
- *
- * Mirrors the geometry / pointcloud extractors' Z↔Y handling for IFCx.
- * Allocates a fresh positions buffer so the source chunk's typed array
- * (often a transferable from the worker) stays untouched.
- */
-function swapZupChunkToYup(chunk: DecodedPointChunk): DecodedPointChunk {
-  const src = chunk.positions;
-  const positions = new Float32Array(src.length);
-  for (let i = 0; i < src.length; i += 3) {
-    const x = src[i];
-    const y = src[i + 1];
-    const z = src[i + 2];
-    positions[i] = x;
-    positions[i + 1] = z;        // new Y = old Z
-    positions[i + 2] = -y;       // new Z = -old Y
-  }
-  // BBox transforms the same way. New min/max derive from the swapped
-  // axes; note the negation flips min and max on the Z-back axis.
-  const oldMin = chunk.bbox.min;
-  const oldMax = chunk.bbox.max;
-  return {
-    ...chunk,
-    positions,
-    bbox: {
-      min: [oldMin[0], oldMin[2], -oldMax[1]],
-      max: [oldMax[0], oldMax[2], -oldMin[1]],
-    },
   };
 }

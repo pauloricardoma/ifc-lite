@@ -17,30 +17,44 @@ ifc-lite props model.ifc --id 42
 ifc-lite export model.ifc --format csv --type IfcWall --columns Name,Type,GlobalId
 ifc-lite create wall --height 3 --thickness 0.2 --start 0,0,0 --end 5,0,0 --out wall.ifc
 ifc-lite eval model.ifc "bim.query().byType('IfcWall').count()"
+ifc-lite eval tests/models/cost/buildingsmart-cost-composition.ifc "bim.cost.evaluateItem({modelId:'default',expressId:42})" --json
 ifc-lite view model.ifc
 ```
+
+The cost command above uses the canonical fixture at the shown path (fetch it
+with `pnpm fixtures`); express ID 42 is its `External wall total` cost item.
+
+`bim.cost` reads the loaded IFC source snapshot and returns decimal strings;
+pending generic mutation overlays are not included until reload.
 
 ## Commands
 
 - `info` - model summary: schema, entities, storeys
 - `query` - query entities by type, properties, quantities; supports `--sum`, `--group-by`, `--spatial`
 - `props` - all properties for a single entity (`--id N`)
-- `export` - export to `csv`, `json`, `ifc`, or `hbjson`
+- `export` - export to `csv`, `json`, `ifc`, `obj`, `gltf`, `glb`, `jsonld`, `ifcx`, `usd`, `step`, `hbjson`, or `dfjson`
 - `ids` - validate against buildingSMART IDS rules
 - `validate` - structural validation checks
 - `stats` - auto-calculated model KPIs and health check
 - `clash` - geometric clash detection, `--matrix`, `--bcf` output
 - `bcf` - create and inspect BCF collaboration files
-- `create` - create IFC elements from scratch (walls, slabs, stairs, 30+ types)
+- `create` - create IFC elements from scratch (walls, slabs, stairs, 29 types)
 - `mutate` - modify properties or attributes and save
 - `merge` - merge multiple IFC files into one federated file
 - `convert` - convert between IFC schema versions (`--schema IFC4`)
 - `diff` - compare two IFC files
+- `rekey` - carry a table keyed on old element keys across a revision
 - `eval` / `run` - run SDK expressions or scripts against a model
 - `ask` - natural language BIM queries
 - `view` - interactive 3D viewer in the browser, controllable via REST (`/api/command`)
 - `analyze` - query plus colorize/isolate/heatmap results in the running viewer
+- `simplify` - demesher: simplify meshes, write a lighter IFC
 - `mcp` - start an MCP server bound to one or more IFC files (stdio or http)
+- `layer` - layered change tracking over a local store (`.ifc-lite/`)
+- `ref` - manage named refs in the layer store
+- `anonymize` - export selected objects + context as an anonymized IFC
+- `schedule` - tabular schedule of one class (csv/json/md/html)
+- `delivery` - repeatable delivery check (structural + IDS) from a saved recipe
 - `gym` - reset/step/reward environment loop over the existing schema/clash/ids checks (see below)
 - `schema`, `bsdd`, `diagnose-geometry`, `extract-entities`, `generate-spaces`, `lod`, `ext` - see `ifc-lite --help`
 
@@ -48,7 +62,7 @@ Global flags: `--json`, `--out <file>`, `--verbose`, `--quiet`, `--debug`, `--lo
 
 ## gym
 
-`ifc-lite gym` is a prototype reset/step/reward environment API over the existing headless checks: the skeleton of an RLVR environment for buildings (see [`docs/vision/moonshots-tech.md`](../../docs/vision/moonshots-tech.md) M2 and [`docs/vision/moonshots-execution-plan.md`](../../docs/vision/moonshots-execution-plan.md) B0.4). It wraps a model - either a fixed file (`--model`) or a procedurally generated World Gym episode (`--seed`) - and lets an agent apply data-mutation ops, scoring each step against the same schema/clash/ids checks the `validate`, `clash`, and `ids` commands already run.
+`ifc-lite gym` is a prototype reset/step/reward environment API over the existing headless checks: the skeleton of an RLVR environment for buildings (see [`tools/world-gym/README.md`](../../tools/world-gym/README.md) M2 and [`tools/world-gym/benchmark/BENCHMARK.md`](../../tools/world-gym/benchmark/BENCHMARK.md) B0.4). It wraps a model - either a fixed file (`--model`) or a procedurally generated World Gym episode (`--seed`) - and lets an agent apply data-mutation ops, scoring each step against the same schema/clash/ids checks the `validate`, `clash`, and `ids` commands already run.
 
 ```bash
 ifc-lite gym --model model.ifc --checks schema,clash

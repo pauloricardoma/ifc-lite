@@ -64,6 +64,16 @@ export interface ClashRule {
   a: string;
   /** Selector for set B. Omitted ⇒ self-clash within A. */
   b?: string;
+  /**
+   * Explicit membership for set A — `clashMemberKey(model, ref)` strings. When
+   * present it REPLACES the `a` selector, so a caller that can resolve a richer
+   * filter than a type name (properties, attributes, storeys) against the model
+   * can express it. An empty array means "matched nothing", never "everything".
+   * See `members.ts`.
+   */
+  membersA?: readonly string[];
+  /** Explicit membership for set B, replacing the `b` selector. See `membersA`. */
+  membersB?: readonly string[];
   mode: ClashMode;
   /** Touching band (m). Defaults to the run-level tolerance. */
   tolerance?: number;
@@ -143,8 +153,9 @@ export interface ClashSettings {
  *   earlier "deepest crossing-triangle vertex" probe that was a sampling
  *   artifact, converging to 0 as a mesh was retessellated instead of to the
  *   true depth (PR #2536).
- * - `'estimate'` — read off the two element AABBs: the smallest overlapping box
- *   dimension. Reported for a hard clash whenever the narrow phase could not
+ * - `'estimate'` — an uncertified depth: the smallest overlapping dimension of
+ *   the two element AABBs, or for a box through-penetration that value capped
+ *   by the box-box minimum translation distance (see below). Reported for a hard clash whenever the narrow phase could not
  *   certify a box-box depth. That happens in four shapes, all common in real
  *   models: either element is not (confirmed) a box; surfaces that only
  *   coincide (stacked layers sharing a footprint); one solid modelled wholly
@@ -155,7 +166,9 @@ export interface ClashSettings {
  *   `'mesh'` for exactly that reason. The value is then a property of the two
  *   BOXES, not of the solids — it can equal an element's own thickness rather
  *   than how far the two actually interpenetrate. Treat it as an indication of
- *   scale, not as a measurement.
+ *   scale, not as a measurement. For a through-penetration between two boxes
+ *   it never exceeds the box-box minimum translation distance, a distance
+ *   proven to separate them (#5742).
  */
 export type ClashDistanceKind = 'mesh' | 'estimate';
 
@@ -174,6 +187,21 @@ export interface Clash {
    * assignable — absent means "unknown", never "measured".
    */
   distanceKind?: ClashDistanceKind;
+  /**
+   * For a `hard` clash, the float32 noise floor of `distance` along the
+   * direction that depth was measured: the depth at or below which the engine
+   * would have classified the pair as `touch` (#5405). Derived from the
+   * elements' own coordinates on that axis and their sizes, never from their
+   * distance from the origin along other axes, so it does not change under a
+   * translation orthogonal to the depth. `isTouching` uses it for its default
+   * band (#5639).
+   *
+   * Set by the engine on every `hard` clash, absent on every other status.
+   * Optional so that a clash recorded before this field existed (or
+   * rehydrated from BCF/JSON without it) stays assignable; `isTouching` then
+   * falls back to its older coordinate-magnitude band.
+   */
+  depthFloor?: number;
   /** True contact point (hard) or closest-point midpoint (clearance/touch). */
   point: Vec3;
   /** Overlap region (hard) or closest-segment box (clearance/touch). */
@@ -225,6 +253,53 @@ export interface ClashRuleCoverage {
   rule: string;
   matchedA: number;
   matchedB: number | null;
+  /**
+   * Whether each side was resolved from explicit membership (`membersA` /
+   * `membersB`) rather than from its type selector. A caller explaining an
+   * empty side needs it and cannot recover it from `rulesRun`, which
+   * deliberately drops the resolved member lists. Absent on a result recorded
+   * before this existed — which is the same thing as "by selector".
+   */
+  fromMembersA?: boolean;
+  fromMembersB?: boolean;
+  /**
+   * The durable `key` (IfcGUID / USD prim path) of every element THIS rule
+   * matched on each side, deduplicated and sorted for determinism — not just
+   * a count. `compareClashRevisions` (revision.ts) needs this to ask "was
+   * this SPECIFIC element re-examined?", which `matchedA`/`matchedB` (counts
+   * only) cannot answer: a narrowed selector that drops one previously-
+   * matched element while keeping the total count non-zero is invisible to a
+   * count-only check. `matchedKeysB` mirrors `matchedB`'s `null` for a
+   * self-clash rule (no `b` side). Absent (not just empty) on a result
+   * recorded before this existed, or from a hand-built fixture — callers
+   * MUST treat an absent `matchedKeysA` as "cannot verify", never as "matched
+   * nothing".
+   */
+  matchedKeysA?: readonly string[];
+  matchedKeysB?: readonly string[] | null;
+  /**
+   * Broad-phase candidate pairs the geometry kernel actually narrow-phase
+   * tested for THIS rule (`RuleDetection.candidatesProcessed` in
+   * `engine-ts/kernel.ts`), surfaced here so a caller can tell "matched
+   * elements on both sides AND compared some of them" apart from "matched
+   * elements on both sides but the broad phase found nothing worth testing".
+   * `matchedA`/`matchedB` alone cannot make that distinction — they are
+   * selector-match counts taken before any geometry runs, so they read as
+   * full coverage even when the broad phase (BVH margin query) ends up
+   * empty (#4244).
+   *
+   * `0` here is NOT on its own evidence of a problem: two selected groups
+   * that are genuinely far apart (further than the rule's tolerance/
+   * clearance margin) legitimately produce zero candidate pairs and a real
+   * `'clean'` result — that is the ordinary, correct outcome for a rule
+   * whose matched elements never come close to touching. `classifyRuleCoverage`
+   * does not treat this field as a coverage signal for exactly that reason;
+   * it exists as a diagnostic a caller can inspect when a `'clean'` result
+   * looks suspicious for other reasons (e.g. a much larger selector match
+   * count than expected), not as an automatic verdict. Absent on a result
+   * recorded before this field existed, or from a hand-built fixture.
+   */
+  candidatesExamined?: number;
 }
 
 export interface ClashResult {

@@ -17,8 +17,12 @@
  * `CompactEntityIndex` whose backing typed arrays are immutable.
  */
 
+import { prepareEntityOperations } from './prepare-entity-operations.js';
+import { highestExistingExpressId } from './express-id-watermark.js';
+import { sourceEntityRef, storeHasSourceEntity } from './source-entity-index.js';
+import type { EntityOperation, EntityPreparationOptions, PreparedEntityOperations } from './cooperative-operation-types.js';
 import type { MutablePropertyView } from './mutable-property-view.js';
-import { QuantityType, PropertyValueType } from '@ifc-lite/data';
+import { IFC_ENTITY_NAMES, QuantityType, PropertyValueType } from '@ifc-lite/data';
 import type {
   IfcAttributeValue,
   MutationEntityRef as EntityRef,
@@ -67,8 +71,32 @@ export class StoreEditor {
   constructor(store: IfcDataStore, view: MutablePropertyView) {
     this.store = store;
     this.view = view;
-    this.maxExistingId = this.computeMaxExistingId();
+    this.maxExistingId = highestExistingExpressId(this.store);
     this.view.setExpressIdWatermark(this.maxExistingId);
+  }
+
+  /** Stage one synchronous IFC edit; failure publishes no partial overlay (#4243).
+   * Prepare image/worker resources before calling this. Returned entity IDs are
+   * valid after success; the draft editor is detached after this callback. */
+  runAtomic<T>(edit: (draft: StoreEditor) => T): T {
+    return this.view.runAtomic(draft => edit(new StoreEditor(this.store, draft)));
+  }
+
+  /** Cooperatively prepare owned entity operations without exposing a draft.
+   * Construction establishes the live allocator watermark before this action;
+   * cancellation changes no live overlay state. Final exact validation is synchronous. */
+  prepareEntityOperations(operations: readonly EntityOperation[], options: EntityPreparationOptions = {}): Promise<PreparedEntityOperations> {
+    return prepareEntityOperations(this.store, this.view, operations, options, draft => this.forkPreparedEditor(draft));
+  }
+
+  private forkPreparedEditor(view: MutablePropertyView): StoreEditor {
+    // The original editor already established its watermark. Reuse that exact
+    // facade state instead of scanning the entire immutable source index again.
+    const editor = Object.create(StoreEditor.prototype) as StoreEditor;
+    editor.store = this.store;
+    editor.view = view;
+    editor.maxExistingId = this.maxExistingId;
+    return editor;
   }
 
   /**
@@ -79,7 +107,7 @@ export class StoreEditor {
    * no-op.
    */
   refreshWatermark(): void {
-    const fresh = this.computeMaxExistingId();
+    const fresh = highestExistingExpressId(this.store);
     if (fresh > this.maxExistingId) {
       this.maxExistingId = fresh;
     }
@@ -156,7 +184,7 @@ export class StoreEditor {
     // emit phantom CREATE_ENTITY / DELETE_ENTITY pairs into the mutation
     // history just to fix our own bookkeeping.
     const nextId = this.view.peekNextExpressId();
-    if (this.store.entityIndex.byId.has(nextId) || this.store.deferredEntityIndex?.has(nextId)) {
+    if (storeHasSourceEntity(this.store, nextId)) {
       this.refreshWatermark();
     }
     const created = this.view.createEntity(canonical, attributes);
@@ -178,7 +206,7 @@ export class StoreEditor {
     if (this.view.getNewEntity(expressId) !== null) {
       return this.view.deleteEntity(expressId);
     }
-    if (!this.store.entityIndex.byId.has(expressId)) return false;
+    if (!storeHasSourceEntity(this.store, expressId)) return false;
     return this.view.deleteEntity(expressId);
   }
 
@@ -246,10 +274,10 @@ export class StoreEditor {
     }
 
     const newEntity = this.view.getNewEntity(expressId);
-    if (newEntity === null && !this.store.entityIndex.byId.has(expressId)) {
+    if (newEntity === null && !storeHasSourceEntity(this.store, expressId)) {
       return false;
     }
-    const oldType = newEntity?.type ?? this.store.entityIndex.byId.get(expressId)?.type;
+    const oldType = newEntity?.type ?? sourceEntityRef(this.store, expressId)?.type;
     this.view.setEntityType(expressId, canonical, options?.predefinedType ?? null, oldType);
     return true;
   }
@@ -259,9 +287,48 @@ export class StoreEditor {
     return this.view.getNewEntity(expressId);
   }
 
+  /** Whether an id resolves to a live source or overlay entity. */
+  hasEntity(expressId: number): boolean {
+    return Number.isSafeInteger(expressId) && expressId > 0 && !this.view.isDeleted(expressId)
+      && (this.view.getNewEntity(expressId) !== null || storeHasSourceEntity(this.store, expressId));
+  }
+
   /** All overlay-created entities, in insertion order. */
   getNewEntities(): NewEntity[] {
     return this.view.getNewEntities();
+  }
+
+  /** The live overlay this editor writes to, for effective read boundaries. */
+  getMutationView(): MutablePropertyView {
+    return this.view;
+  }
+
+  /** The schema declared by the loaded model, if the store exposes it. */
+  getSchemaVersion(): string | undefined {
+    return this.store.schemaVersion;
+  }
+
+  /**
+   * The entity's CURRENT IFC class — canonical, from whichever layer is
+   * authoritative: a pending retype, an overlay-created entity's authored
+   * type, or the source record's declared type — or `undefined` when the id
+   * is deleted or resolves to nothing at all. The one place a builder that
+   * takes "an id of a specific class" (e.g. `bim.store.addCostValue`'s
+   * `UnitBasis`) checks what it actually got, rather than trusting the
+   * caller.
+   */
+  getEntityType(expressId: number): string | undefined {
+    if (!this.hasEntity(expressId)) return undefined;
+    const canonical = (type: string): string => configuredNormalizer?.(type)
+      || IFC_ENTITY_NAMES[type.toUpperCase()]
+      || type;
+    const retype = this.view.getEntityTypeMutation(expressId);
+    if (retype) return canonical(retype.newType);
+    const created = this.view.getNewEntity(expressId);
+    if (created) return canonical(created.type);
+    // Both halves of the source index, like `hasEntity` (#5222).
+    const sourceType = sourceEntityRef(this.store, expressId)?.type;
+    return sourceType ? canonical(sourceType) : undefined;
   }
 
   /**
@@ -313,22 +380,5 @@ export class StoreEditor {
       psetName,
       properties.map((p) => ({ name: p.name, value: p.value, type: kind[p.type], unit: p.unit })),
     );
-  }
-
-  private computeMaxExistingId(): number {
-    let max = 0;
-    for (const id of this.store.entityIndex.byId.keys()) {
-      if (id > max) max = id;
-    }
-    // Deferred property atoms occupy express ids too — clear them so a newly
-    // allocated overlay id can never collide with a deferred atom that sits
-    // above the primary-index maximum (which the exporter now emits).
-    const deferred = this.store.deferredEntityIndex;
-    if (deferred) {
-      for (const id of deferred.keys()) {
-        if (id > max) max = id;
-      }
-    }
-    return max;
   }
 }

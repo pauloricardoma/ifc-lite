@@ -33,6 +33,9 @@ export interface Material {
   transparency?: number;
 }
 
+/** IFC-authored metallic/roughness (#5582); an absent field keeps the renderer's default. */
+export type MeshFinish = Partial<Pick<Material, 'metallic' | 'roughness'>>;
+
 export interface Mesh {
   expressId: number;
   modelIndex?: number;  // Index of the model this mesh belongs to (for multi-model federation)
@@ -40,8 +43,13 @@ export interface Mesh {
   indexBuffer: GPUBuffer;
   indexCount: number;
   transform: Mat4;
+  /** Canonical f64-like translation used by the RTE mesh path.  It is kept
+   * separate from the GPU f32 transform so hydrated selection meshes do not
+   * reintroduce national-grid rounding after their source batch was rebased. */
+  rteOrigin?: [number, number, number];
   color: [number, number, number, number];
   material?: Material;
+  finish?: MeshFinish; // IFC-authored (#5582); packMeshMaterial prefers it over `material`
   // Per-mesh GPU resources for unique colors
   uniformBuffer?: GPUBuffer;
   bindGroup?: GPUBindGroup;
@@ -75,6 +83,8 @@ export interface BatchedMesh {
   indexBuffer: GPUBuffer;
   indexCount: number;
   color: [number, number, number, number];
+  /** Finish shared by every piece: `colorKey` folds it in at 1/1000, so a batch never mixes finishes (#5582). */
+  finish?: MeshFinish;
   expressIds: number[];  // For picking - all expressIds in this batch
   /** The exact meshes this batch was merged from — the source a partial
    *  sub-batch (hide/isolate/ghost) is rebuilt from. Streaming fragments are
@@ -199,13 +209,24 @@ export type SeparationLinesQuality = 'off' | 'low' | 'high';
 
 export interface VisualEnhancementOptions {
   enabled?: boolean;
-  edgeContrast?: {
-    enabled?: boolean;
-    intensity?: number;
-  };
+  /** @deprecated No effect since #5746: edges come from the edge pass, see `separationLines`. Kept so existing settings type-check. */
+  edgeContrast?: { enabled?: boolean; intensity?: number };
+  /**
+   * Screen-space ambient occlusion (the option keeps its historical name).
+   * Darkens corners, junctions and contact areas from the depth buffer; the
+   * sky and background are never darkened. Paused while navigating on GPUs
+   * that miss frames (see {@link RenderOptions.isInteracting}).
+   */
   contactShading?: {
+    /** `'low'`: half-resolution AO, 12 taps. `'high'`: full resolution, 16 taps. Default `'off'`. */
     quality?: ContactShadingQuality;
+    /** Darkening strength, 0-1 (clamped). Default 0.8. */
     intensity?: number;
+    /**
+     * Occlusion radius in WORLD units (metres for IFC models), 0.05-10
+     * (clamped). Geometry farther than this from a point does not occlude it.
+     * Default 1.
+     */
     radius?: number;
   };
   separationLines?: {
@@ -220,8 +241,8 @@ export interface RenderOptions {
   clearColor?: [number, number, number, number];
   /**
    * Global lighting environment (sun direction/colour, hemisphere ambient,
-   * exposure, procedural sky). Omitted/empty reproduces the legacy hardcoded
-   * look exactly. See {@link import('./environment.js').LightingEnvironment}.
+   * exposure, procedural sky). Omitted/empty uses the default rig. See
+   * {@link import('./environment.js').LightingEnvironment}.
    */
   environment?: import('./environment.js').LightingEnvironment;
   /**
@@ -253,6 +274,8 @@ export interface RenderOptions {
   isolatedIds?: Set<number> | null;
   selectedId?: number | null;     // Currently selected mesh (for highlighting)
   selectedIds?: Set<number>;      // Multi-selection support
+  selectedItemId?: number;        // #4382: narrows selectedId's highlight to one representation item (geometryItemId); no effect on selectedIds
+  hoverOutline?: { id: number; modelIndex?: number } | null; // #5390 thin visible-only pre-highlight; modelIndex scopes federation
   /**
    * Render the active colour overrides almost full-bright so they POP like a
    * highlight rather than reading as normal lit materials. Used while a clash is
@@ -267,9 +290,12 @@ export interface RenderOptions {
    * pipeline. Selected meshes (`selectedId` / `selectedIds`) are exempt at
    * every site, so highlights always paint with their own alpha.
    *
-   * Mixed batches (some entries overridden, some not) take the minimum
-   * override alpha across non-selected ids; selected meshes in the batch
-   * are then redrawn on top by the highlight pass.
+   * The alpha applies to THOSE ENTITIES, not to their colour batch (#4129):
+   * a batch whose entities no longer share one alpha is drawn as one
+   * sub-batch per distinct alpha. A batch that cannot be partitioned — its
+   * CPU geometry was released or evicted, it is colour-merged, or it carries
+   * more than 8 distinct alphas — falls back to the minimum override alpha
+   * across its non-selected ids, so degrading fades too much, never too little.
    *
    * The renderer snapshots this map at frame start, so callers may freely
    * mutate or recycle their copy after `render()` returns.
@@ -288,12 +314,10 @@ export interface RenderOptions {
    * are always exempt, and explicit {@link transparencyOverrides} entries win
    * over the ghost alpha. Same id space as `isolatedIds` (federated global id).
    *
-   * Mixed colour batches resolve to the minimum alpha among their non-selected
-   * entities (same as {@link transparencyOverrides}), so an excepted id that
-   * shares a batch with ghosted ids fades with the batch unless it is also in
-   * `selectedIds` — the selection highlight pass then repaints it opaque. To
-   * guarantee a focused entity stays fully solid, include it in `selectedIds`
-   * (the clash viewer co-selects the focused pair for exactly this reason).
+   * Resolution is per entity, with the same batch partition and the same
+   * whole-batch fallback documented on {@link transparencyOverrides}: an
+   * excepted id sharing a colour batch with ghosted ids stays solid on its own,
+   * without having to be in `selectedIds` as well.
    */
   ghostExceptIds?: Set<number> | null;
   /**
@@ -331,9 +355,9 @@ export interface RenderOptions {
   // Streaming state
   isStreaming?: boolean;          // If true, skip expensive operations like picker
   // True during rapid camera movement (zoom, orbit, pan, animations).
-  // Post effects (contact shading / separation lines) KEEP RUNNING during
+  // Post effects (ambient occlusion / separation lines) KEEP RUNNING during
   // interaction as long as the measured frame cadence holds; on GPUs that
-  // miss frames the renderer adaptively degrades to skipping the post pass
+  // miss frames the renderer adaptively degrades to skipping the post passes
   // for the rest of the gesture (see InteractionEffectsGovernor). Full
   // quality is always restored on the next non-interacting frame.
   isInteracting?: boolean;
@@ -390,31 +414,7 @@ export interface RenderOptions {
   sunShadows?: { enabled: boolean; resolution?: number; sunAngleDeg?: number };
 }
 
-/**
- * Options for GPU picking/selection
- * Filters out hidden/invisible elements so users can select what's visible
- */
-export interface PickOptions {
-  // Skip picking during streaming for performance
-  isStreaming?: boolean;
-  // Visibility filtering - same as RenderOptions for consistency
-  hiddenIds?: Set<number>;        // Hidden elements (can't be picked)
-  isolatedIds?: Set<number> | null; // Only these elements can be picked (null = all pickable)
-}
-
-/**
- * Resolved clip state the GPU picker mirrors from the most recent render so that
- * section/crop-clipped geometry is unpickable, not just invisible. The renderer
- * stashes this each `render()` and feeds it to the picker; consumers don't build
- * it. Point clouds are clipped by the section plane only (matching the point
- * render); the crop box clips triangle meshes only, on render and on pick.
- */
-export interface PickClipState {
-  // Resolved section plane (world space, already enabled), or null when off.
-  sectionPlane?: { normal: [number, number, number]; distance: number; flipped: boolean } | null;
-  // Active axis-aligned crop box, or null when off.
-  clipBox?: ClipBox | null;
-}
+export type { PickOptions, PickClipState } from './pick-types.js';
 
 // `PickResult` lives with the code that builds it (pick-resolve.ts) and is
 // re-exported here so every existing `from './types.js'` import still resolves.

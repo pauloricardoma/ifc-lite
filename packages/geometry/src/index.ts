@@ -9,6 +9,7 @@
 
 // IFC-Lite components (recommended - faster)
 export { IfcLiteBridge, type SymbolicRepresentationCollection, type SymbolicPolyline, type SymbolicCircle, type ProfileCollection, type ProfileEntryJs } from './ifc-lite-bridge.js';
+export type { ExtrusionDefinitions, SweptDiskDescriptions } from './analytic-descriptions.js';
 import { safeUtf8Decode } from '@ifc-lite/data';
 
 // Platform bridge abstraction (auto-selects WASM or native based on environment)
@@ -30,6 +31,7 @@ export {
 // event and the native ProcessingStats).
 export type { GeometryDiagnostics } from './diagnostics.js';
 export { mergeGeometryDiagnostics } from './diagnostics.js';
+export type { HbjsonStats } from './hbjson-stats.js'; // consumed by the CLI + viewer energy-export UI
 
 // Typed export-failure contract (fail-closed empty exports, mirrors Rust ExportError).
 export { NO_RENDER_GEOMETRY, isNoRenderGeometryError } from './export-errors.js';
@@ -44,8 +46,13 @@ export { geometryAabbAt, geometryVolumeAt } from './geometry-fingerprints.js';
 // Support components
 export { BufferBuilder } from './buffer-builder.js';
 export { CoordinateHandler, NORMAL_COORD_THRESHOLD_M } from './coordinate-handler.js';
+export type { RtcFrame } from './rtc-frame.js';
 export { computeWorkerCount, pickWorkerCount, type WorkerCountInputs, type WorkerCountResult } from './worker-count.js';
 export { getGeometryStreamWatchdogMs, type WatchdogInputs } from './watchdog.js';
+export { DEFAULT_HUNG_JOB_TIMEOUT_MS, type SkippedHungElements } from './hung-job-recovery.js';
+// #4902: which pre-worker pipeline phase a consumer's own stream watchdog
+// should attribute a stall to, derived from the pool's own gate state.
+export { type StallPhase, type StallPhaseHandle } from './stall-phase.js';
 // Cold-start prewarm: start the shared wasm fetch+compile before a file is
 // opened so the download overlaps think time instead of blocking first
 // geometry. The host app decides when (idle / intent) and affordability.
@@ -80,19 +87,25 @@ export {
 } from './packed-instanced-decoder.js';
 
 export * from './types.js';
-
+export * from './spatial-reference.js';
 import { IfcLiteBridge } from './ifc-lite-bridge.js';
+import type { ExtrusionDefinitions, SweptDiskDescriptions } from './analytic-descriptions.js';
 import { notifyIfWasmAssetUnavailable } from './wasm-asset-error.js';
 import { BufferBuilder } from './buffer-builder.js';
 import { CoordinateHandler } from './coordinate-handler.js';
 import { GEOM_CLASS_OCCURRENCE, geometryClassOf } from './geometry-class.js';
 import { createPlatformBridge, isTauri, type GeometryStats as PlatformGeometryStats, type IPlatformBridge } from './platform-bridge.js';
 import type { GeometryResult, MeshData, CoordinateInfo, GridAxis, TessellationQuality, KmzAltitudeMode, SimplifyMeshesResult } from './types.js';
+import type { HbjsonStats } from './hbjson-stats.js';
 
 // Extracted sub-modules
 import { getStreamingBatchSize, convertMeshCollectionToBatch, withBuildingRotation } from './geometry-coordinate.js';
+import { resolveRtcFrame, type RtcFrame } from './rtc-frame.js';
 import { streamNativeGeometry } from './geometry-native.js';
 import { processParallel } from './geometry-parallel.js';
+import type { StallPhaseHandle } from './stall-phase.js';
+import type { ByteStreamingPrePassResult } from './byte-streaming-prepass-result.js';
+import { buildPrePassWithFinishes } from './style-finishes.js';
 
 /**
  * Default quantization grid (metres) for per-entity geometry hashing,
@@ -100,26 +113,6 @@ import { processParallel } from './geometry-parallel.js';
  * side (1 mm). Used by {@link GeometryProcessor.enableGeometryHashes}.
  */
 export const DEFAULT_GEOM_HASH_TOLERANCE = 1.0e-3;
-
-interface ByteStreamingPrePassResult {
-  jobs: Uint32Array;
-  totalJobs: number;
-  unitScale: number;
-  rtcOffset?: Float64Array;
-  needsShift: boolean;
-  buildingRotation?: number | null;
-  voidKeys: Uint32Array;
-  voidCounts: Uint32Array;
-  voidValues: Uint32Array;
-  styleIds: Uint32Array;
-  styleColors: Uint8Array;
-  /** Prepass-resolved plane-angle→radians scale (additive wire field). */
-  planeAngleToRadians?: number;
-  /** #407/#913 §2.3 per-element material colour lists (flat encoding). */
-  materialElementIds?: Uint32Array;
-  materialColorCounts?: Uint32Array;
-  materialColors?: Uint8Array;
-}
 
 export interface GeometryProcessorOptions {
   preferNative?: boolean; // Default: true in Tauri
@@ -249,6 +242,8 @@ export type StreamingGeometryEvent =
        *  non-parallel load paths. See ./diagnostics.ts for the field semantics
        *  and which counts are exact vs batch-summed upper bounds. */
       diagnostics?: import('./diagnostics.js').GeometryDiagnostics;
+      /** Elements skipped because their geometry never finished (#4884); omitted when none. */
+      skippedHungElements?: import('./hung-job-recovery.js').SkippedHungElements;
     };
 
 // QueuedNativeStreamingEvent, native stream constants, and yieldToEventLoop
@@ -420,21 +415,21 @@ export class GeometryProcessor {
   /**
    * Surface the world→render metadata (unit scale + applied RTC offset) from
    * a pre-pass result onto the coordinate handler (issue #945). Used by the
-   * sync WASM mesh path; `sharedRtcOffset` overrides the model's own detected
-   * offset for federation alignment (mirrors `useSharedRtc` in
-   * geometry-parallel.ts and `processStreamingBytes`).
+   * sync WASM mesh path and the streaming path; the federation-override rule
+   * itself lives in `resolveRtcFrame` (rtc-frame.ts), shared with
+   * `geometry-parallel.ts`.
    */
   private applyPrePassMetadata(
     prePass: ByteStreamingPrePassResult,
     sharedRtcOffset?: { x: number; y: number; z: number },
-  ): { x: number; y: number; z: number; needsShift: boolean } {
-    const useShared = sharedRtcOffset != null;
-    const x = useShared ? sharedRtcOffset.x : (prePass.rtcOffset?.[0] ?? 0);
-    const y = useShared ? sharedRtcOffset.y : (prePass.rtcOffset?.[1] ?? 0);
-    const z = useShared ? sharedRtcOffset.z : (prePass.rtcOffset?.[2] ?? 0);
-    const needsShift = useShared ? true : Boolean(prePass.needsShift);
-    this.coordinateHandler.setWasmMetadata(prePass.unitScale, needsShift ? { x, y, z } : null);
-    return { x, y, z, needsShift };
+  ): RtcFrame {
+    const frame = resolveRtcFrame(prePass, sharedRtcOffset);
+    this.coordinateHandler.setWasmMetadata(
+      prePass.unitScale,
+      frame.needsShift ? { x: frame.x, y: frame.y, z: frame.z } : null,
+      frame,
+    );
+    return frame;
   }
 
   private collectMeshesViaPrePass(
@@ -446,7 +441,7 @@ export class GeometryProcessor {
     }
 
     const api = this.bridge.getApi();
-    const prePass = api.buildPrePassOnce(buffer) as ByteStreamingPrePassResult;
+    const prePass = buildPrePassWithFinishes(api, buffer);
     const rtc = this.applyPrePassMetadata(prePass, sharedRtcOffset);
     try {
       const meshes: MeshData[] = [];
@@ -509,26 +504,20 @@ export class GeometryProcessor {
     }
 
     const api = this.bridge.getApi();
-    const prePass = api.buildPrePassOnce(buffer) as ByteStreamingPrePassResult;
-    const useSharedRtc = sharedRtcOffset != null;
-    const rtc = useSharedRtc
-      ? sharedRtcOffset
-      : { x: prePass.rtcOffset?.[0] ?? 0, y: prePass.rtcOffset?.[1] ?? 0, z: prePass.rtcOffset?.[2] ?? 0 };
-    const effectiveNeedsShift = useSharedRtc || Boolean(prePass.needsShift);
-    this.coordinateHandler.setWasmMetadata(prePass.unitScale, effectiveNeedsShift ? { ...rtc } : null);
+    const prePass = buildPrePassWithFinishes(api, buffer);
+    const rtc = this.applyPrePassMetadata(prePass, sharedRtcOffset);
 
     // try/finally releases the pre-pass cache on every exit: the totalJobs===0
     // early return, a throw, or the consumer abandoning the generator.
     try {
       yield { type: 'model-open', modelID: 0 };
 
-      if (prePass.rtcOffset || useSharedRtc) {
-        yield {
-          type: 'rtcOffset',
-          rtcOffset: { x: rtc.x, y: rtc.y, z: rtc.z },
-          hasRtc: effectiveNeedsShift,
-        };
-      }
+      // Always publish the selected frame, including authoritative false/zero.
+      yield {
+        type: 'rtcOffset',
+        rtcOffset: { x: rtc.x, y: rtc.y, z: rtc.z },
+        hasRtc: rtc.needsShift,
+      };
 
       const buildingRotation = prePass.buildingRotation ?? undefined;
       if (!prePass.jobs || prePass.totalJobs === 0) {
@@ -556,7 +545,7 @@ export class GeometryProcessor {
           rtc.x,
           rtc.y,
           rtc.z,
-          effectiveNeedsShift,
+          rtc.needsShift,
           prePass.voidKeys,
           prePass.voidCounts,
           prePass.voidValues,
@@ -756,6 +745,7 @@ export class GeometryProcessor {
       ids: Uint32Array,
       starts: Uint32Array,
       lengths: Uint32Array, oversizedIdCount?: number, // #3395 refused records
+      malformedRecordCount?: number, // #3790 scan stopped: 0 or 1
     ) => void,
     /**
      * Explicit wasm asset URL forwarded to the worker pool. See
@@ -773,6 +763,13 @@ export class GeometryProcessor {
      * process disjoint, deterministic element slices). Undefined ⇒ heuristic.
      */
     workerCountOverride?: number,
+    sourceFingerprint?: SharedArrayBuffer,
+    /** Terminates the worker pool and ends the stream (#4884). */
+    signal?: AbortSignal,
+    /** Opt in to hung-call recovery; see `ProcessParallelOptions.hungJobTimeoutMs` (#4884). */
+    hungJobTimeoutMs?: number,
+    /** See `ProcessParallelOptions.stallPhaseHandle` (#4902). */
+    stallPhaseHandle?: StallPhaseHandle,
   ): AsyncGenerator<StreamingGeometryEvent> {
     // Initialize if needed
     if (!this.bridge?.isInitialized()) {
@@ -781,6 +778,10 @@ export class GeometryProcessor {
 
     yield* processParallel(buffer, this.coordinateHandler, sharedRtcOffset, existingSab, {
       onEntityIndex,
+      sourceFingerprint,
+      signal,
+      hungJobTimeoutMs,
+      stallPhaseHandle,
       // Issue #540: forward the merge-layers preference snapshotted
       // at construction time. processParallel posts `set-merge-layers`
       // to every spawned worker right after `init`.
@@ -826,6 +827,8 @@ export class GeometryProcessor {
       sharedRtcOffset?: { x: number; y: number; z: number };
       /** Reuse a SAB already populated by the caller (parser worker, etc.). */
       existingSab?: SharedArrayBuffer;
+      /** Fresh per-load prepass fingerprint cell; optional optimization only. */
+      sourceFingerprint?: SharedArrayBuffer;
       /**
        * Callback fired when the streaming pre-pass exports its entity
        * index. Enables a peer worker (e.g. parser) to skip its own scan.
@@ -835,11 +838,10 @@ export class GeometryProcessor {
         ids: Uint32Array,
         starts: Uint32Array,
         lengths: Uint32Array, oversizedIdCount?: number, // #3395 refused records
+        malformedRecordCount?: number, // #3790 scan stopped: 0 or 1
       ) => void;
-      /**
-       * Explicit wasm asset URL forwarded to the worker pool.
-       * See `processParallel(...).wasmUrls` for rationale.
-       */
+      /** Explicit wasm asset URL forwarded to the worker pool.
+       * See `processParallel(...).wasmUrls` for rationale. */
       wasmUrls?: { wasm?: string };
       /**
        * Explicit geometry-worker count for A/B tuning (viewer `?geomWorkers=N`).
@@ -847,6 +849,12 @@ export class GeometryProcessor {
        * Geometry output is unaffected by the count.
        */
       workerCountOverride?: number;
+      /** Terminates the parallel worker pool; see `ProcessParallelOptions.signal` (#4884). */
+      signal?: AbortSignal;
+      /** Opt in to hung-call recovery on the parallel path (#4884). */
+      hungJobTimeoutMs?: number;
+      /** See `ProcessParallelOptions.stallPhaseHandle` (#4902); parallel path only. */
+      stallPhaseHandle?: StallPhaseHandle;
     } = {}
   ): AsyncGenerator<StreamingGeometryEvent> {
     const sizeThreshold = options.sizeThreshold ?? 2 * 1024 * 1024; // Default 2MB
@@ -917,6 +925,10 @@ export class GeometryProcessor {
           options.onEntityIndex,
           options.wasmUrls,
           options.workerCountOverride,
+          options.sourceFingerprint,
+          options.signal,
+          options.hungJobTimeoutMs,
+          options.stallPhaseHandle,
         );
       } else {
         yield* this.processStreaming(buffer, options.entityIndex, batchConfig, options.sharedRtcOffset);
@@ -991,14 +1003,17 @@ export class GeometryProcessor {
    * @param buffer IFC file buffer
    * @returns Collection of symbolic polylines and circles
    */
-  parseSymbolicRepresentations(buffer: Uint8Array): import('@ifc-lite/wasm').SymbolicRepresentationCollection | null {
+  parseSymbolicRepresentations(
+    buffer: Uint8Array,
+    frame?: RtcFrame,
+  ): import('@ifc-lite/wasm').SymbolicRepresentationCollection | null {
     if (!this.bridge || !this.bridge.isInitialized()) {
       return null;
     }
     // SAB-safe: caller may pass a SharedArrayBuffer-backed view, which
     // both Firefox and Chromium reject in raw `TextDecoder.decode`.
     const content = safeUtf8Decode(buffer);
-    return this.bridge.parseSymbolicRepresentations(content);
+    return this.bridge.parseSymbolicRepresentations(content, frame);
   }
 
   /**
@@ -1009,14 +1024,14 @@ export class GeometryProcessor {
    * @param buffer IFC file buffer
    * @returns Flat line-list vertices, or null if not initialized
    */
-  parseAlignmentLines(buffer: Uint8Array): Float32Array | null {
+  parseAlignmentLines(buffer: Uint8Array, frame?: RtcFrame): Float32Array | null {
     if (!this.bridge || !this.bridge.isInitialized()) {
       return null;
     }
     // SAB-safe: caller may pass a SharedArrayBuffer-backed view, which
     // both Firefox and Chromium reject in raw `TextDecoder.decode`.
     const content = safeUtf8Decode(buffer);
-    return this.bridge.parseAlignmentLines(content);
+    return this.bridge.parseAlignmentLines(content, frame);
   }
 
   /**
@@ -1028,12 +1043,12 @@ export class GeometryProcessor {
    * @param buffer IFC file buffer
    * @returns Flat line-list vertices, or null if not initialized
    */
-  parseGridLines(buffer: Uint8Array): Float32Array | null {
+  parseGridLines(buffer: Uint8Array, frame?: RtcFrame): Float32Array | null {
     if (!this.bridge || !this.bridge.isInitialized()) {
       return null;
     }
     const content = safeUtf8Decode(buffer);
-    return this.bridge.parseGridLines(content);
+    return this.bridge.parseGridLines(content, frame);
   }
 
   /**
@@ -1045,14 +1060,14 @@ export class GeometryProcessor {
    * collection is consumed internally), or null if not initialized.
    * @param buffer IFC file buffer
    */
-  parseGridAxes(buffer: Uint8Array): GridAxis[] | null {
+  parseGridAxes(buffer: Uint8Array, frame?: RtcFrame): GridAxis[] | null {
     if (!this.bridge || !this.bridge.isInitialized()) {
       return null;
     }
     const content = safeUtf8Decode(buffer);
     // GridAxisCollection and each GridAxisJs from getAxis are wasm-bindgen
     // handles owning WASM memory — free them deterministically (AGENTS.md §7).
-    const collection = this.bridge.parseGridAxes(content);
+    const collection = this.bridge.parseGridAxes(content, frame);
     try {
       const axes: GridAxis[] = [];
       for (let i = 0; i < collection.length; i++) {
@@ -1078,37 +1093,34 @@ export class GeometryProcessor {
     }
   }
 
-  /**
-   * Extract raw profile polygons from IfcExtrudedAreaSolid building elements.
-   * Returns clean per-element profile outlines + 3D placement transforms.
-   * Used by Drawing2DGenerator for artifact-free 2D projection.
-   * @param buffer IFC file buffer
-   * @param modelIndex Federation model index (0 for single-model files)
-   * @returns Collection of ProfileEntryJs items, or null if not initialized
-   */
+  /** IFC Z-up swept-disk curves in metres; omitted IDs select all, empty IDs none; null until init. */
+  extractSweptDiskDescriptions(buffer: Uint8Array, ids?: Uint32Array): SweptDiskDescriptions | null {
+    return this.bridge?.isInitialized() ? this.bridge.extractSweptDiskDescriptions(buffer, ids) : null;
+  }
+
+  /** Exact extrusion sources in file units and world-metre uses; omitted IDs select all, empty IDs none; null until init. */
+  extractExtrusionDefinitions(buffer: Uint8Array, ids?: Uint32Array): ExtrusionDefinitions | null {
+    return this.bridge?.isInitialized() ? this.bridge.extractExtrusionDefinitions(buffer, ids) : null;
+  }
+
+  /** Extract IfcExtrudedAreaSolid profiles and transforms for 2D projection.
+   * `modelIndex` is the federation index; null until initialized. */
   extractProfiles(buffer: Uint8Array, modelIndex: number = 0): import('@ifc-lite/wasm').ProfileCollection | null {
-    if (!this.bridge || !this.bridge.isInitialized()) {
-      return null;
-    }
+    if (!this.bridge?.isInitialized()) return null;
     // SAB-safe: caller may pass a SharedArrayBuffer-backed view, which
     // both Firefox and Chromium reject in raw `TextDecoder.decode`.
     const content = safeUtf8Decode(buffer);
     return this.bridge.extractProfiles(content, modelIndex);
   }
 
-  /**
-   * Domain-format exporters (Rust source of truth in `ifc-lite-export`). Each takes
-   * the raw IFC buffer and returns the serialized output as bytes (`Uint8Array`;
-   * UTF-8 for the text formats, so output is not capped by the V8 max-string
-   * ceiling - decode with `TextDecoder` when a string is needed), or null if
-   * not initialized.
-   */
-
+  /** Rust domain exporters return bytes to avoid V8 string-size limits; decode
+   * text with TextDecoder. They return null before init(). `isolated`:
+   * undefined selects all; an empty array hides every mesh. Keep distinct. */
   exportObj(
     buffer: Uint8Array,
     includeNormals = true,
     hidden: Uint32Array = new Uint32Array(),
-    isolated: Uint32Array = new Uint32Array(),
+    isolated: Uint32Array | undefined = undefined,
   ): Uint8Array | null {
     if (!this.bridge?.isInitialized()) return null;
     return this.bridge.exportObj(buffer, includeNormals, hidden, isolated);
@@ -1123,7 +1135,7 @@ export class GeometryProcessor {
     buffer: Uint8Array,
     includeMetadata = false,
     hidden: Uint32Array = new Uint32Array(),
-    isolated: Uint32Array = new Uint32Array(),
+    isolated: Uint32Array | undefined = undefined,
     hiddenTypesCsv = '',
     lit = true,
     emissive = false,
@@ -1169,7 +1181,7 @@ export class GeometryProcessor {
     includeProperties = true,
     includeQuantities = false,
     pretty = false,
-    included: Uint32Array = new Uint32Array(),
+    included: Uint32Array | undefined = undefined,
   ): Uint8Array | null {
     if (!this.bridge?.isInitialized()) return null;
     return this.bridge.exportJsonld(buffer, context, includeProperties, includeQuantities, pretty, included);
@@ -1178,7 +1190,7 @@ export class GeometryProcessor {
   exportStep(
     buffer: Uint8Array,
     schema = '',
-    included: Uint32Array = new Uint32Array(),
+    included: Uint32Array | undefined = undefined,
     mutationsJson = '',
   ): Uint8Array | null {
     if (!this.bridge?.isInitialized()) return null;
@@ -1281,7 +1293,7 @@ export class GeometryProcessor {
     const records = meshes.filter(
       (m) => geometryClassOf(m) === GEOM_CLASS_OCCURRENCE && levels.has(m.expressId) && m.indices.length >= 3,
     );
-    const requested = new Set([...levels.keys()]);
+    const requested = new Set(levels.keys());
     const covered = new Set(records.map((m) => m.expressId));
     const result: SimplifyMeshesResult = { elements: [], skipped: [] };
     for (const id of requested) {
@@ -1363,8 +1375,7 @@ export class GeometryProcessor {
       const trisAfter: Uint32Array = out.trisAfter;
       const cavitiesDropped: Uint32Array = out.cavitiesDropped;
 
-      let rvo = 0;
-      let rio = 0;
+      let rvo = 0, rio = 0;
       for (let i = 0; i < outIds.length; i++) {
         const vCount = outVertexCounts[i] * 3;
         const iCount = outIndexCounts[i];
@@ -1379,6 +1390,7 @@ export class GeometryProcessor {
           origin: [renderOrigins[i * 3], renderOrigins[i * 3 + 1], renderOrigins[i * 3 + 2]],
           geometryClass: 0,
           ...(src?.localToWorld ? { localToWorld: src.localToWorld } : {}),
+          ...(src?.material ? { material: src.material } : {}), // #5582
         };
         result.elements.push({
           expressId: outIds[i],
@@ -1403,24 +1415,6 @@ export class GeometryProcessor {
     } finally {
       out.free();
     }
-  }
-
-  /**
-   * Package an already-produced GLB + georeference into a KMZ (Google Earth) archive.
-   * `xAxisAbscissa`/`xAxisOrdinate` are the `IfcMapConversion` grid-north components
-   * (pass `undefined` for heading 0). Returns null if not initialized.
-   */
-  exportKmz(
-    glb: Uint8Array,
-    latitude: number,
-    longitude: number,
-    altitude: number,
-    xAxisAbscissa: number | undefined,
-    xAxisOrdinate: number | undefined,
-    name = 'IFC Model',
-  ): Uint8Array | null {
-    if (!this.bridge?.isInitialized()) return null;
-    return this.bridge.exportKmz(glb, latitude, longitude, altitude, xAxisAbscissa, xAxisOrdinate, name);
   }
 
   /**
@@ -1481,17 +1475,14 @@ export class GeometryProcessor {
     );
   }
 
-  /**
-   * Export the `IfcSpace` volumes in `buffer` as a Honeybee HBJSON string
-   * (Ladybug Tools energy/daylight model). Returns null if not initialized.
-   * @param buffer IFC file buffer
-   * @param name Model identifier / display name
-   */
+  /** Export the `IfcSpace` volumes in `buffer` as Honeybee HBJSON. Null if not initialized. */
   exportHbjson(buffer: Uint8Array, name: string): Uint8Array | null {
-    if (!this.bridge || !this.bridge.isInitialized()) {
-      return null;
-    }
-    return this.bridge.exportHbjson(buffer, name);
+    return this.bridge?.isInitialized() ? this.bridge.exportHbjson(buffer, name) : null;
+  }
+
+  /** Like {@link exportHbjson}; also returns `HbjsonStats`. Null if not initialized. */
+  exportHbjsonWithStats(buffer: Uint8Array, name: string): { content: Uint8Array; stats: HbjsonStats } | null {
+    return this.bridge?.isInitialized() ? this.bridge.exportHbjsonWithStats(buffer, name) : null;
   }
 
   /**

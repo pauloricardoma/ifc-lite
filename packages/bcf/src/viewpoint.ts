@@ -14,7 +14,6 @@ import type {
   BCFPerspectiveCamera,
   BCFOrthogonalCamera,
   BCFClippingPlane,
-  BCFPoint,
   BCFDirection,
 } from './types.js';
 import { generateUuid } from '@ifc-lite/encoding';
@@ -37,6 +36,16 @@ export interface ViewerCameraState {
   isOrthographic?: boolean;
   /** Orthographic scale (view-to-world) */
   orthoScale?: number;
+  /**
+   * Viewport aspect ratio (width / height). REQUIRED to write BCF 3.0:
+   * v3_0/visinfo.xsd makes `<AspectRatio>` a mandatory child of both camera
+   * types and `writer-camera.ts` refuses to invent one, so without this field
+   * no viewpoint this package produced could be written as 3.0 at all -- and
+   * `writeBCF` throws for the whole archive on the first such camera, so one
+   * captured viewpoint meant no export (#3612). Optional because 2.1 has no
+   * such element; leave it unset rather than assert a view nobody had.
+   */
+  aspectRatio?: number;
 }
 
 export interface ViewerSectionPlane {
@@ -92,7 +101,7 @@ function viewerToBcfCoords(p: Point3D): Point3D {
 /**
  * Convert from BCF coordinates (Z-up) to viewer coordinates (Y-up)
  */
-function bcfToViewerCoords(p: Point3D): Point3D {
+export function bcfToViewerCoords(p: Point3D): Point3D {
   return {
     x: p.x,
     y: p.z,
@@ -144,6 +153,7 @@ export function cameraToPerspective(camera: ViewerCameraState): BCFPerspectiveCa
     cameraDirection: direction,
     cameraUpVector: upVector,
     fieldOfView: Math.max(1, Math.min(179, fieldOfView)), // Clamp to valid range
+    ...(camera.aspectRatio === undefined ? {} : { aspectRatio: camera.aspectRatio }),
   };
 }
 
@@ -184,6 +194,7 @@ export function cameraToOrthogonal(
     cameraDirection: direction,
     cameraUpVector: upVector,
     viewToWorldScale,
+    ...(camera.aspectRatio === undefined ? {} : { aspectRatio: camera.aspectRatio }),
   };
 }
 
@@ -235,6 +246,15 @@ export function perspectiveToCamera(
     up: viewerUp,
     fov,
     isOrthographic: false,
+    // Carried back so the conversion pair is lossless in both directions.
+    // NOT for the viewer's apply path: `useBCF`'s `applyCameraState` never
+    // pushes an aspect ratio into the renderer (the viewport owns that) and
+    // `getCameraState` reads a fresh one, so nothing there depends on this.
+    // It matters for a caller that reads a viewpoint, edits the camera state,
+    // and writes it back -- `perspectiveToCamera` -> `cameraToPerspective`
+    // would otherwise silently drop the field and make the result unwritable
+    // as BCF 3.0. The tests pin the round trip, not a viewer scenario.
+    ...(camera.aspectRatio === undefined ? {} : { aspectRatio: camera.aspectRatio }),
   };
 }
 
@@ -269,6 +289,7 @@ export function orthogonalToCamera(
     fov: Math.PI / 4, // Default FOV for ortho (not used)
     isOrthographic: true,
     orthoScale: camera.viewToWorldScale,
+    ...(camera.aspectRatio === undefined ? {} : { aspectRatio: camera.aspectRatio }),
   };
 }
 
@@ -450,7 +471,24 @@ export function createViewpoint(options: {
   // Add components
   const hasSelection = selectedGuids && selectedGuids.length > 0;
   const hasHidden = hiddenGuids && hiddenGuids.length > 0;
-  const hasVisible = visibleGuids && visibleGuids.length > 0;
+  // `visibleGuids` is an ISOLATION ALLOWLIST and is meaningfully nullable:
+  // omitted means "no isolation channel is active, everything is visible",
+  // while an EMPTY array means one IS active and currently matches nothing --
+  // the viewer is showing an empty viewport, and the viewpoint has to say so.
+  // A `.length > 0` test here collapses the two and writes a viewpoint
+  // claiming the whole model is visible. Same distinction `isEntityVisible`
+  // in `packages/renderer/src/entity-visibility.ts` draws for `isolatedIds`.
+  // `hiddenGuids` below is a BLOCKLIST, where empty and absent both correctly
+  // mean "hide nothing", so it keeps its length test.
+  //
+  // When BOTH are supplied the allowlist wins and the blocklist is not
+  // written. That is deliberate and lossless, not a dropped input: BCF's
+  // `<Visibility>` carries a single `DefaultVisibility` flag, so only one of
+  // the two modes can be expressed at all -- and an allowlist already hides
+  // everything outside itself, `hiddenGuids` included. `visibleGuids: []`
+  // (isolate nothing) hides the whole model, which likewise satisfies any
+  // blocklist. Pinned by "lets an isolation allowlist subsume hiddenGuids".
+  const hasVisible = visibleGuids != null;
   const hasColoring = coloredGuids && coloredGuids.length > 0;
 
   if (hasSelection || hasHidden || hasVisible || hasColoring) {
@@ -498,7 +536,16 @@ export function extractViewpointState(
   sectionPlane?: ViewerSectionPlane;
   selectedGuids: string[];
   hiddenGuids: string[];
-  visibleGuids: string[]; // For isolation mode (defaultVisibility=false)
+  // For isolation mode (defaultVisibility=false). `null` means the viewpoint
+  // carries no isolation channel at all (show everything); a non-null array
+  // -- EMPTY included -- means isolation WAS active in the captured
+  // viewpoint, down to "matched nothing". Collapsing an empty array from a
+  // spec-valid `<Visibility DefaultVisibility="false"/>` with no
+  // `<Exceptions>` (a real BCF viewer isolating to nothing) into the same
+  // shape as "no isolation" misreads a captured empty viewport as an
+  // unfiltered one -- the read-side half of the write-side fix in
+  // `createViewpoint`'s `hasVisible`, above.
+  visibleGuids: string[] | null;
   coloredGuids: { color: string; guids: string[] }[];
 } {
   let camera: ViewerCameraState | undefined;
@@ -528,15 +575,22 @@ export function extractViewpointState(
 
   // Extract visibility GUIDs
   const hiddenGuids: string[] = [];
-  const visibleGuids: string[] = [];
+  let visibleGuids: string[] | null = null;
   if (viewpoint.components?.visibility) {
     const { defaultVisibility, exceptions } = viewpoint.components.visibility;
+    // `defaultVisibility === false` is what the BCF schema uses to mean
+    // "isolation mode" -- set it regardless of whether `exceptions` is
+    // present, so an isolation that matches nothing (no `<Exceptions>`
+    // element, or an empty one) still comes back as `[]`, not `null`.
+    if (defaultVisibility === false) {
+      visibleGuids = [];
+    }
     if (exceptions) {
       for (const comp of exceptions) {
         if (comp.ifcGuid) {
           if (defaultVisibility === false) {
             // Isolation mode: exceptions are the visible entities
-            visibleGuids.push(comp.ifcGuid);
+            visibleGuids!.push(comp.ifcGuid);
           } else {
             // Normal mode: exceptions are the hidden entities
             hiddenGuids.push(comp.ifcGuid);

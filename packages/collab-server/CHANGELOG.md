@@ -1,5 +1,53 @@
 # @ifc-lite/collab-server
 
+## 0.7.3
+
+### Patch Changes
+
+- Updated dependencies [[`dec98a2`](https://github.com/LTplus-AG/ifc-lite/commit/dec98a2c97e03e70e8b78c55bb27e87b5b4013a6), [`074178f`](https://github.com/LTplus-AG/ifc-lite/commit/074178f651c21dacbfbec33534701a59a7e81ace), [`dabc489`](https://github.com/LTplus-AG/ifc-lite/commit/dabc48987aca1392685218dd31641f8dbadf9590), [`f942fb6`](https://github.com/LTplus-AG/ifc-lite/commit/f942fb6c48ac9be1464e49fd963340835a72945d), [`58691b3`](https://github.com/LTplus-AG/ifc-lite/commit/58691b362d67ab87f666d76d6ee27e39d1ec45f9), [`685b541`](https://github.com/LTplus-AG/ifc-lite/commit/685b5414f57eec64c74e056b9b51b6b8ffe3a88f)]:
+  - @ifc-lite/collab@0.9.0
+  - @ifc-lite/ifcx@4.2.0
+  - @ifc-lite/merge@0.4.7
+
+## 0.7.2
+
+### Patch Changes
+
+- Updated dependencies [[`e18a434`](https://github.com/LTplus-AG/ifc-lite/commit/e18a434ec2258e474728bd9a90146486b38efedb), [`53003de`](https://github.com/LTplus-AG/ifc-lite/commit/53003de1e36a956b7f51e9dffc035218477d5d3c), [`4ab63cd`](https://github.com/LTplus-AG/ifc-lite/commit/4ab63cd72e374dbdc98b6f59599fb9d2050f0f85)]:
+  - @ifc-lite/collab@0.8.0
+  - @ifc-lite/ifcx@4.1.1
+
+## 0.7.1
+
+### Patch Changes
+
+- Updated dependencies [[`b0700f2`](https://github.com/LTplus-AG/ifc-lite/commit/b0700f25434d1cf1ec5f7438a8e27c09188208ec), [`7179a9c`](https://github.com/LTplus-AG/ifc-lite/commit/7179a9c6c2d0620f6bd3260e37b80c771697ce85), [`dbf513b`](https://github.com/LTplus-AG/ifc-lite/commit/dbf513b785f1dbc2f2dce5c173d28fd5ab65aa0c)]:
+  - @ifc-lite/ifcx@4.1.0
+  - @ifc-lite/collab@0.7.0
+
+## 0.7.0
+
+### Minor Changes
+
+- [#3579](https://github.com/LTplus-AG/ifc-lite/pull/3579) [`b50283e`](https://github.com/LTplus-AG/ifc-lite/commit/b50283e99b4e34a8a28b69f35497ad9379c4565b) Thanks [@BIMvoice](https://github.com/BIMvoice)! - `Principal.expiresAt` is now enforced, not just carried. It was documented in `auth.ts` as "checked again every 5 minutes per spec", populated from a room token's `exp` claim, and never read anywhere on any post-connect path ([#3441](https://github.com/LTplus-AG/ifc-lite/issues/3441)): an established WebSocket session kept write access indefinitely after its credential's stated expiry, since `verifyRoomToken` only checks expiry at connect and nothing re-examined it afterward.
+  
+  Two enforcement paths, covering different exposure:
+  
+  - `Room`'s write-gate (`preCheckWriteFrame`) now denies a sync write-frame with reason `expired` once `Date.now()` passes `principal.expiresAt` (plus the same clock-skew tolerance `verifyRoomToken` applies at connect).
+  - A new periodic sweep, `Room.sweepExpiredPrincipals` / `RoomManager.sweepExpiredPrincipals`, closes any connection whose principal has expired — every 5 minutes by default, matching the documented interval — so read and presence access stop too, not only writes. It reuses the same close-and-let-`ws.on('close', ...)`-clean-up path as an explicit admin kick.
+
+- [#3470](https://github.com/LTplus-AG/ifc-lite/pull/3470) [`ac00630`](https://github.com/LTplus-AG/ifc-lite/commit/ac0063028517e471b58e741c2018b21b37509a63) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `/metrics` reporting a stale, permanent peer count for a room after it unloads.
+  
+  `peersGauge` is keyed by `roomId`, an identifier the connecting peer picks (the websocket URL path). Every scrape re-`set` the gauge for each currently-loaded room, but nothing ever removed a series for a room that had since unloaded, so `collab_room_peers{room="<id>"}` kept reporting that room's last-known (non-zero) peer count forever, and the registry grew one label series per distinct room id that was loaded at the time of some scrape over the life of a long-running server rather than tracking only currently-loaded rooms. `MetricsRegistry`'s gauge now exposes `reset()`, and the `/metrics` handler resets `peersGauge` before repopulating it from the live room list on each scrape.
+
+### Patch Changes
+
+- [#3855](https://github.com/LTplus-AG/ifc-lite/pull/3855) [`182215a`](https://github.com/LTplus-AG/ifc-lite/commit/182215a835c4beac6a776bcb4eb1d019cab9063e) Thanks [@louistrue](https://github.com/louistrue)! - Corrected the code samples on each package's npm landing page: the README fences are now typechecked against the package's real exports, so the snippets import what they call, declare the values they read, and no longer show removed options or renamed methods. Patch-bumping every package whose README changed so the corrections actually reach npmjs.com.
+- Updated dependencies [[`53a92b1`](https://github.com/LTplus-AG/ifc-lite/commit/53a92b1f7cc5770f164dc4867fc2adc33470e245), [`cebcb21`](https://github.com/LTplus-AG/ifc-lite/commit/cebcb2133ef672e9199ee2f158578499d449d9e0), [`e986c81`](https://github.com/LTplus-AG/ifc-lite/commit/e986c81bf6d28fec57f1953fa53bf315dbd80a3a), [`8c181c9`](https://github.com/LTplus-AG/ifc-lite/commit/8c181c99f91964402ad352aead36d9619af5b427), [`6e48c4c`](https://github.com/LTplus-AG/ifc-lite/commit/6e48c4c5f441e8a42e4cc55440cf747ad8679f0a), [`8f08715`](https://github.com/LTplus-AG/ifc-lite/commit/8f087158a662a02c01a21dd2546fb863bb24e665), [`9b709c5`](https://github.com/LTplus-AG/ifc-lite/commit/9b709c51480fbabb68167aa4892f7e4c87b0e4e6), [`f8e03d4`](https://github.com/LTplus-AG/ifc-lite/commit/f8e03d4d5bb620fc9e807d5233091d145a201165), [`32b31bc`](https://github.com/LTplus-AG/ifc-lite/commit/32b31bc8501f04e110733289bde0389b9899bc76), [`c78ce8c`](https://github.com/LTplus-AG/ifc-lite/commit/c78ce8c3f1da3b8b2c6fa0f982595adc8c48b7d6), [`4735f1c`](https://github.com/LTplus-AG/ifc-lite/commit/4735f1cbb6635016e83c7890f670e615bbdc48c3), [`182215a`](https://github.com/LTplus-AG/ifc-lite/commit/182215a835c4beac6a776bcb4eb1d019cab9063e)]:
+  - @ifc-lite/collab@0.6.1
+  - @ifc-lite/ifcx@4.0.0
+  - @ifc-lite/merge@0.4.5
+
 ## 0.6.1
 
 ### Patch Changes
@@ -410,7 +458,7 @@
   already closed in prior batches.
 
 - [#616](https://github.com/louistrue/ifc-lite/pull/616) [`2fc15b4`](https://github.com/louistrue/ifc-lite/commit/2fc15b45fbd06ebb57120d87db9a0ab06ed18142) Thanks [@louistrue](https://github.com/louistrue)! - Big reach-for-the-stars batch. Closes (or near-closes) the remaining
-  substantial items in `docs/architecture/collab-plan.md` for v0.2,
+  substantial items in `docs/architecture/collaboration.md` for v0.2,
   v0.5, v0.7, and v1.0. **+21 tests, total 140 passing.**
 
   `@ifc-lite/collab`
@@ -610,7 +658,7 @@ name, buckets, help)` accumulates observations into upper-bound
   end-to-end sync through the websocket server, undo isolation, and
   per-user layer extraction.
 
-  See `docs/architecture/collab-plan.md` for the v0.1 → v1.0 roadmap.
+  See `docs/architecture/collaboration.md` for the v0.1 → v1.0 roadmap.
 
 - [#616](https://github.com/louistrue/ifc-lite/pull/616) [`2fc15b4`](https://github.com/louistrue/ifc-lite/commit/2fc15b45fbd06ebb57120d87db9a0ab06ed18142) Thanks [@louistrue](https://github.com/louistrue)! - Continuing the v0.1 → v1.0 plan. Lands foundational pieces of v0.3
   (geometry), v0.4 (federation), and v0.6 (MCP) so each upstack consumer

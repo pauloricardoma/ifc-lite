@@ -12,6 +12,7 @@
 import type { IfcDataStore, IfcSourceHeader } from '@ifc-lite/parser';
 import { EntityExtractor, parseSourceHeader } from '@ifc-lite/parser';
 import type { MutablePropertyView } from '@ifc-lite/mutations';
+import { fileSchemaIdentifier } from '@ifc-lite/data';
 import { needsConversion, type IfcSchemaVersion } from './schema-converter.js';
 import { getCompleteEntityIndex, getMaxExpressId } from './entity-iteration.js';
 import { createSourceRefReader } from './source-ref-bounds.js';
@@ -19,6 +20,7 @@ import { writeSourceEntityLines } from './step-source-iteration.js';
 import { writeOverlayCreatedEntities } from './step-overlay-entities.js';
 import { generatePropertyAndQuantitySetEntities } from './step-property-sets.js';
 import {
+  resolveFallbackOwnerHistoryRef,
   type OwnerHistoryCache,
   type PropertySetContext,
 } from './step-property-set-readers.js';
@@ -147,11 +149,12 @@ export class StepExporter {
         : undefined);
 
     // Preserve the exact FILE_SCHEMA identifier (e.g. IFC4X3_ADD2) only when we
-    // are NOT converting schemas; conversion must emit the coarse target token.
+    // are NOT converting schemas; otherwise declare the target family's file
+    // identifier (IFC4X3 is written as IFC4X3_ADD2, #5351).
     const schemaToken: string =
       !converting && sourceHeader?.schemaIdentifiers?.[0]
         ? sourceHeader.schemaIdentifiers[0]
-        : schema;
+        : fileSchemaIdentifier(schema);
 
     // The one construction site for the state this export shares across its
     // seven phases, built in `step-pass-builder.ts` (#2475). `ExportPass` in
@@ -196,6 +199,12 @@ export class StepExporter {
     // A deltaOnly export with nothing to say is already finished.
     if (omission.kind === 'short-circuit') return omission.result;
     const { isOmittedFromOutput, mayNameOmittedRefs } = omission;
+
+    // The owner history an IFC2X3 downgrade reuses for `$` OwnerHistory slots
+    // (#4686): the same surviving one the generated property sets fall back to.
+    if (converting && schema === 'IFC2X3') {
+      pass.slotFill.prefer(resolveFallbackOwnerHistoryRef(this.propertySetContext(), pass.willBeEmitted, pass.effective));
+    }
 
     // Write every source-backed record this export keeps (#2475 step 2d),
     // preceded — inside that call — by the shared-atom retention that decides

@@ -9,9 +9,9 @@ import { Renderer } from './index.js';
 /**
  * `Renderer.init()` must release what a previous `init()` created (issue #2448).
  *
- * `init()` assigns a fresh `RenderPipeline`, `Picker`, `PostProcessor`,
- * `PointCloudRenderer`, `DeviationComputer`, `EdlPass` and overlay layer over
- * whatever the fields already hold. Its own comment advertises a
+ * `init()` assigns a fresh `RenderPipeline`, `Picker`, `PointCloudRenderer`,
+ * `DeviationComputer` and overlay layer over whatever the fields already hold
+ * (and the frame after it builds a fresh post-pass chain). Its own comment advertises a
  * `destroy()` + `init()` re-init flow, so the obvious device-loss auto-recovery
  * — call `init()` on the live instance — orphans every one of them, two GPU
  * pipelines and a glyph-atlas texture at a time.
@@ -63,8 +63,7 @@ function makeInitialisedRenderer(): { renderer: Renderer; tomb: Tomb } {
 
     poke(renderer, 'pipeline', stub('pipeline'));
     poke(renderer, 'picker', stub('picker'));
-    poke(renderer, 'postProcessor', stub('postProcessor'));
-    poke(renderer, 'edlPass', stub('edlPass'));
+    poke(renderer, 'postPasses', stub('postPasses'));
     poke(renderer, 'skyPass', stub('skyPass'));
     poke(renderer, 'pointCloudRenderer', stub('pointCloudRenderer'));
     // `deviationComputer` is the `DeviationComputer` collaborator (#2425)
@@ -174,8 +173,7 @@ describe('a second init() releases the first init()\'s GPU objects (#2448)', () 
         for (const name of [
             'pipeline',
             'picker',
-            'postProcessor',
-            'edlPass',
+            'postPasses',
             'skyPass',
             'pointCloudRenderer',
             'deviationComputer',
@@ -857,6 +855,21 @@ describe('a device loss revokes readiness (#2464 review)', () => {
         const outcome = await settleWhenReady(renderer);
         assert.ok(outcome instanceof Error, 'whenReady() resolved against the device that was lost mid-init');
         assert.strictEqual((outcome as Error).name, 'RendererDeviceLostError');
+    });
+
+    it('ignores a delayed loss signal from a superseded device wrapper', async () => {
+        const renderer = new Renderer(makeCanvas());
+        const oldDevice = pokeLosableDevice(renderer);
+        await initExpectingNoWebGPU(renderer);
+
+        poke(renderer, 'device', { replacement: true });
+        oldDevice.lose();
+
+        assert.strictEqual(
+            renderer.isDeviceLost(),
+            false,
+            'an abandoned device wrapper poisoned the replacement device',
+        );
     });
 
     it('re-arms whenReady() the instant init() is called, with no second reset', async () => {

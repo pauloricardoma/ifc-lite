@@ -15,8 +15,10 @@ The `bim` object (a `BimContext`) groups its capabilities into namespaces, plus 
 | `bim.store` | Document-level edits (add/remove entities, positional attributes) |
 | `bim.lens` | Lens visualization presets |
 | `bim.create` | Create IFC elements from scratch |
-| `bim.export` | Export to CSV, glTF, STEP, HBJSON, and more |
+| `bim.export` | Export to CSV, JSON, IFC/STEP, HBJSON, DFJSON |
 | `bim.clash` | Run clash rules and the discipline matrix |
+| `bim.cost` | Read and evaluate IFC 5D cost schedules, items, values, and quantities |
+| `bim.structural` | Read-only access to IFC structural analysis data (analysis models, members, connections, activities, load/result groups) |
 | `bim.ids` | IDS validation |
 | `bim.bcf` | BCF topics, comments, viewpoints |
 | `bim.files`, `bim.schedule`, `bim.spatial`, `bim.spaces`, `bim.drawing`, `bim.list`, `bim.bsdd`, `bim.events`, `bim.sandbox` | Supporting namespaces (file access, scheduling, spatial ops, space program, 2D drawings, entity tables, bSDD lookups, events, sandboxed sub-scripts) |
@@ -95,7 +97,27 @@ ifc-lite schema              # full schema with params and return types
 ifc-lite schema --compact    # names and descriptions only
 ```
 
-The schema covers the scriptable namespaces, `model`, `query`, `viewer`, `mutate`, `store`, `lens`, `create`, `files`, `schedule`, `clash`, and `export`, and includes each method's parameter names, return type, and LLM semantic hints (`useWhen`, task tags). Running `ifc-lite schema` first is the recommended way to author correct `eval`/`run` code. See [Using with LLM Terminals](cli.md#using-with-llm-terminals) for the wider agent workflow.
+`ifc-lite schema` documents the `bim` object `eval`/`run` actually hand your script — a root `bim` namespace of top-level methods, plus the scriptable namespaces `model`, `query`, `viewer`, `mutate`, `store`, `lens`, `create`, `files`, `schedule`, `cost`, `clash`, and `export` — and includes each method's parameter names, return type, and LLM semantic hints (`useWhen`, task tags). There `query` is the chain reached via `bim.query()` (`.byType(...).toArray()`), not a namespace of standalone lookups. That differs from the sandbox's own bridge schema shown below, where `bim.query.byType(...)` runs and returns data in one call — the sandbox and `eval`/`run` hand scripts different `bim` shapes, so pick the one matching where the script will run. Running `ifc-lite schema` first is the recommended way to author correct `eval`/`run` code. See [Using with LLM Terminals](cli.md#using-with-llm-terminals) for the wider agent workflow.
+
+### IFC 5D cost data
+
+`bim.cost` reads the canonical cost graph from the loaded IFC source snapshot.
+References are model-qualified and evaluated amounts remain decimal strings:
+
+The example below uses the canonical fixture at
+`tests/models/cost/buildingsmart-cost-composition.ifc` (fetch it with
+`pnpm fixtures`), which contains the `External wall total` item.
+
+```js
+const graph = bim.cost.data();
+const total = graph.CostItems.find(item => item.Name === 'External wall total');
+const result = bim.cost.evaluateItem(total.ref, { Precision: 34 });
+console.log(result.Amount, result.Currency, result.Diagnostics);
+```
+
+`CostValues`, `CostQuantities`, relationships, and diagnostic references all
+use `{ modelId, expressId }`. Generic mutation overlays are not folded into
+this read model; replacing or reloading the IFC source refreshes it.
 
 ## The sandbox
 
@@ -166,3 +188,42 @@ remote.viewer.colorize(refs, '#ff0000');
 ```
 
 In remote mode `bim.viewer.*` calls are forwarded to the connected viewer, which is exactly how `ifc-lite run script.js model.ifc --viewer <port>` works under the hood. For the full type surface, see the [`@ifc-lite/sdk` README](https://github.com/LTplus-AG/ifc-lite/tree/main/packages/sdk) and the [TypeScript API reference](../api/typescript.md).
+
+### Exporting the whole model vs. a subset
+
+`bim.export.ifc(refs, options)` reads its first argument as an isolation filter,
+and the *absence* of that argument is what asks for the whole model:
+
+```ts
+bim.export.ifc();                                   // no filter: the whole model
+bim.export.ifc(bim.query().byType('IfcWall').refs()); // only the walls (plus their reference closure)
+```
+
+An **empty array is not the same as no argument**. It means a filter that
+matched nothing, and it is refused:
+
+```ts
+const refs = bim.query().byType('IfcNonExistentType').refs(); // []
+bim.export.ifc(refs); // throws: the isolation filter matched nothing
+```
+
+An empty array used to mean "no filter", so a query that matched nothing
+silently exported every entity in the model and reported success. The release
+that changed this is the `@ifc-lite/sdk` major carrying issue #4738 in its
+changelog; before it, the refusal above did not happen. A call that used the
+empty array to mean the whole model, `bim.export.ifc([], options)`, becomes
+`bim.export.ifc(undefined, options)`.
+
+The same distinction holds in a sandboxed script (`bim.export.ifc()` with no
+arguments) and behind the CLI's `--format ifc`, which refuses a zero-match
+`--type`/`--where`/`--storey`/`--limit` rather than exporting everything.
+
+### Textured IFC exports in the web viewer
+
+The viewer's `bim.export.ifc(refs, options)` returns IFCZIP `Uint8Array` bytes
+when retained texture images accompany the exported model or subset. Its existing
+return type remains `string | Uint8Array`; do not decode archive bytes as STEP
+text. Supplying an `.ifc` download filename automatically changes it to
+`.ifczip` with ZIP MIME type. Untextured exports retain their ordinary STEP
+content. This packaging belongs to the web viewer adapter; other SDK backends
+provide their own resource packaging.

@@ -35,12 +35,15 @@ describe('StepTokenizer.scanEntitiesFast', () => {
     expect(src[ref.offset + ref.length - 1]).toBe(';');
   });
 
-  it('rejects a type token that does not start with an uppercase letter', () => {
-    // STEP entity keywords are uppercase. A lowercase token after `=` is not a
-    // type name; accepting it invents entities out of malformed input.
-    expect(scanFast('#1=ifcwall(1);')).toEqual([]);
+  it('rejects a type token that does not start with a letter', () => {
+    // A token after `=` that starts with neither letter case is not a type
+    // name; accepting it invents entities out of malformed input.
     expect(scanFast('#1=_priv(1);')).toEqual([]);
-    // ...but a legitimately uppercase-initial name is still accepted.
+    expect(scanFast('#1=2WALL(1);')).toEqual([]);
+    // A lowercase lead letter IS a keyword: its case is not significant, and
+    // Rust's EntityScanner accepts it. Refusing it dropped every record of an
+    // all-lowercase file (#4713). The type is named in upper case.
+    expect(scanFast('#1=ifcwall(1);').map((r) => r.type)).toEqual(['IFCWALL']);
     expect(scanFast('#1=IFCWALL(1);').map((r) => r.type)).toEqual(['IFCWALL']);
   });
 
@@ -72,13 +75,14 @@ describe('StepTokenizer.scanEntitiesFast', () => {
 
   it('does not alias two type names that collide in the type-name cache', () => {
     // The fast scanner caches decoded type names under a `length:hash` key to
-    // avoid millions of allocations. `Aa` and `BB` are the same length and
+    // avoid millions of allocations. `AO` and `B0` are the same length and
     // produce the same 32-bit rolling hash, so the cache key alone cannot tell
     // them apart — only the byte-for-byte verification of a cache hit can.
     // Without it a hostile or corrupt file has one type silently read as
-    // another (a door reported as a wall).
-    const refs = scanFast('#1=Aa(1);\n#2=BB(1);\n#3=Aa(1);');
-    expect(refs.map((r) => r.type)).toEqual(['Aa', 'BB', 'Aa']);
+    // another (a door reported as a wall). The hash and the verification both
+    // fold case (#4713), so `Ao` collides with `B0` too.
+    const refs = scanFast('#1=Ao(1);\n#2=B0(1);\n#3=AO(1);');
+    expect(refs.map((r) => r.type)).toEqual(['AO', 'B0', 'AO']);
   });
 
   it('keeps colliding type names distinct even when their lengths differ', () => {

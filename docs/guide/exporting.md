@@ -2,6 +2,29 @@
 
 Guide to exporting IFC data in various formats.
 
+## Textured IFC in the web viewer
+
+Normal IFC exports, visible subsets, and Export modified IFC… package retained image
+resources into `.ifczip` automatically. The archive preserves original PNG/JPEG
+bytes, the IFC entry directory, and relative texture paths; authored images use
+content-addressed filenames. Untextured models continue to download as `.ifc`.
+SDK IFC exports and Export modified IFC… omit unreachable appearance resources
+created by tracked commands, while the original session keeps those rows and
+images for Undo/Redo. Imported resources are preserved; this is not general
+cleanup of orphan entities from another authoring session.
+The serialization helper prepares an uncommitted atomic view and preserves the
+live allocator watermark. It still copies overlay/history arrays temporarily;
+compact output does not imply lower peak memory. Reopened formerly active image
+rows become imported source and remain outside authored-only cleanup.
+Export is unavailable while images load and refuses missing or budget-omitted resources
+rather than producing an apparently complete textureless file.
+
+Merged textured-model export currently requires texture URL remapping and is
+unavailable. Export each model separately to preserve its appearance. Subset
+archives may retain unused images from their source model. The STEP subset
+closure retains inverse texture maps for included faces, including maps created
+or retargeted through pending edits.
+
 ## Quick Start: CDN Export (No Build Required)
 
 Export IFC to GLB directly in the browser with zero setup:
@@ -114,7 +137,7 @@ const glb = gp.exportGlb(
   bytes,                 // Uint8Array of the .ifc
   true,                  // includeMetadata: expressId/ifcType/GlobalId in node extras
   new Uint32Array(),     // hidden  express-ids (empty = none hidden)
-  new Uint32Array(),     // isolated express-ids (empty = all visible)
+  undefined,             // isolated: undefined = no filter; a Uint32Array = keep ONLY these (empty = keep nothing)
   '',                    // hidden IFC-type CSV (e.g. 'IfcSpace,IfcOpeningElement')
   true,                  // lit: PBR materials; false = flat KHR_materials_unlit
 );
@@ -134,7 +157,7 @@ RTC origins ride a glTF node translation so large-coordinate models stay precise
 |-----------|---------|
 | `includeMetadata` | Write `expressId` / `ifcType` / `GlobalId` (plus `modelId` for federated exports) into each node's `extras` |
 | `hidden` | Express-ids to omit (mirrors the viewer's hide set) |
-| `isolated` | Express-ids to keep; empty = all visible |
+| `isolated` | `undefined` = no isolation filter (everything not hidden exports). A `Uint32Array` = an **active** allowlist: only these express-ids export, and an **empty** array exports nothing (`NO_RENDER_GEOMETRY`). Pass `undefined`, not `new Uint32Array()`, when your filter is inactive — `exportObj` follows the same contract (`isolated?`); on the Rust side this is `GltfOptions::isolated` / `ObjOptions::isolated: Option<Vec<u32>>` (`None` vs `Some(ids)`) |
 | hidden-types CSV | IFC class names to drop wholesale, e.g. `IfcSpace,IfcOpeningElement` |
 | `lit` | `true` (default) emits standard PBR materials that shade from normals; `false` emits flat `KHR_materials_unlit` materials |
 
@@ -189,6 +212,11 @@ await saveFile('properties.parquet', propsParquet);
 const quantsParquet = await exporter.exportTable('quantities');
 await saveFile('quantities.parquet', quantsParquet);
 ```
+
+Pass a `MutablePropertyView` as the third constructor argument to export live
+entity, relationship, property, and quantity rows, including sets on created
+entities. Geometry rows still come from the supplied geometry result; use STEP
+or IFC5 export when geometry payload edits must be included.
 
 ### Parquet Schema
 
@@ -285,11 +313,17 @@ const jsonld = gp.exportJsonld(
   true,                  // includeProperties
   false,                 // includeQuantities
   true,                  // pretty
-  new Uint32Array(),     // express-id isolation filter (empty ⇒ all entities)
+  undefined,             // express-id isolation filter — see below
 );
 
 await saveFile('model.jsonld', jsonld);
 ```
+
+The isolation filter carries a null-vs-empty distinction, the same one
+`exportObj` / `exportGlb` / `exportStep` use: `undefined` means "no filter",
+and an empty `Uint32Array` means "the filter is active and matched nothing",
+which produces an empty `@graph`. Collapsing the two would hand a user who
+asked for a subset the entire model.
 
 ### JSON-LD Structure
 
@@ -404,6 +438,19 @@ For quick scripts there is also `exportToStep(dataStore, options?)`, which
 returns the STEP text as a string (defaults `schema` to the source model's own
 schema, so a round-trip preserves it; pass `schema` explicitly to convert.
 Prefer `StepExporter` and its `Uint8Array` output for very large files).
+
+#### Which schema identifier is written
+
+A re-export that does not change schema keeps the source file's own
+`FILE_SCHEMA` identifier verbatim (`IFC4X3_ADD2`, `IFC2X3_TC1`, …). When ifc-lite
+chooses the identifier itself (a schema conversion, a merged export, a model
+authored with `IfcCreator`), it writes the family name, except for IFC4X3,
+which it declares as **`IFC4X3_ADD2`** (ISO 16739-1:2024). ifc-lite writes the
+IFC4X3_ADD2 attribute layouts, and IfcOpenShell (and so the buildingSMART
+Validation Service) resolves a bare `IFC4X3` token to a later development schema
+whose layouts differ, so the bare token would fail validation. The `schema`
+option still takes `'IFC4X3'`; only the header token differs. ifc-lite reads
+both identifiers as IFC4X3. The Rust exporter (CLI, wasm) follows the same rule.
 
 ### Visible-Only Export
 
@@ -611,6 +658,14 @@ await saveFile('model.ifcx', result.content);  // string; result.stats has count
 
 A Rust-side variant is also available as `GeometryProcessor.exportIfcx(bytes, onlyKnownProperties?, pretty?)`.
 
+The low-level `IfcxWriter` in `@ifc-lite/ifcx` accepts an optional
+`effectiveSpatialEdges` array when exporting a live `mutationView`. Supply the
+complete current `IfcRelAggregates`, `IfcRelNests`, and
+`IfcRelContainedInSpatialStructure` edge set as `{ sourceId, targetId,
+relationshipType }` records. This replaces the parsed `spatialHierarchy` for
+child links, so containment edits appear in the IFCX file. The writer reports
+an error if it detects an edited spatial relationship without these edges.
+
 ## OpenUSD (.usda) Export
 
 Export a model as a real **OpenUSD ASCII** (`.usda`) stage — distinct from IFCX, which is
@@ -644,13 +699,16 @@ The Rust exporter crate backs several more one-call formats on `GeometryProcesso
 |--------|--------|
 | `exportUsd(bytes)` | OpenUSD ASCII (`.usda`) stage of the whole model |
 | `exportObj(bytes, includeNormals?, hidden?, isolated?)` | Wavefront OBJ of the render geometry |
+| `exportKmzFromMeshes(meshes, latitude, longitude, altitude, xAxisAbscissa?, xAxisOrdinate?, name?, altitudeMode?)` | Google Earth KMZ with a supported COLLADA `model.dae`; preserves each mesh origin and accepts IFC map-conversion grid-north components |
 | `exportJson(bytes, pretty?, includeProperties?, includeQuantities?)` | Plain JSON entity dump |
 | `exportStep(bytes, schema?, included?, mutationsJson?)` | STEP/IFC re-export (Rust path) |
 | `exportHbjson(bytes, name)` | Honeybee HBJSON energy/daylight model built from the `IfcSpace` volumes |
-| `exportKmz(glb, lat, lon, alt, xAxisAbscissa?, xAxisOrdinate?, name?)` | KMZ (Google Earth) wrapping an already-exported GLB at a georeferenced location |
+| `exportDfjson(bytes, name)` | Dragonfly DFJSON energy model (extruded `Room2D` plates) built from the `IfcSpace` volumes |
 | `exportMerged(buffers, schema?)` | Merge several IFC byte buffers into one STEP file (Rust path) |
 
-Each returns a `Uint8Array` (UTF-8 for the text formats; decode with `TextDecoder` when you need a string), or `null` if the processor is not initialized.
+Each returns a `Uint8Array` (UTF-8 for the text formats; decode with `TextDecoder`
+when you need a string), except `exportDfjson`, which returns a string. Methods
+return `null` if the processor is not initialized.
 
 ## GLB Import
 
@@ -746,7 +804,56 @@ await gp.init();
 const glb = gp.exportGlb(bytes, true, new Uint32Array(), isolated, '');
 // … the same `isolated` set also filters OBJ, STEP and JSON-LD:
 const jsonld = gp.exportJsonld(bytes, '', true, false, true, isolated);
+const step = gp.exportStep(bytes, '', isolated);
 ```
+
+All four take `undefined` for "no isolation filter" and an empty
+`Uint32Array` for "the filter is active and matched nothing" — the latter
+exports nothing rather than everything. Pass `undefined`, not
+`new Uint32Array()`, when you do not want to filter.
+
+## Saving Edits Through the Rust Writer
+
+`StepExporter` needs the whole file as one buffer in the JS heap, which fails
+past V8's ArrayBuffer ceiling (~2 GB). `exportStep` takes the session's edits
+as the mutation log `MutablePropertyView.exportMutations()` returns and writes
+them natively, streaming every record the log does not touch:
+
+```typescript
+// `view` is the session's MutablePropertyView, `bytes` the source file.
+const saved = gp.exportStep(bytes, '', undefined, view.exportMutations());
+```
+
+The output is byte-identical to `new StepExporter(store, view).export(...)`
+for the same edits, except the GlobalIds of the records the export generates
+(regenerated property and quantity sets and their relationships), which the
+Rust writer derives instead of drawing at random. The shared parity fixture
+`rust/export/tests/fixtures/step_log_parity_vectors.json` pins this from both
+sides. The log applies property and quantity edits (create, update, delete, whole-set
+deletion), root-attribute and positional edits, retypes, entity deletion (with
+the same reference cleanup: list slots narrowed, relationships withheld) and
+created entities, whose payloads travel in the log's `newEntities` member
+(`view.getNewEntities()`), since a `CREATE_ENTITY` record carries only the id:
+
+```typescript
+const log = { ...JSON.parse(view.exportMutations()), newEntities: view.getNewEntities() };
+const savedWithCreations = gp.exportStep(bytes, '', undefined, JSON.stringify(log));
+```
+
+Georeferencing edits travel in `georefMutations` (the `StepExportOptions`
+shape): an existing `IfcProjectedCRS` / `IfcMapConversion` is edited in place,
+a missing one is created. Like `StepExporter`, the writer refuses them for an
+IFC2X3 output; an IFC2X3 model's georeferencing is its `ePSet_MapConversion` /
+`ePSet_ProjectedCRS` property sets, which are ordinary property edits.
+
+A log the TypeScript replay would throw on (an invalid class name in a retype)
+is refused with an error rather than exported, and so is a log it would save
+WITHOUT an edit: a mutation `type` the writer does not recognise, an attribute
+edit whose value is `null` (clear an attribute with `''`), or a `CREATE_ENTITY`
+whose payload is missing from `newEntities`. A log does not combine with an
+isolation set. Native hosts merging several models pass one log per model to
+`ifc_lite_export::export_merged_models_with_logs`, which bakes each edited model
+the way `MergedExporter.exportAsync` does.
 
 ## Export Pipeline
 
@@ -789,3 +896,79 @@ await saveFile('entities.csv', csv);
 
 - [Query Guide](querying.md) - Filter data before export
 - [API Reference](../api/typescript.md) - Complete API docs
+
+STEP exports from an IFCXML archive keep the model entry’s directory but use an
+`.ifc` suffix, so archive filenames agree with the serialized format.
+
+### Cleaning up authored appearance resources
+
+`planAuthoredResourceCleanup(dataStore, mutationView, candidateIds, protectedValues)` returns `{ entityIds, retainedImageUris }`: a deletion plan for explicitly owned, overlay-created appearance resource entities plus the effective image URLs that survive it. It follows the same effective positional and named reference overrides as STEP export. Source-backed resources, entities outside the candidate set, and live inverse style/texture bindings are retained. The URI set includes independent/source image entities that copy an authored URL, even after its original image entity is removed. Values and references use the existing STEP serializers, retype and attribute-override helpers, with positional overrides taking precedence as they do in the exported file. The optional `protectedValues` iterable carries entity references and saved attribute values needed by Undo/Redo; these references keep the corresponding resource graph alive.
+
+The helper is pure: apply `entityIds` through an atomic mutation transaction, then release image bytes only after that transaction succeeds. Reconcile outside history publication and advance the model revision after deletion. It refuses oversized candidate/reference walks without returning a partial plan. This is authored-resource housekeeping, not a general imported-model cleanup pass. Non-candidate entities establish roots first; only reachable candidate payloads are read. Thus a large unreachable history-only UV array can be omitted without consuming the live-reference budget. A reached payload still receives the same depth, value, reference and byte checks. For serialization, callers can omit history protection and apply the resulting deletions to a detached atomic view without committing it; image packaging must preserve originals and include authored URLs from `retainedImageUris`, without releasing any live leases.
+
+### Validating appearance dependencies before replay
+
+`captureAppearanceDependencies(dataStore, mutationView, rootEntityIds)` returns a guard with `validate(currentMutationView)`. Capture the before/after views while preparing an appearance command, then validate the corresponding expected state before Undo/Redo changes IFC or GPU resources. The guard compares effective STEP records reached through geometry, placement and appearance references, including overlay-created chains and inverse `IfcStyledItem`/texture-map attachments. It uses the existing STEP writers and reference scanner, so positional overrides retain the same precedence as export. Unrelated property-set edits do not invalidate the command.
+
+Validation is synchronous, bounded and conservative: a changed record, dependency set, or exceeded work/byte budget throws before replay. Formatting-equivalent rewrites may also require refreshing the command. Source data is assumed immutable within a model; replacement models require new guards. Capture once per command state, not during rendering. Viewer preview planning additionally needs a snapshot-time overlay checkpoint across its asynchronous export/worker interval; a replay dependency guard is not a replacement for that checkpoint.
+
+The guard caps the source index at 200,000 entities before constructing its effective index, authored overlay entities at 100,000, traversed records at 100,000, references at two million and authored values at eight million. Exact UTF-8 accounting uses a fixed scratch buffer before allocating each encoded row. Its 192 MiB effective-row budget covers the planner's bounded 128 MiB source plus 64 MiB output, including higher-precision newly authored UVs. Immutable source records retain identity markers rather than duplicate large source strings in every history checkpoint. Material/type inheritance and material-definition representations are included; sharing a type or material does not pull peer products' geometry into the guard.
+
+### Serializing an element subgraph for re-meshing
+
+`serializeEntitySubgraph(dataStore, mutationView, { targets })` writes a small, standalone STEP file holding the target elements and what the mesher needs to rebuild them. That is each element's forward references, the project's units and representation contexts, and its openings and their fillings with the voiding and filling relationships. It also holds its `IfcRelAssociatesMaterial`, narrowed to the elements in the file. `remeshContextRoots(dataStore, mutationView, targets)` returns those extra roots on their own. Pass them back as `contextRoots` to add or drop context.
+
+```typescript
+import { serializeEntitySubgraph } from '@ifc-lite/export';
+
+const sub = serializeEntitySubgraph(store, mutationView, { targets: new Set([wallId]) });
+// sub.bytes: a complete STEP file; sub.ids: every express id it defines;
+// sub.unreadable: ids whose effective record could not be written faithfully.
+```
+
+The cost follows the targets' own reference closure, not the model size, so it can run on every authoring commit. Queued edits and overlay-created entities are written by the same writers as `StepExporter`, and express ids are kept, overlay-allocated ones included. Styles are left out, so a caller meshing the buffer supplies the model's load-time style wire itself.
+
+### IFCX texture portability
+
+`Ifc5Exporter` preserves textured mesh fragments using the declared, versioned
+`ifclite::appearance::v1` and `ifclite::image::v1` extension. Each fragment remains
+an ordinary `usd::usdgeom::mesh` child of its original IFC owner. The extension
+carries per-vertex UVs, sampler repeats, and shared top-down straight-alpha RGBA8
+pixels. It does not change geometry, evaluate IFC materials, or generate UVs.
+
+This is an IFClite extension, not an official OpenUSD material binding. The
+[current buildingSMART USD schema](https://github.com/buildingSMART/ifcx.dev/blob/main/%40openusd.org/usd%40v1.ifcx)
+defines mesh points and face indices but no texture binding. Readers that ignore
+the extension retain standard geometry and fragment colors; they do not recover
+textures. Native Rust IFCX export currently exports structural data without
+geometry and is outside this mesh-transport path.
+
+The synchronous exporter accepts decoded `MeshData.texture` pixels in headless
+applications. Browser `textureBitmap` inputs are read through `OffscreenCanvas`;
+unresolved images or invalid UVs raise an actionable error. Optional
+`textureSources` maps exact `MeshTextureRef.url` values to `{ mimeType, bytes }`
+for original PNG/JPEG assets. Originals are preserved without recompression,
+separately from the decoded pixels needed for rendering; decoded IFCX originals
+survive subsequent IFCX exports. The caller must supply available originals;
+the exporter does not fetch external URLs. Images are deduplicated by content
+and dimensions. The file budget is 512 MiB of unique pixel/resource bytes, with
+16,384 pixels per dimension and 64 MiB per optional encoded original.
+
+The current RGBA wire favors exact, wasm-free roundtrips over compressed file
+size. It can make IFCX substantially larger than IFCZIP. Original source images
+are archival alongside pixels, rather than a second mandatory decoder pipeline.
+
+## Importing textured GLB captures
+
+Use **Open** or **Add model** for an opaque textured GLB. Embedded base-colour
+PNG/JPEG images and their UV seams now follow the same model load path for
+primary and federated models. Original encoded images remain available to
+capture authoring while the model is loaded. Node translation, rotation and
+scale are applied once; UV texture transforms and repeat/clamp are preserved.
+
+This capture slice supports albedo, not a complete glTF material renderer.
+Unsupported texture alpha modes, transparent pixels, additional material maps,
+compression, external resources, mirrored repeat and UV sets beyond
+`TEXCOORD_0` stop import with a diagnostic rather than produce an untextured
+success. Images use the existing inventory limits (32 MiB per encoded image,
+8192 px maximum edge, 16 megapixels per image).

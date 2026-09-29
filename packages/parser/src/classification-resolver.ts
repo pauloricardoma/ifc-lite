@@ -18,6 +18,16 @@ export interface ClassificationInfo {
     location?: string;
     description?: string;
     path?: string[];
+    /**
+     * True when the relationship graph proves this entity/type carries a
+     * classification association, but the classification's own attributes
+     * (system, identification, name, path) could not be read because this
+     * store has no source bytes — a server-parsed store (issue #3948).
+     * Distinguishes "classified but unresolved" from "genuinely unclassified"
+     * (an empty result array), which are otherwise byte-identical to every
+     * caller. All other fields are left `undefined` on an unresolved entry.
+     */
+    unresolved?: boolean;
 }
 
 /**
@@ -59,12 +69,48 @@ export function extractClassificationsOnDemand(
     }
 
     if (!classRefIds || classRefIds.length === 0) return [];
-    if (!store.source?.length) return [];
+    if (!store.source?.length) {
+        // Server-parsed / source-empty store: no source bytes to decode the
+        // classification reference's own attributes. The relationship graph
+        // above already proved this entity (or its type) IS classified — the
+        // ids resolved into `classRefIds` are real
+        // `IfcRelAssociatesClassification` targets.
+        //
+        // If the server also forwarded the resolved attributes (issue
+        // #3955), prefer those — real system/identification/name data beats
+        // a marker. Roll up the entity's own row plus its type's (mirroring
+        // the classRefIds roll-up above) so a type-level classification is
+        // not dropped.
+        if (store.resolvedClassifications) {
+            const resolved: ClassificationInfo[] = [...(store.resolvedClassifications.get(entityId) || [])];
+            if (store.relationships) {
+                const typeIds = store.relationships.getRelated(entityId, RelationshipType.DefinesByType, 'inverse');
+                for (const typeId of typeIds) {
+                    const typeResolved = store.resolvedClassifications.get(typeId);
+                    if (typeResolved) resolved.push(...typeResolved);
+                }
+            }
+            // The server resolves these rows from the same immutable input
+            // as its graph. Repeated relationships emit repeated rows while
+            // the graph deduplicates edges, so their counts need not match.
+            if (resolved.length > 0) return resolved;
+        }
+        // No forwarded resolved data. Turning an id into
+        // system/identification/name/path needs raw STEP bytes
+        // (`EntityExtractor`), which this store doesn't have. Previously
+        // this silently returned `[]` here, making a classified entity
+        // byte-identical to a genuinely unclassified one (issue #3948).
+        // Surface one unresolved marker per resolved id instead, so callers
+        // — the IDS bridge in particular — can tell "classified, but this
+        // data source can't say more" from "none".
+        return classRefIds.map((): ClassificationInfo => ({ unresolved: true }));
+    }
 
     const extractor = new EntityExtractor(store.source);
     const results: ClassificationInfo[] = [];
 
     for (const classRefId of classRefIds) {
+        // @raw-entity-enumeration-ok source classification association ids require source byte offsets for EntityExtractor
         const ref = store.entityIndex.byId.get(classRefId);
         if (!ref) continue;
 
@@ -89,6 +135,18 @@ export function extractClassificationsOnDemand(
                 const path = walkClassificationChain(store, extractor, referencedSourceId);
                 info.system = path.systemName;
                 info.path = path.codes;
+                // A dangling link, an unreadable entity, or an unexpected
+                // type broke the walk before it reached an IfcClassification
+                // root (#5290) — distinct from a `ReferencedSource` that was
+                // never there to begin with, which `path.chainUnresolved`
+                // leaves `false` (see the function doc). `info.system` stays
+                // `undefined` either way, so without this flag
+                // `resolveClassifications` cannot tell "chain could not be
+                // resolved" from "chain resolved to no system", and flattens
+                // both to a confident empty system (`c.system || ''`) — a
+                // definite mismatch, not the unresolved-chain result this
+                // marks it for.
+                if (path.chainUnresolved) info.unresolved = true;
             }
 
             results.push(info);
@@ -106,9 +164,26 @@ export function extractClassificationsOnDemand(
     return results;
 }
 
+/** Result of {@link extractClassificationSystemsOnDemand}. */
+export interface ClassificationSystemNames {
+    /** Distinct system names, sorted. Empty when the model genuinely has no
+     *  `IfcClassification` entities — check `unresolved` before reading an
+     *  empty array as "no systems". */
+    names: string[];
+    /**
+     * True when the model DOES have `IfcClassification` entities (per the
+     * byType index) but their `Name` could not be read because this store
+     * has no source bytes — a server-parsed store (issue #3948), the same
+     * condition `extractClassificationsOnDemand` signals per-entity via
+     * `ClassificationInfo.unresolved`. When true, `names` is always `[]`
+     * and must not be read as "the model has no classification systems".
+     */
+    unresolved: boolean;
+}
+
 /**
  * List the distinct classification system names present in a model —
- * CHEAP and EXACT.
+ * CHEAP and EXACT when source bytes are available.
  *
  * Unlike extractClassificationsOnDemand (which resolves classifications for
  * ONE entity by walking its reference chain, and is only reachable through
@@ -121,14 +196,23 @@ export function extractClassificationsOnDemand(
  * A model can carry SEVERAL systems at once (e.g. Uniclass, OmniClass, and
  * a national system) — this returns all of them, sorted alphabetically.
  */
-export function extractClassificationSystemsOnDemand(store: IfcDataStore): string[] {
+export function extractClassificationSystemsOnDemand(store: IfcDataStore): ClassificationSystemNames {
+    // @raw-entity-enumeration-ok this parser API enumerates systems in the parsed source; live viewer sessions use effectiveClassificationSystems
     const ids = store.entityIndex.byType.get('IFCCLASSIFICATION');
-    if (!ids || ids.length === 0 || !store.source?.length) return [];
+    if (!ids || ids.length === 0) return { names: [], unresolved: false };
+    if (!store.source?.length) {
+        // The model has classification systems (confirmed by the byType
+        // index), but reading their Name needs raw STEP bytes this
+        // server-parsed store doesn't carry. `[]` alone would be
+        // indistinguishable from "no systems" (issue #3948).
+        return { names: [], unresolved: true };
+    }
 
     const extractor = new EntityExtractor(store.source);
     const names = new Set<string>();
 
     for (const id of ids) {
+        // @raw-entity-enumeration-ok each source classification id needs its STEP byte span to decode Name
         const ref = store.entityIndex.byId.get(id);
         if (!ref) continue;
 
@@ -140,29 +224,46 @@ export function extractClassificationSystemsOnDemand(store: IfcDataStore): strin
         if (typeof name === 'string' && name.length > 0) names.add(name);
     }
 
-    return Array.from(names).sort();
+    return { names: Array.from(names).sort(), unresolved: false };
 }
 
 /**
  * Walk up the IfcClassificationReference chain to find the root IfcClassification system.
+ *
+ * `chainUnresolved` (#5290) is `true` when the walk stopped WITHOUT ever
+ * reaching an `IfcClassification` root and WITHOUT the chain legitimately
+ * ending on its own terms — a dangling `ReferencedSource` (the id does not
+ * resolve in `entityIndex`), an entity whose bytes cannot be extracted, an
+ * entity of a type that is neither `IfcClassification` nor
+ * `IfcClassificationReference`, or a cycle back to an id already visited.
+ * Every one of those means "this data cannot say whether a system exists",
+ * not "there is no system" — the caller (`extractClassificationsOnDemand`)
+ * needs to tell that apart from a chain that simply ran out of links
+ * (`ReferencedSource` omitted, `$`, which IS schema-legal and leaves
+ * `chainUnresolved: false`): the two are otherwise byte-identical, both
+ * returning `systemName: undefined`.
  */
 function walkClassificationChain(
     store: IfcDataStore,
     extractor: EntityExtractor,
     startId: number
-): { systemName?: string; codes: string[] } {
+): { systemName?: string; codes: string[]; chainUnresolved: boolean } {
     const codes: string[] = [];
     let currentId: number | undefined = startId;
     const visited = new Set<number>();
 
-    while (currentId !== undefined && !visited.has(currentId)) {
+    while (currentId !== undefined) {
+        if (visited.has(currentId)) {
+            return { codes, chainUnresolved: true };
+        }
         visited.add(currentId);
 
+        // @raw-entity-enumeration-ok chain cursor follows source ReferencedSource links and decodes each STEP record
         const ref = store.entityIndex.byId.get(currentId);
-        if (!ref) break;
+        if (!ref) return { codes, chainUnresolved: true };
 
         const entity = extractor.extractEntity(ref);
-        if (!entity) break;
+        if (!entity) return { codes, chainUnresolved: true };
 
         const typeUpper = entity.type.toUpperCase();
         const attrs = entity.attributes || [];
@@ -170,7 +271,7 @@ function walkClassificationChain(
         if (typeUpper === 'IFCCLASSIFICATION') {
             // Root: IfcClassification [Source, Edition, EditionDate, Name, ...]
             const systemName = typeof attrs[3] === 'string' ? attrs[3] : undefined;
-            return { systemName, codes };
+            return { systemName, codes, chainUnresolved: false };
         }
 
         if (typeUpper === 'IFCCLASSIFICATIONREFERENCE') {
@@ -181,9 +282,12 @@ function walkClassificationChain(
 
             currentId = typeof attrs[3] === 'number' ? attrs[3] : undefined;
         } else {
-            break;
+            return { codes, chainUnresolved: true };
         }
     }
 
-    return { codes };
+    // `currentId` became `undefined`: `ReferencedSource` was omitted (`$`).
+    // Schema-legal, not malformed — an `IfcClassificationReference` is
+    // allowed to not name a system.
+    return { codes, chainUnresolved: false };
 }

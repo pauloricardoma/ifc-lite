@@ -28,8 +28,17 @@ impl IfcAPI {
     ///
     /// `hidden` / `isolated` are express-id visibility filters; `hidden_types_csv` is a
     /// comma-separated list of IFC type names whose class toggle is off (e.g.
-    /// `"IfcOpeningElement,IfcSpace"`). `include_metadata` attaches counts + per-node
-    /// `expressId`. Per-mesh RTC origin rides the node translation (precision-safe).
+    /// `"IfcOpeningElement,IfcSpace"`). `isolated` carries the isolation allowlist's
+    /// null-vs-empty distinction across the wasm boundary: omit it (`undefined`) for
+    /// "no isolation filter" (every mesh is a candidate); pass an empty `Uint32Array`
+    /// for "isolation is ACTIVE and currently matches nothing" (every mesh is
+    /// excluded). Collapsing the two — as a bare `Uint32Array` parameter would force a
+    /// caller to do — silently exports the whole model when a filter matches nothing
+    /// (#4328 follow-up: reachable by filtering the Class tab to a type present only
+    /// in a federated model's secondary member, then exporting "Visible Only"). A
+    /// non-empty `Uint32Array` is the ordinary allowlist. `include_metadata` attaches
+    /// counts + per-node `expressId`. Per-mesh RTC origin rides the node translation
+    /// (precision-safe).
     /// `lit` emits standard PBR materials that shade from normals; omitted or
     /// `true` ⇒ lit (the default), `false` ⇒ flat `KHR_materials_unlit` (the
     /// historical look — #1321). Optional at the boundary so older 5-arg callers
@@ -50,7 +59,7 @@ impl IfcAPI {
         content: &[u8],
         include_metadata: bool,
         hidden: &[u32],
-        isolated: &[u32],
+        isolated: Option<Vec<u32>>,
         hidden_types_csv: String,
         lit: Option<bool>,
         emissive: Option<bool>,
@@ -63,7 +72,7 @@ impl IfcAPI {
         let opts = ifc_lite_export::GltfOptions::default()
             .with_include_metadata(include_metadata)
             .with_hidden(hidden.to_vec())
-            .with_isolated(isolated.to_vec())
+            .with_isolated(isolated)
             .with_hidden_types(hidden_types)
             .with_lit(lit.unwrap_or(true))
             .with_emissive(emissive.unwrap_or(false))
@@ -90,11 +99,15 @@ impl IfcAPI {
     /// per-mesh local). The caller passes exactly the meshes it wants emitted.
     ///
     /// Fails CLOSED: if the declared vertex/index counts run past the flattened
-    /// `positions` / `indices`, there are fewer `index_counts` than meshes, or `normals`
-    /// is empty or too short to cover every vertex, this throws an `Error` whose message
-    /// starts with `MALFORMED_MESH_INPUT` — instead of silently emitting a GLB with those
-    /// meshes dropped. (The viewer always passes fully-backed, normal-covered arrays, so
-    /// this only fires on a caller bug.)
+    /// `positions` / `indices`, there are fewer `index_counts` than meshes, `normals`
+    /// is empty or too short to cover every vertex, a mesh's index block is not a
+    /// whole number of triangles, or an index names a vertex its own mesh does not
+    /// have (glTF 2.0 3.7.2.1), this throws an `Error` whose message starts with
+    /// `MALFORMED_MESH_INPUT` — instead of silently emitting a GLB with those meshes
+    /// dropped, a TRIANGLES primitive whose count is not a multiple of 3, or the
+    /// out-of-range index copied into the BIN chunk. (The viewer always passes
+    /// fully-backed, normal-covered, whole-triangle, in-range arrays, so this only
+    /// fires on a caller bug.)
     #[wasm_bindgen(js_name = exportGlbFromMeshes)]
     #[allow(clippy::too_many_arguments)]
     pub fn export_glb_from_meshes(
@@ -128,43 +141,6 @@ impl IfcAPI {
         .map_err(|e| JsValue::from(js_sys::Error::new(&e.to_string())))
     }
 
-    /// Package an already-produced **GLB** + georeference into a **KMZ** (`Uint8Array`)
-    /// for Google Earth: a ZIP of `doc.kml` (a `<Model>` placed at `latitude`/`longitude`/
-    /// `altitude`) + `model.glb`. `x_axis_abscissa`/`x_axis_ordinate` are the
-    /// `IfcMapConversion` grid-north components; pass both as `undefined` for heading 0.
-    ///
-    /// `altitude_mode` selects the KML vertical placement: `"clampToGround"`
-    /// (the default when omitted) rests the model on the terrain, ignoring
-    /// `altitude`; `"absolute"` places the origin at `altitude` metres MSL.
-    /// Google Earth's terrain already encodes the site elevation, so clamping
-    /// keeps a wrong/zero/double-counted OrthogonalHeight from floating the
-    /// model into the sky (#1427); absolute is offered for models whose
-    /// OrthogonalHeight is a true MSL elevation the user wants honoured.
-    #[wasm_bindgen(js_name = exportKmz)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn export_kmz(
-        &self,
-        glb: &[u8],
-        latitude: f64,
-        longitude: f64,
-        altitude: f64,
-        x_axis_abscissa: Option<f64>,
-        x_axis_ordinate: Option<f64>,
-        name: String,
-        altitude_mode: Option<String>,
-    ) -> Vec<u8> {
-        let opts = ifc_lite_export::KmzOptions {
-            latitude,
-            longitude,
-            altitude,
-            altitude_mode: kmz_altitude_mode(altitude_mode),
-            x_axis_abscissa,
-            x_axis_ordinate,
-            name: if name.is_empty() { None } else { Some(name) },
-        };
-        ifc_lite_export::export_kmz(glb, &opts)
-    }
-
     /// Build a Google-Earth-ready **KMZ** (`Uint8Array`) straight from the viewer's
     /// already-produced meshes — the working path (#1427). The model is embedded as
     /// **COLLADA** (`model.dae`), the only `<Model>` format Google Earth loads (a GLB
@@ -175,6 +151,15 @@ impl IfcAPI {
     /// `altitude_mode` (`"clampToGround"` default ⇒ rest on terrain, ignoring
     /// `altitude`; `"absolute"` ⇒ place at `altitude` metres MSL) selects the
     /// KML vertical placement (#1427).
+    ///
+    /// Fails CLOSED: when no triangle survives (an empty visible set, or meshes
+    /// whose only triangles are degenerate and collapse in the vertex dedup)
+    /// this throws an `Error` whose message starts with `NO_RENDER_GEOMETRY`;
+    /// a declared vertex/index count running past its buffer, an index block
+    /// that is not whole triangles, or an index outside its mesh throws
+    /// `MALFORMED_MESH_INPUT`, exactly as `exportGlbFromMeshes` does. These used
+    /// to ship as a "successful" archive: an empty one around a COLLADA
+    /// document the 1.4.1 schema rejects, or one with meshes or faces missing.
     #[wasm_bindgen(js_name = exportKmzFromMeshes)]
     #[allow(clippy::too_many_arguments)]
     pub fn export_kmz_from_meshes(
@@ -193,7 +178,7 @@ impl IfcAPI {
         x_axis_ordinate: Option<f64>,
         name: String,
         altitude_mode: Option<String>,
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>, JsValue> {
         let opts = ifc_lite_export::KmzOptions {
             latitude,
             longitude,
@@ -203,7 +188,7 @@ impl IfcAPI {
             x_axis_ordinate,
             name: if name.is_empty() { None } else { Some(name) },
         };
-        ifc_lite_export::export_kmz_collada_from_meshes(
+        ifc_lite_export::try_export_kmz_collada_from_meshes(
             positions,
             normals,
             indices,
@@ -213,5 +198,6 @@ impl IfcAPI {
             origins,
             &opts,
         )
+        .map_err(|e| JsValue::from(js_sys::Error::new(&e.to_string())))
     }
 }

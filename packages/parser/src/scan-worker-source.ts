@@ -13,6 +13,7 @@
  */
 
 import { MAX_EXPRESS_ID } from './express-id.js';
+import { WORKER_LEXING } from './scan-worker-lexing.js';
 
 /**
  * Self-contained entity scanner code (runs inside Web Worker).
@@ -39,45 +40,7 @@ self.onmessage = function(e) {
   // (#3395). The worker runs from a Blob URL and cannot import at runtime, so
   // the bound below is interpolated from express-id.ts when this template is
   // evaluated -- one home for the number, not a copy that can drift.
-  // Whether a STEP comment opens at p.
-  function opensCommentAt(p) {
-    return p + 1 < len && buf[p] === 0x2F && buf[p + 1] === 0x2A;
-  }
-
-  // Index just past the '*/' closing the comment at p, or -1 when it never
-  // closes. Counts the newlines it crosses so line numbers stay in step.
-  //
-  // Kept behaviourally identical to skipComment/skipTrivia in step-lexing.ts,
-  // which this cannot import: the worker source is a string, so this copy of
-  // the rule has to live here. Comments do not nest, per ISO 10303-21.
-  function skipCommentAt(p) {
-    var q = p + 2;
-    while (q + 1 < len) {
-      if (buf[q] === 0x2A && buf[q + 1] === 0x2F) return q + 2;
-      if (buf[q] === 0x0A) line++;
-      q++;
-    }
-    return -1;
-  }
-
-  // Skip whitespace, comments, and any run of the two -- 10303-21 allows a
-  // comment wherever whitespace is allowed, INCLUDING inside a record.
-  // Returns -1 when a comment opens and never closes: everything from there on
-  // is inside it, so there is nothing left to find.
-  function skipTriviaAt(p) {
-    for (;;) {
-      while (p < len) {
-        var t = buf[p];
-        if (t === 0x20 || t === 0x09 || t === 0x0D) { p++; }
-        else if (t === 0x0A) { line++; p++; }
-        else break;
-      }
-      if (!opensCommentAt(p)) return p;
-      var e = skipCommentAt(p);
-      if (e < 0) return -1;
-      p = e;
-    }
-  }
+${WORKER_LEXING}
 
   var ids = new Uint32Array(estimatedCount);
   var offsets = new Uint32Array(estimatedCount);
@@ -88,6 +51,24 @@ self.onmessage = function(e) {
   var count = 0;
   // Records refused by the express-id bound, reported back to the caller.
   var oversizedIds = 0;
+  // 0 or 1, never a count of how many: whether this scan stopped early on an
+  // unclosed string, an unclosed comment, or a declaration cut off before its
+  // own '(' -- set once, by the single post-loop check at the bottom of this
+  // function. Reported back to the caller. Mirrors tokenizer.ts's
+  // scanEntitiesFast contract exactly, including the 0-or-1 shape.
+  var malformedRecords = 0;
+  // Set on the way to that post-loop check, not counted at each site:
+  // 'stopped' for an unclosed string or comment that ran to end of buffer
+  // with nothing left to find, 'declOpen' while a #id=TYPE( header is
+  // incomplete. 'declOpen' stays armed ONLY when the reason for abandoning
+  // is running out of buffer (pos >= len); a mismatch with buffer still
+  // left (bad byte, oversized id) clears it, because the scan resumes
+  // byte-by-byte from wherever it gave up, and a #ref token inside the
+  // abandoned record's own argument list reads as a fresh, equally
+  // incomplete attempt that must not report "cut off" just because
+  // nothing later happens to clear it.
+  var stopped = false;
+  var declOpen = false;
 
   // Type name cache (IFC files have ~776 unique types across millions of entities)
   var typeCache = new Map();
@@ -131,20 +112,25 @@ self.onmessage = function(e) {
         }
       }
       if (!hasDigits) continue;
+      declOpen = true;
 
       // Whitespace AND comments: '#1 /* was #7 */ =' is a declaration. The
       // inline loop stays for the common case; skipTriviaAt runs only once a
       // comment actually opens. Mirrors tokenizer.ts's scanEntitiesFast.
       while (pos < len) {
         var c2 = buf[pos];
-        if (c2 === 0x20 || c2 === 0x09 || c2 === 0x0D) { pos++; }
+        if (c2 === 0x20 || c2 === 0x09 || c2 === 0x0D || c2 === 0x0C || c2 === 0x0B) { pos++; }
         else if (c2 === 0x0A) { line++; pos++; }
         else break;
       }
-      if (opensCommentAt(pos)) { pos = skipTriviaAt(pos); if (pos < 0) break; }
+      if (opensCommentAt(pos)) { pos = skipTriviaAt(pos); if (pos < 0) { stopped = true; break; } }
 
-      // Check for '='
-      if (pos >= len || buf[pos] !== 0x3D) continue;
+      // Check for '='. A byte that is not '=' with buffer left to scan is
+      // not a truncation -- clear declOpen so a reference token inside a
+      // LATER abandoned record's argument list (see the oversized-id note
+      // below) cannot leave it stuck armed with nothing left to clear it.
+      if (pos >= len) continue;
+      if (buf[pos] !== 0x3D) { declOpen = false; continue; }
       pos++;
 
       // Express-id bound, identical to StepTokenizer.scanEntitiesFast -- this
@@ -160,20 +146,23 @@ self.onmessage = function(e) {
       // list, so an oversized '#ref' in there arrives here too and would be
       // counted as a second dropped record. Count the refusal; a record that
       // vanishes without a trace is the same defect wearing a different hat.
-      if (expressId > ${MAX_EXPRESS_ID}) { oversizedIds++; continue; }
+      if (expressId > ${MAX_EXPRESS_ID}) { oversizedIds++; declOpen = false; continue; }
 
       // Skip whitespace and comments
       while (pos < len) {
         var c3 = buf[pos];
-        if (c3 === 0x20 || c3 === 0x09 || c3 === 0x0D) { pos++; }
+        if (c3 === 0x20 || c3 === 0x09 || c3 === 0x0D || c3 === 0x0C || c3 === 0x0B) { pos++; }
         else if (c3 === 0x0A) { line++; pos++; }
         else break;
       }
-      if (opensCommentAt(pos)) { pos = skipTriviaAt(pos); if (pos < 0) break; }
+      if (opensCommentAt(pos)) { pos = skipTriviaAt(pos); if (pos < 0) { stopped = true; break; } }
 
-      // Read type name
+      // Read type name. Must start with a letter of either case (#4713); a
+      // bad start byte with buffer left clears declOpen for the same reason
+      // as the '=' check.
       var typeStart = pos;
-      if (pos >= len || buf[pos] < 0x41 || buf[pos] > 0x5A) continue;
+      if (pos >= len) continue;
+      if (!isKeywordLeadByteAt(pos)) { declOpen = false; continue; }
 
       while (pos < len) {
         var c4 = buf[pos];
@@ -189,11 +178,13 @@ self.onmessage = function(e) {
       // Cache type name — use length + hash compound key and verify the actual
       // bytes on a hit. Length alone can't disambiguate a 32-bit hash collision
       // (e.g. "Aa"/"BB"), so without the byte compare a crafted/unlucky file
-      // could have one type silently misread as another. Mirrors tokenizer.ts.
+      // could have one type silently misread as another. Mirrors tokenizer.ts,
+      // including its case fold (#4713): the cached name is upper case, and
+      // the loop above satisfies upperKeywordByte's [A-Za-z0-9_] precondition.
       var typeLen = pos - typeStart;
       var typeHash = typeLen;
       for (var i = typeStart; i < pos; i++) {
-        typeHash = (typeHash * 31 + buf[i]) | 0;
+        typeHash = (typeHash * 31 + upperKeywordByte(buf[i])) | 0;
       }
       var cacheKey = typeLen + ':' + typeHash;
       var typeName = typeCache.get(cacheKey);
@@ -201,31 +192,47 @@ self.onmessage = function(e) {
       if (typeName !== undefined && typeName.length === typeLen) {
         cacheHitMatches = true;
         for (var v = 0; v < typeLen; v++) {
-          if (typeName.charCodeAt(v) !== buf[typeStart + v]) {
+          if (typeName.charCodeAt(v) !== upperKeywordByte(buf[typeStart + v])) {
             cacheHitMatches = false;
             break;
           }
         }
       }
       if (typeName === undefined || !cacheHitMatches) {
-        typeName = String.fromCharCode.apply(null, buf.subarray(typeStart, pos));
+        typeName = String.fromCharCode.apply(null, buf.subarray(typeStart, pos)).toUpperCase();
         typeCache.set(cacheKey, typeName);
       }
 
       // Skip whitespace and comments
       while (pos < len) {
         var c5 = buf[pos];
-        if (c5 === 0x20 || c5 === 0x09 || c5 === 0x0D) { pos++; }
+        if (c5 === 0x20 || c5 === 0x09 || c5 === 0x0D || c5 === 0x0C || c5 === 0x0B) { pos++; }
         else if (c5 === 0x0A) { line++; pos++; }
         else break;
       }
-      if (opensCommentAt(pos)) { pos = skipTriviaAt(pos); if (pos < 0) break; }
+      if (opensCommentAt(pos)) { pos = skipTriviaAt(pos); if (pos < 0) { stopped = true; break; } }
 
-      // Check for '('
-      if (pos >= len || buf[pos] !== 0x28) continue;
+      // Check for '('. Same EOF-vs-mismatch split as '=' and the type name.
+      if (pos >= len) continue;
+      if (buf[pos] !== 0x28) { declOpen = false; continue; }
+      declOpen = false; // Header complete: '(' found.
 
-      // Skip to semicolon (handling strings)
+      // Skip to semicolon (handling strings), bounded to THIS record's own
+      // body so a record missing its ';' cannot latch onto a later one and
+      // swallow what lies between (#4179): the ';' must be preceded, modulo
+      // trivia, by the ')' closing the parameter list, and no '=' may come
+      // before it outside a string or comment. On either failure the record is
+      // DROPPED and the scan resumes at that ')' rather than abandoning the
+      // file's tail. close_step_record in rust/core/src/parser/lexical.rs
+      // argues both rules and the recovery; this is a hand-duplicated copy
+      // because a Blob worker cannot import at runtime. Change them together.
+      var parenPos = pos;
       var inString = false;
+      var foundTerminator = false;
+      // Memoised across the exact ';' check and the recovery below, which
+      // would otherwise balance the same record twice. -3 = not computed;
+      // -1 = unbalanced but readable; -2 = a literal/comment never closed.
+      var recordClose = -3;
       while (pos < len) {
         var c6 = buf[pos];
         if (c6 === 0x27) { // quote
@@ -240,15 +247,26 @@ self.onmessage = function(e) {
           // and parens inside it text -- the other direction of the rule the
           // quote branch above gives for a '/*' inside a literal.
           var ce = skipCommentAt(pos);
-          if (ce < 0) {
-            // Unterminated: this record has no terminator, and neither has
-            // anything after it. Drop it and stop.
-            pos = len;
-            break;
-          }
+          if (ce < 0) break; // Unterminated: recovery below finds no ')'.
           pos = ce;
           continue;
         } else if (c6 === 0x3B && !inString) { // semicolon
+          // ')' modulo whitespace settles it for every record a real file
+          // holds. Anything else -- including the '/' of a trailing '*/',
+          // which a backwards walk cannot see through -- goes to the cold,
+          // exact balance-and-skip-trivia check.
+          var w = pos;
+          while (w > parenPos && isSpaceByteAt(w - 1)) w--;
+          if (buf[w - 1] !== 0x29) {
+            var savedBalLine = line;
+            recordClose = findEntityLengthAt(parenPos, startOffset);
+            line = savedBalLine;
+            if (recordClose <= 0) break;
+            recordClose += startOffset;
+            var after = skipTriviaAt(recordClose);
+            line = savedBalLine;
+            if (after < 0 || after !== pos) break;
+          }
           var entityLength = pos - startOffset + 1;
 
           // Grow if needed
@@ -262,11 +280,44 @@ self.onmessage = function(e) {
           count++;
 
           pos++;
+          foundTerminator = true;
           break;
+        } else if (c6 === 0x3D && !inString) {
+          break; // '=': the NEXT declaration already started.
         } else if (c6 === 0x0A) {
           line++;
         }
         pos++;
+      }
+
+      // No ';' of this record's own. EVERY such exit lands here, so the
+      // recovery lives here once rather than at each break -- mirrors
+      // tokenizer.ts's scanEntitiesFast. Resume at the ')' balancing this
+      // record's own '(' when there is one, dropping just this record;
+      // otherwise run to len, ending the scan un-resynced rather than guessing
+      // a resume point from misaligned bytes. The balance walk stops at the
+      // next declaration's '=' (#4573), so a refusal costs this record's
+      // bytes, never a re-walk of the remainder per refusal.
+      if (!foundTerminator) {
+        stopped = true;
+        if (recordClose === -3) {
+          var savedRecLine = line;
+          recordClose = findEntityLengthAt(parenPos, startOffset);
+          line = savedRecLine;
+          if (recordClose > 0) recordClose += startOffset;
+        }
+        if (recordClose > 0) {
+          pos = recordClose;
+          line = startLine;
+          for (var q = startOffset; q < pos; q++) if (buf[q] === 0x0A) line++;
+        } else if (recordClose === -1) {
+          // No ')' before the next '=' (or EOF), bytes after readable:
+          // re-hunt from past this record's '#'.
+          pos = startOffset + 1;
+          line = startLine;
+        } else {
+          pos = len; // Nothing to resume from (#3695).
+        }
       }
     } else if (ch === 0x0A) {
       line++;
@@ -276,16 +327,23 @@ self.onmessage = function(e) {
       // loop walks them byte by byte, and a '/*' inside a description would
       // otherwise open a comment that never closes and take DATA with it.
       var sp = pos + 1;
+      var closed = false;
       while (sp < len) {
         if (buf[sp] === 0x27) {
           if (sp + 1 < len && buf[sp + 1] === 0x27) { sp += 2; continue; }
           sp++;
+          closed = true;
           break;
         }
         if (buf[sp] === 0x0A) { line++; }
         sp++;
       }
       pos = sp;
+      // Ran off the end without a closing quote: everything from the open
+      // quote to EOF was consumed looking for one, so nothing after it was
+      // ever a candidate '#' -- the same "no terminator" shape as inside a
+      // record, just outside one (a HEADER string, most often).
+      if (!closed) { stopped = true; break; }
     } else if (opensCommentAt(pos)) {
       // Skip a comment region BETWEEN records. A record that is commented out
       // is still a well-formed #id = TYPE(...), so every check above accepts
@@ -294,6 +352,7 @@ self.onmessage = function(e) {
       if (cp < 0) {
         // Unterminated: everything to EOF is commented out.
         pos = len;
+        stopped = true;
         break;
       }
       pos = cp;
@@ -301,6 +360,13 @@ self.onmessage = function(e) {
       pos++;
     }
   }
+
+  // ONE post-loop check, not an increment at every exit site above: the scan
+  // stopped early if it hit an explicit "no terminator" boundary ('stopped'),
+  // or the last #id=TYPE( header was cut short before its own '(' was found
+  // ('declOpen'). Always 0 or 1 -- the scan stops at the first one, so there
+  // is nothing further to accumulate.
+  if (stopped || declOpen) { malformedRecords = 1; }
 
   // Trim arrays once, reuse for both message and transfer list
   var needsTrim = ids.buffer.byteLength > count * 4;
@@ -316,6 +382,7 @@ self.onmessage = function(e) {
     types: types.slice(0, count),
     count: count,
     oversizedIds: oversizedIds,
+    malformedRecords: malformedRecords,
   }, [
     trimmedIds.buffer,
     trimmedOffsets.buffer,

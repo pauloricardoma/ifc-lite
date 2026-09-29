@@ -8,7 +8,7 @@
  */
 
 import type { IfcDataStore } from '@ifc-lite/parser';
-import { IfcTypeEnumToString, PropertyValueType, QuantityType, RelationshipType } from '@ifc-lite/data';
+import { IfcTypeEnumToString, PropertyValueType, QuantityType, flattenRelationshipEdges, relationshipTypeName } from '@ifc-lite/data';
 
 export interface SQLResult {
   columns: string[];
@@ -138,6 +138,7 @@ export class DuckDBIntegration {
   private async registerTables(store: IfcDataStore): Promise<void> {
     // conn is guaranteed non-null here — called only from init() after connect()
     const conn = this.conn!;
+    // @raw-entity-enumeration-ok SQL registration materializes the supplied parsed store once, without a mutation view
     console.log('[DuckDB] Registering tables from store with', store.entities.count, 'entities');
 
     // Create and populate entities table
@@ -180,7 +181,9 @@ export class DuckDBIntegration {
     const batchSize = 1000;
 
     // Insert in batches for performance
+    // @raw-entity-enumeration-ok the SQL entities table copies the parsed EntityTable rows, not the live overlay
     for (let i = 0; i < entities.count; i += batchSize) {
+      // @raw-entity-enumeration-ok cap each parsed-table batch at its source row count
       const end = Math.min(i + batchSize, entities.count);
       const values: string[] = [];
 
@@ -207,6 +210,7 @@ export class DuckDBIntegration {
       }
     }
 
+    // @raw-entity-enumeration-ok report the number of parsed rows just registered in DuckDB
     console.log(`[DuckDB] Registered entities table with ${entities.count} rows`);
   }
 
@@ -341,40 +345,15 @@ export class DuckDBIntegration {
     `);
 
     const { relationships } = store;
-    const edges = relationships.forward;
     const batchSize = 1000;
 
-    const relTypeNames: Record<number, string> = {
-      [RelationshipType.ContainsElements]: 'ContainsElements',
-      [RelationshipType.Aggregates]: 'Aggregates',
-      [RelationshipType.DefinesByProperties]: 'DefinesByProperties',
-      [RelationshipType.DefinesByType]: 'DefinesByType',
-      [RelationshipType.AssociatesMaterial]: 'AssociatesMaterial',
-      [RelationshipType.AssociatesClassification]: 'AssociatesClassification',
-      [RelationshipType.VoidsElement]: 'VoidsElement',
-      [RelationshipType.FillsElement]: 'FillsElement',
-      [RelationshipType.ConnectsPathElements]: 'ConnectsPathElements',
-      [RelationshipType.ConnectsElements]: 'ConnectsElements',
-      [RelationshipType.SpaceBoundary]: 'SpaceBoundary',
-      [RelationshipType.AssignsToGroup]: 'AssignsToGroup',
-      [RelationshipType.AssignsToProduct]: 'AssignsToProduct',
-      [RelationshipType.ReferencedInSpatialStructure]: 'ReferencedInSpatialStructure',
-    };
-
-    // Flatten CSR format to rows
-    const rows: { sourceId: number; targetId: number; relType: string; relId: number }[] = [];
-
-    for (const [sourceId, offset] of edges.offsets) {
-      const count = edges.counts.get(sourceId) || 0;
-      for (let i = offset; i < offset + count; i++) {
-        rows.push({
-          sourceId,
-          targetId: edges.edgeTargets[i],
-          relType: relTypeNames[edges.edgeTypes[i]] || 'Unknown',
-          relId: edges.edgeRelIds[i],
-        });
-      }
-    }
+    // One row per `IfcRel*` STEP record, not one row per deduped edge; see `flattenRelationshipEdges`'s doc comment.
+    const rows = flattenRelationshipEdges(relationships.forward).map((row) => ({
+      sourceId: row.sourceId,
+      targetId: row.targetId,
+      relType: relationshipTypeName(row.type),
+      relId: row.relationshipId,
+    }));
 
     // Insert in batches
     for (let i = 0; i < rows.length; i += batchSize) {

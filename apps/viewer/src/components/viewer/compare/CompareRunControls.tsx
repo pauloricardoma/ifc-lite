@@ -13,18 +13,20 @@
  * threaded in, so this file has no behaviour to test beyond wiring.
  */
 
-import { Loader2, Play } from 'lucide-react';
-import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { tourAnchor, TOUR_ANCHORS } from '@/lib/tours/anchors';
+import { useTranslation, type TranslationKey } from '@/i18n';
 import type { DiffScope } from '@ifc-lite/diff';
+import type { DuplicateAuthoredKeyInfo } from '@/lib/compare/authoredKeys';
+import { AnalysisRunButton } from '../analysis/AnalysisRunActions';
 import { CompareBlacklist } from './CompareBlacklist';
+import { CompareKeyProperty } from './CompareKeyProperty';
 import type { ChangedTypeCount } from './changeRow';
 
-const SCOPES: { id: DiffScope; label: string }[] = [
-  { id: 'both', label: 'Both' },
-  { id: 'data', label: 'Data' },
-  { id: 'geometry', label: 'Geometry' },
+const SCOPES: { id: DiffScope; labelKey: TranslationKey }[] = [
+  { id: 'both', labelKey: 'comparePanel.runControls.scopeBoth' },
+  { id: 'data', labelKey: 'comparePanel.runControls.scopeData' },
+  { id: 'geometry', labelKey: 'comparePanel.runControls.scopeGeometry' },
 ];
 
 interface CompareRunControlsProps {
@@ -39,10 +41,13 @@ interface CompareRunControlsProps {
   onShowUnchanged: (show: boolean) => void;
   matchByContent: boolean;
   onMatchByContent: (enabled: boolean) => void;
+  keyProperty: string | undefined;
+  onKeyProperty: (keyProperty: string | undefined) => void;
+  duplicateInfo: DuplicateAuthoredKeyInfo | null;
   canRun: boolean;
   running: boolean;
   onRun: () => void;
-  error: string | null;
+  onCancel: () => void;
   /** Show the "no geometry fingerprints" warning (result-dependent). */
   geometryUnavailable: boolean;
   /** Placement fingerprints are still comparing moves (symmetric mesh-less
@@ -68,10 +73,13 @@ export function CompareRunControls({
   onShowUnchanged,
   matchByContent,
   onMatchByContent,
+  keyProperty,
+  onKeyProperty,
+  duplicateInfo,
   canRun,
   running,
   onRun,
-  error,
+  onCancel,
   geometryUnavailable,
   placementOnlyGeometry,
   excludedTypes,
@@ -80,14 +88,15 @@ export function CompareRunControls({
   onRemoveExcludedType,
   onClearExcludedTypes,
 }: CompareRunControlsProps) {
+  const { t } = useTranslation();
   return (
     <div className="p-3 space-y-3 border-b border-border">
       <div
         className="grid grid-cols-[1.25rem_1fr] items-center gap-x-2 gap-y-2 text-xs"
         {...tourAnchor(TOUR_ANCHORS.compareAb)}
       >
-        <span className="text-muted-foreground">A</span>
-        <select
+        <span className="text-muted-foreground">{t('comparePanel.runControls.baseLabel')}</span>
+        <select aria-label={t('comparePanel.runControls.baseLabel')}
           value={baseModelId ?? ''}
           onChange={(e) => onBaseModelId(e.target.value)}
           className="w-full rounded border border-border bg-transparent px-2 py-1 text-foreground min-w-0"
@@ -96,8 +105,8 @@ export function CompareRunControls({
             <option key={m.id} value={m.id}>{m.name}</option>
           ))}
         </select>
-        <span className="text-muted-foreground">B</span>
-        <select
+        <span className="text-muted-foreground">{t('comparePanel.runControls.headLabel')}</span>
+        <select aria-label={t('comparePanel.runControls.headLabel')}
           value={headModelId ?? ''}
           onChange={(e) => onHeadModelId(e.target.value)}
           className="w-full rounded border border-border bg-transparent px-2 py-1 text-foreground min-w-0"
@@ -109,7 +118,7 @@ export function CompareRunControls({
       </div>
 
       {baseModelId === headModelId && (
-        <p className="text-xs text-[#e0af68]">Pick two different models.</p>
+        <p className="text-xs text-[#e0af68]">{t('comparePanel.runControls.pickDifferentModels')}</p>
       )}
 
       <div className="flex flex-wrap items-center gap-2">
@@ -123,7 +132,7 @@ export function CompareRunControls({
                 scope === s.id ? 'bg-primary text-primary-foreground' : 'hover:bg-muted',
               )}
             >
-              {s.label}
+              {t(s.labelKey)}
             </button>
           ))}
         </div>
@@ -133,7 +142,7 @@ export function CompareRunControls({
             checked={showUnchanged}
             onChange={(e) => onShowUnchanged(e.target.checked)}
           />
-          Show unchanged
+          {t('comparePanel.runControls.showUnchanged')}
         </label>
       </div>
 
@@ -149,36 +158,39 @@ export function CompareRunControls({
           onChange={(e) => onMatchByContent(e.target.checked)}
         />
         <span>
-          Match re-exported elements by content
-          <span className="block text-[10px] opacity-70">
-            Re-pairs elements whose GlobalId changed but whose content did not.
+          {t('comparePanel.runControls.matchByContentLabel')}
+          <span className="block text-2xs opacity-70">
+            {t('comparePanel.runControls.matchByContentHint')}
           </span>
         </span>
       </label>
 
-      <Button
-        size="sm"
-        className="w-full gap-1.5"
-        disabled={!canRun}
-        onClick={onRun}
-        {...tourAnchor(TOUR_ANCHORS.compareRun)}
-      >
-        {running ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
-        {running ? 'Comparing…' : 'Run comparison'}
-      </Button>
+      {/* Authored key (#4989): compare on `Tag` / `Pset.Property` instead of
+          GlobalId, for a from-scratch re-export that re-GUIDs everything but
+          keeps the project's own identifiers stable. */}
+      <CompareKeyProperty
+        keyProperty={keyProperty}
+        onKeyProperty={onKeyProperty}
+        duplicateInfo={duplicateInfo}
+        disabled={running}
+      />
 
-      {error && <p className="text-xs text-[#f7768e]">{error}</p>}
+      <AnalysisRunButton
+        size="sm"
+        running={running}
+        canRun={canRun}
+        onRun={onRun}
+        onCancel={onCancel}
+        runLabel={t('comparePanel.runControls.runComparison')}
+        cancelLabel={t('comparePanel.runControls.cancel')}
+        {...tourAnchor(TOUR_ANCHORS.compareRun)}
+      />
 
       {geometryUnavailable && scope !== 'data' && (
         <p className="text-xs text-[#e0af68]">
           {placementOnlyGeometry
-            ? 'Neither model has mesh geometry fingerprints (loaded outside ' +
-              'the WASM mesh path), so SHAPE changes can’t be detected. ' +
-              'Placement-driven moves and data changes are still compared.'
-            : 'One model has no geometry fingerprints (loaded outside the ' +
-              'WASM mesh path), so geometry changes can’t be detected. Data ' +
-              'changes are still accurate — switch to the Data scope for ' +
-              'reliable results.'}
+            ? t('comparePanel.runControls.geometryUnavailablePlacementOnly')
+            : t('comparePanel.runControls.geometryUnavailableFull')}
         </p>
       )}
 

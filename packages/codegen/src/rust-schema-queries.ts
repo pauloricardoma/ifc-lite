@@ -10,11 +10,61 @@
  * answers questions ABOUT the enum stay separable.
  */
 
-import type { ExpressSchema } from './express-parser.js';
+import type { IfcEntityInfo } from '@ifc-lite/data';
+import type { EntityDefinition, ExpressSchema } from './express-parser.js';
 import { getAllAttributes } from './express-parser.js';
 
+/** Adapt class-shaped IFC catalog rows into a name-only EXPRESS supplement. */
+export function entityCatalogSchema(
+  name: string,
+  catalog: readonly IfcEntityInfo[],
+  excludedTypes: readonly { readonly name: string }[],
+): ExpressSchema {
+  const excludedNames = new Set(excludedTypes.map((type) => type.name.toUpperCase()));
+  const entities: EntityDefinition[] = catalog
+    .filter(
+      (entity) =>
+        !excludedNames.has(entity.name.toUpperCase()) &&
+        (entity.parent !== undefined || entity.abstract || entity.attributes.length > 0),
+    )
+    .map((entity) => ({
+      name: entity.name,
+      isAbstract: entity.abstract,
+      supertype: entity.parent,
+      attributes: [],
+    }));
+  return { name, entities, types: [], enums: [], selects: [] };
+}
+
+/** Merge exact names while preserving canonical positional metadata. */
+export function mergeTypeUniverse(
+  canonical: ExpressSchema,
+  supplemental: readonly ExpressSchema[],
+): ExpressSchema {
+  const entities = [...canonical.entities];
+  const names = new Set(entities.map((entity) => entity.name.toUpperCase()));
+  for (const schema of supplemental) {
+    for (const entity of schema.entities) {
+      if (!names.has(entity.name.toUpperCase())) {
+        entities.push(entity);
+        names.add(entity.name.toUpperCase());
+      }
+    }
+  }
+  return {
+    ...canonical,
+    name: [canonical, ...supplemental].map((item) => item.name).join(' + '),
+    entities,
+  };
+}
+
 /** Emitted inside `impl IfcType { … }`, closing the impl block. */
-export function generateSchemaQueries(schema: ExpressSchema): string {
+export function generateSchemaQueries(
+  schema: ExpressSchema,
+  typeUniverse: readonly EntityDefinition[] = schema.entities,
+  visibility = 'pub',
+): string {
+  const canonicalNames = new Set(schema.entities.map((entity) => entity.name));
   return `    /// This entity's attributes, in STEP declaration order.
     ///
     /// Supertype attributes come FIRST, which is what makes the position here
@@ -28,7 +78,9 @@ export function generateSchemaQueries(schema: ExpressSchema): string {
     /// as authoritative for it.
     pub fn attribute_names(&self) -> &'static [&'static str] {
         match self {
-${schema.entities.map((e) => `            Self::${e.name} => &[${getAllAttributes(e, schema).map((a) => `"${a.name}"`).join(', ')}],`).join('\n')}
+${typeUniverse.map((e) => canonicalNames.has(e.name)
+    ? `            Self::${e.name} => &[${getAllAttributes(e, schema).map((a) => `"${a.name}"`).join(', ')}],`
+    : `            Self::${e.name} => &[],`).join('\n')}
             Self::Unknown(_) => &[],
         }
     }
@@ -39,6 +91,24 @@ ${schema.entities.map((e) => `            Self::${e.name} => &[${getAllAttribute
     /// spelling is the only one that resolves.
     pub fn attribute_index(&self, name: &str) -> Option<usize> {
         self.attribute_names().iter().position(|n| *n == name)
+    }
+
+    /// Whether ${schema.name} itself declares this class.
+    ///
+    /// The enum is one exact-name universe across every supported release;
+    /// a variant that only a supplemental (older) schema declares keeps its
+    /// name but carries no positional metadata here (its
+    /// \`attribute_names()\` is empty). A per-schema registry that must fail
+    /// closed for a class the declared FILE_SCHEMA does not know consults
+    /// this rather than the emptiness of the attribute list, which a genuine
+    /// zero-attribute class shares (#4203).
+    pub fn declared_by_canonical_schema(&self) -> bool {
+        ${typeUniverse.some((e) => !canonicalNames.has(e.name))
+          ? `!matches!(
+            self,
+            ${typeUniverse.filter((e) => !canonicalNames.has(e.name)).map((e) => `Self::${e.name}`).join(' | ')} | Self::Unknown(_)
+        )`
+          : '!matches!(self, Self::Unknown(_))'}
     }
 }
 
@@ -54,7 +124,7 @@ ${schema.entities.map((e) => `            Self::${e.name} => &[${getAllAttribute
 /// WHOLE schema — mapping every class to some other vocabulary, auditing
 /// which ones it covers, generating a table — otherwise has to re-parse
 /// the EXPRESS file or scrape this one.
-pub static ALL: &[IfcType] = &[
+${visibility} static ALL: &[IfcType] = &[
 ${schema.entities.map((e) => `    IfcType::${e.name},`).join('\n')}\n];
 
 `;

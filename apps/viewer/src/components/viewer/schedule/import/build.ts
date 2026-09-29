@@ -248,7 +248,7 @@ export function buildScheduleExtraction(
   };
 
   return {
-    extraction: { workSchedules: [workSchedule], tasks, sequences, hasSchedule: tasks.length > 0 },
+    extraction: { workSchedules: [workSchedule], tasks, sequences, workCalendars: [], hasSchedule: tasks.length > 0 },
     warnings,
   };
 }

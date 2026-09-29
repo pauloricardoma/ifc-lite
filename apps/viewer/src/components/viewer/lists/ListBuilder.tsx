@@ -18,36 +18,37 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { ComboInput } from '@/components/ui/combo-input';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import { Badge } from '@/components/ui/badge';
 import { cn } from '@/lib/utils';
 import { IfcTypeEnum } from '@ifc-lite/data';
-import { collectSpatialContainerNames } from '@/utils/spatialHierarchy';
+import type { FilterRule } from '@ifc-lite/rules';
 import type { IfcDataStore } from '@ifc-lite/parser';
-import {
-  discoverFilterValues,
-  discoverFilterSchema,
-  propValueKey,
-} from '@/lib/search/filter-schema';
 import type {
   ListDataProvider,
   ListDefinition,
+  ListModelTagScope,
   ColumnDefinition,
   DiscoveredColumns,
-  PropertyCondition,
-  ConditionOperator,
+  UnreadableListCondition,
 } from '@ifc-lite/lists';
-import { discoverColumns, ENTITY_ATTRIBUTES, groupingColumnIds, isZoneVolumeMode } from '@ifc-lite/lists';
+import { discoverColumns, ENTITY_ATTRIBUTES, groupingColumnIds } from '@ifc-lite/lists';
 
-/** The `zone` column modes that carry a volume. Spelled here in the exact
- *  capitalisation the picker shows and the engine lower-cases, so the label a
- *  user sees IS the stored mode -- the basis cannot be dropped on the way
- *  through. */
+/** The `zone` column mode that carries mesh volume. */
 const ZONE_MODE_VOLUME_LABEL = 'Volume (mesh)';
-const ZONE_MODE_BREAKDOWN_LABEL = 'Volume breakdown (mesh)';
 import { useViewerStore } from '@/store';
 import type { ZoneSet } from '@/lib/zones';
 import { collectScopeTypes } from '@/lib/lists/scope-types';
 import { rebuildGrouping } from './list-table-utils';
+import { Section, Chip } from './ListBuilder.parts';
+import { ListModelTagScopeEditor } from './ListModelTagScopeEditor';
+import { FilterGroupEditor, type FilterGroupEditorState } from '../FilterGroupEditor';
+import { UnreadableListFilters } from './ListBuilder.unreadableFilters';
+import { ListValueOptionsContext, groupsNeedListValues, useListValueOptions } from './use-list-value-options';
+import { RULE_KIND_LABEL } from '../filter-rule-labels';
+
+/** Every rule kind, including the List-value rule only a list can evaluate (#6190). */
+const LIST_FILTER_KINDS = new Set(Object.keys(RULE_KIND_LABEL) as FilterRule['kind'][]);
+import { formatLocaleCount } from './formatLocaleCount';
+import { PatternHint } from './PatternHint';
 import {
   isEditableColumn,
   draftFromColumn,
@@ -57,47 +58,9 @@ import {
   updateColumnInPlace,
   type ColumnDraft,
 } from '@/lib/lists/column-edit';
-import { previewSetPattern, formatMatchHint } from './pattern-preview';
-
-const NO_OPTIONS: readonly string[] = [];
-
-/**
- * Distinct model values used to suggest condition values in the chip editors.
- * Storeys are intentionally NOT here — they come cheaply from the spatial
- * index, whereas these require sampling element property/material data.
- */
-interface ListConditionValues {
-  materials: string[];
-  classifications: string[];
-  /** propValueKey(pset, prop) → distinct values. */
-  propertyValues: Map<string, string[]>;
-}
-
-/**
- * Merge per-store value discovery into one suggestion set. This is the
- * EXPENSIVE pass (samples element property/material/classification data), so
- * it's only run when a property/material/classification condition exists —
- * never for storey-only filters (storeys come from `discoverFilterSchema`).
- */
-function discoverConditionValues(stores: IfcDataStore[]): ListConditionValues {
-  const materials = new Set<string>();
-  const classifications = new Set<string>();
-  const propertyValues = new Map<string, Set<string>>();
-  for (const store of stores) {
-    const v = discoverFilterValues(store);
-    v.materials.forEach((m) => materials.add(m));
-    v.classifications.forEach((c) => classifications.add(c));
-    for (const [k, arr] of v.propertyValues) {
-      let bucket = propertyValues.get(k);
-      if (!bucket) { bucket = new Set(); propertyValues.set(k, bucket); }
-      for (const val of arr) bucket.add(val);
-    }
-  }
-  const sort = (s: Set<string>) => Array.from(s).sort();
-  const pv = new Map<string, string[]>();
-  for (const [k, s] of propertyValues) pv.set(k, sort(s));
-  return { materials: sort(materials), classifications: sort(classifications), propertyValues: pv };
-}
+import { previewSetPattern } from './pattern-preview';
+import { useTranslation } from '@/i18n/useTranslation';
+import { storesWithMutationViews } from './list-builder-discovery';
 
 /** Column descriptor shared by the quick-add grid. */
 interface CommonColumn {
@@ -108,11 +71,6 @@ interface CommonColumn {
   propertyName: string;
   label: string;
 }
-
-/** Spatial-container levels a `spatial` column / filter can target, fine to
- *  coarse: Container is the element's IMMEDIATE container (any level); Storey
- *  is the default (back-compat). */
-const SPATIAL_LEVELS = ['Container', 'Storey', 'Building', 'Site', 'Project'] as const;
 
 /**
  * The first-class columns: built-in attributes plus the spatial / semantic
@@ -168,84 +126,41 @@ interface ListBuilderProps {
   providers: ListDataProvider[];
   /** Backing stores for value discovery (condition value suggestions). */
   stores: IfcDataStore[];
+  /** Model IDs aligned with stores; keeps duplicate-store federation isolated. */
+  modelIds?: readonly string[];
   initial: ListDefinition | null;
   onSave: (definition: ListDefinition) => void;
   onCancel: () => void;
   onExecute: (definition: ListDefinition) => void;
 }
 
-export function ListBuilder({ providers, stores, initial, onSave, onCancel, onExecute }: ListBuilderProps) {
-  const [name, setName] = useState(initial?.name ?? '');
+export function ListBuilder({ providers, stores, modelIds, initial, onSave, onCancel, onExecute }: ListBuilderProps) {
+  const { t, locale } = useTranslation(); const [name, setName] = useState(initial?.name ?? '');
+  const models = useViewerStore((s) => s.models);
+  const mutationViews = useViewerStore((s) => s.mutationViews);
+  const mutationVersion = useViewerStore((s) => s.mutationVersion);
+  const storeViews = useMemo(
+    () => storesWithMutationViews(stores, models, mutationViews, modelIds),
+    [stores, models, mutationViews, mutationVersion, modelIds],
+  );
   const [description, setDescription] = useState(initial?.description ?? '');
   const [selectedTypes, setSelectedTypes] = useState<Set<IfcTypeEnum>>(
     new Set(initial?.entityTypes ?? [])
   );
   const [columns, setColumns] = useState<ColumnDefinition[]>(initial?.columns ?? []);
-  const [conditions, setConditions] = useState<PropertyCondition[]>(initial?.conditions ?? []);
-  // Lazily-discovered distinct values for condition suggestions. This is the
-  // EXPENSIVE sampling pass, so only run it when a property / material /
-  // classification condition exists — storey-only filters never trigger it.
-  const [conditionValues, setConditionValues] = useState<ListConditionValues | null>(null);
-  React.useEffect(() => {
-    if (conditionValues || stores.length === 0) return;
-    const needs = conditions.some(
-      (c) => c.source === 'property' || c.source === 'material' || c.source === 'classification',
-    );
-    if (!needs) return;
-    setConditionValues(discoverConditionValues(stores));
-  }, [conditions, stores, conditionValues]);
-
-  // Storey names come cheaply from the spatial index (no element sampling),
-  // so they're always available without the expensive value pass above.
-  const storeyNames = useMemo<string[]>(() => {
-    if (stores.length === 0) return [];
-    const set = new Set<string>();
-    for (const store of stores) {
-      for (const [name] of discoverFilterSchema(store).storeys) set.add(name);
-    }
-    return Array.from(set).sort();
-  }, [stores]);
-
-  // Spatial-filter value suggestions per level. Storey reuses the index-derived
-  // names above; Building / Site / Project come from a cheap spatial-tree walk
-  // (only the handful of container nodes, no element sampling).
-  const spatialNamesByLevel = useMemo<Record<string, string[]>>(() => {
-    const building = new Set<string>();
-    const site = new Set<string>();
-    const project = new Set<string>();
-    const container = new Set<string>();
-    // Reuse the shared collector so the site / building-like / project /
-    // container classification can't drift from the column resolver (#1591 review).
-    for (const store of stores) {
-      const names = collectSpatialContainerNames(store.spatialHierarchy, (id) => store.entities.getName(id));
-      names.sites.forEach((n) => site.add(n));
-      names.buildings.forEach((n) => building.add(n));
-      names.projects.forEach((n) => project.add(n));
-      names.containers.forEach((n) => container.add(n));
-    }
-    const sorted = (s: Set<string>) => Array.from(s).sort();
-    return {
-      Container: sorted(container),
-      Storey: storeyNames,
-      Building: sorted(building),
-      Site: sorted(site),
-      Project: sorted(project),
-    };
-  }, [stores, storeyNames]);
-
-  // Loaded model / file names — value suggestions for a `Model` filter, and the
-  // discriminator the Model column surfaces (issue #1591).
-  const modelNames = useMemo<string[]>(() => {
-    const set = new Set<string>();
-    for (const p of providers) { const n = p.getModelName?.(); if (n) set.add(n); }
-    return Array.from(set).sort();
-  }, [providers]);
-
-  // Location zones (issue #1810): every currently-defined zone set, for the
-  // quick-add column chips and the `zone` filter's set-picker + value
-  // suggestions. Read directly from the store rather than round-tripping
-  // through a provider — zone sets are viewer state, not IFC-model data.
+  const [filterState, setFilterState] = useState<FilterGroupEditorState>(() => ({
+    groups: initial?.groups?.length ? initial.groups
+      : [{ rules: [], combinator: 'AND' }],
+    activeGroup: 0,
+  }));
+  const [unreadableConditions, setUnreadableConditions] = useState<UnreadableListCondition[]>(
+    initial?.unreadableConditions ?? [],
+  );
+  // Which federated models the list runs over, by model tag (#4215).
+  const [modelTagScope, setModelTagScope] = useState<ListModelTagScope | undefined>(initial?.modelTagScope);
+  // Location zones remain available for quick-add columns.
   const zoneSets = useViewerStore((s) => s.zoneSets);
+  const filterModels = useMemo(() => [...models.values()].map(({ id, name, sourceFingerprint }) => ({ id, name, sourceFingerprint })), [models]);
   // Ordered group-by columns, outermost first (multi-criteria grouping #1790).
   const [groupByColumnIds, setGroupByColumnIds] = useState<string[]>(
     () => groupingColumnIds(initial?.grouping)
@@ -258,7 +173,7 @@ export function ListBuilder({ providers, stores, initial, onSave, onCancel, onEx
   // the loaded model(s), with instance counts. Derived from the models rather
   // than a curated allowlist, so a present class the curator never listed —
   // e.g. IfcDuctSegment / IfcPipeSegment — is still selectable (#1662).
-  const scopeTypes = useMemo(() => collectScopeTypes(stores), [stores]);
+  const scopeTypes = useMemo(() => collectScopeTypes(storeViews), [storeViews]);
   const typeCounts = useMemo(() => {
     const counts = new Map<IfcTypeEnum, number>();
     for (const { type, count } of scopeTypes) counts.set(type, count);
@@ -276,6 +191,8 @@ export function ListBuilder({ providers, stores, initial, onSave, onCancel, onEx
     }
     return discoverColumns(providers, Array.from(selectedTypes));
   }, [providers, selectedTypes]);
+  const valueOptions = useListValueOptions(groupsNeedListValues(filterState.groups), stores, storeViews, providers, mutationVersion);
+  const listValueOptions = useMemo(() => ({ ...valueOptions, discovered, zoneSets }), [valueOptions, discovered, zoneSets]);
 
   const toggleType = useCallback((type: IfcTypeEnum) => {
     setSelectedTypes(prev => {
@@ -340,16 +257,6 @@ export function ListBuilder({ providers, stores, initial, onSave, onCancel, onEx
     });
   }, []);
 
-  const addCondition = useCallback((condition: PropertyCondition) => {
-    setConditions(prev => [...prev, condition]);
-  }, []);
-  const updateCondition = useCallback((idx: number, condition: PropertyCondition) => {
-    setConditions(prev => prev.map((c, i) => (i === idx ? condition : c)));
-  }, []);
-  const removeCondition = useCallback((idx: number) => {
-    setConditions(prev => prev.filter((_, i) => i !== idx));
-  }, []);
-
   const toggleSumColumn = useCallback((id: string) => {
     setSumColumnIds(prev => {
       const next = new Set(prev);
@@ -395,11 +302,13 @@ export function ListBuilder({ providers, stores, initial, onSave, onCancel, onEx
       entityTypes: Array.from(selectedTypes),
       // Preserve a filter-snapshot scope (set at creation; not edited here).
       expressIdsByModel: initial?.expressIdsByModel,
-      conditions,
+      modelTagScope,
+      groups: filterState.groups,
+      unreadableConditions,
       columns,
       grouping,
     };
-  }, [initial, name, description, selectedTypes, conditions, columns, groupByColumnIds, sumColumnIds]);
+  }, [initial, name, description, selectedTypes, modelTagScope, filterState.groups, unreadableConditions, columns, groupByColumnIds, sumColumnIds]);
 
   const handleSave = useCallback(() => onSave(buildDefinition()), [buildDefinition, onSave]);
   const handleRun = useCallback(() => onExecute(buildDefinition()), [buildDefinition, onExecute]);
@@ -426,14 +335,14 @@ export function ListBuilder({ providers, stores, initial, onSave, onCancel, onEx
         <div className="px-3 py-3 space-y-5">
           {/* Identity */}
           <div className="space-y-2">
-            <Input
-              placeholder="List name…"
+            <Input aria-label={t('lists.builder.nameInputLabel')}
+              placeholder={t('lists.builder.namePlaceholder')}
               value={name}
               onChange={e => setName(e.target.value)}
               className="h-9 text-sm font-medium"
             />
-            <Input
-              placeholder="Description (optional)"
+            <Input aria-label={t('lists.builder.descriptionInputLabel')}
+              placeholder={t('lists.builder.descriptionPlaceholder')}
               value={description}
               onChange={e => setDescription(e.target.value)}
               className="h-7 text-xs"
@@ -442,18 +351,17 @@ export function ListBuilder({ providers, stores, initial, onSave, onCancel, onEx
 
           {/* Scope: entity types — or a frozen filter snapshot */}
           <Section
-            label="Scope"
+            label={t('lists.builder.sectionScope')}
             hint={isSnapshot
-              ? `${snapshotCount.toLocaleString()} elements · snapshot`
+              ? t('lists.builder.scopeSnapshotHint', { count: snapshotCount, countDisplay: formatLocaleCount(snapshotCount, locale) })
               : selectedTypes.size > 0
-                ? `${totalSelectedEntities.toLocaleString()} elements`
-                : 'All elements'}
+                ? t('lists.builder.scopeSelectedElementsHint', { count: totalSelectedEntities, countDisplay: formatLocaleCount(totalSelectedEntities, locale) })
+                : t('lists.builder.scopeAllElementsHint')}
           >
             {isSnapshot ? (
-              <p className="rounded-md border border-primary/30 bg-primary/5 px-2.5 py-2 text-[11px] leading-relaxed text-muted-foreground">
-                <strong className="font-medium text-foreground">Filter snapshot</strong> — frozen to the{' '}
-                {snapshotCount.toLocaleString()} elements that matched the search filter. Entity-type scope
-                doesn&apos;t apply; configure columns and grouping below.
+              <p className="rounded-md border border-primary/30 bg-primary/5 px-2.5 py-2 text-2xs leading-relaxed text-muted-foreground">
+                <strong className="font-medium text-foreground">{t('lists.builder.filterSnapshotLabel')}</strong>{' '}
+                {t('lists.builder.filterSnapshotHint', { count: snapshotCount, countDisplay: formatLocaleCount(snapshotCount, locale) })}
               </p>
             ) : (
               <>
@@ -463,39 +371,35 @@ export function ListBuilder({ providers, stores, initial, onSave, onCancel, onEx
                       key={type}
                       selected={selectedTypes.has(type)}
                       onClick={() => toggleType(type)}
-                      trailing={count.toLocaleString()}
+                      trailing={formatLocaleCount(count, locale)}
                     >
                       {label}
                     </Chip>
                   ))}
                 </div>
                 {selectedTypes.size === 0 && (
-                  <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
-                    No type selected — the list targets <strong className="font-medium text-foreground">all model elements</strong>.
-                    Use filters to narrow by name, material, classification or storey.
+                  <p className="mt-2 text-2xs leading-relaxed text-muted-foreground">
+                    {t('lists.builder.noTypeSelected')}
                   </p>
                 )}
               </>
             )}
+            <ListModelTagScopeEditor value={modelTagScope} onChange={setModelTagScope} />
           </Section>
 
           {/* Filters */}
-          <Section label="Filters" hint={conditions.length > 0 ? `${conditions.length}` : undefined}>
-            <ConditionsBody
-              conditions={conditions}
-              discovered={discovered}
-              values={conditionValues}
-              spatialNames={spatialNamesByLevel}
-              modelNames={modelNames}
-              zoneSets={zoneSets}
-              onAdd={addCondition}
-              onUpdate={updateCondition}
-              onRemove={removeCondition}
-            />
+          <Section label={t('lists.builder.sectionFilters')} hint={filterState.groups.some((group) => group.rules.length > 0) || unreadableConditions.length > 0
+            ? formatLocaleCount(filterState.groups.reduce((count, group) => count + group.rules.length, unreadableConditions.length), locale)
+            : undefined}>
+            <ListValueOptionsContext.Provider value={listValueOptions}>
+              <FilterGroupEditor groups={filterState.groups} activeGroup={filterState.activeGroup}
+                onChange={setFilterState} allowedKinds={LIST_FILTER_KINDS} models={filterModels} />
+            </ListValueOptionsContext.Provider>
+            <UnreadableListFilters rows={unreadableConditions} onChange={setUnreadableConditions} />
           </Section>
 
           {/* Columns */}
-          <Section label="Columns" hint={columns.length > 0 ? `${columns.length}` : undefined}>
+          <Section label={t('lists.builder.sectionColumns')} hint={columns.length > 0 ? formatLocaleCount(columns.length, locale) : undefined}>
             {columns.length > 0 && (
               <SelectedColumns
                 columns={columns}
@@ -518,7 +422,7 @@ export function ListBuilder({ providers, stores, initial, onSave, onCancel, onEx
 
           {/* Grouping & totals */}
           {columns.length > 0 && (
-            <Section label="Grouping & Totals">
+            <Section label={t('lists.builder.sectionGroupingTotals')}>
               <GroupingBody
                 columns={columns}
                 groupByColumnIds={groupByColumnIds}
@@ -534,77 +438,17 @@ export function ListBuilder({ providers, stores, initial, onSave, onCancel, onEx
       {/* Bottom actions */}
       <div className="flex items-center gap-2 px-3 py-2.5 border-t bg-muted/30">
         <Button size="sm" onClick={handleRun} disabled={!canRun} className="h-8 gap-1.5 text-xs font-medium">
-          <Play className="h-3.5 w-3.5" /> Run
+          <Play className="h-3.5 w-3.5" /> {t('lists.builder.run')}
         </Button>
         <Button variant="outline" size="sm" onClick={handleSave} disabled={!canRun} className="h-8 gap-1.5 text-xs">
-          <Save className="h-3.5 w-3.5" /> Save
+          <Save className="h-3.5 w-3.5" /> {t('lists.builder.save')}
         </Button>
         <div className="flex-1" />
         <Button variant="ghost" size="sm" onClick={onCancel} className="h-8 text-xs">
-          Cancel
+          {t('lists.builder.cancel')}
         </Button>
       </div>
     </div>
-  );
-}
-
-// ============================================================================
-// Section shell — consistent header with an accent rule
-// ============================================================================
-
-function Section({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <section>
-      <div className="mb-2 flex items-center gap-2">
-        <span className="h-3 w-1 rounded-full bg-primary/70" aria-hidden />
-        <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-          {label}
-        </span>
-        {hint !== undefined && (
-          <Badge variant="secondary" className="h-4 px-1.5 text-[10px] font-normal">{hint}</Badge>
-        )}
-      </div>
-      {children}
-    </section>
-  );
-}
-
-function Chip({
-  selected,
-  onClick,
-  trailing,
-  children,
-}: {
-  selected: boolean;
-  onClick: () => void;
-  trailing?: React.ReactNode;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-pressed={selected}
-      className={cn(
-        'inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs transition-colors',
-        selected
-          ? 'border-primary bg-primary text-primary-foreground shadow-sm'
-          : 'border-border bg-background hover:bg-muted',
-      )}
-    >
-      {children}
-      {trailing !== undefined && (
-        <span className={cn('tabular-nums', selected ? 'opacity-80' : 'text-muted-foreground')}>{trailing}</span>
-      )}
-    </button>
   );
 }
 
@@ -629,7 +473,7 @@ function SelectedColumns({
 }) {
   // Which column's inline editor is open (one at a time). Cleared when the
   // edited column is removed or after a save.
-  const [editingId, setEditingId] = useState<string | null>(null);
+  const { t } = useTranslation(); const [editingId, setEditingId] = useState<string | null>(null);
 
   return (
     <div className="mb-3 space-y-1">
@@ -649,7 +493,7 @@ function SelectedColumns({
               {editable && (
                 <button
                   onClick={() => setEditingId(editing ? null : col.id)}
-                  aria-label={editing ? 'Close editor' : 'Edit column'}
+                  aria-label={editing ? t('lists.builder.closeEditorAriaLabel') : t('lists.builder.editColumnAriaLabel')}
                   aria-pressed={editing}
                   className={cn(
                     'shrink-0 hover:text-foreground',
@@ -662,7 +506,7 @@ function SelectedColumns({
               <button
                 onClick={() => onMove(idx, -1)}
                 disabled={idx === 0}
-                aria-label="Move up"
+                aria-label={t('lists.builder.moveUpAriaLabel')}
                 className="shrink-0 text-muted-foreground hover:text-foreground disabled:opacity-25"
               >
                 <ChevronUp className="h-3.5 w-3.5" />
@@ -670,14 +514,14 @@ function SelectedColumns({
               <button
                 onClick={() => onMove(idx, 1)}
                 disabled={idx === columns.length - 1}
-                aria-label="Move down"
+                aria-label={t('lists.builder.moveDownAriaLabel')}
                 className="shrink-0 text-muted-foreground hover:text-foreground disabled:opacity-25"
               >
                 <ChevronDown className="h-3.5 w-3.5" />
               </button>
               <button
                 onClick={() => { if (editing) setEditingId(null); onRemove(col.id); }}
-                aria-label="Remove column"
+                aria-label={t('lists.builder.removeColumnAriaLabel')}
                 className="shrink-0 text-muted-foreground hover:text-destructive"
               >
                 <Trash2 className="h-3.5 w-3.5" />
@@ -721,7 +565,7 @@ function colSourceTag(col: ColumnDefinition): string {
 
 function ColSourceTag({ col }: { col: ColumnDefinition }) {
   return (
-    <span className="shrink-0 rounded bg-muted px-1 text-[9px] font-medium uppercase tracking-wide text-muted-foreground">
+    <span className="shrink-0 rounded bg-muted px-1 text-2xs font-medium uppercase tracking-wide text-muted-foreground">
       {colSourceTag(col)}
     </span>
   );
@@ -875,7 +719,7 @@ function CustomColumnEntry({
   onAdd: (col: ColumnDefinition) => void;
   isDuplicate: (draft: ColumnDraft, excludeId?: string) => boolean;
 }) {
-  const [open, setOpen] = useState(false);
+  const { t } = useTranslation(); const [open, setOpen] = useState(false);
 
   if (!open) {
     return (
@@ -883,8 +727,8 @@ function CustomColumnEntry({
         onClick={() => setOpen(true)}
         className="flex w-full items-center gap-1.5 rounded-md border border-dashed border-border px-2 py-1.5 text-xs text-muted-foreground hover:border-primary/50 hover:text-foreground"
       >
-        <Plus className="h-3.5 w-3.5" /> Custom column
-        <span className="ml-auto font-mono text-[10px] opacity-70">Pset/Qto or /regex/</span>
+        <Plus className="h-3.5 w-3.5" /> {t('lists.builder.customColumn')}
+        <span className="ml-auto font-mono text-2xs opacity-70">{t('lists.builder.customColumnHint')}</span>
       </button>
     );
   }
@@ -941,6 +785,7 @@ function ColumnEditorPanel({
   onClose: () => void;
   isDuplicate?: (draft: ColumnDraft) => boolean;
 }) {
+  const { t } = useTranslation();
   const [source, setSource] = useState<'property' | 'quantity'>(initial.source);
   const [setName, setSetName] = useState(initial.setName);
   const [propName, setPropName] = useState(initial.propName);
@@ -977,33 +822,33 @@ function ColumnEditorPanel({
   return (
     <div className="space-y-2 rounded-md border border-border/60 bg-card p-2.5">
       <div className="flex items-center gap-1.5">
-        <Chip selected={source === 'property'} onClick={() => setSource('property')}>Property</Chip>
-        <Chip selected={source === 'quantity'} onClick={() => setSource('quantity')}>Quantity</Chip>
+        <Chip selected={source === 'property'} onClick={() => setSource('property')}>{t('lists.builder.property')}</Chip>
+        <Chip selected={source === 'quantity'} onClick={() => setSource('quantity')}>{t('lists.builder.quantity')}</Chip>
         {preview.isPattern && (
-          <span className="rounded bg-primary/10 px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide text-primary">
-            regex
+          <span className="rounded bg-primary/10 px-1.5 py-0.5 text-2xs font-medium uppercase tracking-wide text-primary">
+            {t('lists.builder.regexBadge')}
           </span>
         )}
         <button
           onClick={onClose}
-          aria-label={mode === 'add' ? 'Close custom column' : 'Close editor'}
+          aria-label={mode === 'add' ? t('lists.builder.closeCustomColumnAriaLabel') : t('lists.builder.closeEditorAriaLabel')}
           className="ml-auto shrink-0 text-muted-foreground hover:text-foreground"
         >
           <ChevronUp className="h-3.5 w-3.5" />
         </button>
       </div>
       <div className="flex items-center gap-1.5">
-        <ComboInput
+        <ComboInput aria-label={t(source === 'quantity' ? 'lists.builder.quantitySetInputLabel' : 'lists.builder.propertySetInputLabel')}
           value={setName}
           options={setOptions}
-          placeholder={source === 'quantity' ? 'Qto_… or /Qto_.*/' : 'Pset_… or /Pset_.*/'}
+          placeholder={source === 'quantity' ? t('lists.builder.quantitySetPlaceholder') : t('lists.builder.propertySetPlaceholder')}
           className="h-7 min-w-0 flex-1 text-xs"
           onChange={setSetName}
         />
-        <ComboInput
+        <ComboInput aria-label={t(source === 'quantity' ? 'lists.builder.quantityNameInputLabel' : 'lists.builder.propertyNameInputLabel')}
           value={propName}
           options={propOptions}
-          placeholder={source === 'quantity' ? 'NetVolume' : 'FireRating'}
+          placeholder={source === 'quantity' ? t('lists.builder.quantityNamePlaceholder') : t('lists.builder.propertyNamePlaceholder')}
           className="h-7 min-w-0 flex-1 text-xs"
           onChange={setPropName}
         />
@@ -1011,27 +856,13 @@ function ColumnEditorPanel({
           size="sm"
           onClick={submit}
           disabled={!canSubmit}
-          aria-label={mode === 'add' ? 'Add custom column' : 'Save column'}
+          aria-label={mode === 'add' ? t('lists.builder.addCustomColumnAriaLabel') : t('lists.builder.saveColumnAriaLabel')}
           className="h-7 shrink-0 px-2"
         >
           {mode === 'add' ? <Plus className="h-3.5 w-3.5" /> : <Check className="h-3.5 w-3.5" />}
         </Button>
       </div>
-      {preview.isInvalid ? (
-        <p className="text-[11px] leading-relaxed text-destructive">
-          Invalid pattern. It would be matched as a literal name, so it likely hits nothing.
-        </p>
-      ) : preview.isPattern ? (
-        <p className="text-[11px] leading-relaxed text-muted-foreground">
-          {formatMatchHint(preview.matches)}
-        </p>
-      ) : (
-        <p className="text-[11px] leading-relaxed text-muted-foreground">
-          Type an exact set name, or wrap a pattern in{' '}
-          <code className="rounded bg-muted px-1 font-mono text-[10px]">/…/</code> to pull one value across every
-          matching set, e.g. <code className="rounded bg-muted px-1 font-mono text-[10px]">/Qto_.*BaseQuantities/</code>.
-        </p>
-      )}
+      <PatternHint preview={preview} />
     </div>
   );
 }
@@ -1057,7 +888,7 @@ function PickerGroup({
       >
         {expanded ? <ChevronDown className="h-3.5 w-3.5 shrink-0" /> : <ChevronRight className="h-3.5 w-3.5 shrink-0" />}
         <span className="truncate font-medium">{title}</span>
-        <span className="ml-auto rounded bg-muted px-1 text-[9px] font-medium uppercase tracking-wide text-muted-foreground">
+        <span className="ml-auto rounded bg-muted px-1 text-2xs font-medium uppercase tracking-wide text-muted-foreground">
           {badge}
         </span>
       </button>
@@ -1075,7 +906,7 @@ function PickerItem({
   selected: boolean;
   onAdd: () => void;
 }) {
-  return (
+  const { t } = useTranslation(); return (
     <button
       className={cn(
         'flex w-full items-center gap-1.5 rounded px-2 py-1 text-xs',
@@ -1086,7 +917,7 @@ function PickerItem({
     >
       {selected ? <Check className="h-3 w-3 text-primary" /> : <Plus className="h-3 w-3" />}
       <span className="truncate">{label}</span>
-      {selected && <span className="ml-auto text-[10px]">added</span>}
+      {selected && <span className="ml-auto text-2xs">{t('lists.builder.added')}</span>}
     </button>
   );
 }
@@ -1109,6 +940,7 @@ function GroupingBody({
   onGroupLevelChange: (level: number, id: string) => void;
   onToggleSum: (id: string) => void;
 }) {
+  const { t } = useTranslation();
   // One select per active level, plus a trailing empty slot to add the next
   // level (as long as ungrouped columns remain).
   const levelSlots = groupByColumnIds.length < columns.length
@@ -1119,13 +951,13 @@ function GroupingBody({
       <div className="space-y-1.5">
         {levelSlots.map((id, level) => (
           <label key={level} className="flex items-center gap-2 text-xs">
-            <span className="w-16 shrink-0 text-muted-foreground">{level === 0 ? 'Group by' : 'then by'}</span>
+            <span className="w-16 shrink-0 text-muted-foreground">{level === 0 ? t('lists.builder.groupByLabel') : t('lists.builder.thenByLabel')}</span>
             <select
               value={id}
               onChange={(e) => onGroupLevelChange(level, e.target.value)}
               className="h-7 flex-1 rounded-md border border-border bg-background px-2 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
             >
-              <option value="">{level === 0 ? '— None (flat list) —' : 'None'}</option>
+              <option value="">{level === 0 ? t('lists.builder.noneFlatList') : t('lists.builder.none')}</option>
               {columns
                 .filter((c) => c.id === id || !groupByColumnIds.includes(c.id))
                 .map((c) => (
@@ -1135,331 +967,23 @@ function GroupingBody({
           </label>
         ))}
         {groupByColumnIds.length > 0 && (
-          <div className="text-[11px] text-muted-foreground">
-            Each group shows its element count.
+          <div className="text-2xs text-muted-foreground">
+            {t('lists.builder.groupCountHint')}
           </div>
         )}
       </div>
       <div>
-        <div className="mb-1 text-[11px] text-muted-foreground">
-          Σ Totals — sum these columns per group and overall
+        <div className="mb-1 text-2xs text-muted-foreground">
+          {t('lists.builder.totalsHint')}
         </div>
         <div className="flex flex-wrap gap-1.5">
           {columns.map((c) => (
             <Chip key={c.id} selected={sumColumnIds.has(c.id)} onClick={() => onToggleSum(c.id)}>
-              <span className="font-mono">Σ</span> {c.label ?? c.propertyName}
+              <span className="font-mono">{t('lists.builder.sumIcon')}</span> {c.label ?? c.propertyName}
             </Chip>
           ))}
         </div>
       </div>
-    </div>
-  );
-}
-
-// ============================================================================
-// Filters (conditions)
-// ============================================================================
-
-type ConditionSource = PropertyCondition['source'];
-
-const CONDITION_SOURCES: { source: ConditionSource; label: string }[] = [
-  { source: 'attribute', label: 'Attribute' },
-  { source: 'property', label: 'Property' },
-  { source: 'quantity', label: 'Quantity' },
-  { source: 'material', label: 'Material' },
-  { source: 'classification', label: 'Classification' },
-  { source: 'spatial', label: 'Spatial' },
-  { source: 'model', label: 'Model' },
-  { source: 'zone', label: 'Zone' },
-];
-
-const OPERATOR_LABEL: Record<ConditionOperator, string> = {
-  equals: '=',
-  notEquals: '≠',
-  contains: 'contains',
-  gt: '>',
-  lt: '<',
-  gte: '≥',
-  lte: '≤',
-  exists: 'is set',
-};
-
-function operatorsFor(source: ConditionSource): ConditionOperator[] {
-  switch (source) {
-    case 'quantity':
-      return ['equals', 'notEquals', 'gt', 'gte', 'lt', 'lte', 'exists'];
-    case 'material':
-    case 'classification':
-      return ['contains', 'equals', 'notEquals', 'exists'];
-    default:
-      return ['equals', 'notEquals', 'contains', 'exists'];
-  }
-}
-
-/** `zoneSets` supplies the default zone-SET id for a fresh `zone` condition
- *  (the first defined set, so switching the source dropdown to Zone lands
- *  on something usable rather than an empty set-picker). */
-function defaultConditionFor(source: ConditionSource, zoneSets: ZoneSet[] = []): PropertyCondition {
-  switch (source) {
-    case 'property':
-      return { source, psetName: '', propertyName: '', operator: 'equals', value: '' };
-    case 'quantity':
-      return { source, psetName: '', propertyName: '', operator: 'gt', value: '' };
-    case 'material':
-      return { source, propertyName: 'Material', operator: 'contains', value: '' };
-    case 'classification':
-      return { source, propertyName: 'Classification', operator: 'contains', value: '' };
-    case 'spatial':
-      return { source, propertyName: 'Storey', operator: 'equals', value: '' };
-    case 'model':
-      return { source, propertyName: 'Model', operator: 'equals', value: '' };
-    case 'zone':
-      return { source, psetName: zoneSets[0]?.id ?? '', propertyName: 'Zone', operator: 'equals', value: '' };
-    case 'attribute':
-    default:
-      return { source: 'attribute', propertyName: 'Name', operator: 'contains', value: '' };
-  }
-}
-
-const SELECT_CLASS =
-  'h-7 rounded-md border border-border bg-background px-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring';
-
-function ConditionsBody({
-  conditions,
-  discovered,
-  values,
-  spatialNames,
-  modelNames,
-  zoneSets,
-  onAdd,
-  onUpdate,
-  onRemove,
-}: {
-  conditions: PropertyCondition[];
-  discovered: DiscoveredColumns;
-  values: ListConditionValues | null;
-  spatialNames: Record<string, string[]>;
-  modelNames: string[];
-  zoneSets: ZoneSet[];
-  onAdd: (condition: PropertyCondition) => void;
-  onUpdate: (idx: number, condition: PropertyCondition) => void;
-  onRemove: (idx: number) => void;
-}) {
-  return (
-    <div className="space-y-1.5">
-      {conditions.map((condition, idx) => (
-        <ConditionRow
-          key={idx}
-          condition={condition}
-          discovered={discovered}
-          values={values}
-          spatialNames={spatialNames}
-          modelNames={modelNames}
-          zoneSets={zoneSets}
-          onChange={(next) => onUpdate(idx, next)}
-          onRemove={() => onRemove(idx)}
-        />
-      ))}
-      <button
-        onClick={() => onAdd(defaultConditionFor('attribute'))}
-        className="flex items-center gap-1 rounded-md border border-dashed border-border px-2 py-1 text-xs text-muted-foreground hover:border-primary/50 hover:text-foreground"
-      >
-        <Plus className="h-3.5 w-3.5" /> Add filter
-      </button>
-    </div>
-  );
-}
-
-function ConditionRow({
-  condition,
-  discovered,
-  values,
-  spatialNames,
-  modelNames,
-  zoneSets,
-  onChange,
-  onRemove,
-}: {
-  condition: PropertyCondition;
-  discovered: DiscoveredColumns;
-  values: ListConditionValues | null;
-  spatialNames: Record<string, string[]>;
-  modelNames: string[];
-  zoneSets: ZoneSet[];
-  onChange: (next: PropertyCondition) => void;
-  onRemove: () => void;
-}) {
-  const ops = operatorsFor(condition.source);
-  const showValue = condition.operator !== 'exists';
-  const isProperty = condition.source === 'property';
-  const isQuantity = condition.source === 'quantity';
-  const isSpatial = condition.source === 'spatial';
-  const isZone = condition.source === 'zone';
-  const showSetFields = isProperty || isQuantity;
-
-  const setNameOptions = useMemo<string[]>(() => {
-    if (isProperty) return Array.from(discovered.properties.keys()).sort();
-    if (isQuantity) return Array.from(discovered.quantities.keys()).sort();
-    return [];
-  }, [discovered, isProperty, isQuantity]);
-
-  const propNameOptions = useMemo<string[]>(() => {
-    const set = condition.psetName ?? '';
-    if (isProperty) return [...(discovered.properties.get(set) ?? [])];
-    if (isQuantity) return [...(discovered.quantities.get(set) ?? [])];
-    return [];
-  }, [discovered, condition.psetName, isProperty, isQuantity]);
-
-  const zoneNameOptions = useMemo<string[]>(() => {
-    if (!isZone) return [];
-    const set = zoneSets.find((zs) => zs.id === condition.psetName);
-    return set ? set.zones.map((z) => z.name) : [];
-  }, [isZone, zoneSets, condition.psetName]);
-
-  const valueOptions = useMemo<readonly string[]>(() => {
-    switch (condition.source) {
-      case 'property':
-        return values?.propertyValues.get(propValueKey(condition.psetName ?? '', condition.propertyName)) ?? NO_OPTIONS;
-      case 'material': return values?.materials ?? NO_OPTIONS;
-      case 'classification': return values?.classifications ?? NO_OPTIONS;
-      case 'spatial': return spatialNames[condition.propertyName] ?? spatialNames.Storey ?? NO_OPTIONS;
-      case 'model': return modelNames;
-      case 'zone':
-        if (condition.propertyName === 'Straddles') return ['true', 'false'];
-        // A volume mode compares against a NUMBER, so offering zone names as
-        // completions would suggest a comparison that can never match.
-        if (isZoneVolumeMode(condition.propertyName) || condition.propertyName === ZONE_MODE_BREAKDOWN_LABEL) return [];
-        return zoneNameOptions;
-      default: return NO_OPTIONS;
-    }
-  }, [condition.source, condition.psetName, condition.propertyName, values, spatialNames, modelNames, zoneNameOptions]);
-
-  const valuePlaceholder =
-    condition.source === 'spatial' ? `${(condition.propertyName || 'Storey').toLowerCase()} name`
-      : condition.source === 'model' ? 'model / file'
-        : condition.source === 'material' ? 'material'
-          : condition.source === 'classification' ? 'code or name'
-            : condition.source === 'zone' ? (
-              condition.propertyName === 'Straddles' ? 'true / false'
-                : isZoneVolumeMode(condition.propertyName) ? 'volume'
-                  : condition.propertyName === ZONE_MODE_BREAKDOWN_LABEL ? 'zone: value, …'
-                    : 'zone name'
-            )
-              : 'value';
-
-  return (
-    <div className="flex flex-wrap items-center gap-1.5 rounded-md border border-border/60 bg-card px-2 py-1.5 text-xs">
-      <select
-        value={condition.source}
-        onChange={(e) => onChange(defaultConditionFor(e.target.value as ConditionSource, zoneSets))}
-        className={SELECT_CLASS}
-        aria-label="Filter dimension"
-      >
-        {CONDITION_SOURCES.map((s) => (
-          <option key={s.source} value={s.source}>{s.label}</option>
-        ))}
-      </select>
-
-      {condition.source === 'attribute' && (
-        <select
-          value={condition.propertyName}
-          onChange={(e) => onChange({ ...condition, propertyName: e.target.value })}
-          className={SELECT_CLASS}
-          aria-label="Attribute"
-        >
-          {ENTITY_ATTRIBUTES.map((a) => (
-            <option key={a} value={a}>{a}</option>
-          ))}
-        </select>
-      )}
-
-      {isSpatial && (
-        <select
-          value={condition.propertyName || 'Storey'}
-          onChange={(e) => onChange({ ...condition, propertyName: e.target.value, value: '' })}
-          className={SELECT_CLASS}
-          aria-label="Spatial level"
-        >
-          {SPATIAL_LEVELS.map((level) => (
-            <option key={level} value={level}>{level}</option>
-          ))}
-        </select>
-      )}
-
-      {isZone && (
-        <>
-          <select
-            value={condition.psetName ?? ''}
-            onChange={(e) => onChange({ ...condition, psetName: e.target.value, value: '' })}
-            className={SELECT_CLASS}
-            aria-label="Zone set"
-          >
-            {zoneSets.length === 0 && <option value="">(no zone sets)</option>}
-            {zoneSets.map((zs) => (
-              <option key={zs.id} value={zs.id}>{zs.name}</option>
-            ))}
-          </select>
-          <select
-            value={condition.propertyName || 'Zone'}
-            onChange={(e) => onChange({ ...condition, propertyName: e.target.value, value: '' })}
-            className={SELECT_CLASS}
-            aria-label="Zone display mode"
-          >
-            <option value="Zone">Zone</option>
-            <option value="Straddles">Straddles</option>
-            <option value={ZONE_MODE_VOLUME_LABEL}>{ZONE_MODE_VOLUME_LABEL}</option>
-            <option value={ZONE_MODE_BREAKDOWN_LABEL}>{ZONE_MODE_BREAKDOWN_LABEL}</option>
-          </select>
-        </>
-      )}
-
-      {showSetFields && (
-        <>
-          <ComboInput
-            value={condition.psetName ?? ''}
-            options={setNameOptions}
-            placeholder={isQuantity ? 'Qto_…' : 'Pset_…'}
-            className="h-7 w-32 text-xs"
-            onChange={(v) => onChange({ ...condition, psetName: v })}
-          />
-          <ComboInput
-            value={condition.propertyName}
-            options={propNameOptions}
-            placeholder="name"
-            className="h-7 w-28 text-xs"
-            onChange={(v) => onChange({ ...condition, propertyName: v })}
-          />
-        </>
-      )}
-
-      <select
-        value={condition.operator}
-        onChange={(e) => onChange({ ...condition, operator: e.target.value as ConditionOperator })}
-        className={SELECT_CLASS}
-        aria-label="Operator"
-      >
-        {ops.map((op) => (
-          <option key={op} value={op}>{OPERATOR_LABEL[op]}</option>
-        ))}
-      </select>
-
-      {showValue && (
-        <ComboInput
-          value={String(condition.value ?? '')}
-          options={valueOptions}
-          placeholder={valuePlaceholder}
-          className="h-7 w-44 text-xs"
-          onChange={(v) => onChange({ ...condition, value: v })}
-        />
-      )}
-
-      <button
-        onClick={onRemove}
-        aria-label="Remove filter"
-        className="ml-auto shrink-0 text-muted-foreground hover:text-destructive"
-      >
-        <Trash2 className="h-3.5 w-3.5" />
-      </button>
     </div>
   );
 }

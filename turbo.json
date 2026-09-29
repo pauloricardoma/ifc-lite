@@ -10,9 +10,11 @@
     "tsconfig.json",
     "tsconfig.packages.json",
     "tsconfig.tests.base.json",
-    "scripts/typecheck-tests.mjs"
+    "scripts/typecheck-tests.mjs",
+    "scripts/lib/is-main-entry.mjs"
   ],
   "globalPassThroughEnv": [
+    "NODE_OPTIONS",
     "RUSTUP_HOME",
     "CARGO_HOME",
     "RUSTUP_TOOLCHAIN",
@@ -68,6 +70,8 @@
         "VITE_POSTHOG_HOST",
         "VITE_SOURCEMAP",
         "VERCEL_GIT_COMMIT_SHA",
+        "VERCEL_DEPLOYMENT_ID",
+        "VERCEL_SKEW_PROTECTION_ENABLED",
         "GITHUB_SHA"
       ]
     },

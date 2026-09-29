@@ -3,16 +3,15 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * 2D Drawing generation state slice
- *
- * Manages state for generating and viewing 2D architectural drawings
- * (floor plans, sections, elevations) from the 3D model.
+ * 2D Drawing generation state slice: manages state for generating and
+ * viewing 2D architectural drawings (floor plans, sections, elevations) from the 3D model.
  */
 
 import type { StateCreator } from 'zustand';
 import type { Drawing2D, DxfPlacement, DxfUnderlay, GraphicOverrideRule, GraphicOverridePreset } from '@ifc-lite/drawing-2d';
 import { BUILT_IN_PRESETS, DEFAULT_DXF_PLACEMENT } from '@ifc-lite/drawing-2d';
 import { DEFAULT_SCAN_SECTION_THICKNESS } from '@/hooks/scanSectionMath';
+import { isDegenerateMeasurement, isDegenerateArea, isDegenerateCloud } from './drawing2DDegenerateGuards';
 
 export type Drawing2DStatus = 'idle' | 'generating' | 'ready' | 'error';
 
@@ -136,8 +135,6 @@ export interface Drawing2DState {
   drawing2DError: string | null;
   /** Whether the 2D panel is visible */
   drawing2DPanelVisible: boolean;
-  /** Suppress auto-opening 2D panel on next section tool activation */
-  suppressNextSection2DPanelAutoOpen: boolean;
   /** SVG content for export (cached) */
   drawing2DSvgContent: string | null;
   /** Display options */
@@ -177,6 +174,13 @@ export interface Drawing2DState {
     scanSectionOpacity: number;
     /** Include the scan layer's dots in SVG export/print. */
     scanSectionIncludeInExport: boolean;
+    /**
+     * Print preview (#5496): forces the direct-mode canvas to white paper
+     * with black ink regardless of the active app theme, previewing what
+     * exports already produce. Off by default — the canvas otherwise
+     * follows the theme (dark paper in dark theme).
+     */
+    showPrintPreview: boolean;
   };
   /** Available graphic override presets */
   graphicOverridePresets: GraphicOverridePreset[];
@@ -245,7 +249,6 @@ export interface Drawing2DSlice extends Drawing2DState {
   setDrawing2DProgress: (progress: number, phase: string) => void;
   setDrawing2DError: (error: string | null) => void;
   setDrawing2DPanelVisible: (visible: boolean) => void;
-  setSuppressNextSection2DPanelAutoOpen: (suppress: boolean) => void;
   toggleDrawing2DPanel: () => void;
   setDrawing2DSvgContent: (svg: string | null) => void;
   updateDrawing2DDisplayOptions: (options: Partial<Drawing2DState['drawing2DDisplayOptions']>) => void;
@@ -363,6 +366,7 @@ const getDefaultDisplayOptions = (): Drawing2DState['drawing2DDisplayOptions'] =
   scanSectionThickness: DEFAULT_SCAN_SECTION_THICKNESS,
   scanSectionOpacity: 0.9,
   scanSectionIncludeInExport: true,
+  showPrintPreview: false,
 });
 
 export const getDefaultDrawing2DState = (): Drawing2DState => ({
@@ -372,7 +376,6 @@ export const getDefaultDrawing2DState = (): Drawing2DState => ({
   drawing2DPhase: '',
   drawing2DError: null,
   drawing2DPanelVisible: false,
-  suppressNextSection2DPanelAutoOpen: false,
   drawing2DSvgContent: null,
   drawing2DDisplayOptions: getDefaultDisplayOptions(),
   // Graphic overrides
@@ -428,7 +431,6 @@ export const createDrawing2DSlice: StateCreator<Drawing2DSlice, [], [], Drawing2
   }),
 
   setDrawing2DPanelVisible: (visible) => set({ drawing2DPanelVisible: visible }),
-  setSuppressNextSection2DPanelAutoOpen: (suppress) => set({ suppressNextSection2DPanelAutoOpen: suppress }),
 
   toggleDrawing2DPanel: () => set((state) => ({ drawing2DPanelVisible: !state.drawing2DPanelVisible })),
 
@@ -559,8 +561,7 @@ export const createDrawing2DSlice: StateCreator<Drawing2DSlice, [], [], Drawing2
       const distance = Math.sqrt(dx * dx + dy * dy);
 
       // Ignore zero-length measurements (click without drag)
-      const MIN_MEASUREMENT_DISTANCE = 0.001; // 1mm minimum
-      if (distance < MIN_MEASUREMENT_DISTANCE) {
+      if (isDegenerateMeasurement(distance)) {
         // Reset state without saving the measurement
         set({
           measure2DStart: null,
@@ -635,6 +636,7 @@ export const createDrawing2DSlice: StateCreator<Drawing2DSlice, [], [], Drawing2
     const state = get();
     if (state.polygonArea2DPoints.length < 3) return;
 
+    if (isDegenerateArea(area)) { set({ polygonArea2DPoints: [], annotation2DCursorPos: null }); return; } // near-zero-area guard (#4197)
     const result: PolygonArea2DResult = {
       id: `poly-area-${Date.now()}`,
       points: [...state.polygonArea2DPoints],
@@ -692,6 +694,7 @@ export const createDrawing2DSlice: StateCreator<Drawing2DSlice, [], [], Drawing2
     const state = get();
     if (state.cloudAnnotation2DPoints.length < 2) return;
 
+    if (isDegenerateCloud(state.cloudAnnotation2DPoints)) { set({ cloudAnnotation2DPoints: [], annotation2DCursorPos: null }); return; } // near-zero-size guard (#4197)
     const result: CloudAnnotation2D = {
       id: `cloud-${Date.now()}`,
       points: [...state.cloudAnnotation2DPoints],

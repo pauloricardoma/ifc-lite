@@ -135,6 +135,10 @@ classDiagram
         +AABB originalBounds
         +AABB shiftedBounds
         +boolean hasLargeCoordinates
+        +Vec3? wasmRtcOffset
+        +RtcFrame? wasmRtcFrame
+        +number? buildingRotation
+        +number? lengthUnitScale
     }
 
     GeometryResult "1" --> "*" MeshData
@@ -174,6 +178,41 @@ const wallMesh = result.meshes.find(m => m.expressId === wallId);
 const bounds = result.coordinateInfo.shiftedBounds;
 console.log(`Model bounds:`, bounds);
 ```
+
+### Exact extrusion source definitions
+
+`GeometryProcessor.extractExtrusionDefinitions` returns the authored
+`IfcExtrudedAreaSolid` profile, direction, depth, and placement separately from
+each product occurrence. It accepts raw IFC bytes and optional product STEP IDs.
+Omit the IDs to inspect every product; pass an empty `Uint32Array` to select none.
+The result type comes from the generated WASM binding.
+
+```typescript
+import { GeometryProcessor, type ExtrusionDefinitions } from '@ifc-lite/geometry';
+
+async function inspectExtrusions(bytes: Uint8Array, productId: number): Promise<ExtrusionDefinitions> {
+  const geometry = new GeometryProcessor();
+  await geometry.init();
+  try {
+    const definitions = geometry.extractExtrusionDefinitions(bytes, new Uint32Array([productId]));
+    if (!definitions) throw new Error('Geometry processor is not initialized');
+    return definitions;
+  } finally {
+    geometry.dispose();
+  }
+}
+```
+
+Source references use exact EXPRESS keys: `SweptArea`, `Position`, and
+`ExtrudedDirection` on the solid, and `Position` on the profile. `source.Depth`,
+profile loop coordinates and the optional `position_matrix` and
+`profile_position` retain IFC file length units. `length_unit_scale` converts
+file lengths to metres; nominal area and volume remain in squared and cubed
+file units. Each occurrence's column-major `world_from_source` maps solid-local
+coordinates to absolute IFC Z-up metres. For a profile point, apply
+`world_from_source × position_matrix × profile_position` in that order, using
+identity for an absent position. The `status` field reports unsupported or
+invalid sources explicitly; a missing `nominal_quantities` value is not zero.
 
 ### Drilling from a Mesh Back to its Source Item
 
@@ -240,6 +279,23 @@ than one of them, so no single id describes it. The cases:
 A material-layer slice is a fourth kind of absence with a different reading: it
 carries `materialId` instead, so the identity is present but is a material's,
 not an item's.
+
+### Canonical triangle provenance
+
+Item-identified meshes extracted from WASM carry optional `appearanceSource`
+metadata. Its `indices` reference identifies the current topology, while
+`sourceIndices` identifies the canonical unsplit triangle order. At extraction,
+both reference the existing mesh index array; no geometry buffer is copied.
+Those shared references survive worker structured clone and buffer transfer.
+
+Consumers that split triangles must carry a `cornerIndices` mapping from each
+current triangle corner to its canonical triangle corner. A consumer that
+rebuilds topology without such a mapping must discard the metadata. This is
+provenance for matching authored UVs to actual geometry, not a claim that every
+item is eligible for editing. Transports and caches must explicitly preserve
+the array identities before a downstream authoring tool can rely on them.
+Keeping a fragment may retain its original unsplit index array; callers that
+release CPU geometry must release this metadata too.
 
 ## Streaming Geometry
 
@@ -336,6 +392,51 @@ The worker count is chosen by a cores/memory heuristic; geometry output is
 identical regardless of the count (workers process deterministic, disjoint
 slices).
 
+### Hung elements and abandoning a stream
+
+A worker in the parallel pool runs one synchronous WASM call at a time. By
+default, an element whose geometry never finishes stalls the stream. Pass
+`hungJobTimeoutMs` (for example `DEFAULT_HUNG_JOB_TIMEOUT_MS`, 45 s) to opt in
+to recovery, but only if you handle `complete.skippedHungElements`:
+
+1. A worker silent inside a multi-element call for that budget is replaced, and that call is re-run one element per call.
+   Nothing is skipped at this stage.
+2. A worker silent inside a single-element call for twice that budget is
+   replaced and the element is skipped.
+3. Everything else the worker had queued is replayed on the replacement.
+
+A load that skipped elements still completes. `complete.skippedHungElements`
+lists their express ids and counts by IFC type, so treat such a `complete` as
+a partial result: tell the user, and don't cache it as the full model. After 16
+replacements the pool stops recovering, and the stream stalls as it did before
+recovery existed.
+
+The pool does not stop its workers when you stop iterating. A
+generator waiting on a silent worker cannot run its cleanup from `return()`,
+so pass a `signal` and abort it when you abandon the stream (cancel, timeout,
+or a newer load):
+
+```typescript
+import { DEFAULT_HUNG_JOB_TIMEOUT_MS } from '@ifc-lite/geometry';
+
+const controller = new AbortController();
+for await (const event of geometry.processAdaptive(new Uint8Array(buffer), {
+  signal: controller.signal,
+  hungJobTimeoutMs: DEFAULT_HUNG_JOB_TIMEOUT_MS,
+})) {
+  if (event.type === 'batch') renderer.addMeshes(event.meshes, true);
+  if (event.type === 'complete' && event.skippedHungElements) {
+    const { expressIds, byType } = event.skippedHungElements;
+    console.warn(`${expressIds.length} element(s) skipped`, byType);
+  }
+}
+// Elsewhere, on cancel: controller.abort();
+```
+
+`GeometryProcessor.processParallel` (`geometry.processParallel(...)`) takes
+positional arguments rather than an options object: pass `signal` and
+`hungJobTimeoutMs` as its last two, after `sourceFingerprint`.
+
 ## Coordinate Handling
 
 IFC files often use large georeferenced coordinates that cause precision issues:
@@ -364,32 +465,75 @@ flowchart LR
 
 ### Auto Origin Shift
 
-The geometry processor automatically handles large coordinates:
+For a georeferenced or otherwise far-from-origin model, the large offset is
+usually removed by the WASM mesh pass itself and reported as
+`coordinateInfo.wasmRtcOffset` — an **IFC Z-up** translation, not yet in the
+mesh's Y-up axes. `originShift` (already Y-up) is a second, JS-side shift that
+only fires when WASM did *not* re-base the model and it is still more than
+`NORMAL_COORD_THRESHOLD_M` (10&nbsp;km) from the origin
+(`packages/geometry/src/coordinate-handler.ts`). For most real georeferenced
+models `wasmRtcOffset` is the one that is set and `originShift` stays
+`{ x: 0, y: 0, z: 0 }` — reading only `originShift`, as the previous version of
+this example did, silently drops the WASM offset and hands back render-frame
+coordinates while presenting them as world coordinates.
+
+`hasLargeCoordinates` tracks only the JS `originShift` path, so it is `false`
+whenever WASM already re-based the model. `wasmRtcOffset !== undefined` alone
+is not enough either, because a model shifted only by `originShift` has
+`hasLargeCoordinates: true` and no `wasmRtcOffset`. To ask "was this model
+shifted at all?", check both:
+`coordinateInfo.hasLargeCoordinates || coordinateInfo.wasmRtcOffset !== undefined`.
+
+`@ifc-lite/geometry/world-frame` is the one place that combines both offsets
+and applies the Y-up/Z-up axis swap (`scripts/check-rtc-frame-copies.mjs`
+fails CI on any hand-rolled copy of this arithmetic outside that module):
 
 ```typescript
-import { GeometryProcessor } from '@ifc-lite/geometry';
+import { GeometryProcessor, type Vec3 } from '@ifc-lite/geometry';
+import { renderFrameWorldOffset, viewerToIfcAxes } from '@ifc-lite/geometry/world-frame';
 
 const geometry = new GeometryProcessor();
 await geometry.init();
 
 const result = await geometry.process(new Uint8Array(buffer));
 
-// Access the computed shift from coordinate info (returned on the result)
-const coordInfo = result.coordinateInfo;
-if (coordInfo?.originShift) {
-  console.log(`Origin shifted by:`, coordInfo.originShift);
-  // { x: 487234.5, y: 5234891.2, z: 0 }
-}
+// Render-frame -> IFC world translation, in IFC Z-up metres. Folds in both
+// wasmRtcOffset (Z-up) and originShift (Y-up) and performs the axis swap.
+const offset = renderFrameWorldOffset(result.coordinateInfo);
 
-// Convert local coordinates back to world
-function toWorldCoords(localPos: Vector3, shift: Vector3): Vector3 {
+// A point read off a mesh (positions + origin) is in the Y-up render frame.
+// Convert it to IFC Z-up first, then add the offset, to get IFC world
+// coordinates:
+function toWorldCoords(renderFramePointYup: Vec3): Vec3 {
+  const zUp = viewerToIfcAxes(renderFramePointYup);
   return {
-    x: localPos.x + shift.x,
-    y: localPos.y + shift.y,
-    z: localPos.z + shift.z
+    x: zUp.x + offset.x,
+    y: zUp.y + offset.y,
+    z: zUp.z + offset.z,
   };
 }
 ```
+
+For `coordinateInfo` `{ originShift: { x: 0, y: 0, z: 0 }, wasmRtcOffset: {
+x: 2000031.105, y: 1000012, z: 500 } }` (the WASM-shifted case above),
+`renderFrameWorldOffset` returns `{ x: 2000031.105, y: 1000012, z: 500 }`.
+Converting a render-frame point `{ x: 12.5, y: 3.2, z: -8.1 }` (Y-up) with the
+code above gives the Z-up point `{ x: 12.5, y: 8.1, z: 3.2 }` and then the
+IFC world point `{ x: 2000043.605, y: 1000020.1, z: 503.2 }` (Z-up) — verified by running `world-frame.ts`'s `renderFrameWorldOffset`
+and `viewerToIfcAxes` directly against this `coordinateInfo`.
+
+The viewer, `ifc-lite clash --bcf` and `bim.bcf` in the SDK already apply this
+conversion for you; see [BCF Collaboration → Coordinate
+frames](bcf.md#coordinate-frames) for the equivalent viewpoint-export path.
+
+In a federation, every model is drawn against one shared `wasmRtcOffset`, and
+a model loaded before that anchor was known is moved onto it after the fact:
+each mesh's `origin` and the model's `coordinateInfo` change, while its
+`positions` do not. Point clouds and models with GPU-instanced geometry are
+the exceptions and keep their own frame. Use `federationFrameInfo` from
+`@ifc-lite/geometry/world-frame` for the federation's frame instead of any one
+model's load-time `coordinateInfo`; see [Federation → Coordinates in a
+Federation](federation.md#coordinates-in-a-federation).
 
 ## Geometry Processors
 
@@ -615,3 +759,59 @@ console.log(`  Total vertices: ${result.totalVertices}`);
 - [Rendering Guide](rendering.md) - Display geometry with WebGPU
 - [Parsing Guide](parsing.md) - Parse options and streaming
 - [API Reference](../api/typescript.md) - Complete API docs
+
+### Sharing the source fingerprint with a parser worker
+
+`GeometryProcessor.processAdaptive` accepts an optional `sourceFingerprint` shared
+cell. `GeometryProcessor.processParallel` takes it positionally, as the
+`sourceFingerprint` argument after `workerCountOverride`. Pass the
+same fresh per-load cell to `WorkerParser.parseColumnar`; its layout and lifetime
+are documented in [Browser Worker Mode](./parsing.md#browser-worker-mode). Only the
+parallel prepass produces this key. Other geometry paths and older WASM builds
+leave the cell unavailable, and the parser computes its ordinary source key without
+waiting. Geometry streaming and parser index-handoff deadlines remain unchanged.
+
+### Polygonal annotation fills
+
+Ordinary native and WASM geometry processing supports direct
+`IfcAnnotationFillArea` items on `IfcAnnotation` products in `Annotation2D` and
+`Surface2D` representations. Closed `IfcPolyline` boundaries can contain holes;
+object placement and model units use the normal geometry pipeline. Auxiliary
+building-type footprints remain excluded.
+
+This initial subset accepts unstyled fills or one solid `IfcFillAreaStyle` RGB
+paint, including an IFC2x3 `IfcPresentationStyleAssignment` wrapper. Mixed paint,
+hatching/tiling, invalid RGB, unsupported boundaries and exhausted validation
+budgets refuse the fill and report an unsupported item. Limits are 64 rings and
+2,048 input vertices per fill, with a source-scoped style lookup bounded to
+256 MiB of source, one million attached-style edges, 16 KiB per styled record,
+and 64 styled items per geometry item. This does not enable PDF vector conversion.
+
+### Re-meshing edited elements
+
+`@ifc-lite/geometry/remesh` re-meshes a few elements after an edit, without reloading the model. `RemeshClient.create(config)` spawns one long-lived wasm worker. Each `remesh` request takes a standalone subgraph buffer from `serializeEntitySubgraph` (`@ifc-lite/export`) and meshes only the requested targets. It runs the load path's own calls: `buildPrePassOnce`, `processGeometryBatch`, then `convertMeshCollectionToBatch`. The request carries the RTC frame the model was meshed in and the load-time style wire, because the subgraph cannot derive either. Pass the same toggles the model was loaded with in the config, or the re-meshed element will not match its neighbours.
+
+```typescript
+import { RemeshClient, filterStyleWire } from '@ifc-lite/geometry/remesh';
+import { serializeEntitySubgraph } from '@ifc-lite/export';
+
+// Captured when the model loaded: its RTC frame and the pre-pass style wire.
+declare const loadFrame: { x: number; y: number; z: number; needsShift: boolean };
+declare const loadStyles: { styleIds: Uint32Array; styleColors: Uint8Array };
+
+const client = await RemeshClient.create({
+  mergeLayers: false, tessellationQuality: null, skipSmallCuts: false, rectParamFastPath: true,
+});
+const sub = serializeEntitySubgraph(store, mutationView, { targets: new Set([wallId]) });
+const { meshes, csgFailures } = await client.remesh({
+  buffer: sub.bytes, // transferred to the worker
+  targets: Uint32Array.of(wallId),
+  frame: loadFrame,
+  ...filterStyleWire(loadStyles.styleIds, loadStyles.styleColors, sub.ids),
+});
+client.dispose(); // terminates the worker; in-flight requests reject
+```
+
+`client.styleWire(sourceBytes)` runs one whole-file pre-pass in the worker and returns that style wire, for a model whose load did not keep one; the viewer captures it once per model. A client whose worker fails or does not answer within `requestTimeoutMs` (default 30 s) is dead: `alive` turns false, requests still in flight and any later ones reject at once, and the caller creates a new client.
+
+The meshes come back in the same frame and units as the load, so they can replace the element's load-time meshes directly. `scripts/lib/wasm-remesh-contracts.mjs` pins this. For each wall of several fixtures, including one with an RTC shift, it re-meshes the wall from its subgraph and checks the positions, indices, colours and origins against meshing the whole file.

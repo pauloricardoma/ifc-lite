@@ -34,6 +34,7 @@
  */
 
 import { useEffect, useRef } from 'react';
+import { useTranslation } from '@/i18n';
 import { useThreeScene } from './useThreeScene';
 import { createScene, type SceneHandle } from './hero-scene';
 
@@ -78,7 +79,7 @@ export const HERO_STEPS: HeroStep[] = [
   { verb: 'Standardize', line: 'bsdd_property_sets("IfcWall")',                family: 'bSDD',      overlay: { kind: 'psets', psets: ['Pset_WallCommon', 'Qto_WallBaseQuantities', 'Pset_ConcreteElementGeneral'] } },
   { verb: 'Add',       line: 'entity_create(IfcDoor)',                         family: 'Mutation' },
   { verb: 'Section',   line: 'viewer_set_section(z = 2.2)',                    family: 'Viewer' },
-  { verb: 'Issue',     line: 'bcf_topic_create("missing fire rating")',        family: 'BCF',       overlay: { kind: 'pin', ref: 'BCF #04' } },
+  { verb: 'Flag',      line: 'bcf_topic_create("missing fire rating")',        family: 'BCF',       overlay: { kind: 'pin', ref: 'BCF #04' } },
   { verb: 'Inspect',   line: 'viewer_describe_selection()',                    family: 'Viewer',    overlay: { kind: 'card', ref: 'IfcWall #262', lines: ['Pset_WallCommon · IsExternal=true', 'FireRating=EI60 · 240 mm concrete'] } },
 ];
 
@@ -98,6 +99,7 @@ export interface HeroSceneProps {
 }
 
 export function HeroScene({ step, className, onPinFrame }: HeroSceneProps) {
+  const { t } = useTranslation();
   const onPinRef = useRef(onPinFrame);
   onPinRef.current = onPinFrame;
 
@@ -133,10 +135,10 @@ export function HeroScene({ step, className, onPinFrame }: HeroSceneProps) {
       {unavailable && (
         <div className="flex h-full w-full items-center justify-center px-6 text-center">
           <span
-            className="text-[10px] uppercase tracking-[0.22em]"
+            className="text-2xs uppercase tracking-[0.22em]"
             style={{ color: CAPTION_DIM_CSS, fontFamily: '"JetBrains Mono", ui-monospace, monospace' }}
           >
-            3D preview unavailable on this device
+            {t('mcp.heroScene.webglUnavailable')}
           </span>
         </div>
       )}

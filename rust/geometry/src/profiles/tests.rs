@@ -3,6 +3,128 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use super::*;
+use super::outline::trim_polyline;
+
+    #[test]
+    fn malformed_line_mesh_defaults_remain_available_6402() {
+        // A mesh historically recovers these malformed IfcVector fields. Both
+        // a bare line and a trimmed line must use the same recovered basis.
+        for (vector, direction, expected_step) in [
+            ("IFCVECTOR(#2,$)", "IFCDIRECTION((1.,0.,0.))", 1.0),
+            ("IFCVECTOR($,2.)", "IFCDIRECTION((1.,0.,0.))", 2.0),
+            ("IFCVECTOR(#2,2.)", "IFCDIRECTION((0.,0.,0.))", 2.0),
+        ] {
+            let data = format!(
+                "#1=IFCCARTESIANPOINT((5.,6.,7.));\n#2={direction};\n#3={vector};\n#4=IFCLINE(#1,#3);\n#5=IFCTRIMMEDCURVE(#4,(IFCPARAMETERVALUE(2.)),(IFCPARAMETERVALUE(4.)),.T.,.PARAMETER.);"
+            );
+            let mut decoder = EntityDecoder::new(&data);
+            let processor = ProfileProcessor::new(IfcSchema::new());
+            let bare = decoder.decode_by_id(4).unwrap();
+            let trimmed = decoder.decode_by_id(5).unwrap();
+            assert_eq!(
+                processor
+                    .get_curve_points(&bare, &mut decoder, TessellationQuality::Medium)
+                    .unwrap(),
+                vec![
+                    Point3::new(5.0, 6.0, 7.0),
+                    Point3::new(5.0 + expected_step, 6.0, 7.0)
+                ]
+            );
+            assert_eq!(
+                processor
+                    .get_curve_points(&trimmed, &mut decoder, TessellationQuality::Medium)
+                    .unwrap(),
+                vec![
+                    Point3::new(5.0 + 2.0 * expected_step, 6.0, 7.0),
+                    Point3::new(5.0 + 4.0 * expected_step, 6.0, 7.0)
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn trimmed_line_descending_false_sense_follows_ifc_first_trim_6402() {
+        // IFC4.3 IfcTrimmedCurve: Trim1 is the first point; false sense on an
+        // open line corresponds to descending basis parameters (10 to 2).
+        let data = "#1=IFCCARTESIANPOINT((0.,0.,0.));\n#2=IFCDIRECTION((1.,0.,0.));\n#3=IFCVECTOR(#2,1.);\n#4=IFCLINE(#1,#3);\n#5=IFCTRIMMEDCURVE(#4,(IFCPARAMETERVALUE(10.)),(IFCPARAMETERVALUE(2.)),.F.,.PARAMETER.);";
+        let mut decoder = EntityDecoder::new(data);
+        let curve = decoder.decode_by_id(5).unwrap();
+        let points = ProfileProcessor::new(IfcSchema::new())
+            .get_curve_points(&curve, &mut decoder, TessellationQuality::Medium).unwrap();
+        assert_eq!(points, vec![Point3::new(10.0, 0.0, 0.0), Point3::new(2.0, 0.0, 0.0)]);
+    }
+
+    #[test]
+    fn trimmed_line_master_representation_selects_cartesian_or_parameter_6402() {
+        let data = "#1=IFCCARTESIANPOINT((0.,0.,0.));\n#2=IFCDIRECTION((1.,0.,0.));\n#3=IFCVECTOR(#2,2.);\n#4=IFCLINE(#1,#3);\n#5=IFCCARTESIANPOINT((3.,0.,0.));\n#6=IFCCARTESIANPOINT((7.,0.,0.));\n#7=IFCTRIMMEDCURVE(#4,(#5,IFCPARAMETERVALUE(10.)),(#6,IFCPARAMETERVALUE(2.)),.F.,.CARTESIAN.);\n#8=IFCTRIMMEDCURVE(#4,(#5,IFCPARAMETERVALUE(10.)),(#6,IFCPARAMETERVALUE(2.)),.F.,.PARAMETER.);";
+        let mut decoder = EntityDecoder::new(data);
+        let processor = ProfileProcessor::new(IfcSchema::new());
+        let cartesian = decoder.decode_by_id(7).unwrap();
+        let parameter = decoder.decode_by_id(8).unwrap();
+        let a = processor.get_curve_points(&cartesian, &mut decoder, TessellationQuality::Medium).unwrap();
+        let b = processor.get_curve_points(&parameter, &mut decoder, TessellationQuality::Medium).unwrap();
+        assert_eq!(a, vec![Point3::new(3.0, 0.0, 0.0), Point3::new(7.0, 0.0, 0.0)]);
+        assert_eq!(b, vec![Point3::new(20.0, 0.0, 0.0), Point3::new(4.0, 0.0, 0.0)]);
+    }
+
+    #[test]
+    fn trimmed_line_mesh_recovers_bad_cartesian_ref_using_parameter_6402() {
+        let data = "#1=IFCCARTESIANPOINT((0.,0.,0.));\n#2=IFCDIRECTION((1.,0.,0.));\n#3=IFCVECTOR(#2,1.);\n#4=IFCLINE(#1,#3);\n#5=IFCTRIMMEDCURVE(#4,(#999,IFCPARAMETERVALUE(2.)),(IFCPARAMETERVALUE(5.)),.T.,.CARTESIAN.);";
+        let mut decoder = EntityDecoder::new(data);
+        let curve = decoder.decode_by_id(5).unwrap();
+        let points = ProfileProcessor::new(IfcSchema::new())
+            .get_curve_points(&curve, &mut decoder, TessellationQuality::Medium).unwrap();
+        assert_eq!(points, vec![Point3::new(2.0, 0.0, 0.0), Point3::new(5.0, 0.0, 0.0)]);
+    }
+
+    #[test]
+    fn trimmed_circle_rotated_wrap_and_clockwise_follow_authored_trims_6402() {
+        let data = "#1=IFCCARTESIANPOINT((0.,0.,0.));\n#2=IFCDIRECTION((0.,0.,1.));\n#3=IFCDIRECTION((0.,1.,0.));\n#4=IFCAXIS2PLACEMENT3D(#1,#2,#3);\n#5=IFCCIRCLE(#4,2.);\n#6=IFCTRIMMEDCURVE(#5,(IFCPARAMETERVALUE(5.5)),(IFCPARAMETERVALUE(0.5)),.T.,.PARAMETER.);\n#7=IFCTRIMMEDCURVE(#5,(IFCPARAMETERVALUE(0.5)),(IFCPARAMETERVALUE(5.5)),.F.,.PARAMETER.);";
+        let mut decoder = EntityDecoder::new(data);
+        let processor = ProfileProcessor::new(IfcSchema::new());
+        let forward = decoder.decode_by_id(6).unwrap();
+        let backward = decoder.decode_by_id(7).unwrap();
+        let a = processor.get_curve_points(&forward, &mut decoder, TessellationQuality::Medium).unwrap();
+        let b = processor.get_curve_points(&backward, &mut decoder, TessellationQuality::Medium).unwrap();
+        let point_at = |angle: f64| Point3::new(-2.0 * angle.sin(), 2.0 * angle.cos(), 0.0);
+        assert!(approx_eq_p3(a[0], point_at(5.5), 1e-9));
+        assert!(approx_eq_p3(*a.last().unwrap(), point_at(0.5), 1e-9));
+        assert!(approx_eq_p3(b[0], point_at(0.5), 1e-9));
+        assert!(approx_eq_p3(*b.last().unwrap(), point_at(5.5), 1e-9));
+        assert_eq!(a.len(), b.len());
+    }
+
+    #[test]
+    fn trimmed_circle_parameter_bounds_use_project_plane_angle_unit_6402() {
+        let data = "#1=IFCPROJECT('guid',$,'Test',$,$,$,$,(#2),#3);\n#2=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-5,#4,$);\n#3=IFCUNITASSIGNMENT((#5,#10));\n#4=IFCAXIS2PLACEMENT3D(#7,$,$);\n#5=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);\n#7=IFCCARTESIANPOINT((0.,0.,0.));\n#8=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);\n#9=IFCMEASUREWITHUNIT(IFCRATIOMEASURE(0.0174532925199433),#8);\n#10=IFCCONVERSIONBASEDUNIT(#11,.PLANEANGLEUNIT.,'DEGREE',#9);\n#11=IFCDIMENSIONALEXPONENTS(0,0,0,0,0,0,0);\n#12=IFCCIRCLE(#4,2.);\n#13=IFCTRIMMEDCURVE(#12,(IFCPARAMETERVALUE(0.)),(IFCPARAMETERVALUE(90.)),.T.,.PARAMETER.);";
+        let mut decoder = EntityDecoder::new(data);
+        let curve = decoder.decode_by_id(13).unwrap();
+        let points = ProfileProcessor::new(IfcSchema::new())
+            .get_curve_points(&curve, &mut decoder, TessellationQuality::Medium).unwrap();
+        assert!(approx_eq_p3(points[0], Point3::new(2.0, 0.0, 0.0), 1e-9));
+        assert!(approx_eq_p3(*points.last().unwrap(), Point3::new(0.0, 2.0, 0.0), 1e-9));
+    }
+
+    #[test]
+    fn malformed_circle_spans_keep_mesh_raw_single_wrap_recovery_6402() {
+        // IFC4.3 forbids out-of-domain/cyclic-equal bounds, but old mesh files
+        // may contain them. The 3D sampler used one seam correction, not modulo.
+        let data = "#1=IFCCARTESIANPOINT((0.,0.,0.));\n#2=IFCAXIS2PLACEMENT3D(#1,$,$);\n#3=IFCCIRCLE(#2,2.);\n#4=IFCTRIMMEDCURVE(#3,(IFCPARAMETERVALUE(0.)),(IFCPARAMETERVALUE(9.42477796076938)),.T.,.PARAMETER.);\n#5=IFCTRIMMEDCURVE(#3,(IFCPARAMETERVALUE(0.)),(IFCPARAMETERVALUE(9.42477796076938)),.F.,.PARAMETER.);\n#6=IFCTRIMMEDCURVE(#3,(),(),.F.,.PARAMETER.);";
+        let mut decoder = EntityDecoder::new(data);
+        let processor = ProfileProcessor::new(IfcSchema::new());
+        let sample = |id, decoder: &mut EntityDecoder| {
+            let curve = decoder.decode_by_id(id).unwrap();
+            processor.get_curve_points(&curve, decoder, TessellationQuality::Medium).unwrap()
+        };
+        let one_and_half_turns = sample(4, &mut decoder);
+        let half_turn = sample(5, &mut decoder);
+        let absent_false = sample(6, &mut decoder);
+        assert!(one_and_half_turns.len() > half_turn.len());
+        assert!(one_and_half_turns[one_and_half_turns.len() / 2].y < -1.0);
+        assert!(approx_eq_p3(*one_and_half_turns.last().unwrap(), Point3::new(-2.0, 0.0, 0.0), 1e-9));
+        assert!(half_turn[half_turn.len() / 2].y > 1.0);
+        assert!(absent_false.iter().all(|point| approx_eq_p3(*point, Point3::new(2.0, 0.0, 0.0), 1e-9)));
+    }
 
     #[test]
     fn test_rectangle_profile() {
@@ -395,6 +517,34 @@ use super::*;
                 a.x * b.y - b.x * a.y
             })
             .sum()
+    }
+
+    /// `Profile2D::outer`'s contract is counter-clockwise. The T and Z
+    /// builders listed their points clockwise (measured signed areas -16 and
+    /// -22 for the fixtures below while I/L/U/C/Rect were positive), which
+    /// the extrusion and earcut paths hid by re-deriving orientation and the
+    /// 2D drawing path emitted verbatim. `process_parametric` now pins the
+    /// contract for every parametric shape in one place.
+    #[test]
+    fn every_parametric_profile_outer_loop_is_counter_clockwise() {
+        let fixtures: [(&str, &str, f64); 7] = [
+            ("T", "#1=IFCTSHAPEPROFILEDEF(.AREA.,'T',$,5.,8.,2.,1.,$,$,$,$,$);\n", 16.0),
+            ("Z", "#1=IFCZSHAPEPROFILEDEF(.AREA.,'Z',$,10.,3.,2.,1.,$,$);\n", 22.0),
+            ("I", "#1=IFCISHAPEPROFILEDEF(.AREA.,'I',$,6.,8.,1.,1.,$,$,$);\n", 18.0),
+            ("L", "#1=IFCLSHAPEPROFILEDEF(.AREA.,'L',$,10.,8.,2.,$,$,$);\n", 32.0),
+            ("U", "#1=IFCUSHAPEPROFILEDEF(.AREA.,'U',$,10.,4.,1.,2.,$,$,$);\n", 22.0),
+            ("C", "#1=IFCCSHAPEPROFILEDEF(.AREA.,'C',$,10.,5.,1.,2.,$);\n", 20.0),
+            ("Rect", "#1=IFCRECTANGLEPROFILEDEF(.AREA.,'R',$,4.,2.);\n", 8.0),
+        ];
+        for (name, content, area) in fixtures {
+            let profile = process_content(content, 1);
+            let signed = signed_area2(&profile.outer) * 0.5;
+            assert!(
+                (signed.abs() - area).abs() < 1e-9,
+                "{name}: fixture area drifted, got {signed}"
+            );
+            assert!(signed > 0.0, "{name}: outer loop must be CCW, signed area {signed}");
+        }
     }
 
     #[test]
@@ -850,6 +1000,117 @@ use super::*;
         assert_eq!(pts.len(), 2);
         assert!(approx_eq_p3(pts[0], Point3::new(0.0, 10.0, 0.0), 1e-9));
         assert!(approx_eq_p3(pts[1], Point3::new(0.0, 7.0, 0.0), 1e-9));
+    }
+
+    #[test]
+    fn composite_curve_trim_uses_polyline_parent_span_5566() {
+        // #5566: a composite's parameter is the running sum of its parents'
+        // spans. A 3-point polyline parent spans [0, 2] (one unit per edge,
+        // whatever the edge length), so the composite spans [0, 3] and
+        // [1, 2.5] is the second polyline edge plus half of the second
+        // segment. Unit-per-segment read [1, 2.5] as "all of seg 1 and half
+        // of seg 2"; an arc-length reading would cut elsewhere on these
+        // unequal edges.
+        let content = r#"
+#1=IFCCARTESIANPOINT((0.0,0.0,0.0));
+#2=IFCCARTESIANPOINT((0.0,2.0,0.0));
+#3=IFCCARTESIANPOINT((0.0,5.0,0.0));
+#4=IFCCARTESIANPOINT((0.0,9.0,0.0));
+#5=IFCPOLYLINE((#1,#2,#3));
+#6=IFCPOLYLINE((#3,#4));
+#7=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#5);
+#8=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#6);
+#9=IFCCOMPOSITECURVE((#7,#8),.F.);
+"#;
+        let mut decoder = EntityDecoder::new(content);
+        let processor = ProfileProcessor::new(IfcSchema::new());
+        let curve = decoder.decode_by_id(9).unwrap();
+        let pts = processor
+            .get_composite_curve_points_trimmed(&curve, &mut decoder, Some(1.0), Some(2.5))
+            .unwrap();
+        let ys: Vec<f64> = pts.iter().map(|p| p.y).collect();
+        assert_eq!(ys.len(), 3, "got points: {pts:?}");
+        assert!((ys[0] - 2.0).abs() < 1e-9);
+        assert!((ys[1] - 5.0).abs() < 1e-9);
+        assert!((ys[2] - 7.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn composite_curve_trim_counts_a_reversed_segment_from_its_new_start_5566() {
+        // #5566: SameSense=.F. traverses the parent backwards, so the
+        // composite's parameter runs from the parent's END. Segment 2 is
+        // (0,4)->(0,8) reversed: [1, 1.25] is its first quarter, y 8 -> 7.
+        let content = r#"
+#1=IFCCARTESIANPOINT((0.0,0.0,0.0));
+#2=IFCCARTESIANPOINT((0.0,8.0,0.0));
+#3=IFCCARTESIANPOINT((0.0,4.0,0.0));
+#5=IFCPOLYLINE((#1,#2));
+#6=IFCPOLYLINE((#3,#2));
+#7=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#5);
+#8=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.F.,#6);
+#9=IFCCOMPOSITECURVE((#7,#8),.F.);
+"#;
+        let mut decoder = EntityDecoder::new(content);
+        let processor = ProfileProcessor::new(IfcSchema::new());
+        let curve = decoder.decode_by_id(9).unwrap();
+        let pts = processor
+            .get_composite_curve_points_trimmed(&curve, &mut decoder, Some(1.0), Some(1.25))
+            .unwrap();
+        assert_eq!(pts.len(), 2, "got points: {pts:?}");
+        assert!(approx_eq_p3(pts[0], Point3::new(0.0, 8.0, 0.0), 1e-9), "{pts:?}");
+        assert!(approx_eq_p3(pts[1], Point3::new(0.0, 7.0, 0.0), 1e-9), "{pts:?}");
+    }
+
+    #[test]
+    fn composite_curve_trim_survives_a_parent_the_analytic_reader_rejects_5566() {
+        // A negative circle Radius: the sampler draws it, the stricter
+        // analytic reader errors. The span is then unknown and the
+        // composite is swept whole; the solid must not fail.
+        let content = r#"
+#1=IFCCARTESIANPOINT((0.0,0.0,0.0));
+#2=IFCCARTESIANPOINT((0.0,2.0,0.0));
+#3=IFCPOLYLINE((#1,#2));
+#4=IFCDIRECTION((0.0,0.0,1.0));
+#5=IFCDIRECTION((1.0,0.0,0.0));
+#6=IFCAXIS2PLACEMENT3D(#2,#4,#5);
+#7=IFCCIRCLE(#6,-1.0);
+#8=IFCTRIMMEDCURVE(#7,(IFCPARAMETERVALUE(0.0)),(IFCPARAMETERVALUE(1.0)),.T.,.PARAMETER.);
+#9=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#3);
+#10=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#8);
+#11=IFCCOMPOSITECURVE((#9,#10),.F.);
+"#;
+        let mut decoder = EntityDecoder::new(content);
+        let processor = ProfileProcessor::new(IfcSchema::new());
+        let curve = decoder.decode_by_id(11).unwrap();
+        let pts = processor
+            .get_composite_curve_points_trimmed(&curve, &mut decoder, Some(0.0), Some(0.5))
+            .expect("an unreadable span must not fail the directrix");
+        assert!(pts.len() > 2, "{pts:?}");
+    }
+
+    #[test]
+    fn composite_curve_trim_with_unsupported_parent_span_sweeps_whole_curve_5566() {
+        // An IfcIndexedPolyCurve parent has no span the analytic reader
+        // supports, so the composite has no well-defined parameter: the
+        // whole directrix is swept instead of guessing a unit span.
+        let content = r#"
+#1=IFCCARTESIANPOINTLIST3D(((0.0,0.0,0.0),(0.0,2.0,0.0),(0.0,4.0,0.0)));
+#2=IFCINDEXEDPOLYCURVE(#1,$,.F.);
+#3=IFCCARTESIANPOINT((0.0,4.0,0.0));
+#4=IFCCARTESIANPOINT((0.0,6.0,0.0));
+#5=IFCPOLYLINE((#3,#4));
+#6=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#2);
+#7=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#5);
+#8=IFCCOMPOSITECURVE((#6,#7),.F.);
+"#;
+        let mut decoder = EntityDecoder::new(content);
+        let processor = ProfileProcessor::new(IfcSchema::new());
+        let curve = decoder.decode_by_id(8).unwrap();
+        let pts = processor
+            .get_composite_curve_points_trimmed(&curve, &mut decoder, Some(0.0), Some(0.5))
+            .unwrap();
+        assert!(approx_eq_p3(pts[0], Point3::new(0.0, 0.0, 0.0), 1e-9), "{pts:?}");
+        assert!(approx_eq_p3(*pts.last().unwrap(), Point3::new(0.0, 6.0, 0.0), 1e-9), "{pts:?}");
     }
 
     // A negative Thickness / WebThickness on a parametric L/U/T/C/Z profile is

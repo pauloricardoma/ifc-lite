@@ -32,6 +32,8 @@ describe('BCFTopicDetail author display (#3574)', () => {
         onEditTopic={() => {}}
         onAddComment={() => {}}
         onAddViewpoint={() => {}}
+        onAddSectionViewpoint={() => {}}
+        sectionViewpointBlockReason="Open the 2D section panel to capture it."
         onActivateViewpoint={() => {}}
         onDeleteViewpoint={() => {}}
         onUpdateStatus={() => {}}

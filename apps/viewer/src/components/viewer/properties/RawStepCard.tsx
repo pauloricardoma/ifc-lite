@@ -20,10 +20,11 @@ import { ArrowLeft, ChevronRight, FileBox, Info, Sparkles } from 'lucide-react';
 import { getAttributeNames } from '@ifc-lite/parser';
 import type { EntityRef } from '@ifc-lite/parser';
 import type { IfcDataStore } from '@ifc-lite/parser';
-import type { IfcAttributeValue } from '@ifc-lite/mutations';
+import type { IfcAttributeValue, MutablePropertyView } from '@ifc-lite/mutations';
 import { useViewerStore } from '@/store';
 import { RawStepRow } from './RawStepRow';
 import { extractRawStepTokens, serializeStepToken } from './raw-step-format';
+import { useTranslation } from '@/i18n';
 
 /** Max wrappers to skip when auto-following a `#N` click. Caps the
  *  loop in case of cyclic STEP graphs (shouldn't happen in valid
@@ -56,9 +57,30 @@ function applyOverlayTokens(
  */
 function readSourceTokens(dataStore: IfcDataStore | null, expressId: number): string[] | null {
   if (!dataStore?.source) return null;
+  // @raw-entity-enumeration-ok source byte span for one entity; readEffectiveTokens applies overlay edits and creations
   const ref: EntityRef | undefined = dataStore.entityIndex.byId.get(expressId);
   if (!ref || ref.byteLength <= 0) return null;
   return extractRawStepTokens(dataStore.source, ref.byteOffset, ref.byteLength);
+}
+
+/** The same token view is used for display and wrapper navigation. */
+function readEffectiveTokens(
+  dataStore: IfcDataStore | null,
+  expressId: number,
+  view: MutablePropertyView | null | undefined,
+): { tokens: string[] | null; isOverlayOnly: boolean; overlayMap: Map<number, IfcAttributeValue> | null } {
+  if (view?.isDeleted(expressId)) return { tokens: null, isOverlayOnly: false, overlayMap: null };
+  const overlayMap = view?.getPositionalMutationsForEntity(expressId) ?? null;
+  const sourceTokens = readSourceTokens(dataStore, expressId);
+  if (sourceTokens) {
+    return { tokens: applyOverlayTokens(sourceTokens, overlayMap), isOverlayOnly: false, overlayMap };
+  }
+  const created = view?.getNewEntity(expressId);
+  if (created) {
+    const base = (created.attributes as IfcAttributeValue[]).map(serializeStepToken);
+    return { tokens: applyOverlayTokens(base, overlayMap), isOverlayOnly: true, overlayMap };
+  }
+  return { tokens: null, isOverlayOnly: false, overlayMap };
 }
 
 /**
@@ -70,13 +92,11 @@ function readSourceTokens(dataStore: IfcDataStore | null, expressId: number): st
  */
 function autoFollowWrappers(
   startId: number,
-  dataStore: IfcDataStore | null,
-  isDeleted: (id: number) => boolean,
+  readTokens: (id: number) => string[] | null,
 ): number {
   let current = startId;
   for (let i = 0; i < AUTO_FOLLOW_DEPTH; i++) {
-    if (isDeleted(current)) return current;
-    const tokens = readSourceTokens(dataStore, current);
+    const tokens = readTokens(current);
     if (!tokens || tokens.length !== 1) return current;
     const m = tokens[0].match(/^#(\d+)$/);
     if (!m) return current;
@@ -104,6 +124,7 @@ export function RawStepCard({
   dataStore,
   enableEditing,
 }: RawStepCardProps) {
+  const { t } = useTranslation();
   // Subscribe to the mutation version so overlay overrides re-render
   // here exactly when they would in the Properties tab.
   const mutationVersion = useViewerStore((s) => s.mutationVersion);
@@ -144,30 +165,7 @@ export function RawStepCard({
   // NewEntity records otherwise. Per-index overrides land on top.
   const { tokens, isOverlayOnly, overlayMap } = useMemo(() => {
     const view = getMutationView(modelId);
-    const overlay = view?.getPositionalMutationsForEntity(currentId) ?? null;
-
-    const sourceTokens = readSourceTokens(dataStore, currentId);
-    if (sourceTokens) {
-      return {
-        tokens: applyOverlayTokens(sourceTokens, overlay),
-        isOverlayOnly: false,
-        overlayMap: overlay,
-      };
-    }
-
-    if (view) {
-      const overlayEntity = view.getNewEntity(currentId);
-      if (overlayEntity) {
-        const baseTokens = (overlayEntity.attributes as IfcAttributeValue[]).map(serializeStepToken);
-        return {
-          tokens: applyOverlayTokens(baseTokens, overlay),
-          isOverlayOnly: true,
-          overlayMap: overlay,
-        };
-      }
-    }
-
-    return { tokens: null as string[] | null, isOverlayOnly: false, overlayMap: overlay };
+    return readEffectiveTokens(dataStore, currentId, view);
     // mutationVersion forces this hook to re-run when any overlay
     // (positional or overlay-entity) changes — overlay maps are
     // mutated in place, so identity-based memoization isn't enough.
@@ -178,7 +176,7 @@ export function RawStepCard({
   // "Arg N" for entities the generated registry doesn't know.
   const attributeNames = useMemo(() => getAttributeNames(currentType) ?? [], [currentType]);
 
-  // Per-row mutation indicator — drives the purple dot.
+  // Per-row mutation indicator — drives the accent dot.
   const mutatedIndices = useMemo(() => {
     if (!overlayMap) return new Set<number>();
     return new Set(overlayMap.keys());
@@ -191,8 +189,7 @@ export function RawStepCard({
   const handleNavigate = useCallback(
     (refId: number) => {
       const view = getMutationView(modelId);
-      const isDeleted = (id: number) => view?.isDeleted?.(id) ?? false;
-      const target = autoFollowWrappers(refId, dataStore, isDeleted);
+      const target = autoFollowWrappers(refId, (id) => readEffectiveTokens(dataStore, id, view).tokens);
       setNavStack((prev) => {
         // No-op if the user is already viewing the target — refs that
         // self-loop or land on the current node would otherwise grow
@@ -219,16 +216,16 @@ export function RawStepCard({
         <FileBox className="h-5 w-5 mx-auto mb-2 text-zinc-400" />
         <p className="text-xs font-mono text-zinc-500 dark:text-zinc-500">
           {dataStore
-            ? `Entity #${currentId} has no positional STEP arguments`
-            : 'Raw STEP is unavailable for this model'}
+            ? t('properties.rawStep.noPositionalArgs', { id: currentId })
+            : t('properties.rawStep.unavailable')}
         </p>
         {!isAtRoot && (
           <button
             type="button"
             onClick={handleResetToRoot}
-            className="mt-3 text-[10px] font-mono text-emerald-600 dark:text-emerald-400 hover:underline"
+            className="mt-3 text-2xs font-mono text-emerald-600 dark:text-emerald-400 hover:underline"
           >
-            ← Back to {entityType} #{entityId}
+            {t('properties.rawStep.backToRoot', { type: entityType, id: entityId })}
           </button>
         )}
       </div>
@@ -239,21 +236,21 @@ export function RawStepCard({
     <div className="rounded-md border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 overflow-hidden">
       {/* Breadcrumb (only when drilled in) */}
       {!isAtRoot && (
-        <div className="flex items-center gap-1 px-2 py-1.5 border-b border-zinc-200 dark:border-zinc-800 bg-emerald-50/40 dark:bg-emerald-950/15 text-[10px] font-mono">
+        <div className="flex items-center gap-1 px-2 py-1.5 border-b border-zinc-200 dark:border-zinc-800 bg-emerald-50/40 dark:bg-emerald-950/15 text-2xs font-mono">
           <button
             type="button"
             onClick={handleBack}
             className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded hover:bg-emerald-100 dark:hover:bg-emerald-900/40 text-emerald-700 dark:text-emerald-400"
-            title="Back one step"
+            title={t('properties.rawStep.backOneStepTooltip')}
           >
             <ArrowLeft className="h-3 w-3" />
-            <span>back</span>
+            <span>{t('properties.rawStep.back')}</span>
           </button>
           <button
             type="button"
             onClick={handleResetToRoot}
             className="px-1 py-0.5 rounded text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 truncate"
-            title={`Back to selected entity ${entityType} #${entityId}`}
+            title={t('properties.rawStep.backToSelectedTooltip', { type: entityType, id: entityId })}
           >
             {entityType} #{entityId}
           </button>
@@ -276,9 +273,9 @@ export function RawStepCard({
       {/* Header */}
       <div className="flex items-center justify-between gap-2 px-3 py-2 border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50/80 dark:bg-zinc-900/40">
         <div className="flex items-center gap-2 min-w-0">
-          <FileBox className="h-3.5 w-3.5 text-purple-600 dark:text-purple-400 shrink-0" />
+          <FileBox className="h-3.5 w-3.5 text-overlay-accent shrink-0" />
           <span
-            className="font-mono text-[11px] font-semibold tracking-wide text-zinc-700 dark:text-zinc-200 truncate"
+            className="font-mono text-2xs font-semibold tracking-wide text-zinc-700 dark:text-zinc-200 truncate"
             title={`${currentType} #${currentId}`}
           >
             {currentType} #{currentId}
@@ -286,11 +283,11 @@ export function RawStepCard({
         </div>
         {isOverlayOnly && (
           <span
-            className="inline-flex items-center gap-1 rounded-sm border border-emerald-300 dark:border-emerald-700 bg-emerald-50 dark:bg-emerald-950/40 px-1.5 py-0.5 text-[9px] font-mono uppercase tracking-wider text-emerald-700 dark:text-emerald-300"
-            title="This entity was added through the overlay (bim.store.addEntity / addColumn)."
+            className="inline-flex items-center gap-1 rounded-sm border border-emerald-300 dark:border-emerald-700 bg-emerald-50 dark:bg-emerald-950/40 px-1.5 py-0.5 text-2xs font-mono uppercase tracking-wider text-emerald-700 dark:text-emerald-300"
+            title={t('properties.rawStep.overlayAddedTooltip')}
           >
             <Sparkles className="h-2.5 w-2.5" />
-            New
+            {t('properties.rawStep.newBadge')}
           </span>
         )}
       </div>
@@ -300,7 +297,7 @@ export function RawStepCard({
         {tokens.map((token, idx) => {
           // Fallback name uses the 1-based position so it stays aligned with
           // the bracketed index shown in each row (which is also 1-based).
-          const name = attributeNames[idx] || `Arg ${idx + 1}`;
+          const name = attributeNames[idx] || t('properties.rawStep.argN', { n: idx + 1 });
           return (
             <RawStepRow
               key={idx}
@@ -320,13 +317,8 @@ export function RawStepCard({
       {/* Help footer */}
       <div className="flex items-start gap-2 px-3 py-2 border-t border-zinc-200 dark:border-zinc-800 bg-zinc-50/60 dark:bg-zinc-900/30">
         <Info className="h-3 w-3 mt-0.5 text-zinc-400 dark:text-zinc-500 shrink-0" />
-        <p className="text-[10.5px] font-mono leading-relaxed text-zinc-500 dark:text-zinc-500">
-          STEP literals: numbers, <code className="px-0.5 rounded bg-zinc-200/60 dark:bg-zinc-800/60">$</code> for null,{' '}
-          <code className="px-0.5 rounded bg-zinc-200/60 dark:bg-zinc-800/60">.T.</code>/
-          <code className="px-0.5 rounded bg-zinc-200/60 dark:bg-zinc-800/60">.F.</code> for booleans,{' '}
-          <code className="px-0.5 rounded bg-zinc-200/60 dark:bg-zinc-800/60">#42</code> for refs (click to drill),{' '}
-          <code className="px-0.5 rounded bg-zinc-200/60 dark:bg-zinc-800/60">.AREA.</code> for enums. Edits
-          land on the export overlay — undo/redo via the toolbar.
+        <p className="text-2xs font-mono leading-relaxed text-zinc-500 dark:text-zinc-500">
+          {t('properties.rawStep.footerHelp')}
         </p>
       </div>
     </div>

@@ -32,17 +32,42 @@ export function generatePropertySetEntities(
   willBeEmitted: (id: number) => boolean,
   effective: EffectiveEntityIndex,
   typeOwnedPsetNames?: Set<string>,
-  random?: RandomSource
+  random?: RandomSource,
+  sourceMembers?: ReadonlyMap<string, ReadonlyMap<string, number>>,
+  canReferenceSourceMember: (id: number) => boolean = willBeEmitted,
 ): { lines: string[]; count: number; generatedTypeOwnedPsetIds: Map<string, number> } {
   const lines: string[] = [];
   let count = 0;
   const generatedTypeOwnedPsetIds = new Map<string, number>();
+  const ownerHistoryRef = resolveOwnerHistoryRef(ctx, entityId, willBeEmitted, effective);
 
   for (const pset of psets) {
+    // `HasProperties` is declared `SET [1:?] OF IfcProperty` in every bundled
+    // schema (IFC2X3/IFC4/IFC4X3) — not OPTIONAL, so `$` is as wrong as `()`.
+    // A caller is entitled to create a pset with zero properties as a
+    // placeholder to fill in later (`createPropertySet`/`addPropertySet`
+    // document this explicitly, and `change-set-to-ops.ts` has dedicated
+    // handling for it) — that is a legitimate mutations-layer state, just one
+    // with no valid STEP representation. Writing NEITHER the
+    // `IFCPROPERTYSET` NOR its `IFCRELDEFINESBYPROPERTIES` is the only
+    // schema-valid choice; skipping before allocating any express id also
+    // keeps the id sequence free of gaps for a record that was never emitted
+    // (#5199).
+    if (pset.properties.length === 0) continue;
     const propertyIds: number[] = [];
+    const members = sourceMembers?.get(pset.name);
 
     // Create IfcPropertySingleValue for each property
     for (const prop of pset.properties) {
+      // A property the session did not edit keeps its source atom, and with
+      // it its IFC class: a list, enumerated, bounded, table, reference or
+      // complex member re-serialized below would come back as flattened
+      // single-value text (#5794).
+      const sourceMemberId = members?.get(prop.name);
+      if (sourceMemberId !== undefined && canReferenceSourceMember(sourceMemberId)) {
+        propertyIds.push(sourceMemberId);
+        continue;
+      }
       const propId = ctx.allocateExpressId();
       count++;
 
@@ -55,8 +80,15 @@ export function generatePropertySetEntities(
       const unitId = prop.unit ? findUnitId(ctx, prop.unit, effective) : null;
       const unitStr = unitId !== null ? ref(unitId) : null;
 
+      // A list value is an `IfcPropertyListValue`: `NominalValue` is a single
+      // `IfcValue`, and a `(…)` aggregate there is not valid IFC (#5794).
+      // Same four slots (Name, Specification, ListValues, Unit); an empty
+      // list is `$`, as `ListValues` is OPTIONAL and `LIST [1:?]`.
+      const isList = valueStr.startsWith('(');
+      const entity = isList ? 'IFCPROPERTYLISTVALUE' : 'IFCPROPERTYSINGLEVALUE';
+      const value = isList && valueStr === '()' ? '$' : valueStr;
       // #ID=IFCPROPERTYSINGLEVALUE('Name',$,Value,Unit);
-      const line = `#${propId}=IFCPROPERTYSINGLEVALUE('${escapeStepString(prop.name)}',$,${valueStr},${unitStr ? serializeValue(unitStr) : '$'});`;
+      const line = `#${propId}=${entity}('${escapeStepString(prop.name)}',$,${value},${unitStr ? serializeValue(unitStr) : '$'});`;
       lines.push(line);
       propertyIds.push(propId);
     }
@@ -69,7 +101,7 @@ export function generatePropertySetEntities(
     const globalId = generateGlobalId(random);
 
     // #ID=IFCPROPERTYSET('GlobalId',#ownerHistory,'Name',$,(#props));
-    const psetLine = `#${psetId}=IFCPROPERTYSET('${globalId}',${resolveOwnerHistoryRef(ctx, entityId, willBeEmitted)},'${escapeStepString(pset.name)}',$,(${propRefs}));`;
+    const psetLine = `#${psetId}=IFCPROPERTYSET('${globalId}',${ownerHistoryRef},'${escapeStepString(pset.name)}',$,(${propRefs}));`;
     lines.push(psetLine);
 
     if (typeOwnedPsetNames?.has(pset.name)) {
@@ -81,7 +113,7 @@ export function generatePropertySetEntities(
 
       const relGlobalId = generateGlobalId(random);
       // #ID=IFCRELDEFINESBYPROPERTIES('GlobalId',#ownerHistory,$,$,(#entity),#pset);
-      const relLine = `#${relId}=IFCRELDEFINESBYPROPERTIES('${relGlobalId}',${resolveOwnerHistoryRef(ctx, entityId, willBeEmitted)},$,$,(#${entityId}),#${psetId});`;
+      const relLine = `#${relId}=IFCRELDEFINESBYPROPERTIES('${relGlobalId}',${ownerHistoryRef},$,$,(#${entityId}),#${psetId});`;
       lines.push(relLine);
     }
   }
@@ -97,12 +129,17 @@ export function generateQuantitySetEntities(
   entityId: number,
   qsets: QuantitySet[],
   willBeEmitted: (id: number) => boolean,
+  effective: EffectiveEntityIndex,
   random?: RandomSource
 ): { lines: string[]; count: number } {
   const lines: string[] = [];
   let count = 0;
+  const ownerHistoryRef = resolveOwnerHistoryRef(ctx, entityId, willBeEmitted, effective);
 
   for (const qset of qsets) {
+    // `Quantities` is `SET [1:?] OF IfcPhysicalQuantity` — same rule and same
+    // reasoning as `HasProperties` above; see that comment (#5199).
+    if (qset.quantities.length === 0) continue;
     const quantityIds: number[] = [];
 
     for (const q of qset.quantities) {
@@ -125,7 +162,7 @@ export function generateQuantitySetEntities(
     const globalId = generateGlobalId(random);
 
     // #ID=IFCELEMENTQUANTITY('GlobalId',#ownerHistory,'Name',$,$,(#quants));
-    const qsetLine = `#${qsetId}=IFCELEMENTQUANTITY('${globalId}',${resolveOwnerHistoryRef(ctx, entityId, willBeEmitted)},'${escapeStepString(qset.name)}',$,$,(${quantRefs}));`;
+    const qsetLine = `#${qsetId}=IFCELEMENTQUANTITY('${globalId}',${ownerHistoryRef},'${escapeStepString(qset.name)}',$,$,(${quantRefs}));`;
     lines.push(qsetLine);
 
     // Create IfcRelDefinesByProperties to link qset to entity
@@ -133,7 +170,7 @@ export function generateQuantitySetEntities(
     count++;
 
     const relGlobalId = generateGlobalId(random);
-    const relLine = `#${relId}=IFCRELDEFINESBYPROPERTIES('${relGlobalId}',${resolveOwnerHistoryRef(ctx, entityId, willBeEmitted)},$,$,(#${entityId}),#${qsetId});`;
+    const relLine = `#${relId}=IFCRELDEFINESBYPROPERTIES('${relGlobalId}',${ownerHistoryRef},$,$,(#${entityId}),#${qsetId});`;
     lines.push(relLine);
   }
 

@@ -1,5 +1,47 @@
 # @ifc-lite/pointcloud
 
+## 0.11.0
+
+### Minor Changes
+
+- [#5258](https://github.com/LTplus-AG/ifc-lite/pull/5258) [`c0f6caa`](https://github.com/LTplus-AG/ifc-lite/commit/c0f6caab3c726369707173e8aa48017a609e7cc0) Thanks [@louistrue](https://github.com/louistrue)! - `inspectE57SpatialMetadata` and `E57StreamingSource.open()` now throw when the E57 XML metadata section reads shorter than its declared length (a truncated blob), instead of silently returning `undefined` as if the file had no CRS. Point-data reads keep their existing tolerance for an over-reported `recordCount`.
+
+## 0.10.0
+
+### Minor Changes
+
+- [#5112](https://github.com/LTplus-AG/ifc-lite/pull/5112) [`35e54fc`](https://github.com/LTplus-AG/ifc-lite/commit/35e54fc20bc8a7632b9caec26cdb820e1ee0c0b7) Thanks [@louistrue](https://github.com/louistrue)! - Expose explicit E57 `coordinateMetadata` CRS identifiers through streaming source-open metadata before point decoding begins.
+
+## 0.9.0
+
+### Minor Changes
+
+- [#4587](https://github.com/LTplus-AG/ifc-lite/pull/4587) [`e94a233`](https://github.com/LTplus-AG/ifc-lite/commit/e94a233a8fce5be0e9d6fa833f6a5fc121961e08) Thanks [@louistrue](https://github.com/louistrue)! - Preserve invalid PLY normal provenance through streaming and exact worker transfers, and keep floating RGB normalization consistent across chunks.
+
+- [#4570](https://github.com/LTplus-AG/ifc-lite/pull/4570) [`ed38bfc`](https://github.com/LTplus-AG/ifc-lite/commit/ed38bfc562cb170458141c5abecf15c0c0e2ea4d) Thanks [@louistrue](https://github.com/louistrue)! - Expose source-supplied PLY `nx`/`ny`/`nz` normals on decoded and streamed point chunks while preserving row order through bounded, stride-aware decoding and the worker wire protocol.
+
+## 0.8.0
+
+### Minor Changes
+
+- [#4255](https://github.com/LTplus-AG/ifc-lite/pull/4255) [`bc26223`](https://github.com/LTplus-AG/ifc-lite/commit/bc26223b5b7e09c8bafcdf7f95afafe033622867) Thanks [@louistrue](https://github.com/louistrue)! - Support absolute model and pointcloud translations without rewriting mesh or scan vertices. Keep model draw origins independent, compose scan alignment and manual offsets in double precision, and retain placement bounds after CPU geometry release. Streaming pointcloud callers can choose a nearby decode origin before narrowing coordinates to float32.
+
+### Patch Changes
+
+- [#4348](https://github.com/LTplus-AG/ifc-lite/pull/4348) [`8369d06`](https://github.com/LTplus-AG/ifc-lite/commit/8369d067dba22a7ca69b0420d49bf94bd698edd5) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Reject a zero or non-finite X/Y/Z scale factor and a non-finite offset in a LAS/LAZ header instead of silently collapsing every point to the header offset (or NaN). `decodeLasPoints`'s bbox fold now also skips a non-finite coordinate rather than letting one bad point poison the whole chunk's box. When every coordinate in a chunk is non-finite (e.g. a finite-but-huge scale that overflows on multiplication), the chunk's bbox is left at its `±Infinity` seed — an absorbing no-op in the multi-chunk union `streaming/host.ts` does across a streamed file — so the bad chunk drops out of the aggregate instead of a finite fallback value pulling it toward the origin, and a wholly non-finite file still falls back to the header's own bbox.
+
+## 0.7.2
+
+### Patch Changes
+
+- [#3680](https://github.com/LTplus-AG/ifc-lite/pull/3680) [`445d813`](https://github.com/LTplus-AG/ifc-lite/commit/445d813b8ea3b6a09f2930a3e409ccaeff316a85) Thanks [@BIMvoice](https://github.com/BIMvoice)! - The E57 decoder defaulted a ScaledInteger/Integer prototype field's `minimum`/`maximum` to `0` when a producer's XML omitted them, instead of refusing. Those attributes have no valid default under the E57 spec (ASTM E2807 §6.3.4) — the bitpack codec needs the declared range to know how many bits a record occupies, and the ScaledInteger decode formula `(raw + minimum) * scale + offset` uses `minimum` directly — so a non-conformant file that omits them was decoded anyway, silently shifting or mis-scaling every point, colour, intensity, and classification value with no error and nothing in the output to indicate it. `parseE57Xml` now leaves `minimum`/`maximum` undefined rather than defaulting them, and the decoder throws a clear error identifying the field instead of guessing. `scale`/`offset` keep their spec-defined defaults of `1.0`/`0.0`, which were already correct. This only affects a non-conformant producer that omits a required attribute; a conformant file decodes exactly as before.
+  
+  The same file also parsed a `points` element's `fileOffset`/`recordCount` attributes with a bare `!fileOffsetAttr || !recordCountAttr` presence check: an empty string (`fileOffset=""`) was correctly treated as absent and the scan skipped, but a whitespace-only value (`fileOffset=" "`) is truthy and slipped through to `Number(...)`, where it coerces to `0` — a value that then passes the finite/non-negative guard. That decoded the scan from logical offset `0` (the file header) instead of skipping it, producing garbage points from misinterpreted header bytes with no error. `parseE57Xml` now trims both attributes before the presence check, so whitespace-only behaves exactly like absent (scan skipped).
+
+- [#3548](https://github.com/LTplus-AG/ifc-lite/pull/3548) [`801e697`](https://github.com/LTplus-AG/ifc-lite/commit/801e697ea09cad23839b032fd593eb363bf8455b) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix the PLY decoder mis-normalizing vertex colours declared with a type other than `uchar`. PLY has no single mandated colour encoding: `uchar` (0..255) is by far the most common, but writers that declare `property float red/green/blue` (or `double`) already store a 0..1 value, and 16-bit-colour exports (`property ushort red/green/blue`, e.g. many Leica/FARO scanner outputs and CloudCompare's 16-bit RGB option) store 0..65535. `decodePly` divided every RGB channel by 255 regardless of its declared type, so an already-normalized float `0.8` became `~0.0031` (crushed to near-black) and a `ushort` value like `32768` clamped to `1.0` (saturated to white). Colour channels are now normalized per their declared property type: `float`/`double` pass through (clamped to 0..1), `ushort`/`uint16` divide by 65535, `short`/`int16` divide by 32767, and the remaining integer types (`uchar` and friends, plus the undocumented 32-bit int types) still divide by 255 as before. Both the ascii and binary decode paths were affected.
+
+- [#3855](https://github.com/LTplus-AG/ifc-lite/pull/3855) [`182215a`](https://github.com/LTplus-AG/ifc-lite/commit/182215a835c4beac6a776bcb4eb1d019cab9063e) Thanks [@louistrue](https://github.com/louistrue)! - Corrected the code samples on each package's npm landing page: the README fences are now typechecked against the package's real exports, so the snippets import what they call, declare the values they read, and no longer show removed options or renamed methods. Patch-bumping every package whose README changed so the corrections actually reach npmjs.com.
+
 ## 0.7.1
 
 ### Patch Changes

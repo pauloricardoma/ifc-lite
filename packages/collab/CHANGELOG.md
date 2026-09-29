@@ -1,5 +1,112 @@
 # @ifc-lite/collab
 
+## 0.9.1
+
+### Patch Changes
+
+- Updated dependencies [[`ccc491e`](https://github.com/LTplus-AG/ifc-lite/commit/ccc491efac18ce496af47c91b1ef4fc04ebecca5), [`7215c2a`](https://github.com/LTplus-AG/ifc-lite/commit/7215c2a9344ede37c90680e1eb2a6c2b70c0ee3d), [`5c02af8`](https://github.com/LTplus-AG/ifc-lite/commit/5c02af8b7fda4d2fe53f79d3f00b9d192fc664d9)]:
+  - @ifc-lite/data@6.0.0
+  - @ifc-lite/mutations@2.7.1
+  - @ifc-lite/ifcx@4.2.1
+
+## 0.9.0
+
+### Minor Changes
+
+- [#5294](https://github.com/LTplus-AG/ifc-lite/pull/5294) [`dec98a2`](https://github.com/LTplus-AG/ifc-lite/commit/dec98a2c97e03e70e8b78c55bb27e87b5b4013a6) Thanks [@louistrue](https://github.com/louistrue)! - Fix `mergeBranch(..., 'layer')` recreating an entity that the parent deleted after the fork. The branch's IFCX snapshot carries every entity the branch still has, including ones it never touched, and the overlay created any of those the parent lacked. `forkSession` now records the parent's Yjs state vector inside the branch doc (`meta` key `branch.forkStateVector`). A layer merge drops a snapshot node whose path the parent no longer has when the branch's copy is the entity it inherited at fork. A branch that deleted and re-created that path after the fork still merges it.
+  
+  `MergeReport.droppedDeletions` is computed from the same record, so it no longer depends on the branch session still holding the original `Y.Doc` object. Before, a reload, a second tab, or a merge job rebuilding the session reported a confident `0` and also lost the resurrection guard. The type is now `number | null`. `null` means the branch doc has no fork record (it was forked by an earlier version); in that case neither the count nor the parent-deletion guard could be applied. It never means zero.
+
+### Patch Changes
+
+- [#5287](https://github.com/LTplus-AG/ifc-lite/pull/5287) [`074178f`](https://github.com/LTplus-AG/ifc-lite/commit/074178f651c21dacbfbec33534701a59a7e81ace) Thanks [@louistrue](https://github.com/louistrue)! - Fix the conflict detector throwing a `TypeError` out of `Y.applyUpdate` when it is attached to a raw `Y.Doc` (for example one passed as `CollabSessionOptions.doc`) whose top-level maps had never been accessed locally. The first remote update decoded `entities` as a bare `Y.AbstractType`, and because the detector watches the same doc the websocket provider writes to, the throw landed inside the provider's message handling. The detector now initialises the maps it reads when it is created, so that update is classified normally instead of crashing.
+  
+  Also fix the detector missing conflicts when a single `Y.applyUpdate` carries writes from more than one remote client (relay catch-up, a merged diff, coalesced updates). It used to attribute the whole transaction to one guessed client. It now reads the structs the transaction inserted and credits every client that wrote the key, so a conflict is reported the same way whether it arrives batched or as separate transactions.
+
+- [#5435](https://github.com/LTplus-AG/ifc-lite/pull/5435) [`f942fb6`](https://github.com/LTplus-AG/ifc-lite/commit/f942fb6c48ac9be1464e49fd963340835a72945d) Thanks [@louistrue](https://github.com/louistrue)! - IFCX export no longer silently merges same-named properties from different property sets ([#5376](https://github.com/LTplus-AG/ifc-lite/issues/5376)). Before this change, every pset property went out under `bsi::ifc::prop::<Name>`, which has no pset component. Two psets on one entity that shared a name wrote the same key, the last value won, and on import the pset each property came from could not be recovered.
+  
+  - With `onlyKnownProperties: false` (full fidelity, used by Export Changes), every pset property is now written under `bsi::ifc::v5a::<Pset>::<Name>` as a typed `{ type, value }` record. This is the pset-qualified form collab snapshots and MCP draft ops already write, so nothing is lost, and re-import restores each pset with its real name.
+  - The flat `bsi::ifc::prop::<Name>` key is still written, but only for names the official IFC5 property schema (`prop@v5a.ifcx`) defines, so standard IFCX consumers still find them. Custom names such as `Reference` no longer get a flat key the schema does not define.
+  - `Ifc5ExportResult.stats.propertyCollisions` lists every official flat key that two psets on one entity disagreed on. `valueLost` is true when only the flat key was written (`onlyKnownProperties: true`), which means one value is missing from the file. The viewer's IFCX export toast now reports lost values.
+  - On import, `@ifc-lite/ifcx` skips a flat key that only mirrors a pset-qualified value on the same node, so the property is not listed twice.
+  - `PROPERTY_TYPE_NAMES` (`PropertyValueType` → IFC defined type name for typed records) now lives in `@ifc-lite/ifcx`, shared by the exporter and collab. `@ifc-lite/collab` still re-exports it.
+  
+  Files written before this change still read the same: their flat keys land in "IFC Properties", as before.
+
+- [#5289](https://github.com/LTplus-AG/ifc-lite/pull/5289) [`685b541`](https://github.com/LTplus-AG/ifc-lite/commit/685b5414f57eec64c74e056b9b51b6b8ffe3a88f) Thanks [@louistrue](https://github.com/louistrue)! - Fix `applyIfcxOverlay` silently dropping a concurrent peer's deletion. Cross-call overlay tombstones were stored as one JSON array under a single doc key. When two peers tombstoned different paths at the same time, each wrote its whole array, Yjs kept only the last write, and one peer's deletion was lost even though both peers converged. A later layer with no opinion on that path could then resurrect it. Tombstones now live one per path in a dedicated root-level map (`overlay.tombstones.registry`), so concurrent deletions of different paths no longer race.
+  
+  Migration: a doc written before this change is still honoured. Its legacy `meta` array is read and never written again, and an explicit per-path revival overrides a stale legacy entry. Rollout limit: an old-code peer and a new-code peer editing the same room at the same time are not supported. The old peer only reads the legacy array, which stops being updated, so it will not see tombstones the new peer records. Upgrade every client of a room together.
+- Updated dependencies [[`35b8b23`](https://github.com/LTplus-AG/ifc-lite/commit/35b8b238821138d6c5bc94d3ad51abf832677a88), [`83284a9`](https://github.com/LTplus-AG/ifc-lite/commit/83284a947d9adb9e1ece28f9d5ee7166722be1e5), [`992f553`](https://github.com/LTplus-AG/ifc-lite/commit/992f55304ca0ec8ed5be3b4eabab429c68808a7e), [`e66c849`](https://github.com/LTplus-AG/ifc-lite/commit/e66c849b6a79de9691a1e70ee3b2b593c5327fa1), [`52d30de`](https://github.com/LTplus-AG/ifc-lite/commit/52d30de0ae3fc8ef6322191bd1831483b93d485f), [`a250a92`](https://github.com/LTplus-AG/ifc-lite/commit/a250a928b1c8c64ac6153136772fe6c71398eee9), [`617da29`](https://github.com/LTplus-AG/ifc-lite/commit/617da29bc17326105dd1143385c967210e529a43), [`dabc489`](https://github.com/LTplus-AG/ifc-lite/commit/dabc48987aca1392685218dd31641f8dbadf9590), [`60f70f9`](https://github.com/LTplus-AG/ifc-lite/commit/60f70f93c9cdf9948f1a7325efb1e157a09d3a60), [`bd15b3f`](https://github.com/LTplus-AG/ifc-lite/commit/bd15b3f607f43ab47c8f4d530ed95231f802e15c), [`eebb00e`](https://github.com/LTplus-AG/ifc-lite/commit/eebb00e52719e0254d1626f791740ce7fe7489a9), [`f942fb6`](https://github.com/LTplus-AG/ifc-lite/commit/f942fb6c48ac9be1464e49fd963340835a72945d), [`58691b3`](https://github.com/LTplus-AG/ifc-lite/commit/58691b362d67ab87f666d76d6ee27e39d1ec45f9), [`2dd677d`](https://github.com/LTplus-AG/ifc-lite/commit/2dd677d7307d87f3b433256bd00647a2a3ee06df), [`71ace41`](https://github.com/LTplus-AG/ifc-lite/commit/71ace41b0ccfde286fe7fc1074011a91c9c8d5b1), [`07ed0dd`](https://github.com/LTplus-AG/ifc-lite/commit/07ed0ddaf4e527f1fff3704cc0d36e700fcde1a7), [`0d9cbc0`](https://github.com/LTplus-AG/ifc-lite/commit/0d9cbc0072baa634923623c6772500d57a63f412), [`80c6a38`](https://github.com/LTplus-AG/ifc-lite/commit/80c6a38a3efc8783965e94d309bcc2f984cef71d)]:
+  - @ifc-lite/mutations@2.7.0
+  - @ifc-lite/data@5.1.0
+  - @ifc-lite/ifcx@4.2.0
+
+## 0.8.1
+
+### Patch Changes
+
+- Updated dependencies [[`d38af5a`](https://github.com/LTplus-AG/ifc-lite/commit/d38af5afd36f12329fe6f33bf905d28fca65ba43), [`0100a54`](https://github.com/LTplus-AG/ifc-lite/commit/0100a544d0446d2f19b5f76f37d6dc45d31da837), [`e1ace4f`](https://github.com/LTplus-AG/ifc-lite/commit/e1ace4f05a45a252d502bf72a506336185d2b157), [`ab8380e`](https://github.com/LTplus-AG/ifc-lite/commit/ab8380e6b9edf1ca1f05abf343ae6040ac8aee77), [`6a5f3f2`](https://github.com/LTplus-AG/ifc-lite/commit/6a5f3f2ae703ce170b890f85535af846251d3ab7), [`873a648`](https://github.com/LTplus-AG/ifc-lite/commit/873a6481af34f1a494e9667ab1f77c3328125077), [`e211790`](https://github.com/LTplus-AG/ifc-lite/commit/e211790ff4d7070d908fb519652158089652dd9c)]:
+  - @ifc-lite/data@5.0.0
+  - @ifc-lite/mutations@2.5.0
+  - @ifc-lite/ifcx@4.1.2
+
+## 0.8.0
+
+### Minor Changes
+
+- [#4546](https://github.com/LTplus-AG/ifc-lite/pull/4546) [`e18a434`](https://github.com/LTplus-AG/ifc-lite/commit/e18a434ec2258e474728bd9a90146486b38efedb) Thanks [@louistrue](https://github.com/louistrue)! - Rooms carry an explicit federation scope: one model slot per shared model ([#4444](https://github.com/LTplus-AG/ifc-lite/issues/4444)).
+  
+  - `@ifc-lite/collab`: new top-level `models` map and `doc/model-slot` helpers (`modelSlotRef`, `slotPath`, `pathInSlot`, `prefixPathForSlot`, `createModelSlot`, `listModelSlots`, …). `seedFromStep` / `seedFromIfcx` accept a `slot` option that qualifies every entity path with `/<slotId>` (children and inherits references included); `snapshotToIfcx` accepts `slot` to emit one slot's entities with that slot's own IFCX header / imports / schemas (recorded per slot under `meta.ifcxFile:<slotId>`; a whole-room snapshot merges them in slot order). Slot ids are minted in share order, never from a file name, its bytes or its GlobalIds, so two copies of one file are two slots. Rooms seeded before slots existed keep their unqualified `/<GlobalId>` paths and room-wide file metadata, and are read as one implicit legacy slot — no migration, nothing on disk is rewritten. Known limit: an IFCX seed re-homes `children` / `inherits` references under the slot but not path-valued attributes of a custom schema, which keep the file's unqualified path.
+  - Viewer: with several models loaded, the Share dialog asks whether to share the active model only or all loaded models (default: all — the workspace on screen is the federation) and creates the room only on **Create link**, since a room's scope is fixed by its seed. Each model is seeded from its own store and meshes into its own slot, one after another; `collabSeedProgress` carries `modelIndex` / `modelCount` and the upload row reads "model 2 of 3". A recipient reconstructs one federated model per slot (`room:<roomId>:<slotId>`), registered through the federation registry in its own global-id range, so two copies of one file — same GlobalIds, same local express ids — are two selectable, editable, exportable models with their own geometry and textures (the second is listed as "<name> (2)" on the recipient). An owner with nothing seedable (a model still loading, a GLB or point-cloud workspace) still creates the room as its owner with an empty scope, and the "All loaded models" option counts what can be shared rather than what is loaded. Inbound peer edits are routed to the model their path's slot names; outbound mirrors gate per model.
+
+- [#4608](https://github.com/LTplus-AG/ifc-lite/pull/4608) [`53003de`](https://github.com/LTplus-AG/ifc-lite/commit/53003de1e36a956b7f51e9dffc035218477d5d3c) Thanks [@louistrue](https://github.com/louistrue)! - Add portable STEP archive metadata to collaboration slots and a bounded IFCZIP resource extractor so shared annotations retain referenced appearance resources safely. Property overlays can now delete one quantity while retaining its quantity set.
+
+- [#4553](https://github.com/LTplus-AG/ifc-lite/pull/4553) [`4ab63cd`](https://github.com/LTplus-AG/ifc-lite/commit/4ab63cd72e374dbdc98b6f59599fb9d2050f0f85) Thanks [@louistrue](https://github.com/louistrue)! - Sharing: the invite is withheld until the relay confirms it holds the model ([#4446](https://github.com/LTplus-AG/ifc-lite/issues/4446)). The owner seed ends in a new `confirming` phase: `@ifc-lite/collab` gains `fetchRoomStateVector` (reads a room's state vector from the sync handshake of a throw-away connection), `stateVectorCovers` and `roomSocketUrl`, and `runOwnerSeed` reports `ready` only once the relay's state vector covers the owner's — a local transaction only proves the bytes are queued in the browser's socket, and a tab closed at that moment used to leave the room empty. Share dialog and Room panel show "Confirming the upload with the room server…" meanwhile; a relay that stays out of reach settles the seed as failed with an owner-facing message, while a relay that answers but is still behind is waited for (probes back off 250 → 500 → 1000 ms). The automated relay acceptance (`tests/e2e/collab-share-seed.e2e.spec.ts`, Playwright project `viewer-collab-e2e`) proves the fresh-guest / rejoin / export journey over a disposable signed relay.
+
+### Patch Changes
+
+- Updated dependencies [[`53003de`](https://github.com/LTplus-AG/ifc-lite/commit/53003de1e36a956b7f51e9dffc035218477d5d3c)]:
+  - @ifc-lite/mutations@2.3.0
+  - @ifc-lite/ifcx@4.1.1
+
+## 0.7.0
+
+### Minor Changes
+
+- [#4352](https://github.com/LTplus-AG/ifc-lite/pull/4352) [`dbf513b`](https://github.com/LTplus-AG/ifc-lite/commit/dbf513b785f1dbc2f2dce5c173d28fd5ab65aa0c) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Add `MergeReport.droppedDeletions` so a caller of `mergeBranch(parent, branch, 'layer')` can detect when a branch-side deletion did not propagate to the parent — a documented limitation of the IFCX snapshot wire format, which cannot distinguish "removed" from "no opinion". Pin the deletion-drop behaviour itself with a regression test in `test/branch-merge-layer-overlay.test.ts`.
+
+### Patch Changes
+
+- [#4355](https://github.com/LTplus-AG/ifc-lite/pull/4355) [`7179a9c`](https://github.com/LTplus-AG/ifc-lite/commit/7179a9c6c2d0620f6bd3260e37b80c771697ce85) Thanks [@BIMvoice](https://github.com/BIMvoice)! - `createConflictDetector`'s `classify()` returned `null` for every entity create on the top-level entities map, on the documented reasoning that concurrent creates are CRDT-friendly since both entities coexist — true only when the two peers pick different paths. When two offline peers independently create at the same path (e.g. each assigns the next sequential id from its own local view), Yjs LWW keeps exactly one peer's entity and silently discards the other's class/attributes/psets, and no `ConflictEvent` ever fired for it. `classify()` now surfaces this as a new `concurrent-create` `ConflictKind`; a create at a non-colliding path still raises nothing, since the detector only flags once two distinct clients write the same `(kind, path)` key within the window. Merge semantics (LWW) are unchanged — this is detection only. `test/conflict-scenarios.test.ts` and `test/convergence-property.test.ts` gain regression coverage for the same-path collision, the different-path false-positive guard, and a survival assertion so a lost write is visible to the randomized convergence test instead of only checked for agreement. Delete-vs-edit remains an undetected, documented gap — it does not fall out of this change since a top-level delete and a nested attribute edit classify under different `ConflictKind`s and never share a detector key.
+- Updated dependencies [[`ced8bb4`](https://github.com/LTplus-AG/ifc-lite/commit/ced8bb46c368648bd54a1bab716d049143faa036), [`e119819`](https://github.com/LTplus-AG/ifc-lite/commit/e1198197556375019c5a7820cc7c99da55e5c639), [`b0700f2`](https://github.com/LTplus-AG/ifc-lite/commit/b0700f25434d1cf1ec5f7438a8e27c09188208ec), [`8620be3`](https://github.com/LTplus-AG/ifc-lite/commit/8620be38be0162b7cbdbe23ae7bc924763b83612), [`be4fdb9`](https://github.com/LTplus-AG/ifc-lite/commit/be4fdb9ffe6995c74d3629887021c98b843beadb), [`5a01e5a`](https://github.com/LTplus-AG/ifc-lite/commit/5a01e5abe220f21ae5233045c6e9cfc5aa37a4e3), [`b9c3aa1`](https://github.com/LTplus-AG/ifc-lite/commit/b9c3aa1b7da9b0c26742bacb6eb3c7c4b44ca80b), [`591c593`](https://github.com/LTplus-AG/ifc-lite/commit/591c5938bdc4e8210c3b3158f22ecd78552bcdc2)]:
+  - @ifc-lite/data@4.1.0
+  - @ifc-lite/mutations@2.2.0
+  - @ifc-lite/ifcx@4.1.0
+
+## 0.6.1
+
+### Patch Changes
+
+- [#3604](https://github.com/LTplus-AG/ifc-lite/pull/3604) [`53a92b1`](https://github.com/LTplus-AG/ifc-lite/commit/53a92b1f7cc5770f164dc4867fc2adc33470e245) Thanks [@BIMvoice](https://github.com/BIMvoice)! - `createGeometry` no longer drops an explicit empty-string `blobHash` (`if (opts.blobHash)` was a truthiness check, so `blobHash: ''` never made it into the Y.Doc — the value was lost before there was anything to snapshot or seed back). `createGeometry` now checks `!== undefined`, matching the contract `upsertGeometry` already used.
+
+- [#3469](https://github.com/LTplus-AG/ifc-lite/pull/3469) [`c78ce8c`](https://github.com/LTplus-AG/ifc-lite/commit/c78ce8c3f1da3b8b2c6fa0f982595adc8c48b7d6) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `MemoryBlobStore.put()` keeping the FIRST upload's `uploadedAt` forever on a re-put of already-known content, instead of refreshing it like `IndexedDbBlobStore` and `HttpBlobStore` already do.
+  
+  `put()` deduplicates by content hash and returned a fresh `meta` object either way, but only wrote it to the store on the first call for a given hash — a later `put()` of the same bytes handed the caller a meta claiming the current time while `stat()`/`get()` kept reporting the original upload time. Blob GC's grace-window check (`planBlobSweep` in `packages/collab/src/geometry/gc.ts`) reads that stored `uploadedAt` to decide whether an unreferenced-right-now blob is too young to sweep; a client re-references (and re-PUTs) a blob specifically to refresh that clock, per the race-protection this store's own sibling implementations already rely on. With the stale timestamp, a blob re-uploaded long after its original upload read back as old enough to sweep immediately.
+  
+  `put()` now always writes the fresh `meta` (reusing the already-stored bytes rather than copying them again), matching `IndexedDbBlobStore` and `HttpBlobStore`.
+
+- [#3569](https://github.com/LTplus-AG/ifc-lite/pull/3569) [`4735f1c`](https://github.com/LTplus-AG/ifc-lite/commit/4735f1cbb6635016e83c7890f670e615bbdc48c3) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `applyIfcxOverlay` silently resurrecting an entity a previous, separately-arriving layer had deleted.
+  
+  `applyIfcxOverlay` writes a file's opinions onto a doc that may already hold the paths involved — used by `mergeBranch(parent, branch, 'layer')` and by any other caller applying a sequence of layers/ops to the same doc. Within one call, a delete-then-resurrect sequence already resolved correctly ("the last opinion wins"), but `deleteEntity` purges the path from `entitiesMap` entirely, so once that call's transaction ended there was nothing left on the doc distinguishing "deleted, no opinion since" from "never existed". A later, separate `applyIfcxOverlay` call touching the same path with no opinion on deletion at all read `hasEntity() === false` as "brand new" and silently recreated the entity via `createNodeEntity`, losing the deletion and every attribute the deleted entity had carried that the new layer did not itself restate. Two layers applied in different orders — a delete-op and an unrelated set-op on the same path — converged to two different final states depending only on which was applied first: order A (delete, then set) left the entity alive; order B (set, then delete) left it deleted.
+  
+  `applyIfcxOverlay` now records paths it deletes in a small persistent set on the doc's meta map, and a later call that touches such a path without itself stating a deletion opinion leaves it deleted rather than recreating it. An explicit revive (`ifclite::deleted: false`) still resurrects the entity as before, and the tombstone is cleared once it does.
+
+- [#3855](https://github.com/LTplus-AG/ifc-lite/pull/3855) [`182215a`](https://github.com/LTplus-AG/ifc-lite/commit/182215a835c4beac6a776bcb4eb1d019cab9063e) Thanks [@louistrue](https://github.com/louistrue)! - Corrected the code samples on each package's npm landing page: the README fences are now typechecked against the package's real exports, so the snippets import what they call, declare the values they read, and no longer show removed options or renamed methods. Patch-bumping every package whose README changed so the corrections actually reach npmjs.com.
+- Updated dependencies [[`bcbe7b9`](https://github.com/LTplus-AG/ifc-lite/commit/bcbe7b9afa38e8dafb5900e73575c71a8fd96012), [`793fce2`](https://github.com/LTplus-AG/ifc-lite/commit/793fce217039f11d6b74f898daed03f48c33809d), [`586fa29`](https://github.com/LTplus-AG/ifc-lite/commit/586fa292b69cdb3ba6e45764b4ff742b2fa7b9a9), [`1000dce`](https://github.com/LTplus-AG/ifc-lite/commit/1000dce72e9ec75c59848efefc1f709d01172e72), [`cebcb21`](https://github.com/LTplus-AG/ifc-lite/commit/cebcb2133ef672e9199ee2f158578499d449d9e0), [`e986c81`](https://github.com/LTplus-AG/ifc-lite/commit/e986c81bf6d28fec57f1953fa53bf315dbd80a3a), [`8c181c9`](https://github.com/LTplus-AG/ifc-lite/commit/8c181c99f91964402ad352aead36d9619af5b427), [`6e48c4c`](https://github.com/LTplus-AG/ifc-lite/commit/6e48c4c5f441e8a42e4cc55440cf747ad8679f0a), [`8f08715`](https://github.com/LTplus-AG/ifc-lite/commit/8f087158a662a02c01a21dd2546fb863bb24e665), [`9b709c5`](https://github.com/LTplus-AG/ifc-lite/commit/9b709c51480fbabb68167aa4892f7e4c87b0e4e6), [`f8e03d4`](https://github.com/LTplus-AG/ifc-lite/commit/f8e03d4d5bb620fc9e807d5233091d145a201165), [`32b31bc`](https://github.com/LTplus-AG/ifc-lite/commit/32b31bc8501f04e110733289bde0389b9899bc76), [`89c4cf2`](https://github.com/LTplus-AG/ifc-lite/commit/89c4cf22e83d76115035f7dcbf6e34f9c06dd091), [`19f1312`](https://github.com/LTplus-AG/ifc-lite/commit/19f13120a05cd3a3b729eeaf5550cff71b7506d9), [`82c77c1`](https://github.com/LTplus-AG/ifc-lite/commit/82c77c118d5a4be8e5ee5b7f7e0648514e9fb74e), [`182215a`](https://github.com/LTplus-AG/ifc-lite/commit/182215a835c4beac6a776bcb4eb1d019cab9063e), [`a1aebc8`](https://github.com/LTplus-AG/ifc-lite/commit/a1aebc822b819221258f4759edf4c82ff0d140f7), [`f8e03d4`](https://github.com/LTplus-AG/ifc-lite/commit/f8e03d4d5bb620fc9e807d5233091d145a201165), [`a1069f8`](https://github.com/LTplus-AG/ifc-lite/commit/a1069f8f096fcfc5771200a2748466096c3463d5), [`dc8198c`](https://github.com/LTplus-AG/ifc-lite/commit/dc8198ce3f9b9be4b2420dce90343822e0079465), [`1060a30`](https://github.com/LTplus-AG/ifc-lite/commit/1060a30187c8f6bb327f9e356056f2364568e8ff), [`a2488e8`](https://github.com/LTplus-AG/ifc-lite/commit/a2488e858bc7792cdcc818f7759c0a6e46e7d892), [`8368339`](https://github.com/LTplus-AG/ifc-lite/commit/83683393654d8c1b903f03b5c6e9e5ff111fdaf0)]:
+  - @ifc-lite/data@4.0.0
+  - @ifc-lite/mutations@2.0.0
+  - @ifc-lite/ifcx@4.0.0
+
 ## 0.6.0
 
 ### Minor Changes
@@ -421,7 +528,7 @@
   already closed in prior batches.
 
 - [#616](https://github.com/louistrue/ifc-lite/pull/616) [`2fc15b4`](https://github.com/louistrue/ifc-lite/commit/2fc15b45fbd06ebb57120d87db9a0ab06ed18142) Thanks [@louistrue](https://github.com/louistrue)! - Big reach-for-the-stars batch. Closes (or near-closes) the remaining
-  substantial items in `docs/architecture/collab-plan.md` for v0.2,
+  substantial items in `docs/architecture/collaboration.md` for v0.2,
   v0.5, v0.7, and v1.0. **+21 tests, total 140 passing.**
 
   `@ifc-lite/collab`
@@ -621,7 +728,7 @@ name, buckets, help)` accumulates observations into upper-bound
   end-to-end sync through the websocket server, undo isolation, and
   per-user layer extraction.
 
-  See `docs/architecture/collab-plan.md` for the v0.1 → v1.0 roadmap.
+  See `docs/architecture/collaboration.md` for the v0.1 → v1.0 roadmap.
 
 - [#616](https://github.com/louistrue/ifc-lite/pull/616) [`2fc15b4`](https://github.com/louistrue/ifc-lite/commit/2fc15b45fbd06ebb57120d87db9a0ab06ed18142) Thanks [@louistrue](https://github.com/louistrue)! - Continuing the v0.1 → v1.0 plan. Lands foundational pieces of v0.3
   (geometry), v0.4 (federation), and v0.6 (MCP) so each upstack consumer
@@ -813,7 +920,7 @@ getModelForGlobalId` contract. `passThroughResolver` is the default
 
 ### Minor Changes
 
-- Initial release. v0.1 Foundation per `docs/architecture/collab-plan.md`:
+- Initial release. v0.1 Foundation per `docs/architecture/collaboration.md`:
   - Y.Doc schema with `entities`, `relationships`, `geometry` top-level maps.
   - IFCX seed (`from-ifcx`) and snapshot (`to-ifcx`) round-trip.
   - Per-user layer extraction.

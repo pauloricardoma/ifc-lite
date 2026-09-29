@@ -42,6 +42,100 @@ fn aabb_to_mesh(min: Point3<f64>, max: Point3<f64>) -> Mesh {
     mesh
 }
 
+/// The cut mesh of a subtraction, or a panic naming the rejection.
+fn group_cut(outcome: GroupCut) -> Mesh {
+    match outcome {
+        GroupCut::Cut(m) => m,
+        GroupCut::Retessellated(m) => panic!("expected a cut, got a {}-triangle re-tessellation", m.triangle_count()),
+        GroupCut::Rejected(why) => panic!("group rejected: {why:?}"),
+    }
+}
+
+fn group_reject(outcome: GroupCut) -> GroupReject {
+    match outcome {
+        GroupCut::Cut(m) | GroupCut::Retessellated(m) => {
+            panic!("expected a rejection, got a {}-triangle mesh", m.triangle_count())
+        }
+        GroupCut::Rejected(why) => why,
+    }
+}
+
+/// Tetrahedron in the x + y > 2.2 corner of the unit cube's AABB: its AABB
+/// overlaps the cube, its solid never reaches it.
+fn tetra_missing_the_unit_cube() -> Mesh {
+    let mut miss = Mesh::new();
+    let (a, b, c, d) = (
+        Point3::new(2.1, 0.1, 0.5),
+        Point3::new(0.1, 2.1, 0.5),
+        Point3::new(2.1, 2.1, 0.5),
+        Point3::new(2.1, 2.1, 1.5),
+    );
+    for t in [
+        Triangle::new(a, b, c),
+        Triangle::new(a, d, b),
+        Triangle::new(b, d, c),
+        Triangle::new(c, d, a),
+    ] {
+        add_triangle_to_mesh(&mut miss, &t);
+    }
+    miss
+}
+
+/// Every way a group is turned down used to come back as `Ok(host.clone())`,
+/// the shape of a real cut, and the router re-derived the bit with a triangle
+/// count and a 0.1 % volume gate (`router/voids/sweep.rs`; repaired twice
+/// under #1788). The seam now names the outcome. Mutations that fail this:
+/// return `GroupCut::Cut(host_mesh.clone())` from any bail; force `changed =
+/// true` in the kernel classifier (the tetra case reads `Cut`).
+#[test]
+fn subtract_mesh_many_names_each_rejection_instead_of_returning_the_host() {
+    let host = aabb_to_mesh(Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 1.0, 1.0));
+    let far = aabb_to_mesh(Point3::new(5.0, 5.0, 5.0), Point3::new(6.0, 6.0, 6.0));
+    let through = aabb_to_mesh(Point3::new(0.4, 0.4, -0.1), Point3::new(0.6, 0.6, 1.1));
+    let miss = tetra_missing_the_unit_cube();
+    let p = ClippingProcessor::new();
+
+    assert_eq!(group_reject(p.subtract_mesh_many(&Mesh::new(), &[&through])), GroupReject::EmptyHost);
+    assert_eq!(group_reject(p.subtract_mesh_many(&host, &[&far])), GroupReject::NoOverlap);
+    assert_eq!(group_reject(p.subtract_mesh_many(&host, &[])), GroupReject::NoOverlap);
+    assert_eq!(group_reject(p.subtract_mesh_many(&host, &[&miss])), GroupReject::Unchanged);
+    // A miss alongside a real cutter is still a cut.
+    let cut = group_cut(p.subtract_mesh_many(&host, &[&miss, &through]));
+    assert!(cut.triangle_count() > host.triangle_count(), "through-cutter must carve the host");
+    assert_eq!(p.take_failures(), vec![], "none of these rejections is a failure record");
+}
+
+/// The single-cutter twin (#4692). `subtract_mesh` handed the host back
+/// un-cut on every bail, and on a miss it returned the kernel's re-tessellated
+/// host in the same shape as a cut, so the void router guessed the outcome
+/// from the triangle count and a 0.1 % volume test. It now names each outcome;
+/// the records it made are unchanged. Mutations that fail this: return
+/// `GroupCut::Cut(host.clone())` from any bail; ignore the `changed` bit (the
+/// tetra case reads `Cut`).
+#[test]
+fn subtract_mesh_names_each_rejection_instead_of_returning_the_host_4692() {
+    let host = aabb_to_mesh(Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 1.0, 1.0));
+    let far = aabb_to_mesh(Point3::new(5.0, 5.0, 5.0), Point3::new(6.0, 6.0, 6.0));
+    let through = aabb_to_mesh(Point3::new(0.4, 0.4, -0.1), Point3::new(0.6, 0.6, 1.1));
+    let miss = tetra_missing_the_unit_cube();
+    let p = ClippingProcessor::new();
+
+    assert_eq!(group_reject(p.subtract_mesh(&Mesh::new(), &through)), GroupReject::EmptyHost);
+    assert_eq!(group_reject(p.subtract_mesh(&host, &Mesh::new())), GroupReject::NoOverlap);
+    assert_eq!(group_reject(p.subtract_mesh(&host, &far)), GroupReject::NoOverlap);
+    let GroupCut::Retessellated(miss_result) = p.subtract_mesh(&host, &miss) else {
+        panic!("a cutter that never reaches the solid is a re-tessellation, not a cut");
+    };
+    assert!(!miss_result.is_empty(), "the re-tessellated host is the host, not nothing");
+    let cut = group_cut(p.subtract_mesh(&host, &through));
+    assert!(cut.triangle_count() > host.triangle_count(), "through-cutter must carve the host");
+    assert_eq!(
+        p.take_failures().iter().map(|f| f.reason.clone()).collect::<Vec<_>>(),
+        vec![BoolFailureReason::EmptyOperand, BoolFailureReason::NoBoundsOverlap],
+        "the empty cutter and the missed overlap keep their records; the others record nothing"
+    );
+}
+
 /// More cutters than MAX_CUTTERS_PER_ARRANGEMENT force the chunked path in
 /// `subtract_mesh_many`; the result must match the sequential subtract chain.
 /// Set difference is order-independent (`host - {all}` equals
@@ -78,12 +172,10 @@ fn subtract_mesh_many_chunks_match_sequential() {
         })
         .collect();
     let refs: Vec<&Mesh> = cutters.iter().collect();
-    let batched = csg
-        .subtract_mesh_many(&wall, &refs)
-        .expect("chunked subtract must conform");
+    let batched = group_cut(csg.subtract_mesh_many(&wall, &refs));
     let mut seq = wall.clone();
     for c in &cutters {
-        seq = csg.subtract_mesh(&seq, c).expect("sequential subtract");
+        seq = group_cut(csg.subtract_mesh(&seq, c));
     }
     let (vb, vs) = (vol(&batched), vol(&seq));
     assert!(
@@ -429,8 +521,8 @@ fn topology_tear_recorded_by_every_boolean_op_without_gating() {
 
     let cases: Vec<(&str, BoolOp, Mesh)> = {
         let p = ClippingProcessor::new();
-        let subtract = p.subtract_mesh(&open_host, &through_cutter).unwrap();
-        let batched = p.subtract_mesh_many(&open_host, &[&through_cutter]).unwrap();
+        let subtract = group_cut(p.subtract_mesh(&open_host, &through_cutter));
+        let batched = group_cut(p.subtract_mesh_many(&open_host, &[&through_cutter]));
         let union = p.union_mesh(&open_host, &overlapping).unwrap();
         let intersection = p.intersection_mesh(&open_host, &overlapping).unwrap();
         // One processor, four ops, four records — in call order.
@@ -480,8 +572,8 @@ fn topology_tear_not_recorded_for_closed_results() {
     let overlapping = aabb_to_mesh(Point3::new(0.5, 0.5, 0.5), Point3::new(1.5, 1.5, 1.5));
 
     let p = ClippingProcessor::new();
-    p.subtract_mesh(&closed_host, &through_cutter).unwrap();
-    p.subtract_mesh_many(&closed_host, &[&through_cutter]).unwrap();
+    group_cut(p.subtract_mesh(&closed_host, &through_cutter));
+    group_cut(p.subtract_mesh_many(&closed_host, &[&through_cutter]));
     p.union_mesh(&closed_host, &overlapping).unwrap();
     p.intersection_mesh(&closed_host, &overlapping).unwrap();
 
@@ -498,7 +590,20 @@ fn topology_tear_not_recorded_for_closed_results() {
 /// twice, inflating the very per-host census this diagnostic exists to feed.
 /// 16 cutters (one chunk) is the control: same host, same tear, one record
 /// either way.
-#[cfg(not(feature = "csg_topology_gate"))] // step-1-only: asserts the non-gating KernelError record; superseded under the feature by OpenTopologyRejected + fallback
+// step-1-only: asserts the non-gating KernelError record; superseded under
+// `csg_topology_gate` by OpenTopologyRejected + fallback.
+//
+// Also excluded under `csg_manifold_gate` (#3440). This test needs the group
+// to be CUT - it says so itself, and asserts it, because a rejected group
+// records nothing and would make the whole thing vacuous. The fixture is a
+// deliberately torn open box cut 17 ways, so the manifold gate rejects it and
+// the group comes back un-cut. That is the gate working, not the diagnostic
+// breaking: there is no "worse number" to pin here, only a fixture the feature
+// makes unreachable.
+#[cfg(all(
+    not(feature = "csg_topology_gate"),
+    not(feature = "csg_manifold_gate")
+))]
 #[test]
 fn topology_tear_recorded_once_per_batched_subtract_not_once_per_chunk() {
     let open_host = open_box_mesh(Point3::new(0.0, 0.0, 0.0), Point3::new(20.0, 1.0, 1.0));
@@ -518,12 +623,11 @@ fn topology_tear_recorded_once_per_batched_subtract_not_once_per_chunk() {
     for cutter_count in [16usize, 17] {
         let refs: Vec<&Mesh> = cutters.iter().take(cutter_count).collect();
         let p = ClippingProcessor::new();
-        let result = p.subtract_mesh_many(&open_host, &refs).unwrap();
-        // The group must have been CUT, not rejected — a rejected group returns
-        // the host un-cut and records nothing, which would make this vacuous.
+        // `group_cut` panics on a rejection, which would make this vacuous.
+        let result = group_cut(p.subtract_mesh_many(&open_host, &refs));
         assert!(
             result.triangle_count() > open_host.triangle_count(),
-            "{cutter_count} cutters: the group was rejected, so this proves nothing"
+            "{cutter_count} cutters: the cut must carve the host"
         );
         assert!(
             !crate::router::voids::prism_cut::closure_checks::directed_closed(&result)
@@ -696,8 +800,8 @@ fn topology_gate_is_a_true_noop_without_the_feature() {
     let overlapping = aabb_to_mesh(Point3::new(0.5, 0.5, 0.5), Point3::new(1.5, 1.5, 1.5));
 
     let p = ClippingProcessor::new();
-    let subtract = p.subtract_mesh(&open_host, &through_cutter).unwrap();
-    let batched = p.subtract_mesh_many(&open_host, &[&through_cutter]).unwrap();
+    let subtract = group_cut(p.subtract_mesh(&open_host, &through_cutter));
+    let batched = group_cut(p.subtract_mesh_many(&open_host, &[&through_cutter]));
     let union = p.union_mesh(&open_host, &overlapping).unwrap();
     let intersection = p.intersection_mesh(&open_host, &overlapping).unwrap();
 
@@ -730,13 +834,19 @@ fn topology_gate_rejects_every_torn_boolean_result_when_enabled() {
     let overlapping = aabb_to_mesh(Point3::new(0.5, 0.5, 0.5), Point3::new(1.5, 1.5, 1.5));
 
     let p = ClippingProcessor::new();
-    let subtract = p.subtract_mesh(&open_host, &through_cutter).unwrap();
-    let batched = p.subtract_mesh_many(&open_host, &[&through_cutter]).unwrap();
+    let subtract = p.subtract_mesh(&open_host, &through_cutter);
+    let batched = p.subtract_mesh_many(&open_host, &[&through_cutter]);
     let union = p.union_mesh(&open_host, &overlapping).unwrap();
     let intersection = p.intersection_mesh(&open_host, &overlapping).unwrap();
 
-    assert_eq!(subtract.indices, open_host.indices, "subtract_mesh must fall back to the un-cut host");
-    assert_eq!(batched.indices, open_host.indices, "subtract_mesh_many must fall back to the un-cut host");
+    assert!(
+        matches!(subtract, GroupCut::Rejected(GroupReject::GateRejected)),
+        "subtract_mesh must reject the cut at the gate"
+    );
+    assert!(
+        matches!(batched, GroupCut::Rejected(GroupReject::GateRejected)),
+        "subtract_mesh_many must reject the group at the gate"
+    );
     assert!(intersection.is_empty(), "intersection_mesh must fall back to an empty mesh");
     let mut expected_union_merge = open_host.clone();
     expected_union_merge.merge(&overlapping);
@@ -765,3 +875,237 @@ fn topology_gate_rejects_every_torn_boolean_result_when_enabled() {
 // imports via `crate::csg::`, so the attachment depth does not matter.
 #[path = "world_frame_tests.rs"]
 mod world_frame_tests;
+
+/// A closed unit box carrying a FIN: one extra triangle hung off the box's
+/// `(min.x,min.y,min.z)-(max.x,min.y,min.z)` edge. That edge is now used by
+/// three triangles, so `edge_multiplicity_defects` reports `over_used = 1`
+/// while the signed closure tally still nets the shell to zero.
+///
+/// A doubled coincident FACE was the first fixture tried here and does not
+/// work: the exact kernel's vertex interner collapses the duplicate and the
+/// output comes back clean. A fin survives, which is what makes it usable as
+/// an end-to-end fixture rather than a direct call to the predicate.
+fn finned_box_mesh(min: Point3<f64>, max: Point3<f64>) -> Mesh {
+    let mut mesh = aabb_to_mesh(min, max);
+    add_triangle_to_mesh(
+        &mut mesh,
+        &Triangle::new(
+            Point3::new(min.x, min.y, min.z),
+            Point3::new(max.x, min.y, min.z),
+            Point3::new(
+                0.5 * (min.x + max.x),
+                min.y - 0.5 * (max.y - min.y),
+                0.5 * (min.z + max.z),
+            ),
+        ),
+    );
+    mesh
+}
+
+/// #3440 step 3: under `csg_manifold_gate`, a kernel result carrying an
+/// edge-multiplicity defect must be REJECTED at the accept seam, and each op
+/// must fall back the way it already falls back for `KernelOutputInvalid` —
+/// un-cut host or plain merge — never an `Err` that would drop the element.
+/// The default build's half of this pair is
+/// `manifold_gate_is_a_true_noop_without_the_feature` at the end of this file.
+///
+/// Driving the public ops rather than `manifold_gate_reject` directly is the
+/// point: the call sites are the change, so reverting any one of them has to
+/// turn this red.
+///
+/// `intersection_mesh` is covered by the sibling test below instead of here.
+/// Its call site is wired identically, but no fixture reaches it: the exact
+/// kernel's intersection re-derives orientation from the arrangement, so it
+/// returned a CLEAN mesh for every torn operand tried (fin host, reversed-face
+/// host, either argument order, self-intersection). A test asserting rejection
+/// there would have to fake the mesh, and one asserting acceptance would pass
+/// with the call site deleted.
+#[cfg(feature = "csg_manifold_gate")]
+#[test]
+fn manifold_gate_rejects_a_non_manifold_result_at_the_accept_seam() {
+    let host = finned_box_mesh(Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 1.0, 1.0));
+    let through_cutter = aabb_to_mesh(Point3::new(0.4, 0.4, -0.1), Point3::new(0.6, 0.6, 1.1));
+    let overlapping = aabb_to_mesh(Point3::new(0.5, 0.5, 0.5), Point3::new(1.5, 1.5, 1.5));
+
+    let p = ClippingProcessor::new();
+    let subtract = p.subtract_mesh(&host, &through_cutter);
+    let batched = p.subtract_mesh_many(&host, &[&through_cutter]);
+    let union = p.union_mesh(&host, &overlapping).unwrap();
+
+    assert!(
+        matches!(subtract, GroupCut::Rejected(GroupReject::GateRejected)),
+        "subtract_mesh must reject the cut at the gate"
+    );
+    assert!(
+        matches!(batched, GroupCut::Rejected(GroupReject::GateRejected)),
+        "subtract_mesh_many must reject the group at the gate"
+    );
+    let mut expected_union_merge = host.clone();
+    expected_union_merge.merge(&overlapping);
+    assert_eq!(
+        union.triangle_count(),
+        expected_union_merge.triangle_count(),
+        "union_mesh must fall back to the plain merge"
+    );
+
+    let rejected: Vec<BoolOp> = p
+        .take_failures()
+        .iter()
+        .filter(|f| matches!(f.reason, BoolFailureReason::NonManifoldRejected { .. }))
+        .map(|f| f.op)
+        .collect();
+    assert_eq!(
+        rejected,
+        vec![BoolOp::Difference, BoolOp::Difference, BoolOp::Union],
+        "each accept path must reject and record NonManifoldRejected exactly once"
+    );
+}
+
+/// The intersection seam's gate, exercised directly because no operand pair
+/// makes the exact kernel emit a torn intersection (see the test above). This
+/// pins the predicate + the recorded reason + the `true` return that
+/// `intersection_mesh`'s call site branches on; it cannot pin the call site
+/// itself.
+#[cfg(feature = "csg_manifold_gate")]
+#[test]
+fn manifold_gate_reports_the_intersection_op_when_it_rejects() {
+    let torn = finned_box_mesh(Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 1.0, 1.0));
+    let p = ClippingProcessor::new();
+    assert!(
+        p.manifold_gate_reject(BoolOp::Intersection, &torn),
+        "a finned mesh must be rejected"
+    );
+    assert_eq!(
+        p.take_failures()
+            .iter()
+            .map(|f| (f.op, f.reason.clone()))
+            .collect::<Vec<_>>(),
+        vec![(
+            BoolOp::Intersection,
+            BoolFailureReason::NonManifoldRejected {
+                over_used: 1,
+                same_direction: 0,
+            }
+        )],
+        "the rejection must be attributed to the op that was passed in, with its counts"
+    );
+}
+
+/// The other direction: a CLEAN boolean result must sail through the gate
+/// untouched. Without this the tests above are satisfied by a gate that
+/// rejects everything, which would be a far worse bug than the one being
+/// fixed.
+#[cfg(feature = "csg_manifold_gate")]
+#[test]
+fn manifold_gate_accepts_a_clean_boolean_result() {
+    let host = aabb_to_mesh(Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 1.0, 1.0));
+    let through_cutter = aabb_to_mesh(Point3::new(0.4, 0.4, -0.1), Point3::new(0.6, 0.6, 1.1));
+    let overlapping = aabb_to_mesh(Point3::new(0.5, 0.5, 0.5), Point3::new(1.5, 1.5, 1.5));
+
+    let p = ClippingProcessor::new();
+    let cut = group_cut(p.subtract_mesh(&host, &through_cutter));
+    let union = p.union_mesh(&host, &overlapping).unwrap();
+    let intersection = p.intersection_mesh(&host, &overlapping).unwrap();
+
+    assert!(
+        cut.triangle_count() > host.triangle_count(),
+        "the clean cut must be the kernel result, not the un-cut host"
+    );
+    assert!(!union.is_empty() && !intersection.is_empty());
+    assert!(
+        p.take_failures()
+            .iter()
+            .all(|f| !matches!(f.reason, BoolFailureReason::NonManifoldRejected { .. })),
+        "clean results must record no multiplicity rejection"
+    );
+}
+
+/// The default build's half of the pair above: WITHOUT `csg_manifold_gate` the
+/// same torn result must come back untouched and record nothing. Without this
+/// test the feature could be left on by accident — or the `cfg(not(...))` twin
+/// could grow a body — and the only thing that would notice is a quality
+/// fixture in another file, whose failure would not name the cause.
+///
+/// Also excluded under `csg_topology_gate`: the finned host is open as well as
+/// non-manifold, so with THAT feature on the other gate rejects it and the
+/// un-cut host comes back for a reason this test is not about. Naming both
+/// features keeps the assertion measuring the thing in its own name.
+#[cfg(all(
+    not(feature = "csg_manifold_gate"),
+    not(feature = "csg_topology_gate")
+))]
+#[test]
+fn manifold_gate_is_a_true_noop_without_the_feature() {
+    let host = finned_box_mesh(Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 1.0, 1.0));
+    let through_cutter = aabb_to_mesh(Point3::new(0.4, 0.4, -0.1), Point3::new(0.6, 0.6, 1.1));
+
+    let p = ClippingProcessor::new();
+    let subtract = group_cut(p.subtract_mesh(&host, &through_cutter));
+
+    assert_ne!(
+        subtract.indices, host.indices,
+        "without the feature the torn kernel result must be returned, not the un-cut host"
+    );
+    assert!(
+        p.take_failures()
+            .iter()
+            .all(|f| !matches!(f.reason, BoolFailureReason::NonManifoldRejected { .. })),
+        "NonManifoldRejected must never be recorded without csg_manifold_gate"
+    );
+}
+
+/// An empty operand means `union_pair` hands back the other operand untouched
+/// and no boolean ever ran, so `union_mesh` must record nothing about it — the
+/// same reason `union_meshes` audits only when a pair actually met. Without
+/// this guard a caller mesh that is already torn or already non-manifold gets
+/// blamed on a union, which inflates both the public failure list and the
+/// `csg_manifold_gate` census the flip decision is read off.
+///
+/// Feature-independent on purpose: it pins the topology-tear channel in the
+/// default build and, under `csg_manifold_gate`, the `NonManifoldRejected`
+/// channel too. `finned_box_mesh` trips both predicates (a dangling fin leaves
+/// unpaired edges AND an over-used one), so the same fixture covers each build.
+#[test]
+fn union_with_an_empty_operand_records_no_failure() {
+    let torn = finned_box_mesh(Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 1.0, 1.0));
+    let empty = Mesh::new();
+
+    let p = ClippingProcessor::new();
+    let right = p.union_mesh(&torn, &empty).unwrap();
+    let left = p.union_mesh(&empty, &torn).unwrap();
+
+    assert_eq!(
+        right.indices, torn.indices,
+        "an empty second operand must pass the first through untouched"
+    );
+    assert_eq!(
+        left.indices, torn.indices,
+        "an empty first operand must pass the second through untouched"
+    );
+    assert_eq!(
+        p.take_failures()
+            .iter()
+            .map(|f| format!("{:?}", f.reason))
+            .collect::<Vec<_>>(),
+        Vec::<String>::new(),
+        "a union that never ran must not be blamed for its operand's topology"
+    );
+}
+
+/// #5362: `found_no_overlap` is the kernel's "nothing to cut" verdict, the
+/// only case in which the void router may skip its #635 fallback. A cutter
+/// that misses the host (disjoint bounds, or touching a face without entering)
+/// reads as no-overlap; one that enters the host does not.
+#[test]
+fn found_no_overlap_separates_a_miss_from_a_cut_5362() {
+    use crate::kernel::arrangement::box_mesh;
+    use crate::kernel::mesh_bridge::tris_to_mesh;
+    let host = tris_to_mesh(&box_mesh([0.0, 0.0, 0.0], [4.0, 0.3, 3.0]));
+    let clipper = ClippingProcessor::new();
+    let verdict = |lo: [f64; 3], hi: [f64; 3]| {
+        clipper.subtract_mesh(&host, &tris_to_mesh(&box_mesh(lo, hi))).found_no_overlap()
+    };
+    assert!(verdict([10.0, 0.0, 0.0], [11.0, 1.0, 1.0]), "disjoint bounds");
+    assert!(verdict([1.0, -2.0, 1.0], [1.2, 0.0, 2.0]), "touching the face, not entering");
+    assert!(!verdict([1.0, -1.0, 1.0], [1.2, 1.0, 2.0]), "a through opening is a cut");
+}

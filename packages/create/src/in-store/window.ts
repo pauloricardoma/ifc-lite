@@ -9,6 +9,7 @@
  */
 
 import type { StoreEditor } from '@ifc-lite/mutations';
+import { assertFinitePoint3 } from '../ifc-creator-math.js';
 import { toNativeLength, toNativePoint3, type SpatialAnchor } from './anchor.js';
 import {
   assertPositiveFinite,
@@ -56,6 +57,8 @@ export interface WindowInStoreParams {
   Description?: string;
   ObjectType?: string;
   Tag?: string;
+  /** Explicit GlobalId (22-char IFC GUID); generated when omitted. */
+  GlobalId?: string;
 }
 
 export interface WindowBuildResult {
@@ -73,6 +76,7 @@ export function addWindowToStore(
   anchor: SpatialAnchor,
   params: WindowInStoreParams,
 ): WindowBuildResult {
+  assertFinitePoint3({ Position: params.Position }, 'addWindowToStore');
   assertPositiveFinite([params.Width, params.Height], 'addWindowToStore: Width and Height must be positive');
   assertPositiveFinite(
     [params.FrameThickness ?? 0.05],
@@ -95,27 +99,37 @@ export function addWindowToStore(
   const solidId = emitExtrudedSolid(editor, profileId, params.Height);
   const { shapeRepId, productShapeId } = emitBodyRepresentation(editor, anchor.bodyContextId, solidId);
 
-  const isIFC2X3 = (anchor.schema ?? 'IFC4') === 'IFC2X3';
   const attrs = ifcElementHeader(anchor.ownerHistoryId, placementId, productShapeId, params, 'Window', anchor.guidRandom);
-  attrs.push(params.Height, params.Width);
-  if (!isIFC2X3) {
-    // Free-form values that aren't part of IfcWindowTypePartitioningEnum
-    // are normalised to .USERDEFINED. + UserDefinedPartitioningType so
-    // they round-trip through STEP without producing invalid `.<value>.`
-    // enum tokens.
-    const requested = params.PartitioningType ?? 'NOTDEFINED';
-    const isKnownEnum = WINDOW_PARTITIONING_ENUM.has(requested);
-    const partitioningType = isKnownEnum ? requested : 'USERDEFINED';
-    const userDefined = partitioningType === 'USERDEFINED'
-      ? (isKnownEnum ? params.UserDefinedPartitioningType ?? null : requested)
-      : null;
-    attrs.push(`.${params.PredefinedType ?? 'NOTDEFINED'}.`);
-    attrs.push(`.${partitioningType}.`);
-    attrs.push(userDefined);
-  }
+  attrs.push(...windowAttributeTail(anchor.schema, params));
 
   const windowId = editor.addEntity('IfcWindow', attrs as Parameters<StoreEditor['addEntity']>[1]).expressId;
   const relContainedId = emitRelContainedInSpatialStructure(editor, anchor.ownerHistoryId, windowId, anchor.storeyId, anchor.guidRandom);
 
   return { windowId, placementId, profileId, solidId, shapeRepId, productShapeId, relContainedId };
+}
+
+/**
+ * IfcWindow's attributes after the IfcElement header: OverallHeight and
+ * OverallWidth in every schema, then PredefinedType / PartitioningType /
+ * UserDefinedPartitioningType from IFC4 on. Shared by the hosted window
+ * builder. `Height`/`Width` must already be in the native length unit.
+ */
+export function windowAttributeTail(
+  schema: SpatialAnchor['schema'],
+  params: Pick<WindowInStoreParams, 'Height' | 'Width' | 'PredefinedType' | 'PartitioningType' | 'UserDefinedPartitioningType'>,
+): unknown[] {
+  const tail: unknown[] = [params.Height, params.Width];
+  if ((schema ?? 'IFC4') === 'IFC2X3') return tail;
+  // Free-form values that aren't part of IfcWindowTypePartitioningEnum
+  // are normalised to .USERDEFINED. + UserDefinedPartitioningType so
+  // they round-trip through STEP without producing invalid `.<value>.`
+  // enum tokens.
+  const requested = params.PartitioningType ?? 'NOTDEFINED';
+  const isKnownEnum = WINDOW_PARTITIONING_ENUM.has(requested);
+  const partitioningType = isKnownEnum ? requested : 'USERDEFINED';
+  const userDefined = partitioningType === 'USERDEFINED'
+    ? (isKnownEnum ? params.UserDefinedPartitioningType ?? null : requested)
+    : null;
+  tail.push(`.${params.PredefinedType ?? 'NOTDEFINED'}.`, `.${partitioningType}.`, userDefined);
+  return tail;
 }

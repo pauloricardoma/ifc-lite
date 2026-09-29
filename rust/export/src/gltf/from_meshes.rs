@@ -8,14 +8,17 @@
 use super::{build_gltf, pack_glb, Chunker, GltfStats, MeshView};
 use crate::error::ExportError;
 
-/// Fail-closed [`export_glb_from_meshes`]: validates that the per-mesh
-/// `vertex_counts` / `index_counts` (and normals) are fully backed by the flattened
-/// buffers BEFORE assembling. If a declared vertex/index count runs past the end of
-/// `positions` / `indices`, an `index_counts` entry is missing, or `normals` is empty or
-/// too short to cover every emitted vertex, returns [`ExportError::MalformedMeshInput`]
-/// instead of silently dropping the un-backed meshes (which the infallible variant does —
-/// a valid GLB missing part of the model, reported as success). Prefer this at any
-/// boundary where the counts and buffers come from separate sources (the wasm FFI).
+/// Fail-closed [`export_glb_from_meshes`]: validates the per-mesh
+/// `vertex_counts` / `index_counts` (and normals) against the flattened buffers, and
+/// the index VALUES against the vertex counts, BEFORE assembling. Returns
+/// [`ExportError::MalformedMeshInput`] when a declared vertex/index count runs past
+/// the end of `positions` / `indices`, an `index_counts` entry is missing, `normals`
+/// is empty or too short to cover every emitted vertex, or an index names a vertex
+/// its own mesh does not have — instead of silently dropping the un-backed meshes
+/// (which the infallible variant does — a valid GLB missing part of the model,
+/// reported as success) or copying the out-of-range index straight into the BIN
+/// chunk. Prefer this at any boundary where the counts and buffers come from
+/// separate sources (the wasm FFI).
 #[allow(clippy::too_many_arguments)]
 pub fn try_export_glb_from_meshes(
     positions: &[f32],
@@ -76,6 +79,12 @@ pub fn try_export_glb_from_meshes(
             ),
         });
     }
+    // Every check above is about a COUNT running past a buffer. A block that is
+    // not whole triangles, or an index VALUE outside its mesh, passes all of
+    // them; the assembler would write the first as a TRIANGLES primitive whose
+    // count is not a multiple of 3 and copy the second into the BIN chunk. The
+    // COLLADA writer refuses both through the same predicate.
+    crate::mesh_input::check_index_blocks(indices, vertex_counts, index_counts)?;
     // Every count is backed and every mesh's normals/indices are present, so the
     // infallible assembler's malformed-input `break` is unreachable and no mesh is dropped.
     let (glb, stats) = export_glb_from_meshes(
@@ -136,9 +145,9 @@ pub fn export_glb_from_meshes(
     );
     let n = vertex_counts.len();
     // The viewer's `MeshData` arrives pre-welded from the mesh source
-    // (`ifc_lite_processing::element::build_mesh_data` welds every element via
-    // `ifc_lite_geometry::mesh_weld::weld_indexed`), so this path no longer
-    // re-welds — it slices each mesh's block straight into a borrowing
+    // (`ifc_lite_geometry::mesh_weld`, run in the object frame for shared
+    // geometry and at `element::build_mesh_data` for the rest), so this path no
+    // longer re-welds — it slices each mesh's block straight into a borrowing
     // `MeshView`. Views borrow the caller's buffers, which outlive the call.
     let mut views: Vec<MeshView> = Vec::with_capacity(n);
     let mut vbase = 0usize; // running vertex offset
@@ -194,6 +203,10 @@ pub fn export_glb_from_meshes(
             None,
             lit,
             emissive,
+            // No `ProcessingResult` reaches this path, so there is no tag
+            // either. `RawIfc` is what the absent site placement and the zero
+            // RTC below already say: nothing was subtracted, nothing rotated.
+            ifc_lite_processing::MeshCoordinateSpace::RawIfc,
             [0.0, 0.0, 0.0],
             // No `ProcessingResult` reaches this path, so there is no site
             // placement available to restore.

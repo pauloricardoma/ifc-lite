@@ -17,65 +17,30 @@
  */
 
 import { useCallback, useEffect, useRef } from 'react';
+import { cancelCompareRun } from './analysisRunCancellation';
+import { stampAnalysisReport } from './useAnalysisStaleness';
 import { diffModels, type EntityFingerprint } from '@ifc-lite/diff';
 import { useViewerStore } from '@/store';
 import { posthog } from '@/lib/analytics';
 import type { CompareResult } from '@/store/slices/compareSlice';
 import { buildEntityFingerprints, type CompareRef } from '@/lib/compare/buildFingerprints';
+import { effectiveComparePair } from '@/lib/compare/effectiveCompareStore';
+import { useInvalidateCompareCacheOnEdit } from './compare/useInvalidateCompareCacheOnEdit';
+import { fallbackPairDuplicateAuthoredKeys } from '@/lib/compare/authoredKeys';
 import {
   geometryVolumesSurviveAlignment,
   resolveGeometryChannel,
 } from '@/lib/compare/geometryCapability';
-import { contentMatchCounts, contentMatchingRan } from '@/lib/compare/contentMatches';
-import { productTypeSplit } from '@/lib/compare/productTypeCounts';
+import { contentMatchingRan } from '@/lib/compare/contentMatches';
+import { acceptedForPair, keyAliasesFromAccepted } from '@/lib/compare/acceptedIdentity';
+import { compareRunPayload } from '@/lib/compare/runTelemetry';
 import { buildAtCurrentVersion } from '@/lib/compare/versionedBuild';
+import { isCurrentFor, readGeometryContentVersion, type BuiltPair } from './compare/comparePairCache';
 
-/** Read the live mesh-content version. A FUNCTION, not a captured number: the
- *  whole point is to observe the value moving across an extraction's awaits, so
- *  a caller that snapshots it once defeats the guard it feeds. */
-export const readGeometryContentVersion = (): number =>
-  useViewerStore.getState().geometryContentVersion;
-
-type Side = EntityFingerprint<CompareRef>[];
-interface BuiltPair {
-  baseModelId: string;
-  headModelId: string;
-  baseName: string;
-  headName: string;
-  base: Side;
-  head: Side;
-  /**
-   * `geometryContentVersion` the fingerprints were extracted at (#1891).
-   *
-   * The A/B model ids are NOT enough to key this cache. Federation re-alignment
-   * re-frames vertices and their world `geometryAabb`s IN PLACE, under the same
-   * ids and the same `geometryResult` object, so fingerprints built before it
-   * carry pre-alignment boxes while the meshes carry post-alignment ones — and
-   * every move distance the engine derives from them is then measured between
-   * two coordinate frames. That store counter is bumped by exactly one caller,
-   * `realignFederation`, and only when something actually moved, so it is the
-   * precise "mesh content was mutated under you" signal this cache was missing.
-   */
-  contentVersion: number;
-}
-
-/** Are these fingerprints the ones for this A/B pair, extracted from the mesh
- *  content the store holds NOW? (Ids compared field-wise rather than through a
- *  joined key string, so two ids can never alias.)
- *
- *  THE staleness predicate for the compare path — asked before a cached pair is
- *  reused, again after the extraction's awaits, and again before a cheap
- *  re-diff. One definition, so the three cannot drift apart. */
-export function isCurrentFor(
-  built: Pick<BuiltPair, 'baseModelId' | 'headModelId' | 'contentVersion'>,
-  baseModelId: string,
-  headModelId: string,
-  contentVersion: number,
-): boolean {
-  return built.baseModelId === baseModelId
-    && built.headModelId === headModelId
-    && built.contentVersion === contentVersion;
-}
+// Re-exported so existing consumers (`useCompare.test.ts`) see no change —
+// the cache key itself moved to `compare/comparePairCache.ts` for the
+// module-size house rule (AGENTS.md).
+export { isCurrentFor, readGeometryContentVersion };
 
 /** Canonical, order-independent signature of a blacklist so a re-render with a
  *  fresh-but-equivalent array reference doesn't trigger a re-diff. Compared
@@ -152,6 +117,7 @@ function publishCompareResult(built: BuiltPair): {
   const scope: CompareResult['scope'] = store.compareScope;
   const excludedTypes = store.compareExcludedTypes;
   const matchByContent = store.compareMatchByContent;
+  const accepted = acceptedForPair(store.compareAcceptedIdentity, built); // this pair's only
 
   // The strip decision, the warning flag and its placement-only nuance are ONE
   // resolution (`resolveGeometryChannel`), so the panel's warning can never
@@ -176,6 +142,15 @@ function publishCompareResult(built: BuiltPair): {
     // mismatch reports a real distance; an entity the wasm pass produced no box
     // for still degrades to a bare `moved`, the engine's documented fallback.
     matchUnpairedByContent: matchByContent,
+    // #4955. Suggestions, never decisions: neither stage retires an entry or
+    // touches a count, and both abstain with the content pass when a side has
+    // no geometry. The panel's Suggestions section lists what they found.
+    detectSplitMerge: true,
+    detectSuccessors: true,
+    // The pairs the user accepted (or imported) this session, replayed so
+    // they classify by key and leave the suggestions. Read HERE with the
+    // other options, under the same no-await rule.
+    keyAliases: keyAliasesFromAccepted(accepted),
   });
   const result: CompareResult = {
     baseModelId: built.baseModelId,
@@ -187,8 +162,17 @@ function publishCompareResult(built: BuiltPair): {
     placementOnlyGeometry,
     excludedHiddenIds: collectExcludedHiddenIds(built, excludedTypes),
     diff,
+    // #4989: the scheme THIS extraction ran under, not whatever the store
+    // holds now — see the doc comment on `BuiltPair.keyProperty`.
+    keyProperty: built.keyProperty,
+    duplicateAuthoredKeys: built.duplicateAuthoredKeys.size > 0 ? built.duplicateAuthoredKeys : undefined,
+    comparedStores: built.comparedStores.size > 0 ? built.comparedStores : undefined,
+    mutationVersion: built.mutationVersion,
   };
-  store.setCompareResult(result);
+  store.setCompareResult(stampAnalysisReport(result, {
+    mutationVersion: built.mutationVersion,
+    geometryContentVersion: built.contentVersion,
+  }));
   // Completed-comparison signal for baseline consumers (compare tour). An
   // option change re-diffing the cached fingerprints is a completed comparison
   // too, so it bumps the same counter.
@@ -206,6 +190,7 @@ export function useCompare() {
   const scope = useViewerStore((s) => s.compareScope);
   const excludedTypes = useViewerStore((s) => s.compareExcludedTypes);
   const matchByContent = useViewerStore((s) => s.compareMatchByContent);
+  const acceptedIdentity = useViewerStore((s) => s.compareAcceptedIdentity);
   const running = useViewerStore((s) => s.compareRunning);
   const result = useViewerStore((s) => s.compareResult);
   const error = useViewerStore((s) => s.compareError);
@@ -230,10 +215,8 @@ export function useCompare() {
    *   already in the air when the user cleared must not resurrect the result
    *   they just dismissed.
    *
-   * Bumped at the start of every `runComparison()` call and by `clearCompare`
-   * below (the ONLY two events that make an in-flight run's eventual answer
-   * unwanted). Each run captures the epoch value once, and every place that
-   * writes to the store re-checks it immediately before writing - never
+   * Bumped on run, clear and cancel. Every post-await store write re-checks
+   * its captured epoch immediately before writing - never
    * earlier, so nothing can supersede between the check and the write.
    */
   const epochRef = useRef(0);
@@ -248,6 +231,8 @@ export function useCompare() {
     useViewerStore.getState().clearCompare();
   }, []);
 
+  const cancelComparison = useCallback(() => cancelCompareRun(epochRef), []);
+
   const runComparison = useCallback(async () => {
     const store = useViewerStore.getState();
     const baseId = store.compareBaseModelId;
@@ -261,6 +246,11 @@ export function useCompare() {
       store.setCompareError('Pick two different models to compare.');
       return;
     }
+
+    // Captured with the pair, before any await (#4989): this drives what the
+    // fingerprints extracted below are keyed on, and must not drift mid-run
+    // — see the doc comment on `BuiltPair.keyProperty`.
+    const keyProperty = store.compareKeyProperty;
 
     const baseModel = store.models.get(baseId);
     const headModel = store.models.get(headId);
@@ -294,7 +284,9 @@ export function useCompare() {
     const stillWanted = (): boolean => {
       if (epochRef.current !== myEpoch) return false;
       const live = useViewerStore.getState();
-      return live.compareBaseModelId === baseId && live.compareHeadModelId === headId;
+      return live.compareBaseModelId === baseId
+        && live.compareHeadModelId === headId
+        && live.compareKeyProperty === keyProperty;
     };
 
     store.setCompareError(null);
@@ -313,30 +305,33 @@ export function useCompare() {
       const built = await buildAtCurrentVersion<BuiltPair>({
         readVersion: readGeometryContentVersion,
         cached: builtRef.current,
-        isCurrent: (candidate, version) => isCurrentFor(candidate, baseId, headId, version),
-        extract: async (contentVersion) => ({
-          baseModelId: baseId,
-          headModelId: headId,
-          contentVersion,
-          baseName: baseModel.name,
-          headName: headModel.name,
-          base: await buildEntityFingerprints({
+        isCurrent: (candidate, version) => isCurrentFor(candidate, baseId, headId, version, keyProperty),
+        extract: async (contentVersion) => {
+          // ONE collision map for both sides (#4989): if either revision
+          // duplicates a value, the pair-level fallback below retires that
+          // authored key from both revisions before diffing.
+          const duplicateAuthoredKeys = new Map<string, number[]>();
+          // The models as edited, not as loaded (#5312): see effectiveCompareStore.
+          const mutationVersion = useViewerStore.getState().mutationVersion;
+          const { baseEffective, headEffective, comparedStores } = await effectiveComparePair(
+            [baseModel, baseStore], [headModel, headStore], useViewerStore.getState().getMutationView);
+          const base = await buildEntityFingerprints({
             modelId: baseId,
-            store: baseStore,
+            store: baseEffective,
             meshes: baseGeometry.meshes,
             instancedGeometryHashes: baseGeometry.instancedGeometryHashes,
             instancedGeometryAabbs: baseGeometry.instancedGeometryAabbs,
             instancedGeometryVolumes: baseGeometry.instancedGeometryVolumes,
-            // #1993: a re-baked model's volumes describe a size that is no
-            // longer on screen, and nothing on this side can re-measure them.
             geometryVolumesTrusted: geometryVolumesSurviveAlignment(
               baseModel.federationAlignmentStatus,
             ),
             idOffset: baseModel.idOffset,
-          }),
-          head: await buildEntityFingerprints({
+            keyProperty,
+            duplicateAuthoredKeys,
+          });
+          const head = await buildEntityFingerprints({
             modelId: headId,
-            store: headStore,
+            store: headEffective,
             meshes: headGeometry.meshes,
             instancedGeometryHashes: headGeometry.instancedGeometryHashes,
             instancedGeometryAabbs: headGeometry.instancedGeometryAabbs,
@@ -345,8 +340,27 @@ export function useCompare() {
               headModel.federationAlignmentStatus,
             ),
             idOffset: headModel.idOffset,
-          }),
-        }),
+            keyProperty,
+            duplicateAuthoredKeys,
+          });
+          fallbackPairDuplicateAuthoredKeys([
+            { fingerprints: base, store: baseEffective },
+            { fingerprints: head, store: headEffective },
+          ], duplicateAuthoredKeys);
+          return {
+            comparedStores,
+            mutationVersion,
+            baseModelId: baseId,
+            headModelId: headId,
+            contentVersion,
+            keyProperty,
+            duplicateAuthoredKeys,
+            baseName: baseModel.name,
+            headName: headModel.name,
+            base,
+            head,
+          };
+        },
       });
       if (!built) {
         // Never silently: `finally` clears the running flag, so returning with
@@ -377,36 +391,7 @@ export function useCompare() {
       // documented on that function. Nothing here may capture them earlier.
       const { result: payload, matchByContent: ranMatchByContent } = publishCompareResult(built);
 
-      // Per-kind match counts are the default-on rollout's evidence (#1891):
-      // they say how often the pass fires in the field, and how much of what it
-      // finds it resolves versus hands back for review.
-      const matches = contentMatchCounts(payload.diff.contentMatches);
-      // Products vs type objects (headline-count confusion, see
-      // `productTypeCounts.ts`): the field's evidence for how often a run's
-      // engine-wide counts actually include type-object changes.
-      const split = productTypeSplit(payload.diff.entries);
-      posthog.capture('model_compare_run', {
-        scope: payload.scope,
-        changed_entity_count: payload.diff.entries.length,
-        geometry_unavailable: payload.geometryUnavailable,
-        excluded_type_count: payload.diff.excludedTypes.length,
-        content_matching: ranMatchByContent,
-        content_match_count: matches.total,
-        content_matched_elements: matches.matchedElements,
-        content_needs_review_elements: matches.needsReviewElements,
-        content_match_renamed: matches.renamed,
-        content_match_moved: matches.moved,
-        content_match_reshaped: matches.reshaped,
-        content_match_duplicated: matches.duplicated,
-        content_match_deduplicated: matches.deduplicated,
-        content_match_ambiguous: matches.ambiguous,
-        product_added: split.products.added,
-        product_modified: split.products.modified,
-        product_deleted: split.products.deleted,
-        type_object_added: split.typeObjects.added,
-        type_object_modified: split.typeObjects.modified,
-        type_object_deleted: split.typeObjects.deleted,
-      });
+      posthog.capture('model_compare_run', compareRunPayload(payload, ranMatchByContent));
     } catch (err) {
       console.error('[compare] comparison failed', err);
       // Same guard as above: a superseded run's own failure must set an error
@@ -427,32 +412,32 @@ export function useCompare() {
     }
   }, []);
 
-  // Federation re-alignment re-frames vertices and their world boxes IN PLACE
-  // (#1891), so a comparison published before it describes geometry that has
-  // since moved and the cached fingerprints hold pre-alignment boxes. Retire
-  // both. Clearing the RESULT as well as the cache is what keeps
-  // `publishCompareResult`'s invariant intact: leaving a result on screen with
-  // no usable fingerprints behind it would make the effect below early-return
-  // on an option change, and the panel would disagree with its own controls -
-  // exactly the staleness that function exists to prevent.
+  // A geometry re-alignment invalidates cached fingerprints. Keep the result
+  // visible with a stale banner until the user re-runs; the option re-diff
+  // below refuses to reuse the retired cache.
   //
   // Declared BEFORE the re-diff effect so a commit that changes both the
-  // version and an option clears first. Seeded with the mounted value so a
-  // remount is not mistaken for a bump; a re-align while this panel is
-  // unmounted leaves no cache to reuse, and `runComparison` re-extracts.
+  // version and an option invalidates the cache first. Seeded with the mounted
+  // value so a remount is not mistaken for a bump; a re-align while unmounted
+  // leaves no cache to reuse, and `runComparison` re-extracts.
   const lastContentVersionRef = useRef(geometryContentVersion);
+  // The accepted list a published result was diffed with. `appliedKeyAliases`
+  // cannot stand in for it: an accepted pair the engine ignored (key not in
+  // the base) leaves no trace there, and the effect would re-publish forever.
+  const lastAcceptedRef = useRef(acceptedIdentity);
   useEffect(() => {
     if (lastContentVersionRef.current === geometryContentVersion) return;
     lastContentVersionRef.current = geometryContentVersion;
     builtRef.current = null;
-    clearCompare();
-  }, [geometryContentVersion, clearCompare]);
+  }, [geometryContentVersion]);
+  useInvalidateCompareCacheOnEdit(builtRef);
 
-  // Scope, blacklist OR content-matching change with an existing result for the
-  // same pair -> re-diff from the cached fingerprints (instant). No-op when
-  // nothing has been compared yet, or when none actually changed (equivalent
-  // array refs). `contentMatches`' PRESENCE is the result's record of the flag
-  // it ran with (see `contentMatchingRan`).
+  // Scope, blacklist, content-matching OR accepted-identity change with an
+  // existing result for the same pair -> re-diff from the cached fingerprints
+  // (instant). No-op when nothing has been compared yet, or when none actually
+  // changed (equivalent array refs). `contentMatches`' PRESENCE is the result's
+  // record of the flag it ran with (see `contentMatchingRan`); the accepted
+  // list is compared by reference, which the slice keeps stable on a no-op.
   //
   // This is only the change DETECTOR - the options it publishes are re-read from
   // the store by `publishCompareResult`, which is what makes the published
@@ -467,16 +452,18 @@ export function useCompare() {
   useEffect(() => {
     const built = builtRef.current;
     if (!result || !built) return;
-    if (!isCurrentFor(built, result.baseModelId, result.headModelId, geometryContentVersion)) return;
+    if (!isCurrentFor(built, result.baseModelId, result.headModelId, geometryContentVersion, result.keyProperty)) return;
     const sameScope = result.scope === scope;
     const sameExcluded =
       excludedSignature(result.diff.excludedTypes) === excludedSignature(excludedTypes);
     const sameMatching = contentMatchingRan(result.diff.contentMatches) === matchByContent;
-    if (sameScope && sameExcluded && sameMatching) return;
+    const sameAccepted = lastAcceptedRef.current === acceptedIdentity;
+    if (sameScope && sameExcluded && sameMatching && sameAccepted) return;
 
+    lastAcceptedRef.current = acceptedIdentity;
     publishCompareResult(built);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scope, excludedTypes, matchByContent]);
+  }, [scope, excludedTypes, matchByContent, acceptedIdentity]);
 
-  return { baseModelId, headModelId, scope, running, result, error, runComparison, clearCompare };
+  return { baseModelId, headModelId, scope, running, result, error, runComparison, cancelComparison, clearCompare };
 }

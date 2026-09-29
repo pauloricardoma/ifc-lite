@@ -24,9 +24,15 @@ import assert from 'node:assert';
 
 import { RaycastEngine } from './raycast-engine.js';
 import { Camera } from './camera.js';
-import { Scene } from './scene.js';
+import { Scene, type TexturedMesh } from './scene.js';
 import type { Mesh, BatchedMesh, PickOptions } from './types.js';
-import type { MeshData } from '@ifc-lite/geometry';
+import type { DecodedInstancedShard, MeshData } from '@ifc-lite/geometry';
+import type { SourceSnapCurve } from './source-curve-snap.js';
+import { PointCloudSpatialIndex } from './pointcloud/point-cloud-spatial-index.js';
+
+(globalThis as Record<string, unknown>).GPUBufferUsage = {
+  COPY_DST: 1, INDEX: 2, VERTEX: 4,
+};
 
 // ─── fake canvas ────────────────────────────────────────────────────────────
 
@@ -36,6 +42,32 @@ function fakeCanvas(width = 800, height = 600): HTMLCanvasElement {
     height,
     getBoundingClientRect: () => ({ width, height }),
   } as unknown as HTMLCanvasElement;
+}
+
+function instancedDevice(): GPUDevice {
+  return {
+    limits: { maxBufferSize: 1 << 30, maxStorageBufferBindingSize: 1 << 30 },
+    createBuffer: ({ size }: { size: number }) => {
+      const bytes = new ArrayBuffer(size);
+      return { getMappedRange: () => bytes, unmap() {}, destroy() {} };
+    },
+    queue: { writeBuffer() {} },
+  } as unknown as GPUDevice;
+}
+
+function instancedTriangle(entityId: number, itemId?: number): DecodedInstancedShard {
+  return {
+    templates: [{
+      // Decoder output is IFC Z-up. Conversion on upload maps this XZ triangle
+      // to the viewer XY plane at z=0, directly under the camera ray.
+      positions: new Float32Array([-5, 0, -5, 5, 0, -5, 0, 0, 5]),
+      normals: new Float32Array([0, -1, 0, 0, -1, 0, 0, -1, 0]),
+      indices: new Uint32Array([0, 1, 2]), origin: [0, 0, 0],
+    }],
+    instances: [{ templateIndex: 0, entityId, ...(itemId === undefined ? {} : { itemId }), color: [1, 1, 1, 1],
+      transform: new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]) }],
+    carriesItemIds: itemId !== undefined,
+  };
 }
 
 // ─── fixture geometry ───────────────────────────────────────────────────────
@@ -303,6 +335,123 @@ describe('RaycastEngine.raycastScene', () => {
     assert.equal(hitEmptyIsolation, null);
   });
 
+  it('reports exact item/model/source identity and continues behind clipped triangles (#4555)', () => {
+    const scene = new Scene();
+    const near = makeQuad({ expressId: 7, modelIndex: 3, translate: [0, 0, 10] });
+    near.geometryItemId = 70;
+    near.appearanceSource = { kind: 'canonical-item', indices: near.indices,
+      sourceIndices: near.indices, cornerIndices: new Uint32Array([3, 4, 5, 0, 1, 2]) };
+    const rear = makeQuad({ expressId: 8, modelIndex: 4, translate: [0, 0, -10] });
+    rear.geometryItemId = 80;
+    rear.appearanceSource = { kind: 'canonical-item', indices: rear.indices, sourceIndices: rear.indices };
+    addRegularQuad(scene, near);
+    addRegularQuad(scene, rear);
+    const engine = engineFor(scene, orthoCameraLookingDownZ([0, 0, 0], 50));
+
+    const exact = engine.raycastScene(399, 301)!.intersection;
+    assert.deepEqual({ expressId: exact.expressId, modelIndex: exact.modelIndex,
+      geometryItemId: exact.geometryItemId, sourceTriangleIndex: exact.sourceTriangleIndex },
+    { expressId: 7, modelIndex: 3, geometryItemId: 70, sourceTriangleIndex: 1 });
+
+    const visible = engine.raycastScene(399, 301, undefined, { sectionPlane: {
+      normal: [0, 0, 1], distance: 0, flipped: false,
+    } })!.intersection;
+    assert.deepEqual({ expressId: visible.expressId, modelIndex: visible.modelIndex,
+      geometryItemId: visible.geometryItemId, sourceTriangleIndex: visible.sourceTriangleIndex },
+    { expressId: 8, modelIndex: 4, geometryItemId: 80, sourceTriangleIndex: 0 });
+
+    const cropVisible = engine.raycastScene(399, 301, undefined, { clipBox: {
+      min: [-2, -2, -12], max: [2, 2, -8], enabled: true,
+    } })!.intersection;
+    assert.equal(cropVisible.expressId, 8, 'the crop box also rejects the nearer hidden surface');
+  });
+
+  it('rejects clipped snap candidates while retaining the best visible candidate (#4555)', () => {
+    const scene = new Scene();
+    const positions = new Float32Array([0.05, 0, 0, -1, -1, 0, -1, 1, 0]);
+    const triangle: MeshData = { expressId: 9, positions,
+      normals: new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1]), indices: new Uint32Array([0, 1, 2]),
+      color: [1, 1, 1, 1] };
+    addRegularMesh(scene, triangle);
+    const hit = engineFor(scene, orthoCameraLookingDownZ([0, 0, 0], 50)).raycastScene(399, 300, {
+      snapOptions: { snapToVertices: true, snapToEdges: false, snapToFaces: false, screenSnapRadius: 200 },
+    }, { sectionPlane: { normal: [1, 0, 0], distance: 0, flipped: false } });
+    assert.ok(hit?.snap);
+    assert.equal(hit.intersection.expressId, 9, 'the visible portion of the triangle remains hittable');
+    assert.equal(hit.snap.position.x, -1, 'the closer x=0.05 vertex is clipped and cannot win snapping');
+  });
+
+  it('reports canonical identity from a materialized instance in its federation model (#4555)', () => {
+    const scene = new Scene();
+    scene.addInstancedShard(instancedDevice(), instancedTriangle(1_025, 1_011), 7);
+    const engine = engineFor(scene, orthoCameraLookingDownZ([0, 0, 0], 50));
+    const hit = engine.raycastScene(400, 300)?.intersection;
+    assert.ok(hit);
+    assert.deepEqual({ expressId: hit.expressId, modelIndex: hit.modelIndex,
+      geometryItemId: hit.geometryItemId, sourceTriangleIndex: hit.sourceTriangleIndex },
+    { expressId: 1_025, modelIndex: 7, geometryItemId: 1_011, sourceTriangleIndex: 0 });
+  });
+
+  it('does not expose a canonical face ordinal when an instance has no representation item (#4555)', () => {
+    const scene = new Scene();
+    scene.addInstancedShard(instancedDevice(), instancedTriangle(1_025), 7);
+    const hit = engineFor(scene, orthoCameraLookingDownZ([0, 0, 0], 50)).raycastScene(400, 300)?.intersection;
+    assert.ok(hit);
+    assert.equal(hit.modelIndex, 7);
+    assert.equal(hit.geometryItemId, undefined);
+    assert.equal(hit.sourceTriangleIndex, undefined);
+  });
+
+  it('keeps equal-sized fragments that share an owner, origin and first vertex (#4556)', () => {
+    const scene = new Scene();
+    const sourceIndices = new Uint32Array([0, 1, 2, 0, 3, 4]);
+    const fragment = (x: number, ordinal: number): MeshData => {
+      const indices = new Uint32Array([0, 1, 2]);
+      return { expressId: 7, modelIndex: 3, geometryItemId: 70,
+        positions: new Float32Array([0, 0, 0, x, -1, 0, x, 1, 0]),
+        normals: new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1]), indices, color: [1, 1, 1, 1],
+        appearanceSource: { kind: 'canonical-item', indices, sourceIndices,
+          cornerIndices: Uint32Array.from([ordinal * 3, ordinal * 3 + 1, ordinal * 3 + 2]) } };
+    };
+    addRegularMesh(scene, fragment(-10, 0));
+    addRegularMesh(scene, fragment(10, 1));
+    const engine = engineFor(scene, orthoCameraLookingDownZ([0, 0, 0], 50));
+    const left = engine.raycastScene(300, 300)?.intersection;
+    const right = engine.raycastScene(500, 300)?.intersection;
+    assert.deepEqual(left && { modelIndex: left.modelIndex, geometryItemId: left.geometryItemId,
+      sourceTriangleIndex: left.sourceTriangleIndex }, { modelIndex: 3, geometryItemId: 70, sourceTriangleIndex: 0 });
+    assert.deepEqual(right && { modelIndex: right.modelIndex, geometryItemId: right.geometryItemId,
+      sourceTriangleIndex: right.sourceTriangleIndex }, { modelIndex: 3, geometryItemId: 70, sourceTriangleIndex: 1 },
+    'the equal-signature right fragment must remain raycastable with its canonical ordinal');
+  });
+
+  it('rebuilds a populated BVH when equal-shaped owner fragments are replaced and reordered (#4556)', () => {
+    const scene = new Scene();
+    const fullSource = new Uint32Array([0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7]);
+    const fragment = (x: number, itemId: number, firstCorner: number): MeshData => {
+      const mesh = makeQuad({ expressId: 7, modelIndex: 3, translate: [x, 0, 0] });
+      return { ...mesh, geometryItemId: itemId,
+        appearanceSource: { kind: 'canonical-item', indices: mesh.indices, sourceIndices: fullSource,
+          cornerIndices: Uint32Array.from({ length: 6 }, (_, corner) => firstCorner + corner) } };
+    };
+    addRegularMesh(scene, fragment(-10, 70, 0));
+    addRegularMesh(scene, fragment(10, 71, 6));
+    for (let i = 0; i < 99; i++) {
+      addRegularMesh(scene, makeQuad({ expressId: 100 + i, translate: [1_000 + i * 20, 0, 0] }));
+    }
+    const engine = engineFor(scene, orthoCameraLookingDownZ([0, 0, 0], 50));
+    assert.equal(engine.raycastScene(200, 350)?.intersection.geometryItemId, 70,
+      'the first ray populates the >100-piece BVH with the old left fragment');
+
+    const newRight = fragment(10, 170, 0);
+    const newLeft = fragment(-10, 171, 6);
+    (scene as unknown as { meshDataMap: Map<number, MeshData[]> }).meshDataMap.set(7, [newRight, newLeft]);
+    const hit = engine.raycastScene(200, 350)?.intersection;
+    assert.deepEqual(hit && { geometryItemId: hit.geometryItemId, sourceTriangleIndex: hit.sourceTriangleIndex,
+      x: Math.round(hit.point.x) }, { geometryItemId: 171, sourceTriangleIndex: 2, x: -10 },
+    'same-count, same-shape replacement and reorder must return the new piece, ordinal and location');
+  });
+
   it('off-origin, rotated, non-uniformly-scaled geometry is hit at the transformed location, not the local one', () => {
     // An asymmetric triangle (legs of different length: 12 along local X, 4
     // along local Y), scaled non-uniformly, rotated 90 degrees about Y, and
@@ -535,5 +684,98 @@ describe('RaycastEngine.raycastScene', () => {
         `instead of model 1's own batch entry (distance ~40); got ${hit2!.intersection.distance}`,
       );
     });
+  });
+});
+
+describe('magnetic authored source curves (#5780)', () => {
+  const lock = { edge: null, meshExpressId: null, lockStrength: 0 };
+  const snapOptions = { snapToVertices: true, snapToEdges: true, snapToFaces: true, screenSnapRadius: 4 };
+  const source = (modelId: string, globalId: number, x: number): SourceSnapCurve => ({
+    identity: { modelId, expressId: 42, solidId: 50, directrixId: 51, mappingPath: [], occurrenceIndex: 0, segmentIndex: 0 },
+    globalId, kind: 'line', length: 0.2,
+    pointAt: (t) => ({ x: x + (t - 0.5) * 0.2, y: 0, z: 0 }),
+  });
+
+  it('scopes equal STEP IDs to their federated model and obeys hide, isolate and lifecycle clear', () => {
+    const camera = orthoCameraLookingDownZ([0, 0, 0], 50);
+    const engine = engineFor(new Scene(), camera);
+    engine.setSourceSnapCurves([source('a', 42, 0), source('b', 1_000_042, 10)]);
+    const pick = (x: number, options = {}) => engine.raycastSceneMagnetic(x, 300, lock, { ...options, snapOptions });
+    const secondScreen = camera.projectToScreen({ x: 10, y: 0, z: 0 }, 800, 600);
+    assert.ok(secondScreen);
+    assert.deepEqual([pick(400).snapTarget?.expressId, pick(secondScreen.x).snapTarget?.expressId], [42, 1_000_042]);
+    assert.equal(pick(secondScreen.x).snapTarget?.metadata?.sourceCurve?.modelId, 'b');
+    assert.equal(pick(secondScreen.x, { hiddenIds: new Set([1_000_042]) }).snapTarget, null);
+    assert.equal(pick(secondScreen.x, { isolatedIds: new Set([42]) }).snapTarget, null);
+    engine.setSourceSnapCurves([]);
+    assert.equal(pick(400).snapTarget, null);
+  });
+
+  it('clips new source curves without changing existing magnetic mesh or scan picks (#5780)', () => {
+    const scene = new Scene();
+    addRegularQuad(scene, makeQuad({ expressId: 1, translate: [0, 0, 10] }));
+    addRegularQuad(scene, makeQuad({ expressId: 2, translate: [0, 0, -10] }));
+    const engine = engineFor(scene, orthoCameraLookingDownZ([0, 0, 0], 50));
+    engine.setSourceSnapCurves([{ ...source('a', 42, 0), pointAt: (t) => ({ x: (t - 0.5) * 0.2, y: 0, z: 1 }) }]);
+    const index = new PointCloudSpatialIndex(0.5);
+    index.insertRange(new Float32Array([0, 0, 1]), 1, null);
+    engine.setPointCloudProvider(() => [{ expressId: 77, index }]);
+    const clip = { sectionPlane: { normal: [0, 0, 1] as [number, number, number], distance: 0, flipped: false } };
+    const hit = engine.raycastSceneMagnetic(400, 300, lock, { snapOptions }, clip);
+    assert.equal(hit.intersection?.expressId, 1, 'preexisting magnetic mesh pick remains reachable');
+    assert.equal(hit.snapTarget?.metadata?.sourceCurve, undefined);
+    const scanOnly = engineFor(new Scene(), orthoCameraLookingDownZ([0, 0, 0], 50));
+    scanOnly.setPointCloudProvider(() => [{ expressId: 77, index }]);
+    const scanHit = scanOnly.raycastSceneMagnetic(400, 300, lock, { snapOptions }, clip);
+    assert.equal(scanHit.snapTarget?.expressId, 77, 'preexisting magnetic scan pick remains reachable');
+  });
+});
+
+/** Same real Scene CPU path as textured upload; GPU-only handles are inert. */
+function addTexturedQuad(scene: Scene, quad: MeshData): void {
+  scene.addMeshData(quad);
+  const drawable: TexturedMesh = {
+    expressId: quad.expressId, modelIndex: quad.modelIndex,
+    vertexBuffer: {} as GPUBuffer, indexBuffer: {} as GPUBuffer,
+    indexCount: quad.indices.length, uniformBuffer: {} as GPUBuffer,
+    texture: {} as GPUTexture, sampler: {} as GPUSampler, bindGroup: {} as GPUBindGroup,
+    color: quad.color, origin: quad.origin ?? [0, 0, 0],
+  };
+  (scene as unknown as { texturedMeshes: TexturedMesh[] }).texturedMeshes.push(drawable);
+}
+
+describe('textured scene raycasts (#4407)', () => {
+  it('hits a textured-only owner and respects its retained origin', () => {
+    const scene = new Scene();
+    const quad = makeQuad({ expressId: 77 });
+    quad.origin = [1000, 2000, 20];
+    addTexturedQuad(scene, quad);
+    const engine = engineFor(scene, orthoCameraLookingDownZ([1000, 2000, 0], 50));
+    const hit = engine.raycastScene(400, 300)?.intersection;
+    assert.ok(hit);
+    assert.equal(hit.expressId, 77);
+    assert.ok(Math.abs(hit.point.x - 1000) < 1e-4);
+    assert.ok(Math.abs(hit.point.y - 2000) < 1e-4);
+    assert.ok(Math.abs(hit.point.z - 20) < 1e-4);
+  });
+  it('textured front occludes a regular rear, while hide/isolate excludes it', () => {
+    const scene = new Scene();
+    addRegularQuad(scene, makeQuad({ expressId: 1 }));
+    addTexturedQuad(scene, makeQuad({ expressId: 2, translate: [0, 0, 20] }));
+    const engine = engineFor(scene, orthoCameraLookingDownZ([0, 0, 0], 50));
+    assert.equal(engine.raycastScene(400, 300)?.intersection.expressId, 2);
+    assert.equal(engine.raycastScene(400, 300, { hiddenIds: new Set([2]) })?.intersection.expressId, 1);
+    assert.equal(engine.raycastScene(400, 300, { isolatedIds: new Set([1]) })?.intersection.expressId, 1);
+    assert.equal(engine.raycastScene(400, 300, { isolatedIds: new Set([2]) })?.intersection.expressId, 2);
+    assert.equal(engine.raycastScene(400, 300, { hiddenIds: new Set([1, 2]) }), null);
+  });
+  it('never pulls a nearer retained same-ID piece from a model absent from the textured pass', () => {
+    const scene = new Scene();
+    scene.addMeshData(makeQuad({ expressId: 99, modelIndex: 0, translate: [0, 0, 30] }));
+    addTexturedQuad(scene, makeQuad({ expressId: 99, modelIndex: 1, translate: [0, 0, 10] }));
+    const engine = engineFor(scene, orthoCameraLookingDownZ([0, 0, 0], 50));
+    const hit = engine.raycastScene(400, 300)?.intersection;
+    assert.ok(hit);
+    assert.ok(Math.abs(hit.point.z - 10) < 1e-4, 'modelIndex must scope the visible owner');
   });
 });

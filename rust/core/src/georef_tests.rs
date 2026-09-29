@@ -11,6 +11,26 @@
 use super::*;
 
 #[test]
+fn georef_discovery_does_not_retain_unrelated_property_sets() {
+    // Cold-load invariant: searching once for two georeferencing property sets
+    // must not retain every other property set in the model's decoder cache.
+    let mut source = String::from("DATA;\n");
+    let mut types = Vec::new();
+    for id in 1..=1000 {
+        source.push_str(&format!("#{id}=IFCPROPERTYSET('g',$,'Unrelated',$,(#2001));\n"));
+        types.push((id, IfcType::IfcPropertySet));
+    }
+    source.push_str("#1001=IFCPROPERTYSET('g',$,'ePsEt_MapConversion',$,(#2001));\n#2001=IFCPROPERTYSINGLEVALUE('Eastings',$,IFCLENGTHMEASURE(42.),$);\nENDSEC;");
+    types.push((1001, IfcType::IfcPropertySet));
+    let mut decoder = EntityDecoder::new(&source);
+    let geo = GeoRefExtractor::extract(&mut decoder, &types).unwrap().unwrap();
+    assert_eq!(geo.eastings, 42.0);
+    assert_eq!(geo.source, Some(GeoRefSource::EPSetMapConversion));
+    assert!(decoder.cache_size() <= 2, "only the selected set and its value should be retained");
+    assert_eq!(decoder.decode_by_id(500).unwrap().get_string(2), Some("Unrelated"));
+}
+
+#[test]
 fn test_georef_local_to_map() {
     let mut georef = GeoReference::new();
     georef.eastings = 500000.0;
@@ -102,68 +122,6 @@ fn test_georef_map_to_local_with_rotation_round_trips_local_to_map() {
     assert!((z - lz).abs() < 1e-9, "map_to_local must invert local_to_map (z), got {z}");
 }
 
-#[test]
-fn test_rtc_offset() {
-    let positions = vec![
-        500000.0f32,
-        5000000.0,
-        0.0,
-        500010.0,
-        5000010.0,
-        10.0,
-        500020.0,
-        5000020.0,
-        20.0,
-    ];
-
-    let offset = RtcOffset::from_positions(&positions);
-    assert!(offset.is_significant());
-    assert!((offset.x - 500010.0).abs() < 1.0);
-    assert!((offset.y - 5000010.0).abs() < 1.0);
-}
-
-#[test]
-fn test_rtc_apply() {
-    let mut positions = vec![500000.0f32, 5000000.0, 0.0, 500010.0, 5000010.0, 10.0];
-
-    let offset = RtcOffset {
-        x: 500000.0,
-        y: 5000000.0,
-        z: 0.0,
-    };
-
-    offset.apply(&mut positions);
-
-    assert!((positions[0] - 0.0).abs() < 1e-5);
-    assert!((positions[1] - 0.0).abs() < 1e-5);
-    assert!((positions[3] - 10.0).abs() < 1e-5);
-    assert!((positions[4] - 10.0).abs() < 1e-5);
-}
-
-/// `apply`'s z-channel must subtract `self.z`, not `self.x`/`self.y`.
-///
-/// `test_rtc_apply` above uses `z: 0.0` and never asserts on
-/// `positions[2]`/`positions[5]`, so the third component of `chunk[2] =
-/// chunk[2] - self.z` was free to read the wrong field of `self` — a
-/// `self.x`-for-`self.z` swap left that test fully green. Distinct,
-/// non-zero x/y/z offsets and asserting all three components pins it.
-#[test]
-fn test_rtc_apply_z_channel_uses_z_offset() {
-    let mut positions = vec![100.0f32, 200.0, 300.0];
-
-    let offset = RtcOffset {
-        x: 10.0,
-        y: 20.0,
-        z: 30.0,
-    };
-
-    offset.apply(&mut positions);
-
-    assert!((positions[0] - 90.0).abs() < 1e-5);
-    assert!((positions[1] - 180.0).abs() < 1e-5);
-    assert!((positions[2] - 270.0).abs() < 1e-5);
-}
-
 /// The `-0` leniency (#3546 residual): a writer that signs a zero-magnitude
 /// degree component of `IfcSite.RefLatitude`/`RefLongitude` (e.g. `(-0, 30,
 /// 0)` for 0°30'S) must still land the site in the correct hemisphere.
@@ -198,7 +156,7 @@ END-ISO-10303-21;
         .expect("decode ok")
         .expect("legacy site georeference extracted");
 
-    assert_eq!(georef.source, GeoRefSource::SiteLocation);
+    assert_eq!(georef.source, Some(GeoRefSource::SiteLocation));
     assert!(
         (georef.northings - (-0.5)).abs() < 1e-9,
         "expected northings -0.5 (0°30'S), got {}",
@@ -300,4 +258,258 @@ END-ISO-10303-21;
 
     assert!((georef.northings - (-0.5)).abs() < 1e-9);
     assert!((georef.eastings - (-0.75)).abs() < 1e-9);
+}
+
+/// #4687: a comment is trivia for the `-0` scan. A comma in one shifted
+/// every later attribute, an apostrophe in one opened a string for the rest
+/// of the record, and one beside the component hid the `-0`.
+#[test]
+fn issue_4687_negative_zero_scan_treats_comments_as_trivia() {
+    for site in [
+        "#1=IFCSITE('1abc',$,/* a, b */'Site',$,$,$,$,$,.ELEMENT.,(-0,30,0),(-0,45,0),0.,$,$);",
+        "#1=IFCSITE('1abc',$,/* it's */'Site',$,$,$,$,$,.ELEMENT.,(-0,30,0),(-0,45,0),0.,$,$);",
+        "#1=IFCSITE('1abc',$,'Site',$,$,$,$,$,.ELEMENT.,(-0 /* deg */,30,0),( /* deg */ -0,45,0),0.,$,$);",
+    ] {
+        let ifc_content = format!("DATA;\n{site}\nENDSEC;\n");
+        let mut decoder = EntityDecoder::new(&ifc_content);
+        let georef = GeoRefExtractor::extract(&mut decoder, &[(1u32, IfcType::IfcSite)])
+            .expect("decode ok")
+            .expect("legacy site georeference extracted");
+        assert!((georef.northings - (-0.5)).abs() < 1e-9, "{site}: {}", georef.northings);
+        assert!((georef.eastings - (-0.75)).abs() < 1e-9, "{site}: {}", georef.eastings);
+    }
+}
+
+fn ifc4x3_with_conversion(map_conversion_line: &str) -> String {
+    format!(
+        "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('Test'),'2;1');\nFILE_NAME('t.ifc','2026-01-01',(''),(''),'','','');\nFILE_SCHEMA(('IFC4X3_ADD2'));\nENDSEC;\nDATA;\n#2=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#5,$);\n#4=IFCCARTESIANPOINT((0.,0.,0.));\n#5=IFCAXIS2PLACEMENT3D(#4,$,$);\n#10=IFCPROJECTEDCRS('EPSG:32632',$,$,$,$,$,$);\n{map_conversion_line}\nENDSEC;\nEND-ISO-10303-21;\n"
+    )
+}
+
+fn extract_map_conversion(map_conversion_line: &str) -> Option<GeoReference> {
+    // Both the plain and the Scaled spelling are classified as
+    // `IfcMapConversion` by the processing-crate candidate scan; the decoder
+    // reads the record's own attribute count either way.
+    extract_map_conversion_as(map_conversion_line, IfcType::IfcMapConversion)
+}
+
+fn extract_map_conversion_as(map_conversion_line: &str, conversion_type: IfcType) -> Option<GeoReference> {
+    let content = ifc4x3_with_conversion(map_conversion_line);
+    let mut decoder = EntityDecoder::new(&content);
+    let types = vec![(11u32, conversion_type), (10, IfcType::IfcProjectedCRS)];
+    GeoRefExtractor::extract(&mut decoder, &types).expect("decode ok")
+}
+
+/// `IfcMapConversionScaled.FactorX/Y/Z` (attributes 8..10) are the only
+/// reason the subtype exists and nothing read them: a feet-authored scaled
+/// conversion (factors 0.3048, Scale absent) shipped a transform with
+/// diagonal [1, 1, 1]. The existing scaled test uses factors of 1.0 and so
+/// cannot tell "applied" from "ignored"; this one cannot pass either way.
+#[test]
+fn scaled_map_conversion_factors_scale_each_axis() {
+    let geo = extract_map_conversion(
+        "#11=IFCMAPCONVERSIONSCALED(#2,#10,1000.,2000.,42.,1.,0.,$,0.3048,0.3048,0.3048);",
+    )
+    .expect("scaled conversion is a georeference");
+
+    assert_eq!((geo.factor_x, geo.factor_y, geo.factor_z), (0.3048, 0.3048, 0.3048));
+    assert_eq!(geo.scale, 1.0, "the inherited uniform Scale stays at its default");
+
+    let (e, n, h) = geo.local_to_map(10.0, 20.0, 5.0);
+    assert!((e - 1003.048).abs() < 1e-9, "e = {e}");
+    assert!((n - 2006.096).abs() < 1e-9, "n = {n}");
+    assert!((h - 43.524).abs() < 1e-9, "h = {h}");
+
+    let m = geo.to_matrix();
+    assert!((m[0] - 0.3048).abs() < 1e-12 && (m[5] - 0.3048).abs() < 1e-12 && (m[10] - 0.3048).abs() < 1e-12,
+        "matrix diagonal must carry the factors, got [{}, {}, {}]", m[0], m[5], m[10]);
+
+    // Round trip through the inverse, per axis.
+    let (x, y, z) = geo.map_to_local(e, n, h);
+    assert!((x - 10.0).abs() < 1e-9 && (y - 20.0).abs() < 1e-9 && (z - 5.0).abs() < 1e-9);
+}
+
+/// Anisotropic factors under rotation: the factor is applied on the LOCAL
+/// axis before the rotation, so with factor_x != factor_y the rotated
+/// result differs from "rotate then scale". Pins the order.
+#[test]
+fn scaled_map_conversion_applies_factors_before_rotation() {
+    // 90 degrees: local x maps onto map north.
+    let geo = extract_map_conversion(
+        "#11=IFCMAPCONVERSIONSCALED(#2,#10,0.,0.,0.,0.,1.,2.,3.,5.,7.);",
+    )
+    .expect("georeference");
+    let (e, n, h) = geo.local_to_map(1.0, 1.0, 1.0);
+    // x: 1 * 2 * 3 = 6 lands on north; y: 1 * 2 * 5 = 10 lands on -east.
+    assert!((e + 10.0).abs() < 1e-9, "e = {e}");
+    assert!((n - 6.0).abs() < 1e-9, "n = {n}");
+    assert!((h - 14.0).abs() < 1e-9, "h = {h}");
+    let (x, y, z) = geo.map_to_local(e, n, h);
+    assert!((x - 1.0).abs() < 1e-9 && (y - 1.0).abs() < 1e-9 && (z - 1.0).abs() < 1e-9);
+}
+
+/// `GeoRefExtractor::extract` is public, and a caller that types the record
+/// with `IfcType::from_str` hands it `IfcMapConversionScaled`, not the
+/// supertype. Matching only `IfcMapConversion` dropped such a file to "no
+/// georeferencing", factors and all.
+#[test]
+fn scaled_map_conversion_typed_as_its_own_type_is_extracted() {
+    let geo = extract_map_conversion_as(
+        "#11=IFCMAPCONVERSIONSCALED(#2,#10,1000.,2000.,42.,1.,0.,$,0.3048,0.3048,0.3048);",
+        IfcType::from_str("IFCMAPCONVERSIONSCALED"),
+    )
+    .expect("a scaled conversion typed as itself is a georeference");
+    assert_eq!(geo.source, Some(GeoRefSource::MapConversion));
+    let (e, _, _) = geo.local_to_map(10.0, 20.0, 5.0);
+    assert!((e - 1003.048).abs() < 1e-9, "factors applied, e = {e}");
+}
+
+/// A plain `IfcMapConversion` (eight attributes) leaves every factor at 1.0
+/// and keeps the uniform-scale behaviour byte-for-byte.
+#[test]
+fn plain_map_conversion_keeps_unit_factors() {
+    let geo = extract_map_conversion("#11=IFCMAPCONVERSION(#2,#10,1000.,2000.,42.,1.,0.,2.);")
+        .expect("georeference");
+    assert_eq!((geo.factor_x, geo.factor_y, geo.factor_z), (1.0, 1.0, 1.0));
+    assert_eq!(geo.scale, 2.0);
+    assert_eq!(geo.local_to_map(10.0, 20.0, 5.0), (1020.0, 2040.0, 52.0));
+}
+
+/// A zero-length X-axis direction (`XAxisAbscissa = XAxisOrdinate = 0.`) must
+/// reset to the identity direction, not pass through: used as cos/sin it
+/// collapsed every local point to `(Eastings, Northings)`.
+#[test]
+fn zero_length_axis_direction_resets_to_identity() {
+    let geo = extract_map_conversion("#11=IFCMAPCONVERSION(#2,#10,1000.,2000.,42.,0.,0.,1.);")
+        .expect("georeference");
+    assert_eq!((geo.x_axis_abscissa, geo.x_axis_ordinate), (1.0, 0.0));
+    assert_eq!(geo.local_to_map(10.0, 20.0, 5.0), (1010.0, 2020.0, 47.0));
+    // Two distinct local points must map to two distinct map points.
+    assert_ne!(geo.local_to_map(1.0, 0.0, 0.0), geo.local_to_map(2.0, 0.0, 0.0));
+
+}
+
+/// A component that overflows the double range (`1.0E999` parses to
+/// infinity) refuses the WHOLE conversion, as the TS twin's
+/// `extractMapConversion` does, instead of one component being replaced by
+/// its default: an infinite abscissa used to divide into a NaN axis, and a
+/// reset axis would still place the model with a rotation the file did not
+/// state. The IfcProjectedCRS still claims georeferencing (TS: no
+/// `transformMatrix`); without one, the IfcSite fallback runs.
+#[test]
+fn map_conversion_with_a_non_finite_component_is_refused_whole() {
+    for slot in 2..=10 {
+        let mut values = [
+            "1000.", "2000.", "42.", "1.", "0.", "1.", "1.", "1.", "1.",
+        ];
+        values[slot - 2] = "1.0E999";
+        let line = format!("#11=IFCMAPCONVERSIONSCALED(#2,#10,{});", values.join(","));
+        let geo = extract_map_conversion(&line).expect("the IfcProjectedCRS still claims georeferencing");
+        assert!(!geo.has_map_conversion, "slot {slot}: conversion must be refused");
+        assert_eq!(geo.crs_name.as_deref(), Some("EPSG:32632"));
+        assert_eq!(geo.local_to_map(10.0, 20.0, 5.0), (10.0, 20.0, 5.0), "slot {slot}");
+    }
+
+    // No IfcProjectedCRS in the candidate list: nothing else claims georeferencing.
+    let content = ifc4x3_with_conversion(
+        "#11=IFCMAPCONVERSION(#2,#10,1000.,2000.,42.,1.0E999,0.,1.);\n#1=IFCSITE('1abc',$,'Site',$,$,$,$,$,.ELEMENT.,(51,30,0),(14,28,0),0.,$,$);",
+    );
+    let mut decoder = EntityDecoder::new(&content);
+    let types = [(11u32, IfcType::IfcMapConversion), (1, IfcType::IfcSite)];
+    let geo = GeoRefExtractor::extract(&mut decoder, &types)
+        .expect("decode ok")
+        .expect("with no CRS, the IfcSite fallback answers");
+    assert_eq!(geo.source, Some(GeoRefSource::SiteLocation));
+}
+
+/// An explicit `Scale` of 0 collapsed every local point onto
+/// `(Eastings, Northings)`, the same failure as a zero axis. A zero scaled-axis
+/// factor has the same effect on that axis. Both reset to 1.0.
+#[test]
+fn zero_scale_or_factor_resets_to_one() {
+    let geo = extract_map_conversion("#11=IFCMAPCONVERSION(#2,#10,1000.,2000.,42.,1.,0.,0.);")
+        .expect("georeference");
+    assert_eq!(geo.scale, 1.0);
+    assert_eq!(geo.local_to_map(10.0, 20.0, 5.0), (1010.0, 2020.0, 47.0));
+
+    let geo = extract_map_conversion(
+        "#11=IFCMAPCONVERSIONSCALED(#2,#10,1000.,2000.,42.,1.,0.,$,3.,0.,2.);",
+    )
+    .expect("georeference");
+    assert_eq!((geo.factor_x, geo.factor_y, geo.factor_z), (3.0, 1.0, 2.0));
+    assert_eq!(geo.local_to_map(10.0, 20.0, 5.0), (1030.0, 2020.0, 52.0));
+}
+
+/// A rotation-only conversion (zero offsets, 30 degrees to grid north, no
+/// `IfcProjectedCRS`) is a georeference: the TS twin reports one whenever a
+/// map conversion parsed, and the value-based test dropped it.
+#[test]
+fn rotation_only_map_conversion_is_reported() {
+    let content = ifc4x3_with_conversion(
+        "#11=IFCMAPCONVERSION(#2,#12,0.,0.,0.,0.8660254037844387,0.5,1.);\n#12=IFCGEOGRAPHICCRS('EPSG:4326',$,$,$,$,$,$);",
+    );
+    let mut decoder = EntityDecoder::new(&content);
+    // No IfcProjectedCRS candidate: the CRS name stays None.
+    let geo = GeoRefExtractor::extract(&mut decoder, &[(11u32, IfcType::IfcMapConversion)])
+        .expect("decode ok")
+        .expect("a parsed map conversion is a georeference even with zero offsets");
+    assert!(geo.has_map_conversion);
+    assert_eq!(geo.crs_name, None);
+    assert!((geo.rotation().to_degrees() - 30.0).abs() < 1e-9);
+}
+
+/// A non-numeric component in a compound plane angle refuses the WHOLE
+/// angle. Compacting the list first re-indexed `($,51,30,0)` as 51 deg 30
+/// min and placed the site instead of skipping it.
+#[test]
+fn compound_plane_angle_with_non_numeric_component_is_refused() {
+    let angles = ["($,51,30,0)", "(51,$,30,0)", "(51,30,$,0)", "(51,30,0,$)"];
+    for angle in angles {
+        let content = format!(
+            "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('Test'),'2;1');\nFILE_NAME('t.ifc','2026-01-01',(''),(''),'','','');\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n#1=IFCSITE('1abc',$,'Site',$,$,$,$,$,.ELEMENT.,{angle},(14,28,0),0.,$,$);\nENDSEC;\nEND-ISO-10303-21;\n"
+        );
+        let mut decoder = EntityDecoder::new(&content);
+        let geo = GeoRefExtractor::extract(&mut decoder, &[(1, IfcType::IfcSite)]).expect("decode ok");
+        assert!(geo.is_none(), "{angle} must be refused, got {:?}", geo.map(|g| g.northings));
+    }
+
+    // Control: the numeric four-component form still resolves by position.
+    let content = "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('Test'),'2;1');\nFILE_NAME('t.ifc','2026-01-01',(''),(''),'','','');\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n#1=IFCSITE('1abc',$,'Site',$,$,$,$,$,.ELEMENT.,(51,30,0,500000),(14,28,0),0.,$,$);\nENDSEC;\nEND-ISO-10303-21;\n";
+    let mut decoder = EntityDecoder::new(content);
+    let geo = GeoRefExtractor::extract(&mut decoder, &[(1, IfcType::IfcSite)])
+        .expect("decode ok")
+        .expect("numeric angle resolves");
+    let expected = 51.0 + 30.0 / 60.0 + 0.5 / 3600.0;
+    assert!((geo.northings - expected).abs() < 1e-12, "got {}", geo.northings);
+}
+
+/// A CRS the decoder cannot read declares nothing on its own: with no
+/// conversion the site fallback still answers, as it did before a CRS-only
+/// file started holding the fallbacks back. Beside a parsed conversion the
+/// CRS may carry the MapUnit that scales it, so there it stays an error
+/// (#4695).
+#[test]
+fn undecodable_projected_crs_blocks_nothing_without_a_conversion() {
+    let file = |conversion: &str| {
+        format!(
+            "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('Test'),'2;1');\nFILE_NAME('t.ifc','2026-01-01',(''),(''),'','','');\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n#1=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-05,$,$);\n#2=IFCPROJECTEDCRS(%%%);\n{conversion}\n#4=IFCSITE('1abc',$,'Site',$,$,$,$,$,.ELEMENT.,(51,30,0),(14,28,0),0.,$,$);\nENDSEC;\nEND-ISO-10303-21;\n"
+        )
+    };
+
+    let content = file("");
+    let mut decoder = EntityDecoder::new(&content);
+    let types = [(2, IfcType::IfcProjectedCRS), (4, IfcType::IfcSite)];
+    let geo = GeoRefExtractor::extract(&mut decoder, &types)
+        .expect("an undecodable CRS alone is not an extraction error")
+        .expect("the site fallback answers");
+    assert_eq!(geo.source, Some(GeoRefSource::SiteLocation));
+
+    let content = file("#3=IFCMAPCONVERSION(#1,#2,1000.,2000.,42.,1.,0.,1.);");
+    let mut decoder = EntityDecoder::new(&content);
+    let types = [
+        (2, IfcType::IfcProjectedCRS),
+        (3, IfcType::IfcMapConversion),
+        (4, IfcType::IfcSite),
+    ];
+    assert!(GeoRefExtractor::extract(&mut decoder, &types).is_err());
 }

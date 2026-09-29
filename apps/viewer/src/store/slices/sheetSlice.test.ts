@@ -13,7 +13,7 @@
  * destructive side effect with no relation to what the action name promises.
  */
 
-import { describe, it } from 'node:test';
+import { describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { createStore } from 'zustand/vanilla';
 import { createSheetSlice, type SheetSlice } from './sheetSlice.js';
@@ -43,5 +43,22 @@ describe('sheetSlice: clearSheet does not destroy saved templates', () => {
   it('still starts with no templates on a fresh store', () => {
     const s = make();
     assert.equal(s.getState().savedSheetTemplates.length, 0);
+  });
+
+  it('keeps templates addressable when saves share a timestamp', () => {
+    const now = mock.method(Date, 'now', () => 100);
+    const s = make();
+    s.getState().createSheet();
+    s.getState().saveAsTemplate('First');
+    s.getState().saveAsTemplate('Second');
+    now.mock.restore();
+
+    assert.deepEqual(
+      s.getState().savedSheetTemplates.map(({ id, name }) => ({ id, name })),
+      [
+        { id: 'template-100', name: 'First' },
+        { id: 'template-100-2', name: 'Second' },
+      ]
+    );
   });
 });

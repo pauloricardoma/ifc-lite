@@ -14,7 +14,9 @@ import { fileURLToPath } from 'node:url';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, '..', '..');
 import assert from 'node:assert/strict';
-import { main, buildJudgePrompt } from './run-judge.mjs';
+import { main, buildJudgePrompt, judge } from './run-judge.mjs';
+import { resolveProviderFallbacks } from './provider-fallbacks.mjs';
+import { OPENROUTER_JUDGE_MODELS_DEFAULT } from './openrouter-reviewer.mjs';
 
 const RUBRIC = join(HERE, 'judge.md');
 
@@ -64,6 +66,58 @@ const docOf = (n) => ({ verdict: 'findings', findings: Array.from({ length: n },
 
 // ============================================ 1. the failure direction that matters
 
+test('the judge forwards its provider chain to runReviewerWithFailover when Claude fails', () => {
+  const seen = [];
+  const tokens = [{ token: 'sk-ant-oat01-test', label: 'the primary credential' }];
+  const spawn = () => ({ status: 1, stdout: '', stderr: 'Usage limit reached' });
+  const result = judge({
+    judgeRubricPath: RUBRIC,
+    findings: [finding(0)],
+    tokens,
+    spawn,
+    providerFallback: [
+      { label: 'openrouter-fallback', run: (p) => { seen.push('openrouter-fallback'); return verdictsRunFromPrompt(p); } },
+    ],
+  });
+  assert.deepEqual(seen, ['openrouter-fallback']);
+  assert.equal(result.ran, true);
+});
+
+/** The judge's real verdict wire format, used only by the provider-chain test above. */
+function verdictsRunFromPrompt() {
+  return JSON.stringify({ end: 'ifc-lite-judge-v1', verdicts: [{ index: 0, keep: true, file: 'packages/a/f0.ts', line: 10 }] });
+}
+
+test('#finding-4: NO Claude token at all still reaches the provider chain, instead of failing before trying it', () => {
+  // Before the fix, `tokens: []` (no CLAUDE_CODE_OAUTH_TOKEN configured) threw
+  // AUTH_MISSING inside `runReviewerWithFailover` before the provider loop ever
+  // ran, so a lane with OpenRouter configured but no Claude credential judged
+  // NOTHING -- it looked identical to "the judge is entirely unconfigured" in
+  // the logs, even though a usable provider was sitting right there.
+  const seen = [];
+  const result = judge({
+    judgeRubricPath: RUBRIC,
+    findings: [finding(0)],
+    tokens: [],
+    spawn: () => { throw new Error('the Claude CLI must never be spawned with no token'); },
+    providerFallback: [
+      { label: 'openrouter-fallback', run: (p) => { seen.push('openrouter-fallback'); return verdictsRunFromPrompt(p); } },
+    ],
+  });
+  assert.deepEqual(seen, ['openrouter-fallback']);
+  assert.equal(result.ran, true);
+  assert.equal(result.kept.length, 1);
+});
+
+test('resolveProviderFallbacks builds the judge-specific env-var names and default model chain', () => {
+  const providers = resolveProviderFallbacks(
+    { OPENROUTER_API_KEY: 'k' },
+    { openRouterModelsEnvVar: 'OPENROUTER_JUDGE_MODELS', openRouterModelEnvVar: 'OPENROUTER_JUDGE_MODEL', openRouterDefaultModels: ['anthropic/claude-haiku-4.5'] },
+  );
+  assert.equal(providers.length, 1);
+  assert.equal(providers[0].label, 'openrouter-fallback');
+});
+
 test('a judge that CANNOT RUN keeps every finding, and says it did not run', () => {
   // The whole contract. An outage must not be able to delete a validated finding,
   // because that failure is silent -- the PR just looks clean.
@@ -95,6 +149,17 @@ test('the judge removes what it rejects and keeps the rest', () => {
     ['body 0', 'body 2'],
   );
   assert.equal(written.counts.dropped, 1);
+});
+
+test('#3837: the optional judge cannot suppress a mechanically verified sibling finding', () => {
+  const doc = docOf(1);
+  doc.findings[0].sibling = { path: 'src/twin.ts', line: 9, quote: 'return raw;' };
+  const { written } = run(doc, spawnSaying(verdicts([
+    { index: 0, keep: false, why: 'the sibling means this is already owned' },
+  ])));
+  assert.equal(written.findings.length, 1);
+  assert.equal(written.counts.dropped, 0);
+  assert.deepEqual(written.findings[0].sibling, doc.findings[0].sibling);
 });
 
 test('a judge that emptied the list leaves the verdict alone', () => {
@@ -220,6 +285,13 @@ test('EVERY call site passes the three flags run-judge requires', () => {
       }
     }
   }
+});
+
+test('judge rubric treats a verified untouched sibling as second-site evidence, not ownership', () => {
+  const rubric = readFileSync(join(HERE, 'judge.md'), 'utf8');
+  assert.match(rubric, /verified sibling/i); // @source-text-assertion-ok judge.md is the prompt handed to the judge (data, not code); the test pins that the rubric states this rule
+  assert.match(rubric, /second-site defect/i); // @source-text-assertion-ok judge.md is the prompt handed to the judge (data, not code); the test pins that the rubric states this rule
+  assert.match(rubric, /“Already[\s\S]*owned” means a deterministic gate/i); // @source-text-assertion-ok judge.md is the prompt handed to the judge (data, not code); the test pins that the rubric states this rule
 });
 
 // =================================== 6. the shipped path, which no fake can reach
@@ -443,4 +515,83 @@ test('a judge answering with NO indices is not a successful judging', () => {
   assert.equal(written.findings.length, 2, 'nothing may be dropped on a set this malformed');
   assert.equal(written.judged, false, 'and it must NOT be recorded as judged');
   assert.match(log, /do not match the finding they index/); // @source-text-assertion-ok asserts on the CLI stdout this test just produced, not on a source file
+});
+
+// ==================================== 5. the class-pass flag crosses this file (#3862)
+
+test('#3862 the class-pass flag reaches judged.json when the judge drops EVERY finding', () => {
+  // THE ROUND TRIP, and only that. It pins the shape the poster reads on the run
+  // that matters -- reviewer said `findings`, so nothing asked it for a
+  // per-class pass; the judge then removed all of them -- but the mechanism it
+  // exercises is the `{...doc}` spread, which carried the field before this
+  // change made the carry explicit. The restatement itself is pinned by the
+  // absent-field test below, which is the one that went red.
+  const doc = { ...docOf(2), classPass: false };
+  const { written } = run(doc, spawnSaying(verdicts([{ index: 0, keep: false }, { index: 1, keep: false }])));
+  assert.equal(written.findings.length, 0, 'fixture precondition: the judge emptied it');
+  assert.equal(written.verdict, 'findings', 'the judge never rewrites the verdict');
+  assert.equal(written.classPass, false);
+});
+
+test('#3862 a clean review\'s class-pass flag survives judging untouched', () => {
+  // The other direction of the same round trip: `true` must not be lost either,
+  // or every clean review would post the weaker verdict. Also the spread.
+  const { written } = run({ verdict: 'clean', findings: [], classPass: true }, spawnSaying(verdicts([])));
+  assert.equal(written.classPass, true);
+});
+
+test('#3862 an input with NO class-pass field is normalised to false, never left undefined', () => {
+  // THE ONE THE RESTATEMENT EXISTS FOR, and the only one of these three that a
+  // `{...doc}` spread does not already satisfy. A document that predates the
+  // field, or one written by hand, carries no flag; judged.json is a contract,
+  // so this file states it as a BOOLEAN rather than passing a hole through.
+  // `undefined` and `false` read the same in a truthiness test and differently
+  // under `===`, and the poster's rule is the strict one.
+  const { written } = run(docOf(1), spawnSaying(verdicts([{ index: 0, keep: true }])));
+  assert.equal(written.classPass, false);
+  assert.equal(Object.hasOwn(written, 'classPass'), true, 'the field must be PRESENT, not merely falsy');
+});
+
+/**
+ * BEHAVIOURAL, not source-checked. The old version of this test read
+ * run-judge.mjs's own text and matched a regex against the literal call
+ * (`openRouterTimeoutMsDefault:\s*120_000`), which proves nothing about what
+ * actually happens at runtime -- a value could be renamed, computed, or piped
+ * through another constant and the regex would simply stop matching (or worse,
+ * keep matching something unrelated). This drives the REAL provider chain
+ * `main()` builds -- `resolveProviderFallbacks` with the judge's own
+ * `OPENROUTER_JUDGE_MODELS_DEFAULT`/120_000 options -- through an injected
+ * `spawn` (the same test-only override `provider-fallbacks.test.mjs` uses) and
+ * reads the timeout that chain actually hands OpenRouter's child process, with
+ * no network and no real `spawnSync` involved. `provider-fallbacks.test.mjs`
+ * carries the fuller version of this same check (both providers, both
+ * callers); this one pins it specifically from the judge's own construction
+ * so a future edit to run-judge.mjs's call site is caught here too.
+ */
+test('#finding-3: the judge builds a provider chain whose OpenRouter fallback actually times out at 120000ms', () => {
+  const seenTimeoutMs = [];
+  const fakeSpawn = (_cmd, _args, opts) => {
+    seenTimeoutMs.push(opts.env.OPENROUTER_TIMEOUT_MS);
+    return { status: 0, stdout: 'a plausible verdict body', stderr: '' };
+  };
+  const providers = resolveProviderFallbacks(
+    { OPENROUTER_API_KEY: 'k' },
+    {
+      openRouterModelsEnvVar: 'OPENROUTER_JUDGE_MODELS',
+      openRouterModelEnvVar: 'OPENROUTER_JUDGE_MODEL',
+      openRouterDefaultModels: OPENROUTER_JUDGE_MODELS_DEFAULT,
+      openRouterTimeoutMsDefault: 120_000,
+      spawn: fakeSpawn,
+    },
+  );
+  assert.equal(providers.length, 1);
+  providers[0].run('prompt');
+  assert.deepEqual(seenTimeoutMs, ['120000'], 'the judge\'s OpenRouter fallback must actually receive a 120000ms budget');
+
+  // And the reviewer's own call site -- no override at all -- must NOT share
+  // that shorter budget: it is the primary review path, not a fail-soft filter.
+  seenTimeoutMs.length = 0;
+  const reviewerProviders = resolveProviderFallbacks({ OPENROUTER_API_KEY: 'k' }, { spawn: fakeSpawn });
+  reviewerProviders[0].run('prompt');
+  assert.deepEqual(seenTimeoutMs, ['300000']);
 });

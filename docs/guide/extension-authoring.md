@@ -21,7 +21,7 @@ my-tool/
         └── hello.js
 ```
 
-The scaffolded `hello.js` contributes one command (`ext.starter.hello`) and prints a greeting to the console. It passes `ext validate` as-is, but note the scaffold uses `export default async function hello(ctx)`; before it will run in the sandbox you must convert that to a plain top-level `async function hello(ctx)` (see [Writing entry code](#writing-entry-code) - entry files allow no `export` and no `import`). Validate it:
+The scaffolded `hello.js` contributes one command (`ext.starter.hello`) and returns a fixed greeting. It follows the entry-script contract as scaffolded: a plain top-level `function run(ctx)`, no `export`, no `ctx.log`/`ctx.notify` (see [Writing entry code](#writing-entry-code) - entry files allow no `export` and no `import`, and `ctx` is `{ bim }`). Validate it:
 
 ```bash
 npx @ifc-lite/cli ext validate my-tool
@@ -89,7 +89,7 @@ The manifest is the contract between your bundle and the host. Every field is ha
 
 | Field | Purpose |
 |-------|---------|
-| `manifestVersion` | Schema version (currently `1`). The migration chain handles future versions. |
+| `manifestVersion` | Schema version (currently `1`). New contribution types are added without a bump: a host ignores `contributes` keys it does not know, so a bundle using a newer contribution still loads, minus that contribution, in an older viewer. |
 | `id` | Stable reverse-DNS identifier, lowercase, dot/underscore/hyphen-separated. |
 | `name` | Display name shown in the Extensions panel and Command Palette. |
 | `description` | One-paragraph explanation. |
@@ -112,9 +112,31 @@ The manifest is the contract between your bundle and the host. Every field is ha
 | `contextMenu` | Items in `contextMenu.entity` / `contextMenu.canvas` / `contextMenu.tree`. |
 | `keybindings` | Keyboard shortcuts bound to a command. |
 | `lenses` | Visualisation presets registered in the lens library. |
-| `exporters` | Custom export formats added to the export menu. |
+| `exporters` | Custom export formats added to the export menu, the ribbon's Export group and the command palette. The file is named after the active model. |
 | `idsValidators` | Custom IDS rule validators. |
 | `statusBar` | Items in `statusBar.left` / `statusBar.right`. |
+| `flows` | `.flow.json` graphs shipped with the bundle, listed in the viewer's Flow panel (since #5167 Phase 4.2). Older viewers skip this key and load the rest of the extension. |
+
+#### Shipping a flow graph
+
+```json
+"contributes": {
+  "flows": [
+    {
+      "id": "fire-rating-audit",
+      "name": "Fire rating audit",
+      "description": "Flags walls missing Pset_WallCommon.FireRating.",
+      "path": "flows/fire-rating-audit.flow.json"
+    }
+  ]
+}
+```
+
+`path` is a bundle-relative path to the `*.flow.json` file, cross-referenced against the bundle's file list the same way `exporters[].handler` is — a missing file fails the bundle build. The graph itself is validated when the extension loads: `parseFlowDocument` (structural) and `validateFlowWiring` (registry-aware, the same check the viewer runs on a graph you draw by hand). A graph that fails either check is skipped — named by extension and graph id in a console diagnostic — without taking down the extension's other contributions.
+
+The graph's own `capabilities` array is bounded by what the user actually granted your extension at install (`grantedCapabilities`), not by what your manifest merely declares — a graph asking for more than your extension was granted is rejected the same way a malformed graph is.
+
+In the Flow panel, a contributed graph appears in its own group, marked with its source extension, and is **read-only**: it can be run, but not edited or deleted, until the user clicks "Duplicate to my graphs", which copies it into their own saved graphs under a fresh id. Contributed graph ids are namespaced `ext:<extensionId>:<graphId>` so they can never collide with, or overwrite, a user's own saved graph; uninstalling or disabling the extension removes its graphs from the panel.
 
 #### Writing an exporter that produces CSV
 

@@ -75,6 +75,8 @@ import {
   createBCFTopic,
   updateTopicStatus,
 } from './index.js';
+import { createBCFFromIDSReport } from './ids-reporter.js';
+import type { EntityBoundsInput, IDSReportInput } from './ids-reporter.js';
 import type { BCFProject } from './types.js';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -100,6 +102,14 @@ const SCHEMA_FOR_ENTRY: ReadonlyArray<readonly [RegExp, string]> = [
  * a schema failure rather than silently mangled text.
  */
 const STRESS_TEXT = `Grüße & <critical> "urgent" 'now' — 通風管 café`;
+
+/**
+ * The viewport ratio every camera below carries, mirroring what the viewer
+ * now records (`Camera.getAspect()`). 3.0's `visinfo.xsd` requires
+ * `<AspectRatio>`; 2.1 has no such element, and the writer emits none there,
+ * so one fixture value serves both arms.
+ */
+const ASPECT_RATIO = 16 / 9;
 
 /**
  * Build the archive a user downloads, using only the public helpers (plus the
@@ -154,6 +164,7 @@ function plainExport(version: '2.1' | '3.0'): BCFProject {
         up: { x: 0, y: 1, z: 0 },
         fov: Math.PI / 4,
         isOrthographic: false,
+        aspectRatio: ASPECT_RATIO,
       },
       // The user's report singles out selected objects by GUID; a viewpoint
       // with no selection could not show them going missing.
@@ -252,6 +263,7 @@ function plainExport(version: '2.1' | '3.0'): BCFProject {
       fov: Math.PI / 3,
       isOrthographic: true,
       orthoScale: 5.5,
+      aspectRatio: ASPECT_RATIO,
     },
     sectionPlane: { axis: 'down', position: 40, enabled: true, flipped: false },
     bounds: { min: { x: -10, y: -10, z: -10 }, max: { x: 10, y: 10, z: 10 } },
@@ -268,6 +280,7 @@ function plainExport(version: '2.1' | '3.0'): BCFProject {
       position: { x: 3, y: 1, z: -2 },
       target: { x: 0, y: 0, z: 0 },
       up: { x: 0, y: 1, z: 0 },
+      aspectRatio: ASPECT_RATIO,
       // 50 degrees -- inside 2.1's [45, 60] FieldOfView facet, distinct from
       // plainTopic's 45-degree boundary case. (writer-camera.ts deliberately
       // does not enforce this facet on write -- see requireFieldOfViewElement
@@ -324,17 +337,21 @@ async function entriesOf(project: BCFProject): Promise<Map<string, string>> {
 }
 
 /**
- * 2.1 only, and that is the point rather than a shortcut: `createBCFProject`
- * defaults to 2.1 and every caller in this repository takes that default, so
- * 2.1 is the archive users actually get. A plain 3.0 export cannot even be
- * built through these helpers today — 3.0's `visinfo.xsd` requires
- * `AspectRatio` on both camera types, `ViewerCameraState` carries none, so
- * `createViewpoint` produces a camera the writer refuses (deliberately) rather
- * than emitting an invalid archive. `schema-validation.test.ts` covers 3.0
- * from a hand-built fixture that supplies the field.
+ * Both versions. 2.1 is what `createBCFProject` defaults to and what most
+ * callers download, but 3.0 is NOT hypothetical: `readBCF` sets
+ * `project.version` from the imported `bcf.version`, so importing another
+ * tool's 3.0 archive and adding a topic exports 3.0.
+ *
+ * The 3.0 arm was skipped until #3612 because it could not be built at all
+ * through these helpers -- `visinfo.xsd` requires `AspectRatio` on both camera
+ * types, `ViewerCameraState` carried none, and the writer refuses (rightly) to
+ * invent one, so `writeBCF` threw for the whole archive. That was read as "3.0
+ * is not what users get" when it was really "3.0 export is broken"; skipping
+ * the arm is what let it stay broken. `ViewerCameraState.aspectRatio` closes
+ * it, and running the arm is what keeps it closed.
  */
 describe('a plainly-exported archive validates entry by entry', () => {
-  for (const version of ['2.1'] as const) {
+  for (const version of ['2.1', '3.0'] as const) {
     it(`BCF ${version}`, async () => {
       const entries = await entriesOf(plainExport(version));
 
@@ -360,17 +377,130 @@ describe('a plainly-exported archive validates entry by entry', () => {
           // contain `/`; a fixed inert name keeps both out of the argv.
           xml: [{ fileName: 'subject.xml', contents: xml }],
           schema: [schema(version, xsd)],
-          // No preload needed: this sweep is 2.1-only (see the block comment
-          // above), and 2.1's schemas are self-contained. A 3.0 archive would
-          // need shared-types.xsd preloaded for its cross-schema references;
-          // `schema-validation.test.ts` covers that case.
-          preload: [],
+          // 2.1's schemas are self-contained; 3.0 pulls its simple types in
+          // with `<xs:include schemaLocation="shared-types.xsd"/>`, which
+          // xmllint resolves against its in-memory filesystem, so the include
+          // target has to be preloaded under exactly that name.
+          preload:
+            version === '3.0'
+              ? [{ fileName: 'shared-types.xsd', contents: schema('3.0', 'shared-types.xsd') }]
+              : [],
         });
         if (!result.valid) {
           failures.push(`${name} [${xsd}]: ${result.errors.map((e) => e.message).join(' | ')}`);
         }
       }
       expect(failures).toEqual([]);
-    });
+    }, 30_000); // XSD validation of every archive entry: ~5 s on a loaded CI runner, past vitest's 5 s default
+  }
+});
+
+/**
+ * The other archive shape this package produces: `createBCFFromIDSReport`.
+ *
+ * `plainExport` above builds its viewpoints through `createViewpoint`, so it
+ * only ever exercises cameras the VIEWER captured. The IDS reporter builds
+ * viewpoints itself, from entity bounds, and that second path had its own
+ * 3.0 hole (#3849): the camera it computed carried no `AspectRatio`, which
+ * `visinfo.xsd` requires, so a 3.0 archive from an IDS report could not be
+ * written at all. Validating it here — against the same vendored schemas, in
+ * the same sweep — is what keeps the two paths honest about the same rules.
+ */
+describe('an IDS-derived archive validates entry by entry', () => {
+  const IDS_REPORT: IDSReportInput = {
+    title: 'Fire rating',
+    description: STRESS_TEXT,
+    specificationResults: [
+      {
+        specification: { name: 'Walls carry a fire rating', description: STRESS_TEXT },
+        status: 'fail',
+        applicableCount: 2,
+        passedCount: 0,
+        failedCount: 2,
+        entityResults: [
+          {
+            expressId: 100,
+            modelId: 'model-1',
+            entityType: 'IfcWall',
+            entityName: STRESS_TEXT,
+            globalId: '2O2Fr$t4X7Zf8NOew3FL01',
+            passed: false,
+            requirementResults: [
+              {
+                status: 'fail',
+                facetType: 'property',
+                checkedDescription: 'Pset_WallCommon.FireRating must exist',
+                failureReason: STRESS_TEXT,
+                expectedValue: 'REI 60',
+              },
+            ],
+          },
+          {
+            expressId: 200,
+            modelId: 'model-1',
+            entityType: 'IfcWall',
+            entityName: 'Curtain Wall',
+            globalId: '3P3Gs$u5Y8Ag9OPfx4GM02',
+            passed: false,
+            requirementResults: [
+              {
+                status: 'fail',
+                facetType: 'attribute',
+                checkedDescription: 'Description must be provided',
+                failureReason: 'Attribute Description is missing',
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+
+  const IDS_BOUNDS = new Map<string, EntityBoundsInput>([
+    ['model-1:100', { min: { x: 0, y: 0, z: 0 }, max: { x: 4, y: 3, z: 0.2 } }],
+    ['model-1:200', { min: { x: 9, y: 0, z: 0 }, max: { x: 13, y: 3, z: 0.2 } }],
+  ]);
+
+  for (const version of ['2.1', '3.0'] as const) {
+    for (const topicGrouping of ['per-entity', 'per-specification', 'per-requirement'] as const) {
+      it(`BCF ${version} / ${topicGrouping}`, async () => {
+        const project = createBCFFromIDSReport(IDS_REPORT, {
+          version,
+          topicGrouping,
+          entityBounds: IDS_BOUNDS,
+        });
+        const entries = await entriesOf(project);
+
+        // Guard against a vacuous pass with the EXACT counts each grouping
+        // owes for this report -- one specification, two failing entities, one
+        // failing requirement each -- the way the plainExport arm above does.
+        // "At least one" is satisfied by an export that dropped a topic or its
+        // viewpoint, which is precisely how the camera rules under test would
+        // stop being reached.
+        const expectedTopics = topicGrouping === 'per-specification' ? 1 : 2;
+        const kinds = [...entries.keys()].map((n) => n.replace(/^[^/]+\//, ''));
+        expect(kinds).toContain('bcf.version');
+        expect(kinds).toContain('project.bcfp');
+        expect(kinds.filter((n) => n === 'markup.bcf')).toHaveLength(expectedTopics);
+        expect(kinds.filter((n) => n.endsWith('.bcfv'))).toHaveLength(expectedTopics);
+
+        const failures: string[] = [];
+        for (const [name, xml] of entries) {
+          const xsd = SCHEMA_FOR_ENTRY.find(([re]) => re.test(name))![1];
+          const result = await validateXML({
+            xml: [{ fileName: 'subject.xml', contents: xml }],
+            schema: [schema(version, xsd)],
+            preload:
+              version === '3.0'
+                ? [{ fileName: 'shared-types.xsd', contents: schema('3.0', 'shared-types.xsd') }]
+                : [],
+          });
+          if (!result.valid) {
+            failures.push(`${name} [${xsd}]: ${result.errors.map((e) => e.message).join(' | ')}`);
+          }
+        }
+        expect(failures).toEqual([]);
+      }, 30_000); // same validateXML loop as the plain-export cases above
+    }
   }
 });

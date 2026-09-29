@@ -1,0 +1,330 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+/**
+ * Print a document (#4594): bindings resolved, blocks measured, pages
+ * composed (`compose.ts`), then drawn through the report's PDF seams —
+ * the same jsPDF + svg2pdf + snapshot path the coordination report uses,
+ * so a chart block prints exactly as it does in a report.
+ */
+import type { Aggregation } from '@ifc-lite/charts';
+import type { BCFTopic } from '@ifc-lite/bcf';
+import { REPORT_MARGIN } from '../export/report/compose.js';
+import type { ReportDoc, ReportPdfSeams } from '../export/report/generate-report-pdf.js';
+import { dataUrlToBytes } from '../export/download.js';
+import { renderTemplate, type BindingContext } from './bindings.js';
+import { composeDocument, estimateTextWidth, type DocumentLayout, type ResolvedBlock } from './compose.js';
+import { flattenExportModel, flattenRawModel, tableMessageKind, type TableLabels, type TableMessageKind, type TableState } from './resolve-table.js';
+import { TABLE_ROWS_DEFAULT, type DocumentSpec, type TableBlock } from './types.js';
+
+export interface DocumentPdfSeams extends ReportPdfSeams {
+  /** Natural size of an image (data URL); the layout keeps its aspect ratio. */
+  imageSize: (dataUrl: string) => Promise<{ w: number; h: number }>;
+}
+
+export interface DocumentPdfInput {
+  document: DocumentSpec;
+  bindings: BindingContext;
+  /** Chart block id → its aggregation over the loaded model (`null`: cannot aggregate). */
+  aggregations: Map<string, Aggregation | null>;
+  /** Chart block id → its filter's resolving/refused message (#4946), when
+   *  one applies — printed instead of the generic "No data" so a broken or
+   *  still-running filter cannot look like a selector that legitimately
+   *  matched nothing. */
+  chartMessages: Map<string, string>;
+  /** Ids of the elements of a chart block's largest bucket, for the snapshot. */
+  snapshotIds: (blockId: string) => readonly number[];
+  /** BCF topics by GUID. */
+  topics: Map<string, BCFTopic>;
+  /** Table block id → its list run (#5142); a block with no entry prints as still resolving. */
+  tables: ReadonlyMap<string, TableState>;
+}
+
+export interface DocumentPdfResult {
+  blob: Blob;
+  pages: number;
+  /** Binding paths that did not resolve; they print as `[path: reason]`. */
+  unresolved: string[];
+  /** Topic blocks whose GUID is not among the loaded topics. */
+  missingTopics: string[];
+  snapshotFailures: string[];
+  /** Images jsPDF could not decode; the page says so in their place. */
+  imageFailures: string[];
+  /** Table blocks whose list did not run (no model, still resolving, or an error); the page says so in their place. */
+  tableFailures: string[];
+}
+
+/** The English the PDF prints for a table block's rows, like every other string this module prints. */
+export const TABLE_PDF_LABELS: TableLabels = {
+  more: (n) => `… ${n.toLocaleString()} more row${n === 1 ? '' : 's'}`,
+  total: (count) => `Total (${count.toLocaleString()})`,
+};
+
+const TABLE_MESSAGES: Record<Exclude<TableMessageKind, 'error' | 'no-rows'>, string> = {
+  resolving: 'Table not ready: the list is still running.',
+  'no-model': 'Load a model to fill this table.',
+  'no-report': 'No validation report yet — run validation, then export again.',
+  'rule-not-found': 'The rule this table refers to is not in the current validation report.',
+};
+
+/** What a table block prints in place of its rows, by state; `null` when it has rows to print. */
+export function tableMessage(state: TableState | undefined): string | null {
+  const kind = tableMessageKind(state);
+  if (kind === null) return null;
+  // An engine error with an empty message (review finding) still has to read as an error, not as an empty grid.
+  if (kind === 'error') return (state?.status === 'error' && state.message.trim()) || 'The list could not be run.';
+  // "No rows" reads differently per source: a list matched nothing, a validation table's rule/rows filter did.
+  if (kind === 'no-rows') return state?.status === 'ok' && state.kind === 'validation' ? 'No rows match this rule.' : 'No rows match this list.';
+  return TABLE_MESSAGES[kind];
+}
+
+/** The title a table block prints: its own, the list's name, or "Validation results". */
+export const tableTitle = (block: TableBlock): string => block.title?.trim() || (block.source.kind === 'list' ? block.source.list.name : 'Validation results');
+
+/** The browser's image measure: decode the data URL. */
+export function browserImageSize(dataUrl: string): Promise<{ w: number; h: number }> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve({ w: img.naturalWidth, h: img.naturalHeight });
+    img.onerror = () => reject(new Error('The image could not be decoded'));
+    img.src = dataUrl;
+  });
+}
+
+export const topicLines = (topic: BCFTopic): string[] => {
+  const lines: string[] = [];
+  const field = (label: string, value: string | undefined): void => { if (value && value.trim()) lines.push(`${label}: ${value}`); };
+  field('Status', topic.topicStatus);
+  field('Type', topic.topicType);
+  field('Priority', topic.priority);
+  field('Assigned to', topic.assignedTo);
+  field('Created', topic.creationDate ? `${topic.creationDate.slice(0, 10)}${topic.creationAuthor ? ` by ${topic.creationAuthor}` : ''}` : undefined);
+  field('Due', topic.dueDate?.slice(0, 10));
+  if (topic.description?.trim()) lines.push(topic.description.trim());
+  return lines;
+};
+
+/** The first viewpoint snapshot as a data URL, or null. */
+export function topicSnapshotDataUrl(topic: BCFTopic): string | null {
+  for (const vp of topic.viewpoints ?? []) {
+    if (vp.snapshot?.startsWith('data:image/')) return vp.snapshot;
+    if (vp.snapshotData && vp.snapshotData.length > 0) {
+      let binary = '';
+      for (const byte of vp.snapshotData) binary += String.fromCharCode(byte);
+      return `data:image/png;base64,${btoa(binary)}`;
+    }
+  }
+  return null;
+}
+
+/** Resolve every block against the model — what the composer and the preview share. */
+export async function resolveBlocks(input: DocumentPdfInput, imageSize: DocumentPdfSeams['imageSize'], result: Pick<DocumentPdfResult, 'unresolved' | 'missingTopics' | 'tableFailures'>): Promise<ResolvedBlock[]> {
+  const blocks: ResolvedBlock[] = [];
+  for (const block of input.document.blocks) {
+    switch (block.kind) {
+      case 'text': {
+        const rendered = renderTemplate(block.text, input.bindings);
+        for (const b of rendered.bindings) if (!b.ok) result.unresolved.push(b.path);
+        blocks.push({ kind: 'text', id: block.id, style: block.style, text: rendered.text, font: block.font, fontSize: block.fontSize, width: block.width });
+        break;
+      }
+      case 'image': {
+        let aspect = 1;
+        try {
+          const size = await imageSize(block.dataUrl);
+          if (size.w > 0 && size.h > 0) aspect = size.w / size.h;
+        } catch (err) {
+          console.warn('[Documents] image could not be measured; printed square', err);
+        }
+        blocks.push({ kind: 'image', id: block.id, height: block.height, align: block.align, caption: block.caption, aspect, width: block.width });
+        break;
+      }
+      case 'chart': {
+        const agg = input.aggregations.get(block.id) ?? null;
+        // A resolving/refused filter (#4946) names itself instead of the
+        // generic "No data" — review finding: this used to be computed only
+        // from `agg`, so `chartMessages` reached `resolveBlocks` but nothing
+        // here ever read it.
+        const message = input.chartMessages.get(block.id);
+        const subtitle = message ?? (agg ? `${agg.categories.length} bucket${agg.categories.length === 1 ? '' : 's'} · ${agg.total.toLocaleString()} ${agg.spec.measure.agg === 'count' ? 'elements' : (agg.unit ?? '')}`.trim() : 'No data');
+        blocks.push({ kind: 'chart', id: block.id, title: block.chart.title, subtitle, hasData: !!agg && agg.categories.length > 0, snapshot: block.snapshot, height: block.height, width: block.width });
+        break;
+      }
+      case 'spacer': {
+        blocks.push({ kind: 'spacer', id: block.id, height: block.height });
+        break;
+      }
+      case 'table': {
+        const state = input.tables.get(block.id);
+        const message = tableMessage(state);
+        if (state?.status === 'ok' && message === null) {
+          const flat = state.kind === 'validation'
+            ? flattenRawModel(state.model, block.maxRows ?? TABLE_ROWS_DEFAULT, TABLE_PDF_LABELS)
+            : flattenExportModel(state.model, block.maxRows ?? TABLE_ROWS_DEFAULT, TABLE_PDF_LABELS);
+          blocks.push({ kind: 'table', id: block.id, title: tableTitle(block), caption: block.caption, columns: flat.columns, rows: flat.rows });
+          break;
+        }
+        if (state?.status !== 'ok') result.tableFailures.push(block.id);
+        // `tableMessage` is non-null for every non-ok state; the fallback only satisfies the types.
+        blocks.push({ kind: 'table', id: block.id, title: tableTitle(block), caption: block.caption, message: message ?? 'No rows to print.', columns: [], rows: [] });
+        break;
+      }
+      case 'ids-report': {
+        // A frozen snapshot (`ids-report.ts`), not model-derived — nothing to resolve against bindings.
+        blocks.push({ ...block, kind: 'ids-report' });
+        break;
+      }
+      case 'topic': {
+        const topic = input.topics.get(block.guid);
+        if (!topic) {
+          result.missingTopics.push(block.guid);
+          blocks.push({ kind: 'topic', id: block.id, title: `[BCF topic ${block.guid}: not among the loaded topics]`, lines: [], snapshotAspect: null });
+          break;
+        }
+        let snapshotAspect: number | null = null;
+        const dataUrl = block.snapshot ? topicSnapshotDataUrl(topic) : null;
+        if (dataUrl) {
+          try {
+            const size = await imageSize(dataUrl);
+            snapshotAspect = size.w > 0 && size.h > 0 ? size.w / size.h : 4 / 3;
+          } catch (err) {
+            console.warn(`[Documents] viewpoint snapshot of "${topic.title}" could not be measured; printed 4:3`, err);
+            snapshotAspect = 4 / 3;
+          }
+        }
+        blocks.push({ kind: 'topic', id: block.id, title: topic.title, lines: topicLines(topic), snapshotAspect });
+        break;
+      }
+    }
+  }
+  return blocks;
+}
+
+function drawHeaderFooter(doc: ReportDoc, layout: DocumentLayout, pageIndex: number): void {
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(8);
+  doc.setTextColor(150);
+  doc.text(layout.header, REPORT_MARGIN, REPORT_MARGIN - 8);
+  doc.text(layout.footer, REPORT_MARGIN, layout.size.h - REPORT_MARGIN + 12);
+  doc.text(`Page ${pageIndex + 1} / ${layout.pages.length}`, layout.size.w - REPORT_MARGIN - 60, layout.size.h - REPORT_MARGIN + 12);
+  doc.setTextColor(0);
+}
+
+const imageFormat = (dataUrl: string): 'PNG' | 'JPEG' => (dataUrl.startsWith('data:image/jpeg') ? 'JPEG' : 'PNG');
+
+/** Place an image; a file jsPDF cannot decode leaves a note in its box instead of aborting the export. */
+function placeImage(doc: ReportDoc, dataUrl: string | null, label: string, box: { x: number; y: number; w: number; h: number }, result: DocumentPdfResult): void {
+  const bytes = dataUrl ? dataUrlToBytes(dataUrl) : undefined;
+  if (bytes && dataUrl) {
+    try {
+      doc.addImage(bytes, imageFormat(dataUrl), box.x, box.y, box.w, box.h);
+      return;
+    } catch (err) {
+      console.warn(`[Documents] image "${label}" could not be placed`, err);
+    }
+  }
+  result.imageFailures.push(label);
+  doc.setFontSize(9);
+  doc.setTextColor(130);
+  doc.text(`Image unavailable: ${label}`, box.x, box.y + 14);
+  doc.setTextColor(0);
+}
+
+export async function generateDocumentPdf(input: DocumentPdfInput, seams: DocumentPdfSeams): Promise<DocumentPdfResult> {
+  const result: DocumentPdfResult = { blob: new Blob(), pages: 0, unresolved: [], missingTopics: [], snapshotFailures: [], imageFailures: [], tableFailures: [] };
+  const format = input.document.page.size === 'A3' ? 'a3' : 'a4';
+  const doc = await seams.createDoc(format, input.document.page.orientation);
+  const blocks = await resolveBlocks(input, seams.imageSize, result);
+
+  // jsPDF measures in the font that is current, so the measure sets it first.
+  const measure = (text: string, size: number, bold: boolean, font: 'helvetica' | 'times' | 'courier' = 'helvetica'): number => {
+    if (!doc.textWidth) return estimateTextWidth(text, size, bold);
+    doc.setFont(font, bold ? 'bold' : 'normal');
+    doc.setFontSize(size);
+    return doc.textWidth(text);
+  };
+  const layout = composeDocument({ name: input.document.name, page: input.document.page, blocks, generatedAt: seams.now().toLocaleString(), measure });
+  const byId = new Map(input.document.blocks.map((b) => [b.id, b]));
+  const topicsByBlock = new Map(input.document.blocks.filter((b) => b.kind === 'topic').map((b) => [b.id, input.topics.get((b as { guid: string }).guid)]));
+
+  for (const page of layout.pages) {
+    if (page.index > 0) doc.addPage(format, input.document.page.orientation);
+    drawHeaderFooter(doc, layout, page.index);
+    for (const item of page.items) {
+      switch (item.kind) {
+        case 'text':
+          doc.setFont(item.font ?? 'helvetica', item.bold ? 'bold' : 'normal');
+          doc.setFontSize(item.size);
+          doc.setTextColor(item.gray);
+          doc.text(item.text, item.x, item.y);
+          doc.setTextColor(0);
+          break;
+        case 'image': {
+          const block = byId.get(item.blockId);
+          if (block?.kind === 'image') placeImage(doc, block.dataUrl || null, block.caption || 'logo', item, result);
+          break;
+        }
+        case 'chart': {
+          const agg = input.aggregations.get(item.blockId);
+          if (agg && agg.categories.length > 0) {
+            await doc.svg(seams.renderSvg(agg, item.w, item.h, seams.theme), item.x, item.y, item.w, item.h);
+          } else {
+            doc.setFontSize(9);
+            doc.setTextColor(130);
+            // A resolving/refused filter (#4946) prints its own reason instead
+            // of the generic line, same as `resolveBlocks`'s subtitle above.
+            doc.text(input.chartMessages.get(item.blockId) ?? 'No data for this chart.', item.x, item.y + 14);
+            doc.setTextColor(0);
+          }
+          break;
+        }
+        case 'snapshot': {
+          let png: Uint8Array | undefined;
+          try {
+            png = await seams.capture?.(input.snapshotIds(item.blockId));
+          } catch (err) {
+            console.warn('[Documents] snapshot failed', err);
+          }
+          if (png) {
+            try {
+              doc.addImage(png, 'PNG', item.x, item.y, item.w, item.h);
+            } catch (err) {
+              console.warn('[Documents] snapshot could not be placed', err);
+              png = undefined;
+            }
+          }
+          if (!png) {
+            const block = byId.get(item.blockId);
+            result.snapshotFailures.push(block?.kind === 'chart' ? block.chart.title : item.blockId);
+            doc.setFontSize(9);
+            doc.setTextColor(130);
+            doc.text('3D snapshot unavailable.', item.x, item.y + 14);
+            doc.setTextColor(0);
+          }
+          break;
+        }
+        case 'topic-snapshot': {
+          const topic = topicsByBlock.get(item.blockId);
+          placeImage(doc, topic ? topicSnapshotDataUrl(topic) : null, topic ? `viewpoint of "${topic.title}"` : 'viewpoint', item, result);
+          break;
+        }
+        case 'table':
+          // One chunk per call; the composer cut it to fit, so autotable never breaks the page itself.
+          doc.table({
+            startY: item.y,
+            margin: { left: item.x, right: layout.size.w - item.x - item.w },
+            head: [item.columns.map((c) => c.label)],
+            body: item.rows.map((r) => r.cells),
+            columns: item.columns.map((c) => ({ width: c.width, align: c.align })),
+            rowRoles: item.rows.map((r) => r.role),
+          });
+          break;
+      }
+    }
+  }
+
+  result.pages = doc.pageCount();
+  result.blob = doc.output();
+  return result;
+}

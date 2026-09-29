@@ -3,6 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use super::*;
+use crate::router::GeometryProcessor;
 
 /// A self-referential clipping result: `#10`'s FirstOperand is `#10` again,
 /// with `#20` an `IfcPolygonalBoundedHalfSpace` cutter. Before the visited-id
@@ -895,4 +896,743 @@ fn an_operand_shared_between_two_branches_is_not_a_cycle() {
             "{label}: the shared operand must contribute geometry"
         );
     }
+}
+
+/// A #3922-review hypothesis: `solo_step` was `spine.len() == 1`, applied
+/// uniformly to every node in `spine`. But a longer chain's top-level batch
+/// can fail for a reason specific to its OUTERMOST cutter while the very
+/// next suffix batches cleanly, leaving `spine` holding only that outermost
+/// node — `spine.len() == 1` — even though its cutter has siblings (the ones
+/// the suffix already folded into the mesh). If that lone node then hits an
+/// accept-gate rejection, the old `solo_step = true` sent it to the riskier
+/// unbounded `FallThrough` instead of the safer `KeepUncut` — exactly the
+/// over-cut `!solo_step` exists to prevent.
+///
+/// House.ifc wall #2152's real chain (fixture: issue #960) reproduces the
+/// shape without any synthetic geometry: entity #2146 (8 PBHS cutters) is
+/// the node whose own top-level batch fails (its accept-gate rejects), while
+/// the very next level, #2145 (7 cutters), batches cleanly. In the full
+/// wall-#2152 chain (topmost #2149, 11 cutters) that leaves #2146 as one of
+/// 4 nodes still in `spine`, so `solo_step` was already correctly `false`
+/// there. Entering the SAME real geometry graph directly at #2146 — a
+/// perfectly valid `IfcBooleanClippingResult` node; nothing in the IFC
+/// schema requires the chain above it to exist — simulates an authored
+/// element whose own representation root IS #2146: `spine` then holds only
+/// `[#2146]`, so the old code set `solo_step = true` even though #2146's
+/// cutter has the same 7 siblings, already batched, right below it.
+#[cfg(any(feature = "csg_manifold_gate", feature = "csg_topology_gate"))]
+#[test]
+fn solo_step_accounts_for_a_batched_suffix_not_just_spine_length() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/models/issues/960_house_segmented_roof_clip.ifc");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(s) if !s.starts_with("version https://git-lfs.github.com/spec/") => s,
+        _ => {
+            eprintln!(
+                "skipping: fixture issues/960_house_segmented_roof_clip.ifc not present \
+                 (or an LFS pointer) — run `pnpm fixtures`"
+            );
+            return;
+        }
+    };
+    let mut decoder = EntityDecoder::new(&content);
+    let entity = decoder.decode_by_id(2146).expect("decode #2146");
+    let processor = BooleanClippingProcessor::new();
+    let schema = IfcSchema::new();
+    let mesh = processor
+        .process(&entity, &mut decoder, &schema, TessellationQuality::Medium)
+        .expect("process #2146 chain");
+    assert!(!mesh.is_empty(), "#2146's chain must not render as empty");
+    let (_, mx) = mesh.bounds();
+    // Before the fix: `solo_step` was wrongly `true` here, so the accept-gate
+    // rejection on #2146's own cutter fell through to the unbounded plane
+    // clip and OVER-cut the already-batched 7-cutter result down to max
+    // Z ~= 2735.6 mm. After the fix, `solo_step` is correctly `false` (the
+    // 7-cutter suffix batched below #2146 means it is not alone), so the
+    // rejection keeps that step's host un-cut instead, landing at
+    // max Z ~= 4475.3 mm — the un-cut 7-cutter-batched mesh, not a
+    // secondary over-cut of it.
+    assert!(
+        (mx.z - 4475.3).abs() < 1.0,
+        "#2146 max Z = {:.1} mm, expected ~4475.3 mm (KeepUncut, not an \
+         unbounded-fallback over-cut). A value near 2735.6 means solo_step \
+         was miscomputed from spine.len() alone again, ignoring that a \
+         nested batch already folded this cutter's siblings into the mesh.",
+        mx.z,
+    );
+}
+
+/// A SYNTHETIC, small hand-written fixture that makes the #4023 defect
+/// ACTIVE (RED before the fix, GREEN after), unlike the real-fixture guard
+/// above (whose #2146 entry point never reaches an accept-gate rejection —
+/// see #4024's PR body for the ~50-node scan across every DIFFERENCE-chain
+/// root in `960_house_segmented_roof_clip.ifc` that confirmed this).
+///
+/// Chain (innermost first): `G` (a plain 10x10x10 box) `-cutterF2->` `H`
+/// `-cutterF1->` `F` `-cutterE->` `E`. `collect_polygonal_chain(E)` walks the
+/// WHOLE left-spine PBHS chain in one call, so entering at `E` always
+/// attempts to batch all three cutters together first
+/// (`try_union_polygonal_chain`, verified below via bounds/failure evidence,
+/// not asserted directly on private state). `cutterE`'s polygonal boundary
+/// is a self-intersecting (bowtie) `IfcPolyline` — a structurally invalid
+/// polygon whose extruded prism makes the CSG subtract produce a torn,
+/// non-closed result. That trips the accept gate for the 3-cutter batch
+/// attempt at `E`, so it defers; `process_with_depth_inner` pushes `E` onto
+/// `spine` and walks down to `F`, whose OWN 2-cutter batch (`cutterF1`,
+/// `cutterF2` — both ordinary, non-degenerate half-space slabs) succeeds
+/// cleanly. That leaves `spine == [E]` with `based_on_batch == true`: the
+/// exact shape `solo_step == spine.len() == 1` mis-reads as "no sibling".
+///
+/// Applying `E`'s own step then re-hits the SAME bowtie-cutter accept-gate
+/// rejection, this time via `apply_boolean_step`'s single-cutter
+/// `IfcPolygonalBoundedHalfSpace` branch
+/// (`BooleanClippingProcessor::resolve_single_cutter_subtract`). Pre-fix,
+/// `solo_step` is wrongly `true` there, so the rejection escalates to
+/// `SingleCutterSubtract::FallThrough` — the unbounded plane clip at
+/// `cutterE`'s plane (z = 2, agreement removes z > 2) — collapsing the
+/// batched `F`/`H` result down to z in `[0, 2]` and x/y in `[-5, 3]`
+/// (`F`'s own x > 3 slab already capped x at 3). Post-fix, `based_on_batch`
+/// makes `solo_step` correctly `false`, so the same rejection instead takes
+/// `SingleCutterSubtract::KeepUncut`: `E`'s cutter is dropped and the
+/// batched `F`/`H` result (x, y in `[-5, 5]`, z in `[0, 10]`) is returned
+/// un-cut.
+///
+/// Verified directly (not asserted, since it reads private state): on this
+/// checkout, `collect_polygonal_chain(#450)` (E) returns cutters
+/// `[240, 340, 440]` (all three); `try_union_polygonal_chain(#450)` returns
+/// `None` (deferred) under both `csg_manifold_gate` and `csg_topology_gate`;
+/// `try_union_polygonal_chain(#350)` (F) returns `Some` (batched) under
+/// both. `cargo test --features csg_manifold_gate` records exactly one
+/// `NonManifoldRejected { same_direction: 6, .. }` failure on this fixture
+/// pre- and post-fix; `--features csg_topology_gate` records exactly one
+/// `OpenTopologyRejected` either way — the SAME accept-gate rejection is
+/// reached both times, only its fallback changes.
+#[cfg(any(feature = "csg_manifold_gate", feature = "csg_topology_gate"))]
+#[test]
+fn solo_step_batched_suffix_defect_is_active_on_a_synthetic_bowtie_cutter() {
+    // G: a plain 10x10x10 box (IfcRectangleProfileDef is CENTERED on its
+    // position, so this spans x, y in [-5, 5], z in [0, 10]).
+    let base = "\
+#10=IFCCARTESIANPOINT((0.,0.));
+#11=IFCAXIS2PLACEMENT2D(#10,$);
+#12=IFCRECTANGLEPROFILEDEF(.AREA.,$,#11,10.,10.);
+#13=IFCCARTESIANPOINT((0.,0.,0.));
+#14=IFCAXIS2PLACEMENT3D(#13,$,$);
+#15=IFCDIRECTION((0.,0.,1.));
+#16=IFCEXTRUDEDAREASOLID(#12,#14,#15,10.);
+";
+    // cutterF2 (innermost of the F/H suffix): ordinary half-space slab,
+    // plane at y=3, removing y>3 across the full x/z extent.
+    let cutter_f2 = "\
+#200=IFCCARTESIANPOINT((0.,3.,0.));
+#201=IFCDIRECTION((0.,1.,0.));
+#202=IFCAXIS2PLACEMENT3D(#200,#201,$);
+#203=IFCPLANE(#202);
+#210=IFCCARTESIANPOINT((0.,3.,0.));
+#211=IFCDIRECTION((0.,1.,0.));
+#212=IFCDIRECTION((0.,0.,1.));
+#213=IFCAXIS2PLACEMENT3D(#210,#211,#212);
+#220=IFCCARTESIANPOINT((-6.,-6.));
+#221=IFCCARTESIANPOINT((6.,-6.));
+#222=IFCCARTESIANPOINT((6.,6.));
+#223=IFCCARTESIANPOINT((-6.,6.));
+#224=IFCCARTESIANPOINT((-6.,-6.));
+#230=IFCPOLYLINE((#220,#221,#222,#223,#224));
+#240=IFCPOLYGONALBOUNDEDHALFSPACE(#203,.F.,#213,#230);
+#250=IFCBOOLEANCLIPPINGRESULT(.DIFFERENCE.,#16,#240);
+";
+    // cutterF1 (outer half of the F/H suffix): ordinary half-space slab,
+    // plane at x=3, removing x>3. Together F1+F2 batch cleanly in ONE call
+    // (try_union_polygonal_chain from #350) since neither is degenerate.
+    let cutter_f1 = "\
+#300=IFCCARTESIANPOINT((3.,0.,0.));
+#301=IFCDIRECTION((1.,0.,0.));
+#302=IFCAXIS2PLACEMENT3D(#300,#301,$);
+#303=IFCPLANE(#302);
+#310=IFCCARTESIANPOINT((3.,0.,0.));
+#311=IFCDIRECTION((1.,0.,0.));
+#312=IFCDIRECTION((0.,0.,1.));
+#313=IFCAXIS2PLACEMENT3D(#310,#311,#312);
+#320=IFCCARTESIANPOINT((-6.,-6.));
+#321=IFCCARTESIANPOINT((6.,-6.));
+#322=IFCCARTESIANPOINT((6.,6.));
+#323=IFCCARTESIANPOINT((-6.,6.));
+#324=IFCCARTESIANPOINT((-6.,-6.));
+#330=IFCPOLYLINE((#320,#321,#322,#323,#324));
+#340=IFCPOLYGONALBOUNDEDHALFSPACE(#303,.F.,#313,#330);
+#350=IFCBOOLEANCLIPPINGRESULT(.DIFFERENCE.,#250,#340);
+";
+    // cutterE (outermost, E's own cutter): a SELF-INTERSECTING (bowtie)
+    // IfcPolyline boundary -- (-4,-4)->(4,4)->(4,-4)->(-4,4)->(-4,-4) crosses
+    // itself at the origin -- at plane z=2, removing z>2. Extruding this
+    // invalid polygon into a prism and subtracting it is what trips the
+    // accept gate, both as part of E's own 3-cutter top-level batch attempt
+    // and again at E's single-cutter step once the F/H suffix has batched.
+    let cutter_e = "\
+#400=IFCCARTESIANPOINT((0.,0.,2.));
+#401=IFCDIRECTION((0.,0.,1.));
+#402=IFCAXIS2PLACEMENT3D(#400,#401,$);
+#403=IFCPLANE(#402);
+#410=IFCCARTESIANPOINT((0.,0.,2.));
+#411=IFCDIRECTION((0.,0.,1.));
+#412=IFCDIRECTION((1.,0.,0.));
+#413=IFCAXIS2PLACEMENT3D(#410,#411,#412);
+#420=IFCCARTESIANPOINT((-4.,-4.));
+#421=IFCCARTESIANPOINT((4.,4.));
+#422=IFCCARTESIANPOINT((4.,-4.));
+#423=IFCCARTESIANPOINT((-4.,4.));
+#424=IFCCARTESIANPOINT((-4.,-4.));
+#430=IFCPOLYLINE((#420,#421,#422,#423,#424));
+#440=IFCPOLYGONALBOUNDEDHALFSPACE(#403,.F.,#413,#430);
+#450=IFCBOOLEANCLIPPINGRESULT(.DIFFERENCE.,#350,#440);
+";
+    let content = wrap_ifc(&format!("{base}{cutter_f2}{cutter_f1}{cutter_e}"));
+    let mut decoder = EntityDecoder::new(&content);
+    let processor = BooleanClippingProcessor::new();
+    let entity = decoder.decode_by_id(450).expect("decode #450");
+    let mesh = processor
+        .process(&entity, &mut decoder, &IfcSchema::new(), TessellationQuality::Medium)
+        .expect("process #450 chain");
+    assert!(!mesh.is_empty(), "#450's chain must not render as empty");
+
+    // The accept gate must actually have fired (this fixture is worthless as
+    // a RED/GREEN unless a real rejection was observed, not just an empty
+    // failure list that happens to leave bounds unchanged).
+    let failures = processor.take_failures();
+    assert!(
+        failures.iter().any(|f| matches!(
+            f.reason,
+            BoolFailureReason::OpenTopologyRejected | BoolFailureReason::NonManifoldRejected { .. }
+        )),
+        "expected an accept-gate rejection (OpenTopologyRejected / \
+         NonManifoldRejected) on the bowtie cutterE subtract; got {failures:?}"
+    );
+
+    let (_, mx) = mesh.bounds();
+    // Before the fix: `solo_step` was wrongly `true` (spine.len() == 1,
+    // ignoring `based_on_batch`), so the gate rejection escalated to
+    // FallThrough and applied cutterE's unbounded plane clip (z > 2 removed)
+    // on top of cutterF1's own x > 3 cap, landing at max ~= (3, 3, 2).
+    // After the fix, `based_on_batch` is threaded through, `solo_step` is
+    // correctly `false`, and the rejection takes KeepUncut instead: cutterE
+    // is dropped entirely and the F/H batched result is returned un-cut, at
+    // its true extent, max ~= (5, 5, 10).
+    assert!(
+        (mx.x - 5.0).abs() < 1.0e-3 && (mx.y - 5.0).abs() < 1.0e-3 && (mx.z - 10.0).abs() < 1.0e-3,
+        "max bounds = {mx:?}, expected ~(5, 5, 10) (KeepUncut: cutterE dropped, \
+         F/H batched result returned un-cut). ~(3, 3, 2) means solo_step was \
+         miscomputed from spine.len() alone again, ignoring that a nested \
+         batch already folded this cutter's siblings into the mesh."
+    );
+}
+
+/// `m` DIFFERENCE nodes per level on the left spine, every one of whose
+/// SecondOperand is the SAME next-level root, repeated for `levels` levels
+/// and bottoming out on a block. No id repeats on any path, every path is
+/// short, and the nesting depth is `levels`, so neither the cycle set, the
+/// path bound nor `MAX_BOOLEAN_DEPTH` fires; the walk simply enters the
+/// next-level root `m` times per level, `m^levels` in all.
+fn fan_out_fixture(m: u32, levels: u32) -> String {
+    // The base is a 2 m block and the cutter a 1 m block in its corner, so
+    // every level's result is a non-empty solid that does not engulf the
+    // next base: an emptied intermediate would end a spine early and hide
+    // the fan-out (an identical-block fixture did exactly that).
+    let mut data = String::from("#1=IFCBLOCK($,2.,2.,2.);\n#2=IFCBLOCK($,1.,1.,1.);\n");
+    for level in 0..levels {
+        let base = 100 * (level + 1);
+        let next_root = if level + 1 == levels { 2 } else { 100 * (level + 2) };
+        for i in 0..m {
+            let id = base + i;
+            let first = if i + 1 == m { 1 } else { id + 1 };
+            data.push_str(&format!(
+                "#{id}=IFCBOOLEANRESULT(.DIFFERENCE.,#{first},#{next_root});\n"
+            ));
+        }
+    }
+    wrap_ifc(&data)
+}
+
+/// Pins the operand work budget (`MAX_OPERAND_VISITS`): four spine nodes per
+/// level over six levels is `sum(4^i, i < 6)` entries into
+/// `process_with_depth`, each with up to four exact subtracts, from 26 STEP
+/// entities. Without the budget the walk runs them all (the 60 s timeout is
+/// the assertion for that); with it the element is refused past the budget
+/// and the refusal is on record.
+#[test]
+fn a_shared_second_operand_fan_out_is_refused_at_the_visit_budget() {
+    let content = fan_out_fixture(4, 6);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let mut decoder = EntityDecoder::new(&content);
+        let entity = decoder.decode_by_id(100).expect("decode #100");
+        let processor = BooleanClippingProcessor::new();
+        let schema = IfcSchema::new();
+        let result = processor.process(&entity, &mut decoder, &schema, Default::default());
+        let failures = processor.take_failures();
+        let _ = tx.send((result.map(|m| m.triangle_count()).map_err(|e| e.to_string()), failures));
+    });
+    let (result, failures) = crate::test_support::recv_or_diagnose(
+        &rx,
+        std::time::Duration::from_secs(60),
+        "the operand fan-out walk did not terminate within 60 s (no work budget?)",
+        "the operand fan-out worker PANICKED (not a hang); its panic is printed above",
+    );
+    let _ = handle.join();
+    let err = result.expect_err("an over-budget operand walk must be refused, not rendered");
+    assert!(
+        err.contains("operand walk exceeds"),
+        "expected the visit budget to be named, got: {err}"
+    );
+    assert!(
+        failures.iter().any(|f| matches!(f.reason, BoolFailureReason::OperandBudgetExhausted)),
+        "the refusal must be on record; got {failures:?}"
+    );
+}
+
+/// The budget must not bind on the shapes real files have: a three-level fan
+/// of three resolves with nothing on record.
+#[test]
+fn a_small_shared_second_operand_fan_out_still_resolves() {
+    let content = fan_out_fixture(3, 3);
+    let mut decoder = EntityDecoder::new(&content);
+    let entity = decoder.decode_by_id(100).expect("decode #100");
+    let processor = BooleanClippingProcessor::new();
+    let schema = IfcSchema::new();
+    let mesh = processor
+        .process(&entity, &mut decoder, &schema, Default::default())
+        .expect("a 13-entry fan-out is well inside the budget");
+    assert!(!mesh.is_empty(), "the 2 m block minus a corner cube is a solid");
+    let failures = processor.take_failures();
+    assert!(failures.is_empty(), "nothing to record on a small fan-out: {failures:?}");
+}
+
+/// Provisional attempts are real work and must remain charged.
+/// `try_union_polygonal_chain` meshes the base
+/// provisionally at EVERY spine level it is attempted from and defers when
+/// a cutter cannot be batched (here the innermost PBHS has no boundary), so
+/// `n` PBHS cutters over a base whose spine carries `b` boolean second
+/// operands enters the base's nodes `n * b` times. This 40 x 30 chain crosses
+/// the 1024-entry bound and must be refused; refunding attempts made the
+/// counter linear while nested variants could perform exponential work.
+#[test]
+fn provisional_batch_attempts_spend_the_monotonic_work_budget() {
+    const CUTTERS: u32 = 40;
+    const BASE_OPERANDS: u32 = 30;
+    let mut data = String::from(
+        "#10=IFCCARTESIANPOINT((0.,0.));
+#11=IFCAXIS2PLACEMENT2D(#10,$);
+#12=IFCRECTANGLEPROFILEDEF(.AREA.,$,#11,10.,10.);
+#13=IFCCARTESIANPOINT((0.,0.,0.));
+#14=IFCAXIS2PLACEMENT3D(#13,$,$);
+#15=IFCDIRECTION((0.,0.,1.));
+#16=IFCEXTRUDEDAREASOLID(#12,#14,#15,10.);
+#20=IFCBLOCK(#14,1.,1.,1.);
+#21=IFCBLOCK(#14,0.5,0.5,0.5);
+#22=IFCBOOLEANRESULT(.DIFFERENCE.,#20,#21);
+#200=IFCCARTESIANPOINT((0.,3.,0.));
+#201=IFCDIRECTION((0.,1.,0.));
+#202=IFCAXIS2PLACEMENT3D(#200,#201,$);
+#203=IFCPLANE(#202);
+#210=IFCCARTESIANPOINT((0.,3.,0.));
+#211=IFCDIRECTION((0.,1.,0.));
+#212=IFCDIRECTION((0.,0.,1.));
+#213=IFCAXIS2PLACEMENT3D(#210,#211,#212);
+#240=IFCPOLYGONALBOUNDEDHALFSPACE(#203,.F.,#213,$);
+#300=IFCCARTESIANPOINT((3.,0.,0.));
+#301=IFCDIRECTION((1.,0.,0.));
+#302=IFCAXIS2PLACEMENT3D(#300,#301,$);
+#303=IFCPLANE(#302);
+#310=IFCCARTESIANPOINT((3.,0.,0.));
+#311=IFCDIRECTION((1.,0.,0.));
+#312=IFCDIRECTION((0.,0.,1.));
+#313=IFCAXIS2PLACEMENT3D(#310,#311,#312);
+#320=IFCCARTESIANPOINT((-6.,-6.));
+#321=IFCCARTESIANPOINT((6.,-6.));
+#322=IFCCARTESIANPOINT((6.,6.));
+#323=IFCCARTESIANPOINT((-6.,6.));
+#324=IFCCARTESIANPOINT((-6.,-6.));
+#330=IFCPOLYLINE((#320,#321,#322,#323,#324));
+#340=IFCPOLYGONALBOUNDEDHALFSPACE(#303,.F.,#313,#330);
+",
+    );
+    // The base: a spine of `b` DIFFERENCE nodes whose second operand is the
+    // boolean node #22 (a charged entry each time the base is meshed).
+    let mut prev = 16;
+    for j in 0..BASE_OPERANDS {
+        let id = 1000 + j;
+        data.push_str(&format!("#{id}=IFCBOOLEANRESULT(.DIFFERENCE.,#{prev},#22);\n"));
+        prev = id;
+    }
+    // The chain: `n` PBHS clips, the innermost with no boundary so every
+    // batch attempt defers.
+    for i in 0..CUTTERS {
+        let id = 2000 + i;
+        let cutter = if i == 0 { 240 } else { 340 };
+        data.push_str(&format!("#{id}=IFCBOOLEANCLIPPINGRESULT(.DIFFERENCE.,#{prev},#{cutter});\n"));
+        prev = id;
+    }
+    let content = wrap_ifc(&data);
+    let mut decoder = EntityDecoder::new(&content);
+    let entity = decoder.decode_by_id(prev).expect("decode chain root");
+    let processor = BooleanClippingProcessor::new();
+    let schema = IfcSchema::new();
+    let out = processor.process(&entity, &mut decoder, &schema, Default::default());
+    let failures = processor.take_failures();
+    let err = out.expect_err("repeated provisional work must exhaust the operand budget");
+    assert!(err.to_string().contains("operand walk exceeds"));
+    assert!(
+        failures.iter().any(|f| matches!(f.reason, BoolFailureReason::OperandBudgetExhausted)),
+        "the refusal must be observable as OperandBudgetExhausted; got {failures:?}"
+    );
+}
+
+
+// Regression tests for #4639: an unreadable boolean operator executed as
+// DIFFERENCE, and an emptied intermediate ending a UNION chain, with the
+// one-record-per-dropped-operand bookkeeping around both.
+
+/// Two unit blocks side by side (`#2` is placed at x = 1), so the three
+/// operators give three different solids: DIFFERENCE leaves `#1`, UNION
+/// spans both, INTERSECTION is empty.
+const TWO_BLOCKS: &str = "#1=IFCBLOCK($,1.,1.,1.);\n\
+#2=IFCBLOCK(#3,1.,1.,1.);\n\
+#3=IFCAXIS2PLACEMENT3D(#4,$,$);\n\
+#4=IFCCARTESIANPOINT((1.,0.,0.));\n";
+
+fn process_root(data: &str, root: u32) -> (Result<Mesh>, Vec<BoolFailure>) {
+    let content = wrap_ifc(data);
+    let mut decoder = EntityDecoder::new(&content);
+    let entity = decoder.decode_by_id(root).expect("decode root");
+    let processor = BooleanClippingProcessor::new();
+    let schema = IfcSchema::new();
+    let out = processor.process(&entity, &mut decoder, &schema, Default::default());
+    (out, processor.take_failures())
+}
+
+fn assert_unreadable_operator_recorded(failures: &[BoolFailure]) {
+    assert!(
+        failures.iter().any(|f| matches!(
+            &f.reason,
+            BoolFailureReason::UnknownBooleanOperator(op) if op == "<unreadable>"
+        )),
+        "the unreadable operator must be on record; got {failures:?}"
+    );
+}
+
+/// An `IfcBooleanResult` whose `Operator` is `$` was executed as a
+/// DIFFERENCE: a different solid from the file's, and one the existing
+/// `UnknownBooleanOperator` record could never report because the default
+/// swallowed it first. UNION and INTERSECTION are as legal there as
+/// DIFFERENCE, so there is no safe default: the host comes back un-cut and
+/// the unreadable operator is on record.
+#[test]
+fn an_unreadable_operator_on_a_boolean_result_is_recorded_not_subtracted() {
+    let data = format!("{TWO_BLOCKS}#10=IFCBOOLEANRESULT($,#1,#2);\n");
+    let (out, failures) = process_root(&data, 10);
+    let mesh = out.expect("an unreadable operator hands the first operand back");
+    assert!(!mesh.is_empty());
+    assert_unreadable_operator_recorded(&failures);
+}
+
+/// The same `$` on an `IfcBooleanClippingResult` IS a DIFFERENCE: the schema
+/// allows no other operator there, so the default is the spec, not a guess.
+/// The cutter is a plane at z = 0.5 with the material above it; the clip
+/// keeps the lower half of the block and records nothing.
+#[test]
+fn an_unreadable_operator_on_a_clipping_result_still_clips() {
+    let data = "#1=IFCBLOCK($,1.,1.,1.);\n\
+#20=IFCHALFSPACESOLID(#21,.F.);\n\
+#21=IFCPLANE(#22);\n\
+#22=IFCAXIS2PLACEMENT3D(#23,$,$);\n\
+#23=IFCCARTESIANPOINT((0.,0.,0.5));\n\
+#10=IFCBOOLEANCLIPPINGRESULT($,#1,#20);\n";
+    let (out, failures) = process_root(data, 10);
+    let mesh = out.expect("a clipping result with an unreadable operator is a DIFFERENCE");
+    let (_, hi) = mesh.bounds();
+    assert!(
+        (hi.z - 0.5).abs() < 1e-5,
+        "the plane clip must have run (max z {}), as DIFFERENCE is the only legal operator",
+        hi.z
+    );
+    assert!(failures.is_empty(), "nothing to record: {failures:?}");
+}
+
+/// `collect_polygonal_chain` had the same default: a `$`-operator
+/// `IfcBooleanResult` above a polygonal-bounded cutter was folded into the
+/// DIFFERENCE chain. It must stop the chain instead.
+#[test]
+fn collect_polygonal_chain_stops_at_an_unreadable_operator() {
+    let content = wrap_ifc(
+        "#10=IFCBOOLEANRESULT($,#30,#20);\n\
+#30=IFCBOOLEANCLIPPINGRESULT(.DIFFERENCE.,#50,#40);\n\
+#20=IFCPOLYGONALBOUNDEDHALFSPACE($,$,$,$);\n\
+#40=IFCPOLYGONALBOUNDEDHALFSPACE($,$,$,$);\n\
+#50=IFCBLOCK($,1.,1.,1.);\n",
+    );
+    let (base_id, cutters) = collect_with_timeout(content, 10);
+    assert_eq!(base_id, 10, "the chain must stop AT the unreadable node");
+    assert!(cutters.is_empty(), "nothing below an unreadable operator is collected: {cutters:?}");
+}
+
+/// `#5` meshes EMPTY as an operand because no built-in processor takes its
+/// type, so the operand walk records `UnsupportedOperand` for it. It was an
+/// `IfcSphere` until #4560 routed operands through the router's table, which
+/// meshes spheres; the triangle-count asserts below fail if this one gains a
+/// processor too.
+const UNSUPPORTED_BASE: &str = "#5=IFCRIGHTCIRCULARCYLINDER($,1.,0.5);\n";
+
+/// Count `(UnsupportedOperand, EmptyOperand)` records: one dropped operand
+/// must produce exactly one of them, the cause over the consequence.
+fn dropped_operand_records(failures: &[BoolFailure]) -> (usize, usize) {
+    let count = |pred: fn(&BoolFailureReason) -> bool| failures.iter().filter(|f| pred(&f.reason)).count();
+    (
+        count(|r| matches!(r, BoolFailureReason::UnsupportedOperand(_))),
+        count(|r| matches!(r, BoolFailureReason::EmptyOperand)),
+    )
+}
+
+/// `UNION(empty, B) = B`. An emptied first operand used to end the chain
+/// for every operator, so a UNION whose base meshed empty (here
+/// [`UNSUPPORTED_BASE`]) lost its second operand with no record beyond the
+/// base's. The union now carries on with `B`, and the base's loss is on
+/// record ONCE, as `UnsupportedOperand` (the cause), not also as
+/// `EmptyOperand`.
+#[test]
+fn a_union_over_an_emptied_first_operand_keeps_the_second() {
+    let data = format!("{TWO_BLOCKS}{UNSUPPORTED_BASE}#10=IFCBOOLEANRESULT(.UNION.,#5,#2);\n");
+    let (out, failures) = process_root(&data, 10);
+    let mesh = out.expect("UNION(empty, B) is B");
+    assert_eq!(mesh.triangle_count(), 12, "the second operand's block must survive");
+    let (lo, hi) = mesh.bounds();
+    assert!((lo.x - 1.0).abs() < 1e-6 && (hi.x - 2.0).abs() < 1e-6, "got {lo:?}..{hi:?}");
+    assert_eq!(dropped_operand_records(&failures), (1, 0), "one record for one dropped operand: {failures:?}");
+}
+
+/// The same unsupported base under TWO polygonal-bounded cutters, so the
+/// batched `try_union_polygonal_chain` meshes it first. That path used to
+/// return the empty base as a batched SUCCESS, skipping the sequential walk
+/// that sets the one-record flag, so the UNION above recorded `EmptyOperand`
+/// on top of the base's `UnsupportedOperand`. The batched path now hands
+/// the base's unsupported flag to the spine, which owns the one record.
+#[test]
+fn a_union_over_an_emptied_batched_base_records_the_loss_once() {
+    let data = format!(
+        "{TWO_BLOCKS}{UNSUPPORTED_BASE}\
+         #30=IFCBOOLEANCLIPPINGRESULT(.DIFFERENCE.,#5,#40);\n\
+         #31=IFCBOOLEANCLIPPINGRESULT(.DIFFERENCE.,#30,#41);\n\
+         #40=IFCPOLYGONALBOUNDEDHALFSPACE($,$,$,$);\n\
+         #41=IFCPOLYGONALBOUNDEDHALFSPACE($,$,$,$);\n\
+         #10=IFCBOOLEANRESULT(.UNION.,#31,#2);\n"
+    );
+    let (out, failures) = process_root(&data, 10);
+    let mesh = out.expect("UNION(DIFFERENCE(DIFFERENCE(empty, c1), c2), B) is B");
+    assert_eq!(mesh.triangle_count(), 12, "the second operand's block must survive");
+    assert_eq!(dropped_operand_records(&failures), (1, 0), "one record for one dropped operand: {failures:?}");
+}
+
+/// `#10` is an intersection of two disjoint blocks: an intermediate that
+/// meshes empty for a reason the operand walk did NOT already record.
+/// `#11` applies `op` to it and `#2`; `#12` unions `#11` with `#2`.
+fn emptied_intermediate_chain(op: &str) -> String {
+    format!(
+        "{TWO_BLOCKS}#10=IFCBOOLEANRESULT(.INTERSECTION.,#1,#2);\n\
+         #11=IFCBOOLEANRESULT(.{op}.,#10,#2);\n\
+         #12=IFCBOOLEANRESULT(.UNION.,#11,#2);\n"
+    )
+}
+
+/// A UNION over the emptied intermediate: the second operand survives and
+/// the emptied first operand is recorded as `EmptyOperand` under UNION.
+#[test]
+fn a_union_over_an_emptied_intermediate_records_the_loss_once() {
+    let (out, failures) = process_root(&emptied_intermediate_chain("UNION"), 11);
+    let mesh = out.expect("UNION(empty intersection, B) is B");
+    assert_eq!(mesh.triangle_count(), 12, "the second operand's block must survive");
+    let empty_unions = failures
+        .iter()
+        .filter(|f| f.op == BoolOp::Union && matches!(f.reason, BoolFailureReason::EmptyOperand))
+        .count();
+    assert_eq!(empty_unions, 1, "the emptied first operand is on record once: {failures:?}");
+}
+
+/// The counter-case: an emptied intermediate still empties a DIFFERENCE
+/// (nothing left to cut), as before.
+#[test]
+fn a_difference_over_an_emptied_intermediate_stays_empty() {
+    let (out, _) = process_root(&emptied_intermediate_chain("DIFFERENCE"), 11);
+    assert!(out.expect("resolves").is_empty(), "DIFFERENCE(empty, B) is empty");
+}
+
+/// The emptied DIFFERENCE above does not end the spine: a UNION higher up
+/// (`#12`) still gets its second operand. Returning at the first non-UNION
+/// node that sees an empty mesh loses `B` here just as the original
+/// every-operator early-out did; the node has to be skipped, not the spine.
+#[test]
+fn a_union_above_an_emptied_difference_still_keeps_its_second_operand() {
+    let (out, failures) = process_root(&emptied_intermediate_chain("DIFFERENCE"), 12);
+    let mesh = out.expect("UNION(DIFFERENCE(empty, x), B) is B");
+    assert_eq!(mesh.triangle_count(), 12, "the second operand's block must survive: {failures:?}");
+    assert_eq!(dropped_operand_records(&failures), (0, 1), "the emptied operand is on record once: {failures:?}");
+}
+
+/// An INTERSECTION whose cutter has no mesher records `UnsupportedOperand`
+/// and empties the mesh; the UNION above must not add `EmptyOperand` for the
+/// same dropped operand.
+#[test]
+fn a_union_over_an_intersection_with_an_unsupported_cutter_records_it_once() {
+    let data = format!(
+        "{TWO_BLOCKS}{UNSUPPORTED_BASE}#11=IFCBOOLEANRESULT(.INTERSECTION.,#1,#5);\n\
+         #12=IFCBOOLEANRESULT(.UNION.,#11,#2);\n"
+    );
+    let (out, failures) = process_root(&data, 12);
+    assert_eq!(out.expect("resolves").triangle_count(), 12, "the UNION keeps its second operand");
+    assert_eq!(dropped_operand_records(&failures), (1, 0), "one record for one dropped operand: {failures:?}");
+}
+
+/// The counter-case: the unsupported operand sits INSIDE the INTERSECTION's
+/// cutter (`#13` hands `#2` back un-cut), so the INTERSECTION with the
+/// disjoint block empties for its own reason. That emptying is a separate
+/// loss and the UNION above still records it: a flag set by any drop record
+/// made during the step would hide it.
+#[test]
+fn a_nested_drop_inside_an_intersection_cutter_does_not_hide_its_emptying() {
+    let data = format!(
+        "{TWO_BLOCKS}{UNSUPPORTED_BASE}#13=IFCBOOLEANRESULT(.DIFFERENCE.,#2,#5);\n\
+         #11=IFCBOOLEANRESULT(.INTERSECTION.,#1,#13);\n\
+         #12=IFCBOOLEANRESULT(.UNION.,#11,#2);\n"
+    );
+    let (out, failures) = process_root(&data, 12);
+    assert_eq!(out.expect("resolves").triangle_count(), 12, "the UNION keeps its second operand");
+    assert_eq!(dropped_operand_records(&failures), (1, 1), "two losses, two records: {failures:?}");
+}
+
+/// The one-record flag follows the emptiness, not the spine: a base that
+/// went down as `UnsupportedOperand` is rescued by the inner UNION, the
+/// INTERSECTION with a disjoint block empties the mesh AGAIN, and that
+/// second loss is a new one, recorded under the outer UNION. A flag that
+/// stays set from the base records only the base.
+#[test]
+fn a_second_emptying_after_a_rescued_base_is_recorded_on_its_own() {
+    let data = format!(
+        "{TWO_BLOCKS}{UNSUPPORTED_BASE}\
+         #10=IFCBOOLEANRESULT(.UNION.,#5,#2);\n\
+         #11=IFCBOOLEANRESULT(.INTERSECTION.,#10,#1);\n\
+         #12=IFCBOOLEANRESULT(.UNION.,#11,#2);\n"
+    );
+    let (out, failures) = process_root(&data, 12);
+    assert_eq!(out.expect("resolves").triangle_count(), 12, "the outer UNION keeps its second operand");
+    assert_eq!(dropped_operand_records(&failures), (1, 1), "two losses, two records: {failures:?}");
+}
+
+/// (#4639) The SecondOperand of an unreadable-operator node is never used, so
+/// a `$` there must not become an `Err`. The damage case: `#10` has an
+/// emptied first operand (so #4639 lets it run instead of ending the chain)
+/// and is itself the cutter of `#20`. Resolving its `$` first made `#20` an
+/// `Err` and dropped the valid host `#1`; recording first hands `#20` an
+/// empty cutter, and the host comes back un-cut.
+#[test]
+fn an_unreadable_operator_does_not_resolve_its_unused_second_operand() {
+    let data = format!(
+        "{TWO_BLOCKS}{UNSUPPORTED_BASE}#10=IFCBOOLEANRESULT($,#5,$);\n\
+         #20=IFCBOOLEANRESULT(.DIFFERENCE.,#1,#10);\n"
+    );
+    let (out, failures) = process_root(&data, 20);
+    let mesh = out.unwrap_or_else(|e| panic!("an unused `$` must not drop the parent's host: {e}"));
+    assert_eq!(mesh.triangle_count(), 12, "the parent's host #1 comes back un-cut");
+    assert_unreadable_operator_recorded(&failures);
+}
+
+/// An unreadable operator over an EMPTY first operand is still on record:
+/// skipping the node like a DIFFERENCE would lose the
+/// `UnknownBooleanOperator` record whenever the base meshed empty.
+#[test]
+fn an_unreadable_operator_over_an_empty_first_operand_is_still_recorded() {
+    let data = format!("{TWO_BLOCKS}{UNSUPPORTED_BASE}#10=IFCBOOLEANRESULT($,#5,#2);\n");
+    let (out, failures) = process_root(&data, 10);
+    assert!(out.expect("resolves").is_empty(), "the (empty) host comes back un-cut");
+    assert_unreadable_operator_recorded(&failures);
+}
+
+// Regression tests for #4691: a nested boolean or `IfcCsgSolid` operand that
+// meshes empty because an operand INSIDE it was dropped is already on record,
+// so the level above must not add `EmptyOperand` for the same loss.
+
+/// `#13` meshes empty because its base `#5` has no mesher, which the inner
+/// walk records as `UnsupportedOperand`. `#20` applies `op` to the host `#1`
+/// and `#13`, reached directly or, when `csg` is set, through an
+/// `IfcCsgSolid` wrapping it.
+fn emptied_nested_cutter(op: &str, csg: bool) -> String {
+    let cutter = if csg { "#14" } else { "#13" };
+    format!(
+        "{TWO_BLOCKS}{UNSUPPORTED_BASE}#13=IFCBOOLEANRESULT(.DIFFERENCE.,#5,#2);\n\
+         #14=IFCCSGSOLID(#13);\n\
+         #20=IFCBOOLEANRESULT(.{op}.,#1,{cutter});\n"
+    )
+}
+
+/// One dropped operand inside a nested second operand, one record, for every
+/// operator and through both nested hops.
+#[test]
+fn a_nested_operand_emptied_by_an_unsupported_operand_records_it_once() {
+    for op in ["DIFFERENCE", "UNION", "INTERSECTION"] {
+        for csg in [false, true] {
+            let (out, failures) = process_root(&emptied_nested_cutter(op, csg), 20);
+            out.unwrap_or_else(|e| panic!("{op} csg={csg}: must resolve, got {e}"));
+            assert_eq!(
+                dropped_operand_records(&failures),
+                (1, 0),
+                "{op} csg={csg}: one record for one dropped operand: {failures:?}"
+            );
+        }
+    }
+}
+
+/// The failing input from #4691: both operands of the inner UNION have no
+/// mesher. Two dropped operands, two records, and no `EmptyOperand` on top.
+#[test]
+fn a_nested_union_of_two_unsupported_operands_records_each_once() {
+    let data = format!(
+        "{TWO_BLOCKS}{UNSUPPORTED_BASE}#6=IFCRIGHTCIRCULARCONE($,1.,0.5);\n\
+         #13=IFCBOOLEANRESULT(.UNION.,#5,#6);\n\
+         #20=IFCBOOLEANRESULT(.DIFFERENCE.,#1,#13);\n"
+    );
+    let (out, failures) = process_root(&data, 20);
+    assert_eq!(out.expect("resolves").triangle_count(), 12, "the host comes back un-cut");
+    assert_eq!(dropped_operand_records(&failures), (2, 0), "two dropped operands, two records: {failures:?}");
+}
+
+/// The batched chain's base is a boolean node (`#11`) that empties on an
+/// unsupported operand. The batched path handed the UNION above that empty
+/// base with the flag unset, so it recorded `EmptyOperand` on top (#4691).
+#[test]
+fn a_union_over_a_batched_chain_on_an_emptied_boolean_base_records_it_once() {
+    let data = format!(
+        "{TWO_BLOCKS}{UNSUPPORTED_BASE}\
+         #11=IFCBOOLEANRESULT(.INTERSECTION.,#1,#5);\n\
+         #30=IFCBOOLEANCLIPPINGRESULT(.DIFFERENCE.,#11,#40);\n\
+         #31=IFCBOOLEANCLIPPINGRESULT(.DIFFERENCE.,#30,#41);\n\
+         #40=IFCPOLYGONALBOUNDEDHALFSPACE($,$,$,$);\n\
+         #41=IFCPOLYGONALBOUNDEDHALFSPACE($,$,$,$);\n\
+         #10=IFCBOOLEANRESULT(.UNION.,#31,#2);\n"
+    );
+    let (out, failures) = process_root(&data, 10);
+    assert_eq!(out.expect("resolves").triangle_count(), 12, "the second operand's block must survive");
+    assert_eq!(dropped_operand_records(&failures), (1, 0), "one record for one dropped operand: {failures:?}");
+}
+
+/// The counter-case: inside the nested cutter `#13` the dropped base is
+/// rescued by its UNION, and the INTERSECTION with the disjoint `#1` then
+/// empties it for a reason nothing recorded. That is a second loss and the
+/// outer DIFFERENCE still records it: a flag set by any drop record made
+/// inside the nested walk would hide it.
+#[test]
+fn a_nested_operand_emptied_after_a_rescued_drop_is_still_recorded() {
+    let data = format!(
+        "{TWO_BLOCKS}{UNSUPPORTED_BASE}#12=IFCBOOLEANRESULT(.UNION.,#5,#2);\n\
+         #13=IFCBOOLEANRESULT(.INTERSECTION.,#12,#1);\n\
+         #20=IFCBOOLEANRESULT(.DIFFERENCE.,#1,#13);\n"
+    );
+    let (out, failures) = process_root(&data, 20);
+    assert_eq!(out.expect("resolves").triangle_count(), 12, "the host comes back un-cut");
+    assert_eq!(dropped_operand_records(&failures), (1, 1), "two losses, two records: {failures:?}");
 }

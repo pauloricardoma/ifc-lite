@@ -33,6 +33,23 @@ console.log(`Entities: ${refs.length}`);
 api.free();                           // free the API instance
 ```
 
+`api.extrusionDefinitions(bytes, ids)` returns exact authored
+`IfcExtrudedAreaSolid` sources and placed product occurrences without decoding
+meshes. Omit `ids` for all products, pass `new Uint32Array()` for none, or
+selected product STEP IDs for a filtered view. Repeated mapping targets share a source key while each
+occurrence retains its f64 `world_from_source` matrix and deterministic ordinal.
+Complete sources with valid positive net profile area have
+`nominal_quantities` in raw squared/cubed IFC file units; unsupported or
+invalid sources have `null`.
+For a complete source-profile point, apply `profile_position`, then
+`position_matrix`, then `world_from_source`; the last matrix includes file-unit
+conversion and maps to absolute IFC Z-up metres. An absent optional `Position`
+leaves its matrix field `null`, so use identity for that step when composing
+rather than expecting an identity array. Check `status` before interpreting a
+null matrix; unsupported sources and bounded output are reported by `status`
+and `diagnostics`. CSG operands carry
+`source_modified=true` because their final body can differ.
+
 ## Meshes (pre-pass + job batches)
 
 Geometry runs as a single pre-pass (one scan that produces a flat job list
@@ -43,9 +60,14 @@ plus unit scale, RTC offset, void/style indices) followed by
 ```typescript
 import init, { IfcAPI } from '@ifc-lite/wasm';
 
+// Your renderer, and your own adapter from a wasm mesh to its mesh type.
+declare const scene: { add(m: unknown): void };
+declare function toThreeMesh(mesh: unknown): unknown;
+
 await init();
 const api = new IfcAPI();
-const bytes = new Uint8Array(await fetch('model.ifc').then(r => r.arrayBuffer()));
+const modelBuffer = await fetch('model.ifc').then(r => r.arrayBuffer());
+const bytes = new Uint8Array(modelBuffer);
 
 const pre = api.buildPrePassOnce(bytes);
 // Large-coordinate models: pre.needsShift / pre.rtcOffset give the RTC origin.
@@ -70,6 +92,49 @@ for (let start = 0; start < pre.totalJobs; start += 100) {
 api.clearPrePassCache();
 api.free();                           // release the API instance when done
 ```
+
+### Auxiliary geometry in the mesh frame
+
+Grid, alignment, and symbolic parsers accept the mesh pre-pass decision through
+their explicit-frame variants. `RtcFrame` coordinates are IFC Z-up metres:
+
+```typescript
+import type { IfcAPI, RtcFrame } from '@ifc-lite/wasm';
+
+declare const api: IfcAPI;
+declare const pre: ReturnType<IfcAPI['buildPrePassOnce']>;
+declare const content: string;
+
+const frame: RtcFrame = {
+  x: pre.rtcOffset?.[0] ?? 0,
+  y: pre.rtcOffset?.[1] ?? 0,
+  z: pre.rtcOffset?.[2] ?? 0,
+  needsShift: pre.needsShift,
+};
+
+const grids = api.parseGridLinesInFrame(content, frame);
+const axes = api.parseGridAxesInFrame(content, frame);
+try {
+  const alignments = api.parseAlignmentLinesInFrame(content, frame);
+  const symbols = api.parseSymbolicRepresentationsInFrame(content, frame);
+  try {
+    console.log(grids.length, axes.length, alignments.length, symbols.totalCount);
+  } finally {
+    symbols.free();
+  }
+} finally {
+  axes.free();
+}
+```
+
+`needsShift: false` means no RTC subtraction, even when the inactive coordinates
+are non-zero. “Raw IFC” here describes only that RTC step: each parser still
+applies its documented unit scaling and output-axis conversion. It is distinct
+from having no frame.
+The methods without `InFrame` remain available for standalone parsing and
+detect a frame from the whole source. That standalone choice is not guaranteed
+to match an earlier streaming sample or a federation override; reuse the exact
+pre-pass frame whenever these results accompany already-produced meshes.
 
 > Most consumers should use [`@ifc-lite/geometry`](../geometry/README.md)'s
 > `GeometryProcessor` instead — it wraps this pre-pass/job-batch flow with a
@@ -106,3 +171,68 @@ See the [WASM API Reference](https://ifclite.dev/docs/api/wasm/).
 ## License
 
 [MPL-2.0](https://mozilla.org/MPL/2.0/)
+
+
+For appearance authoring, `IfcAPI.catalogAppearance` resolves current IFC product
+classes and type memberships from an effective STEP snapshot before planning.
+It shares bounded native decoding with `planAppearance`; run both in a worker and
+validate the source revision before using a catalog or applying a plan. See the
+[WASM API guide](../../docs/api/wasm.md#effective-appearance-scope-catalog) for the
+request, response and limits.
+
+`IfcAPI.planPageAppearance(content, requestJson, rgba)` adds a bounded finite-page
+compositor. It returns an `IFPA` metadata/PNG envelope with per-item digest-named
+assets and ordinary atomic IFC edits. Outside-page albedo is resampled from the
+original canonical style/texture, not a repeated or clamped page border. Run in
+a cancellable worker and retain all generated assets with the command. See the
+[WASM API guide](../../docs/api/wasm.md#finite-page-appearance-output).
+
+`IfcAPI.planAnnotationPlane` creates a bounded calibrated image `IfcAnnotation`
+plan for an explicit spatial container, reusing canonical native geometry. Run it
+in a worker and publish its typed entities, source-image lease and returned mesh
+as one existing model/history transaction. See the [WASM API guide](../../docs/api/wasm.md#calibrated-annotation-creation)
+for the Z-up geometry/top-down UV and allocator/source validation contract.
+
+`IfcAPI.planCapturedMesh` creates a bounded `IfcBuildingElementProxy` plan from
+an already segmented textured triangle mesh, retaining independent UV seams and
+the original image URI. It uses the same native authoring and geometry path as
+annotation creation. See [captured surface creation](../../docs/api/wasm.md#captured-textured-surface-creation)
+for coordinate, budget and atomic host-commit requirements.
+
+Captured-mesh planning preserves optional `repeatS`/`repeatT` image sampler flags
+(default `false`); UVs remain bounded to `[0, 1]`.
+
+`IfcAPI.registerScanCorrespondences` fits bounded manual source-scan/IFC point
+pairs and returns a proper rigid transform plus separate fitting and held-out
+residuals. Frames and asset identities are bound into the report; the call does
+not align a loaded model or approve scan accuracy. See the
+[registration contract](../../docs/api/wasm.md#scan-correspondence-registration).
+
+`IfcAPI.planMeshTransfer` composes registered opaque textured-mesh observations
+onto supported direct IFC tessellations using the shared atlas planner. Unknown
+samples retain existing target albedo; the IFPA response includes explicit
+coverage and frozen-input bindings. Entirely unknown transfer has no applicable
+plan. See the [transfer contract](../../docs/api/wasm.md#registered-textured-mesh-appearance-transfer)
+for source identity, coordinate frames, budgets and host acceptance requirements.
+
+`IfcAPI.preparePdfVectorPage` validates bounded ordered PDF vector graphics states
+and preserves source operator identity, calibrated transforms and paint state.
+Content the planner cannot convert (text, images, clips, transparency,
+patterns, unqualified dashed strokes, curved/hairline strokes, unknown operators) is returned
+as a fidelity report with counts, page extents and visibility, and an
+`exact`/`rasterOnly` verdict; `IfcAPI.planPdfFillAnnotation` plans a partial
+page only when the request quotes that report's digest as the user's
+acceptance. It emits no IFC entities and makes no flattened-geometry fidelity
+claim; see the
+[preparation contract](../../docs/api/wasm.md#pdf-vector-graphics-state-preparation-and-fidelity-report).
+Qualified positive dash patterns on open and closed straight subpaths preserve
+phase, odd-array repetition, subpath reset, joins across vertices and run caps.
+The closing edge participates in the pattern. PDF 1.0–1.7 retain caps where the
+first and last on-dash pieces meet at the closure seam; PDF 2.0 joins them.
+PDF.js's effective format version is bound into the page DTO; an unknown version
+reports `dashVersion`, and a PDF 1.x dash covering the complete closed perimeter
+reports `dashTopology`. Explicit close-path and close-and-stroke operators share
+the versioned behavior.
+Combined fill and dashed-stroke paints can still refuse atomically when
+multiple run boundaries produce crossings outside the current fill-region
+qualifier.

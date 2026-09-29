@@ -95,25 +95,37 @@ fn string_literal(input: &[u8]) -> IResult<&[u8], Token<'_>> {
     ))(input)
 }
 
-/// Parse integer: 42, -42
+/// Parse integer: 42, -42, +42
+///
+/// ISO 10303-21 spells `INTEGER` as `[ SIGN ] DIGIT { DIGIT }` with
+/// `SIGN = '+' | '-'`, so a leading `+` is as legal as a leading `-`. Accepting
+/// only `-` dropped the WHOLE entity, not just the attribute: every caller of
+/// `parse_entity` discards a record that fails to tokenize
+/// (`let Ok(..) = .. else { continue }`). The exponent sign below already
+/// accepted both, `fast_float2::parse_partial` (the fast reader in `decoder.rs`)
+/// accepts `+`, and the TypeScript half reads values with `parseFloat`, so the
+/// same file used to decode differently in the browser and in wasm.
 /// Uses lexical-core for 10x faster parsing
 #[inline]
 fn integer(input: &[u8]) -> IResult<&[u8], Token<'_>> {
-    map_res(recognize(tuple((opt(char('-')), digit1))), |s: &[u8]| {
+    map_res(recognize(tuple((opt(one_of("+-")), digit1))), |s: &[u8]| {
         lexical_core::parse::<i64>(s)
             .map(Token::Integer)
             .map_err(|_| "parse error")
     })(input)
 }
 
-/// Parse float: 3.14, -3.14, 1.5E-10, 0., 1.
+/// Parse float: 3.14, -3.14, +3.14, 1.5E-10, 0., 1.
 /// IFC allows floats like "0." without decimal digits
+///
+/// `REAL` carries the same `[ SIGN ]` as `INTEGER`; see [`integer`] for why a
+/// rejected sign costs the whole entity.
 /// Uses lexical-core for 10x faster parsing
 #[inline]
 fn float(input: &[u8]) -> IResult<&[u8], Token<'_>> {
     map_res(
         recognize(tuple((
-            opt(char('-')),
+            opt(one_of("+-")),
             digit1,
             char('.'),
             opt(digit1), // Made optional to support "0." format
@@ -157,6 +169,21 @@ fn derived(input: &[u8]) -> IResult<&[u8], Token<'_>> {
 const MAX_NESTING_DEPTH: u32 = 256;
 
 /// Parse typed value: IFCPARAMETERVALUE(0.), IFCBOOLEAN(.T.)
+///
+/// The type name and its `(` are usually adjacent, but a STEP writer's line
+/// wrap can land exactly between them - measured on a real file where 39 of
+/// 175 `IFCSURFACESTYLERENDERING` entities wrap as `…MEASURE\r\n(1.)`. Without
+/// `ws` here, `char('(')` sees `\r` and the whole entity fails to parse, which
+/// silently dropped it from every full-file walk (`decode_at_uncached` returns
+/// `Err`, and every caller's `let Ok(..) = .. else { continue }` skips it) -
+/// the entity was never malformed, just wrapped where the parser assumed it
+/// never would be.
+///
+/// An EMPTY argument list also needs `ws` on both sides of the parens
+/// (`IFCLABEL(\r\n)`), not just before `(`: `separated_list0` matches zero
+/// items without consuming anything, so with a bare `char(')')` any
+/// whitespace or comment before the `)` left it unconsumed and the whole
+/// typed value failed to parse (#3789).
 fn typed_value_at_depth(input: &[u8], depth: u32) -> IResult<&[u8], Token<'_>> {
     map(
         pair(
@@ -164,11 +191,14 @@ fn typed_value_at_depth(input: &[u8], depth: u32) -> IResult<&[u8], Token<'_>> {
             take_while1(|c: u8| c.is_ascii_alphanumeric() || c == b'_'),
             // Arguments
             delimited(
-                char('('),
-                separated_list0(delimited(ws, char(','), ws), move |i| {
-                    token_at_depth(i, depth)
-                }),
-                char(')'),
+                pair(ws, char('(')),
+                preceded(
+                    ws,
+                    separated_list0(delimited(ws, char(','), ws), move |i| {
+                        token_at_depth(i, depth)
+                    }),
+                ),
+                pair(ws, char(')')),
             ),
         ),
         |(type_name, args)| Token::TypedValue(type_name, args),
@@ -232,14 +262,19 @@ fn list(input: &[u8]) -> IResult<&[u8], Token<'_>> {
     list_at_depth(input, 0)
 }
 
+/// An EMPTY list (`( )`, `(\r\n)`, `(/* empty */)`) needs `ws` explicitly
+/// around the empty `separated_list0`: it matches zero items without
+/// consuming anything, so a bare `char(')')` failed to parse past any
+/// whitespace or comment left between the parens (#3789, same shape as
+/// `typed_value_at_depth`'s empty-args fix).
 fn list_at_depth(input: &[u8], depth: u32) -> IResult<&[u8], Token<'_>> {
     map(
         delimited(
-            char('('),
+            pair(char('('), ws),
             separated_list0(delimited(ws, char(','), ws), move |i| {
                 token_at_depth(i, depth)
             }),
-            char(')'),
+            pair(ws, char(')')),
         ),
         Token::List,
     )(input)
@@ -272,11 +307,16 @@ where
                 ws,
             ),
         ),
-        // Arguments: ('guid', 'owner', ...)
+        // Arguments: ('guid', 'owner', ...). `ws` around the empty
+        // `separated_list0` handles an EMPTY argument list separated from
+        // its `)` by whitespace or a comment (`#1=IFCX(\r\n);`), the same
+        // shape as `list_at_depth`'s and `typed_value_at_depth`'s fix
+        // (#3789): with zero items `separated_list0` consumes nothing, so
+        // a bare `char(')')` failed to parse past it.
         delimited(
-            char('('),
+            pair(char('('), ws),
             separated_list0(delimited(ws, char(','), ws), token),
-            tuple((char(')'), ws, char(';'))),
+            tuple((ws, char(')'), ws, char(';'))),
         ),
     ))(input);
 

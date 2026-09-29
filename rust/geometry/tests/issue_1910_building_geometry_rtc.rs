@@ -13,7 +13,7 @@
 //! in `rust/processing/src/processor/mod.rs` (server) and
 //! `rust/wasm-bindings/src/api/gpu_meshes/prepass.rs` (browser/wasm) never
 //! scheduled the building's `IfcProductDefinitionShape` for meshing at all —
-//! independent of RTC. As a side effect, `detect_rtc_offset_from_first_element`
+//! independent of RTC. As a side effect, the whole-file RTC detector
 //! (which scans the same `has_geometry_by_name`-filtered entity set) also
 //! sampled zero translations and reported a `(0, 0, 0)` offset for this file,
 //! matching the symptom reported in the issue.
@@ -32,8 +32,25 @@
 //! ~5 400 000 (UTM zone 32N scale), all placements identity, geometry hangs
 //! off `IFCBUILDING` rather than a building element.
 
-use ifc_lite_core::{build_entity_index, has_geometry_by_name, EntityDecoder, EntityScanner};
+use ifc_lite_core::{
+    build_entity_index, has_geometry_by_name, EntityDecoder, EntityScanner, RtcVerdict,
+};
 use ifc_lite_geometry::GeometryRouter;
+
+/// The offset the mesh pipelines actually subtract for a whole file: the live
+/// detector's verdict, read the live way (zero for `Small`). These tests used
+/// to call `detect_rtc_offset_from_first_element`, the same sampler without the
+/// verdict or the placement-bounds fallback, which had no production caller
+/// left (#4611).
+fn detected_offset(
+    router: &GeometryRouter,
+    content: &str,
+    decoder: &mut EntityDecoder,
+) -> (f64, f64, f64) {
+    router
+        .detect_rtc_offset_for_file(content.as_bytes(), decoder)
+        .map_or((0.0, 0.0, 0.0), RtcVerdict::offset)
+}
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -126,7 +143,7 @@ fn building_only_geometry_is_scheduled_and_meshes() {
     );
 }
 
-/// `detect_rtc_offset_from_first_element` must now see the building's raw
+/// The whole-file RTC detector must now see the building's raw
 /// UTM-scale vertex (~500 000 / ~5 400 000) via the same fixed job-eligible
 /// entity set and report a large offset instead of `(0, 0, 0)`.
 #[test]
@@ -136,11 +153,11 @@ fn building_only_geometry_rtc_offset_is_no_longer_zero() {
     let mut decoder = EntityDecoder::with_index(&content, entity_index);
     let router = GeometryRouter::with_units(&content, &mut decoder);
 
-    let offset = router.detect_rtc_offset_from_first_element(&content, &mut decoder);
+    let verdict = router.detect_rtc_offset_for_file(content.as_bytes(), &mut decoder);
 
     assert!(
-        offset.0.abs() > 10_000.0 || offset.1.abs() > 10_000.0,
-        "expected a large RTC offset once the building's geometry is sampled, got {offset:?}"
+        matches!(verdict, Some(RtcVerdict::Large { .. })),
+        "expected a Large verdict once the building's geometry is sampled, got {verdict:?}"
     );
 }
 
@@ -154,8 +171,7 @@ fn building_only_geometry_is_small_after_rtc_is_applied() {
     let mut decoder = EntityDecoder::with_index(&content, entity_index);
     let mut router = GeometryRouter::with_units(&content, &mut decoder);
 
-    let offset = router.detect_rtc_offset_from_first_element(&content, &mut decoder);
-    router.set_rtc_offset(offset);
+    router.set_rtc_offset(detected_offset(&router, &content, &mut decoder));
 
     let entity = decoder.decode_by_id(40).expect("IFCBUILDING #40 must decode");
     let mesh = router

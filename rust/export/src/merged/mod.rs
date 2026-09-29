@@ -25,38 +25,28 @@
 
 mod empty;
 mod guid;
+mod header;
 mod line_edit;
 mod plan;
+mod single_parents;
 mod spatial;
 mod units;
+mod warnings;
 
 use std::collections::{HashMap, HashSet};
 
 use crate::schema_detect::detect_schema;
-use crate::step_text::escape;
 
 use guid::{read_leading_guid, replace_global_id, GuidMinter};
 pub use guid::{deterministic_global_id, leading_rooted_global_id};
 use line_edit::{rewrite_refs, LineDecision};
 use plan::{build_plan, model_salt, ModelIndex, PlanCtx};
-use units::{resolve_length_scale, resolve_model_modes};
+use crate::schema_ifc2x3_slots::Ifc2x3SlotFill;
+use crate::schema_enum::ConversionChecks;
+use units::resolve_model_modes;
+pub use units::UnitReconciliation;
 
 pub use spatial::{ContainerMergeStrategy, StoreyMergeStrategy};
-
-/// How to reconcile models whose length unit differs from the first model's.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum UnitReconciliation {
-    /// Federate an incompatible-unit model as its own `IfcProject` (JS default).
-    #[default]
-    Auto,
-    /// Request rescaling into the first model's unit. Not performed natively in
-    /// this iteration: an incompatible model is federated and
-    /// [`MergedStats::unit_rescale_required`] is set for the caller to gate.
-    Normalize,
-    /// Treat every model as sharing the first model's unit (no compatibility
-    /// check) — unify regardless of the declared length unit.
-    AssumeShared,
-}
 
 /// A single input model for [`export_merged_models`].
 pub struct MergedModel<'a> {
@@ -162,21 +152,9 @@ pub fn export_merged_with_stats(models: &[&[u8]], opts: &MergedOptions) -> (Stri
 /// Merge several parsed models into one STEP/IFC string, honoring per-model
 /// visibility, spatial-merge strategies, and unit reconciliation.
 pub fn export_merged_models(models: &[MergedModel], opts: &MergedOptions) -> (String, MergedStats) {
-    let schema = opts
-        .schema
-        .clone()
-        .or_else(|| models.first().map(|m| detect_schema(m.content)))
-        .unwrap_or_else(|| "IFC4".to_string());
+    let schema = header::output_schema(models, opts);
 
-    let mut out = String::new();
-    out.push_str("ISO-10303-21;\nHEADER;\n");
-    out.push_str(&format!("FILE_DESCRIPTION(('{}'),'2;1');\n", escape(&opts.description)));
-    out.push_str(&format!(
-        "FILE_NAME('','',(''),(''),'{}','ifc-lite-export','');\n",
-        escape(&opts.application)
-    ));
-    out.push_str(&format!("FILE_SCHEMA(('{}'));\n", escape(&schema)));
-    out.push_str("ENDSEC;\nDATA;\n");
+    let mut out = header::merged_header(opts, &schema);
 
     let mut stats = MergedStats {
         models: models.len(),
@@ -198,8 +176,26 @@ pub fn export_merged_models(models: &[MergedModel], opts: &MergedOptions) -> (St
     // emission would leave later models dangling a `#ref` to a line never written
     // (Greptile P1 / CR). An excluded canonical simply isn't a target — later
     // models then keep their own project/infra/containers (less dedup, still valid).
+    // Total `#<digits>` references above `u32::MAX` refused (issue #3421)
+    // while resolving every model's reachable set below. Surfaced in
+    // `stats.warnings` once the loop finishes — see `resolve_included`'s doc
+    // for why this is a diagnostic about the source file, not a completeness
+    // gap in the merge (#3752).
+    let mut refused_refs_total = 0usize;
+    // #5116: a non-rooted type with no representation in the target schema
+    // (e.g. `IfcCartesianPointList3D` downgraded to IFC2X3) cannot become an
+    // `IFCPROXY` either, so `convert_step_line` errs instead of guessing.
+    // `export_merged_models` has no fallible signature to propagate that
+    // through today, and this is common enough real-world input (any IFC4
+    // model with tessellated geometry) that panicking here would abort a
+    // merge that the SINGLE-model path only ever silently mis-converted —
+    // a regression, not an improvement. Counted here and kept as the prior
+    // (pass-through-unchanged) behavior instead; see the fallback below.
+    let mut unrepresented_types_kept: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // `None`: the emit loop below re-resolves model 0 at i == 0 and is the
+    // scan that gets reported (CodeRabbit, PR #3766).
     let first = ModelIndex::build(models[0].content);
-    let first_included = plan::resolve_included(&first, &models[0].included);
+    let first_included = plan::resolve_included(&first, &models[0].included, None);
     let canonical_project = first.projects.iter().copied().find(|id| first_included.contains(id));
     let first_infra: HashMap<&'static str, u32> = first
         .first_infra
@@ -214,7 +210,7 @@ pub fn export_merged_models(models: &[MergedModel], opts: &MergedOptions) -> (St
         &|id| first.line_str(id),
         &|id| first.type_of.get(&id).cloned(),
     );
-    let primary_scale = resolve_length_scale(models[0].content);
+    let primary_scale = units::primary_scale(models);
     drop(first);
 
     // Unit verdicts for every model, resolved once: the empty-container pre-pass
@@ -229,11 +225,14 @@ pub fn export_merged_models(models: &[MergedModel], opts: &MergedOptions) -> (St
     let mut emitted_guids: HashSet<String> = HashSet::new();
     let mut minter = GuidMinter::new();
     let mut offset: u32 = 0;
+    let mut slot_fill = Ifc2x3SlotFill::new(None);
+    let mut checks = ConversionChecks::new(); // IFC4-required `$` slots (#5307), enums (#5365)
+    let mut parents = single_parents::ParentClaims::for_schema(&schema); // one rel per single-valued inverse (#5727, #5802, #5774, #5923)
 
     for (i, model) in models.iter().enumerate() {
         let is_first = i == 0;
         let index = ModelIndex::build(model.content);
-        let included = plan::resolve_included(&index, &model.included);
+        let included = plan::resolve_included(&index, &model.included, Some(&mut refused_refs_total));
         // Placing this model would push the merged EXPRESS-id space past u32::MAX,
         // so stop here instead: the file emitted so far is valid, and the unmerged
         // tail is reported for the caller to gate. `plan::next_offset` is the single
@@ -279,6 +278,15 @@ pub fn export_merged_models(models: &[MergedModel], opts: &MergedOptions) -> (St
             salt: salt.clone(),
         });
 
+        // IFC2X3 `$` OwnerHistory: this model's first written one, else an earlier model's (#4686).
+        if crate::schema_convert::targets_ifc2x3(&schema) {
+            slot_fill.prefer(index.order.iter().copied().find(|&id| {
+                index.type_of.get(&id).is_some_and(|t| t == "IFCOWNERHISTORY")
+                    && included.contains(&id)
+                    && !plan.skip.contains(&id)
+            }).map(|id| id.saturating_add(offset)));
+        }
+
         // Emit.
         let source_schema = detect_schema(model.content);
         let converting = crate::schema_convert::needs_conversion(&source_schema, &schema);
@@ -311,21 +319,52 @@ pub fn export_merged_models(models: &[MergedModel], opts: &MergedOptions) -> (St
                 Some(g) => replace_global_id(&remapped, g),
                 None => remapped,
             };
-            let mut final_text = if converting {
+            let final_text = if converting {
                 // Pass the GLOBAL id (offset applied): a schema downgrade with no
                 // target type falls back to IFCPROXY with a `placeholder_guid(id)`
                 // GlobalId, so two models sharing a source-local id must not seed the
                 // same placeholder (Greptile P1). rewrite_refs already offset the
                 // line's own `#id`, so this keeps the proxy guid consistent with it.
-                crate::schema_convert::convert_step_line(
+                //
+                // Falls back to the UNCONVERTED line on `Err`, not `?`/panic:
+                // unlike the single-model `step.rs` path (which already threads a
+                // `Result` out through `std::io::Result`), `export_merged`/
+                // `export_merged_models` have no fallible signature at all, and
+                // giving them one is a separate, deliberate API change this fix
+                // does not make -- the same scope choice the TypeScript twin's
+                // `merged-exporter.ts` documents for its own withholding
+                // optimization (#5114). Unlike a rare edge case, a non-rooted type
+                // with no target representation is COMMON real-world input (any
+                // IFC4 model with tessellated geometry -- IfcCartesianPointList3D,
+                // IfcTriangulatedFaceSet, IfcIndexedPolyCurve -- has one), so
+                // panicking here would abort a merge the single-model path only
+                // ever silently mis-converted before #5116: a regression, not an
+                // improvement, and unrecoverable through the wasm ABI (no
+                // unwinding). Keeping the prior pass-through behavior and
+                // reporting it in `stats.warnings` is a real fix for every OTHER
+                // type (rooted-proxy and renamed types both now convert
+                // correctly here too) without a new abort path for the one this
+                // signature genuinely cannot express yet.
+                match crate::schema_convert::convert_step_line(
                     &after_guid,
                     &source_schema,
                     &schema,
                     id.saturating_add(offset),
-                )
+                    &mut slot_fill,
+                    Some(&mut checks),
+                ) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        unrepresented_types_kept.insert(e.entity_type);
+                        after_guid.clone()
+                    }
+                }
             } else {
                 after_guid
             };
+
+            let ty = index.type_of.get(&id).map_or("", String::as_str);
+            let Some(mut final_text) = parents.claim(ty, final_text, !is_first && compatible) else { continue };
 
             if let Some(local_guid) = plan.local_guids.get(&id) {
                 let mut emitted = read_leading_guid(&final_text)
@@ -363,13 +402,10 @@ pub fn export_merged_models(models: &[MergedModel], opts: &MergedOptions) -> (St
         offset = next;
     }
 
-    if stats.federated_model_count > 0 {
-        stats.warnings.push(format!(
-            "{} model(s) had an incompatible length unit and were federated as separate IfcProject instances (relaxing IfcSingleProjectInstance).",
-            stats.federated_model_count
-        ));
-    }
-
+    warnings::push_merge_warnings(&mut stats, refused_refs_total, unrepresented_types_kept, &schema);
+    stats.warnings.extend(slot_fill.warnings());
+    stats.warnings.extend(checks.warnings());
+    stats.warnings.extend(parents.apply_folds(&mut out)); // #5774 folds, after every model is written
     out.push_str("ENDSEC;\nEND-ISO-10303-21;\n");
     (out, stats)
 }

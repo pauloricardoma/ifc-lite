@@ -45,7 +45,20 @@ export type {
   IDSEnumerationConstraint,
   IDSBoundsConstraint,
 
-  // Validation results
+  // Validation results — generalised report (issue #5138)
+  ValidationSource,
+  SpecificationSummary,
+  RequirementSummary,
+  CheckKind,
+  FailureReasonCode,
+  SetResult,
+  RequirementResult,
+  EntityResult,
+  SpecificationResult,
+  ValidationReport,
+  ValidationModelInfo,
+
+  // Validation results — IDS-specific narrowings
   IDSValidationReport,
   IDSModelInfo,
   IDSValidationSummary,
@@ -80,10 +93,25 @@ export type {
 export { parseIDS, IDSParseError } from './parser/xml-parser.js';
 
 // ============================================================================
+// Material bridge
+// ============================================================================
+
+// Flattens the parser's hierarchical material graph into flat `{name,
+// category}` candidates, duplicating each Category under its own entry.
+// Shared with the viewer's selector-adapted `material` filter rule so
+// "does material=X match this element" has exactly one implementation
+// instead of the IDS material facet and the viewer growing separate,
+// driftable answers to the same question.
+export { flattenMaterials } from './bridge/materials.js';
+
+// ============================================================================
 // Validation
 // ============================================================================
 
-export { validateIDS } from './validation/validator.js';
+export { validateIDS, calculateSummary } from './validation/validator.js';
+
+// Runtime narrowing for the generalised report (#5138) — see report-guards.ts.
+export { isIDSValidationReport } from './report-guards.js';
 
 // ============================================================================
 // Facets
@@ -111,6 +139,10 @@ export {
   formatConstraint,
   getConstraintMismatchReason,
 } from './constraints/index.js';
+
+// The one XSD-regex -> JS-regex translator, shared with `@ifc-lite/rules`'
+// IDS import (#5225) so an imported pattern means what the checker reads.
+export { translateXsdRegex, type TranslateResult } from './constraints/xsd-regex.js';
 
 // ============================================================================
 // Audit (IDS document correctness)

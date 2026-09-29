@@ -106,6 +106,8 @@ function resetStore(): void {
     clashResult: null,
     clashGroups: null,
     clashSelectedId: null,
+    clashRunning: false,
+    clashProgress: null,
     clashSortBy: 'severity',
     clashHideTouching: false,
     clashStatusFilter: new Set(['open', 'resolved', 'accepted']),
@@ -113,6 +115,15 @@ function resetStore(): void {
 }
 
 describe('ClashPanel surfaces the existing clash grouping as coordination issues', () => {
+  it('replaces Detect all with a working Cancel control during a run (#5831)', () => {
+    useViewerStore.setState({ clashRunning: true });
+    const container = renderPanel();
+    const cancel = [...container.querySelectorAll('button')].find((button) => button.textContent?.includes('Cancel detection'));
+    assert.ok(cancel);
+    act(() => cancel.click());
+    assert.equal(useViewerStore.getState().clashRunning, false);
+  });
+
   beforeEach(() => {
     resetStore();
   });
@@ -221,16 +232,24 @@ describe('ClashPanel surfaces the existing clash grouping as coordination issues
 
     // Exactly one group header rendered (the touching cluster's section has no
     // visible members left, per `issueSections`'s `.filter((s) => s.items.length > 0)`).
-    // Group headers carry `aria-label="Expand/Collapse <group label>"`; the
-    // per-clash "show both objects" toggle also has `aria-expanded` but no
-    // `aria-label`, so this selector is specific to group rows.
-    const groupHeaders = container.querySelectorAll('button[aria-expanded][aria-label]');
+    // Group headers carry `aria-label="Expand/Collapse <group label>"`. Other
+    // disclosures have `aria-expanded` too (the per-clash "show both objects"
+    // toggle, and the help toggle, whose IconButton label is its name), so
+    // match the group rows by their label.
+    const groupHeaders = [...container.querySelectorAll('button[aria-expanded][aria-label]')]
+      .filter((b) => /^(Expand|Collapse) /.test(b.getAttribute('aria-label') ?? ''));
     assert.equal(groupHeaders.length, 1, 'the emptied cluster must not render a group row either');
 
-    // The header count next to "Issues" must say 1, not 2. (Adjacent spans mean
-    // `textContent` has no space between the number and the word, e.g. "1issue".)
-    const text = container.textContent ?? '';
-    assert.ok(/(?:^|[^0-9])1\s*issue/i.test(text), `expected the header to read "1 issue"; got: ${text}`);
-    assert.ok(!/(?:^|[^0-9])2\s*issues?/i.test(text), `header must not also claim 2 issues; got: ${text}`);
+    // Scope this to the summary description. The manual Groups toggle also
+    // renders its numeric count immediately before the summary in DOM text,
+    // so scanning the whole panel can concatenate `1` + `1 issue` as `11
+    // issue` even though the visible layout separates them.
+    const summary = [...container.querySelectorAll('span')]
+      .map((span) => span.textContent ?? '')
+      .find((text) => /\bissues?\b/i.test(text));
+    assert.ok(summary && /(?:^|[^0-9])1\s*issue/i.test(summary),
+      `expected the summary to read "1 issue"; got: ${summary ?? '<missing>'}`);
+    assert.ok(!/(?:^|[^0-9])2\s*issues?/i.test(summary),
+      `summary must not also claim 2 issues; got: ${summary}`);
   });
 });

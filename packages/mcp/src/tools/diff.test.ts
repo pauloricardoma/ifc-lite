@@ -106,6 +106,8 @@ interface ContentDiffShape {
     headTruncated: boolean;
   }>;
   truncatedMatches: number;
+  splitMerges?: Array<{ kind: string; confidence: string; whole: string; pieces: string[] }>;
+  successors?: Array<{ confidence: string; base: string; head: string; overlap: number; distance: number }>;
 }
 
 interface DiffShape {
@@ -229,10 +231,13 @@ describe('model_diff by_content', () => {
     // pair, and the check is inert unless BOTH sides supply them.
     expect(fingerprints.every((f) => f.components?.['attr:core'] !== undefined)).toBe(true);
 
-    // The IfcTask is an IfcObjectDefinition the columnar parser does not put in
-    // its EntityTable (it is not an IfcProduct subtype), so `getGlobalId`
-    // answers ''. Reading the table alone drops it from the comparison
-    // entirely; the chain check sends it to its STEP record instead.
+    // The IfcTask is an IfcObjectDefinition that is not an IfcProduct subtype.
+    // Before #4204's IfcRoot-descendant retention, the columnar parser did not
+    // put it in its EntityTable and `getGlobalId` answered '', so reading the
+    // table alone dropped it from the comparison entirely and the chain check
+    // had to send it to its STEP record instead. Now #4204 retains every
+    // IfcRoot descendant, so the table holds it directly — this pins that it
+    // still ends up correctly in the comparison either way.
     expect(byKey.get(guid('OLDT'))).toBe('IfcTask');
     // And with a real class name, not the table's 'Unknown': ifcType is hashed
     // into the fingerprint and cross-checked on every content match, so
@@ -355,6 +360,29 @@ ${twinWallsBody(guid('MXE'), guid('MXF'))}`));
     expect(content.contentMatches).toHaveLength(1);
     expect(content.contentMatches[0].kind).toBe('ambiguous');
     expect(content.truncatedMatches).toBe(2);
+  }, 30_000);
+
+  it('split_merge / successors are wired through but produce no claims — this server has no geometry pipeline (issue #4956)', async () => {
+    // Both stages are geometry-only. This server always compares at `scope:
+    // 'data'`, so the engine abstains on both regardless of the flags —
+    // pinning that the params are accepted and threaded to `diffModels`
+    // without throwing, and that the honest "absent, not empty" answer comes
+    // back rather than a fabricated `[]`.
+    const off = await diff({ a: 'base', b: 'head', by_content: true });
+    expect(off.contentDiff?.splitMerges).toBeUndefined();
+    expect(off.contentDiff?.successors).toBeUndefined();
+
+    const on = await diff({
+      a: 'base',
+      b: 'head',
+      by_content: true,
+      split_merge: true,
+      successors: true,
+    });
+    expect(on.contentDiff?.splitMerges).toBeUndefined();
+    expect(on.contentDiff?.successors).toBeUndefined();
+    // The rest of the comparison is unaffected by the two flags.
+    expect(on.contentDiff?.counts).toEqual(off.contentDiff?.counts);
   }, 30_000);
 });
 

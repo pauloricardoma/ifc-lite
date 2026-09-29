@@ -22,17 +22,12 @@
  */
 
 import React, { useMemo, useState } from 'react';
-import {
-  AlertCircle,
-  AlertTriangle,
-  CheckCircle2,
-  ChevronDown,
-  ChevronRight,
-  Info,
-  Loader2,
-} from 'lucide-react';
+import { AlertCircle, AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Info } from 'lucide-react';
+import { Spinner } from '@/components/ui/spinner';
 import type { IDSAuditIssue, IDSAuditReport, IDSAuditSeverity } from '@ifc-lite/ids';
 import { cn } from '@/lib/utils';
+import { useTranslation } from '@/i18n';
+import type { TranslationKey } from '@/i18n/en';
 
 interface IDSAuditSummaryProps {
   report: IDSAuditReport | null;
@@ -57,8 +52,8 @@ const SEVERITY_ORDER: Record<IDSAuditSeverity, number> = {
 const SEVERITY_TOKENS: Record<
   IDSAuditSeverity,
   {
-    label: string;
-    pluralLabel: string;
+    labelKey: TranslationKey;
+    pluralLabelKey: TranslationKey;
     dot: string;
     rail: string;
     chipBg: string;
@@ -69,8 +64,8 @@ const SEVERITY_TOKENS: Record<
   }
 > = {
   error: {
-    label: 'error',
-    pluralLabel: 'errors',
+    labelKey: 'idsPanel.audit.severity.error',
+    pluralLabelKey: 'idsPanel.audit.severity.errors',
     dot: 'bg-red-500',
     rail: 'border-l-red-500',
     chipBg: 'bg-red-500/10',
@@ -80,8 +75,8 @@ const SEVERITY_TOKENS: Record<
     iconClass: 'text-red-500',
   },
   warning: {
-    label: 'warning',
-    pluralLabel: 'warnings',
+    labelKey: 'idsPanel.audit.severity.warning',
+    pluralLabelKey: 'idsPanel.audit.severity.warnings',
     dot: 'bg-amber-500',
     rail: 'border-l-amber-500',
     chipBg: 'bg-amber-500/10',
@@ -91,8 +86,8 @@ const SEVERITY_TOKENS: Record<
     iconClass: 'text-amber-500',
   },
   info: {
-    label: 'note',
-    pluralLabel: 'notes',
+    labelKey: 'idsPanel.audit.severity.note',
+    pluralLabelKey: 'idsPanel.audit.severity.notes',
     dot: 'bg-sky-400',
     rail: 'border-l-sky-400',
     chipBg: 'bg-sky-400/10',
@@ -112,6 +107,7 @@ export function IDSAuditSummary({
   auditing = false,
   className,
 }: IDSAuditSummaryProps): React.ReactElement | null {
+  const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
   const [filter, setFilter] = useState<SeverityFilter>('all');
 
@@ -148,18 +144,17 @@ export function IDSAuditSummary({
   // Auditing in flight — quietly mark the spot.
   if (auditing && !report) {
     return (
-      <div
+      <output
         className={cn(
           'flex items-center gap-2 rounded-md border border-border/60 bg-muted/30 px-3 py-2 text-xs text-muted-foreground',
           'animate-fade-in-up',
           className
         )}
-        role="status"
         aria-live="polite"
       >
-        <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
-        <span>Auditing IDS document…</span>
-      </div>
+        <Spinner size="sm" />
+        <span>{t('idsPanel.audit.auditing')}</span>
+      </output>
     );
   }
 
@@ -179,7 +174,7 @@ export function IDSAuditSummary({
         )}
       >
         <CheckCircle2 className="h-4 w-4" aria-hidden="true" />
-        <span>Document is valid — no audit issues</span>
+        <span>{t('idsPanel.audit.documentValid')}</span>
       </div>
     );
   }
@@ -191,7 +186,7 @@ export function IDSAuditSummary({
         'overflow-hidden rounded-md border border-border/70 bg-card animate-fade-in-up',
         className
       )}
-      aria-label="IDS document audit summary"
+      aria-label={t('idsPanel.audit.summaryLabel')}
     >
       <button
         type="button"
@@ -206,25 +201,25 @@ export function IDSAuditSummary({
           {(['error', 'warning', 'info'] as IDSAuditSeverity[]).map((sev) => {
             const n = counts[sev];
             if (n === 0) return null;
-            const t = SEVERITY_TOKENS[sev];
+            const tok = SEVERITY_TOKENS[sev];
             return (
               <span key={sev} className="inline-flex items-center gap-1.5">
                 <span
-                  className={cn('h-1.5 w-1.5 rounded-full', t.dot)}
+                  className={cn('h-1.5 w-1.5 rounded-full', tok.dot)}
                   aria-hidden="true"
                 />
-                <span className={cn('font-mono tabular-nums', t.chipFg)}>
+                <span className={cn('font-mono tabular-nums', tok.chipFg)}>
                   {n}
                 </span>
                 <span className="text-muted-foreground">
-                  {n === 1 ? t.label : t.pluralLabel}
+                  {n === 1 ? t(tok.labelKey) : t(tok.pluralLabelKey)}
                 </span>
               </span>
             );
           })}
         </span>
         <span className="flex items-center gap-1 text-xs text-muted-foreground">
-          <span>{expanded ? 'Hide' : 'Details'}</span>
+          <span>{expanded ? t('idsPanel.audit.hide') : t('idsPanel.audit.details')}</span>
           {expanded ? (
             <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />
           ) : (
@@ -239,18 +234,18 @@ export function IDSAuditSummary({
           <div className="flex items-center gap-1 border-b border-border/60 bg-muted/20 px-2 py-1.5">
             {(
               [
-                { key: 'all', label: `All (${totalIssues})` },
+                { key: 'all', label: t('idsPanel.audit.tabAll', { count: totalIssues }) },
                 counts.error > 0 && {
                   key: 'error',
-                  label: `Errors (${counts.error})`,
+                  label: t('idsPanel.audit.tabErrors', { count: counts.error }),
                 },
                 counts.warning > 0 && {
                   key: 'warning',
-                  label: `Warnings (${counts.warning})`,
+                  label: t('idsPanel.audit.tabWarnings', { count: counts.warning }),
                 },
                 counts.info > 0 && {
                   key: 'info',
-                  label: `Notes (${counts.info})`,
+                  label: t('idsPanel.audit.tabNotes', { count: counts.info }),
                 },
               ].filter(Boolean) as Array<{
                 key: SeverityFilter;
@@ -262,7 +257,7 @@ export function IDSAuditSummary({
                 type="button"
                 onClick={() => setFilter(tab.key)}
                 className={cn(
-                  'rounded px-2 py-0.5 text-[11px] transition-colors',
+                  'rounded px-2 py-0.5 text-2xs transition-colors',
                   filter === tab.key
                     ? 'bg-foreground text-background'
                     : 'text-muted-foreground hover:bg-muted/60 hover:text-foreground'
@@ -280,7 +275,7 @@ export function IDSAuditSummary({
             ))}
             {visibleIssues.length === 0 && (
               <li className="px-3 py-3 text-xs text-muted-foreground">
-                No issues match the selected filter.
+                {t('idsPanel.audit.noIssuesMatch')}
               </li>
             )}
           </ul>
@@ -300,8 +295,9 @@ interface IssueRowProps {
 }
 
 function IssueRow({ issue, index }: IssueRowProps): React.ReactElement {
+  const { t } = useTranslation();
   const [open, setOpen] = useState(false);
-  const t = SEVERITY_TOKENS[issue.severity];
+  const tok = SEVERITY_TOKENS[issue.severity];
   const hasDetail =
     !!issue.path ||
     (issue.detail !== undefined && Object.keys(issue.detail).length > 0);
@@ -310,7 +306,7 @@ function IssueRow({ issue, index }: IssueRowProps): React.ReactElement {
     <li
       className={cn(
         'group border-l-2 px-3 py-1.5 text-xs transition-colors hover:bg-muted/30',
-        t.rail,
+        tok.rail,
         // Stagger reveal — capped so long lists don't take seconds.
         'animate-fade-in-up'
       )}
@@ -326,15 +322,15 @@ function IssueRow({ issue, index }: IssueRowProps): React.ReactElement {
         )}
         aria-expanded={hasDetail ? open : undefined}
       >
-        <span className={cn('mt-0.5 shrink-0', t.iconClass)}>{t.icon}</span>
+        <span className={cn('mt-0.5 shrink-0', tok.iconClass)}>{tok.icon}</span>
         <span className="min-w-0 flex-1 space-y-1">
           <span className="flex flex-wrap items-baseline gap-2">
             <code
               className={cn(
-                'shrink-0 rounded border px-1.5 py-0 font-mono text-[10px] uppercase tracking-tight leading-relaxed',
-                t.chipBg,
-                t.chipFg,
-                t.chipBorder
+                'shrink-0 rounded border px-1.5 py-0 font-mono text-2xs uppercase tracking-tight leading-relaxed',
+                tok.chipBg,
+                tok.chipFg,
+                tok.chipBorder
               )}
             >
               {issue.code}
@@ -344,26 +340,26 @@ function IssueRow({ issue, index }: IssueRowProps): React.ReactElement {
           {hasDetail && open && (
             <div className="ml-1 mt-1.5 space-y-1 border-l border-border/60 pl-2">
               {issue.path && (
-                <div className="flex gap-2 font-mono text-[11px]">
-                  <span className="text-muted-foreground/70">path</span>
+                <div className="flex gap-2 font-mono text-2xs">
+                  <span className="text-muted-foreground">{t('idsPanel.audit.path')}</span>
                   <span className="break-all text-muted-foreground">
                     {issue.path}
                   </span>
                 </div>
               )}
               {issue.facetType && (
-                <div className="flex gap-2 font-mono text-[11px]">
-                  <span className="text-muted-foreground/70">facet</span>
+                <div className="flex gap-2 font-mono text-2xs">
+                  <span className="text-muted-foreground">{t('idsPanel.audit.facet')}</span>
                   <span className="text-muted-foreground">
                     {issue.facetType}
                   </span>
                 </div>
               )}
               {issue.detail && Object.keys(issue.detail).length > 0 && (
-                <div className="flex flex-col gap-0.5 font-mono text-[11px]">
+                <div className="flex flex-col gap-0.5 font-mono text-2xs">
                   {Object.entries(issue.detail).map(([k, v]) => (
                     <div key={k} className="flex gap-2">
-                      <span className="text-muted-foreground/70">{k}</span>
+                      <span className="text-muted-foreground">{k}</span>
                       <span className="break-all text-muted-foreground">
                         {String(v)}
                       </span>

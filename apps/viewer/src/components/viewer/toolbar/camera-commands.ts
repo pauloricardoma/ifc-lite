@@ -3,24 +3,17 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * The camera command set — Home, zoom, the six preset views and the 90°
- * rotations — as ONE ordered list, shared by the classic toolbar and the
- * ribbon so neither style can host a camera command the other lacks.
+ * The camera command set — Home, zoom, six preset views and 90°
+ * rotations — in ribbon order. Camera callbacks stay behind this table so
+ * keyboard metadata and visible controls share command ids.
  *
- * This exists because they did fork: `rotateLeft`/`rotateRight` landed with
- * a single call site in the ribbon's View tab (#1829), leaving the classic
- * toolbar with no way to rotate the camera at all, and the same change hid
- * the viewport's desktop zoom cluster from BOTH styles on the (ribbon-only)
- * grounds that the ribbon owned those controls. A list is the fix that
- * scales: a command added here reaches both surfaces without anyone
- * remembering to wire the second one.
- *
- * Icons and rendering live in `CameraCommands.tsx` — the icon module is a
- * Vite virtual module, so keeping the command data here is what lets the
- * dispatch be asserted in a plain node test.
+ * Icons and rendering live in `CameraCommands.tsx`; keeping command data
+ * here lets dispatch be asserted in a plain Node test.
  */
 
+import type { TranslationKey } from '@/i18n';
 import type { CameraCallbacks } from '@/store/types';
+import type { KeyCommandId } from '@/lib/commands/keyboard-commands';
 
 export type CameraCommandId =
   | 'home'
@@ -45,25 +38,19 @@ export type CameraCommandGroup = 'camera' | 'preset' | 'rotate';
 
 export interface CameraCommand {
   id: CameraCommandId;
-  /** Short button caption. */
-  label: string;
-  /** Longer tooltip when the label isn't the whole story. */
-  tooltip: string;
-  /** Keyboard shortcut, where one exists (see `useKeyboardShortcuts`). */
-  shortcut?: string;
+  /** Longer tooltip; the registered surface command owns the button label. */
+  tooltipKey: TranslationKey;
+  /** Keyboard command naming this action's key, where one exists (`lib/commands`). */
+  shortcut?: KeyCommandId;
   group: CameraCommandGroup;
-  /**
-   * True when users press it repeatedly (zoom, rotate). Menu surfaces stay
-   * open on select for these; a menu that closes after one 90° step makes a
-   * half-turn a four-click errand.
-   */
+  /** Repeated zoom and rotation action. */
   repeatable?: boolean;
   run: () => void;
 }
 
 export interface CameraCommandContext {
   callbacks: CameraCallbacks;
-  /** Home also resets visibility, so it is more than a camera pose — injected. */
+  /** Camera Home is shared across the toolbar and ribbon. */
   goHome: () => void;
 }
 
@@ -71,96 +58,84 @@ export function buildCameraCommands({ callbacks, goHome }: CameraCommandContext)
   return [
     {
       id: 'home',
-      label: 'Isometric',
-      tooltip: 'Home (isometric + reset visibility)',
-      shortcut: 'H',
+      tooltipKey: 'cameraCommands.home.tooltip',
+      shortcut: 'camera.home',
       group: 'camera',
       run: () => goHome(),
     },
     {
       id: 'zoomIn',
-      label: 'Zoom in',
-      tooltip: 'Zoom in',
+      tooltipKey: 'cameraCommands.zoomIn.tooltip',
       group: 'camera',
       repeatable: true,
       run: () => callbacks.zoomIn?.(),
     },
     {
       id: 'zoomOut',
-      label: 'Zoom out',
-      tooltip: 'Zoom out',
+      tooltipKey: 'cameraCommands.zoomOut.tooltip',
       group: 'camera',
       repeatable: true,
       run: () => callbacks.zoomOut?.(),
     },
     {
       id: 'fitAll',
-      label: 'Fit all',
-      tooltip: 'Fit all in view',
-      shortcut: 'Z',
+      tooltipKey: 'cameraCommands.fitAll.tooltip',
+      shortcut: 'camera.fitAll',
       group: 'camera',
       run: () => callbacks.fitAll?.(),
     },
     {
       id: 'viewTop',
-      label: 'Top',
-      tooltip: 'Top view',
-      shortcut: '1',
+      tooltipKey: 'cameraCommands.viewTop.tooltip',
+      shortcut: 'camera.viewTop',
       group: 'preset',
       run: () => callbacks.setPresetView?.('top'),
     },
     {
       id: 'viewBottom',
-      label: 'Bottom',
-      tooltip: 'Bottom view',
-      shortcut: '2',
+      tooltipKey: 'cameraCommands.viewBottom.tooltip',
+      shortcut: 'camera.viewBottom',
       group: 'preset',
       run: () => callbacks.setPresetView?.('bottom'),
     },
     {
       id: 'viewFront',
-      label: 'Front',
-      tooltip: 'Front view',
-      shortcut: '3',
+      tooltipKey: 'cameraCommands.viewFront.tooltip',
+      shortcut: 'camera.viewFront',
       group: 'preset',
       run: () => callbacks.setPresetView?.('front'),
     },
     {
       id: 'viewBack',
-      label: 'Back',
-      tooltip: 'Back view',
-      shortcut: '4',
+      tooltipKey: 'cameraCommands.viewBack.tooltip',
+      shortcut: 'camera.viewBack',
       group: 'preset',
       run: () => callbacks.setPresetView?.('back'),
     },
     {
       id: 'viewLeft',
-      label: 'Left',
-      tooltip: 'Left view',
-      shortcut: '5',
+      tooltipKey: 'cameraCommands.viewLeft.tooltip',
+      shortcut: 'camera.viewLeft',
       group: 'preset',
       run: () => callbacks.setPresetView?.('left'),
     },
     {
       id: 'viewRight',
-      label: 'Right',
-      tooltip: 'Right view',
-      shortcut: '6',
+      tooltipKey: 'cameraCommands.viewRight.tooltip',
+      shortcut: 'camera.viewRight',
       group: 'preset',
       run: () => callbacks.setPresetView?.('right'),
     },
     {
       id: 'rotateLeft',
-      label: 'Rotate left',
-      tooltip: 'Rotate left 90°',
+      tooltipKey: 'cameraCommands.rotateLeft.tooltip',
       group: 'rotate',
       repeatable: true,
       run: () => callbacks.rotateLeft?.(),
     },
     {
       id: 'rotateRight',
-      label: 'Rotate right',
-      tooltip: 'Rotate right 90°',
+      tooltipKey: 'cameraCommands.rotateRight.tooltip',
       group: 'rotate',
       repeatable: true,
       run: () => callbacks.rotateRight?.(),

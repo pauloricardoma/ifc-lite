@@ -10,11 +10,17 @@
  */
 
 import { EntityNode } from '@ifc-lite/query';
+import { iterateEffectiveEntityIds } from '@ifc-lite/mutations';
 import { IFC_ENTITY_NAMES } from '@ifc-lite/data';
-import { diffModels, type ContentMatch, type ContentMatchKind } from '@ifc-lite/diff';
 import type { Tool } from './types.js';
 import { okResult, assertModelAccess } from './util.js';
-import { buildModelFingerprints, type DiffRef } from './diff-fingerprints.js';
+import { parseAuthoredKeySpec } from '@ifc-lite/parser';
+import {
+  contentDiff,
+  describeCounts,
+  DEFAULT_MAX_GROUP_MEMBERS,
+  DEFAULT_MAX_MATCHES,
+} from './diff-content.js';
 import { foldedTypeCounts, pendingMutationsField, pendingOverlay, type PendingOverlay } from '../overlay.js';
 import type { LoadedModel, ToolContext } from '../context.js';
 import { ToolErrorCode, ToolExecutionError } from '../errors.js';
@@ -34,125 +40,6 @@ function resolveTwo(ctx: ToolContext, a: string, b: string) {
   assertModelAccess(ctx, left);
   assertModelAccess(ctx, right);
   return { left, right };
-}
-
-/** Default cap on the listed `contentMatches`. Per-kind totals are reported
- *  whole, so the cap bounds the payload without hiding anything. */
-const DEFAULT_MAX_MATCHES = 200;
-
-/**
- * Default cap on the GlobalIds listed per side of one match.
- *
- * `max_matches` bounds how many groups come back, not how big one is, and a
- * `duplicated` / `deduplicated` / `ambiguous` group is a set of candidates that
- * in a repetitive model can run to thousands of entities on each side. Without
- * this, `max_matches: 1` could still return a model-sized payload and overflow
- * the context window the cap exists to protect.
- *
- * 20 is chosen against what the list is *for*. A group is the engine declining
- * to guess, so its members are a hand-off to the caller; twenty candidates on a
- * side is already past what anyone resolves by reading a list rather than by
- * querying the two models. The overwhelmingly common match is a 1:1 `renamed`
- * pair, which this never touches. Every group still reports `baseCount` and
- * `headCount` whole, computed before the cap for the same reason
- * `contentMatchCounts` is: truncation must never be what makes a model look
- * cleanly matched.
- */
-const DEFAULT_MAX_GROUP_MEMBERS = 20;
-
-/**
- * Kinds an agent has to resolve itself, listed before the ones the engine
- * already retired. Truncating the list must never be what drops the
- * "we could not tell" groups.
- */
-const UNRESOLVED_FIRST: ContentMatchKind[] = [
-  'ambiguous',
-  'duplicated',
-  'deduplicated',
-  'moved',
-  'reshaped',
-  'renamed',
-];
-
-/**
- * Run the real `@ifc-lite/diff` engine over two loaded models (issue #1891).
- *
- * **Data scope only.** This server has no geometry pipeline, so there is no
- * world geometry hash and no bounding box; `scope: 'data'` is the honest
- * description of what it can see, and every unambiguous 1:1 content match is
- * therefore reported as `renamed` rather than `moved`/`reshaped`. See
- * `diff-fingerprints.ts`.
- */
-function contentDiff(
-  left: LoadedModel,
-  right: LoadedModel,
-  overlays: { left: PendingOverlay | null; right: PendingOverlay | null },
-  maxMatches: number,
-  maxGroupMembers: number,
-): Record<string, unknown> {
-  const diff = diffModels(
-    buildModelFingerprints(left.store, overlays.left),
-    buildModelFingerprints(right.store, overlays.right),
-    { scope: 'data', matchUnpairedByContent: true },
-  );
-
-  const matches = [...(diff.contentMatches ?? [])].sort(
-    (a: ContentMatch<DiffRef>, b: ContentMatch<DiffRef>) =>
-      UNRESOLVED_FIRST.indexOf(a.kind) - UNRESOLVED_FIRST.indexOf(b.kind),
-  );
-  const byKind: Record<string, number> = {};
-  for (const match of matches) byKind[match.kind] = (byKind[match.kind] ?? 0) + 1;
-
-  return {
-    scope: diff.scope,
-    counts: diff.counts,
-    // Whole totals, computed before the cap: an agent reading `contentMatches`
-    // can always tell whether the list it got is the whole story.
-    contentMatchCounts: byKind,
-    contentMatches: matches.slice(0, maxMatches).map((match) => ({
-      kind: match.kind,
-      ifcType: match.base[0]?.ifcType ?? match.head[0]?.ifcType,
-      // Groups are reported as groups. Collapsing a `duplicated` or
-      // `ambiguous` set to a single pair would be the engine guessing, which
-      // is exactly what it refuses to do (#1923). Long groups are cut to
-      // `maxGroupMembers` per side and say so, whole size included, so a cut
-      // group still reads as a group of that size.
-      ...listSide('base', match.base, maxGroupMembers),
-      ...listSide('head', match.head, maxGroupMembers),
-      ...(match.distance !== undefined ? { distance: match.distance } : {}),
-    })),
-    truncatedMatches: Math.max(0, matches.length - maxMatches),
-    // Uncommitted edits are folded into the comparison; saying how many there
-    // are is what separates "the two files differ" from "this session has
-    // edits it has not written yet". Absent when neither model has any.
-    //
-    // `pendingMutations` is the scalar every other payload carries; the split a
-    // two-model comparison can additionally give lives under its own name rather
-    // than overloading that one.
-    ...pendingMutationsField(overlays.left, overlays.right),
-    ...(overlays.left || overlays.right
-      ? {
-        pendingMutationsBySide: {
-          base: overlays.left?.pendingMutations ?? 0,
-          head: overlays.right?.pendingMutations ?? 0,
-        },
-      }
-      : {}),
-  };
-}
-
-/** One side of a match: the (capped) keys, the whole count, and whether the
- *  list was cut. Emits `base`/`baseCount`/`baseTruncated` (or `head…`). */
-function listSide(
-  side: 'base' | 'head',
-  entities: ReadonlyArray<{ key: string }>,
-  maxGroupMembers: number,
-): Record<string, unknown> {
-  return {
-    [side]: entities.slice(0, maxGroupMembers).map((entity) => entity.key),
-    [`${side}Count`]: entities.length,
-    [`${side}Truncated`]: entities.length > maxGroupMembers,
-  };
 }
 
 const modelDiff: Tool = {
@@ -175,7 +62,7 @@ const modelDiff: Tool = {
         description:
           'Run the @ifc-lite/diff engine with content-keyed matching over every IfcObjectDefinition. '
           + 'Adds `contentDiff` with added/modified/deleted/unchanged counts and the content matches '
-          + '(renamed / moved / reshaped are resolved; duplicated / deduplicated / ambiguous are listed '
+          + '(renamed / moved / reshaped / respecified are resolved; duplicated / deduplicated / ambiguous are listed '
           + 'as groups for you to resolve). Data scope only — this server has no geometry pipeline.',
       },
       max_matches: {
@@ -186,6 +73,14 @@ const modelDiff: Tool = {
           'Cap on the listed content matches (by_content only). Unresolved groups are listed first and '
           + '`contentMatchCounts` always reports whole per-kind totals.',
       },
+      key_from: {
+        type: 'string',
+        description:
+          'Compare on an authored identifier instead of GlobalId (by_content only): "Tag", or '
+          + '"<PsetName>.<PropertyName>" such as "Pset_Asset.AssetId". An entity carrying a non-empty, '
+          + 'unique value is keyed on it; the rest keep their GlobalId. Values shared by several entities '
+          + 'are listed in duplicateAuthoredKeys.',
+      },
       max_group_members: {
         type: 'integer',
         default: DEFAULT_MAX_GROUP_MEMBERS,
@@ -194,6 +89,23 @@ const modelDiff: Tool = {
           'Cap on the GlobalIds listed per side of one match (by_content only). A duplicated / '
           + 'deduplicated / ambiguous group can hold thousands. `baseCount` / `headCount` always report '
           + 'the whole size and `baseTruncated` / `headTruncated` say whether the list was cut.',
+      },
+      split_merge: {
+        type: 'boolean',
+        default: false,
+        description:
+          'Opt in to the split/merge detector (by_content only, issue #4956). Geometry-only stage: '
+          + 'this server has no geometry pipeline yet, so `contentDiff.splitMerges` currently stays '
+          + 'absent regardless of this flag — wired through so it starts producing claims the moment '
+          + 'one lands, with no client-side change.',
+      },
+      successors: {
+        type: 'boolean',
+        default: false,
+        description:
+          'Opt in to the successor-match detector: suggestions that one deleted entity was replaced '
+          + 'in place by one added entity (by_content only, issue #4956). Same geometry-only caveat as '
+          + '`split_merge` — `contentDiff.successors` currently stays absent on this server.',
       },
     },
     required: ['a', 'b'],
@@ -235,6 +147,13 @@ const modelDiff: Tool = {
     // Opt-in, and deliberately so. An `ambiguous` group has no honest scalar
     // form, so turning this on by default would change what `counts` means
     // under agent scripts that already read this tool.
+    const keyFrom = typeof input.key_from === 'string' && input.key_from.trim() ? input.key_from.trim() : undefined;
+    if (keyFrom !== undefined && !parseAuthoredKeySpec(keyFrom)) {
+      throw new ToolExecutionError({
+        code: ToolErrorCode.INVALID_INPUT,
+        message: 'key_from must be "Tag" or "<PsetName>.<PropertyName>", got "' + keyFrom + '"',
+      });
+    }
     const content = (input.by_content as boolean | undefined) ?? false
       ? contentDiff(
         left,
@@ -242,6 +161,9 @@ const modelDiff: Tool = {
         { left: leftOverlay, right: rightOverlay },
         (input.max_matches as number | undefined) ?? DEFAULT_MAX_MATCHES,
         (input.max_group_members as number | undefined) ?? DEFAULT_MAX_GROUP_MEMBERS,
+        keyFrom,
+        (input.split_merge as boolean | undefined) ?? false,
+        (input.successors as boolean | undefined) ?? false,
       )
       : null;
 
@@ -273,25 +195,13 @@ const modelDiff: Tool = {
 /** Every GlobalId the session has, queued creates and deletes applied. */
 function collectGlobalIds(model: LoadedModel, overlay: PendingOverlay | null): Set<string> {
   const gids = new Set<string>();
-  for (const [, ids] of model.store.entityIndex.byType) {
-    for (const id of ids) {
-      if (overlay?.deleted.has(id)) continue;
-      const node = new EntityNode(model.store, id);
-      if (node.globalId) gids.add(node.globalId);
-    }
+  for (const { expressId, overlayCreated } of iterateEffectiveEntityIds(model.store, model.backend.getMutationView())) {
+    if (overlayCreated) continue; // The identified queued set is folded below.
+    const node = new EntityNode(model.store, expressId);
+    if (node.globalId) gids.add(node.globalId);
   }
   for (const entity of overlay?.created ?? []) gids.add(entity.globalId);
   return gids;
-}
-
-/** One-line human summary of the engine result, for the text block. */
-function describeCounts(content: Record<string, unknown>): string {
-  const counts = content.counts as { added: number; modified: number; deleted: number; unchanged: number };
-  const byKind = content.contentMatchCounts as Record<string, number>;
-  const kinds = Object.entries(byKind).map(([kind, n]) => `${n} ${kind}`).join(', ');
-  return `${counts.added} added, ${counts.modified} modified, ${counts.deleted} deleted, `
-    + `${counts.unchanged} unchanged`
-    + (kinds ? `; content matches: ${kinds}` : '; no content matches');
 }
 
 const quantityDiff: Tool = {

@@ -22,6 +22,8 @@
 //! holes. The buggy AABB fallback removed ~3% more material (each round/hex
 //! hole grew to its bounding box), which this tolerance rejects.
 
+mod support;
+
 use ifc_lite_core::{build_entity_index, EntityDecoder, EntityScanner};
 use ifc_lite_geometry::{propagate_voids_to_parts, GeometryRouter, Mesh};
 use rustc_hash::FxHashMap;
@@ -58,8 +60,8 @@ fn build_void_index_like_production(content: &str) -> FxHashMap<u32, Vec<u32>> {
 
 /// Sum of |XY area| of triangles lying on the mesh's bottom face (z ≈ z_min).
 /// For an extruded slab this equals the solid cross-section area: outer
-/// rectangle minus the holes. Round/hex holes ⇒ ~7.46e6; if a hole is cut to
-/// its bounding box instead ⇒ ~7.24e6.
+/// rectangle minus the holes. Round/hex holes ⇒ ~7.46 m²; if a hole is cut to
+/// its bounding box instead ⇒ ~7.24 m².
 fn bottom_cap_area(mesh: &Mesh) -> f64 {
     let mut z_min = f32::INFINITY;
     for p in mesh.positions.chunks_exact(3) {
@@ -67,7 +69,7 @@ fn bottom_cap_area(mesh: &Mesh) -> f64 {
             z_min = p[2];
         }
     }
-    let tol = 1e-3_f32;
+    let tol = 1e-6_f32;
     let mut area = 0.0f64;
     for tri in mesh.indices.chunks_exact(3) {
         let a = tri[0] as usize * 3;
@@ -90,12 +92,17 @@ fn bottom_cap_area(mesh: &Mesh) -> f64 {
 fn redundant_openings_do_not_rectangularize_profile_voids() {
     let content = match std::fs::read_to_string(fixture_path()) {
         Ok(s) => s,
-        Err(_) => {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            assert!(
+                !support::require_fixtures(),
+                "fixture missing at {FIXTURE} and IFC_LITE_REQUIRE_FIXTURES=1 -- run `pnpm fixtures` to download (sha256 in tests/models/manifest.json)"
+            );
             eprintln!(
                 "skipping issue-964 regression: fixture missing at {FIXTURE}; run `pnpm fixtures`"
             );
             return;
         }
+        Err(e) => panic!("fixture {FIXTURE} exists but could not be read: {e}"),
     };
 
     let void_index = build_void_index_like_production(&content);
@@ -106,14 +113,20 @@ fn redundant_openings_do_not_rectangularize_profile_voids() {
 
     let entity_index = build_entity_index(&content);
     let mut decoder = EntityDecoder::with_index(&content, entity_index);
-    let router = GeometryRouter::with_scale(1.0);
+    // The file is authored in millimetres; production meshes it in metres
+    // (the unit scale). This test drove the raw millimetre coordinates at
+    // scale 1.0 until #5410 made the host a consistently wound solid; at that
+    // non-production scale the exact kernel then leaves a thin crack in the
+    // bottom cap (35 open edges), while the production-scale cut is closed and
+    // within 0.04% of IfcOpenShell's volume.
+    let router = GeometryRouter::with_scale(0.001);
 
     let slab = decoder.decode_by_id(SLAB_ID).expect("decode slab");
 
     // Body alone (profile-with-voids): the reference correct hole area.
     let body = router.process_element(&slab, &mut decoder).expect("body");
     let body_area = bottom_cap_area(&body);
-    assert!(body_area > 1.0, "body produced no bottom cap");
+    assert!(body_area > 1.0e-3, "body produced no bottom cap");
 
     // Production void path: opening boolean cuts applied on top of the body.
     let slab = decoder.decode_by_id(SLAB_ID).expect("decode slab");

@@ -6,7 +6,7 @@
  * @ifc-lite/bcf - BIM Collaboration Format support
  *
  * This package provides BCF (BIM Collaboration Format) support for IFC-Lite.
- * It implements BCF 2.1 and 3.0 specifications for issue tracking in BIM projects.
+ * It implements BCF 2.1 and 3.0 specifications for topic tracking in BIM projects.
  *
  * @see https://github.com/buildingSMART/BCF-XML
  * @see https://www.buildingsmart.org/standards/bsi-standards/bim-collaboration-format/
@@ -71,6 +71,7 @@ export {
   createViewpoint,
   extractViewpointState,
 } from './viewpoint.js';
+export { translateViewpoint, viewpointFromWorld } from './viewpoint-frame.js';
 
 // 3D Overlay (viewer-agnostic marker positioning)
 export type {
@@ -82,10 +83,6 @@ export type {
   ComputeMarkersOptions,
 } from './overlay.js';
 export { computeMarkerPositions } from './overlay.js';
-
-// 3D Overlay DOM Renderer (browser-only, framework-agnostic)
-export type { BCFOverlayRendererOptions } from './overlay-renderer.js';
-export { BCFOverlayRenderer } from './overlay-renderer.js';
 
 // IDS → BCF reporter
 export type {
@@ -121,7 +118,7 @@ export function createBCFProject(options?: {
 }
 
 /**
- * Create a new BCF topic (issue)
+ * Create a new BCF topic
  */
 export function createBCFTopic(options: {
   title: string;

@@ -7,6 +7,14 @@
 //!
 //! Split out of `consolidate.rs` to keep it under the module-size ratchet.
 
+/// Rim noise as a fraction of a ring's own size, `2⁻¹³`, used by
+/// [`weld_near_coincident_2d`] before its absolute cap is applied.
+const RIM_NOISE_OF_SIZE: f64 = 1.0 / 8192.0;
+
+/// Physical ring-width noise limit, `2⁻¹²` metres. The legacy rim weld also
+/// uses this numeric value as a cap in caller units; its behavior is unchanged.
+const RIM_NOISE_CAP: f64 = 1.0 / 4096.0;
+
 /// Merge consecutive near-coincident 2D contour vertices BEFORE the union/earcut.
 ///
 /// The exact mesh-arrangement kernel correctly preserves two distinct rim points
@@ -52,7 +60,7 @@ pub(super) fn weld_near_coincident_2d(
     }
     // extent · 2⁻¹³ rounded DOWN to a power of two, capped at an absolute
     // 2⁻¹² m so big rings can't swallow mm-scale features ⇒ exact, deterministic.
-    let eps = (floor_pow2(extent) * 2.0_f64.powi(-13)).min(2.0_f64.powi(-12));
+    let eps = (floor_pow2(extent) * RIM_NOISE_OF_SIZE).min(RIM_NOISE_CAP);
     let eps2 = eps * eps;
     let mut kept: Vec<nalgebra::Point2<f64>> = Vec::with_capacity(n);
     for &p in ring {
@@ -130,6 +138,67 @@ pub(super) fn simplify_2d_collinear(ring: &[nalgebra::Point2<f64>]) -> Vec<nalge
         .filter_map(|(p, k)| if *k { Some(*p) } else { None })
         .collect()
 }
+
+/// One i_overlay union ring, cleaned for triangulation: rim duplicates welded
+/// (the #1007 diagonal-sliver source) BEFORE collinear phantoms are dropped, then
+/// `None` if what is left is noise ([`ring_is_noise`]).
+pub(super) fn clean_ring(
+    ring: &[[f64; 2]],
+    plane_area: f64,
+    length_unit_scale: f64,
+) -> Option<Vec<nalgebra::Point2<f64>>> {
+    let pts: Vec<_> = ring.iter().map(|p| nalgebra::Point2::new(p[0], p[1])).collect();
+    let simplified = simplify_2d_collinear(&weld_near_coincident_2d(&pts));
+    (!ring_is_noise(&simplified, plane_area, length_unit_scale)).then_some(simplified)
+}
+
+/// Is a simplified 2D ring noise? `plane_area` is the summed area of the plane
+/// bucket it came from. `length_unit_scale` is metres per caller unit; only the
+/// new width comparison is normalized, not the pre-existing absolute area floor
+/// or rim weld.
+///
+/// Noise is a ring under [`NOISE_AREA`], or one whose mean width
+/// `2·area / perimeter` is under [`RIM_NOISE_CAP`] metres and whose area is
+/// under [`NOISE_PLANE_SHARE`] of its plane. Multiplying area by metres per
+/// caller unit puts that width comparison in metres without changing the
+/// pre-existing caller-unit tests.
+///
+/// The width gate is what keeps a real opening on a large face, which the plane
+/// share alone filled (#4698). The share gate is what keeps a hairline ring that
+/// is most of its plane, such as a µm-deep reveal lip. Fewer than three vertices
+/// is noise.
+///
+pub(super) fn ring_is_noise(
+    ring: &[nalgebra::Point2<f64>],
+    plane_area: f64,
+    length_unit_scale: f64,
+) -> bool {
+    let n = ring.len();
+    if n < 3 {
+        return true;
+    }
+    let edges = || (0..n).map(|i| (ring[i], ring[(i + 1) % n]));
+    let twice_signed_area: f64 = edges().map(|(a, b)| a.x * b.y - b.x * a.y).sum();
+    let area = (twice_signed_area * 0.5).abs();
+    if area < NOISE_AREA {
+        return true;
+    }
+    if !(area < plane_area * NOISE_PLANE_SHARE) {
+        return false;
+    }
+    let perimeter: f64 = edges().map(|(a, b)| (b - a).norm()).sum();
+    2.0 * area * length_unit_scale < perimeter * RIM_NOISE_CAP
+}
+
+/// Absolute area floor for [`ring_is_noise`], in squared mesh units. Inherited
+/// from origin/main and still caller-unit-based. The physical width/share gate
+/// also catches small compact rings that occupy only a tiny share of their
+/// plane; the legacy floor can still differ by unit when that share gate is
+/// deliberately bypassed.
+const NOISE_AREA: f64 = 1.0e-8;
+
+/// Share of its plane under which a thin ring counts as noise ([`ring_is_noise`]).
+const NOISE_PLANE_SHARE: f64 = 1.0e-4;
 
 pub(super) fn floor_pow2(x: f64) -> f64 {
     if !x.is_finite() || x <= 0.0 {

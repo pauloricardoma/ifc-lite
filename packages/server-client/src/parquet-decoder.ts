@@ -10,97 +10,66 @@
  */
 
 import type { MeshData } from './types.js';
-import { buildMeshesFromTables, buildMeshesFromOptimizedTables } from './parquet-tables.js';
+import {
+  buildMeshesFromTables,
+  buildMeshesFromOptimizedTables,
+  type ArrowTableLike,
+} from './parquet-tables.js';
 
-// Ambient types in vendor-types.d.ts cover parquet-wasm and apache-arrow APIs.
+// Ambient types in vendor-types.d.ts cover the apache-arrow APIs used here.
+// parquet-wasm ships its own types, one set per build.
 
-// WASM initialization state
-let parquetInitialized = false;
-let parquetModule: typeof import('parquet-wasm/esm/arrow2.js') | null = null;
+// WASM initialization state. The in-flight promise is cached too, so
+// concurrent decodes share one init instead of racing two.
+type ParquetModule = typeof import('parquet-wasm');
+let parquetInit: Promise<ParquetModule> | null = null;
 
 /**
  * Ensure parquet-wasm WASM module is initialized.
  * This MUST be called before using any parquet functions.
- * 
+ *
  * @returns Initialized parquet-wasm module
  */
-export async function ensureParquetInit() {
-  if (parquetInitialized && parquetModule) {
-    return parquetModule;
+export async function ensureParquetInit(): Promise<ParquetModule> {
+  parquetInit ??= loadParquet().catch((err) => {
+    // Do not cache a failed init: a later call (e.g. after the WASM asset
+    // becomes reachable) should be able to try again.
+    parquetInit = null;
+    throw err;
+  });
+  return parquetInit;
+}
+
+async function loadParquet(): Promise<ParquetModule> {
+  // Import the package entry point and let its export map choose the build.
+  // Deep-importing a build (this module used `parquet-wasm/esm/arrow2.js`)
+  // breaks on parquet-wasm 0.6+, where that path no longer exists (#3845).
+  const parquet = await import('parquet-wasm');
+
+  // The browser/bundler ESM build does nothing until its default export is
+  // awaited; without it every call throws `Cannot read properties of
+  // undefined (reading '__wbindgen_malloc')`. The Node build initializes
+  // itself on import and exposes no default init, hence the guard rather
+  // than an unconditional call. Same shape as
+  // packages/export/src/columns-to-parquet.ts.
+  //
+  // The cast is the price of that guard: TypeScript resolves the export map
+  // under the `node` condition, so it only ever sees the Node build's types,
+  // where `default` is the CommonJS namespace object and not callable. Which
+  // build actually loads is a runtime question, so ask at runtime.
+  const init = (parquet as { default?: unknown }).default;
+  if (typeof init === 'function') {
+    await (init as () => Promise<unknown>)();
   }
 
-  console.log('[parquet-decoder] Starting WASM initialization...');
-
-  let parquet: typeof import('parquet-wasm/esm/arrow2.js') | undefined;
-
-  // Strategy 1: Try ESM build with explicit WASM URL (works with Vite)
-  try {
-    parquet = await import('parquet-wasm/esm/arrow2.js');
-    console.log('[parquet-decoder] Imported ESM build');
-
-    // ESM build requires calling init (default export) to load WASM
-    if (typeof parquet.default === 'function') {
-      console.log('[parquet-decoder] Calling ESM init to load WASM...');
-
-      // Get the WASM file URL - Vite handles this with ?url suffix
-      const wasmModule = await import('parquet-wasm/esm/arrow2_bg.wasm?url');
-      const wasmUrl = wasmModule.default;
-      console.log('[parquet-decoder] Loading WASM from:', wasmUrl);
-
-      // Pass the URL to init so it can fetch the WASM correctly
-      await parquet.default(wasmUrl);
-      console.log('[parquet-decoder] ESM WASM initialized');
-    }
-
-    if (typeof parquet.readParquet === 'function') {
-      parquetModule = parquet;
-      parquetInitialized = true;
-      console.log('[parquet-decoder] ESM build ready with readParquet');
-      return parquet;
-    } else {
-      console.warn('[parquet-decoder] ESM build initialized but readParquet not found');
-    }
-  } catch (e) {
-    console.warn('[parquet-decoder] ESM import failed:', e);
+  if (typeof parquet.readParquet !== 'function') {
+    throw new Error(
+      'parquet-wasm: module loaded but readParquet is missing. ' +
+        'Install a supported parquet-wasm version (see this package\'s peerDependencies).'
+    );
   }
 
-  // Strategy 2: Try web build with fetch (alternative for browsers)
-  try {
-    parquet = await import('parquet-wasm/esm/arrow2.js');
-
-    if (typeof parquet.default === 'function') {
-      console.log('[parquet-decoder] Trying web init with node_modules path...');
-
-      // Try common paths where WASM might be served
-      const wasmPaths = [
-        '/node_modules/parquet-wasm/esm/arrow2_bg.wasm',
-        './node_modules/parquet-wasm/esm/arrow2_bg.wasm',
-      ];
-
-      for (const wasmPath of wasmPaths) {
-        try {
-          const response = await fetch(wasmPath);
-          if (response.ok) {
-            console.log('[parquet-decoder] Found WASM at:', wasmPath);
-            await parquet.default(response);
-
-            if (typeof parquet.readParquet === 'function') {
-              parquetModule = parquet;
-              parquetInitialized = true;
-              console.log('[parquet-decoder] Web init successful');
-              return parquet;
-            }
-          }
-        } catch {
-          // Try next path
-        }
-      }
-    }
-  } catch (e2) {
-    console.warn('[parquet-decoder] Web init failed:', e2);
-  }
-
-  throw new Error('parquet-wasm: Could not load WASM module. Ensure parquet-wasm is installed and WASM files are accessible.');
+  return parquet;
 }
 
 /**
@@ -131,6 +100,27 @@ interface MeshMetadata {
  * @returns Decoded MeshData array
  */
 export async function decodeParquetGeometry(data: ArrayBuffer): Promise<MeshData[]> {
+  const { meshArrow, vertexArrow, indexArrow } = await readFlatTables(data);
+  // Column semantics (including the additive origin / geometry_class columns of
+  // issue #1841) live in `parquet-tables.ts` so they are unit-testable without
+  // booting parquet-wasm. Everything above is wire framing.
+  return buildMeshesFromTables(meshArrow, vertexArrow, indexArrow);
+}
+
+/** The three tables of one flat geometry blob, as Arrow tables. */
+export interface FlatTables {
+  meshArrow: ArrowTableLike;
+  vertexArrow: ArrowTableLike;
+  indexArrow: ArrowTableLike;
+}
+
+/**
+ * Read the `[len][mesh][len][vertex][len][index]` framing into its three
+ * tables, WITHOUT deciding what they mean. Split out of `decodeParquetGeometry`
+ * so the cross-batch stream reader (#5407) can put a batch's vertex and index
+ * tables behind the ones earlier batches sent before building meshes.
+ */
+export async function readFlatTables(data: ArrayBuffer): Promise<FlatTables> {
   // Initialize WASM module (only runs once)
   const parquet = await ensureParquetInit();
 
@@ -168,11 +158,7 @@ export async function decodeParquetGeometry(data: ArrayBuffer): Promise<MeshData
   const meshArrow = arrow.tableFromIPC(meshTable.intoIPCStream());
   const vertexArrow = arrow.tableFromIPC(vertexTable.intoIPCStream());
   const indexArrow = arrow.tableFromIPC(indexTable.intoIPCStream());
-
-  // Column semantics (including the additive origin / geometry_class columns of
-  // issue #1841) live in `parquet-tables.ts` so they are unit-testable without
-  // booting parquet-wasm. Everything above is wire framing.
-  return buildMeshesFromTables(meshArrow, vertexArrow, indexArrow);
+  return { meshArrow, vertexArrow, indexArrow };
 }
 
 /**
@@ -230,9 +216,15 @@ export async function decodeOptimizedParquetGeometry(
   // Read header
   const version = view.getUint8(offset);
   offset += 1;
-  if (version !== 2) {
+  // v2: no rotation columns (pre-#3575), every instance decodes as identity.
+  // v3: instance table carries rot0..rot8 (#3575) — `readRotationColumns`
+  // (parquet-tables.ts) reads them when present; `buildMeshesFromOptimizedTables`
+  // rejects a v3 payload that omits/truncates them (malformed wire data),
+  // rather than silently falling back to identity as it would for v2.
+  if (version !== 2 && version !== 3) {
     throw new Error(`Unsupported optimized Parquet version: ${version}`);
   }
+  const wireVersion: 2 | 3 = version;
 
   const flags = view.getUint8(offset);
   offset += 1;
@@ -284,6 +276,7 @@ export async function decodeOptimizedParquetGeometry(
     indexArrow,
     hasNormals,
     vertexMultiplier,
+    wireVersion,
   });
 }
 

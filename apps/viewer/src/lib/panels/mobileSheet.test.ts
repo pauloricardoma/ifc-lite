@@ -18,13 +18,11 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolveMobileSheet, type MobileSheetInput } from './mobileSheet.js';
 
-/** Nothing open: no extension, plain select tool, Information in the dock. */
+/** Nothing open: no extension, plain select tool, Properties in the dock. */
 const IDLE: MobileSheetInput = {
   hasAnalysisExtension: false,
   activeTool: 'select',
-  ganttVisible: false,
-  scriptVisible: false,
-  listVisible: false,
+  bottomPanel: null,
   sidebarActivePanel: 'properties',
 };
 
@@ -39,15 +37,15 @@ describe('mobile bottom sheet occupant', () => {
 
   it('prefers a bottom-strip panel over the docked side panel', () => {
     assert.deepEqual(
-      resolveMobileSheet({ ...IDLE, sidebarActivePanel: 'bcf', listVisible: true }),
+      resolveMobileSheet({ ...IDLE, sidebarActivePanel: 'bcf', bottomPanel: 'lists' }),
       { kind: 'panel', id: 'lists' },
     );
     assert.deepEqual(
-      resolveMobileSheet({ ...IDLE, scriptVisible: true }),
+      resolveMobileSheet({ ...IDLE, bottomPanel: 'script' }),
       { kind: 'panel', id: 'script' },
     );
     assert.deepEqual(
-      resolveMobileSheet({ ...IDLE, ganttVisible: true, scriptVisible: true, listVisible: true }),
+      resolveMobileSheet({ ...IDLE, bottomPanel: 'gantt' }),
       { kind: 'panel', id: 'gantt' },
     );
   });
@@ -69,9 +67,7 @@ describe('mobile bottom sheet occupant', () => {
       resolveMobileSheet({
         ...IDLE,
         activeTool: 'addElement',
-        ganttVisible: true,
-        scriptVisible: true,
-        listVisible: true,
+        bottomPanel: 'gantt',
       }),
       { kind: 'addElement' },
     );
@@ -90,7 +86,7 @@ describe('mobile bottom sheet occupant', () => {
         ...IDLE,
         hasAnalysisExtension: true,
         activeTool: 'addElement',
-        ganttVisible: true,
+        bottomPanel: 'gantt',
       }),
       { kind: 'extension' },
     );

@@ -16,7 +16,8 @@ import { join } from 'path';
 
 // Dependency order: geometry depends on core; clash is dependency-free;
 // processing depends on core+geometry; ffi (cdylib C bindings) depends on
-// processing; wasm depends on core+geometry+clash+processing.
+// processing; landxml depends on geometry; wasm depends on
+// core+geometry+clash+processing+landxml.
 export const CRATES = [
   'ifc-lite-core',
   // ifc-lite-clash must precede ifc-lite-geometry. geometry carries a
@@ -38,6 +39,10 @@ export const CRATES = [
   'ifc-lite-clash',
   'ifc-lite-geometry',
   'ifc-lite-processing',
+  // ifc-lite-landxml depends on geometry and must precede wasm, which pins it
+  // by version. It was missing from this list, so the release after #5078
+  // failed at wasm with "no matching package named `ifc-lite-landxml`".
+  'ifc-lite-landxml',
   // ifc-lite-export must precede ffi/wasm: wasm-bindings pins it by version
   // (HBJSON/KMZ exporters, #1235) and cargo resolves that against crates.io
   // at publish time. NOTE: the crate's FIRST publish cannot go through
@@ -139,6 +144,35 @@ export async function fetchVersionRecord(crate, ver, fetchImpl = fetch, opts = {
   const body = await res.json();
   if (body.errors) return null;
   return body.version ?? null;
+}
+
+/**
+ * Latest published baseline for a release gate. Only a real 404 or a valid
+ * crate record with no versions means "no baseline". HTTP errors, exhausted
+ * transient retries and malformed responses must reach the caller as errors;
+ * treating any of those as absence makes a published crate look uncheckable.
+ */
+export async function fetchLatestPublishedVersion(crate, fetchImpl = fetch, opts = {}) {
+  const res = await cratesIoGet(`https://crates.io/api/v1/crates/${crate}`, { fetchImpl, ...opts });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`crates.io returned ${res.status} for ${crate}`);
+
+  const body = await res.json();
+  if (!body?.crate || typeof body.crate !== 'object') {
+    throw new Error(`crates.io returned no crate record for ${crate}`);
+  }
+  if (!('max_stable_version' in body.crate) && !('max_version' in body.crate)) {
+    throw new Error(`crates.io returned no version fields for ${crate}`);
+  }
+  const stable = body.crate.max_stable_version;
+  const latest = body.crate.max_version;
+  if ([stable, latest].some((value) => value != null && (typeof value !== 'string' || !value))) {
+    throw new Error(`crates.io returned an invalid latest version for ${crate}`);
+  }
+  const version = stable ?? latest;
+  if (version === undefined) throw new Error(`crates.io returned an invalid latest version for ${crate}`);
+  if (version === null) return null;
+  return version;
 }
 
 /**

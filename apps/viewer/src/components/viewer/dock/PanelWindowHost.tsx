@@ -11,11 +11,12 @@
  * and make sure every child closes when the parent tab unloads.
  */
 
-import { useEffect } from 'react';
+import { useEffect, type ElementType, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { useSyncExternalStore } from 'react';
 import { PinOff, X, MonitorUp } from 'lucide-react';
 import { useViewerStore } from '@/store';
+import { useTranslation } from '@/i18n';
 import { getPanelDef } from '@/lib/panels/registry';
 import { renderPanelBody } from '@/lib/panels/renderPanelBody';
 import { PortalContainerProvider } from '@/components/ui/portal-container';
@@ -60,44 +61,66 @@ export function PanelWindowHost() {
 }
 
 function PanelWindowChrome({ entry }: { entry: PanelWindowEntry }) {
+  const { t, revision } = useTranslation();
   const def = getPanelDef(entry.id);
-  const Icon = def?.Icon;
   const dock = () => useViewerStore.getState().showWorkspacePanel(entry.id);
   const close = () => closePanelWindow(entry.id);
+  const title = def ? t(def.titleKey) : entry.id;
+
+  useEffect(() => {
+    entry.win.document.title = `${title} — ifc-lite`;
+  }, [entry.win, revision, title]);
 
   return (
     <PortalContainerProvider container={entry.win.document.body}>
+      <PanelWindowChromeShell title={title} Icon={def?.Icon} kind={entry.kind} onDock={dock} onClose={close}>
+        {renderPanelBody(entry.id, close)}
+      </PanelWindowChromeShell>
+    </PortalContainerProvider>
+  );
+}
+
+/** The rendered window surface also supplies real DOM classes to the contrast regression test. */
+export function PanelWindowChromeShell({ title, Icon, kind, onDock, onClose, children }: {
+  title: string;
+  Icon?: ElementType;
+  kind: PanelWindowEntry['kind'];
+  onDock: () => void;
+  onClose: () => void;
+  children: ReactNode;
+}) {
+  const { t } = useTranslation();
+  return (
     <div className="flex flex-col h-screen w-screen overflow-hidden bg-background text-foreground">
       <div className="flex items-center gap-2 h-9 shrink-0 px-2 border-b border-border bg-muted/40 select-none">
         {Icon && <Icon className="h-3.5 w-3.5 text-muted-foreground shrink-0" />}
-        <span className="text-xs font-medium truncate flex-1 min-w-0">{def?.title ?? entry.id}</span>
-        <span className="text-[9px] uppercase tracking-wide text-muted-foreground/70 shrink-0">
-          {entry.kind === 'pip' ? 'Picture-in-picture' : 'Window'}
+        <span className="text-xs font-medium truncate flex-1 min-w-0">{title}</span>
+        <span className="text-xs uppercase tracking-wide text-muted-foreground shrink-0">
+          {t(kind === 'pip' ? 'shellChrome.panelWindowHost.kindPip' : 'shellChrome.panelWindowHost.kindWindow')}
         </span>
         <button
           type="button"
-          title="Dock back into the sidebar"
-          onClick={dock}
+          title={t('shellChrome.panelWindowHost.dockTitle')}
+          onClick={onDock}
           className="h-6 w-6 inline-flex items-center justify-center rounded hover:bg-muted transition-colors"
         >
           <PinOff className="h-3.5 w-3.5" />
         </button>
         <button
           type="button"
-          title="Close window"
-          onClick={close}
+          title={t('shellChrome.panelWindowHost.closeWindowTitle')}
+          onClick={onClose}
           className="h-6 w-6 inline-flex items-center justify-center rounded hover:bg-muted transition-colors"
         >
           <X className="h-3.5 w-3.5" />
         </button>
       </div>
-      <div className="flex-1 min-h-0 overflow-hidden">{renderPanelBody(entry.id, close)}</div>
+      <div className="flex-1 min-h-0 overflow-hidden">{children}</div>
       {/* Decorative hint strip — reinforces that this content is live. */}
-      <div className="flex items-center gap-1.5 h-5 shrink-0 px-2 border-t border-border bg-muted/30 text-[9px] text-muted-foreground/70 select-none">
+      <div className="flex items-center gap-1.5 h-5 shrink-0 px-2 border-t border-border bg-muted/30 text-xs text-muted-foreground select-none">
         <MonitorUp className="h-3 w-3" />
-        <span>Live · synced with the main window</span>
+        <span>{t('shellChrome.panelWindowHost.liveSyncedNotice')}</span>
       </div>
     </div>
-    </PortalContainerProvider>
   );
 }

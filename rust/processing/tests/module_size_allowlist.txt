@@ -6,18 +6,40 @@
 # The rule: shrink or split. When you split a file below 400, delete its row
 # (the total must trend DOWN). Only ADD a row with a written justification.
 # Regenerated against the branch's merge base; refresh on rebase if a listed
+# file's count moved under you. After a merge conflict HERE, never pick a side:
+# diff both sides against the merge base, row by row (the rule and the two git
+# commands are in scripts/module-size-allowlist.txt). scripts/check-module-size.mjs
+# judges every row of this file that differs from the merge base against the
+# file's measured count and fails a hand-picked number; a duplicate row fails
+# in module_size_ratchet.rs (#4388).
      756 apps/server/src/services/parquet_data_model.rs
      581 apps/server/src/services/parquet_optimized.rs
-     522 apps/server/src/services/parquet.rs
 # +8: add set_entity_index setter so the processor can install its inline-built index (perf/single-scan).
 # +50: add the per-worker placement-transform memo (field + take/set/get/cache methods), mirroring point_cache (perf/placement-cache).
     1064 rust/core/src/decoder.rs
 # -35: the ePSet MapUnit label rules moved to unit_labels.rs, next to the unit
 # tables they resolve through (#3292); 793 -> 758.
      758 rust/core/src/georef.rs
-     445 rust/core/src/model_bounds.rs
-     601 rust/core/src/parser/scanner.rs
-     463 rust/core/src/parser/tokenizer.rs
+# -50: data_section_start (the STEP HEADER-skip, self-contained, no scanner
+# state) split out to scanner_header.rs (62 lines, under budget, no row) to
+# bring this file back under budget after a merge combined two independent
+# feature additions to it (#3673's four-scanner comment-trivia work and
+# #3699's unterminated-record reporting) past the recorded 601; 606 -> 557.
+# -105: same move again for the same reason. has_non_null_attribute (one
+# per-ATTRIBUTE walk over an already-located span, sharing no state with the
+# record scan) split out to scanner_attributes.rs (125 lines, under budget, no
+# row) to make room for #4179's record-boundary rules and their recovery;
+# 557 -> 453.
+# -31: and once more. The four refusal/drop accessors, which are a reporting
+# surface with no control flow shared with the record hunt, split out to
+# scanner_diagnostics.rs (67 lines, under budget, no row) to make room for
+# #4179 review finding 2, which needed every dropped offset kept rather than
+# only the first; 453 -> 422.
+# scanner.rs row removed: and once more, this time clear of the limit.
+# find_entity_end (one walk over an already-located record body, sharing no
+# control flow with the declaration hunt) split out to scanner_record_end.rs
+# (113 lines, under budget, no row) so the quadratic-recovery fix and its
+# doc had room; 422 -> 361, under 400, so the exemption goes.
 # +3: Arc<Vec<AttributeValue>> so DecodedEntity clone is a refcount bump not a deep attribute-tree clone (perf/decode-churn).
     553 rust/core/src/schema_gen.rs
 # schema_helpers.rs row removed: the merged upstream #1969 split its tests into
@@ -31,12 +53,29 @@
 # +4: build the index once in parallel on the fail-closed try_/project_glb_size large-model GLB paths (perf/parallel-scan).
 # +81: emissive-material knob for KMZ/Google Earth (#1427) - make_material lit/unlit/emissive branch + emissive param threaded through build_gltf/export_glb_from_meshes and their tests.
     4028 rust/export/src/gltf.rs
-# COLLADA (.dae) exporter that embeds geometry in the KMZ (#1427); cohesive single-purpose module.
-# -205: #2628 review follow-up split the inline #[cfg(test)] mod out to collada_tests.rs
-# (ratchet-exempt) to make room for the composed KMZ heading+up-axis orientation
-# invariant test without growing this file; budget refreshed downward.
-    430 rust/export/src/collada.rs
+# NEW (#5116): a non-rooted type with no representation in the target schema
+# (common real-world input: any IFC4 model with tessellated geometry) must not
+# panic here, since export_merged/export_merged_models have no fallible
+# signature to propagate a clean error through (unlike the single-model
+# step.rs path, which does). Falls back to the prior pass-through behavior
+# and reports every affected type in stats.warnings instead.
+# #5307 (Rust twin of #5202): an Ifc4SlotCheck alongside the Ifc2x3SlotFill
+# (declare, pass, report its warning), +4 lines.
+     420 rust/export/src/merged/mod.rs
+# Row DELETED: the COLLADA document WRITER moved verbatim to collada_document.rs
+# so collada.rs could take try_export_collada_from_meshes and come
+# back under the 400-line rule instead of raising this budget to 470.
      468 rust/export/src/model.rs
+# NEW (#5116): port the TypeScript exporter's resolveUnrepresentedEntity
+# fallback (proxy a rooted type with no target representation, error for a
+# non-rooted one) instead of silently passing an unmapped type through
+# unchanged. The bulk of the new logic lives in schema_unrepresented.rs
+# (a fresh, well-under-budget module); this is only the one call site plus
+# the Result-returning signature changes that ripple through convert_record's
+# existing early returns.
+# #5307 (Rust twin of #5202): the ifc4_slots parameter, its doc line and the
+# IFC4X3/IFC5 -> IFC4 count arm in convert_step_line, +5 lines.
+     413 rust/export/src/schema_convert.rs
 # -140 net: text-level STEP primitives (escape/detect_schema/refs_in_line/
 # split_top_level_args/apply_attr_mutations) split out to step_text.rs, making
 # room for the backslash-doubling fix to escape() without raising this
@@ -62,7 +101,10 @@
 # -60: #3442 review — union_mesh/union_meshes moved to csg/union.rs (85 lines, under
 # the house limit, no row) so the un-audited union_pair the #3440 census needs has
 # somewhere to live; budget refreshed downward.
-     611 rust/geometry/src/csg/mod.rs
+# -48: #3440 pre-flight — the four accept paths' repeated two-gate block collapsed
+# into ClippingProcessor::accept_gates_reject in csg/topology_diagnostic.rs (208
+# lines, under the house limit, no row); budget refreshed downward.
+     563 rust/geometry/src/csg/mod.rs
  # -73: #1806 watertight-extrude tests split out to extrusion_watertight_tests.rs (ratchet-exempt); budget refreshed downward.
 # +9: #1806 review — extrude_profile_watertight rejects < 3-vertex hole rings before
 # triangulation (triangulate_constrained drops them from the cap while create_side_walls
@@ -86,7 +128,13 @@
 # weld; engagement gated to coordinates that need it). The derivation lives inline at the
 # anchor (Step 1.5); its regression tests moved to facet_weld_scoped_tests.rs
 # (ratchet-exempt), netting the module below the prior budget; budget refreshed downward.
-          907 rust/geometry/src/facet_weld.rs
+# +16: the cell-dedup contract for refine_high_aspect_slivers (#4698). Doc
+# prose only, no code: the pass's 100 um cell dedup also closes
+# near-duplicate cracks and drops collapsed triangles, which the census depends
+# on (552 of 2227 rebuilds over the local corpus), and that was recorded nowhere.
+# A caller reading "bisect high-aspect slivers" could not know it. The doc is +18 lines; the row moves 16 because #4745 freed
+# two in the same file; 907 -> 923.
+          923 rust/geometry/src/facet_weld.rs
 # +87: the #3341 far-endpoint soundness guarantee (`sound_far`) and the argument
 # it rests on, which has to be local because the comment it replaces asserted a
 # safety property that is FALSE for non-convex operands. All +75 is NEW code and
@@ -97,13 +145,6 @@
      566 rust/geometry/src/kernel/fixed.rs
 # NEW (#1655): register-resident FixedInt<K> newtype backing the exact predicate cascade; large because it is a drop-in for bnum's I512 and must carry the full num_traits + std::ops trait surface (16 impls) the fixed_impl! macro binds. Its differential fuzz is split into the sibling tests.rs, kept under budget.
      630 rust/geometry/src/kernel/fixed_int/mod.rs
-# +39: begin()/tripped() budget-guard added to the union & intersection kernel entries (#1109 parity with subtract).
-# +7: union_many threads/documents union_all's new (union, conforming) signal (B8 arrange-many parity).
-# +12: near_band_from_extent (the snap-scatter band formula) single-homed here, next to canonical SNAP_GRID; tritri/classify import it instead of mirroring the expression.
-# -420: inline `mod tests` split out to the ratchet-exempt sibling mesh_bridge_tests.rs
-#       when `intersection_tris` was added for the clash intersection solid; the module
-#       itself shrank, so the budget ratchets DOWN to match rather than absorbing the growth.
-     484 rust/geometry/src/kernel/mesh_bridge.rs
      700 rust/geometry/src/kernel/predicates.rs
 # -31: extracted the final conformity audit + traversal recovery into kernel/retriangulate_audit.rs and phase-D recovery into retriangulate_recover.rs (issue #098 dense faceted-reveal walls); net down.
               935 rust/geometry/src/kernel/retriangulate.rs
@@ -140,16 +181,19 @@
 # per-processor reset, and a valid 8-CsgSolid-8 chain that resolves on main
 # would have been dropped with "depth 11 exceeds limit 10". Caught in review,
 # so the note is the record of a regression avoided rather than commentary.
-    1005 rust/geometry/src/processors/boolean/mod.rs
+# -69: #3821 split process_operand_with_depth (with its new unsupported-operand
+# record) out to the operand.rs sibling and the failure-log methods out to
+# failures.rs; 1005 -> 936.
+     936 rust/geometry/src/processors/boolean/mod.rs
      486 rust/geometry/src/processors/brep/faceted.rs
-# +20: #2866 — the Boolean<->CSG cycle guard, with the module's tests moved to a
-# sibling csg_primitive_tests.rs (402 -> 422). The guard costs more than the
-# test split paid back, so this is a LOOSENING and is recorded as one.
-     422 rust/geometry/src/processors/csg_primitive.rs
+# csg_primitive.rs row REMOVED: #3821 moved IfcSphere (processor + UV-sphere
+# tessellation, verbatim) to the sphere.rs sibling to make room for the
+# CsgSolid boolean-failure hand-off; 422 -> 348, under the 400 limit. That
+# repays the #2866 loosening this row recorded.
      608 rust/geometry/src/processors/sectioned.rs
      758 rust/geometry/src/profile_extractor.rs
      598 rust/geometry/src/profiles/curves_2d.rs
-     709 rust/geometry/src/profiles/curves_3d.rs
+     670 rust/geometry/src/profiles/curves_3d.rs
 # +1: `mod steel_shapes;` for the shapes.rs split, which removed the 594-line shapes.rs row (net down).
 # +55: #2866 follow-up — MAX_CURVE_DEPTH = 50 WAS the weakest bound in the tree,
 # exactly as suspected. It caps one PATH's length and says nothing about the
@@ -171,11 +215,10 @@
 # The cohort also includes the 4-line `#[cfg(test)] #[path] mod
 # curve_fanout_tests;` registration, so the number accounts for that too; the
 # tests themselves live in the sibling file and are exempt.
-     954 rust/geometry/src/profiles/mod.rs
+     847 rust/geometry/src/profiles/mod.rs
      706 rust/geometry/src/profiles/simplify.rs
 # +26: cap the fast-path opening count (O(N^3) DoS guard) + regression test.
      807 rust/geometry/src/rect_fast.rs
-     586 rust/geometry/src/router/diagnostics.rs
 # +26: #2866 — item_has_identity_position chases IfcBooleanResult.FirstOperand,
 # a file-supplied reference, so one self-referential entity aborted the process
 # (stack overflow = abort in Rust, not a catchable panic). The walk is now
@@ -198,7 +241,24 @@
 # +42: #1623 Phase 3 batch-local template mode — instancing_batch_local flag + instanced_sources_materialized tracker fields + set_/getter/mark_source_materialized_if_first methods (browser per-batch don't-bake).
 # +1: #1293 dedup rep_identity: build_dedup_extra_enabled/set_build_dedup_extra_override gate + DEDUP_EXTRA_OVERRIDE static; net +1 after the ItemDedupCache doc consolidation.
 # +1: #1781 `mod textured;` — texture channel split OUT of processing.rs (that file drops ~90 lines below its budget; crate trends down).
-     749 rust/geometry/src/router/mod.rs
+# -17: #3821 moved the GeometryProcessor trait to the router/processor.rs
+# sibling, which paid for its new take_bool_failures drain hook and for the
+# sweep that stops set_skip_small_cuts discarding an undrained log; 749 -> 732.
+# +6: #3691. Measured against the row above after rebasing onto it, not against
+# the 749 this PR was first written on. The six are: `mod diagnostics_recording;`
+# and `mod mapped_item;` (2) for the two modules this PR extracts, which take
+# ~570 lines OUT of diagnostics.rs and processing.rs and drop diagnostics.rs off
+# this list entirely; one line from reflowing the `pub use diagnostics::{..}`
+# block around the new `format_unsupported_breakdown` re-export (1); and the
+# dropped-item counter's router state (3) — the `unsupported` RefCell field, its
+# constructor line, and the `forget_sources` call in set_tessellation_quality.
+# The counter's three state pieces (counts, sources already counted, open
+# scopes) are ONE struct in router/diagnostics/unsupported_items.rs rather than
+# three fields here, which is as small as the router side gets. Raised rather
+# than paid for by trimming unrelated doc comments: earlier rounds of this PR
+# did that and it makes an unrelated comment the currency of an unrelated
+# change, leaving no record of either.
+     738 rust/geometry/src/router/mod.rs
 # +65: #1623 Phase 2 don't-bake — the top-level mapped-item intercept (template retag + instance placeholder) + the public/impl process_element_with_submeshes split; the two eligibility/ensure helpers were extracted to router/instancing.rs (new, 92 lines) to hold the net down.
 # +7: #858 palette guard — exclude an indexed-colour single-solid source from the don't-bake decision (one .filter on the resolved solid id + explanatory comment) so its per-triangle palette survives the flat split.
 # +16: #1623 Phase 3 — thread the batch-local vs global template decision through the mapped-item intercept (is_template match arm + retag guard).

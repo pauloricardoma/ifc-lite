@@ -25,6 +25,7 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { Camera, type Renderer } from '@ifc-lite/renderer';
 import { useViewerStore } from '@/store';
+import { fixtureModel, fixtureModels } from '@/test/store-fixture.js';
 import { useMouseControls, type UseMouseControlsParams, type MouseState } from './useMouseControls.js';
 
 const NOTCH_DELTA_Y = 120;
@@ -35,9 +36,10 @@ const NOTCH_DELTA_Y = 120;
  * both. Same reasoning as in `wheelZoom.test.ts`; without it the ctrl cases
  * would quietly test the unmodified path.
  */
-function wheelEvent(init: { ctrlKey?: boolean } = {}): WheelEvent {
+function wheelEvent(init: { ctrlKey?: boolean; deltaX?: number; deltaY?: number } = {}): WheelEvent {
   const e = new WheelEvent('wheel', {
-    deltaY: NOTCH_DELTA_Y,
+    deltaX: init.deltaX ?? 0,
+    deltaY: init.deltaY ?? NOTCH_DELTA_Y,
     deltaMode: 0,
     bubbles: true,
     cancelable: true,
@@ -54,12 +56,18 @@ function wheelEvent(init: { ctrlKey?: boolean } = {}): WheelEvent {
 const ref = <T,>(current: T) => ({ current });
 const noop = () => {};
 
-function makeParams(canvas: HTMLCanvasElement, camera: Camera): UseMouseControlsParams {
+function makeParams(
+  canvas: HTMLCanvasElement,
+  camera: Camera,
+  rendererExtras: Record<string, unknown> = {},
+  isStreaming = false,
+): UseMouseControlsParams {
   const renderer = {
     getCamera: () => camera,
     requestRender: noop,
     pick: () => null,
     pickRect: () => [],
+    ...rendererExtras,
   } as unknown as Renderer;
 
   const state = useViewerStore.getState();
@@ -124,7 +132,7 @@ function makeParams(canvas: HTMLCanvasElement, camera: Camera): UseMouseControls
     updateCameraRotationRealtime: noop,
     toggleSelection: noop,
     calculateScale: noop,
-    getPickOptions: () => ({ isStreaming: false, hiddenIds: new Set<number>(), isolatedIds: null }),
+    getPickOptions: () => ({ isStreaming, hiddenIds: new Set<number>(), isolatedIds: null }),
     hasPendingMeasurements: () => false,
     setSectionPlaneFromFace: noop,
     setSectionPickMode: noop,
@@ -142,14 +150,17 @@ function makeParams(canvas: HTMLCanvasElement, camera: Camera): UseMouseControls
 const mounted: { root: Root; host: HTMLDivElement }[] = [];
 
 /** Mounts the hook against a canvas and returns both. */
-function mountViewport(): { canvas: HTMLCanvasElement; camera: Camera } {
+function mountViewport(
+  rendererExtras: Record<string, unknown> = {},
+  isStreaming = false,
+): { canvas: HTMLCanvasElement; camera: Camera } {
   const canvas = document.createElement('canvas');
   canvas.width = 800;
   canvas.height = 600;
   document.body.appendChild(canvas);
 
   const camera = new Camera();
-  const params = makeParams(canvas, camera);
+  const params = makeParams(canvas, camera, rendererExtras, isStreaming);
 
   function Probe() {
     useMouseControls(params);
@@ -192,6 +203,7 @@ describe('useMouseControls wheel zoom - registration and wiring (#2683)', () => 
       host.remove();
     }
     document.body.innerHTML = '';
+    useViewerStore.setState({ navigationPreset: 'default' });
   });
 
   it('cancels the browser default on a ctrl+wheel, so the page does not zoom', () => {
@@ -239,5 +251,69 @@ describe('useMouseControls wheel zoom - registration and wiring (#2683)', () => 
     const plain = travelOf(plainView.canvas, plainView.camera, wheelEvent());
 
     assert.equal(pinch, plain, 'pinch-zoom must keep its usual speed');
+  });
+
+  for (const modelCount of [1, 2]) {
+    it(`trackpad wheel pans the camera without zooming across ${modelCount} model(s) (#5889)`, () => {
+      const previous = useViewerStore.getState();
+      const models = Array.from({ length: modelCount }, (_, i) => fixtureModel(`m-${i}`, { idOffset: i * 1_000_000 }));
+      useViewerStore.setState({ ...fixtureModels(...models), navigationPreset: 'trackpad' });
+      try {
+        const { canvas, camera } = mountViewport();
+        const target = camera.getTarget();
+        const distance = camera.getDistance();
+        const pan = wheelEvent({ deltaX: 30, deltaY: 0 });
+        canvas.dispatchEvent(pan);
+        assert.equal(pan.defaultPrevented, true);
+        assert.notDeepEqual(camera.getTarget(), target, 'horizontal swipe must pan');
+        assert.equal(camera.getDistance(), distance, 'pan preserves orbit distance');
+
+        const pinch = wheelEvent({ ctrlKey: true, deltaY: 120 });
+        canvas.dispatchEvent(pinch);
+        assert.notEqual(camera.getDistance(), distance, 'Ctrl + wheel must zoom');
+      } finally {
+        useViewerStore.setState({ models: previous.models, activeModelId: previous.activeModelId, navigationPreset: previous.navigationPreset });
+      }
+    });
+  }
+});
+
+describe('useMouseControls wheel zoom - surface pick gate (#5393)', () => {
+  afterEach(() => {
+    while (mounted.length > 0) {
+      const { root, host } = mounted.pop()!;
+      act(() => {
+        root.unmount();
+      });
+      host.remove();
+    }
+    document.body.innerHTML = '';
+  });
+
+  /** A census-shaped scene: `entities` instanced entities, nothing batched. */
+  const scene = (entities: number) => ({ getMeshes: () => [], getBatchedMeshes: () => [], getInstancedEntityCount: () => entities });
+
+  /** Mount, dispatch one zoom-IN notch, return how many raycasts ran. */
+  function raycastsForOneZoomIn(entities: number, isStreaming: boolean, robustAnchor: boolean): number {
+    let raycasts = 0;
+    const { canvas, camera } = mountViewport({
+      getScene: () => scene(entities),
+      raycastScene: () => { raycasts++; return null; },
+    }, isStreaming);
+    if (robustAnchor) camera.setOrbitAnchorBounds({ min: { x: -1, y: -1, z: -1 }, max: { x: 1, y: 1, z: 1 } });
+    const e = wheelEvent();
+    Object.defineProperty(e, 'deltaY', { value: -NOTCH_DELTA_Y, configurable: true });
+    canvas.dispatchEvent(e);
+    return raycasts;
+  }
+
+  it('raycasts the surface under the cursor on a small, loaded model', () => {
+    assert.equal(raycastsForOneZoomIn(10, false, false), 1);
+  });
+
+  it('skips the raycast while streaming, above the orbit-pivot census limit, and with a robust anchor', () => {
+    assert.equal(raycastsForOneZoomIn(10, true, false), 0, 'streaming');
+    assert.equal(raycastsForOneZoomIn(1_000_000, false, false), 0, 'large model');
+    assert.equal(raycastsForOneZoomIn(10, false, true), 0, 'robust orbit anchor');
   });
 });

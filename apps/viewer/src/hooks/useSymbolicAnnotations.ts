@@ -2,21 +2,19 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-/**
- * Lazy extraction of IfcAnnotation 2D curves for the section-plane overlay.
- *
- * The WASM `parseSymbolicRepresentations` already emits polylines and arcs in
- * the same 2D coordinate space the Section2DPanel feeds to
- * `Section2DOverlayRenderer`. We only ever need the data when the IFC
- * Annotation toggle is on AND a section plane is active, so the parse runs
- * lazily and is cached per model source.
- */
+/** Lazy source-cached IFC annotation/grid extraction. Workspace placement is
+ * composed for 3D overlays and 2D drawings without changing parsed source data. */
 
+import { placedSymbols } from '@/lib/model-placement/placed-symbols';
 import { useEffect, useMemo, useState } from 'react';
+import { meshedFillItems } from './symbolic-meshed-fills.js';
 import type { DrawingLine2D } from '@ifc-lite/renderer';
 import { useViewerStore } from '@/store';
 import { useShallow } from 'zustand/react/shallow';
-import type { IfcDataStore } from '@ifc-lite/parser';
+import {
+  useSymbolicActiveStores,
+  type SymbolicActiveStore,
+} from './useSymbolicActiveStores.js';
 import {
   debugEnabled,
   type AnnotationFill2D,
@@ -39,9 +37,6 @@ import {
   type SymbolicRichChannelsEntry,
 } from './symbolic-rich-channels.js';
 
-// The parse walk itself lives in `lib/overlay-parse/symbolic-parse.ts` so a
-// worker can import it (a worker module cannot import this React hook file).
-// Re-exported here so existing consumers keep their import paths.
 export type { AnnotationsForStorey, AnnotationText2D, AnnotationFill2D };
 export { polylineToSegments, circleToSegments } from '../lib/overlay-parse/symbolic-parse.js';
 
@@ -89,37 +84,13 @@ const EMPTY_F32 = new Float32Array(0);
 /** One active model's data store plus the identity needed to map a parsed
  *  primitive's LOCAL express id to the federated global id the visibility
  *  sets are keyed by. `idOffset` is 0 for the legacy single-model path. */
-interface ActiveStore {
-  store: IfcDataStore;
-  modelId: string;
-  idOffset: number;
-}
-
-/** Read the active store set from the viewer store. Federation-aware. */
-function useActiveStores(): ActiveStore[] {
-  const { models, ifcDataStore } = useViewerStore(
-    useShallow((s) => ({ models: s.models, ifcDataStore: s.ifcDataStore })),
-  );
-  return useMemo(() => {
-    const out: ActiveStore[] = [];
-    if (models.size > 0) {
-      for (const [modelId, m] of models) {
-        if (m.ifcDataStore) out.push({ store: m.ifcDataStore, modelId, idOffset: m.idOffset ?? 0 });
-      }
-    } else if (ifcDataStore) {
-      out.push({ store: ifcDataStore, modelId: 'legacy', idOffset: 0 });
-    }
-    return out;
-  }, [models, ifcDataStore]);
-}
-
 /** Trigger parse for the active stores when `enabled`, tick on completion. */
-function useAnnotationParseTrigger(enabled: boolean, stores: ActiveStore[]): number {
+function useAnnotationParseTrigger(enabled: boolean, stores: SymbolicActiveStore[]): number {
   const [version, setVersion] = useState(0);
 
   useEffect(() => {
     if (!enabled) return undefined;
-    ensureParseFor(stores.map((s) => s.store));
+    ensureParseFor(stores.map((s) => ({ store: s.store, mutationView: s.mutationView })));
     return subscribeToParseCache(() => setVersion((v) => v + 1));
   }, [enabled, stores]);
 
@@ -139,17 +110,13 @@ function useAnnotationParseTrigger(enabled: boolean, stores: ActiveStore[]): num
 interface HiddenOwnerSets {
   global: ReadonlySet<number>;
   lens: ReadonlySet<number>;
-  byModel: ReadonlyMap<string, Set<number>>;
 }
-
-const EMPTY_NUM_SET: ReadonlySet<number> = new Set<number>();
 
 function useHiddenOwnerSets(): HiddenOwnerSets {
   return useViewerStore(
     useShallow((s) => ({
       global: s.hiddenEntities,
       lens: s.lensHiddenIds,
-      byModel: s.hiddenEntitiesByModel,
     })),
   );
 }
@@ -157,14 +124,12 @@ function useHiddenOwnerSets(): HiddenOwnerSets {
 /** Build a per-store predicate: is this annotation owner (LOCAL express id)
  *  currently hidden? Cheap fast-path when nothing is hidden. */
 function makeHiddenOwnerPredicate(
-  entry: ActiveStore,
+  entry: SymbolicActiveStore,
   sets: HiddenOwnerSets,
 ): ((ownerId: number) => boolean) | undefined {
-  const perModel = sets.byModel.get(entry.modelId) ?? EMPTY_NUM_SET;
-  if (sets.global.size === 0 && sets.lens.size === 0 && perModel.size === 0) return undefined;
+  if (sets.global.size === 0 && sets.lens.size === 0) return undefined;
   const offset = entry.idOffset;
   return (ownerId: number): boolean => {
-    if (perModel.has(ownerId)) return true;
     const globalId = ownerId + offset;
     return sets.global.has(globalId) || sets.lens.has(globalId);
   };
@@ -198,12 +163,6 @@ export interface SectionClipForGrid {
   axis: 'down' | 'front' | 'side';
 }
 
-// `buildSymbolicLineChannels` (the pure annotation/grid merge, issue #3359)
-// lives in `symbolic-line-channels.ts` — split out to keep this file under
-// budget and so it can be unit-tested with no React/store/WASM dependency.
-// Re-exported here so existing consumers keep this import path.
-export { buildSymbolicLineChannels, type SymbolicLineChannels, type SymbolicLineChannelsEntry };
-
 // `buildSymbolicRichChannels` (the pure text/fill merge) and the
 // `AnnotationText3D` / `AnnotationFill3D` shapes it produces live in
 // `symbolic-rich-channels.ts` — split out for the same two reasons as the line
@@ -235,7 +194,7 @@ export function useSymbolicAnnotations(params: {
   const { gridSectionClip, fallbackY = 0 } = params;
   const { annotation: enabled, grid: effectiveGridEnabled } =
     useOverlayChannelGate(params.enabled, params.gridEnabled ?? params.enabled);
-  const stores = useActiveStores();
+  const stores = useSymbolicActiveStores();
   const hiddenSets = useHiddenOwnerSets();
   // Trigger parse if EITHER subset is enabled — the parse pass is shared.
   const version = useAnnotationParseTrigger(enabled || effectiveGridEnabled, stores);
@@ -252,7 +211,7 @@ export function useSymbolicAnnotations(params: {
     // Stores whose parse isn't cached yet drop out (logged below).
     const entries: SymbolicLineChannelsEntry[] = [];
     for (const entry of stores) {
-      const cached = getParseFor(entry.store);
+      const cached = placedSymbols(getParseFor({ store: entry.store, mutationView: entry.mutationView }), entry.translation, fallbackY);
       if (cached) entries.push({ cached, isHidden: makeHiddenOwnerPredicate(entry, hiddenSets) });
       else if (debugEnabled()) console.log(`[annotations] store not yet ready: ${entry.modelId}`);
     }
@@ -283,7 +242,7 @@ export function useSymbolicAnnotations(params: {
  *
  * The section position is in world units (already converted from the
  * 0-100% slider via `axisMin + (position / 100) * (axisMax - axisMin)`
- * by the caller — Section2DPanel computes the same value to feed the
+ * by the caller — the Drawing panel's `useDrawingLayers` computes the same value to feed the
  * drawing generator).
  */
 export interface DrawingAnnotationData {
@@ -299,10 +258,10 @@ const EMPTY_DRAWING_ANNOTATIONS: DrawingAnnotationData = {
 };
 
 /**
- * Whether `Section2DPanel` should ask this hook for data at all.
+ * Whether the Drawing panel should ask this hook for data at all.
  *
  * Pulled out of the call site as its own predicate (rather than an inline
- * `&&` chain) so the gate is unit-testable independent of `Section2DPanel`,
+ * `&&` chain) so the gate is unit-testable independent of the Drawing panel,
  * which imports `useIfc` → `ifcConfig.ts` → `import.meta.env` and is
  * consequently unrenderable under this repo's `tsx --test` runner
  * (`import.meta.env` is `undefined` outside a Vite build).
@@ -336,7 +295,7 @@ export function useSymbolicAnnotationsForDrawing(params: {
   fallbackY?: number;
 }): DrawingAnnotationData {
   const { enabled, axis, sectionPosWorld, viewDepth, flipped, fallbackY = 0 } = params;
-  const stores = useActiveStores();
+  const stores = useSymbolicActiveStores();
   const version = useAnnotationParseTrigger(enabled, stores);
 
   return useMemo(() => {
@@ -408,7 +367,7 @@ export function useSymbolicAnnotationsForDrawing(params: {
       : (f: AnnotationFill2D) => fills.push(f);
 
     for (const entry of stores) {
-      const cached = getParseFor(entry.store);
+      const cached = placedSymbols(getParseFor({ store: entry.store, mutationView: entry.mutationView }), entry.translation, fallbackY);
       if (!cached) continue;
 
       // Drawing-2D pulls BOTH annotation and grid buckets (issue #862
@@ -465,8 +424,9 @@ export function useSymbolicAnnotationsRichData(params: {
   const { gridSectionClip, fallbackY = 0 } = params;
   const { annotation: enabled, grid: effectiveGridEnabled } =
     useOverlayChannelGate(params.enabled, params.gridEnabled ?? params.enabled);
-  const stores = useActiveStores();
+  const stores = useSymbolicActiveStores();
   const hiddenSets = useHiddenOwnerSets();
+  const theme = useViewerStore((s) => s.theme); // label ink (#5388)
   const version = useAnnotationParseTrigger(enabled || effectiveGridEnabled, stores);
   const clipEnabled = !!gridSectionClip && gridSectionClip.enabled && gridSectionClip.axis === 'down';
   const clipPos = clipEnabled ? gridSectionClip!.posWorld : 0;
@@ -480,8 +440,8 @@ export function useSymbolicAnnotationsRichData(params: {
     // Stores whose parse isn't cached yet drop out.
     const entries: SymbolicRichChannelsEntry[] = [];
     for (const entry of stores) {
-      const cached = getParseFor(entry.store);
-      if (cached) entries.push({ cached, isHidden: makeHiddenOwnerPredicate(entry, hiddenSets) });
+      const cached = placedSymbols(getParseFor({ store: entry.store, mutationView: entry.mutationView }), entry.translation, fallbackY);
+      if (cached) entries.push({ cached, isHidden: makeHiddenOwnerPredicate(entry, hiddenSets), isMeshedFill: meshedFillItems(entry.meshes, id => entry.idOffset === 0 ? id : useViewerStore.getState().toGlobalId(entry.modelId, id)) });
     }
 
     return buildSymbolicRichChannels(entries, {
@@ -491,6 +451,7 @@ export function useSymbolicAnnotationsRichData(params: {
       clipPos,
       clipDepth,
       fallbackY,
+      theme,
     });
-  }, [enabled, effectiveGridEnabled, clipEnabled, clipPos, clipDepth, stores, hiddenSets, version, fallbackY]);
+  }, [enabled, effectiveGridEnabled, clipEnabled, clipPos, clipDepth, stores, hiddenSets, version, fallbackY, theme]);
 }

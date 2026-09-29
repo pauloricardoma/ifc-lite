@@ -5,9 +5,10 @@
 /**
  * Classification of model-load failures. This module owns the taxonomy and the
  * ORDER the buckets are tried in; the user-facing humanisation lives in
- * ./load-error-message.ts, and the two families whose matchers carry more
+ * ./load-error-message.ts, and the families whose matchers carry more
  * rationale than pattern have their own modules (./webgl-unavailable.ts,
- * ./cancelled-and-network-errors.ts) rather than a longer file here.
+ * ./cancelled-and-network-errors.ts, ./file-not-found-errors.ts) rather than a
+ * longer file here.
  *
  * Despite the name, this is the viewer's ONLY error-family classifier —
  * `analytics-scrub.ts` runs it over every captured `$exception` — so a non-load
@@ -25,14 +26,37 @@
  */
 
 import { isCancelledError, isNetworkUnavailableError } from './cancelled-and-network-errors.js';
+import { isFileNotFoundMessage } from './file-not-found-errors.js';
 import { isWebglUnavailable } from './webgl-unavailable.js';
+import { isWorkerScriptSkewMessage } from '@ifc-lite/geometry';
 
 /** Stable, analytics-friendly classification of a load failure. */
 export type LoadErrorKind =
-  /** The WebAssembly geometry engine binary failed to download/compile. */
+  /**
+   * A file the geometry engine needs failed to download: the WebAssembly binary
+   * (404 / wrong MIME / non-OK status), or a worker script that never loaded
+   * (#4886). Both mean the tab's build is gone from the host — typically a tab
+   * left open past Vercel Skew Protection's max age — or a proxy blocked it.
+   * A reload fixes it; a lower tessellation tier cannot.
+   */
   | 'wasm_engine_load'
   /** Out-of-memory / WASM heap exhaustion during processing. */
   | 'out_of_memory'
+  /**
+   * A WebGPU `createBuffer({ mappedAtCreation: true })` failed (#4885).
+   * Chromium's wording is misleading — "size (N) is too large for the
+   * implementation" at sizes as small as a few hundred bytes — and used to be
+   * folded into `out_of_memory`, which is wrong for the common case: the
+   * device had already been lost (a Windows TDR, a GPU-process crash) and
+   * every allocation on it fails afterwards, not because the host is out of
+   * memory. `device_lost_at_time` on the captured event (set by whichever
+   * guarded upload call classified this, see `@ifc-lite/renderer`'s
+   * `gpu-upload-guard.ts`) tells the two apart; the message alone cannot.
+   * Since #5429 the renderer no longer creates buffers mapped at creation, so
+   * this kind should not occur from ifc-lite's own uploads; a new report of
+   * it means a regression reintroduced one.
+   */
+  | 'gpu_alloc_failed'
   /**
    * A geometry worker (or the wasm mesher running in it) stopped unexpectedly
    * — a hard worker crash (`worker.onerror`, no message) or a wasm runtime
@@ -55,6 +79,14 @@ export type LoadErrorKind =
    * evicted it, removable media was unplugged, or an AV/permission change
    * locked it. Nothing about the model is wrong and nothing in the app failed;
    * the user just needs to pick the file again.
+   *
+   * TWO DOMException names land here, not one. `NotReadableError` is the file
+   * that is still at its path but cannot be read; `NotFoundError` is the file
+   * whose bytes are gone by read time — moved, renamed, deleted, or rewritten
+   * in place by the authoring tool between `getFile()` and the read, which is
+   * exactly what the Refresh flow (#1345) invites. Both engine wordings, and
+   * the load context one of them needs to be safe, live in
+   * ./file-not-found-errors.ts.
    */
   | 'file_unreadable'
   /**
@@ -136,22 +168,20 @@ function isWasmEngineLoadError(message: string): boolean {
 }
 
 function isOutOfMemoryError(message: string): boolean {
-  return (
-    /out of memory|oom|memory access out of bounds|cannot enlarge memory|allocation failed|maximum call stack|array buffer allocation failed|rangeerror: (?:invalid array|array buffer)/i.test(
-      message,
-    ) ||
-    // WebGPU buffer allocation failure. Chromium reports a failed
-    // `createBuffer({ mappedAtCreation: true })` as
-    //   "createBuffer failed, size (N) is too large for the implementation
-    //    when mappedAtCreation == true"
-    // and the wording is misleading: the sizes we hit this with are tiny
-    // (~190 KB against a device advertising hundreds of MB), because what
-    // actually failed is mapping host memory for the new buffer — i.e. memory
-    // exhaustion or a device that can no longer service allocations, not a
-    // size-limit violation. Grouped with the OOM family because the user
-    // guidance is identical.
-    /createbuffer failed/i.test(message)
+  return /out of memory|oom|memory access out of bounds|cannot enlarge memory|allocation failed|maximum call stack|array buffer allocation failed|rangeerror: (?:invalid array|array buffer)/i.test(
+    message,
   );
+}
+
+/**
+ * A WebGPU `createBuffer({ mappedAtCreation: true })` the host could not
+ * back. Split out of `isOutOfMemoryError` (#4885): the two share a symptom
+ * (a failed allocation) but not a cause often enough to matter — see the
+ * `gpu_alloc_failed` doc on {@link LoadErrorKind} for why the message alone
+ * cannot tell a dead device from real memory pressure.
+ */
+function isGpuAllocFailedError(message: string): boolean {
+  return /createbuffer failed/i.test(message);
 }
 
 /**
@@ -223,8 +253,16 @@ function isWasmRuntimeCrashError(err: unknown, message: string): boolean {
   );
 }
 
-/** Classify a load failure into a stable analytics bucket. */
-export function classifyLoadError(err: unknown): LoadErrorKind {
+/**
+ * Classify a load failure into a stable analytics bucket.
+ *
+ * `context` is the capture site's own `context` property, where one exists. It
+ * is consulted by exactly one matcher — the WebKit arm of
+ * {@link isFileNotFoundMessage}, whose string is ambiguous on that engine — and
+ * ignored by every other bucket, so omitting it can only cost that one Safari
+ * wording its kind. It can never change any other answer.
+ */
+export function classifyLoadError(err: unknown, context?: unknown): LoadErrorKind {
   const message = messageOf(err);
   // Checked before the memory/worker buckets: a NotReadableError says nothing
   // about the model or this device's capacity, and its message ("...could not
@@ -233,7 +271,11 @@ export function classifyLoadError(err: unknown): LoadErrorKind {
   // browser worded `.message`; the message match covers the analytics path,
   // where all we have is the already-stringified value.
   const name = errorNameOf(err);
-  if (name === 'NotReadableError' || isFileUnreadableError(message)) {
+  if (
+    name === 'NotReadableError' ||
+    isFileUnreadableError(message) ||
+    isFileNotFoundMessage(message, context)
+  ) {
     return 'file_unreadable';
   }
   // Same stable-`.name` argument as NotReadableError above: an aborted fetch
@@ -247,6 +289,14 @@ export function classifyLoadError(err: unknown): LoadErrorKind {
   // every arm of it is anchored or structural (see ./webgl-unavailable.ts).
   if (isWebglUnavailable(err, message)) return 'webgl_unavailable';
   if (isWasmEngineLoadError(message)) return 'wasm_engine_load';
+  // BEFORE the worker-crash bucket (#4886): "Geometry worker failed: worker
+  // script failed to load" matched it, so a stale tab was told the model was
+  // too big for its memory and burned a lowest-tier retry that fails the same way.
+  if (isWorkerScriptSkewMessage(message)) return 'wasm_engine_load';
+  // BEFORE the OOM bucket (#4885): a failed mapped createBuffer used to be
+  // folded into out_of_memory, mislabeling the common case — device-loss
+  // fallout — as host memory pressure. See the `gpu_alloc_failed` doc.
+  if (isGpuAllocFailedError(message)) return 'gpu_alloc_failed';
   // Explicit memory-exhaustion signals win over the worker-crash bucket so a
   // worker that died with a clear OOM message is grouped as out_of_memory.
   if (isOutOfMemoryError(message)) return 'out_of_memory';
@@ -273,22 +323,47 @@ export function classifyLoadError(err: unknown): LoadErrorKind {
  *
  * - `error_kind`  the classified family (see {@link classifyLoadError}); drives
  *                 `$exception_fingerprint` grouping and the severity downgrade.
+ *                 Pass the same `context` the call site stamps on the event:
+ *                 one WebKit wording is only classifiable inside a load, and a
+ *                 kind set here wins over the analytics-path re-classification.
  * - `error_type`  the throwable's own identity — a DOMException's stable
  *                 `.name`, else the constructor name. The one property that
  *                 survives when the message is two words and the stack empty.
  * - `online`      `navigator.onLine` at capture time, so a user-side outage can
  *                 be told apart from a failure of ours. Omitted where the
  *                 browser doesn't expose it (Node tests).
+ * - `device_lost_at_time` (#4885) only for `gpu_alloc_failed`: whether the
+ *                 renderer already reported the GPU device lost when this
+ *                 `createBuffer` failure was caught. The message alone cannot
+ *                 tell a dead-device symptom from real host memory pressure
+ *                 (see the `gpu_alloc_failed` doc on {@link LoadErrorKind}), so
+ *                 the guarded upload call site (`@ifc-lite/renderer`'s
+ *                 `gpu-upload-guard.ts` / the viewer's own) passes it in.
  */
-export function errorCaptureProps(err: unknown): Record<string, unknown> {
+export function errorCaptureProps(err: unknown, context?: unknown, deviceLost?: boolean): Record<string, unknown> {
   const name = errorNameOf(err);
+  const kind = classifyLoadError(err, context);
   const props: Record<string, unknown> = {
-    error_kind: classifyLoadError(err),
+    error_kind: kind,
     // `name` is set on every Error and DOMException; the constructor fallback
     // covers a thrown non-Error (posthog stringifies those, losing even this).
     error_type: name || (err as { constructor?: { name?: string } })?.constructor?.name || typeof err,
   };
+  if (kind === 'gpu_alloc_failed' && typeof deviceLost === 'boolean') {
+    props.device_lost_at_time = deviceLost;
+  }
   const nav = (globalThis as { navigator?: { onLine?: unknown } }).navigator;
   if (typeof nav?.onLine === 'boolean') props.online = nav.onLine;
+  // How old the running bundle is (#4886): a stale-deploy failure on a tab
+  // older than the host's skew window is expected; on a fresh one it is not.
+  const age = bundleAgeHours(typeof __BUILD_DATE__ === 'string' ? __BUILD_DATE__ : undefined, Date.now());
+  if (age !== undefined) props.bundle_age_hours = age;
   return props;
+}
+
+/** Whole hours since `buildDate` (ISO), or undefined when unknown or in the future. */
+export function bundleAgeHours(buildDate: string | undefined, now: number): number | undefined {
+  const built = buildDate ? Date.parse(buildDate) : NaN;
+  if (!Number.isFinite(built) || now < built) return undefined;
+  return Math.floor((now - built) / 3_600_000);
 }

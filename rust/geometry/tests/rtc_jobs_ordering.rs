@@ -2,14 +2,14 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Guards `GeometryRouter::detect_rtc_offset_from_jobs` (issue #1526 follow-up):
+//! Guards `GeometryRouter::detect_rtc_anchor_for_file` (issue #1526 follow-up):
 //! the sample budget must count USABLE samples, not raw jobs. Origin-placed
 //! curve/axis-only products (e.g. IfcAlignmentSegment) abstain from RTC
 //! sampling; if `take(MAX_SAMPLES)` ran before the abstention filter, a file
 //! that lists more than 50 such products ahead of its real large-coordinate
 //! solid would sample zero positions and fail to detect the re-basing offset.
 
-use ifc_lite_core::{build_entity_index, has_geometry_by_name, EntityDecoder, EntityScanner, IfcType};
+use ifc_lite_core::{build_entity_index, has_geometry_by_name, EntityDecoder, EntityScanner};
 use ifc_lite_geometry::GeometryRouter;
 
 /// One origin-placed proxy whose only representation is an axis polyline — no
@@ -95,28 +95,29 @@ fn model() -> String {
 }
 
 #[test]
-fn from_jobs_scans_past_abstaining_curve_only_entities() {
+fn sampling_scans_past_abstaining_curve_only_entities() {
     let content = model();
     let entity_index = build_entity_index(&content);
     let mut decoder = EntityDecoder::with_index(&content, entity_index);
     let router = GeometryRouter::with_units(&content, &mut decoder);
 
-    // Collect geometry jobs in file order (curve proxies first, solid last).
-    // detect_rtc_offset_from_jobs ignores the IfcType slot, so a placeholder is
-    // fine; only (id, start, end) drive decoding.
-    let mut jobs: Vec<(u32, usize, usize, IfcType)> = Vec::new();
+    // Premise: the solid is the LAST geometry entity the detector's own window
+    // walks, and it sits past the 50-sample budget, so the abstaining curve
+    // proxies ahead of it must not have consumed that budget.
     let mut scanner = EntityScanner::new(&content);
-    while let Some((id, type_name, start, end)) = scanner.next_entity() {
+    let mut geometry_entities = 0usize;
+    while let Some((_, type_name, _, _)) = scanner.next_entity() {
         if has_geometry_by_name(type_name) {
-            jobs.push((id, start, end, IfcType::IfcBuildingElementProxy));
+            geometry_entities += 1;
         }
     }
-    assert!(jobs.len() > 50, "need >50 jobs to exercise the budget, got {}", jobs.len());
-    // The solid is the LAST job, past the 50-sample window.
-    assert!(jobs.len() >= 56);
+    assert!(
+        geometry_entities >= 56,
+        "need >=56 geometry entities so the solid is past the 50-sample budget, got {geometry_entities}",
+    );
 
     let offset = router
-        .detect_rtc_offset_from_jobs(&jobs, &mut decoder)
+        .detect_rtc_anchor_for_file(content.as_bytes(), &mut decoder)
         .expect("solid past the first 50 curve-only jobs must still yield a sample");
 
     assert!(

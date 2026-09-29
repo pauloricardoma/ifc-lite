@@ -20,21 +20,22 @@
 //! `has_geometry_by_name`, `is_representationless_spatial_container_by_name`
 //! and `is_simple_geometry_type` are all on the hot path during scene
 //! construction, where the same ~50–100 distinct type names are queried
-//! thousands of times per file. We memoise per-name behind a
-//! `RwLock<FxHashMap<String, bool>>`: the first call for a name pays the
-//! full `IfcType::from_str` (a ~1300-arm match) + `is_subtype_of` traversal
-//! cost; subsequent calls take a read-lock and a single hash lookup.
+//! millions of times per file. An immutable, schema-derived table memoises
+//! all generated names and bounded exporter aliases without taking a read-lock for each entity.
+//! Unknown names use the same predicates without entering a growing cache.
 
-use std::sync::{OnceLock, RwLock};
+use std::sync::OnceLock;
 
 use rustc_hash::FxHashMap;
 
 use crate::generated::IfcType;
-use crate::legacy_entities::get_legacy_entity_info;
 
 /// Normalise to uppercase ASCII without allocating when the input is already
 /// uppercase (the common case — STEP type tokens are emitted uppercase).
-fn normalise_uppercase(type_name: &str) -> std::borrow::Cow<'_, str> {
+///
+/// `pub(crate)` so record-level parsing and keyword resolution share one exact
+/// normalisation rule.
+pub(crate) fn normalise_uppercase(type_name: &str) -> std::borrow::Cow<'_, str> {
     if type_name.bytes().any(|b| b.is_ascii_lowercase()) {
         std::borrow::Cow::Owned(type_name.to_ascii_uppercase())
     } else {
@@ -42,21 +43,37 @@ fn normalise_uppercase(type_name: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// Look up a cached bool, or compute via `f` and insert.
-fn cached<F>(cache: &RwLock<FxHashMap<String, bool>>, key: &str, f: F) -> bool
-where
-    F: FnOnce() -> bool,
-{
-    if let Ok(read) = cache.read() {
-        if let Some(&v) = read.get(key) {
-            return v;
-        }
-    }
-    let value = f();
-    if let Ok(mut write) = cache.write() {
-        write.insert(key.to_owned(), value);
-    }
-    value
+#[derive(Clone, Copy)]
+struct TypeClassification {
+    has_geometry: bool,
+    representationless_spatial: bool,
+    simple_geometry: bool,
+}
+
+/// Build only from the finite schema catalog: file-supplied unknown names
+/// cannot retain memory here. Compute via the canonical predicates, including
+/// legacy overrides for names that also occur in the modern schema.
+fn classifications() -> &'static FxHashMap<&'static str, TypeClassification> {
+    static TABLE: OnceLock<FxHashMap<&'static str, TypeClassification>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        crate::generated::IFC_TYPES
+            .iter()
+            .map(IfcType::as_str)
+            .chain(crate::EXPORTER_STRATUM_ALIASES.iter().copied())
+            .map(|name| {
+                (
+                    name,
+                    TypeClassification {
+                        has_geometry: compute_has_geometry(name),
+                        representationless_spatial: compute_is_representationless_spatial_container(
+                            name,
+                        ),
+                        simple_geometry: compute_is_simple(name),
+                    },
+                )
+            })
+            .collect()
+    })
 }
 
 /// Check if a type name (UPPERCASE STEP string) represents an `IfcProduct`
@@ -71,24 +88,40 @@ where
 ///    `IfcBuilding` (and any concrete subtype of those) are intentionally
 ///    kept — they have boundary representations the renderer consumes. See
 ///    [`is_non_geometric_spatial`] for how that exempt set is maintained.
-/// 2. Legacy IFC2x3 / removed-in-IFC4x3 names that aren't in the generated
-///    enum (e.g. `IFCSLABELEMENTEDCASE`, `IFCBUILDINGELEMENT`, `IFCPROXY`,
-///    `IFCEQUIPMENTELEMENT`, `IFCELECTRICDISTRIBUTIONPOINT`) resolve through
-///    `legacy_entities::get_legacy_entity_info`, which carries a
-///    `has_geometry` flag.
+/// 2. The only non-EXPRESS compatibility spellings are the documented exporter
+///    stratum aliases.
 /// 3. Reinforcement variants not covered above fall back to a substring
 ///    match (`REINFORCING…` / `REINFORCED…`).
 pub fn has_geometry_by_name(type_name: &str) -> bool {
-    static CACHE: OnceLock<RwLock<FxHashMap<String, bool>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| RwLock::new(FxHashMap::default()));
-
     let upper = normalise_uppercase(type_name);
-    cached(cache, upper.as_ref(), || compute_has_geometry(upper.as_ref()))
+    classifications().get(upper.as_ref()).map_or_else(
+        || compute_has_geometry(upper.as_ref()),
+        |class| class.has_geometry,
+    )
+}
+
+/// Return the geometry-bearing and representationless-spatial predicates together.
+/// The tuple matches [`has_geometry_by_name`] and
+/// [`is_representationless_spatial_container_by_name`], respectively, while
+/// sharing one lookup of the immutable schema classification (#3987).
+pub fn geometry_flags_by_name(type_name: &str) -> (bool, bool) {
+    let upper = normalise_uppercase(type_name);
+    classifications().get(upper.as_ref()).map_or_else(
+        || {
+            let geometry = compute_has_geometry(upper.as_ref());
+            // These predicates are disjoint, including legacy and unknown names.
+            (
+                geometry,
+                !geometry && compute_is_representationless_spatial_container(upper.as_ref()),
+            )
+        },
+        |class| (class.has_geometry, class.representationless_spatial),
+    )
 }
 
 fn compute_has_geometry(upper: &str) -> bool {
-    if let Some(info) = get_legacy_entity_info(upper) {
-        return info.has_geometry;
+    if crate::is_exporter_stratum_alias(upper) {
+        return true;
     }
 
     let t = IfcType::from_str(upper);
@@ -161,23 +194,20 @@ fn is_non_geometric_spatial(t: IfcType) -> bool {
 /// to", so callers that need to catch that exceptional case combine this
 /// predicate with an instance-level check of whether the entity's
 /// `Representation` attribute (index 6 on any `IfcProduct`) is actually
-/// non-null before scheduling it for meshing. See
+/// non-null before scheduling it for meshing
+/// (`crate::parser::nth_attribute_is_present`). See
 /// `rust/processing/src/processor/mod.rs` and
 /// `rust/wasm-bindings/src/api/gpu_meshes/prepass.rs`.
 pub fn is_representationless_spatial_container_by_name(type_name: &str) -> bool {
-    static CACHE: OnceLock<RwLock<FxHashMap<String, bool>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| RwLock::new(FxHashMap::default()));
-
     let upper = normalise_uppercase(type_name);
-    cached(cache, upper.as_ref(), || {
-        compute_is_representationless_spatial_container(upper.as_ref())
-    })
+    classifications().get(upper.as_ref()).map_or_else(
+        || compute_is_representationless_spatial_container(upper.as_ref()),
+        |class| class.representationless_spatial,
+    )
 }
 
 fn compute_is_representationless_spatial_container(upper: &str) -> bool {
-    if get_legacy_entity_info(upper).is_some() {
-        // Legacy/removed entities resolve their own `has_geometry` flag and
-        // are never part of this modern-schema-only exception path.
+    if crate::is_exporter_stratum_alias(upper) {
         return false;
     }
     let t = IfcType::from_str(upper);
@@ -185,73 +215,6 @@ fn compute_is_representationless_spatial_container(upper: &str) -> bool {
         return false;
     }
     is_non_geometric_spatial(t)
-}
-
-/// Cheap textual check for whether a STEP entity's attribute at `index`
-/// (0-based, top-level — respects nested parens and quoted strings) is
-/// present and non-null (`$`), without fully decoding the entity via
-/// `EntityDecoder`. Companion to
-/// [`is_representationless_spatial_container_by_name`]: callers use it to
-/// check attribute 6 (`Representation`, stable across every `IfcProduct`
-/// subtype) before deciding an otherwise-excluded spatial container
-/// exceptionally carries geometry (#1910).
-pub fn nth_attribute_is_present(entity_bytes: &[u8], index: usize) -> bool {
-    let Some(open_idx) = entity_bytes.iter().position(|byte| *byte == b'(') else {
-        return false;
-    };
-    let Some(close_idx) = entity_bytes.iter().rposition(|byte| *byte == b')') else {
-        return false;
-    };
-    if close_idx <= open_idx {
-        return false;
-    }
-    let args = &entity_bytes[open_idx + 1..close_idx];
-
-    let mut in_string = false;
-    let mut depth = 0i32;
-    let mut start = 0usize;
-    let mut attr_idx = 0usize;
-    let mut i = 0usize;
-    while i < args.len() {
-        match args[i] {
-            b'\'' => {
-                if in_string && i + 1 < args.len() && args[i + 1] == b'\'' {
-                    i += 1;
-                } else {
-                    in_string = !in_string;
-                }
-            }
-            b'(' if !in_string => depth += 1,
-            b')' if !in_string => depth -= 1,
-            b',' if !in_string && depth == 0 => {
-                if attr_idx == index {
-                    let token = trim_ascii(&args[start..i]);
-                    return !token.is_empty() && token != b"$";
-                }
-                attr_idx += 1;
-                start = i + 1;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    if attr_idx == index {
-        let token = trim_ascii(&args[start..]);
-        return !token.is_empty() && token != b"$";
-    }
-    false
-}
-
-fn trim_ascii(bytes: &[u8]) -> &[u8] {
-    let mut s = 0usize;
-    let mut e = bytes.len();
-    while s < e && bytes[s].is_ascii_whitespace() {
-        s += 1;
-    }
-    while e > s && bytes[e - 1].is_ascii_whitespace() {
-        e -= 1;
-    }
-    &bytes[s..e]
 }
 
 /// Check if an IFC entity class is "simple" geometry (processed first for
@@ -264,30 +227,26 @@ fn trim_ascii(bytes: &[u8]) -> &[u8] {
 /// "secondary/complex" (openings, doors, windows, furniture, MEP/distribution
 /// elements, spaces, sites, annotations, virtual/proxy entities).
 pub fn is_simple_geometry_type(type_name: &str) -> bool {
-    static CACHE: OnceLock<RwLock<FxHashMap<String, bool>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| RwLock::new(FxHashMap::default()));
-
     let upper = normalise_uppercase(type_name);
-    cached(cache, upper.as_ref(), || compute_is_simple(upper.as_ref()))
+    classifications().get(upper.as_ref()).map_or_else(
+        || compute_is_simple(upper.as_ref()),
+        |class| class.simple_geometry,
+    )
 }
 
-/// Resolve a STEP keyword to its `IfcType`, **legacy-aware**: a removed/renamed
-/// entity (`IFCPROXY`, `IFCSOLIDSTRATUM`, …) maps to its modern base type via the
-/// hand-maintained legacy table, exactly as `has_geometry_by_name` does. Any pass
-/// that *classifies* or *labels* an entity must use this rather than a bare
-/// `IfcType::from_str`; otherwise it disagrees with the geometry pass (which meshes
-/// legacy entities), leaving a rendered node with no attribute row — the
-/// geometry/attribute product-set divergence (#1496).
-pub fn legacy_aware_ifc_type(type_name: &str) -> IfcType {
+/// Resolve a STEP keyword to its schema-local `IfcType`. Supported keywords
+/// retain their exact generated variants. The three non-EXPRESS exporter
+/// stratum aliases remain owned `Unknown` values and are handled explicitly by
+/// `has_geometry_by_name`. Any pass that *classifies* or *labels* an entity
+/// must use this helper rather than reimplementing keyword normalization
+/// (#4203).
+pub fn ifc_type_from_keyword(type_name: &str) -> IfcType {
     let upper = normalise_uppercase(type_name);
-    match get_legacy_entity_info(upper.as_ref()) {
-        Some(info) => info.base_type,
-        None => IfcType::from_str(upper.as_ref()),
-    }
+    IfcType::from_str(upper.as_ref())
 }
 
-/// The `IfcTypeProduct` subtype a STEP keyword names, **legacy-aware**, or
-/// `None` when the keyword is not one.
+/// The `IfcTypeProduct` subtype a STEP keyword names, or `None` when it is
+/// not one.
 ///
 /// The single predicate behind every type-geometry candidate gate (#957/#962):
 /// the native processor, the streaming and sharded browser pre-passes, the
@@ -297,51 +256,53 @@ pub fn legacy_aware_ifc_type(type_name: &str) -> IfcType {
 ///
 /// Keeps the cheap `ends_with` pre-filter that kept the resolve and the
 /// `is_subtype_of` walk off the hot path for the non-type majority, and
-/// resolves LEGACY-AWARE: under a bare [`IfcType::from_str`] the IFC2X3 type
-/// products IFC4X3 dropped (`IFCDOORSTYLE`, `IFCWINDOWSTYLE`,
-/// `IFCBUILDINGELEMENTTYPE`) come back `Unknown`, a subtype of nothing, so
-/// every gate discarded them before they could become jobs — and they carry
-/// `has_geometry: false` in the legacy table, so the ordinary product route
-/// did not reach them either. Their `RepresentationMaps` geometry was dropped
-/// by every path at once (#3187).
+/// resolves through the generated schema universe. Exact variants are
+/// preserved for every supported schema keyword, while the three non-EXPRESS
+/// exporter stratum aliases remain owned `Unknown` values and are handled by
+/// the explicit compatibility predicates (#4203).
 ///
-/// `type_name` is the raw STEP keyword, i.e. already uppercase.
+/// `type_name` is the raw STEP keyword as the scanner read it, in whatever case the file wrote it.
 pub fn type_product_ifc_type(type_name: &str) -> Option<IfcType> {
-    if !type_name.ends_with("TYPE") && !type_name.ends_with("STYLE") {
+    if !crate::parser::keyword_ends_with(type_name, "TYPE")
+        && !crate::parser::keyword_ends_with(type_name, "STYLE")
+    {
         return None;
     }
-    let ty = legacy_aware_ifc_type(type_name);
+    let ty = ifc_type_from_keyword(type_name);
     ty.is_subtype_of(IfcType::IfcTypeProduct).then_some(ty)
 }
 
-/// The legacy-aware type for an entity, recovered from its RAW STEP RECORD.
+/// The schema-resolved type for an entity, recovered from its RAW STEP RECORD.
 ///
 /// For callers that hold a `DecodedEntity` and its source bytes but no keyword.
-/// `DecodedEntity.ifc_type` comes from a bare [`IfcType::from_str`], and for a
-/// name IFC4X3 dropped that is `IfcType::Unknown` — which stores a **CRC32
-/// hash, not the name**, so the keyword cannot be recovered from it. The record
-/// is the only place it still exists.
+/// `DecodedEntity.ifc_type` comes from a bare [`IfcType::from_str`]. Supported
+/// supported schema names arrive as exact variants. A genuinely unknown name,
+/// including an exporter stratum alias, remains `IfcType::Unknown`, which owns
+/// its normalized keyword alongside its CRC32 ID. The raw record is only the
+/// fallback when a decoder has not retained a recoverable keyword.
 ///
 /// `decoded` is returned unchanged when it is already a known type, so the
 /// scan is paid only by entities that need it, and when the record is
 /// malformed enough that no keyword can be read.
 ///
 /// Exists because the wasm mesh batch had exactly this shape and got it wrong:
-/// every legacy keyword reached the browser labelled `"Unknown"` while the
-/// native pipeline, which still has the keyword in hand, labelled it correctly
-/// (#3179).
-pub fn legacy_aware_ifc_type_from_record(decoded: IfcType, record: &[u8]) -> IfcType {
+/// unknown keywords reached the browser labelled `"Unknown"` even when the
+/// raw record could identify them. The raw-record fallback keeps both paths
+/// aligned (#3179).
+pub fn ifc_type_from_record(decoded: IfcType, record: &[u8]) -> IfcType {
+    // #4203: supported schema names have exact enum variants. The raw record
+    // is only needed when the decoder preserved an owned unknown value.
     if !matches!(decoded, IfcType::Unknown(_)) {
         return decoded;
     }
     match crate::fast_parse::extract_entity_type_name(record) {
-        Some(name) => legacy_aware_ifc_type(name),
+        Some(name) => ifc_type_from_keyword(name),
         None => decoded,
     }
 }
 
 fn compute_is_simple(upper: &str) -> bool {
-    let t = legacy_aware_ifc_type(upper);
+    let t = ifc_type_from_keyword(upper);
 
     // Anything not in the modern schema defaults to "simple" priority,
     // matching the original blacklist's "anything else is simple" behaviour.
@@ -366,6 +327,14 @@ fn compute_is_simple(upper: &str) -> bool {
                 | IfcType::IfcAnnotation
                 | IfcType::IfcVirtualElement
                 | IfcType::IfcBuildingElementProxy
+                // IFC2X3-only keywords the registry parents outside the arms
+                // above (#5180). `IfcProxy` sits on IfcProduct, not on
+                // IfcBuildingElementProxy; `IfcEquipmentElement` sits on
+                // IfcElement although its IFC4 successors are all
+                // IfcDistributionElement subtypes. The retired legacy table
+                // routed them through those two types, so both were deferred.
+                | IfcType::IfcProxy
+                | IfcType::IfcEquipmentElement
         );
 
     !is_secondary

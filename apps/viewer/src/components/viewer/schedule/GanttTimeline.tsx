@@ -8,21 +8,27 @@
  */
 
 import { memo, useMemo, useCallback, useRef, useLayoutEffect, useState } from 'react';
+import { CalendarOff } from 'lucide-react';
 import type { ScheduleExtraction } from '@ifc-lite/parser';
 import { cn } from '@/lib/utils';
-import { taskStartEpoch, taskFinishEpoch } from '@/store';
+import { useViewerStore, taskStartEpoch, taskFinishEpoch } from '@/store';
 import type { GanttTimeScale, ScheduleTimeRange } from '@/store';
+import { useTranslation } from '@/i18n';
+import { formatLocaleDate } from '@/i18n/intlFormat';
+import { IconButton } from '@/components/ui/icon-button';
 import type { FlattenedTask } from './schedule-utils';
 import {
   computeTicks,
+  advanceCalendarTime,
   formatTickLabel,
   timeToX,
 } from './schedule-utils';
-import { GANTT_ROW_HEIGHT, GANTT_HEADER_HEIGHT } from './GanttTaskTree';
+import { GANTT_ROW_HEIGHT, GANTT_HEADER_HEIGHT, GANTT_BOTTOM_GUTTER_HEIGHT } from './GanttTaskTree';
 import { useGanttBarDrag } from './useGanttBarDrag';
 import { GanttTaskBar } from './GanttTaskBar';
 import { GanttDependencyArrows } from './GanttDependencyArrows';
 import { GanttDragTooltip } from './GanttDragTooltip';
+import { resolveActiveCalendar, getNonWorkingDayStarts, nextLocalDayStart } from './work-calendar';
 
 // Alias kept for local readability; binds to the shared constant so the
 // timeline header and the task-tree header stay the same height.
@@ -57,6 +63,7 @@ export const GanttTimeline = memo(function GanttTimeline({
   scrollTop,
   onScroll,
 }: GanttTimelineProps) {
+  const { t, locale } = useTranslation();
   const containerRef = useRef<HTMLDivElement>(null);
   const [pixelWidth, setPixelWidth] = useState(1000);
 
@@ -110,6 +117,25 @@ export const GanttTimeline = memo(function GanttTimeline({
     () => computeTicks(range.start, range.end, scale),
     [range, scale],
   );
+
+  // Non-working-day shading (#4830). `respectWorkCalendar` is the same flag
+  // the playback clock (`advancePlaybackBy`, `playbackSlice.ts`) uses to
+  // skip these days during auto-play — one flag, two consumers, so toggling
+  // it off both stops the clock-skip AND clears the shading in one action.
+  const respectWorkCalendar = useViewerStore(s => s.respectWorkCalendar);
+  const setRespectWorkCalendar = useViewerStore(s => s.setRespectWorkCalendar);
+  const activeWorkScheduleId = useViewerStore(s => s.activeWorkScheduleId);
+  const activeCalendar = useMemo(
+    () => resolveActiveCalendar(data, activeWorkScheduleId),
+    [data, activeWorkScheduleId],
+  );
+  // Day-granularity shading only reads cleanly at day/week zoom — at
+  // month/year scale a 1-day rect is sub-pixel and just adds SVG nodes.
+  const dayShadingScale = scale === 'day' || scale === 'week';
+  const nonWorkingDayStarts = useMemo(() => {
+    if (!respectWorkCalendar || !dayShadingScale || !activeCalendar) return [];
+    return getNonWorkingDayStarts(activeCalendar, range.start, range.end);
+  }, [respectWorkCalendar, dayShadingScale, activeCalendar, range.start, range.end]);
 
   const rowsHeight = rows.length * GANTT_ROW_HEIGHT;
 
@@ -168,6 +194,24 @@ export const GanttTimeline = memo(function GanttTimeline({
     onScrubSeek(range.start + pct * (range.end - range.start));
   }, [pixelWidth, range, onScrubSeek]);
 
+  const handleTimelineKeyDown = useCallback((event: React.KeyboardEvent<HTMLInputElement>) => {
+    let nextTime: number;
+    switch (event.key) {
+      case 'ArrowLeft':
+      case 'ArrowDown': nextTime = advanceCalendarTime(playbackTime, scale, -1); break;
+      case 'ArrowRight':
+      case 'ArrowUp': nextTime = advanceCalendarTime(playbackTime, scale, 1); break;
+      case 'Home': nextTime = range.start; break;
+      case 'End': nextTime = range.end; break;
+      default: return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    onScrubSeek(Math.min(range.end, Math.max(range.start, nextTime)));
+  }, [playbackTime, scale, range, onScrubSeek]);
+
+  const clampedPlaybackTime = Math.min(range.end, Math.max(range.start, playbackTime));
+
   return (
     <div
       ref={containerRef}
@@ -180,6 +224,19 @@ export const GanttTimeline = memo(function GanttTimeline({
         className="sticky top-0 z-10 bg-card/90 backdrop-blur-sm border-b"
         style={{ height: HEADER_HEIGHT }}
       >
+        {(data.workCalendars?.length ?? 0) > 0 && (
+          <IconButton
+            label={t('gantt.workCalendar.toggle.ariaLabel')}
+            tooltip={respectWorkCalendar ? t('gantt.workCalendar.toggle.tooltipOn') : t('gantt.workCalendar.toggle.tooltipOff')}
+            tooltipSide="bottom"
+            variant={respectWorkCalendar ? 'secondary' : 'ghost'}
+            className="absolute right-1 top-0.5 h-5 w-5 z-20"
+            aria-pressed={respectWorkCalendar}
+            onClick={() => setRespectWorkCalendar(!respectWorkCalendar)}
+          >
+            <CalendarOff className="h-3 w-3" />
+          </IconButton>
+        )}
         <svg width={pixelWidth} height={HEADER_HEIGHT} className="block">
           {ticks.map((t, i) => {
             const x = timeToX(t, range.start, range.end, pixelWidth);
@@ -189,7 +246,7 @@ export const GanttTimeline = memo(function GanttTimeline({
                 <text
                   x={x + 3}
                   y={HEADER_HEIGHT - 8}
-                  className="text-[10px] fill-muted-foreground font-mono"
+                  className="text-2xs fill-muted-foreground font-mono"
                 >
                   {formatTickLabel(t, scale)}
                 </text>
@@ -200,12 +257,35 @@ export const GanttTimeline = memo(function GanttTimeline({
       </div>
 
       {/* Timeline body */}
+      {/* Pointer canvas for bars and scrubbing; the native range below provides keyboard access. */}
+      {/* eslint-disable-next-line jsx-a11y/click-events-have-key-events, jsx-a11y/no-static-element-interactions */}
       <svg
         width={pixelWidth}
         height={rowsHeight}
         className="block cursor-crosshair"
         onClick={handleTimelineClick}
+        data-testid="gantt-timeline-body"
       >
+        {/* Non-working-day shading (#4830) — painted first so grid lines,
+            row highlights and bars all draw on top of it. */}
+        {nonWorkingDayStarts.map((dayStart) => {
+          const x0 = timeToX(dayStart, range.start, range.end, pixelWidth);
+          const x1 = timeToX(nextLocalDayStart(dayStart), range.start, range.end, pixelWidth);
+          return (
+            <rect
+              key={`nwd-${dayStart}`}
+              x={x0}
+              y={0}
+              width={Math.max(0, x1 - x0)}
+              height={rowsHeight}
+              fill="currentColor"
+              fillOpacity={0.05}
+              className="text-foreground pointer-events-none"
+              data-testid="gantt-non-working-day"
+            />
+          );
+        })}
+
         {/* Vertical grid */}
         {ticks.map((t, i) => {
           const x = timeToX(t, range.start, range.end, pixelWidth);
@@ -293,6 +373,21 @@ export const GanttTimeline = memo(function GanttTimeline({
         />
       </svg>
 
+      {/* Native slider also matches the task tree's clear-control scroll gutter. */}
+      <input
+        type="range"
+        className="block accent-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary"
+        style={{ width: pixelWidth, height: GANTT_BOTTOM_GUTTER_HEIGHT }}
+        min={range.start}
+        max={range.end}
+        value={clampedPlaybackTime}
+        aria-label={t('schedule.toolbar.playbackPosition')}
+        aria-valuetext={formatLocaleDate(locale, clampedPlaybackTime, { dateStyle: 'medium', timeStyle: 'short' })}
+        onKeyDown={handleTimelineKeyDown}
+        onChange={(event) => onScrubSeek(Number(event.currentTarget.value))}
+        data-testid="gantt-timeline-slider"
+      />
+
       {/* Live-drag tooltip — floats next to the cursor, absolute-
           positioned inside the scroll container so it scrolls with
           everything else. Only visible while a drag is active. */}
@@ -302,4 +397,3 @@ export const GanttTimeline = memo(function GanttTimeline({
     </div>
   );
 });
-

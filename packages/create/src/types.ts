@@ -23,7 +23,7 @@ export type Point2D = [number, number];
 export interface Placement3D {
   Location: Point3D;
   Axis?: Point3D;        // Z direction, default [0,0,1]
-  RefDirection?: Point3D; // X direction, default [1,0,0]
+  RefDirection?: Point3D; // X direction, default world X projected normal to Axis (IfcFirstProjAxis)
 }
 
 /** 2D rectangle profile (width along X, depth along Y, centered at origin) */
@@ -478,13 +478,27 @@ export interface ProxyParams extends ElementAttributes {
 // ============================================================================
 
 /** IFC property value types */
-export type PropertyType = 'IfcLabel' | 'IfcText' | 'IfcIdentifier' | 'IfcReal' | 'IfcInteger' | 'IfcBoolean' | 'IfcLogical';
+/**
+ * A numeric measure type -- `IfcThermalTransmittanceMeasure`,
+ * `IfcPositiveLengthMeasure`, `IfcCountMeasure`, `IfcPlaneAngleMeasure`, ...
+ * Standard property sets declare their values in these (Pset_WallCommon's
+ * ThermalTransmittance is an IfcThermalTransmittanceMeasure, not an IfcReal),
+ * and an IDS check on the data type fails a value written as the wrong one.
+ */
+export type PropertyMeasureType = `Ifc${string}Measure`;
+
+export type PropertyType =
+  | 'IfcLabel' | 'IfcText' | 'IfcIdentifier' | 'IfcReal' | 'IfcInteger' | 'IfcBoolean' | 'IfcLogical'
+  | PropertyMeasureType;
 
 /** Single property definition */
 export interface PropertyDef {
   Name: string;
   NominalValue: string | number | boolean;
-  /** Defaults to IfcLabel for strings, IfcReal for numbers, IfcBoolean for booleans */
+  /**
+   * Defaults to IfcLabel for strings, IfcInteger/IfcReal for numbers, IfcBoolean
+   * for booleans. A numeric value may declare any measure type and is written as it.
+   */
   Type?: PropertyType;
 }
 
@@ -547,6 +561,13 @@ export interface ProjectParams {
   Schema?: 'IFC2X3' | 'IFC4' | 'IFC4X3';
   /** Length unit: 'METRE' (default), 'MILLIMETRE', 'FOOT' */
   LengthUnit?: string;
+  /**
+   * Project currency (e.g. 'CHF'), written as an IfcMonetaryUnit in the
+   * IfcUnitAssignment. THERE IS NO DEFAULT: leave it out and the file states no
+   * currency, which is a different answer from a guessed one and is the answer
+   * the cost read model gives back.
+   */
+  Currency?: string;
   Author?: string;
   Organization?: string;
   /**
@@ -589,125 +610,19 @@ export interface StoreyParams {
 // Scheduling / 4D (IfcWorkSchedule, IfcTask, IfcRelSequence)
 // ============================================================================
 
-export type WorkScheduleType =
-  | 'ACTUAL' | 'BASELINE' | 'PLANNED'
-  | 'USERDEFINED' | 'NOTDEFINED';
-
-/**
- * IFC task-type enum — union of IFC4 and IFC4X3 `IfcTaskTypeEnum` values.
- *
- * IFC4 introduced the first 14. IFC4X3 added 9 more to cover the
- * operations/maintenance lifecycle (ADJUSTMENT through TROUBLESHOOTING).
- * The superset is exposed here so scripts can author schedules for
- * either schema; IFC4 files that try to round-trip the newer values
- * may fail validation on strict toolchains — caller's responsibility.
- */
-export type TaskPredefinedType =
-  // IFC4 values
-  | 'ATTENDANCE' | 'CONSTRUCTION' | 'DEMOLITION' | 'DISMANTLE'
-  | 'DISPOSAL' | 'INSTALLATION' | 'LOGISTIC' | 'MAINTENANCE'
-  | 'MOVE' | 'OPERATION' | 'REMOVAL' | 'RENOVATION'
-  | 'USERDEFINED' | 'NOTDEFINED'
-  // IFC4X3 additions (operations / maintenance lifecycle)
-  | 'ADJUSTMENT' | 'CALIBRATION' | 'EMERGENCY' | 'INSPECTION'
-  | 'SAFETY' | 'SHUTDOWN' | 'STARTUP' | 'TESTING' | 'TROUBLESHOOTING';
-
-export type TaskDurationType =
-  | 'WORKTIME' | 'ELAPSEDTIME' | 'NOTDEFINED';
-
-export type SequenceType =
-  | 'START_START' | 'START_FINISH' | 'FINISH_START' | 'FINISH_FINISH'
-  | 'USERDEFINED' | 'NOTDEFINED';
-
-/**
- * IfcWorkSchedule parameters.
- *
- * Timestamps are ISO 8601 datetimes (e.g. "2024-05-01T08:00:00").
- * `Duration` / `TotalFloat` use ISO 8601 durations (e.g. "P30D", "PT8H").
- */
-export interface WorkScheduleParams {
-  Name: string;
-  Description?: string;
-  Identification?: string;
-  CreationDate?: string;
-  StartTime: string;
-  FinishTime?: string;
-  Purpose?: string;
-  Duration?: string;
-  TotalFloat?: string;
-  PredefinedType?: WorkScheduleType;
-}
-
-/** IfcWorkPlan parameters — identical shape to IfcWorkSchedule. */
-export interface WorkPlanParams extends WorkScheduleParams {}
-
-/** Canonical IFC-prefixed alias for {@link WorkScheduleParams}. */
-export type IfcWorkScheduleParams = WorkScheduleParams;
-/** Canonical IFC-prefixed alias for {@link WorkPlanParams}. */
-export type IfcWorkPlanParams = WorkPlanParams;
-/** Canonical IFC-prefixed alias for {@link WorkScheduleType}. */
-export type IfcWorkScheduleType = WorkScheduleType;
-/** Canonical IFC-prefixed alias for {@link TaskPredefinedType}. */
-export type IfcTaskPredefinedType = TaskPredefinedType;
-/** Canonical IFC-prefixed alias for {@link TaskDurationType}. */
-export type IfcTaskDurationType = TaskDurationType;
-
-/**
- * IfcTask parameters.
- *
- * When any of the *Start / *Finish / *Duration / IsCritical / Completion
- * fields is supplied, an IfcTaskTime is created and linked.
- */
-export interface TaskParams {
-  Name: string;
-  Description?: string;
-  ObjectType?: string;
-  Identification?: string;
-  LongDescription?: string;
-  Status?: string;
-  WorkMethod?: string;
-  IsMilestone?: boolean;
-  Priority?: number;
-  PredefinedType?: TaskPredefinedType;
-  /** ISO 8601 datetime */
-  ScheduleStart?: string;
-  ScheduleFinish?: string;
-  ScheduleDuration?: string;
-  ActualStart?: string;
-  ActualFinish?: string;
-  ActualDuration?: string;
-  EarlyStart?: string;
-  EarlyFinish?: string;
-  LateStart?: string;
-  LateFinish?: string;
-  FreeFloat?: string;
-  TotalFloat?: string;
-  RemainingTime?: string;
-  StatusTime?: string;
-  IsCritical?: boolean;
-  DurationType?: TaskDurationType;
-  /** Percent complete 0..100 */
-  Completion?: number;
-}
-
-/** Canonical IFC-prefixed alias for {@link TaskParams}. */
-export type IfcTaskParams = TaskParams;
-
-/** IfcRelSequence parameters (predecessor → successor edge). */
-export interface IfcRelSequenceParams {
-  SequenceType?: IfcRelSequenceType;
-  /** ISO 8601 duration (e.g. "P2D"). Negative durations indicate leads. */
-  TimeLag?: string;
-  /** Duration type applied to the lag (default WORKTIME). */
-  LagDurationType?: TaskDurationType;
-  UserDefinedSequenceType?: string;
-}
-
-/** @deprecated Use {@link IfcRelSequenceParams}. */
-export type SequenceParams = IfcRelSequenceParams;
-
-/** Canonical alias using the IFC EXPRESS enum name. */
-export type IfcRelSequenceType = SequenceType;
+// The shapes themselves live in `types-scheduling.ts` — a sibling split for
+// module size, re-exported here so `./types.js` stays the one import path.
+export type {
+  WorkScheduleType, TaskPredefinedType, TaskDurationType, SequenceType,
+  WorkCalendarType, RecurrenceType,
+  WorkScheduleParams, WorkPlanParams, TaskParams,
+  IfcRelSequenceParams, SequenceParams,
+  WorkCalendarParams, WorkTimeParams, RecurrencePatternParams, TimePeriodParams,
+  IfcWorkScheduleParams, IfcWorkPlanParams, IfcTaskParams,
+  IfcWorkScheduleType, IfcTaskPredefinedType, IfcTaskDurationType, IfcRelSequenceType,
+  IfcWorkCalendarParams, IfcWorkTimeParams, IfcRecurrencePatternParams, IfcTimePeriodParams,
+  IfcWorkCalendarType, IfcRecurrenceType,
+} from './types-scheduling.js';
 
 // ============================================================================
 // Creation result

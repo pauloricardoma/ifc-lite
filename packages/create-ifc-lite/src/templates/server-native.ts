@@ -18,6 +18,7 @@ export function createServerNativeTemplate(targetDir: string, projectName: strin
   writeFileSync(join(targetDir, 'package.json'), JSON.stringify({
     name: projectName,
     version: '0.1.0',
+    private: true,
     type: 'module',
     description: 'IFC processing server (native binary) with TypeScript client',
     scripts: {
@@ -39,7 +40,7 @@ export function createServerNativeTemplate(targetDir: string, projectName: strin
       '@types/node': '^20.0.0',
     },
     optionalDependencies: {
-      'parquet-wasm': '^0.6.0',
+      'parquet-wasm': '^0.7.2',
       'apache-arrow': '^17.0.0',
     },
   }, null, 2));

@@ -12,116 +12,26 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use ifc_lite_core::EntityScanner;
 
-/// A single root-attribute edit: replace the top-level attribute at `index` of entity
-/// `express_id` with `value` (already STEP-serialized, e.g. `'New Name'` or `$`).
-/// This is the wasm-bridge form of a `MutablePropertyView` UPDATE_ATTRIBUTE mutation.
-pub struct AttrMutation {
-    pub express_id: u32,
-    pub index: usize,
-    pub value: String,
-}
-
-/// A property create/update: attach (or overwrite) `prop_name` in `pset_name` on
-/// `express_id` with `value` — the STEP-serialized nominal value, e.g. `IFCLABEL('2HR')`
-/// or `IFCREAL(42.)`. The wasm-bridge form of a `MutablePropertyView` CREATE/UPDATE_PROPERTY.
-/// Synthesizes fresh `IfcPropertySingleValue` / `IfcPropertySet` / `IfcRelDefinesByProperties`
-/// entities appended to DATA (new psets; merge-into-existing is a follow-on).
-pub struct PropMutation {
-    pub express_id: u32,
-    pub pset_name: String,
-    pub prop_name: String,
-    pub value: String,
-}
-
-/// Replace one attribute of a record that other records share, by copying the
-/// record and repointing a single referrer at the copy.
-///
-/// The reason this is a writer job rather than a caller one is the id. A copy
-/// needs a number no record holds, and the writer is what knows `max_id`; a
-/// caller that allocates its own has to agree with `PropMutation`'s synthesis
-/// about which numbers are free, and two allocators sharing one space is a
-/// collision waiting for the first export that uses both.
-///
-/// Doing it here also keeps the copy inside the emit path, so it is counted in
-/// [`StepStats::written`] and converted when the export targets another schema.
-/// A record spliced into the output afterwards is neither.
-///
-/// Property sets are the case this exists for. IFC exporters routinely give
-/// each element its own `IfcPropertySet` and point them all at one
-/// `IfcPropertySingleValue` per distinct value, so editing that value in place
-/// changes it for every element sharing it. Copying first changes one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CopyOnWriteMutation {
-    /// The record to copy.
-    pub express_id: u32,
-    /// Which attribute of the copy to replace, zero-based.
-    pub index: usize,
-    /// The replacement, STEP-serialized, e.g. `IFCLABEL('2HR')`.
-    pub value: String,
-    /// The record that should point at the copy instead of the original.
-    pub referrer_id: u32,
-    /// Which attribute of the referrer holds that reference. A list attribute
-    /// is rewritten with the one reference substituted and the rest untouched.
-    pub referrer_index: usize,
-}
-
-/// Options for STEP export.
-#[derive(Default)]
-pub struct StepOptions {
-    /// FILE_SCHEMA label to write (e.g. `IFC4`). `None` ⇒ preserve the source schema.
-    /// When `Some` and the target differs, entity types/attributes are converted (P2).
-    pub schema: Option<String>,
-    /// Express ids to include. `None` ⇒ the whole model. When set, the forward
-    /// reference closure is added so every emitted `#ref` resolves.
-    pub included: Option<Vec<u32>>,
-    /// Root-attribute edits to apply during serialization (P3 mutation bridge).
-    pub attribute_mutations: Vec<AttrMutation>,
-    /// Property create/update edits — synthesized as new pset entities appended to DATA.
-    pub property_mutations: Vec<PropMutation>,
-    /// Copy-then-edit mutations for records other records share.
-    pub copy_on_write: Vec<CopyOnWriteMutation>,
-    /// `FILE_DESCRIPTION` item. `None` ⇒ keep the source file's items, and
-    /// fall back to the generic view-definition default only when the source
-    /// carried none.
-    pub description: Option<String>,
-    /// `FILE_NAME` author. `None` ⇒ keep the source file's.
-    pub author: Option<String>,
-    /// `FILE_NAME` organization. `None` ⇒ keep the source file's.
-    pub organization: Option<String>,
-    /// `FILE_NAME` preprocessor_version — the tool writing this file.
-    /// `None` ⇒ `ifc-lite`.
-    pub application: Option<String>,
-    /// `FILE_NAME` name. `None` ⇒ `export.ifc`.
-    pub filename: Option<String>,
-    /// `FILE_NAME` time_stamp. `None` ⇒ the source file's stamp. There is no
-    /// clock fallback: `SystemTime::now` is unavailable on the
-    /// `wasm32-unknown-unknown` target this exporter ships to, so a caller that
-    /// wants "now" states it.
-    pub time_stamp: Option<String>,
-}
-
-/// Coverage stats for a STEP export.
-pub struct StepStats {
-    /// Entities in the source model.
-    pub total: usize,
-    /// Entities written (after filtering + reference closure).
-    pub written: usize,
-    /// Copy-on-write mutations the file could not express, so none was made.
-    /// Non-zero means an edit the caller asked for is not in the output, and
-    /// the caller is the only one who can say what to do about it.
-    pub copies_refused: usize,
-}
+pub use crate::step_api::{
+    AttrMutation, CopyOnWriteMutation, PropMutation, StepOptions, StepStats,
+};
 
 use crate::schema_detect::detect_schema;
-use crate::step_text::{apply_attr_mutations, escape, merge_edits, refs_in_line, renumber};
+use crate::step_text::{
+    apply_attr_mutations_counted, escape, merge_edits, refs_in_line_counted, renumber,
+};
 
 /// Export the parsed model in `content` as a STEP/IFC string.
-pub fn export_step(content: &[u8], opts: &StepOptions) -> String {
-    export_step_with_stats(content, opts).0
+///
+/// Errs when a source entity's (possibly renamed) type has no representation
+/// at all in an explicit `opts.schema` target and is not an `IfcRoot`
+/// subtype either — see [`crate::schema_unrepresented`] (#5116).
+pub fn export_step(content: &[u8], opts: &StepOptions) -> std::io::Result<String> {
+    export_step_with_stats(content, opts).map(|(s, _)| s)
 }
 
 /// Like [`export_step`] but also returns coverage stats.
-pub fn export_step_with_stats(content: &[u8], opts: &StepOptions) -> (String, StepStats) {
+pub fn export_step_with_stats(content: &[u8], opts: &StepOptions) -> std::io::Result<(String, StepStats)> {
     // Presized for a full re-export, where the output is within a small factor
     // of the source. Not for a subset: 200 MB filtered to a few records would
     // reserve 200 MB, and on wasm that linear memory never comes back.
@@ -131,11 +41,15 @@ pub fn export_step_with_stats(content: &[u8], opts: &StepOptions) -> (String, St
     };
     // `emit`, not `export_step_to_writer`: a `Vec` needs no buffering, and
     // wrapping one memcpys the whole output through a 1 MiB window for nothing.
-    let stats = emit(content, opts, &mut buf).expect("a Vec accepts every write");
+    // A Vec's `Write` impl cannot fail for I/O reasons, so an `Err` here is
+    // always a schema-conversion failure (`emit` also propagates those through
+    // this same `io::Result`, see `schema_unrepresented::UnrepresentedEntityError`'s
+    // `From` impl) — genuinely fallible now, unlike the `.expect` this replaced.
+    let stats = emit(content, opts, &mut buf)?;
     // Every byte came from the source by way of `from_utf8_lossy`, or from a
     // `format!`, so this validates rather than converts.
     let out = String::from_utf8(buf).expect("the writer emits UTF-8");
-    (out, stats)
+    Ok((out, stats))
 }
 
 /// [`export_step_with_stats`], writing as it goes instead of returning the file.
@@ -167,6 +81,26 @@ pub fn export_step_to_writer<W: std::io::Write>(
     Ok(stats)
 }
 
+/// Write one record this exporter SYNTHESIZES (a property set, its properties,
+/// the relationship that attaches it), through the IFC2X3 required-slot fills
+/// when the output is IFC2X3.
+///
+/// These records never reach `convert_step_line` — they are built here, after
+/// the emit loop — so before #4714 they went out with `$` in `OwnerHistory`,
+/// which IFC2X3 requires, even when the file had an owner history to point
+/// them at. Source records are filled inside the converter; these are filled
+/// here, through the same object, so both land in the same counters.
+fn write_synthesized<W: std::io::Write>(
+    out: &mut W,
+    line: String,
+    targets_ifc2x3: bool,
+    slot_fill: &mut crate::schema_ifc2x3_slots::Ifc2x3SlotFill,
+) -> std::io::Result<()> {
+    let line = if targets_ifc2x3 { slot_fill.apply(line) } else { line };
+    out.write_all(line.as_bytes())?;
+    out.write_all(b"\n")
+}
+
 #[allow(clippy::type_complexity)]
 fn emit<W: std::io::Write>(
     content: &[u8],
@@ -177,15 +111,21 @@ fn emit<W: std::io::Write>(
     let mut order: Vec<u32> = Vec::new();
     let mut line_of: HashMap<u32, (usize, usize)> = HashMap::new();
     let mut max_id = 0u32;
+    let mut owner_histories: Vec<u32> = Vec::new();
     let mut scanner = EntityScanner::new(content);
-    while let Some((id, _type, start, end)) = scanner.next_entity() {
+    while let Some((id, type_name, start, end)) = scanner.next_entity() {
         max_id = max_id.max(id);
+        if type_name.eq_ignore_ascii_case("IFCOWNERHISTORY") {
+            owner_histories.push(id);
+        }
         if line_of.insert(id, (start, end)).is_none() {
             order.push(id);
         }
     }
 
     // 2. Resolve the included set + forward reference closure.
+    let mut refused_refs = 0usize;
+    let mut attribute_edits_refused = 0usize;
     let included: HashSet<u32> = match &opts.included {
         None => order.iter().copied().collect(),
         Some(roots) => {
@@ -198,7 +138,7 @@ fn emit<W: std::io::Write>(
                 }
                 if let Some(&(s, e)) = line_of.get(&id) {
                     refs.clear();
-                    refs_in_line(&content[s..e], &mut refs);
+                    refs_in_line_counted(&content[s..e], &mut refs, &mut refused_refs);
                     for &r in &refs {
                         if !keep.contains(&r) {
                             stack.push(r);
@@ -218,6 +158,19 @@ fn emit<W: std::io::Write>(
     // Only convert entity types/attributes when an explicit target differs from source.
     let converting = opts.schema.is_some()
         && crate::schema_convert::needs_conversion(&source_schema, &schema);
+    // The slots IFC2X3 requires a value in: `OwnerHistory` from the first owner
+    // history this export writes (#4686), the rest from the generated
+    // required-slot table (#4714).
+    let mut slot_fill = crate::schema_ifc2x3_slots::Ifc2x3SlotFill::new(
+        owner_histories.into_iter().find(|id| included.contains(id)),
+    );
+    // IFC4-required `$` slots (#5307) and enum members the target lacks (#5365).
+    let mut checks = crate::schema_enum::ConversionChecks::new();
+    // The synthesized property sets below are filled whenever the OUTPUT is
+    // IFC2X3, not only when a conversion runs: an IFC2X3 source needs no
+    // conversion, and the records this exporter writes for it still have to be
+    // valid IFC2X3.
+    let targets_ifc2x3 = crate::schema_convert::targets_ifc2x3(&schema);
 
     // Root-attribute edits, resolved per (entity, attribute) as they are read.
     // A list plus a last-wins rule made "the value at this index" a derived
@@ -245,7 +198,18 @@ fn emit<W: std::io::Write>(
     let repointed = resolved.repointed;
 
     // 3. Emit header + filtered entities (source order) + footer.
-    crate::step_header::write_header(out, opts, source_header.as_ref(), &schema)?;
+    // The FILE_SCHEMA token, by the TypeScript twin's rule: keep the source's
+    // exact identifier unless this export converts, else declare the target
+    // family's file identifier (IFC4X3 is written as IFC4X3_ADD2, #5351).
+    let declared = source_header
+        .as_ref()
+        .and_then(|h| h.schema_identifiers.first())
+        .filter(|s| !s.is_empty());
+    let header_schema = match declared {
+        Some(token) if !converting => token.as_str(),
+        _ => crate::file_schema::file_schema_identifier(&schema),
+    };
+    crate::step_header::write_header(out, opts, source_header.as_ref(), header_schema)?;
 
     let mut written = 0usize;
     for id in &order {
@@ -254,19 +218,21 @@ fn emit<W: std::io::Write>(
                 let raw = String::from_utf8_lossy(&content[s..e]);
                 // Apply root-attribute edits first (original-schema positions), then convert.
                 let edited = match merge_edits(muts_by_id.get(id), repointed.get(id)) {
-                    Some(edits) => apply_attr_mutations(&raw, &edits),
+                    Some(edits) => {
+                        apply_attr_mutations_counted(&raw, &edits, &mut attribute_edits_refused)
+                    }
                     None => raw.into_owned(),
                 };
                 if converting {
-                    out.write_all(
-                        crate::schema_convert::convert_step_line(
-                            &edited,
-                            &source_schema,
-                            &schema,
-                            *id,
-                        )
-                        .as_bytes(),
+                    let converted = crate::schema_convert::convert_step_line(
+                        &edited,
+                        &source_schema,
+                        &schema,
+                        *id,
+                        &mut slot_fill,
+                        Some(&mut checks),
                     )?;
+                    out.write_all(converted.as_bytes())?;
                 } else {
                     out.write_all(edited.as_bytes())?;
                 }
@@ -287,18 +253,18 @@ fn emit<W: std::io::Write>(
             // why they are resolved into their own map.
             let mut muts = muts_by_id.get(source_id).cloned().unwrap_or_default();
             muts.extend(edits.iter().map(|(i, v)| (*i, v.clone())));
-            let edited = apply_attr_mutations(&raw, &muts);
+            let edited = apply_attr_mutations_counted(&raw, &muts, &mut attribute_edits_refused);
             let renumbered = renumber(&edited, *copy_id);
             if converting {
-                out.write_all(
-                    crate::schema_convert::convert_step_line(
-                        &renumbered,
-                        &source_schema,
-                        &schema,
-                        *copy_id,
-                    )
-                    .as_bytes(),
+                let converted = crate::schema_convert::convert_step_line(
+                    &renumbered,
+                    &source_schema,
+                    &schema,
+                    *copy_id,
+                    &mut slot_fill,
+                    Some(&mut checks),
                 )?;
+                out.write_all(converted.as_bytes())?;
             } else {
                 out.write_all(renumbered.as_bytes())?;
             }
@@ -329,7 +295,18 @@ fn emit<W: std::io::Write>(
         // duplicate real records.
         let Some(mut next) = next_id else {
             out.write_all(b"ENDSEC;\nEND-ISO-10303-21;\n")?;
-            return Ok(StepStats { total: order.len(), written, copies_refused });
+            return Ok(StepStats {
+                total: order.len(),
+                written,
+                copies_refused,
+                refused_refs,
+                attribute_edits_refused,
+                owner_history_unfilled: slot_fill.owner_history_unfilled(),
+                required_slots_unfilled: slot_fill.required_slots_unfilled(),
+                ifc4_required_slots_unfilled: checks.ifc4_slots.required_slots_unfilled(),
+                enum_values_lost: checks.enums.lost(),
+                enum_values_refused: checks.enums.refused(),
+            });
         };
         for ((express_id, pset_name), props) in &groups {
             // One property set costs one id per property plus one for the set
@@ -345,12 +322,12 @@ fn emit<W: std::io::Write>(
             }
             let mut prop_refs: Vec<u32> = Vec::with_capacity(props.len());
             for (pname, value) in props {
-                writeln!(
-                    out,
+                let line = format!(
                     "#{next}=IFCPROPERTYSINGLEVALUE('{}',$,{},$);",
                     escape(pname),
                     value
-                )?;
+                );
+                write_synthesized(out, line, targets_ifc2x3, &mut slot_fill)?;
                 prop_refs.push(next);
                 next += 1;
                 written += 1;
@@ -358,28 +335,39 @@ fn emit<W: std::io::Write>(
             let psid = next;
             next += 1;
             let refs_str = prop_refs.iter().map(|r| format!("#{r}")).collect::<Vec<_>>().join(",");
-            writeln!(
-                out,
+            let line = format!(
                 "#{psid}=IFCPROPERTYSET('{}',$,'{}',$,({}));",
                 crate::schema_convert::placeholder_guid(psid),
                 escape(pset_name),
                 refs_str
-            )?;
+            );
+            write_synthesized(out, line, targets_ifc2x3, &mut slot_fill)?;
             written += 1;
             let rid = next;
             next += 1;
-            writeln!(
-                out,
+            let line = format!(
                 "#{rid}=IFCRELDEFINESBYPROPERTIES('{}',$,$,$,(#{express_id}),#{psid});",
                 crate::schema_convert::placeholder_guid(rid),
-            )?;
+            );
+            write_synthesized(out, line, targets_ifc2x3, &mut slot_fill)?;
             written += 1;
         }
     }
 
     out.write_all(b"ENDSEC;\nEND-ISO-10303-21;\n")?;
 
-    Ok(StepStats { total: order.len(), written, copies_refused })
+    Ok(StepStats {
+        total: order.len(),
+        written,
+        copies_refused,
+        refused_refs,
+        attribute_edits_refused,
+        owner_history_unfilled: slot_fill.owner_history_unfilled(),
+        required_slots_unfilled: slot_fill.required_slots_unfilled(),
+        ifc4_required_slots_unfilled: checks.ifc4_slots.required_slots_unfilled(),
+                enum_values_lost: checks.enums.lost(),
+                enum_values_refused: checks.enums.refused(),
+    })
 }
 
 #[cfg(test)]

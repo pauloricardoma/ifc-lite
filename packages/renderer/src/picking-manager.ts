@@ -14,6 +14,10 @@ import { Picker, type PointPickSizing } from './picker.js';
 import type { MeshData } from '@ifc-lite/geometry';
 import type { PickOptions, PickResult, PickClipState } from './types.js';
 import type { PointPickNode } from './point-picker.js';
+import type { GpuUploadOutcome } from './gpu-upload-guard.js';
+import { capturePointRteSnapshot, isPointRteSnapshotCurrent } from './pick-rte-snapshot.js';
+import { computeDrawingBufferSize } from './renderer-viewport.js';
+import { pickPieceKey, planPickMeshHydration } from './pick-mesh-budget.js';
 
 /**
  * Supplied by the renderer when point clouds are loaded — returns the
@@ -29,7 +33,7 @@ export class PickingManager {
     private scene: Scene;
     private picker: Picker | null;
     private canvas: HTMLCanvasElement;
-    private createMeshFromDataFn: (meshData: MeshData) => void;
+    private createMeshFromDataFn: (meshData: MeshData) => GpuUploadOutcome<void>;
     private pointPickProvider: PointPickProvider | null = null;
 
     constructor(
@@ -37,13 +41,27 @@ export class PickingManager {
         scene: Scene,
         picker: Picker | null,
         canvas: HTMLCanvasElement,
-        createMeshFromDataFn: (meshData: MeshData) => void
+        createMeshFromDataFn: (meshData: MeshData) => GpuUploadOutcome<void>
     ) {
         this.camera = camera;
         this.scene = scene;
         this.picker = picker;
         this.canvas = canvas;
         this.createMeshFromDataFn = createMeshFromDataFn;
+    }
+
+    /**
+     * The pick target size and CSS-px to texel scale. The pick pass renders at
+     * the canvas's CSS size, not the device-pixel buffer (#5383): pointer input
+     * only resolves CSS px, the single pick copies the WHOLE depth image back
+     * (4x the bytes at DPR 2), and splat pick sizes stay in the draw's space.
+     * Clamped to 8192, the WebGPU-guaranteed `maxTextureDimension2D`.
+     */
+    private pickViewport(): { width: number; height: number; scaleX: number; scaleY: number } | null {
+        const rect = this.canvas.getBoundingClientRect();
+        const size = computeDrawingBufferSize(rect.width, rect.height, 1, 8192);
+        if (!size) return null;
+        return { width: size.width, height: size.height, scaleX: size.width / rect.width, scaleY: size.height / rect.height };
     }
 
     /** Renderer wires this on init so the manager can fetch point nodes lazily. */
@@ -75,72 +93,32 @@ export class PickingManager {
      */
     private prepareBatchedPick(options?: PickOptions): 'cpu' | 'gpu' {
         const batchedMeshes = this.scene.getBatchedMeshes();
-        // Nothing batched: every mesh is already individually hydrated.
-        if (batchedMeshes.length === 0) return 'gpu';
+        // Textured draws also keep separate GPU buffers and need pick-mesh hydration.
+        if (batchedMeshes.length === 0 && this.scene.getTexturedMeshes().length === 0) return 'gpu';
 
         if (this.scene.isGeometryDataReleased()) return 'cpu';
 
-        // Collect every pickable expressId. We use the scene's authoritative
-        // mesh-data id set rather than each batch's `expressIds`, because a batch
-        // only records the PRIMARY expressId of each merged piece. When a door or
-        // window is colour-fused into a batch keyed by its host wall / opening,
-        // the filler's id lives only in the per-vertex entityIds (registered in
-        // meshDataMap by Scene.addMeshData). Reading batch.expressIds alone would
-        // skip the filler, so under isolation its mesh is never hydrated and
-        // pick() returns null (#1358).
-        const expressIds = new Set<number>(this.scene.getAllMeshDataExpressIds());
-
-        // Track how many individual mesh pieces already exist for each (expressId:modelIndex).
-        // Multi-piece elements (windows/doors with submeshes) need all pieces for reliable picking.
-        const existingPieceCounts = new Map<string, number>();
-        for (const mesh of this.scene.getMeshes()) {
-            const key = `${mesh.expressId}:${mesh.modelIndex ?? 'any'}`;
-            existingPieceCounts.set(key, (existingPieceCounts.get(key) ?? 0) + 1);
-        }
-
-        // Build required piece counts from MeshData for all visible entities.
-        const requiredPieceCounts = new Map<string, number>();
-        const visibleExpressIds: number[] = [];
-        for (const expressId of expressIds) {
-            if (!isEntityVisible(expressId, options?.hiddenIds, options?.isolatedIds)) continue;
-            visibleExpressIds.push(expressId);
-
-            const pieces = this.scene.getMeshDataPieces(expressId);
-            if (!pieces) continue;
-            for (const piece of pieces) {
-                const key = `${piece.expressId}:${piece.modelIndex ?? 'any'}`;
-                requiredPieceCounts.set(key, (requiredPieceCounts.get(key) ?? 0) + 1);
-            }
-        }
-
-        // Count how many meshes we'd need to create for full GPU picking
-        // For multi-model and multi-piece elements, count missing piece instances per key.
-        let toCreate = 0;
-        for (const [key, requiredCount] of requiredPieceCounts) {
-            const existingCount = existingPieceCounts.get(key) ?? 0;
-            if (requiredCount > existingCount) {
-                toCreate += requiredCount - existingCount;
-            }
-        }
-
-        // PERFORMANCE: fall back to CPU for large models instead of creating GPU meshes.
-        // GPU picking requires individual mesh buffers; for 60K+ elements this is too slow.
-        // The CPU paths use bounding boxes - no GPU buffers needed.
-        const MAX_PICK_MESH_CREATION = 500;
-        if (toCreate > MAX_PICK_MESH_CREATION || (visibleExpressIds.length > 0 && requiredPieceCounts.size === 0)) {
-            return 'cpu';
-        }
+        const { overBudget, visibleExpressIds, existingPieceCounts } = planPickMeshHydration(this.scene, options);
+        if (overBudget) return 'cpu';
 
         // For smaller models, create GPU meshes for picking
         // Only create meshes for VISIBLE elements (not hidden, and either no isolation or in isolated set)
         // For multi-model support: create meshes for ALL (expressId, modelIndex) pairs
         const baselineExistingCounts = new Map(existingPieceCounts);
         const seenOrdinalsByKey = new Map<string, number>();
+        // Any hydration failing here (#4885 review) — a lost device, or a
+        // mapped createBuffer allocation failure — means `scene.getMeshes()`
+        // below the 'gpu' return is missing that piece's buffers. Reporting
+        // 'gpu' anyway would make a subsequent pick silently skip it rather
+        // than fall back to the CPU raycast, which needs no GPU resources at
+        // all. One failure degrades the WHOLE prepare call to 'cpu': a mix of
+        // hydrated and un-hydrated pieces has no correct partial GPU answer.
+        let hydrationFailed = false;
         for (const expressId of visibleExpressIds) {
             const pieces = this.scene.getMeshDataPieces(expressId);
             if (pieces) {
                 for (const piece of pieces) {
-                    const meshKey = `${piece.expressId}:${piece.modelIndex ?? 'any'}`;
+                    const meshKey = pickPieceKey(piece);
                     const ordinal = seenOrdinalsByKey.get(meshKey) ?? 0;
                     seenOrdinalsByKey.set(meshKey, ordinal + 1);
                     const baselineExisting = baselineExistingCounts.get(meshKey) ?? 0;
@@ -148,12 +126,12 @@ export class PickingManager {
                     // Assume existing pieces correspond to the first N pieces in stable order.
                     if (ordinal < baselineExisting) continue;
 
-                    this.createMeshFromDataFn(piece);
+                    if (!this.createMeshFromDataFn(piece).ok) hydrationFailed = true;
                 }
             }
         }
 
-        return 'gpu';
+        return hydrationFailed ? 'cpu' : 'gpu';
     }
 
     /**
@@ -169,16 +147,13 @@ export class PickingManager {
             return null;
         }
 
-        // Scale CSS pixel coordinates to canvas pixel coordinates
-        // The canvas.width may differ from CSS width due to 64-pixel alignment for WebGPU
-        const rect = this.canvas.getBoundingClientRect();
-        if (rect.width === 0 || rect.height === 0) {
+        // Scale CSS pixel coordinates to pick-texture texels (see pickViewport).
+        const viewport = this.pickViewport();
+        if (!viewport) {
             return null;
         }
-        const scaleX = this.canvas.width / rect.width;
-        const scaleY = this.canvas.height / rect.height;
-        const scaledX = x * scaleX;
-        const scaledY = y * scaleY;
+        const scaledX = x * viewport.scaleX;
+        const scaledY = y * viewport.scaleY;
 
         // Skip picker during streaming for consistent performance
         // Picking during streaming would be slow and incomplete anyway
@@ -187,7 +162,7 @@ export class PickingManager {
         }
 
         if (this.prepareBatchedPick(options) === 'cpu') {
-            const ray = this.camera.unprojectToRay(scaledX, scaledY, this.canvas.width, this.canvas.height);
+            const ray = this.camera.unprojectToRay(scaledX, scaledY, viewport.width, viewport.height);
             const hit = this.scene.raycast(ray.origin, ray.direction, options?.hiddenIds, options?.isolatedIds, clip);
             if (!hit) return null;
             // The CPU fallback is the COMMON path — anything over
@@ -223,18 +198,27 @@ export class PickingManager {
         // visibility is binary and assets are tiny in count).
         const pointNodes = pointSnap?.nodes ?? undefined;
         const pointSizing = pointSnap?.sizing ?? undefined;
+        // The point pass projects in this immutable RTE frame. Never decode a
+        // delayed readback with a later camera placement: that turns a valid
+        // click into an absolute-coordinate jump after navigation.
+        const pointRteSnapshot = capturePointRteSnapshot(this.camera);
         const result = await this.picker.pick(
             scaledX,
             scaledY,
-            this.canvas.width,
-            this.canvas.height,
+            viewport.width,
+            viewport.height,
             meshes,
             viewProj,
             pointNodes,
             pointSizing,
             this.scene.getInstancedTemplates(),
             clip,
+            pointRteSnapshot,
         );
+        if (pointRteSnapshot
+            && !isPointRteSnapshotCurrent(this.camera, pointRteSnapshot)) {
+            return null;
+        }
         return result;
     }
 
@@ -276,22 +260,21 @@ export class PickingManager {
         clip?: PickClipState | null,
     ): Promise<Set<number>> {
         if (!this.picker) return new Set();
-        const rect = this.canvas.getBoundingClientRect();
-        if (rect.width === 0 || rect.height === 0) return new Set();
-        const scaleX = this.canvas.width / rect.width;
-        const scaleY = this.canvas.height / rect.height;
-        const sx0 = x0 * scaleX, sy0 = y0 * scaleY;
-        const sx1 = x1 * scaleX, sy1 = y1 * scaleY;
+        const viewport = this.pickViewport();
+        if (!viewport) return new Set();
+        const sx0 = x0 * viewport.scaleX, sy0 = y0 * viewport.scaleY;
+        const sx1 = x1 * viewport.scaleX, sy1 = y1 * viewport.scaleY;
         if (options?.isStreaming) return new Set();
 
         if (this.prepareBatchedPick(options) === 'cpu') {
             const boxHits = this.scene.selectRect(
                 sx0, sy0, sx1, sy1,
-                this.canvas.width, this.canvas.height,
-                this.camera.getViewProjMatrix().m,
+                viewport.width, viewport.height,
+                this.camera.getRelativeToEyeFrame().getViewProjection().m,
                 options?.hiddenIds,
                 options?.isolatedIds,
                 clip,
+                { cameraWorld: this.camera.getRelativeToEyeFrame().getCameraWorld() },
             );
             const cpuPointSnap = this.pointPickProvider?.() ?? null;
             if (!cpuPointSnap || cpuPointSnap.nodes.length === 0) return boxHits;
@@ -317,16 +300,18 @@ export class PickingManager {
             // that nothing else on this path can supply — point assets have no
             // entry in `boundingBoxes` at all.
             let pointHits: Set<number>;
+            const pointRteSnapshot = capturePointRteSnapshot(this.camera);
             try {
                 pointHits = await this.picker.pickRect(
                     sx0, sy0, sx1, sy1,
-                    this.canvas.width, this.canvas.height,
+                    viewport.width, viewport.height,
                     [],
                     this.camera.getViewProjMatrix().m,
                     cpuPointSnap.nodes,
                     cpuPointSnap.sizing,
                     undefined,
                     clip,
+                    pointRteSnapshot,
                 );
             } catch (err) {
                 // `picker.pickRect` rethrows any readback failure that is not a
@@ -334,6 +319,9 @@ export class PickingManager {
                 // branch could not throw at all before the point pass was added,
                 // so degrade to them instead of failing the whole rectangle select.
                 console.warn('[PickingManager] point-cloud rect pick failed; returning bounding-box hits only:', err);
+                return boxHits;
+            }
+            if (pointRteSnapshot && !isPointRteSnapshotCurrent(this.camera, pointRteSnapshot)) {
                 return boxHits;
             }
             for (const id of pointHits) boxHits.add(id);
@@ -344,15 +332,20 @@ export class PickingManager {
         meshes = meshes.filter((m) => isEntityVisible(m.expressId, options?.hiddenIds, options?.isolatedIds));
         const viewProj = this.camera.getViewProjMatrix().m;
         const pointSnap = this.pointPickProvider?.() ?? null;
-        return this.picker.pickRect(
+        const pointRteSnapshot = capturePointRteSnapshot(this.camera);
+        const hits = await this.picker.pickRect(
             sx0, sy0, sx1, sy1,
-            this.canvas.width, this.canvas.height,
+            viewport.width, viewport.height,
             meshes,
             viewProj,
             pointSnap?.nodes ?? undefined,
             pointSnap?.sizing ?? undefined,
             this.scene.getInstancedTemplates(),
             clip,
+            pointRteSnapshot,
         );
+        return pointRteSnapshot && !isPointRteSnapshotCurrent(this.camera, pointRteSnapshot)
+            ? new Set()
+            : hits;
     }
 }

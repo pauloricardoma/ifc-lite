@@ -8,6 +8,8 @@
  * Extracted from Viewport.tsx for reusability
  */
 
+import { useMemo } from 'react';
+import { modelHiddenEntities } from '../lib/visibility/model-hidden-entities.js';
 import { useViewerStore } from '../store/index.js';
 
 /**
@@ -35,7 +37,14 @@ export function useSelectionState() {
  * Visibility-related store state (hidden/isolated entities)
  */
 export function useVisibilityState() {
-  const hiddenEntities = useViewerStore((state) => state.hiddenEntities);
+  const userHiddenEntities = useViewerStore((state) => state.hiddenEntities);
+  const models = useViewerStore((state) => state.models);
+  const geometryContentVersion = useViewerStore((state) => state.geometryContentVersion);
+  const toGlobalId = useViewerStore((state) => state.toGlobalId);
+  const hiddenEntities = useMemo(
+    () => modelHiddenEntities(models, userHiddenEntities, toGlobalId),
+    [models, userHiddenEntities, toGlobalId, geometryContentVersion],
+  );
   const isolatedEntities = useViewerStore((state) => state.isolatedEntities);
   const ghostExceptEntities = useViewerStore((state) => state.ghostExceptEntities);
 
@@ -154,13 +163,17 @@ export function useCameraState() {
  */
 export function useHoverState() {
   const hoverTooltipsEnabled = useViewerStore((state) => state.hoverTooltipsEnabled);
+  const hoverHighlightEnabled = useViewerStore((state) => state.hoverHighlightEnabled);
   const setHoverState = useViewerStore((state) => state.setHoverState);
   const clearHover = useViewerStore((state) => state.clearHover);
+  const setHoverHighlightEnabled = useViewerStore((state) => state.setHoverHighlightEnabled);
 
   return {
     hoverTooltipsEnabled,
+    hoverHighlightEnabled,
     setHoverState,
     clearHover,
+    setHoverHighlightEnabled,
   };
 }
 
@@ -171,8 +184,6 @@ export function useThemeState() {
   const theme = useViewerStore((state) => state.theme);
   const isMobile = useViewerStore((state) => state.isMobile);
   const visualEnhancementsEnabled = useViewerStore((state) => state.visualEnhancementsEnabled);
-  const edgeContrastEnabled = useViewerStore((state) => state.edgeContrastEnabled);
-  const edgeContrastIntensity = useViewerStore((state) => state.edgeContrastIntensity);
   const contactShadingQuality = useViewerStore((state) => state.contactShadingQuality);
   const contactShadingIntensity = useViewerStore((state) => state.contactShadingIntensity);
   const contactShadingRadius = useViewerStore((state) => state.contactShadingRadius);
@@ -185,8 +196,6 @@ export function useThemeState() {
     theme,
     isMobile,
     visualEnhancementsEnabled,
-    edgeContrastEnabled,
-    edgeContrastIntensity,
     contactShadingQuality,
     contactShadingIntensity,
     contactShadingRadius,
@@ -219,6 +228,7 @@ export function useColorUpdateState() {
   const clearPendingColorUpdates = useViewerStore((state) => state.clearPendingColorUpdates);
   const clearPendingMeshColorUpdates = useViewerStore((state) => state.clearPendingMeshColorUpdates);
   const clearPendingMeshRemovals = useViewerStore((state) => state.clearPendingMeshRemovals);
+  const pruneGeometryMeshes = useViewerStore((state) => state.pruneGeometryMeshes);
   const clearPendingMeshTranslations = useViewerStore((state) => state.clearPendingMeshTranslations);
   const pendingInstancedShards = useViewerStore((state) => state.pendingInstancedShards);
   const clearInstancedShards = useViewerStore((state) => state.clearInstancedShards);
@@ -235,6 +245,7 @@ export function useColorUpdateState() {
     clearPendingColorUpdates,
     clearPendingMeshColorUpdates,
     clearPendingMeshRemovals,
+    pruneGeometryMeshes,
     clearPendingMeshTranslations,
     clearPendingMeshRotations,
     clearInstancedShards,

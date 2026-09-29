@@ -19,23 +19,28 @@ import type {
   EdgeLockState,
   SectionPlane,
 } from '@/store';
-import type { MeasurementConstraintEdge, OrthogonalAxis, Vec3 } from '@/store/types.js';
+import type { HoverState, MeasurementConstraintEdge, OrthogonalAxis } from '@/store/types.js';
 import { getEntityCenter } from '../../utils/viewportUtils.js';
 import { isPivotRaycastTooExpensive } from './orbitPivotCensus.js';
+import { focusedClashOrbitPivot, sceneAnchorOrbitPivot } from './orbitPivot.js';
+import { orbitPivotStore } from './orbitPivotStore.js';
 import type { MouseHandlerContext } from './mouseHandlerTypes.js';
 import { emitCameraInteracted } from '@/lib/tours/events';
+import { capturePointer, releasePointer } from '@/lib/pointer-capture';
 import { useViewerStore } from '@/store';
-import {
-  handleMeasureDown,
-  handleMeasureDrag,
-  handleMeasureHover,
-  handleMeasureUp,
-  updateMeasureScreenCoords,
-  shouldStartDragMeasurement,
-} from './measureHandlers.js';
-import { handleSelectionClick, handleContextMenu as handleContextMenuSelection, handleAddElementHover, handleSplitHover, finishPolylineFromDoubleClick, finishRadiusFromDoubleClick } from './selectionHandlers.js';
+import { handleMeasureDown, handleMeasureDrag, handleMeasureHover, handleMeasureUp, updateMeasureScreenCoords } from './measureHandlers.js';
+import type { PointerGesture } from './pointerGesture.js';
+import { resolveNavigationPointerGesture, resolveWheelNavigation } from '@/lib/navigation/presets.js';
+import { handleMeasureTap, ignoreTouchPointers, setMeasureTapHandler } from './touchRouting.js';
+import { invalidateSelectionPick } from './referenceSelection.js';
+import { routeCommandPointer } from './commandPointer.js';
+import { handleSelectionClick, handleContextMenu as handleContextMenuSelection, finishPolylineFromDoubleClick, finishRadiusFromDoubleClick } from './selectionHandlers.js';
+import { handleAddElementHover } from './add-element-handlers.js';
 import { applyWheelZoom, createFineZoomModifierTracker } from './wheelZoom.js';
+import { createZoomSurfacePicker } from './zoomSurface.js';
+import { createFlyController } from './flyControls.js';
 import { MIN_RADIUS_POINTS } from './tools/measure-modes/radius.js';
+import { closeAddElementPolygonFromDoubleClick, isAddElementPolygonRepeatClick } from './add-element-double-click.js';
 
 export interface MouseState {
   isDragging: boolean;
@@ -117,12 +122,7 @@ export interface UseMouseControlsParams {
 
   // Callbacks
   handlePickForSelection: (pickResult: PickResult | null) => void;
-  setHoverState: (state: {
-    entityId: number;
-    screenX: number;
-    screenY: number;
-    worldXYZ?: { x: number; y: number; z: number };
-  }) => void;
+  setHoverState: (state: HoverState & { entityId: number }) => void;
   /**
    * Called during a rectangle-selection drag with the current rect
    * (CSS pixels, canvas-relative). Passed `null` on drag end to clear
@@ -196,10 +196,6 @@ export function useMouseControls(params: UseMouseControlsParams): void {
     hiddenEntitiesRef,
     isolatedEntitiesRef,
     selectedEntityIdRef,
-    selectedModelIndexRef,
-    clearColorRef,
-    sectionPlaneRef,
-    sectionRangeRef,
     geometryRef,
     measureRaycastPendingRef,
     measureRaycastFrameRef,
@@ -207,8 +203,6 @@ export function useMouseControls(params: UseMouseControlsParams): void {
     lastHoverSnapTimeRef,
     lastHoverCheckRef,
     hoverTooltipsEnabledRef,
-    lastRenderTimeRef,
-    renderPendingRef,
     isInteractingRef,
     lastClickTimeRef,
     lastClickPosRef,
@@ -241,9 +235,6 @@ export function useMouseControls(params: UseMouseControlsParams): void {
     HOVER_SNAP_THROTTLE_MS,
     SLOW_RAYCAST_THRESHOLD_MS,
     hoverThrottleMs,
-    RENDER_THROTTLE_MS_SMALL,
-    RENDER_THROTTLE_MS_LARGE,
-    RENDER_THROTTLE_MS_HUGE,
   } = params;
 
   // ─── Section face-pick hover preview (issue #243 follow-up) ──────────
@@ -284,6 +275,7 @@ export function useMouseControls(params: UseMouseControlsParams): void {
 
     const camera = renderer.getCamera();
     const mouseState = mouseStateRef.current;
+    let pointerGesture: PointerGesture = 'orbit';
 
     // Build shared context for extracted handler functions
     const ctx: MouseHandlerContext = {
@@ -457,9 +449,11 @@ export function useMouseControls(params: UseMouseControlsParams): void {
     // Uses pointer events + setPointerCapture so pointerup always fires,
     // even when the pointer leaves the canvas (e.g. dragging across panels).
     const handleMouseDown = async (e: PointerEvent) => {
+      orbitPivotStore.end();
+      invalidateSelectionPick(canvas);
       e.preventDefault();
       // Capture the pointer so move/up events fire even outside the canvas
-      canvas.setPointerCapture(e.pointerId);
+      capturePointer(canvas, e.pointerId);
       mouseState.isDragging = true;
       mouseState.button = e.button;
       mouseState.lastX = e.clientX;
@@ -468,14 +462,24 @@ export function useMouseControls(params: UseMouseControlsParams): void {
       mouseState.startY = e.clientY;
       mouseState.didDrag = false;
       mouseState.isRectSelecting = false;
+      mouseState.isPanning = false;
 
-      // Determine action based on active tool and mouse button
       const tool = activeToolRef.current;
+      const gesture = resolveNavigationPointerGesture(useViewerStore.getState().navigationPreset, {
+        tool, button: e.button, shiftKey: e.shiftKey, ctrlKey: e.ctrlKey,
+        metaKey: e.metaKey, altKey: e.altKey,
+        measureMode: useViewerStore.getState().measureMode,
+        flyEnabled: useViewerStore.getState().interactionMode === 'all',
+      });
+      pointerGesture = gesture;
+      // Right-button fly (#4868) takes priority over ordinary pan. A frozen
+      // view refuses fly and falls back to the right-button pan path below.
+      if (gesture === 'fly' && fly.begin(canvas)) { clearHover(); canvas.style.cursor = 'crosshair'; return; }
 
       // Rectangle-select gesture: Ctrl/⌘ + LMB drag while in the
       // select tool. Suppresses orbit/pan; the rect is finalised
       // and pick happens on mouseup.
-      if (tool === 'select' && e.button === 0 && (e.ctrlKey || e.metaKey)) {
+      if (tool === 'select' && gesture === 'tool' && e.button === 0) {
         mouseState.isRectSelecting = true;
         const rect = canvas.getBoundingClientRect();
         const cx = e.clientX - rect.left;
@@ -484,19 +488,16 @@ export function useMouseControls(params: UseMouseControlsParams): void {
         return;
       }
 
-      // Will this mousedown lead to an orbit drag?
-      const isPanGesture = tool === 'pan' || e.button === 1 || e.button === 2 ||
-        (tool === 'select' && e.shiftKey);
-      const willOrbit = !isPanGesture && (
-        tool === 'select' ||
-        (tool === 'measure' && e.shiftKey) ||
-        !e.shiftKey // default tools: no shift = orbit
-      );
+      const willOrbit = gesture === 'orbit';
 
       // Set orbit pivot to the 3D point under the cursor so rotation feels anchored
       // to what the user is looking at. On miss, place pivot at current distance along
       // the cursor ray so orbit always feels connected to where you're pointing.
-      if (willOrbit) {
+      // A focused clash with nothing selected orbits around the clashing pair (#4806).
+      const clashPivot = willOrbit
+        ? focusedClashOrbitPivot(useViewerStore.getState(), selectedEntityIdRef.current) : null;
+      let orbitPivot = clashPivot;
+      if (willOrbit && !clashPivot) {
         const rect = canvas.getBoundingClientRect();
         const cx = e.clientX - rect.left;
         const cy = e.clientY - rect.top;
@@ -525,87 +526,28 @@ export function useMouseControls(params: UseMouseControlsParams): void {
         }
 
         if (hit?.intersection) {
-          camera.setOrbitCenter(hit.intersection.point);
+          orbitPivot = hit.intersection.point;
         } else if (selectedEntityIdRef.current) {
           // No geometry under cursor but object selected — use its center
           const center = getEntityCenter(geometryRef.current, selectedEntityIdRef.current);
-          if (center) {
-            camera.setOrbitCenter(center);
-          } else {
-            camera.setOrbitCenter(null);
-          }
+          orbitPivot = center;
         } else {
-          // No geometry hit or large model — anchor the pivot to the scene
-          // centre (a stable point on the model) rather than the camera target,
-          // which drifts as you orbit/pan and made repeated rotation feel
-          // untethered (issue #1107, item 3).
-          const anchorBounds = camera.getOrbitAnchorBounds();
-          const bounds = anchorBounds ?? camera.getSceneBounds();
-          const anchor = bounds
-            ? {
-                x: (bounds.min.x + bounds.max.x) / 2,
-                y: (bounds.min.y + bounds.max.y) / 2,
-                z: (bounds.min.z + bounds.max.z) / 2,
-              }
-            : camera.getTarget();
-          let pivot: { x: number; y: number; z: number };
-          if (anchorBounds) {
-            // Outlier model (issue #1394): the geometry is a compact cluster
-            // surrounded by lots of empty space, so the cursor usually misses
-            // it. Projecting the anchor onto the cursor ray (the #1107 path
-            // below) would place the pivot in that empty space *beside* the
-            // model, and orbiting then swings the model out of frame. Orbit
-            // around the robust model centre directly so it stays put.
-            pivot = anchor;
-          } else {
-            // #1107: project the scene centre onto the cursor ray so the pivot
-            // still sits under the pointer, at the scene's depth.
-            const ray = camera.unprojectToRay(cx, cy, canvas.width, canvas.height);
-            const toAnchor = {
-              x: anchor.x - ray.origin.x,
-              y: anchor.y - ray.origin.y,
-              z: anchor.z - ray.origin.z,
-            };
-            const d = Math.max(1, toAnchor.x * ray.direction.x + toAnchor.y * ray.direction.y + toAnchor.z * ray.direction.z);
-            pivot = {
-              x: ray.origin.x + ray.direction.x * d,
-              y: ray.origin.y + ray.direction.y * d,
-              z: ray.origin.z + ray.direction.z * d,
-            };
-          }
-          camera.setOrbitCenter(pivot);
+          // No geometry hit or large model — anchor the pivot to the scene centre.
+          orbitPivot = sceneAnchorOrbitPivot(camera, cx, cy, rect.width, rect.height);
         }
       }
+      if (willOrbit) {
+        camera.setOrbitCenter(orbitPivot);
+        orbitPivotStore.begin({ point: orbitPivot ?? camera.getTarget(), camera, canvas });
+      }
 
-      if (tool === 'pan' || e.button === 1 || e.button === 2) {
+      if (gesture === 'pan' || gesture === 'fly') {
         mouseState.isPanning = true;
         canvas.style.cursor = 'move';
-      } else if (tool === 'select') {
-        // Select tool: shift+drag = pan, normal drag = orbit
-        mouseState.isPanning = e.shiftKey;
-        canvas.style.cursor = e.shiftKey ? 'move' : 'grabbing';
-      } else if (tool === 'measure') {
-        // Measure tool - shift+drag = orbit, normal drag = measure (drag
-        // mode) or nothing (polyline mode — see shouldStartDragMeasurement).
-        if (shouldStartDragMeasurement(useViewerStore.getState().measureMode, e.shiftKey)) {
-          // Normal drag: delegate to measurement handler
-          if (handleMeasureDown(ctx, e)) return;
-        } else {
-          // Shift held, OR polyline mode (#2199): never start a drag
-          // measurement. Polyline mode places points on 'click' only (see
-          // handlePolylineClick in selectionHandlers.ts) — falling through
-          // to plain orbit/pan here means a click that doesn't move the
-          // mouse is a no-op for the camera and `activeMeasurement` is
-          // never touched, so the two modes can't corrupt each other.
-          mouseState.isDragging = true;
-          mouseState.isPanning = false;
-          canvas.style.cursor = 'grabbing';
-          // Fall through to allow orbit handling in mousemove
-        }
+      } else if (tool === 'measure' && gesture === 'tool') {
+        if (handleMeasureDown(ctx, e)) return;
       } else {
-        // Default behavior
-        mouseState.isPanning = e.shiftKey;
-        canvas.style.cursor = e.shiftKey ? 'move' : 'grabbing';
+        canvas.style.cursor = 'grabbing';
       }
     };
 
@@ -629,7 +571,7 @@ export function useMouseControls(params: UseMouseControlsParams): void {
 
       // Handle measure tool live preview while dragging
       // IMPORTANT: Check tool first, not activeMeasurement, to prevent orbit conflict
-      if (tool === 'measure' && mouseState.isDragging && activeMeasurementRef.current) {
+      if (tool === 'measure' && pointerGesture === 'tool' && mouseState.isDragging && activeMeasurementRef.current && !fly.isActive()) {
         if (handleMeasureDrag(ctx, e, x, y)) return;
       }
 
@@ -646,26 +588,22 @@ export function useMouseControls(params: UseMouseControlsParams): void {
         if (handleAddElementHover(ctx, x, y)) return;
       }
 
-      // Split-tool hover preview — projects the cursor onto the
-      // hovered wall's axis and pushes the cut distance into the
-      // store so SplitOverlay renders the perpendicular guide.
-      if (tool === 'split' && !mouseState.isDragging) {
-        if (handleSplitHover(ctx, x, y)) return;
-      }
+      // A running modeling command owns the hover (#6232, commandPointer.ts).
+      if (tool === 'command' && !mouseState.isDragging && routeCommandPointer(ctx, 'move', x, y, e)) return;
 
       // Section tool face-pick: dwell-aware hover preview (issue #243
       // follow-up). Runs INSTEAD of the generic tooltip path while
       // pick mode is armed so the overlay stays the only signal under
       // the cursor — the tooltip would just compete visually with the
-      // violet quad. See `handleSectionPickHover` for the full
+      // accent quad. See `handleSectionPickHover` for the full
       // anti-jitter rules.
       if (tool === 'section' && !mouseState.isDragging && sectionPickModeRef.current) {
         handleSectionPickHover(e, x, y);
         return;
       }
 
-      // Handle orbit/pan for other tools (or measure tool with shift+drag or no active measurement)
-      if (mouseState.isDragging && (tool !== 'measure' || !activeMeasurementRef.current)) {
+      // A measure tool drag navigates only when the resolver assigned navigation.
+      if (mouseState.isDragging && (fly.isActive() || pointerGesture !== 'tool')) {
         const dx = e.clientX - mouseState.lastX;
         const dy = e.clientY - mouseState.lastY;
 
@@ -677,13 +615,12 @@ export function useMouseControls(params: UseMouseControlsParams): void {
         }
 
         // Always update camera state immediately (feels responsive)
-        if (mouseState.isPanning || tool === 'pan') {
+        if (fly.isActive()) {
+          fly.look(dx, dy, e.movementX, e.movementY); // pointer-locked: the cursor is pinned, so movement deltas lead
+        } else if (mouseState.isPanning) {
           camera.pan(dx, dy, false);
-        } else if (tool === 'walk') {
-          // Walk mode: mouse drag looks around (full orbit)
-          camera.orbit(dx, dy, false);
         } else {
-          camera.orbit(dx, dy, false);
+          camera.orbit(dx, dy, false); // walk mode too: drag looks around (full orbit)
         }
 
         mouseState.lastX = e.clientX;
@@ -696,8 +633,6 @@ export function useMouseControls(params: UseMouseControlsParams): void {
         renderer.requestRender();
         updateCameraRotationRealtime(camera.getRotation());
         calculateScale();
-
-
 
         // Clear hover while dragging
         clearHover();
@@ -713,7 +648,7 @@ export function useMouseControls(params: UseMouseControlsParams): void {
               entityId: pickResult.expressId,
               screenX: e.clientX,
               screenY: e.clientY,
-              worldXYZ: pickResult.worldXYZ,
+              worldXYZ: pickResult.worldXYZ, modelIndex: pickResult.modelIndex,
             });
           } else {
             clearHover();
@@ -723,8 +658,8 @@ export function useMouseControls(params: UseMouseControlsParams): void {
     };
 
     const handleMouseUp = (e: PointerEvent) => {
-      // Release pointer capture (safe to call even if not captured)
-      canvas.releasePointerCapture(e.pointerId);
+      orbitPivotStore.end();
+      releasePointer(canvas, e.pointerId);
 
       // Clear interaction flag so the animation loop restores post-processing
       if (isInteractingRef.current) {
@@ -733,6 +668,8 @@ export function useMouseControls(params: UseMouseControlsParams): void {
       }
 
       const tool = activeToolRef.current;
+      const flyEnd = e.button === 2 ? fly.end() : 'none';
+      if (flyEnd === 'flew') mouseState.didDrag = true; else if (flyEnd === 'menu' && !mouseState.didDrag) void handleContextMenuSelection(ctx, e);
 
       // Rectangle-select finalisation: run pickRect against the
       // dragged rect, replace the current selection with the result,
@@ -768,7 +705,7 @@ export function useMouseControls(params: UseMouseControlsParams): void {
       }
 
       // Handle measure tool completion
-      if (tool === 'measure' && activeMeasurementRef.current) {
+      if (tool === 'measure' && pointerGesture === 'tool' && activeMeasurementRef.current && e.button !== 2) {
         if (handleMeasureUp(ctx, e)) return;
       }
 
@@ -781,10 +718,11 @@ export function useMouseControls(params: UseMouseControlsParams): void {
 
       mouseState.isDragging = false;
       mouseState.isPanning = false;
-      canvas.style.cursor = tool === 'pan' ? 'grab' : (tool === 'walk' ? 'crosshair' : (tool === 'measure' ? 'crosshair' : 'default'));
+      canvas.style.cursor = tool === 'pan' ? 'grab' : (tool === 'walk' || tool === 'measure' || tool === 'appearance-face' ? 'crosshair' : 'default');
     };
 
     const handleMouseLeave = () => {
+      orbitPivotStore.end();
       const tool = activeToolRef.current;
       mouseState.isDragging = false;
       mouseState.isPanning = false;
@@ -792,7 +730,7 @@ export function useMouseControls(params: UseMouseControlsParams): void {
       // Section face-pick preview: cursor left the canvas, so any
       // pending dwell timer would otherwise commit a stale hover
       // when the user returns. Drop the overlay too so we don't leave
-      // a violet quad orphaned on the last-seen face after leaving.
+      // an accent quad orphaned on the last-seen face after leaving.
       if (sectionDwellTimerRef.current) {
         clearTimeout(sectionDwellTimerRef.current);
         sectionDwellTimerRef.current = null;
@@ -800,20 +738,14 @@ export function useMouseControls(params: UseMouseControlsParams): void {
       sectionLastFaceKeyRef.current = null;
       sectionLastCastPosRef.current = null;
       setSectionPickPreview(null);
-      // Restore cursor based on active tool
-      if (tool === 'measure') {
-        canvas.style.cursor = 'crosshair';
-      } else if (tool === 'pan') {
-        canvas.style.cursor = 'grab';
-      } else if (tool === 'walk') {
-        canvas.style.cursor = 'crosshair';
-      } else {
-        canvas.style.cursor = 'default';
-      }
+      // Restore cursor based on active tool (same mapping as pointerup)
+      canvas.style.cursor = tool === 'pan' ? 'grab' : (tool === 'walk' || tool === 'measure' || tool === 'appearance-face' ? 'crosshair' : 'default');
       clearHover();
     };
 
     const handleContextMenu = async (e: MouseEvent) => {
+      // macOS/Linux fire this on PRESS, mid-fly; hold it until release (pointerup replays a plain click).
+      if (fly.isActive() || fly.consumeMenuSuppression()) { e.preventDefault(); fly.deferContextMenu(); return; }
       await handleContextMenuSelection(ctx, e);
     };
 
@@ -825,23 +757,41 @@ export function useMouseControls(params: UseMouseControlsParams): void {
     // as a wheel event with `ctrlKey: true` and no key ever pressed - see
     // wheelZoom.ts.
     const fineZoomModifier = createFineZoomModifierTracker();
+    const fly = createFlyController({
+      camera,
+      // Fly moves the camera through setters the embed `?controls=` freeze does not gate, so gate it here (#4868).
+      canFly: () => useViewerStore.getState().interactionMode === 'all',
+      onChange: () => {
+        isInteractingRef.current = true; renderer.requestRender(); updateCameraRotationRealtime(camera.getRotation()); calculateScale();
+        clearHover(); // a keys-only flight never reaches the mousemove path that clears it
+      },
+      // Focus or pointer lock lost mid-flight: no pointerup is coming, so end the drag as leaving the canvas does.
+      onCancel: () => { handleMouseLeave(); isInteractingRef.current = false; renderer.requestRender(); },
+    });
 
     const handleWheel = (e: WheelEvent) => {
+      if (fly.isActive()) return fly.wheel(e); // while flying the wheel sets fly speed, not zoom
+      const wheel = resolveWheelNavigation(useViewerStore.getState().navigationPreset, e);
       // Cancels the browser's own Ctrl+wheel page zoom as well as scrolling;
       // works only because the listener below is registered `passive: false`.
-      applyWheelZoom(e, {
-        camera,
-        canvas,
-        fastZoom: e.shiftKey || params.fastZoomRef.current,
-        fineModifierHeld: fineZoomModifier.isHeld(),
-      });
+      e.preventDefault();
+      if (wheel.panX || wheel.panY) camera.pan(wheel.panX, wheel.panY, false);
+      if (wheel.zoom) {
+        applyWheelZoom(e, {
+          camera, canvas,
+          fastZoom: e.shiftKey || params.fastZoomRef.current,
+          fineModifierHeld: fineZoomModifier.isHeld(),
+          pickSurface: createZoomSurfacePicker(renderer, camera, getPickOptions), // #5393
+        });
+      }
+      if (!wheel.panX && !wheel.panY && !wheel.zoom) return;
 
       if (wheelIdleTimer) clearTimeout(wheelIdleTimer);
       wheelIdleTimer = setTimeout(() => {
         isInteractingRef.current = false;
         renderer.requestRender();
-        // One signal per zoom gesture, on the trailing edge of the debounce.
-        emitCameraInteracted('zoom');
+        // One camera-interaction signal per wheel gesture, on the trailing edge.
+        emitCameraInteracted(wheel.zoom ? 'zoom' : 'pan');
       }, 150);
 
       isInteractingRef.current = true;
@@ -855,10 +805,7 @@ export function useMouseControls(params: UseMouseControlsParams): void {
       }
     };
 
-    // Click handling — delegated to selectionHandlers
-    const handleClick = async (e: MouseEvent) => {
-      await handleSelectionClick(ctx, e);
-    };
+    const handleClick = (e: MouseEvent) => { if (!isAddElementPolygonRepeatClick(e)) void handleSelectionClick(ctx, e); };
 
     // Double-click finishes an in-progress polyline sequence as OPEN (#2199)
     // — the same "reads the length so far, does not close the loop" outcome
@@ -872,6 +819,8 @@ export function useMouseControls(params: UseMouseControlsParams): void {
     // `activeRadius` is ever non-null, so the two `!== null` checks below
     // never both fire.
     const handleDoubleClick = (e: MouseEvent) => {
+      // Add Element: double-click closes a polygon outline, like Enter (#6233).
+      if (closeAddElementPolygonFromDoubleClick()) { e.preventDefault(); return; }
       if (activeToolRef.current !== 'measure') return;
       // The store side lives in selectionHandlers.ts (beside
       // handlePolylineClick / handleRadiusClick) so it is reachable from a
@@ -904,9 +853,13 @@ export function useMouseControls(params: UseMouseControlsParams): void {
       }
     };
 
-    canvas.addEventListener('pointerdown', handleMouseDown);
-    canvas.addEventListener('pointermove', handleMouseMove);
-    canvas.addEventListener('pointerup', handleMouseUp);
+    // Touch belongs to useTouchControls; a Measure tap comes back through the tap handler (#5856).
+    const onPointerDown = ignoreTouchPointers(handleMouseDown), onPointerMove = ignoreTouchPointers(handleMouseMove), onPointerUp = ignoreTouchPointers(handleMouseUp);
+    setMeasureTapHandler(canvas, (x, y) => handleMeasureTap(ctx, x, y));
+    canvas.addEventListener('pointerdown', onPointerDown);
+    canvas.addEventListener('pointermove', onPointerMove);
+    canvas.addEventListener('pointerup', onPointerUp);
+    canvas.addEventListener('pointercancel', handleMouseLeave);
     canvas.addEventListener('mouseleave', handleMouseLeave);
     canvas.addEventListener('contextmenu', handleContextMenu);
     canvas.addEventListener('wheel', handleWheel, { passive: false });
@@ -914,15 +867,20 @@ export function useMouseControls(params: UseMouseControlsParams): void {
     canvas.addEventListener('dblclick', handleDoubleClick);
 
     return () => {
-      canvas.removeEventListener('pointerdown', handleMouseDown);
-      canvas.removeEventListener('pointermove', handleMouseMove);
-      canvas.removeEventListener('pointerup', handleMouseUp);
+      orbitPivotStore.end();
+      invalidateSelectionPick(canvas);
+      setMeasureTapHandler(canvas, null);
+      canvas.removeEventListener('pointerdown', onPointerDown);
+      canvas.removeEventListener('pointermove', onPointerMove);
+      canvas.removeEventListener('pointerup', onPointerUp);
+      canvas.removeEventListener('pointercancel', handleMouseLeave);
       canvas.removeEventListener('mouseleave', handleMouseLeave);
       canvas.removeEventListener('contextmenu', handleContextMenu);
       canvas.removeEventListener('wheel', handleWheel);
       canvas.removeEventListener('click', handleClick);
       canvas.removeEventListener('dblclick', handleDoubleClick);
       fineZoomModifier.dispose();
+      fly.dispose();
       if (wheelIdleTimer) clearTimeout(wheelIdleTimer);
 
       // Cancel pending raycast requests

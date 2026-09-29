@@ -1,6 +1,6 @@
 {
   "name": "@ifc-lite/create",
-  "version": "2.2.0",
+  "version": "3.1.0",
   "description": "IFC creation from scratch — walls, slabs, beams, columns, stairs, roofs with geometry, properties and quantities",
   "type": "module",
   "main": "./dist/index.js",
@@ -19,14 +19,16 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@ifc-lite/data": "workspace:^",
     "@ifc-lite/encoding": "workspace:^",
     "@ifc-lite/mutations": "workspace:^",
     "@ifc-lite/parser": "workspace:^"
   },
   "devDependencies": {
     "@ifc-lite/export": "workspace:^",
+    "@ifc-lite/wasm": "workspace:^",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.11"
+    "vitest": "^5.0.2"
   },
   "license": "MPL-2.0",
   "author": "Louis True",

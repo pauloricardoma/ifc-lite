@@ -4,7 +4,6 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { readFileSync } from 'node:fs';
 import { RelationshipType } from '@ifc-lite/data';
 import {
   collectAggregatedDescendants,
@@ -14,8 +13,6 @@ import {
   type AggregationModelAccess,
   type AggregationRelationships,
 } from './aggregation';
-import { fileURLToPath } from 'node:url';
-import { stripSource } from '@/test/strip-comments.js';
 
 /** Minimal forward-only IfcRelAggregates graph from an adjacency map. */
 function makeRelationships(adjacency: Record<number, number[]>): AggregationRelationships {
@@ -145,13 +142,13 @@ describe('expandToGeometryBearingIds', () => {
         : { modelId: 'A', expressId: globalId },
     relationshipsFor: (modelId) =>
       modelId === 'A'
-        ? makeRelationships({ 10: [11, 12] })
+        ? makeRelationships({ 10: [11, 12], 20: [21, 22], 30: [31, 32] })
         : modelId === 'B'
           ? makeRelationships({ 10: [11] })
           : undefined,
     toGlobalId: (modelId, expressId) => (modelId === 'B' ? expressId + 1000 : expressId),
   };
-  const meshed = new Set([11, 12, 14, 1011]);
+  const meshed = new Set([11, 12, 14, 1011, 31]);
   const hasGeometry = (id: number) => meshed.has(id);
 
   it('expands a geometry-less assembly into its meshed parts', () => {
@@ -177,116 +174,38 @@ describe('expandToGeometryBearingIds', () => {
     assert.deepStrictEqual(expandToGeometryBearingIds([11, 10], hasGeometry, access), [11, 12]);
   });
 
-  // frameSelection and resolveHighlightIds live in a useImperativeHandle
-  // closure inside Viewport.tsx, which has no test harness (no DOM/renderer
-  // to mount against) — the behaviour above, on the pure function both of
-  // them delegate to, is what's actually pinned. This is only a guard
-  // against the wiring being silently dropped or one of the two callbacks
-  // being pointed at a DIFFERENT resolution than the other (the actual bug:
-  // frameSelection resolved geometry-less assemblies to their renderable
-  // parts, but nothing told the renderer's highlight channel — see
-  // SearchModal.text.tsx below), so it matches against comment-stripped
-  // source. A bare substring search for `expandToGeometryBearingIds(` would
-  // happily match either callback alone, or the prose explaining the call —
-  // this additionally requires BOTH callbacks route through the SAME shared
-  // helper, which is what actually closes the highlight/frame mismatch.
-  it('frameSelection and resolveHighlightIds share the same aggregation resolution', () => {
-    // Prepared by the shared helper (`@/test/strip-comments.ts`), a TypeScript
-    // parse rather than a lexical scan: a regex stripper desyncs on a regex
-    // literal carrying an unbalanced quote, after which a following `//` is no
-    // longer seen as a comment (#2393). `masked`, not `code`: every anchor
-    // below is real code, so blanking string/template/JSX-text bodies costs
-    // nothing and closes the string-literal decoy at the same time.
-    const viewportPath = fileURLToPath(
-      new URL('../components/viewer/Viewport.tsx', import.meta.url),
-    );
-    const { masked: source } = stripSource(readFileSync(viewportPath, 'utf8'), viewportPath);
+  // #3426, correcting #3382: `hasGeometry` is a point-in-time mesh/bounds
+  // check — during streaming, or behind a type-visibility filter, it says
+  // "no" for a part that legitimately has geometry and just hasn't rendered
+  // YET. Assembly 20's parts (21, 22) are neither in `meshed`.
+  it('falls back to ALL aggregated parts when none of them currently render (#3426)', () => {
+    assert.deepStrictEqual(expandToGeometryBearingIds([20], hasGeometry, access), [21, 22]);
+  });
 
-    const helperStart = source.indexOf('const resolveRenderableIds = ');
-    assert.ok(helperStart >= 0, 'resolveRenderableIds helper defined');
-    const helperBody = source.slice(helperStart, source.indexOf('setCameraCallbacks({', helperStart));
-    assert.ok(
-      helperBody.includes('expandToGeometryBearingIds('),
-      'the shared helper must resolve geometry-less assemblies to their renderable parts',
-    );
-
-    const frameSelection = source.slice(source.indexOf('frameSelection: () => {'));
-    const frameBody = frameSelection.slice(0, frameSelection.indexOf('resolveHighlightIds:'));
-    assert.ok(
-      frameBody.includes('resolveRenderableIds('),
-      'frameSelection must resolve geometry-less assemblies before giving up on bounds',
-    );
-
-    const resolveHighlight = frameSelection.slice(frameSelection.indexOf('resolveHighlightIds:'));
-    const highlightBody = resolveHighlight.slice(0, resolveHighlight.indexOf('frameClashRegion:'));
-    assert.ok(
-      highlightBody.includes('resolveRenderableIds('),
-      'resolveHighlightIds must use the SAME resolution as frameSelection, not a separate one',
+  it('the #3426 fallback still dedups and composes with an ordinary meshed id', () => {
+    assert.deepStrictEqual(
+      expandToGeometryBearingIds([20, 14], hasGeometry, access),
+      [21, 22, 14],
     );
   });
 
-  // Same no-harness constraint, second property: HOW that shared resolution
-  // asks for bounds. `resolveRenderableIds` decides `hasGeometry` for every
-  // input id AND every aggregated descendant, so a per-id `getEntityBounds`
-  // (a full scan of the mesh array, per call) makes one isolate O(ids ×
-  // meshes). It must read through the self-indexing lookup instead — and it
-  // must keep the renderer's per-occurrence fallback, because GPU-instanced
-  // occurrences are not in the mesh array at all and would otherwise every one
-  // of them read as geometry-less and get dropped or wrongly expanded.
-  // Behaviour of the lookup itself is pinned in unionEntityBounds.test.ts.
-  it('the shared bounds lookup is indexed and keeps the instanced fallback', () => {
-    // Prepared by the shared helper (`@/test/strip-comments.ts`), a TypeScript
-    // parse rather than a lexical scan: a regex stripper desyncs on a regex
-    // literal carrying an unbalanced quote, after which a following `//` is no
-    // longer seen as a comment (#2393). `masked`, not `code`: every anchor
-    // below is real code, so blanking string/template/JSX-text bodies costs
-    // nothing and closes the string-literal decoy at the same time.
-    const viewportPath = fileURLToPath(
-      new URL('../components/viewer/Viewport.tsx', import.meta.url),
-    );
-    const { masked: source } = stripSource(readFileSync(viewportPath, 'utf8'), viewportPath);
-
-    const start = source.indexOf('const createRenderableBoundsLookup = ');
-    assert.ok(start >= 0, 'the shared bounds lookup helper is defined');
-    // Assert the END marker too. `indexOf` returns -1 when it is gone, and
-    // `slice(start, -1)` silently runs to the end of the FILE instead of
-    // failing — the assertions below would then be inspecting most of
-    // Viewport.tsx rather than this helper, and would pass or fail on
-    // unrelated code. A source-text guard that can address the wrong region
-    // is worse than none, because it still reports green.
-    const end = source.indexOf('const resolveRenderableIds = ', start);
-    assert.ok(end >= 0, 'resolveRenderableIds follows the lookup helper');
-    const body = source.slice(start, end);
-
-    assert.ok(
-      body.includes('createEntityBoundsLookup('),
-      'bounds must come from the self-indexing reader, not a per-id getEntityBounds scan',
-    );
-    assert.ok(
-      body.includes('getInstancedEntityBounds('),
-      'instanced occurrences live outside the mesh array — the fallback must stay',
-    );
-
-    const helperStart2 = source.indexOf('const resolveRenderableIds = ');
-    assert.ok(helperStart2 >= 0, 'resolveRenderableIds is defined');
-    const helperEnd2 = source.indexOf('setCameraCallbacks({', helperStart2);
-    assert.ok(helperEnd2 >= 0, 'setCameraCallbacks bounds the helper');
-    const helperBody2 = source.slice(helperStart2, helperEnd2);
-    assert.ok(
-      !helperBody2.includes('getEntityBounds('),
-      'resolveRenderableIds must not scan the mesh array per id',
-    );
+  // Control: an entity with NO aggregated descendants at all (13) is still
+  // dropped — the #3426 fallback only helps an id that HAS parts to expand
+  // to; there is nothing here to expand id 13 into.
+  it('control: an entity with no aggregated descendants at all is still dropped', () => {
+    assert.deepStrictEqual(expandToGeometryBearingIds([13], hasGeometry, access), []);
   });
 
-  // The other half of the fix — a selection entry point that assigns
-  // selectedEntityId/selectedEntityIds directly (not via a 3D pick, which can
-  // never land on a geometry-less assembly) must resolve through
-  // resolveHighlightIds before highlighting, or the camera moves to an
-  // assembly that stays dark — is covered behaviourally, not by source text,
-  // in SearchModal.text.wiring.test.tsx ("resolves through resolveHighlightIds
-  // and puts the clicked id LAST, so it stays primary"): it stubs
-  // cameraCallbacks.resolveHighlightIds, clicks a real rendered row, and reads
-  // the resulting selectedEntityIds/selectedEntityId off the store, which is
-  // strictly stronger than grepping commit()'s source for both the call and
-  // its position.
+  // Always expand to ALL aggregated descendants, regardless of renderability
+  // (#3426, #3865). Point-in-time `hasGeometry` checks cannot predict which
+  // parts will arrive during streaming, so presentation channels (hide,
+  // isolate, colour) must persist the complete descendant set to ensure that
+  // parts streaming in later respect the action. Assembly 30 has two parts
+  // (31 meshed, 32 not) — both must be included in the expansion so that when
+  // 32 streams in later, it's already in the persisted set. Carrying an id
+  // with no mesh is free: it simply never matches a renderer's mesh whitelist.
+  it('expands to ALL aggregated parts, including unmeshed ones that may stream in later', () => {
+    assert.deepStrictEqual(expandToGeometryBearingIds([30], hasGeometry, access), [31, 32]);
+  });
+
 });

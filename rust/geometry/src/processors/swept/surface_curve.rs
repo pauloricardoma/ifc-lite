@@ -13,7 +13,7 @@ use ifc_lite_core::{DecodedEntity, EntityDecoder, IfcSchema, IfcType};
 use nalgebra::Matrix4;
 
 use super::super::helpers::parse_axis2_placement_3d;
-use super::disk::build_tube_rmf;
+use super::disk::{build_tube_rmf, directrix_is_sweepable};
 use crate::router::GeometryProcessor;
 
 /// Processor for `IfcSurfaceCurveSweptAreaSolid` and `IfcFixedReferenceSweptAreaSolid`.
@@ -89,40 +89,22 @@ impl GeometryProcessor for SurfaceCurveSweptAreaSolidProcessor {
 
         let start_param = entity.get_float(3);
         let end_param = entity.get_float(4);
-        let has_trim = start_param.is_some() || end_param.is_some();
+        // Same directrix parametrisation as IfcSweptDiskSolid (one home). A
+        // trimmed conic (the duct-elbow case) carries its own Trim1/Trim2, so
+        // the redundant solid params are a no-op there.
+        let curve_points = self.profile_processor.get_directrix_points(
+            &directrix,
+            decoder,
+            start_param,
+            end_param,
+            quality,
+        )?;
 
-        // Mirror IfcSweptDiskSolid's directrix sampling so composite / polyline /
-        // line directrixes honour the solid-level Start/EndParam. A trimmed conic
-        // (the duct-elbow case) carries its own Trim1/Trim2, so get_curve_points
-        // already returns just the swept arc and the redundant solid params are a
-        // no-op.
-        let curve_points =
-            if has_trim && directrix.ifc_type.is_subtype_of(IfcType::IfcCompositeCurve) {
-                self.profile_processor.get_composite_curve_points_trimmed(
-                    &directrix,
-                    decoder,
-                    start_param,
-                    end_param,
-                )?
-            } else if has_trim && directrix.ifc_type == IfcType::IfcPolyline {
-                self.profile_processor.get_polyline_points_trimmed(
-                    &directrix,
-                    decoder,
-                    start_param,
-                    end_param,
-                )?
-            } else if has_trim && directrix.ifc_type == IfcType::IfcLine {
-                self.profile_processor.get_line_points_3d(
-                    &directrix,
-                    decoder,
-                    start_param.unwrap_or(0.0),
-                    end_param.unwrap_or(1.0),
-                )?
-            } else {
-                self.profile_processor
-                    .get_curve_points(&directrix, decoder, quality)?
-            };
-
+        // Refuse a non-finite sample before the dedupe below, whose `>`
+        // comparison would silently drop it (#5191).
+        if !directrix_is_sweepable(&curve_points)? {
+            return Ok(Mesh::new());
+        }
         // Drop consecutive coincident samples — a zero-length step yields a NaN
         // tangent in the RMF and shatters the tube.
         let mut points: Vec<Point3<f64>> = Vec::with_capacity(curve_points.len());
@@ -148,6 +130,10 @@ impl GeometryProcessor for SurfaceCurveSweptAreaSolidProcessor {
         };
         for p in &mut points {
             *p = position.transform_point(p);
+        }
+        // The placement is file data too: re-gate the placed samples (#5191).
+        if !directrix_is_sweepable(&points)? {
+            return Ok(Mesh::new());
         }
 
         // --- Sweep the profile along the placed directrix --------------------------

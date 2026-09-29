@@ -9,27 +9,21 @@
  */
 
 import JSZip from 'jszip';
-import { parseComponents } from './reader-components.js';
-import { extractElement, unescapeXml } from './xml-text.js';
+import { extractElement, unescapeXml, parseLabels, parseXsBoolean } from './xml-text.js';
 import type {
   BCFProject,
   BCFTopic,
   BCFComment,
   BCFViewpoint,
   BCFVersion,
-  BCFPerspectiveCamera,
-  BCFOrthogonalCamera,
-  BCFLine,
-  BCFClippingPlane,
-  BCFBitmap,
-  BCFPoint,
-  BCFDirection,
   BCFExtensions,
   BCFDocumentReference,
   BCFBimSnippet,
   BCFHeaderFile,
 } from './types.js';
-import { parseFiniteFloat } from './numeric.js';
+import { parseViewpointContent } from './reader-viewpoint-content.js';
+import { discoverTopicMarkupPaths, findArchiveEntry, normalizeEntrySeparators, resolveArchiveRoot } from './reader-archive-root.js';
+import { createWarningReporter, reportVersionWarning, type ReportWarning } from './reader-warning.js';
 
 /**
  * Resource caps guarding against a malicious (zip-bomb) .bcfzip: a tiny
@@ -169,12 +163,12 @@ function assertArchiveWithinLimits(zip: JSZip, maxEntries: number, maxExpandedBy
  * Parse a BCF file (.bcfzip) into a BCFProject
  *
  * @param file - BCF file as File, Blob, or ArrayBuffer
- * @param limits - Optional overrides of the anti-zip-bomb resource caps
+ * @param limits - Optional resource caps and callback for skipped archive items
  * @returns Parsed BCF project
  */
 export async function readBCF(
   file: File | Blob | ArrayBuffer | Uint8Array,
-  limits?: { maxArchiveBytes?: number; maxEntries?: number; maxExpandedBytes?: number },
+  limits?: { maxArchiveBytes?: number; maxEntries?: number; maxExpandedBytes?: number; onWarning?: (message: string, kind: 'skipped' | 'version') => void },
 ): Promise<BCFProject> {
   const maxArchiveBytes = limits?.maxArchiveBytes ?? MAX_BCF_ARCHIVE_BYTES;
   const maxEntries = limits?.maxEntries ?? MAX_BCF_ENTRIES;
@@ -199,18 +193,20 @@ export async function readBCF(
     throw new BCFResourceLimitError(`BCF archive rejected: ${rawRecords} raw records exceeds cap ${maxEntries}`);
   }
 
-  const zip = await JSZip.loadAsync(bytes);
+  const warn = createWarningReporter(limits?.onWarning);
+  const zip = normalizeEntrySeparators(await JSZip.loadAsync(bytes), warn);
   assertArchiveWithinLimits(zip, maxEntries, maxExpandedBytes);
   const budget: ExpansionBudget = { used: 0, limit: maxExpandedBytes };
+  const root = resolveArchiveRoot(zip);
 
   // Read version file
-  const version = await readVersionFile(zip, budget);
+  const version = await readVersionFile(zip, budget, root, limits?.onWarning);
 
   // Read project file (optional)
-  const { projectId, name, extensions } = await readProjectFile(zip, budget);
+  const { projectId, name, extensions } = await readProjectFile(zip, budget, root);
 
   // Read topics
-  const topics = await readTopics(zip, budget);
+  const topics = await readTopics(zip, budget, version.versionId, root, warn);
 
   return {
     version: version.versionId,
@@ -224,8 +220,13 @@ export async function readBCF(
 /**
  * Read bcf.version file
  */
-async function readVersionFile(zip: JSZip, budget: ExpansionBudget): Promise<BCFVersion> {
-  const versionFile = zip.file('bcf.version');
+async function readVersionFile(
+  zip: JSZip,
+  budget: ExpansionBudget,
+  root: string,
+  onWarning?: (message: string, kind: 'skipped' | 'version') => void,
+): Promise<BCFVersion> {
+  const versionFile = findArchiveEntry(zip, `${root}bcf.version`);
   if (!versionFile) {
     throw new Error('Invalid BCF file: missing bcf.version');
   }
@@ -239,7 +240,7 @@ async function readVersionFile(zip: JSZip, budget: ExpansionBudget): Promise<BCF
 
   const versionId = versionMatch[1] as '2.1' | '3.0';
   if (versionId !== '2.1' && versionId !== '3.0') {
-    console.warn(`Unsupported BCF version: ${versionId}, treating as 2.1`);
+    reportVersionWarning(`Unsupported BCF version: ${versionId}, treating as 2.1`, onWarning);
   }
 
   return {
@@ -251,12 +252,12 @@ async function readVersionFile(zip: JSZip, budget: ExpansionBudget): Promise<BCF
 /**
  * Read project.bcfp file (optional)
  */
-async function readProjectFile(zip: JSZip, budget: ExpansionBudget): Promise<{
+async function readProjectFile(zip: JSZip, budget: ExpansionBudget, root: string): Promise<{
   projectId?: string;
   name?: string;
   extensions?: BCFExtensions;
 }> {
-  const projectFile = zip.file('project.bcfp');
+  const projectFile = findArchiveEntry(zip, `${root}project.bcfp`);
   if (!projectFile) {
     return {};
   }
@@ -279,29 +280,37 @@ async function readProjectFile(zip: JSZip, budget: ExpansionBudget): Promise<{
 /**
  * Read all topics from the BCF archive
  */
-async function readTopics(zip: JSZip, budget: ExpansionBudget): Promise<Map<string, BCFTopic>> {
+async function readTopics(zip: JSZip, budget: ExpansionBudget, versionId: '2.1' | '3.0', root: string, warn: ReportWarning): Promise<Map<string, BCFTopic>> {
   const topics = new Map<string, BCFTopic>();
 
-  // Find all topic folders (folders with markup.bcf)
-  const topicFolders = new Set<string>();
-
-  zip.forEach((relativePath: string) => {
-    const match = relativePath.match(/^([^/]+)\/markup\.bcf$/i);
-    if (match) {
-      topicFolders.add(match[1]);
-    }
-  });
+  // Match at any depth so zipped project folders are read. Deduplicate on
+  // parsed Guid below when two folders refer to the same topic (#3960).
+  const topicFolders = discoverTopicMarkupPaths(zip, root, warn);
 
   // Parse each topic
-  for (const topicGuid of topicFolders) {
+  for (const [topicGuid, markupPath] of topicFolders) {
     try {
-      const topic = await readTopic(zip, topicGuid, budget);
+      const topic = await readTopic(zip, topicGuid, markupPath, budget, versionId, warn);
       if (topic) {
+        // A second topic folder whose internal Topic/@Guid collides with one
+        // already parsed must not silently overwrite it in the map -- that
+        // would drop a whole topic with no signal the caller could ever act
+        // on (#3960). Keep the first occurrence (folder map iteration order
+        // is insertion order, so this is deterministic) and warn, the same
+        // way every other "skip this piece, keep going" decision in this
+        // function is already reported.
+        if (topics.has(topic.guid)) {
+          warn(
+            `Duplicate topic Guid ${topic.guid}: folder "${topicGuid}" collides with an ` +
+              `already-read topic folder and is being dropped. Keeping the first one read.`,
+          );
+          continue;
+        }
         topics.set(topic.guid, topic);
       }
     } catch (error) {
       if (error instanceof BCFResourceLimitError) throw error;
-      console.warn(`Failed to parse topic ${topicGuid}:`, error);
+      warn(`Failed to parse topic ${topicGuid}:`, error);
     }
   }
 
@@ -311,8 +320,8 @@ async function readTopics(zip: JSZip, budget: ExpansionBudget): Promise<Map<stri
 /**
  * Read a single topic from the BCF archive
  */
-async function readTopic(zip: JSZip, topicFolder: string, budget: ExpansionBudget): Promise<BCFTopic | null> {
-  const markupFile = zip.file(`${topicFolder}/markup.bcf`);
+async function readTopic(zip: JSZip, topicFolder: string, markupPath: string, budget: ExpansionBudget, versionId: '2.1' | '3.0', warn: ReportWarning): Promise<BCFTopic | null> {
+  const markupFile = zip.file(markupPath);
   if (!markupFile) {
     return null;
   }
@@ -324,14 +333,14 @@ async function readTopic(zip: JSZip, topicFolder: string, budget: ExpansionBudge
   // that orders attributes differently from our own writer still parses.
   const topicMatch = markupContent.match(/<Topic\b([^>]*)>([\s\S]*?)<\/Topic>/);
   if (!topicMatch) {
-    console.warn(`Invalid markup.bcf in ${topicFolder}: missing Topic element`);
+    warn(`Invalid markup.bcf in ${topicFolder}: missing Topic element`);
     return null;
   }
 
   const topicAttrs = topicMatch[1];
   const guid = extractAttr(topicAttrs, 'Guid');
   if (!guid) {
-    console.warn(`Invalid markup.bcf in ${topicFolder}: Topic element missing Guid`);
+    warn(`Invalid markup.bcf in ${topicFolder}: could not read Topic Guid attribute`);
     return null;
   }
   const topicContent = topicMatch[2];
@@ -349,6 +358,7 @@ async function readTopic(zip: JSZip, topicFolder: string, budget: ExpansionBudge
   const description = extractElement(topicContent, 'Description');
   const priority = extractElement(topicContent, 'Priority');
   const index = extractElement(topicContent, 'Index');
+  const parsedIndex = index ? Number.parseInt(index, 10) : undefined;
   const creationDate = extractElement(topicContent, 'CreationDate'); // required no-default in markup.xsd; leave undefined, don't fabricate
   const creationAuthor = extractElement(topicContent, 'CreationAuthor'); // same: required no-default, don't fabricate 'Unknown'
   const modifiedDate = extractElement(topicContent, 'ModifiedDate');
@@ -357,12 +367,8 @@ async function readTopic(zip: JSZip, topicFolder: string, budget: ExpansionBudge
   const assignedTo = extractElement(topicContent, 'AssignedTo');
   const stage = extractElement(topicContent, 'Stage');
 
-  // Extract labels
-  const labels: string[] = [];
-  const labelMatches = topicContent.matchAll(/<Labels>([^<]+)<\/Labels>/g);
-  for (const match of labelMatches) {
-    labels.push(unescapeXml(match[1]));
-  }
+  // Extract labels (tolerant of both BCF 2.1 and 3.0 markup.xsd shapes; see parseLabels)
+  const labels = parseLabels(topicContent);
 
   // Extract BIM snippet
   const bimSnippet = extractBimSnippet(topicContent);
@@ -382,7 +388,7 @@ async function readTopic(zip: JSZip, topicFolder: string, budget: ExpansionBudge
   const comments = parseComments(markupContent);
 
   // Parse viewpoints
-  const viewpoints = await parseViewpoints(zip, topicFolder, markupContent, budget);
+  const viewpoints = await parseViewpoints(zip, topicFolder, markupContent, budget, versionId, warn);
 
   return {
     guid,
@@ -391,7 +397,9 @@ async function readTopic(zip: JSZip, topicFolder: string, budget: ExpansionBudge
     topicType,
     topicStatus,
     priority,
-    index: index ? parseInt(index, 10) : undefined,
+    // Preserve integer parsing: accepting fractions makes re-export throw.
+    // Guard malformed/overflowed tokens instead of storing NaN/Infinity (#3961).
+    index: Number.isFinite(parsedIndex) ? parsedIndex : undefined,
     creationDate,
     creationAuthor,
     modifiedDate,
@@ -429,13 +437,13 @@ function parseHeaderFiles(markupContent: string): BCFHeaderFile[] {
     const ifcProject = attrs.match(/IfcProject="([^"]*)"/)?.[1];
     const ifcSpatial = attrs.match(/IfcSpatialStructureElement="([^"]*)"/)?.[1];
     // BCF 2.1 spells this `isExternal`, 3.0 `IsExternal`; accept either casing
-    // (and the xs:boolean `1`/`0` forms a foreign tool may emit).
+    // and the xs:boolean `1`/`0` forms. Blank is absent, per parseXsBoolean.
     const isExternalRaw = attrs.match(/\b[Ii]sExternal="([^"]*)"/)?.[1];
 
     files.push({
       ifcProject: ifcProject || undefined,
       ifcSpatialStructureElement: ifcSpatial || undefined,
-      isExternal: isExternalRaw === undefined ? undefined : (isExternalRaw === 'true' || isExternalRaw === '1'),
+      isExternal: isExternalRaw?.trim() ? parseXsBoolean(isExternalRaw, { ifUnrecognized: false }) : undefined,
       filename: extractElement(body, 'Filename'),
       date: extractElement(body, 'Date'),
       reference: extractElement(body, 'Reference'),
@@ -478,16 +486,16 @@ function extractBimSnippet(content: string): BCFBimSnippet | undefined {
   if (!snippetType) return undefined;
 
   // BCF 2.1 spells this `isExternal`, 3.0 `IsExternal` (same rename as the
-  // Header `<File>` attribute in reader.ts's parseHeaderFiles); accept either
-  // casing so a spec-correct 3.0 file's flag isn't silently read as false, and
-  // the xs:boolean `1`/`0` forms alongside `true`/`false`.
+  // Header `<File>` site above); accept either casing and `1`/`0`. Unlike
+  // that site, `isExternal` here is a required boolean, so absent and blank
+  // both resolve to `false`, not `undefined`.
   const isExternalRaw = match[1].match(/\b[Ii]sExternal="([^"]*)"/)?.[1];
   const reference = extractElement(match[2], 'Reference');
   const referenceSchema = extractElement(match[2], 'ReferenceSchema');
 
   return {
     snippetType,
-    isExternal: isExternalRaw === 'true' || isExternalRaw === '1',
+    isExternal: isExternalRaw?.trim() ? parseXsBoolean(isExternalRaw, { ifUnrecognized: false }) : false,
     reference: reference || '',
     referenceSchema,
   };
@@ -513,7 +521,9 @@ function extractDocumentReferences(content: string): BCFDocumentReference[] {
 
   for (const match of matches) {
     const guidMatch = match[0].match(/Guid="([^"]+)"/);
-    const isExternalMatch = match[0].match(/\bisExternal="([^"]+)"/);
+    // xs:boolean's lexical space is {true, false, 1, 0}; see isExternal above.
+    // Blank is absent, per parseXsBoolean (same as the header <File> site).
+    const isExternalRaw = match[0].match(/\bisExternal="([^"]*)"/)?.[1];
     const referencedDoc = extractElement(match[1], 'ReferencedDocument');
     const documentGuid = extractElement(match[1], 'DocumentGuid');
     const url = extractElement(match[1], 'Url');
@@ -522,7 +532,7 @@ function extractDocumentReferences(content: string): BCFDocumentReference[] {
     if (referencedDoc || documentGuid || url) {
       refs.push({
         guid: guidMatch?.[1],
-        isExternal: isExternalMatch ? isExternalMatch[1] === 'true' : undefined,
+        isExternal: isExternalRaw?.trim() ? parseXsBoolean(isExternalRaw, { ifUnrecognized: false }) : undefined,
         referencedDocument: referencedDoc,
         documentGuid,
         url,
@@ -605,7 +615,9 @@ async function parseViewpoints(
   zip: JSZip,
   topicFolder: string,
   markupContent: string,
-  budget: ExpansionBudget
+  budget: ExpansionBudget,
+  versionId: '2.1' | '3.0',
+  warn: ReportWarning,
 ): Promise<BCFViewpoint[]> {
   const viewpoints: BCFViewpoint[] = [];
 
@@ -678,10 +690,11 @@ async function parseViewpoints(
     }
   }
 
-  // Find viewpoint files directly in the folder
+  // Find viewpoint files; extension matched case-insensitively like the
+  // topic-folder regex's `/i` above -- `viewpoint.BCFV` was silently lost.
   const viewpointFiles: string[] = [];
   zip.forEach((relativePath: string) => {
-    if (relativePath.startsWith(`${topicFolder}/`) && relativePath.endsWith('.bcfv')) {
+    if (relativePath.startsWith(`${topicFolder}/`) && relativePath.toLowerCase().endsWith('.bcfv')) {
       viewpointFiles.push(relativePath);
     }
   });
@@ -693,7 +706,7 @@ async function parseViewpoints(
       if (!viewpointFile) continue;
 
       const viewpointContent = await readEntryCapped(viewpointFile, 'string', budget);
-      const viewpoint = parseViewpointContent(viewpointContent);
+      const viewpoint = parseViewpointContent(viewpointContent, versionId);
 
       if (viewpoint) {
         // Get snapshot filename from markup.bcf if available
@@ -713,7 +726,7 @@ async function parseViewpoints(
 
         // Fallback: try common naming patterns
         if (!snapshotFile) {
-          const viewpointBaseName = viewpointPath.replace('.bcfv', '');
+          const viewpointBaseName = viewpointPath.replace(/\.bcfv$/i, '');
 
           // Handle different naming conventions:
           // 1. Viewpoint_<guid>.bcfv -> Snapshot_<guid>.png (buildingSMART standard)
@@ -759,7 +772,7 @@ async function parseViewpoints(
       }
     } catch (error) {
       if (error instanceof BCFResourceLimitError) throw error;
-      console.warn(`Failed to parse viewpoint ${viewpointPath}:`, error);
+      warn(`Failed to parse viewpoint ${viewpointPath}:`, error);
     }
   }
 
@@ -780,271 +793,6 @@ async function parseViewpoints(
   return viewpoints;
 }
 
-/**
- * Parse viewpoint XML content
- */
-function parseViewpointContent(content: string): BCFViewpoint | null {
-  // Extract viewpoint GUID from root element (Guid can be anywhere in the tag)
-  const guidMatch = content.match(/<VisualizationInfo[^>]+Guid="([^"]+)"/);
-  const guid = guidMatch?.[1] || crypto.randomUUID?.() || `vp-${Date.now()}`;
-
-  // Parse perspective camera
-  const perspectiveCamera = parsePerspectiveCamera(content);
-
-  // Parse orthogonal camera
-  const orthogonalCamera = parseOrthogonalCamera(content);
-
-  // Parse components
-  const components = parseComponents(content);
-
-  // Parse lines
-  const lines = parseLines(content);
-
-  // Parse clipping planes
-  const clippingPlanes = parseClippingPlanes(content);
-
-  // Parse bitmaps
-  const bitmaps = parseBitmaps(content);
-
-  return {
-    guid,
-    perspectiveCamera,
-    orthogonalCamera,
-    components,
-    lines: lines.length > 0 ? lines : undefined,
-    clippingPlanes: clippingPlanes.length > 0 ? clippingPlanes : undefined,
-    bitmaps: bitmaps.length > 0 ? bitmaps : undefined,
-  };
-}
-
-/**
- * Parse perspective camera from viewpoint content
- */
-function parsePerspectiveCamera(content: string): BCFPerspectiveCamera | undefined {
-  const match = content.match(/<PerspectiveCamera>([\s\S]*?)<\/PerspectiveCamera>/);
-  if (!match) return undefined;
-
-  const cameraContent = match[1];
-
-  const viewPoint = parsePoint(cameraContent, 'CameraViewPoint');
-  const direction = parseDirection(cameraContent, 'CameraDirection');
-  const upVector = parseDirection(cameraContent, 'CameraUpVector');
-  const fieldOfView = extractElement(cameraContent, 'FieldOfView');
-
-  if (!viewPoint || !direction || !upVector || !fieldOfView) {
-    return undefined;
-  }
-
-  // Same treatment as the coordinates: an unusable scalar is a missing one.
-  // `fieldOfView` is converted to radians and handed to the viewer camera,
-  // and the parser already drops the whole camera when the element is absent.
-  const fov = parseFiniteFloat(fieldOfView);
-  if (fov === undefined) return undefined;
-
-  return {
-    cameraViewPoint: viewPoint,
-    cameraDirection: direction,
-    cameraUpVector: upVector,
-    fieldOfView: fov,
-    ...parseAspectRatio(cameraContent),
-  };
-}
-
-/**
- * Parse the optional `<AspectRatio>` of either camera type.
- *
- * BCF 3.0's visinfo.xsd makes `AspectRatio` (a `PositiveDouble`) a REQUIRED
- * child of both camera types; BCF 2.1 has no such element. It is read here for
- * both, since the element's presence — not the archive's declared version — is
- * what says whether there is a value to keep.
- *
- * Reading it matters beyond fidelity: the writer refuses to emit a 3.0 camera
- * without one, so a 3.0 archive from another tool could otherwise be read and
- * then not written back. Returned as a spread-able partial so an absent or
- * unusable value leaves the property off entirely rather than setting it to
- * `undefined`, and a non-positive value is dropped rather than carried into
- * output the schema would reject.
- */
-function parseAspectRatio(cameraContent: string): { aspectRatio?: number } {
-  const raw = extractElement(cameraContent, 'AspectRatio');
-  if (!raw) return {};
-  const value = parseFiniteFloat(raw);
-  if (value === undefined || !(value > 0)) return {};
-  return { aspectRatio: value };
-}
-
-/**
- * Parse orthogonal camera from viewpoint content
- */
-function parseOrthogonalCamera(content: string): BCFOrthogonalCamera | undefined {
-  const match = content.match(/<OrthogonalCamera>([\s\S]*?)<\/OrthogonalCamera>/);
-  if (!match) return undefined;
-
-  const cameraContent = match[1];
-
-  const viewPoint = parsePoint(cameraContent, 'CameraViewPoint');
-  const direction = parseDirection(cameraContent, 'CameraDirection');
-  const upVector = parseDirection(cameraContent, 'CameraUpVector');
-  const viewToWorldScale = extractElement(cameraContent, 'ViewToWorldScale');
-
-  if (!viewPoint || !direction || !upVector || !viewToWorldScale) {
-    return undefined;
-  }
-
-  // `viewToWorldScale` becomes the orthographic half-height, which is the
-  // value `getOrthoSize()` hands back into a saved viewpoint — so a
-  // non-finite one persists past the session if it is allowed in (#2461).
-  const scale = parseFiniteFloat(viewToWorldScale);
-  if (scale === undefined) return undefined;
-
-  return {
-    cameraViewPoint: viewPoint,
-    cameraDirection: direction,
-    cameraUpVector: upVector,
-    viewToWorldScale: scale,
-    ...parseAspectRatio(cameraContent),
-  };
-}
-
-/**
- * Parse a 3D point from XML
- */
-function parsePoint(content: string, elementName: string): BCFPoint | undefined {
-  const match = content.match(new RegExp(`<${elementName}>([\\s\\S]*?)<\\/${elementName}>`));
-  if (!match) return undefined;
-
-  const x = extractElement(match[1], 'X');
-  const y = extractElement(match[1], 'Y');
-  const z = extractElement(match[1], 'Z');
-
-  if (x === undefined || y === undefined || z === undefined) {
-    return undefined;
-  }
-
-  // A coordinate that is not a real number is treated as a missing one.
-  // `parseFloat` has no out-of-band failure value — `"NaN"` parses to `NaN`
-  // and the well-formed literal `"1e999"` parses to `Infinity` — and from here
-  // the value reaches `Camera.setPosition`/`setTarget`, which store a pose
-  // verbatim by design. Once stored, a single non-finite coordinate spreads
-  // across the whole pose on the next gesture. Rejecting at the file boundary
-  // means it never gets there, and it costs no new branch: every caller
-  // already drops the thing it was parsing when a coordinate is missing
-  // (#2466).
-  const px = parseFiniteFloat(x);
-  const py = parseFiniteFloat(y);
-  const pz = parseFiniteFloat(z);
-
-  if (px === undefined || py === undefined || pz === undefined) {
-    return undefined;
-  }
-
-  return { x: px, y: py, z: pz };
-}
-
-/**
- * Parse a 3D direction from XML
- */
-function parseDirection(content: string, elementName: string): BCFDirection | undefined {
-  return parsePoint(content, elementName) as BCFDirection | undefined;
-}
-
-/**
- * Parse lines
- */
-function parseLines(content: string): BCFLine[] {
-  const lines: BCFLine[] = [];
-  const linesMatch = content.match(/<Lines>([\s\S]*?)<\/Lines>/);
-  if (!linesMatch) return lines;
-
-  const lineMatches = linesMatch[1].matchAll(/<Line>([\s\S]*?)<\/Line>/g);
-  for (const match of lineMatches) {
-    const startPoint = parsePoint(match[1], 'StartPoint');
-    const endPoint = parsePoint(match[1], 'EndPoint');
-    if (startPoint && endPoint) {
-      lines.push({ startPoint, endPoint });
-    }
-  }
-
-  return lines;
-}
-
-/**
- * Parse clipping planes
- */
-function parseClippingPlanes(content: string): BCFClippingPlane[] {
-  const planes: BCFClippingPlane[] = [];
-  const planesMatch = content.match(/<ClippingPlanes>([\s\S]*?)<\/ClippingPlanes>/);
-  if (!planesMatch) return planes;
-
-  const planeMatches = planesMatch[1].matchAll(/<ClippingPlane>([\s\S]*?)<\/ClippingPlane>/g);
-  for (const match of planeMatches) {
-    const location = parsePoint(match[1], 'Location');
-    const direction = parseDirection(match[1], 'Direction');
-    if (location && direction) {
-      planes.push({ location, direction });
-    }
-  }
-
-  return planes;
-}
-
-/**
- * Parse bitmaps
- *
- * The two BCF versions diverge in shape (see writer.ts's writeBitmap/
- * writeViewpointFiles for the write side of this):
- * - BCF 3.0: entries sit inside a `<Bitmaps>` wrapper, and the per-entry
- *   format element is named `<Format>`. No tag inside an entry shares the
- *   entry's own name, so a plain non-greedy `<Bitmap>...</Bitmap>` match
- *   is unambiguous.
- * - BCF 2.1: entries sit DIRECTLY under `<VisualizationInfo>` (no wrapper),
- *   and the format element is confusingly also named `<Bitmap>`, nested one
- *   level inside the entry (`<Bitmap><Bitmap>PNG</Bitmap><Reference>...`).
- *   A naive non-greedy `<Bitmap>...</Bitmap>` match on that shape terminates
- *   at the FIRST `</Bitmap>` it sees -- the inner format tag's closing tag,
- *   not the entry's -- and silently drops the rest of the entry. It must be
- *   matched with an explicit two-level pattern instead.
- */
-function parseBitmaps(content: string): BCFBitmap[] {
-  const bitmaps: BCFBitmap[] = [];
-  const bitmapsMatch = content.match(/<Bitmaps>([\s\S]*?)<\/Bitmaps>/);
-
-  const pushBitmap = (format: string | undefined, body: string) => {
-    const reference = extractElement(body, 'Reference');
-    const location = parsePoint(body, 'Location');
-    const normal = parseDirection(body, 'Normal');
-    const up = parseDirection(body, 'Up');
-    const height = extractElement(body, 'Height');
-
-    if (format && reference && location && normal && up && height) {
-      bitmaps.push({
-        format: format.toUpperCase() === 'JPG' ? 'JPG' : 'PNG',
-        reference,
-        location,
-        normal,
-        up,
-        height: parseFloat(height),
-      });
-    }
-  };
-
-  if (bitmapsMatch) {
-    // BCF 3.0 shape: <Bitmaps><Bitmap><Format>...</Format>...</Bitmap>...</Bitmaps>
-    for (const match of bitmapsMatch[1].matchAll(/<Bitmap>([\s\S]*?)<\/Bitmap>/g)) {
-      pushBitmap(extractElement(match[1], 'Format'), match[1]);
-    }
-  } else {
-    // BCF 2.1 shape: <Bitmap><Bitmap>PNG</Bitmap>...</Bitmap>, unwrapped,
-    // directly under VisualizationInfo.
-    for (const match of content.matchAll(
-      /<Bitmap>\s*<Bitmap>([\s\S]*?)<\/Bitmap>([\s\S]*?)<\/Bitmap>/g,
-    )) {
-      pushBitmap(match[1], match[2]);
-    }
-  }
-
-  return bitmaps;
-}
 
 /**
  * Convert Uint8Array to base64 string

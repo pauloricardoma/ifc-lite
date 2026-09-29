@@ -75,15 +75,25 @@
 // wiring; external consumers reach its types through the root-level `pub use`
 // re-exports below, so those modules are `pub(crate)` (see #C3.2).
 pub(crate) mod alignment;
+pub(crate) mod alignment_arc_length;
+pub(crate) mod alignment_axis;
+pub mod analytic;
+mod curve_source;
+mod trimmed_curve;
+pub(crate) mod gradient;
+pub(crate) mod curve_segment;
 pub(crate) mod bool2d;
 /// General 2D booleans over contour sets (union/difference/intersection),
 /// keeping every disjoint output shape. Distinct from `bool2d`, which is the
 /// fixed single-`Profile2D` void-subtraction path. Reached through the
 /// root-level re-exports below, so it stays `pub(crate)` per #C3.2.
 pub(crate) mod contour_bool2d;
+mod contour_composition;
+mod contour_grid_guard;
 /// Deterministic Constrained Delaunay Triangulation + bounded Ruppert
 /// min-angle refinement. Backs the quality triangulators in `triangulation`.
 mod cdt;
+mod terrain_cdt;
 /// Candidate contact normals for the `clash_solid` trust gate — the directions
 /// its thickness measurement is taken along. Internal to that gate, so it stays
 /// private; split out only to keep `clash_solid` inside the size ratchet.
@@ -131,7 +141,7 @@ pub mod rect_fast;
 #[cfg(feature = "triangulation-alt")]
 pub use triangulation::alt_oracle::set_alt_triangulator;
 /// Scalar abstraction the extrusion mesher is generic over (`f64` in
-/// production, a forward-mode dual number in the B4.4 kernel-adjoint spike).
+/// production and a forward-mode dual number in scalar-adjoint tests).
 pub(crate) mod scalar;
 /// The extrusion mesher, generic over the scalar. `extrusion`'s public
 /// functions are its `f64` instantiations.
@@ -139,12 +149,13 @@ pub(crate) mod extrusion_generic;
 /// Profile triangulation / ring builders, generic over the scalar.
 pub(crate) mod profile_generic;
 
-/// B4.4 - the M3 kernel-adjoint spike (test-only). Runs the production
+/// Scalar-adjoint validation (test-only). Runs the production
 /// extrusion mesher with a forward-mode dual scalar and grades its adjoints
 /// against central finite differences.
 #[cfg(test)]
-#[path = "b44_kernel_adjoint_tests.rs"]
-mod b44_kernel_adjoint;
+#[path = "scalar_adjoint_tests.rs"]
+mod scalar_adjoint;
+mod telemetry_transaction;
 pub use rect_fast::RectFastStats;
 pub(crate) mod router;
 /// Per-element mesh simplification for the demesher (cavity removal, grid
@@ -171,17 +182,18 @@ pub(crate) mod world_frame_fixture;
 pub mod zone_split;
 
 // Re-export nalgebra types for convenience
-pub use nalgebra::{Point2, Point3, Vector2, Vector3};
+pub use nalgebra::{Matrix4, Point2, Point3, Vector2, Vector3};
 
 pub use bool2d::{
     compute_signed_area, ensure_ccw, ensure_cw, is_valid_contour, point_in_contour, subtract_2d,
     subtract_multiple_2d, subtract_multiple_2d_counted,
 };
+pub use contour_composition::FixedGridComposition;
 pub use contour_bool2d::{
-    boolean_2d, resolve_2d, sanitize as sanitize_contours, BooleanOp2D, ContourSet, Ring2D,
+    boolean_2d, boolean_2d_fixed_grid, ContourFillRule, resolve_2d, sanitize as sanitize_contours, BooleanOp2D, ContourSet, Ring2D,
 };
 pub use clash_solid::{intersection_solid, DegenerateReason, IntersectionSolid};
-pub use csg::{calculate_normals, ClippingProcessor, Plane, Triangle};
+pub use csg::{calculate_normals, ClippingProcessor, GroupCut, GroupReject, Plane, Triangle};
 pub use diagnostics::{BoolFailure, BoolFailureReason, BoolOp};
 pub use error::{Error, Result};
 pub use geom_hash::{
@@ -191,10 +203,10 @@ pub use geom_hash::{
 pub use extrusion::{extrude_profile, extrude_profile_lofted, extrude_profile_with_voids};
 pub use instancing::{
     bake_source_at_world, collate_and_encode, collate_instances, collate_refs,
-    compose_instance_world_row_major, decode_instanced, encode_instanced, encode_refs,
-    instance_rel_row_major_f32, verify_recomposition, Collated, DecodedInstance, DecodedInstanced,
-    DecodedTemplate, InstanceMeshRef, InstanceOccurrence, InstanceTemplate, INSTANCED_MAGIC,
-    INSTANCED_VERSION,
+    collate_refs_in_basis, collate_refs_verified_in, compose_instance_world_row_major, decode_instance_finishes, decode_instanced,
+    encode_instanced, encode_refs, encode_refs_with_finishes, instance_rel_row_major_f32, verify_recomposition, Collated,
+    DecodedInstance, DecodedInstanced, DecodedTemplate, InstanceMeshRef, InstanceOccurrence,
+    InstanceTemplate, INSTANCED_MAGIC, INSTANCED_VERSION,
 };
 pub use material_layer_index::{
     LayerAxis, LayerBuildup, LayerInfo, MaterialLayerFlat, MaterialLayerIndex,
@@ -204,33 +216,41 @@ pub use mesh_orient::{orient_mesh_outward, orient_mesh_outward_verdict, OrientVe
 pub use processors::{
     AdvancedBrepProcessor, BooleanClippingProcessor, ExtrudedAreaSolidProcessor,
     ExtrudedAreaSolidTaperedProcessor, FaceBasedSurfaceModelProcessor, FacetedBrepProcessor,
-    build_texture_index, ImageTextureRef, MeshTexture, PolygonalFaceSetProcessor,
+    build_texture_index, embedded_raster_dimensions, MAX_TEXTURE_DIMENSION, ImageTextureRef, MeshTexture, PolygonalFaceSetProcessor,
     ResolvedTextureMap, RevolvedAreaSolidProcessor, TextureAttachment, TextureSource, SurfaceOfLinearExtrusionProcessor,
     SweptDiskSolidProcessor, TriangulatedFaceSetProcessor,
 };
 pub use alignment::{AlignmentCurve, AlignmentFrame};
+pub use alignment_axis::locate_axis_curve;
+pub use analytic::{
+    extract_analytic_extrusion, extract_analytic_profile, extract_swept_disk,
+    AnalyticCurveSegment, AnalyticExtrusion, AnalyticProfile, AnalyticProfileLoop,
+    AnalyticStatus, AnalyticSweptDisk, ProfileLoopKind,
+};
 pub use profile::{Profile2D, Profile2DWithVoids, ProfileType, VoidInfo};
 pub use profile_extractor::{extract_profiles, extract_profiles_with_diagnostics, ExtractedProfile};
 pub use profile_skip::SkippedProfile;
 pub use profiles::ProfileProcessor;
+pub use cdt::take_cdt_recovery_fallbacks;
+pub use terrain_cdt::{
+    triangulate_terrain_pslg, triangulate_terrain_pslg_with_progress, TerrainCdtError,
+    TerrainCdtMesh,
+};
+pub use kernel::plane_weld::take_plane_weld_stats;
 pub use router::take_bool2d_stats;
 pub use router::{take_prism_defers, take_prism_stats};
 pub use router::{
-    aggregate_diagnostics, local_frame_set_enabled_override, ClassificationStats,
+    aggregate_diagnostics, count_attributed_products, format_unsupported_breakdown,
+    local_frame_set_enabled_override, meshed_representations, ClassificationStats, UNATTRIBUTED_PRODUCT_ID,
     GEOMETRY_DIAGNOSTICS_SCHEMA_VERSION, FACETED_BREP_DEDUP_FACE_LIMIT,
     ClassificationSummary, GeometryDiagnostics, GeometryProcessor, GeometryRouter,
     HostOpeningDiagnostic, ItemDedupCache, MappedInstancePlan, OpeningDiagnostic, OpeningKindDiag,
-    ReasonCount, RectFastSummary, RectParam, SharedMappedItemCache, WorstHost,
+    ReasonCount, RectFastSummary, RectParam, SharedMappedItemCache, SharedBrepSignatureCache, WorstHost,
 };
 
-/// The streaming / needs-shift large-coordinate threshold (metres): a world
-/// coordinate whose magnitude exceeds this needs RTC re-basing before it is
-/// cast to f32, or the model renders with vertex jitter. Shared by the router's
-/// own coordinate sampling (`router::rtc_offset`) and the streaming pre-pass
-/// meta resolver (`ifc_lite_processing::stream_meta`) so those two make the same
-/// decision. (Other 10 km checks carry their own local constant of the same
-/// value.)
-pub const LARGE_COORD_THRESHOLD_METERS: f64 = 10000.0;
+/// The large-coordinate threshold and its predicate, defined in
+/// `ifc_lite_core::limits` so core's own bounds scan can use them too.
+pub use ifc_lite_core::limits::{coord_is_large, LARGE_COORD_THRESHOLD_METERS};
 pub use simplify::{simplify_mesh, SimplifyOptions, SimplifyStats};
 pub use tessellation::{scale_segments, TessellationQuality};
 pub use transform::{

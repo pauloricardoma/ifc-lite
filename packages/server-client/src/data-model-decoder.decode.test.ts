@@ -19,7 +19,6 @@
  */
 
 import { describe, it, expect, beforeAll } from 'vitest';
-import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 import { decodeDataModel } from './data-model-decoder.js';
 
@@ -31,22 +30,38 @@ let arrow: any;
 let parquet: any;
 
 beforeAll(async () => {
-  // `decodeDataModel` boots parquet-wasm via `ensureParquetInit()`, which
-  // fetches the .wasm asset by URL — a Vite/browser-only path that has no
-  // static server under plain `vitest run`. `initSync` with the wasm file's
-  // own bytes initializes the SAME cached module instance (parquet-wasm
-  // memoizes on its internal `wasm` binding, see arrow2.js's `__wbg_init`),
-  // so `ensureParquetInit()`'s later `parquet.default(url)` call short-
-  // circuits on the existing instance instead of re-fetching.
-  const require = createRequire(import.meta.url);
-  const jsPath = require.resolve('parquet-wasm/esm/arrow2.js');
-  const wasmPath = jsPath.replace(/arrow2\.js$/, 'arrow2_bg.wasm');
-  const wasmBytes = readFileSync(wasmPath);
-  parquet = await import('parquet-wasm/esm/arrow2.js');
-  parquet.initSync(wasmBytes);
+  // Same import `ensureParquetInit()` makes: the bare package entry, whose
+  // export map picks the self-initializing Node build under `vitest run`.
+  // (This used to deep-import `parquet-wasm/esm/arrow2.js` and hand-run
+  // `initSync` on the .wasm bytes, because that build initializes by
+  // FETCHING its asset, which has no server here. The deep path was dropped
+  // in parquet-wasm 0.6, see #3845 and `parquet-decoder.entry.test.ts`.)
+  parquet = await import('parquet-wasm');
 
   arrow = await import('apache-arrow');
 });
+
+/**
+ * Re-stamp every field of a table as nullable.
+ *
+ * `new arrow.Table({ col: vector })` always marks its fields NON-nullable,
+ * even for a vector that carries nulls. parquet-wasm 0.7's writer rejects
+ * that mismatch outright (`Column 'name' is declared as non-nullable but
+ * contains null values`), where 0.5 accepted it and silently wrote the nulls
+ * away. Only tables with genuinely nullable columns need this.
+ */
+function nullableTable(columns: Record<string, unknown>) {
+  const table = new arrow.Table(columns);
+  const schema = new arrow.Schema(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    table.schema.fields.map((f: any) => arrow.Field.new(f.name, f.type, true))
+  );
+  return new arrow.Table(
+    schema,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    table.batches.map((b: any) => new arrow.RecordBatch(schema, b.data))
+  );
+}
 
 /** Serialize an Arrow-JS Table to Parquet bytes via parquet-wasm, mirroring
  *  the server's writer path (packages/export/src/parquet-exporter.ts). */
@@ -113,17 +128,27 @@ function emptyQuantitiesTable() {
   });
 }
 
-function relationshipsTable(rows: { relType: string; relatingId: number; relatedId: number }[]) {
-  return new arrow.Table({
+/** `relId` is the data-model v6 column (issue #3860). Omitting it reproduces an
+ *  older server's payload, which the decoder must still accept. */
+function relationshipsTable(
+  rows: { relType: string; relatingId: number; relatedId: number; relId?: number }[],
+  opts: { withRelId?: boolean } = {}
+) {
+  const columns = {
     rel_type: arrow.vectorFromArray(rows.map((r) => r.relType), new arrow.Utf8()),
     relating_id: arrow.vectorFromArray(rows.map((r) => r.relatingId), new arrow.Uint32()),
     related_id: arrow.vectorFromArray(rows.map((r) => r.relatedId), new arrow.Uint32()),
+  };
+  if (!opts.withRelId) return new arrow.Table(columns);
+  return new arrow.Table({
+    ...columns,
+    rel_id: arrow.vectorFromArray(rows.map((r) => r.relId ?? 0), new arrow.Uint32()),
   });
 }
 
 function spatialNodesTable(rows: { id: number; parentId: number; level: number; path: string; type: string }[]) {
   const listType = new arrow.List(arrow.Field.new('item', new arrow.Uint32(), true));
-  return new arrow.Table({
+  return nullableTable({
     entity_id: arrow.vectorFromArray(rows.map((r) => r.id), new arrow.Uint32()),
     parent_id: arrow.vectorFromArray(rows.map((r) => r.parentId), new arrow.Uint32()),
     level: arrow.vectorFromArray(rows.map((r) => r.level), new arrow.Uint16()),
@@ -179,13 +204,15 @@ function emptyDocumentsTable() {
  * `__fixtures__/nodes-nullable-elevation.parquet` and
  * `__fixtures__/materials-nullable-thickness.parquet` are authored by
  * DuckDB (an independent Parquet writer, not this repo's own code), NOT via
- * this file's `toParquetBytes` helper: the locked `parquet-wasm@0.5.0`'s
- * `writeParquet` silently drops null-ness for a nullable Float64 column
- * written through the `apache-arrow` Table -> IPC -> `Table.fromIPCStream`
- * bridge (confirmed against DuckDB reading its own output back: the byte a
- * "null" row lands on decodes as a real `0`, not a null). That is a
- * write-side bug in the pinned `parquet-wasm` version, orthogonal to the
- * read-side bug under test here, and DuckDB's own writer does not share it.
+ * this file's `toParquetBytes` helper: when these fixtures were written the
+ * package resolved `parquet-wasm@0.5.0`, whose `writeParquet` silently drops
+ * null-ness for a nullable Float64 column written through the `apache-arrow`
+ * Table -> IPC -> `Table.fromIPCStream` bridge (confirmed against DuckDB
+ * reading its own output back: the byte a "null" row lands on decodes as a
+ * real `0`, not a null). 0.7.2 (what the package resolves now, see #3845)
+ * does round-trip those nulls, but the fixtures stay DuckDB-authored: an
+ * independent writer is the stronger oracle for a read-side bug, and it is
+ * the writer real payloads come from.
  *
  * Regenerate with DuckDB (`npm i --prefix /tmp/pq duckdb`, not a repo dep):
  *   COPY (SELECT CAST(row_id AS UINTEGER) entity_id, CAST(0 AS UINTEGER)
@@ -229,17 +256,23 @@ function buildDataModelBuffer(
     /** Raw Parquet bytes for the optional materials section; appending it
      *  also appends empty classifications/documents (positional triplet). */
     materialsBytes?: Uint8Array;
+    /** Emit the relationships table's `rel_id` column (data-model v6). */
+    withRelId?: boolean;
+    /** Replace the empty properties table. */
+    propertiesTable?: ReturnType<typeof emptyPropertiesTable>;
   } = {}
 ): ArrayBuffer {
   const entities = toParquetBytes(
     entitiesTable([{ id: 1, type: 'IfcWall', globalId: 'GUID-1', name: 'Wall 1' }])
   );
-  const properties = toParquetBytes(emptyPropertiesTable());
+  const properties = toParquetBytes(opts.propertiesTable ?? emptyPropertiesTable());
   const quantities = toParquetBytes(emptyQuantitiesTable());
   const relationships = toParquetBytes(
     opts.emptyRelationships
-      ? relationshipsTable([])
-      : relationshipsTable([{ relType: 'IfcRelAggregates', relatingId: 1, relatedId: 2 }])
+      ? relationshipsTable([], { withRelId: opts.withRelId })
+      : relationshipsTable([{ relType: 'IfcRelAggregates', relatingId: 1, relatedId: 2, relId: 7 }], {
+          withRelId: opts.withRelId,
+        })
   );
 
   const nodes =
@@ -399,6 +432,9 @@ describe('decodeDataModel — bounding controls (well-formed buffers still decod
       relating_id: 1,
       related_id: 2,
     });
+    // No `rel_id` column in this payload (older server) -> field absent, never
+    // a fabricated 0 that a caller would write into an export as a real id.
+    expect(model.relationships[0].rel_id).toBeUndefined();
 
     expect(model.spatialHierarchy.project_id).toBe(42);
     expect(model.spatialHierarchy.nodes).toHaveLength(1);
@@ -409,6 +445,21 @@ describe('decodeDataModel — bounding controls (well-formed buffers still decod
     expect(model.classifications).toEqual([]);
     expect(model.materials).toEqual([]);
     expect(model.documents).toEqual([]);
+  });
+
+  it('round-trips the relationships `rel_id` column when the server sends it (v6 payload)', async () => {
+    const buf = buildDataModelBuffer({ withRelId: true });
+    const model = await decodeDataModel(buf);
+
+    // 7 is distinct from both id columns (1, 2), so neither a copy of a
+    // neighbouring column nor the old hard-coded 0 passes.
+    expect(model.relationships).toHaveLength(1);
+    expect(model.relationships[0]).toEqual({
+      rel_type: 'IfcRelAggregates',
+      relating_id: 1,
+      related_id: 2,
+      rel_id: 7,
+    });
   });
 
   it('decodes a model with legitimately EMPTY required tables (zero quantities, zero relationships)', async () => {
@@ -458,5 +509,57 @@ describe('decodeDataModel — nullable numeric columns (RED: null decodes as 0 -
     expect(model.materials[0].thickness).toBeCloseTo(0.2);
     expect(model.materials[1].material_name).toBe('Paint Finish');
     expect(model.materials[1].thickness).toBeUndefined();
+    expect(model.materials[0].kind).toBeUndefined();
+    expect(model.materials[0].member_count).toBeUndefined();
+  });
+
+  it('decodes all v8 material association fields from the Rust Parquet writer (#5296)', async () => {
+    // Generated by apps/server/src/services/parquet_data_model_tests.rs with
+    // IFCLITE_MATERIAL_TABLE_OUT pointing at this committed fixture.
+    const model = await decodeDataModel(buildDataModelBuffer({
+      materialsBytes: readFixture('materials-complete.parquet'),
+    }));
+    expect(model.materials).toHaveLength(4);
+    expect(model.materials[0]).toMatchObject({
+      element_id: 7, association_id: 35, definition_id: 34,
+      member_count: 2, kind: 'IfcMaterialLayerSet', set_name: 'WallSet',
+      layer_index: 0, material_name: 'Concrete', material_id: 30,
+      material_name_present: true,
+      member_name: 'Core', material_category: 'Mineral', fraction: 0.5,
+      thickness: 0.2, is_ventilated: false,
+    });
+    expect(model.materials[1]).toMatchObject({
+      association_id: 35, definition_id: 34, member_count: 2,
+      layer_index: 1, material_name: 'Insulation', material_id: 31,
+      category: 'thermal',
+    });
+    expect(model.materials[1].member_name).toBeUndefined();
+    expect(model.materials[1].material_category).toBeUndefined();
+    expect(model.materials[1].fraction).toBeUndefined();
+    expect(model.materials[1].thickness).toBeUndefined();
+    expect(model.materials[2]).toMatchObject({ kind: 'IfcMaterialList', material_name: '',
+      material_name_present: false, material_id: 86 });
+    expect(model.materials[3]).toMatchObject({ kind: 'IfcMaterialList', material_name: '',
+      material_name_present: true, material_id: 87 });
+  });
+});
+
+describe('decodeDataModel — data_type_mixed (#5224)', () => {
+  it('carries the table exemption from the v7 column, and nothing when the column is absent', async () => {
+    const withColumn = new arrow.Table({
+      pset_id: arrow.vectorFromArray([1, 1], new arrow.Uint32()),
+      pset_name: arrow.vectorFromArray(['Pset_X', 'Pset_X'], new arrow.Utf8()),
+      property_name: arrow.vectorFromArray(['Deflection', 'FireRating'], new arrow.Utf8()),
+      property_value: arrow.vectorFromArray(['Table (1 rows)', 'REI 60'], new arrow.Utf8()),
+      property_type: arrow.vectorFromArray(['string', 'string'], new arrow.Utf8()),
+      data_type_mixed: arrow.vectorFromArray([true, false], new arrow.Bool()),
+    });
+    const decoded = await decodeDataModel(buildDataModelBuffer({ propertiesTable: withColumn }));
+    const props = decoded.propertySets.get(1)!.properties;
+    expect(props.find((p) => p.property_name === 'Deflection')?.data_type_mixed).toBe(true);
+    expect(props.find((p) => p.property_name === 'FireRating')?.data_type_mixed).toBeUndefined();
+
+    const older = await decodeDataModel(buildDataModelBuffer());
+    expect(older.propertySets.size).toBe(0);
   });
 });

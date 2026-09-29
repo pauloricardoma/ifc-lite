@@ -20,12 +20,12 @@ import {
   openGeometryChunksV13,
   readInstancedShards,
   BufferReader,
+  toCacheDataStore,
   type CachedEntityIndexColumns,
   type CacheDataStore,
   type GeometryData,
 } from '@ifc-lite/cache';
 import { SpatialHierarchyBuilder, StepTokenizer, CompactEntityIndex, CompactEntityIndexBuilder, extractLengthUnitScale, attachDataStoreAccessors, type IfcDataStore, type IfcStoreData } from '@ifc-lite/parser';
-import { buildSpatialIndexGuarded } from '../utils/loadingUtils.js';
 import { makeColdGeometryProvider } from '../utils/coldGeometryProvider.js';
 import { getGlobalRenderer } from './useBCF.js';
 import { computeFullSourceHash } from '../utils/sourceContentHash.js';
@@ -223,13 +223,12 @@ export function useIfcCache() {
 
       const reader = new BinaryCacheReader();
 
-      // No full-file hash on the repeat-open path (the #1 un-flag blocker). The
-      // hit is already validated by the strengthened, spread-sampled cache key
-      // (`sourceFingerprint.ts`): a key match means the exact byte length AND a
-      // 64-bit hash of a ~160KB spread (head + tail + interior windows) match, so
-      // a genuinely different file can never key the same entry. That makes the
-      // former ~0.7-1.7s `xxhash64(fullSource)` recompute here redundant, and
-      // dropping it removes the main-thread stall for BOTH cache tiers. A
+      // No SYNCHRONOUS full-file hash on the repeat-open path (the former
+      // ~0.7-1.7s `xxhash64(fullSource)` main-thread stall). The spread-sampled
+      // cache key (`@ifc-lite/cache`'s `source-fingerprint.ts`) only KEYS the lookup — it cannot see
+      // a byte-length-preserving edit between its sample windows; staleness is
+      // gated by the mtime guard + off-thread full-hash revalidation in
+      // `cacheTier.ts` / `useIfcLoader` (#4269). A
       // truncated/corrupt cache buffer still fails fast in `reader.read` below →
       // the catch deletes the entry and returns a graceful miss.
       // Blob entries (cold-tier writes) are disk-backed: materialize once
@@ -254,7 +253,6 @@ export function useIfcCache() {
       }
       const geometrySection = headerInfo.sections.find((s) => s.type === SectionType.Geometry);
       const result = await reader.read(cacheBuffer, { skipGeometry: true });
-      const cacheReadTime = performance.now() - cacheLoadStart;
 
       // Restore the source buffer — required for on-demand property extraction
       // AND the lazy entity accessors (getEntity/getProperties/...). The web
@@ -277,17 +275,21 @@ export function useIfcCache() {
         } else {
           // Backward compatibility for v3 caches: rebuild byte offsets from the
           // source once, then future v4 writes persist this section.
+          // Key `byType` in upper case, as a fresh parse and a v4 load do: not
+          // every scan path canonicalises type names (#4712).
           const tokenizer = new StepTokenizer(source);
+          // @raw-entity-enumeration-ok cache hydration sizes a source-index builder from the cached parsed table
           const estimatedCount = cacheStore.entities?.count ?? 100_000;
           const indexBuilder = new CompactEntityIndexBuilder(estimatedCount);
           const byType = new Map<string, number[]>();
 
           for (const ref of tokenizer.scanEntitiesFast()) {
             indexBuilder.add(ref.expressId, ref.type, ref.offset, ref.length);
-            let typeList = byType.get(ref.type);
+            const typeKey = ref.type.toUpperCase();
+            let typeList = byType.get(typeKey);
             if (!typeList) {
               typeList = [];
-              byType.set(ref.type, typeList);
+              byType.set(typeKey, typeList);
             }
             typeList.push(ref.expressId);
           }
@@ -397,7 +399,7 @@ export function useIfcCache() {
               break;
             }
             allMeshes.push(...chunkMeshes);
-            appendGeometryBatch(chunkMeshes, open.coordinateInfo);
+            appendGeometryBatch(modelId, chunkMeshes, open.coordinateInfo);
             if ((i & 3) === 3 || i === open.chunks.length - 1) {
               setProgress({
                 phase: 'Loading geometry from cache',
@@ -447,7 +449,6 @@ export function useIfcCache() {
         }
 
         setIfcDataStore(dataStore);
-        buildSpatialIndexGuarded(allMeshes, dataStore, setIfcDataStore);
 
         // Cold-storage provider (issue #1682 phase 3b): with this wired the
         // scene may drop CPU meshData for cold chunks and restore them from
@@ -535,31 +536,23 @@ export function useIfcCache() {
       console.log(`[useIfcCache] Starting cache write for: ${fileName} (persistSource=${persistSource})`);
       const writer = new BinaryCacheWriter();
 
-      // Adapt dataStore to cache format
-      const cacheDataStore: CacheDataStore = {
-        schema: dataStore.schemaVersion === 'IFC4' ? 1 : dataStore.schemaVersion === 'IFC4X3' ? 2 : 0,
-        entityCount: dataStore.entityCount || dataStore.entities?.count || 0,
-        strings: dataStore.strings,
-        entities: dataStore.entities,
-        properties: dataStore.properties,
-        quantities: dataStore.quantities,
-        relationships: dataStore.relationships,
-        spatialHierarchy: dataStore.spatialHierarchy,
-        entityIndex: dataStore.entityIndex,
-      };
+      // Adapt dataStore to cache format. `toCacheDataStore` is the package's
+      // own runtime→cache adapter and now the ONLY schemaVersion→SchemaVersion
+      // mapping: this hook used to keep an inline copy that spelled the enum
+      // out as bare 1/2/0 literals, so the two could drift apart silently.
+      // It carries the same entityCount fallback the inline copy had.
+      const cacheDataStore: CacheDataStore = toCacheDataStore(dataStore);
 
       // Compute the true full-file validation hash off the main thread (runs in
-      // parallel with the cache-buffer serialization below). ONLY for the
-      // source-decoupled tier: the source-persisting tier serves cached geometry
-      // AND cached source together (self-consistent) and never consults it, so
-      // its <=150MB write path stays exactly as it was.
-      const fullHashPromise = persistSource
-        ? Promise.resolve<string | null>(null)
-        : computeFullSourceHash(sourceBuffer);
+      // parallel with the cache-buffer serialization below) for BOTH tiers
+      // (#4269): the loader background-revalidates a served hit against it and
+      // purges + reloads on mismatch — the only gate that catches an
+      // mtime-preserved, byte-length-preserving in-place edit.
+      const fullHashPromise = computeFullSourceHash(sourceBuffer);
 
       console.log('[useIfcCache] Writing cache buffer...');
       const cacheBuffer = await writer.write(cacheDataStore, geometry, sourceBuffer, {
-        includeGeometry: true,
+        includeGeometry: true, compressGeometryChunksInWorker: true,
         omitSourceHash: true,
       });
       console.log('[useIfcCache] Cache buffer written:', cacheBuffer.byteLength, 'bytes');

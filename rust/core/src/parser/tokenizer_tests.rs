@@ -206,7 +206,7 @@ fn comment_before_a_value_is_not_part_of_the_value() {
 }
 
 /// A comment before the `$` must not make the null slot look non-null --
-/// same shape `has_non_null_attribute`'s tests cover at the scanner layer.
+/// same shape `nth_attribute_is_present`'s tests cover at the scanner layer.
 #[test]
 fn comment_before_dollar_still_decodes_as_null() {
     let input = "#1=IFCWALL(/* c1 */ $);";
@@ -240,4 +240,165 @@ fn comment_free_entity_decodes_unchanged() {
     assert_eq!(id, 123);
     assert_eq!(ifc_type, IfcType::IfcWall);
     assert_eq!(args.len(), 8);
+}
+
+/// A typed value's `(` may be separated from its type name by whitespace,
+/// including a CRLF line wrap - not just adjacent as in `IFCBOOLEAN(.T.)`.
+#[test]
+fn test_typed_value_tolerates_crlf_before_paren() {
+    let result = typed_value_at_depth(b"IFCPOSITIVELENGTHMEASURE\r\n(1.);", 0);
+    assert!(result.is_ok(), "Failed to parse: {:?}", result);
+    let (rest, token) = result.unwrap();
+    assert_eq!(rest, b";");
+    match token {
+        Token::TypedValue(type_name, args) => {
+            assert_eq!(type_name, b"IFCPOSITIVELENGTHMEASURE");
+            assert_eq!(args, vec![Token::Float(1.0)]);
+        }
+        _ => panic!("Expected TypedValue token"),
+    }
+}
+
+/// Synthetic reproduction of the Allplan/Allright IFC2X3 export pattern
+/// that motivated this fix: `IFCSURFACESTYLERENDERING` line-wraps with
+/// `\r\n` right between a typed value's type name and its `(`. Before the
+/// fix, `char('(')` saw `\r` and the whole entity failed to parse - which
+/// every full-file walk treats as a silent skip, not a decode error the
+/// caller sees.
+#[test]
+fn test_parse_entity_typed_value_wrapped_with_crlf() {
+    let input = "#42=IFCSURFACESTYLERENDERING($,IFCPOSITIVELENGTHMEASURE\r\n(1.),$,$,$,$,$,$,.NOTDEFINED.);";
+    let result = parse_entity(input);
+    assert!(result.is_ok(), "Failed to parse: {:?}", result);
+    let (id, ifc_type, args) = result.unwrap();
+    assert_eq!(id, 42);
+    assert_eq!(ifc_type, IfcType::IfcSurfaceStyleRendering);
+    assert_eq!(args.len(), 9);
+    match &args[1] {
+        Token::TypedValue(type_name, inner) => {
+            assert_eq!(*type_name, b"IFCPOSITIVELENGTHMEASURE");
+            assert_eq!(*inner, vec![Token::Float(1.0)]);
+        }
+        other => panic!("Expected TypedValue token, got {:?}", other),
+    }
+}
+
+/// An entity with an EMPTY argument list separated from `)` by whitespace
+/// (#3789: `separated_list0` consumes nothing on zero items, so a bare
+/// `char(')')` never advanced past the trailing `\r\n`).
+#[test]
+fn test_parse_entity_empty_args_with_whitespace() {
+    let input = "#1=IFCX(\r\n);";
+    let result = parse_entity(input);
+    assert!(result.is_ok(), "Failed to parse: {:?}", result);
+    let (id, _ifc_type, args) = result.unwrap();
+    assert_eq!(id, 1);
+    assert_eq!(args.len(), 0);
+}
+
+/// A nested EMPTY list argument separated from its own `)` by a single
+/// space (#3789), inside an otherwise-normal entity.
+#[test]
+fn test_parse_entity_nested_empty_list_with_whitespace() {
+    let input = "#1=IFCTABLE('a',( ));";
+    let result = parse_entity(input);
+    assert!(result.is_ok(), "Failed to parse: {:?}", result);
+    let (id, _ifc_type, args) = result.unwrap();
+    assert_eq!(id, 1);
+    assert_eq!(args.len(), 2);
+    match &args[1] {
+        Token::List(items) => assert_eq!(items.len(), 0),
+        other => panic!("Expected empty List token, got {:?}", other),
+    }
+}
+
+/// A typed value with an EMPTY argument list wrapped across whitespace
+/// before its `)` (#3789).
+#[test]
+fn test_parse_entity_nested_typed_value_empty_args_with_whitespace() {
+    let input = "#1=IFCX(IFCLABEL(\r\n));";
+    let result = parse_entity(input);
+    assert!(result.is_ok(), "Failed to parse: {:?}", result);
+    let (id, _ifc_type, args) = result.unwrap();
+    assert_eq!(id, 1);
+    assert_eq!(args.len(), 1);
+    match &args[0] {
+        Token::TypedValue(type_name, inner) => {
+            assert_eq!(*type_name, b"IFCLABEL");
+            assert_eq!(inner.len(), 0);
+        }
+        other => panic!("Expected TypedValue token, got {:?}", other),
+    }
+}
+
+/// A bare empty list containing only a STEP comment (#3789): `ws` (which
+/// already skips `/* ... */` per #3205) must be consulted on both sides of
+/// the empty `separated_list0`, not just before `(`.
+#[test]
+fn test_list_empty_with_comment_only() {
+    let result = list(b"(/* empty */)");
+    assert!(result.is_ok(), "Failed to parse: {:?}", result);
+    let (rest, token) = result.unwrap();
+    assert_eq!(rest, b"");
+    match token {
+        Token::List(items) => assert_eq!(items.len(), 0),
+        other => panic!("Expected empty List token, got {:?}", other),
+    }
+}
+
+/// Two-way rule: a widened parser must not become permissive about
+/// non-whitespace, non-comment junk between the parens. An unclosed
+/// paren-content mismatch (stray `x`) must still fail, not silently
+/// swallow the invalid byte as if it were trivia.
+#[test]
+fn test_list_rejects_junk_where_only_whitespace_is_allowed() {
+    // `x` is not `ws`/comment, and no token rule in this grammar accepts a
+    // bare identifier, so the widened `ws` around the empty
+    // `separated_list0` must not let it through: `(x)` is rejected outright.
+    assert!(
+        list(b"(x)").is_err(),
+        "`(x)` must be rejected: `x` is neither STEP trivia nor a token"
+    );
+}
+
+/// ISO 10303-21 writes `INTEGER` and `REAL` as `[ SIGN ] ...` with
+/// `SIGN = '+' | '-'`, so a leading `+` is exactly as legal as a leading `-`.
+/// Both parsers took `opt(char('-'))` only, and the cost was not the one
+/// attribute: every caller of `parse_entity` throws the record away when
+/// tokenizing fails (`let Ok(..) = .. else { continue }`), so one `+1.` inside
+/// a coordinate list deleted the whole `IfcCartesianPoint`.
+///
+/// The exponent sign already accepted both, `fast_float2::parse_partial` (the
+/// fast reader on the other decode path) accepts `+`, and the TypeScript half
+/// reads through `parseFloat`, so the file below decoded in the browser and
+/// not in wasm.
+/// Regression for #4577.
+#[test]
+fn plus_is_a_legal_sign_on_integer_and_real() {
+    let empty: &[u8] = b"";
+    assert_eq!(integer(b"+42"), Ok((empty, Token::Integer(42))));
+    assert_eq!(integer(b"+0"), Ok((empty, Token::Integer(0))));
+    assert_eq!(float(b"+3.14"), Ok((empty, Token::Float(3.14))));
+    // "0." with no fraction digits, and an exponent that also carries a sign.
+    assert_eq!(float(b"+1."), Ok((empty, Token::Float(1.0))));
+    assert_eq!(float(b"+1.5E+10"), Ok((empty, Token::Float(1.5e10))));
+    // The minus arm keeps working; a sign is optional, not required.
+    assert_eq!(integer(b"-42"), Ok((empty, Token::Integer(-42))));
+    assert_eq!(float(b"-3.14"), Ok((empty, Token::Float(-3.14))));
+
+    // The whole entity, which is what was actually lost.
+    let (id, ifc_type, args) = parse_entity("#1=IFCCARTESIANPOINT((+1.,2.,-3.));")
+        .expect("a '+'-signed REAL is legal 10303-21");
+    assert_eq!(id, 1);
+    assert_eq!(ifc_type, IfcType::IfcCartesianPoint);
+    assert_eq!(
+        args,
+        vec![Token::List(vec![
+            Token::Float(1.0),
+            Token::Float(2.0),
+            Token::Float(-3.0),
+        ])]
+    );
+    let (_, _, args) = parse_entity("#2=IFCINTEGER(+7);").expect("a '+'-signed INTEGER too");
+    assert_eq!(args, vec![Token::Integer(7)]);
 }

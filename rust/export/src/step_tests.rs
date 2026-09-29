@@ -8,7 +8,7 @@
 use super::*;
 // Exercised directly here; `step.rs` reaches it through `step_cow`.
 use crate::step_json::export_step_json;
-use crate::step_text::substitute_ref_in_attr;
+use crate::step_text::{refs_in_line, substitute_ref_in_attr};
 
 /// Count `#id=` entity lines in a STEP DATA section + grab the FILE_SCHEMA label.
 fn parse_back(step: &str) -> (usize, HashSet<u32>, String) {
@@ -25,7 +25,7 @@ fn parse_back(step: &str) -> (usize, HashSet<u32>, String) {
 #[test]
 fn full_roundtrip_preserves_all_entities() {
     let src = fixture_or_skip!("ara3d/duplex.ifc");
-    let (step, stats) = export_step_with_stats(&src, &StepOptions::default());
+    let (step, stats) = export_step_with_stats(&src, &StepOptions::default()).unwrap();
 
     // Source entity count == written count == re-parsed count.
     let (reparsed, _ids, schema) = parse_back(&step);
@@ -56,7 +56,7 @@ fn subset_export_is_reference_closed() {
             included: Some(vec![wall_id]),
             ..StepOptions::default()
         },
-    );
+    ).unwrap();
     let (_n, ids, _schema) = parse_back(&step);
 
     assert!(ids.contains(&wall_id), "the requested wall is present");
@@ -99,7 +99,7 @@ fn attribute_mutation_renames_entity() {
             }],
             ..StepOptions::default()
         },
-    );
+    ).unwrap();
     // The mutated wall line carries the new name; the model still re-parses fully.
     let line = step
         .lines()
@@ -148,7 +148,7 @@ ENDSEC;\nEND-ISO-10303-21;\n";
             }],
             ..StepOptions::default()
         },
-    );
+    ).unwrap();
 
     let line = step
         .lines()
@@ -189,22 +189,37 @@ fn property_synthesis_attaches_new_pset() {
             }],
             ..StepOptions::default()
         },
-    );
+    ).unwrap();
 
     // The three synthesized entities are present.
     assert!(
         step.contains("=IFCPROPERTYSINGLEVALUE('MyProp',$,IFCLABEL('hello'),$);"),
         "single value synthesized"
     );
-    assert!(step.contains("'Pset_Test'"), "pset name present");
-    // The synthesized rel ($-owner/name/desc) relates the wall to the new pset —
-    // distinct from duplex's original rels which carry a real OwnerHistory ref.
-    let synth_rel = format!(",$,$,$,(#{wall}),#");
-    assert!(
-        step.lines()
-            .any(|l| l.contains("=IFCRELDEFINESBYPROPERTIES(") && l.contains(&synth_rel)),
-        "synthesized rel targeting the wall not found"
-    );
+    // The synthesized rel relates the wall to the SYNTHESIZED pset, which is
+    // what tells it apart from duplex's original rels on the same wall. It
+    // used to be told apart by `$,$,$` in OwnerHistory/Name/Description, and
+    // that stopped working the moment the export started filling OwnerHistory
+    // on the records it synthesizes: duplex is IFC2X3, which requires one on
+    // every IfcRoot, so the `$` this asserted was the defect #4714 fixed.
+    let pset = step
+        .lines()
+        .find(|l| l.contains("=IFCPROPERTYSET(") && l.contains("'Pset_Test'"))
+        .expect("synthesized pset not found");
+    let pset_id = &pset[..pset.find('=').expect("an id")];
+    let synth_rel = step
+        .lines()
+        .find(|l| {
+            l.contains("=IFCRELDEFINESBYPROPERTIES(") && l.contains(&format!("(#{wall}),{pset_id});"))
+        })
+        .expect("synthesized rel targeting the wall not found");
+    // …and it names an owner history rather than `$`, the #4714 guarantee.
+    for record in [pset, synth_rel] {
+        let open = record.find('(').expect("an argument list");
+        let close = record.rfind(')').expect("an argument list");
+        let slots = crate::step_slot::split_top_level_args(&record[open + 1..close]).expect("slots");
+        assert_ne!(slots[1], "$", "IFC2X3 requires OwnerHistory: {record}");
+    }
 
     // Re-parses, and the synthesized entities are counted (written = original + 3).
     let (reparsed, _ids, _schema) = parse_back(&step);
@@ -225,7 +240,7 @@ fn schema_conversion_to_ifc4_keeps_model_parseable() {
             schema: Some("IFC4".to_string()),
             ..StepOptions::default()
         },
-    );
+    ).unwrap();
     assert!(step.contains("FILE_SCHEMA(('IFC4'))"));
     // Conversion preserves every express id (renames type, never drops entities).
     let (reparsed, _ids, schema) = parse_back(&step);
@@ -258,7 +273,7 @@ fn copy_on_write_moves_one_referrer_and_leaves_the_other() {
             }],
             ..StepOptions::default()
         },
-    );
+    ).unwrap();
 
     // The shared original is untouched, so #10 still reads 'shared'.
     assert!(out.contains("#41=IFCPROPERTYSINGLEVALUE('Reference',$,IFCLABEL('shared'),$);"));
@@ -299,7 +314,7 @@ fn copy_ids_and_synthesized_ids_do_not_collide() {
             }],
             ..StepOptions::default()
         },
-    );
+    ).unwrap();
     let mut ids: Vec<&str> = out
         .lines()
         .filter_map(|l| l.strip_prefix('#'))
@@ -343,7 +358,7 @@ fn two_copies_through_one_attribute_both_land() {
             ],
             ..StepOptions::default()
         },
-    );
+    ).unwrap();
     // Both moved, neither orphaned, and the sharer keeps the originals.
     assert!(
         out.contains("#9=IFCPROPERTYSET('g',$,'P',$,(#43,#44));"),
@@ -385,7 +400,7 @@ fn a_copy_whose_referrer_cannot_be_repointed_is_not_emitted() {
             }],
             ..StepOptions::default()
         },
-    );
+    ).unwrap();
     assert_eq!(stats.written, stats.total, "no copy should be emitted");
     assert!(!out.contains("IFCLABEL('e1')"), "{out}");
 }
@@ -411,7 +426,7 @@ fn repointing_leaves_non_ascii_text_in_other_attributes_intact() {
             }],
             ..StepOptions::default()
         },
-    );
+    ).unwrap();
     assert!(out.contains("'Größe'"), "{out}");
 }
 
@@ -448,7 +463,7 @@ fn an_exhausted_id_space_emits_no_copy() {
             }],
             ..StepOptions::default()
         },
-    );
+    ).unwrap();
     assert_eq!(stats.written, stats.total, "no record should be added");
     // And nothing acquired a second definition.
     let mut ids: Vec<&str> = out
@@ -462,7 +477,7 @@ fn an_exhausted_id_space_emits_no_copy() {
     assert_eq!(ids.len(), before, "an id was handed out twice");
 }
 
-/// An attribute index past the end of the record. `apply_attr_mutations`
+/// An attribute index past the end of the record. `apply_attr_mutations_counted`
 /// ignores it, so the copy would be a byte-identical twin and the referrer
 /// would be repointed at a record that changed nothing.
 #[test]
@@ -487,7 +502,7 @@ fn a_copy_with_an_out_of_range_attribute_is_not_made() {
             }],
             ..StepOptions::default()
         },
-    );
+    ).unwrap();
     assert_eq!(stats.written, stats.total, "no copy should be emitted");
     assert!(
         out.contains("#9=IFCPROPERTYSET('g',$,'P',$,(#41));"),
@@ -526,7 +541,7 @@ fn a_property_group_that_does_not_fit_the_id_space_is_skipped_whole() {
             ],
             ..StepOptions::default()
         },
-    );
+    ).unwrap();
     // Two properties plus a set plus a relationship is four ids, and only two
     // remain, so the group is not written at all.
     assert_eq!(stats.written, stats.total, "nothing should be synthesized");
@@ -571,7 +586,7 @@ fn copy_on_write_keeps_a_caller_edit_on_the_same_attribute() {
             }],
             ..StepOptions::default()
         },
-    );
+    ).unwrap();
 
     // Both survive: the caller's #42 and the repointing of #41 onto the copy.
     // Computing the substitution from the untouched record loses #42, because
@@ -611,7 +626,7 @@ fn a_copy_carries_a_caller_edit_to_the_record_it_copied() {
             }],
             ..StepOptions::default()
         },
-    );
+    ).unwrap();
 
     // The copy is built from the record as the caller left it, so it carries
     // the rename as well as the new value.
@@ -655,7 +670,7 @@ fn a_record_that_is_itself_copied_is_not_also_repointed() {
             ],
             ..StepOptions::default()
         },
-    );
+    ).unwrap();
 
     // Applying both inverts the edit. #9 is what A keeps reading only until the
     // second mutation moves A onto a copy of it, so the repointing of #9 lands
@@ -711,7 +726,7 @@ fn two_edits_to_one_shared_record_land_in_one_copy() {
             ],
             ..StepOptions::default()
         },
-    );
+    ).unwrap();
 
     // Both land in the one copy. The second used to find its reference already
     // repointed, conclude the referrer did not hold it, and vanish with no
@@ -735,8 +750,9 @@ fn a_caller_edit_at_a_missing_index_does_not_buy_a_copy() {
     let (out, stats) = export_step_with_stats(
         src.as_bytes(),
         &StepOptions {
-            // Index 9 is past the end of #9, and apply_attr_mutations ignores
-            // it, so the repointing computed from it never reaches the file.
+            // Index 9 is past the end of #9. apply_attr_mutations_counted drops
+            // it (and counts the record into `attribute_edits_refused`), so the
+            // repointing computed from it never reaches the file.
             attribute_mutations: vec![AttrMutation {
                 express_id: 9,
                 index: 9,
@@ -751,7 +767,7 @@ fn a_caller_edit_at_a_missing_index_does_not_buy_a_copy() {
             }],
             ..StepOptions::default()
         },
-    );
+    ).unwrap();
 
     // The referrer index is checked against the record, not against whatever
     // the caller happens to have staged for it. Without that the copy was
@@ -760,6 +776,9 @@ fn a_caller_edit_at_a_missing_index_does_not_buy_a_copy() {
     assert!(!out.contains("#42="));
     assert_eq!(stats.written, stats.total);
     assert!(out.contains("#9=IFCPROPERTYSET(\'s1\',$,\'P\',$,(#41));"));
+    // The caller's out-of-range attribute edit on #9 is reported, not dropped
+    // in silence: that is the one place this export says the edit is missing.
+    assert_eq!(stats.attribute_edits_refused, 1);
 }
 
 #[test]
@@ -797,7 +816,7 @@ fn a_copy_that_cannot_be_made_does_not_refuse_a_repointing() {
             ],
             ..StepOptions::default()
         },
-    );
+    ).unwrap();
 
     // The chain rule refuses a repointing of a record that is being copied.
     // Built from what was asked for rather than what can be made, it refused
@@ -917,7 +936,7 @@ END-ISO-10303-21;
         }],
         ..Default::default()
     };
-    let (returned, rstats) = export_step_with_stats(content, &opts);
+    let (returned, rstats) = export_step_with_stats(content, &opts).unwrap();
     let mut streamed = Vec::new();
     let sstats = export_step_to_writer(content, &opts, &mut streamed).expect("write");
     assert_eq!(returned.as_bytes(), streamed.as_slice(), "the two forms differ");
@@ -946,4 +965,52 @@ fn a_broken_writer_is_an_error() {
     );
     let Err(err) = r else { panic!("a full disk is not a successful export") };
     assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
+}
+
+/// #4659: `Some(empty)` is "the isolation filter is active and matched
+/// nothing", and must write a header-only file rather than the whole model.
+///
+/// `export_step_json` has always taken `Option<Vec<u32>>` and got this right;
+/// the collapse lived one layer up, in the `exportStep` wasm binding, which
+/// took a bare slice and mapped an empty one back to `None`. That binding now
+/// passes the `Option` straight through, so this pins the contract it relies
+/// on — and the `None` sibling pins the other direction, so the two cannot be
+/// re-collapsed into each other here either.
+#[test]
+fn an_active_but_empty_included_set_writes_no_entities() {
+    let src = "ISO-10303-21;\n\
+HEADER;\n\
+FILE_DESCRIPTION((''),'');\n\
+FILE_NAME('','',(''),(''),'','','');\n\
+FILE_SCHEMA(('IFC4'));\n\
+ENDSEC;\n\
+DATA;\n\
+#1=IFCWALL('0WALL000000000000000A',$,'W1',$,$,$,$,$,$);\n\
+#2=IFCWALL('0WALL000000000000000B',$,'W2',$,$,$,$,$,$);\n\
+#3=IFCSLAB('0SLAB000000000000000A',$,'S1',$,$,$,$,$,$);\n\
+ENDSEC;\n\
+END-ISO-10303-21;\n";
+
+    // No filter: the whole model. Asserted first so "writes nothing" below
+    // cannot pass because the fixture or the writer produces nothing at all.
+    let whole = export_step_json(src.as_bytes(), None, None, "").expect("unfiltered export");
+    let (whole_count, _ids, _schema) = parse_back(&whole);
+    assert_eq!(whole_count, 3, "unfiltered export carries every entity");
+
+    // A filter that matches something still narrows.
+    let narrowed = export_step_json(src.as_bytes(), None, Some(vec![1, 2]), "")
+        .expect("filtered export");
+    let (narrowed_count, ids, _schema) = parse_back(&narrowed);
+    assert_eq!(narrowed_count, 2, "an explicit two-entity filter writes exactly those");
+    assert!(ids.contains(&1) && ids.contains(&2));
+
+    // A filter that matches nothing writes nothing.
+    let zero_match = export_step_json(src.as_bytes(), None, Some(Vec::new()), "")
+        .expect("zero-match export");
+    let (zero_count, _ids, _schema) = parse_back(&zero_match);
+    assert_eq!(zero_count, 0, "an active-but-empty filter must not export the whole model");
+    // Still a well-formed STEP file, just an empty one — the shape the CLI's
+    // entity-count guard then refuses to write.
+    assert!(zero_match.contains("FILE_SCHEMA"));
+    assert!(zero_match.contains("END-ISO-10303-21;"));
 }

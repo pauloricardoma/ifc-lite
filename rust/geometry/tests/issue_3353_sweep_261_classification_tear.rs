@@ -50,16 +50,62 @@
 //! coincident-face classification regime this case exercises never fires
 //! there.
 //!
+//! ## Not fixed by the #3353 near-coplanar weld, and what is left
+//!
+//! `issue_3353_near_coplanar_rotated_overlap.rs` fixed the half of #3353 where
+//! two operand faces land a few `SNAP_GRID` steps apart because `mesh_bridge`
+//! snaps per axis: `union_with_conformity` now welds the operands onto shared
+//! planes before the arrangement, which closed a 9464-union sweep of the
+//! rotated corner-overlap family.
+//!
+//! `sweep_261` is only PARTLY that. With the weld in place its Union still
+//! reports 3 unmatched directed edges, unchanged. Disabling the weld entirely
+//! leaves the committed 8000-pair union sweep at exactly 98 torn — measured on
+//! the issue, not here — so the residual is outside the weld's reach.
+//!
+//! ## The mechanism, and where it is written up
+//!
+//! The residual is `rust/geometry/src/kernel/arrangement/classify.rs`'s regime 1
+//! — the coincident-shared-face test — firing on a face pair that is not
+//! coincident. It establishes coincidence from a sub-triangle's CENTROID alone,
+//! and a sub-triangle need not have its parent's plane: retriangulation can leave
+//! one degenerate onto the LINE where the two parent planes meet, at which point
+//! every one of its points lies in the other operand's plane however transversal
+//! the faces are. Here that is `arr.tris_a[22] = [17, 13, 14]`, kept by regime 1
+//! while its own neighbour in the same A face plane, `arr.tris_a[17]`, is
+//! correctly dropped as inside B. That leaves three Vid-space edges at the wrong
+//! multiplicity, and dropping `tris_a[22]` alone repairs all three: `(13,17)`
+//! goes to 0 (it was used once, by that triangle only) and the other two to 2.
+//! Measured in Vid space, one layer above the float `open_edges` below.
+//!
+//! `kernel/arrangement/issue_3353_vid_census_tests.rs` is where this is written
+//! up: the per-triangle regime table for every triangle on an over-used edge,
+//! the measurements behind the paragraph above, and the seven fix shapes tried
+//! against it — including why the two that fix this test each cost 20 golden
+//! census hosts. Read it before attempting an eighth.
+//!
+//! One correction to record here, because it is this file's own earlier reading:
+//! the "84 um IN-PLANE vertex split" to be healed by a coplanar-overlay /
+//! retriangulation chord divergence is the same two vertices seen from the other
+//! end, but it points at the wrong repair. The vertices are exact and
+//! independently derived (measured on the issue), and nothing merges them. What
+//! goes wrong is the verdict taken on the sliver they span.
+//!
 //! ## Status
 //!
-//! `#[ignore]`d: this documents a KNOWN, OPEN defect, not a passing
-//! invariant. Do not un-ignore it without first fixing the classification
-//! disagreement referenced above and re-validating with the full
-//! `triangulation_invariance` census (see AGENTS.md). Verified to fail
-//! for the stated reason (3 unmatched directed edges) when run with
-//! `--ignored`.
+//! Fixed by #4439 (`kernel::arrangement::coincident::coincident_planes`):
+//! regime 1 of the classifier now requires the sub-triangle's OWN plane to be
+//! within 45° of the face its centroid was found near, so the 84 µm needle on
+//! the A/B plane-intersection line — 58° off the B face it was being taken
+//! for a coincident copy of — falls through to the ray cast, which already
+//! classified it as inside B. Un-ignored with that change; this test is the
+//! end-to-end reading of the case and
+//! `kernel/arrangement/issue_3353_vid_census_tests.rs` the Vid-space one.
+//! It failed for the stated reason (3 unmatched directed edges) when run with
+//! `--ignored` immediately before this change. The consolidation-level half of #3353
+//! (`issue_3353_boolean_tear.rs`) is unaffected and still `#[ignore]`d.
 //!
-//! Refs #3353
+//! Refs #3353, #4439
 
 use ifc_lite_geometry::{ClippingProcessor, Mesh};
 use nalgebra::{Point3, Rotation3, Unit, Vector3};
@@ -134,10 +180,9 @@ fn open_edges(m: &Mesh) -> Result<usize, String> {
     Ok(edges.values().filter(|&&(f, r)| f != 1 || r != 1).count())
 }
 
-/// `sweep_261`, recovered verbatim from PR #3373's closed branch.
+/// `sweep_261`, recovered verbatim from PR #3373's closed branch. Closed by
+/// the #4439 `coincident_planes` gate (see the module doc's Status).
 #[test]
-#[ignore = "known-open #3353 defect: classification-level tear, consolidate_coplanar \
-            is a byte-identical no-op on this input (see module doc)"]
 fn sweep_261_overlapping_rotated_union_never_tears() {
     let a_min = [-1.72371594746207, -0.35246108913603935, -1.2204342720208154];
     let a_size = [2.8534163464770894, 3.0795194627753784, 2.858202766048261];

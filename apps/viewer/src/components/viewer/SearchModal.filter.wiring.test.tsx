@@ -30,12 +30,12 @@ import { after, afterEach, before, describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { StringTable, EntityTableBuilder } from '@ifc-lite/data';
 import type { IfcDataStore } from '@ifc-lite/parser';
-import { render, cleanup, click, advance } from '@/test/render.js';
+import { render, cleanup, click, activate, advance } from '@/test/render.js';
 import { useViewerStore } from '@/store';
 import { fixtureModel, fixtureModels } from '@/test/store-fixture.js';
 import { toGlobalIdFromModels } from '@/store/globalId';
 import { toast } from '@/components/ui/toast';
-import { Rule } from '@/lib/search/filter-rules';
+import { Rule } from '@ifc-lite/rules';
 import { SearchModalFilter } from './SearchModal.filter.js';
 
 const MODEL_ID = 'model-a';
@@ -77,7 +77,7 @@ function seedStore() {
   );
   useViewerStore.setState({
     ...seeded,
-    searchFilter: { rules: [{ field: 'Name', op: 'contains', value: 'Wall' }], combinator: 'AND', limit: 500 } as never,
+    searchFilter: { groups: [{ rules: [{ field: 'Name', op: 'contains', value: 'Wall' }], combinator: 'AND' }], limit: 500 } as never,
     searchFilterResult: RESULT as never,
     searchFilterRunning: false,
     searchFilterError: null,
@@ -98,7 +98,7 @@ function seedStore() {
  * test-only markup in the component.
  */
 function cell(container: HTMLElement, text: string): HTMLElement {
-  const found = [...container.querySelectorAll<HTMLElement>('div')].filter(
+  const found = [...container.querySelectorAll<HTMLElement>('span')].filter(
     (el) => el.children.length === 0 && el.textContent?.trim() === text,
   );
   assert.equal(found.length, 1, `expected exactly one cell reading ${JSON.stringify(text)}, found ${found.length}`);
@@ -107,7 +107,7 @@ function cell(container: HTMLElement, text: string): HTMLElement {
 
 /** Every rendered virtual row. The virtualizer positions each one absolutely. */
 function resultRows(container: HTMLElement): HTMLElement[] {
-  return [...container.querySelectorAll<HTMLElement>('div[style*="position: absolute"]')];
+  return [...container.querySelectorAll<HTMLElement>('button[style*="position: absolute"]')];
 }
 
 describe('advanced Filter tab — clicking a result row', () => {
@@ -148,6 +148,18 @@ describe('advanced Filter tab — clicking a result row', () => {
     assert.equal(s.selectedEntityId, ROW0_GLOBAL_ID);
     assert.equal(s.selectedEntityIds.size, 0, 'the stale box-selection must be cleared');
     assert.deepEqual(s.selectedEntity, { modelId: MODEL_ID, expressId: 42 });
+  });
+
+  it('#5823 selects a result row with Enter and Space', () => {
+    for (const key of ['Enter', ' '] as const) {
+      seedStore();
+      const container = render(<SearchModalFilter />);
+      const row = cell(container, 'Wall A').closest('button');
+      assert.ok(row);
+      activate(row, key);
+      assert.equal(useViewerStore.getState().selectedEntityId, ROW0_GLOBAL_ID);
+      cleanup();
+    }
   });
 
   it('clears BEFORE selecting, so the selection survives', () => {
@@ -240,7 +252,7 @@ function seedIsolateStore(options: {
   framedIds = [];
   useViewerStore.setState({
     ...seeded,
-    searchFilter: { rules: [{ field: 'Name', op: 'contains', value: 'Wall' }], combinator: 'AND', limit: 500 } as never,
+    searchFilter: { groups: [{ rules: [{ field: 'Name', op: 'contains', value: 'Wall' }], combinator: 'AND' }], limit: 500 } as never,
     searchFilterResult: { columns: options.columns, rows: options.rows, truncated: false } as never,
     searchFilterRunning: false,
     searchFilterError: null,
@@ -614,7 +626,7 @@ describe('advanced Filter tab — "Isolate in 3D" button', () => {
         id: MODEL_ID, name: MODEL_ID, visible: true, idOffset: ID_OFFSET, ifcDataStore: store,
       } as never]]),
       activeModelId: MODEL_ID,
-      searchFilter: { rules: [Rule.name('contains', 'Wall')], combinator: 'AND', limit: 500 } as never,
+      searchFilter: { groups: [{ rules: [Rule.name('contains', 'Wall')], combinator: 'AND' }], limit: 500 } as never,
       searchFilterResult: null,
       searchFilterRunning: false,
       searchFilterError: null,
@@ -654,5 +666,88 @@ describe('advanced Filter tab — "Isolate in 3D" button', () => {
       isolateSpy.mock.restore();
       selectSpy.mock.restore();
     }
+  });
+
+  // #4262 / #4292: `compileNameMatcher` now throws on a catastrophic-
+  // backtracking `/regex/` literal (via `@ifc-lite/regex-guard`) instead of
+  // hanging the tab. `regexOpMatches` (filter-ops.ts) and the evaluator
+  // (filter-evaluate.ts) do not catch that throw — it is a deliberate design
+  // choice (see `regexOpMatches`'s docstring): the recoverable/visible
+  // handling lives HERE, in `runFilter`'s existing try/catch, which is why
+  // this test drives the real button click rather than asserting on
+  // `evaluateFilterRulesFederated` in isolation (filter-evaluate.test.ts
+  // already does that). It proves the reported worst case — "an uncaught
+  // exception that kills the whole filter evaluation" — does NOT reach the
+  // user: the run ends in a visible "Filter failed" box, `searchFilterError`
+  // is set, `searchFilterRunning` returns to false, and the modal stays open
+  // and usable for the user to fix the pattern and re-run.
+  it('a catastrophic pattern surfaces as a visible, recoverable error — not a crash or a silent empty result', async () => {
+    const strings = new StringTable();
+    const builder = new EntityTableBuilder(1, strings);
+    builder.add(42, 'IFCWALL', '1abcdefghijklmnopqrstu', 'Wall A', '', '', false, false);
+    const store = {
+      fileSize: 0,
+      schemaVersion: 'IFC4',
+      entityCount: 1,
+      parseTime: 0,
+      source: new Uint8Array(0),
+      entityIndex: { byId: { ranges: new Uint32Array(0), index: new Map() }, byType: new Map([['IFCWALL', [42]]]) },
+      strings,
+      entities: builder.build(),
+      properties: { count: 0 },
+      quantities: { count: 0 },
+      relationships: { count: 0 },
+    } as unknown as IfcDataStore;
+
+    useViewerStore.setState({
+      models: new Map([[MODEL_ID, {
+        id: MODEL_ID, name: MODEL_ID, visible: true, idOffset: ID_OFFSET, ifcDataStore: store,
+      } as never]]),
+      activeModelId: MODEL_ID,
+      // A user-typed chip pattern with the well-known nested-quantifier
+      // catastrophic-backtracking shape — the same class `regex-guard`
+      // rejects for IDS (#4259) and the Lists panel (#4262).
+      searchFilter: { groups: [{ rules: [Rule.name('matches', '(a+)+$')], combinator: 'AND' }], limit: 500 } as never,
+      searchFilterResult: null,
+      searchFilterRunning: false,
+      searchFilterError: null,
+      searchModalOpen: true,
+      selectedEntityIds: new Set<number>(),
+      selectedEntityId: null,
+      selectedEntity: null,
+      isolatedEntities: null,
+      searchVimCycle: null,
+      cameraCallbacks: {
+        frameSelection: () => {},
+        frameEntities: () => {},
+      } as never,
+    });
+
+    const container = render(<SearchModalFilter />);
+
+    const runButton = [...container.querySelectorAll('button')].find(
+      (b) => b.textContent?.trim() === 'Run',
+    );
+    assert.ok(runButton, 'expected a "Run" button');
+    click(runButton);
+
+    // runFilter is async (awaits evaluateFilterRulesFederated, which throws
+    // once the guard rejects the pattern); drain microtasks until it settles.
+    await advance(60);
+
+    const state = useViewerStore.getState();
+    assert.equal(state.searchFilterRunning, false, 'a thrown run must still clear the running flag (finally)');
+    assert.equal(state.searchFilterResult, null, 'a rejected run must not publish a (false-clean) empty result');
+    assert.ok(state.searchFilterError, 'the rejection must be recorded, not swallowed');
+    assert.match(state.searchFilterError!, /rejected name pattern/, 'the reason must name the pattern, not a generic failure');
+    assert.equal(state.searchModalOpen, true, 'the modal must stay open — the user needs to see and fix the pattern');
+
+    // The error must actually be VISIBLE, not just present in the store —
+    // several #4262-era defects were "caught but never rendered".
+    assert.match(
+      container.textContent ?? '',
+      /Filter failed/,
+      'the rejection must render, not just live in unread state',
+    );
   });
 });

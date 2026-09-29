@@ -35,14 +35,14 @@ static CORPUS: OnceLock<Vec<CapturedCsgJob>> = OnceLock::new();
 fn replay_one(job: &CapturedCsgJob) -> usize {
     let csg = ClippingProcessor::new();
     match job {
-        CapturedCsgJob::Single { host, cutter } => {
-            csg.subtract_mesh(host, cutter).map(|m| m.indices.len()).unwrap_or(0)
-        }
+        CapturedCsgJob::Single { host, cutter } => csg.subtract_mesh(host, cutter),
         CapturedCsgJob::Many { host, cutters } => {
             let refs: Vec<&Mesh> = cutters.iter().collect();
-            csg.subtract_mesh_many(host, &refs).map(|m| m.indices.len()).unwrap_or(0)
+            csg.subtract_mesh_many(host, &refs)
         }
     }
+    .into_mesh()
+    .map_or(0, |m| m.indices.len())
 }
 
 /// Load the captured corpus blob. Returns the job count.

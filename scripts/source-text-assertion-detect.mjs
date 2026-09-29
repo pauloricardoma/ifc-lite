@@ -113,7 +113,7 @@
  * STILL OPEN, deliberately: `for (const line of lines)` where the split was
  * bound to a name first. Widening the for-of rule to "any iterable carrying
  * file bytes" also taints `for (const file of files)` where the elements are
- * PATHS — measured as 4 new hits in `toolbar-parity.test.ts`. That is a
+ * PATHS — previously measured as 4 hits in the retired toolbar parity test. That is a
  * question about what an array HOLDS, which a parser cannot answer either, so
  * parsing does not close it and the rule still takes only the `.split(` it can
  * prove.
@@ -144,6 +144,7 @@
  */
 
 import ts from 'typescript';
+import { isModuleSpecifierLiteral } from './source-text-assertion-module-specifier.mjs';
 
 /**
  * The taint source: a disk read, however the call is qualified. This used to be
@@ -156,14 +157,13 @@ const READ_NAMES = new Set(['readFileSync', 'readFile']);
 /**
  * Names a SOURCE file as a literal. Fixture formats (.ifc, .json, .csv, …) are
  * deliberately absent: reading a fixture and asserting on it is a normal test.
+ * `mjs` joined for #3754 -- `scripts/` is 271 `.mjs` against 5 `.ts`, so this
+ * half never matched what it read. `cjs`/`js` joined for the same follow-up.
  *
- * Applied to string and template-literal CONTENT from the tree, so a `.ts`
- * filename that appears only in prose cannot satisfy it. That used to need a
- * comment-stripping pass, and it was load-bearing rather than tidy: three
- * unrelated tests mention a `.ts` filename in a comment while reading a wasm
- * binary or a JSON manifest, and matching those flagged all three.
+ * Applied to string/template-literal CONTENT, not PROSE -- load-bearing:
+ * three tests once got flagged by a `.ts` filename in a comment.
  */
-const SOURCE_LITERAL = /^[^'"`\n]*\.(ts|tsx|mts|rs|css|scss)$/;
+const SOURCE_LITERAL = /^[^'"`\n]*\.(ts|tsx|mts|mjs|cjs|js|rs|css|scss)$/;
 
 /**
  * Text predicates. `test` and `exec` are here because this repo already writes
@@ -519,8 +519,8 @@ function computeTainted(sourceFile) {
     //
     // Deliberately narrow to a SPLIT of tainted text. Tainting on
     // `carriesFileBytes` alone also catches `for (const file of files)` where
-    // the elements are PATHS, not contents — measured as 4 false hits in
-    // toolbar-parity.test.ts, because a list of paths is tainted too. Nothing
+    // the elements are PATHS, not contents — previously measured as 4 false hits in the retired toolbar parity test,
+    // because a list of paths is tainted too. Nothing
     // in the SYNTAX separates a tainted array of lines from a tainted array of
     // filenames, which is why parsing does not close this and the rule still
     // takes only the `.split(` it can prove. `for (const line of lines)` with
@@ -592,7 +592,7 @@ function namesASourceFile(sourceFile) {
   walk(sourceFile, (n) => {
     if (found) return;
     if (ts.isStringLiteralLike(n)) {
-      if (SOURCE_LITERAL.test(n.text)) found = true;
+      if (!isModuleSpecifierLiteral(n) && SOURCE_LITERAL.test(n.text)) found = true;
       return;
     }
     // A template with substitutions has no single `.text`; each literal span is

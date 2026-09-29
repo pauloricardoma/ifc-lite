@@ -3,8 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * List execution engine - resolves source sets and extracts column values
- *
+ * List execution engine - resolves source sets and extracts column values.
  * PERF: Uses ListDataProvider.getEntitiesByType() for O(typeRange) entity lookups,
  * and property/quantity accessors for O(1) lookups per entity.
  */
@@ -13,6 +12,7 @@ import type { PropertySet, Property, QuantitySet, Quantity } from '@ifc-lite/dat
 import { isWhollyNumeric, parsePropertyValue } from '@ifc-lite/encoding';
 import { compileNameMatcher } from './name-pattern.js';
 import { getWorldCoordinateValue, extractGeometryColumnValue } from './geometry-column.js';
+import { withAggregateInheritance } from './condition-inherit.js';
 import type {
   ListDataProvider,
   ListDefinition,
@@ -36,9 +36,10 @@ export function executeList(
   provider: ListDataProvider,
   modelId = 'default',
 ): ListResult {
+  if (definition.groups.some((group) => group.rules.length > 0))
+    throw new Error('executeList requires Rules groups to be evaluated before provider-only execution');
   const startTime = performance.now();
 
-  // Step 1: Resolve source set (which entities match)
   const matchedIds = resolveSourceSet(definition, provider, modelId);
 
   // Step 2: Extract column values for matched entities. `columnMeta` collects,
@@ -95,7 +96,6 @@ interface ColumnMeta {
 // ============================================================================
 // Grouping & Aggregation
 // ============================================================================
-
 
 /**
  * Effective ordered group-by column ids for a grouping config — `columnIds`
@@ -242,7 +242,7 @@ function resolveSourceSet(
   provider: ListDataProvider,
   modelId: string,
 ): number[] {
-  const { entityTypes, conditions, expressIdsByModel } = definition;
+  const { entityTypes, legacyConditions = [], expressIdsByModel } = definition;
 
   let entityIds: number[];
   if (expressIdsByModel) {
@@ -268,11 +268,11 @@ function resolveSourceSet(
   }
 
   // Apply conditions as filters
-  if (conditions.length === 0) {
+  if (legacyConditions.length === 0) {
     return entityIds;
   }
 
-  return entityIds.filter(id => matchesAllConditions(id, conditions, provider));
+  return entityIds.filter(id => matchesAllConditions(id, legacyConditions, provider));
 }
 
 function matchesAllConditions(
@@ -288,7 +288,7 @@ function matchesAllConditions(
   return true;
 }
 
-function matchesCondition(
+export function matchesCondition(
   entityId: number,
   condition: PropertyCondition,
   provider: ListDataProvider,
@@ -369,10 +369,10 @@ function getConditionValue(
   switch (condition.source) {
     case 'attribute':
       return getAttributeValue(entityId, condition.propertyName, provider);
-    case 'property':
-      return getPropertyValue(entityId, condition.psetName ?? '', condition.propertyName, provider);
-    case 'quantity':
-      return getQuantityValue(entityId, condition.psetName ?? '', condition.propertyName, provider);
+    case 'property': case 'quantity':
+      return withAggregateInheritance(entityId, condition, provider, (id) => condition.source === 'property'
+        ? getPropertyValue(id, condition.psetName ?? '', condition.propertyName, provider)
+        : getQuantityValue(id, condition.psetName ?? '', condition.propertyName, provider));
     case 'spatial': return getSpatialValue(entityId, condition.propertyName, provider);
     case 'model': return provider.getModelName?.() || null;
     case 'zone':

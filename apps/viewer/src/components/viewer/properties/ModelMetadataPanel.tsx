@@ -26,25 +26,42 @@ import { PropertySetCard } from './PropertySetCard';
 import { GeoreferencingPanel } from './GeoreferencingPanel';
 import type { PropertySet } from './encodingUtils';
 import type { FederatedModel } from '@/store/types';
-import { extractGeoreferencingOnDemand, extractLengthUnitScale, extractProjectUnits, extractClassificationSystemsOnDemand, ProjectUnits, type IfcDataStore } from '@ifc-lite/parser';
+import { extractGeoreferencingOnDemand, extractLengthUnitScale, extractProjectUnits, ProjectUnits, type IfcDataStore } from '@ifc-lite/parser';
 import { useViewerStore } from '@/store';
+import { computeModelStats } from './modelMetadataStats';
+import { collectEffectivePhysicalEntityIds } from '@/lib/physical-objects';
+import { useTranslation } from '@/i18n';
+import { formatLocaleDate, formatLocaleNumber } from '@/i18n/intlFormat';
+import { EXPRESS_DESCRIPTION_ATTRIBUTE, EXPRESS_GLOBAL_ID_ATTRIBUTE, EXPRESS_NAME_ATTRIBUTE } from './express-labels';
+import { LandXmlModelSourceNavigation } from './LandXmlModelSourceNavigation';
+import { TerrainImageryCard } from './TerrainImageryCard';
+import { effectiveClassificationSystems } from './effective-classification-systems';
+import { normalizeMutationModelId } from '@/sdk/adapters/mutation-view';
+import { useStreamingThrottled } from '@/hooks/useStreamingThrottled';
+import { isModelStreaming } from '@/lib/streaming-refresh';
 
 /** Model metadata panel - displays file info, schema version, entity counts, etc. */
 export function ModelMetadataPanel({ model }: { model: FederatedModel }) {
+  const { t, locale, revision } = useTranslation();
   const dataStore = model.ifcDataStore;
+  const selectedLandXmlSource = useViewerStore((state) => state.selectedLandXmlSource);
+  const setSelectedLandXmlSource = useViewerStore((state) => state.setSelectedLandXmlSource);
   // Display-unit converter overrides (issue #1573 proposal 2).
   const unitDisplayOverrides = useViewerStore((s) => s.unitDisplayOverrides);
+  const fromGlobalId = useViewerStore((s) => s.fromGlobalId);
+  const mutationView = useViewerStore((s) => s.getMutationView?.(normalizeMutationModelId(s, model.id)));
+  const mutationVersion = useViewerStore((s) => s.mutationVersion);
 
   // Format file size
   const formatFileSize = (bytes: number): string => {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+    if (bytes < 1024) return `${formatLocaleNumber(locale, bytes)} B`;
+    if (bytes < 1024 * 1024) return `${formatLocaleNumber(locale, bytes / 1024, { minimumFractionDigits: 1, maximumFractionDigits: 1 })} KB`;
+    return `${formatLocaleNumber(locale, bytes / (1024 * 1024), { minimumFractionDigits: 2, maximumFractionDigits: 2 })} MB`;
   };
 
   // Format date
   const formatDate = (timestamp: number): string => {
-    return new Date(timestamp).toLocaleString();
+    return formatLocaleDate(locale, new Date(timestamp), { dateStyle: 'short', timeStyle: 'medium' });
   };
 
   // Get IfcProject data if available
@@ -72,18 +89,43 @@ export function ModelMetadataPanel({ model }: { model: FederatedModel }) {
     return { name, globalId, description, properties };
   }, [dataStore]);
 
-  // Count storeys and elements
-  const stats = useMemo(() => {
-    if (!dataStore?.spatialHierarchy) {
-      return { storeys: 0, elementsWithGeometry: 0 };
-    }
-    const storeys = dataStore.spatialHierarchy.byStorey.size;
-    let elementsWithGeometry = 0;
-    for (const elements of dataStore.spatialHierarchy.byStorey.values()) {
-      elementsWithGeometry += (elements as number[]).length;
-    }
-    return { storeys, elementsWithGeometry };
-  }, [dataStore]);
+  // Membership changes with source/overlay edits, not with each streamed
+  // geometry batch. Keep it stable while the shaped count catches up.
+  const physicalIds = useMemo(
+    () => dataStore?.spatialHierarchy ? collectEffectivePhysicalEntityIds(dataStore, mutationView) : new Set<number>(),
+    [dataStore, mutationView, mutationVersion],
+  );
+
+  // Count storeys and elements — see `modelMetadataStats.ts` for what
+  // "Elements with Geometry" means and why raw `byStorey` membership isn't it.
+  // The count walks every mesh, so while this model's geometry streams it
+  // follows the held geometry rather than every publish (#6411). Only this
+  // model's own streaming geometry is held: another model, or this one
+  // finishing, passes at once.
+  const statsGeometry = useStreamingThrottled(
+    { modelId: model.id, geometry: model.geometryResult, streaming: isModelStreaming(model) },
+    (held, next) => held.modelId === next.modelId && held.streaming && next.streaming,
+  ).geometry;
+  const stats = useMemo(
+    () => computeModelStats(dataStore, statsGeometry, {
+      mutationView,
+      physicalIds,
+      // A completed cache hit may validly contain no geometry result. That is
+      // a known-empty model, unlike the same null while streaming.
+      geometryReady:
+        statsGeometry != null ||
+        model.loadState === 'complete' ||
+        model.geometryLoadState === 'complete',
+      toLocalId: (globalId) => {
+        if (model.id === 'legacy' || model.id === 'default' || model.id === '__legacy__') {
+          return globalId;
+        }
+        const ref = fromGlobalId(globalId);
+        return ref?.modelId === model.id ? ref.expressId : undefined;
+      },
+    }),
+    [dataStore, fromGlobalId, model.geometryLoadState, statsGeometry, model.id, model.loadState, mutationView, physicalIds],
+  );
 
   // Extract georeferencing info
   const georef = useMemo(() => {
@@ -96,13 +138,13 @@ export function ModelMetadataPanel({ model }: { model: FederatedModel }) {
   const unitInfo = useMemo(() => {
     if (!dataStore?.source?.length || !dataStore?.entityIndex) return null;
     const scale = extractLengthUnitScale(dataStore.source, dataStore.entityIndex);
-    let unitName = 'Meters';
-    if (Math.abs(scale - 0.001) < 0.0001) unitName = 'Millimeters';
-    else if (Math.abs(scale - 0.01) < 0.001) unitName = 'Centimeters';
-    else if (Math.abs(scale - 0.0254) < 0.001) unitName = 'Inches';
-    else if (Math.abs(scale - 0.3048) < 0.01) unitName = 'Feet';
+    let unitName = t('properties.modelMetadata.unit.meters');
+    if (Math.abs(scale - 0.001) < 0.0001) unitName = t('properties.modelMetadata.unit.millimeters');
+    else if (Math.abs(scale - 0.01) < 0.001) unitName = t('properties.modelMetadata.unit.centimeters');
+    else if (Math.abs(scale - 0.0254) < 0.001) unitName = t('properties.modelMetadata.unit.inches');
+    else if (Math.abs(scale - 0.3048) < 0.01) unitName = t('properties.modelMetadata.unit.feet');
     return { scale, unitName };
-  }, [dataStore]);
+  }, [dataStore, t, revision]);
 
   // The file's declared units, for rendering unit suffixes on project
   // property values (issue #1573).
@@ -111,14 +153,23 @@ export function ModelMetadataPanel({ model }: { model: FederatedModel }) {
     return extractProjectUnits(dataStore.source, dataStore.entityIndex);
   }, [dataStore]);
 
-  // Classification systems used in THIS model (e.g. Uniclass, OmniClass, a
-  // national system — a model can carry several at once). Walks only the
-  // handful of IfcClassification entities via the byType index, so it's
-  // cheap even on large models — not a per-element scan.
+  // Classification systems in this model's current edit session. `unresolved`
+  // preserves the server-parsed no-source signal for names we cannot read.
   const classificationSystems = useMemo(() => {
-    if (!dataStore) return [];
-    return extractClassificationSystemsOnDemand(dataStore as IfcDataStore);
-  }, [dataStore]);
+    if (!dataStore) return { names: [], unresolved: false };
+    return effectiveClassificationSystems(dataStore as IfcDataStore, mutationView);
+  }, [dataStore, mutationView, mutationVersion]);
+  const landXmlStats = useMemo(() => {
+    const surfaces = model.landXmlDocument?.surfaces ?? [];
+    return {
+      surfaces: surfaces.length,
+      points: surfaces.reduce((total, surface) => total + surface.points.length + surface.sourceDataPoints.length, 0),
+      overlays: surfaces.reduce(
+        (total, surface) => total + surface.boundaries.length + surface.breaklines.length + surface.contours.length,
+        0,
+      ),
+    };
+  }, [model.landXmlDocument]);
 
   return (
     <div className="h-full flex flex-col border-l-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-black">
@@ -132,14 +183,14 @@ export function ModelMetadataPanel({ model }: { model: FederatedModel }) {
             <h3 className="font-bold text-sm truncate uppercase tracking-tight text-zinc-900 dark:text-zinc-100">
               {model.name}
             </h3>
-            <p className="text-xs font-mono text-zinc-500 dark:text-zinc-400">IFC Model</p>
+            <p className="text-xs font-mono text-zinc-500 dark:text-zinc-400">{model.sourceSchema ? t('properties.modelMetadata.sourceModel') : t('properties.modelMetadata.ifcModel')}</p>
           </div>
         </div>
 
         {/* Schema badge */}
         <div className="flex items-center gap-2">
-          <span className="text-[10px] font-mono bg-primary/10 border border-primary/30 px-2 py-1 text-primary font-bold uppercase">
-            {model.schemaVersion}
+          <span className="text-2xs font-mono bg-primary/10 border border-primary/30 px-2 py-1 text-primary font-bold uppercase">
+            {model.sourceSchema ?? model.schemaVersion}
           </span>
         </div>
       </div>
@@ -154,20 +205,20 @@ export function ModelMetadataPanel({ model }: { model: FederatedModel }) {
         <div className="border-b border-zinc-200 dark:border-zinc-800">
           <div className="p-3 bg-zinc-50 dark:bg-zinc-900/50">
             <h4 className="font-bold text-xs uppercase tracking-wide text-zinc-700 dark:text-zinc-300">
-              File Information
+              {t('properties.modelMetadata.fileInformationHeading')}
             </h4>
           </div>
           <div className="divide-y divide-zinc-100 dark:divide-zinc-900">
             <div className="flex items-center gap-3 px-3 py-2">
               <HardDrive className="h-3.5 w-3.5 text-zinc-400 shrink-0" />
-              <span className="text-xs text-zinc-500">File Size</span>
+              <span className="text-xs text-zinc-500">{t('properties.modelMetadata.fileSize')}</span>
               <span className="text-xs font-mono text-zinc-900 dark:text-zinc-100 ml-auto">
                 {formatFileSize(model.fileSize)}
               </span>
             </div>
             <div className="flex items-center gap-3 px-3 py-2">
               <Clock className="h-3.5 w-3.5 text-zinc-400 shrink-0" />
-              <span className="text-xs text-zinc-500">Loaded At</span>
+              <span className="text-xs text-zinc-500">{t('properties.modelMetadata.loadedAt')}</span>
               <span className="text-xs font-mono text-zinc-900 dark:text-zinc-100 ml-auto">
                 {formatDate(model.loadedAt)}
               </span>
@@ -175,9 +226,9 @@ export function ModelMetadataPanel({ model }: { model: FederatedModel }) {
             {dataStore && dataStore.parseTime != null && (
               <div className="flex items-center gap-3 px-3 py-2">
                 <Clock className="h-3.5 w-3.5 text-zinc-400 shrink-0" />
-                <span className="text-xs text-zinc-500">Parse Time</span>
+                <span className="text-xs text-zinc-500">{t('properties.modelMetadata.parseTime')}</span>
                 <span className="text-xs font-mono text-zinc-900 dark:text-zinc-100 ml-auto">
-                  {dataStore.parseTime.toFixed(0)} ms
+                  {t('properties.modelMetadata.parseTimeValue', { ms: formatLocaleNumber(locale, dataStore.parseTime, { maximumFractionDigits: 0 }) })}
                 </span>
               </div>
             )}
@@ -189,9 +240,9 @@ export function ModelMetadataPanel({ model }: { model: FederatedModel }) {
           <div className="border-b border-zinc-200 dark:border-zinc-800">
             <div className="flex items-center gap-3 px-3 py-2.5 bg-amber-50/50 dark:bg-amber-950/20">
               <Ruler className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400 shrink-0" />
-              <span className="text-xs font-bold text-amber-700 dark:text-amber-400 uppercase tracking-wide">Length Unit</span>
+              <span className="text-xs font-bold text-amber-700 dark:text-amber-400 uppercase tracking-wide">{t('properties.modelMetadata.lengthUnitHeading')}</span>
               <span className="text-xs font-mono text-amber-800 dark:text-amber-300 ml-auto">
-                {unitInfo.unitName} ({unitInfo.scale})
+                {t('properties.modelMetadata.lengthUnitValue', { unitName: unitInfo.unitName, scale: formatLocaleNumber(locale, unitInfo.scale, { maximumFractionDigits: 6 }) })}
               </span>
             </div>
           </div>
@@ -206,14 +257,14 @@ export function ModelMetadataPanel({ model }: { model: FederatedModel }) {
           <div className="border-b border-zinc-200 dark:border-zinc-800">
             <div className="p-3 bg-zinc-50 dark:bg-zinc-900/50">
               <h4 className="font-bold text-xs uppercase tracking-wide text-zinc-700 dark:text-zinc-300">
-                Project Information
+                {t('properties.modelMetadata.projectInformationHeading')}
               </h4>
             </div>
             <div className="divide-y divide-zinc-100 dark:divide-zinc-900">
               {projectData.name && (
                 <div className="flex items-center gap-3 px-3 py-2">
                   <Tag className="h-3.5 w-3.5 text-zinc-400 shrink-0" />
-                  <span className="text-xs text-zinc-500">Name</span>
+                  <span className="text-xs text-zinc-500">{EXPRESS_NAME_ATTRIBUTE}</span>
                   <span className="text-xs font-medium text-zinc-900 dark:text-zinc-100 ml-auto truncate max-w-[60%]">
                     {projectData.name}
                   </span>
@@ -222,7 +273,7 @@ export function ModelMetadataPanel({ model }: { model: FederatedModel }) {
               {projectData.description && (
                 <div className="flex items-start gap-3 px-3 py-2">
                   <FileText className="h-3.5 w-3.5 text-zinc-400 shrink-0 mt-0.5" />
-                  <span className="text-xs text-zinc-500 shrink-0">Description</span>
+                  <span className="text-xs text-zinc-500 shrink-0">{EXPRESS_DESCRIPTION_ATTRIBUTE}</span>
                   <span className="text-xs text-zinc-900 dark:text-zinc-100 ml-auto text-right max-w-[60%]">
                     {projectData.description}
                   </span>
@@ -231,8 +282,8 @@ export function ModelMetadataPanel({ model }: { model: FederatedModel }) {
               {projectData.globalId && (
                 <div className="flex items-center gap-3 px-3 py-2">
                   <Hash className="h-3.5 w-3.5 text-zinc-400 shrink-0" />
-                  <span className="text-xs text-zinc-500">GlobalId</span>
-                  <code className="text-[10px] font-mono text-zinc-600 dark:text-zinc-400 ml-auto truncate max-w-[60%]">
+                  <span className="text-xs text-zinc-500">{EXPRESS_GLOBAL_ID_ATTRIBUTE}</span>
+                  <code className="text-2xs font-mono text-zinc-600 dark:text-zinc-400 ml-auto truncate max-w-[60%]">
                     {projectData.globalId}
                   </code>
                 </div>
@@ -252,44 +303,55 @@ export function ModelMetadataPanel({ model }: { model: FederatedModel }) {
           </div>
         )}
 
-        {/* Entity Statistics */}
+        {/* IFC entity statistics or truthful source-record counts. */}
         <div className="border-b border-zinc-200 dark:border-zinc-800">
           <div className="p-3 bg-zinc-50 dark:bg-zinc-900/50">
             <h4 className="font-bold text-xs uppercase tracking-wide text-zinc-700 dark:text-zinc-300">
-              Statistics
+              {model.sourceSchema ? t('properties.modelMetadata.sourceStatisticsHeading') : t('properties.modelMetadata.statisticsHeading')}
             </h4>
           </div>
           <div className="divide-y divide-zinc-100 dark:divide-zinc-900">
             <div className="flex items-center gap-3 px-3 py-2">
               <Database className="h-3.5 w-3.5 text-zinc-400 shrink-0" />
-              <span className="text-xs text-zinc-500">Total Entities</span>
+              <span className="text-xs text-zinc-500">{model.sourceSchema ? t('properties.modelMetadata.sourceSurfaces') : t('properties.modelMetadata.totalEntities')}</span>
               <span className="text-xs font-mono text-zinc-900 dark:text-zinc-100 ml-auto">
-                {dataStore?.entityCount?.toLocaleString() ?? 'N/A'}
+                {model.sourceSchema ? formatLocaleNumber(locale, landXmlStats.surfaces) : dataStore?.entityCount != null ? formatLocaleNumber(locale, dataStore.entityCount) : t('properties.modelMetadata.notAvailable')}
               </span>
             </div>
             <div className="flex items-center gap-3 px-3 py-2">
               <Layers className="h-3.5 w-3.5 text-zinc-400 shrink-0" />
-              <span className="text-xs text-zinc-500">Building Storeys</span>
+              <span className="text-xs text-zinc-500">{model.sourceSchema ? t('properties.modelMetadata.sourcePoints') : t('properties.modelMetadata.buildingStoreys')}</span>
               <span className="text-xs font-mono text-zinc-900 dark:text-zinc-100 ml-auto">
-                {stats.storeys}
+                {formatLocaleNumber(locale, model.sourceSchema ? landXmlStats.points : stats.storeys)}
               </span>
             </div>
             <div className="flex items-center gap-3 px-3 py-2">
               <Building2 className="h-3.5 w-3.5 text-zinc-400 shrink-0" />
-              <span className="text-xs text-zinc-500">Elements with Geometry</span>
+              <span className="text-xs text-zinc-500">{model.sourceSchema ? t('properties.modelMetadata.sourceOverlays') : t('properties.modelMetadata.elementsWithGeometry')}</span>
               <span className="text-xs font-mono text-zinc-900 dark:text-zinc-100 ml-auto">
-                {stats.elementsWithGeometry.toLocaleString()}
+                {formatLocaleNumber(locale, model.sourceSchema ? landXmlStats.overlays : stats.elementsWithGeometry)}
               </span>
             </div>
-            <div className="flex items-center gap-3 px-3 py-2">
-              <Hash className="h-3.5 w-3.5 text-zinc-400 shrink-0" />
-              <span className="text-xs text-zinc-500">Max Express ID</span>
-              <span className="text-xs font-mono text-zinc-900 dark:text-zinc-100 ml-auto">
-                {model.maxExpressId.toLocaleString()}
-              </span>
-            </div>
+            {!model.sourceSchema && (
+              <div className="flex items-center gap-3 px-3 py-2">
+                <Hash className="h-3.5 w-3.5 text-zinc-400 shrink-0" />
+                <span className="text-xs text-zinc-500">{t('properties.modelMetadata.maxExpressId')}</span>
+                <span className="text-xs font-mono text-zinc-900 dark:text-zinc-100 ml-auto">
+                  {formatLocaleNumber(locale, model.maxExpressId)}
+                </span>
+              </div>
+            )}
           </div>
         </div>
+
+        {model.sourceSchema && model.landXmlDocument && <TerrainImageryCard model={model} />}
+
+        {model.sourceSchema && model.landXmlDocument && <LandXmlModelSourceNavigation
+          modelId={model.id}
+          document={model.landXmlDocument}
+          selected={selectedLandXmlSource}
+          onSelect={setSelectedLandXmlSource}
+        />}
 
         {/* Classification Systems — lists every system found in this
             model (not just one), matching the request that a model can
@@ -297,25 +359,30 @@ export function ModelMetadataPanel({ model }: { model: FederatedModel }) {
         <div className="border-b border-zinc-200 dark:border-zinc-800">
           <div className="p-3 bg-zinc-50 dark:bg-zinc-900/50">
             <h4 className="font-bold text-xs uppercase tracking-wide text-zinc-700 dark:text-zinc-300">
-              Classification Systems
+              {t('properties.modelMetadata.classificationSystemsHeading')}
             </h4>
           </div>
           <div className="divide-y divide-zinc-100 dark:divide-zinc-900">
-            {classificationSystems.length === 0 ? (
+            {classificationSystems.unresolved && (
               <div className="flex items-center gap-3 px-3 py-2">
                 <BookMarked className="h-3.5 w-3.5 text-zinc-400 shrink-0" />
-                <span className="text-xs text-zinc-500">No classification systems</span>
+                <span className="text-xs text-zinc-500">{t('properties.modelMetadata.classificationUnresolved')}</span>
               </div>
-            ) : (
-              classificationSystems.map((system) => (
-                <div key={system} className="flex items-center gap-3 px-3 py-2">
-                  <BookMarked className="h-3.5 w-3.5 text-zinc-400 shrink-0" />
-                  <span className="text-xs font-mono text-zinc-900 dark:text-zinc-100">
-                    {system}
-                  </span>
-                </div>
-              ))
             )}
+            {!classificationSystems.unresolved && classificationSystems.names.length === 0 && (
+              <div className="flex items-center gap-3 px-3 py-2">
+                <BookMarked className="h-3.5 w-3.5 text-zinc-400 shrink-0" />
+                <span className="text-xs text-zinc-500">{t('properties.modelMetadata.noClassificationSystems')}</span>
+              </div>
+            )}
+            {classificationSystems.names.map((system) => (
+              <div key={system} className="flex items-center gap-3 px-3 py-2">
+                <BookMarked className="h-3.5 w-3.5 text-zinc-400 shrink-0" />
+                <span className="text-xs font-mono text-zinc-900 dark:text-zinc-100">
+                  {system}
+                </span>
+              </div>
+            ))}
           </div>
         </div>
 

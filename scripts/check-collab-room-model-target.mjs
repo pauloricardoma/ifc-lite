@@ -22,17 +22,11 @@
  *   3. outbound, the user's edits on their PRIVATE model were mirrored into the
  *      shared room and applied to whatever entity the id resolved to there.
  *
- * The fixes are `applyRoomModelData` (room-model-apply.ts) and the resolvers in
- * room-model-target.ts, both unit-tested. THIS file pins the wiring, which is
- * the half that was wrong and the half no test holds: reverting the call sites
- * leaves `tsc --noEmit` clean and the whole viewer suite green, because the
- * collab session path needs jsdom, module mocking, `import.meta.env`,
- * IndexedDB and a websocket and so cannot be driven under `tsx --test`.
+ * `applyRoomModelData` and room-model-target.ts are unit-tested. This guard
+ * pins their call sites, which a typecheck or unit test does not cover: the
+ * collab session needs jsdom, IndexedDB, module mocks and a websocket.
  *
- * An absence claim over a few regions of two files is a lint, not a unit test,
- * so it lives here — `scripts/check-source-text-assertions.mjs` forbids exactly
- * this shape inside a test file, and `check-unbounded-frame-wait.mjs` /
- * `check-wasm-disposal.mjs` are the same shape for the same reason.
+ * The source guard belongs here; tests cannot assert on source text.
  *
  * Every check below fails closed: a region that cannot be located, or that no
  * longer routes through the by-id helper, is an error rather than a silent
@@ -67,6 +61,9 @@ const ROOT =
 
 const COLLAB_SLICE = 'apps/viewer/src/store/slices/collabSlice.ts';
 const MUTATION_SLICE = 'apps/viewer/src/store/slices/mutationSlice.ts';
+const MUTATION_WALL_RESIZE = 'apps/viewer/src/store/slices/mutation-wall-resize.ts';
+const REMESH_SERVICE = 'apps/viewer/src/lib/remesh/remesh-service.ts'; // re-meshed geometry is mirrored here (#6232)
+const ROOM_RECONSTRUCT = 'apps/viewer/src/lib/collab/room-reconstruct.ts'; // the recipient's reconstruct, since #4444
 
 /**
  * Blank out comments and quoted-string contents so they can't desync or
@@ -311,6 +308,9 @@ function assertRegion(reg, { banned, required, consequence }) {
 
 const collab = load(COLLAB_SLICE);
 const mutation = load(MUTATION_SLICE);
+const mutationWallResize = load(MUTATION_WALL_RESIZE);
+const remeshService = load(REMESH_SERVICE);
+const reconstruct = load(ROOM_RECONSTRUCT);
 
 // ── 1. The recipient's re-derivation (#2705) ────────────────────────────────
 //
@@ -327,9 +327,10 @@ const mutation = load(MUTATION_SLICE);
 //
 // Banned WITHOUT their receiver, for check 2's reason: banning the `get()`
 // spelling only is evaded by `const s = get(); … s.ifcDataStore`, the same read
-// under a different name. The region's legitimate reads are `roomModelId` (its
-// own const) and the parse `payload`, so nothing here needs the active model.
-assertRegion(region(collab, 'const reconstruct = async () => {', 'collab recipient reconstruct'), {
+// under a different name. The region's legitimate reads are the slot's own
+// `modelId` and the parse `payload`, so nothing here needs the active model.
+// The region is the whole reconstructor factory (room-reconstruct.ts, #4444).
+assertRegion(region(reconstruct, 'export function createRoomReconstructor(', 'collab recipient reconstruct'), {
   banned: [
     'get().setIfcDataStore(',
     'get().setGeometryResult(',
@@ -340,15 +341,12 @@ assertRegion(region(collab, 'const reconstruct = async () => {', 'collab recipie
     // `bannedHitsFor`. Every other receiver is banned, `get()` included.
     { needle: '.geometryResult', exceptOn: ['payload'] },
   ],
-  required: ['applyRoomModelData('],
-  consequence: `Those setters target \`activeModelId\`, but the reconstruct's target is the room
+  required: ['applyRoomModelData(', 'registerModelOffset('],
+  consequence: `Those setters target \`activeModelId\`, but the reconstruct's target is a room
 model: a recipient with their own file active loses that file's store and
-meshes on the next peer edit. The reads are the same defect one step earlier —
-resolving the store, the model id or the meshes off the ACTIVE model makes
-everything downstream address the wrong model, whatever it is finally written
-through. Use this region's own \`roomModelId\` / \`payload\`, and route writes
-through \`applyRoomModelData(get(), roomModelId, { … })\`
-(apps/viewer/src/lib/collab/room-model-apply.ts).`,
+meshes on the next peer edit. The reads are the same defect one step earlier.
+Use the slot's own \`modelId\` / \`payload\`, and route writes through
+\`applyRoomModelData(deps.get(), modelId, { … })\` (room-model-apply.ts).`,
 });
 
 // ── 2. Inbound: a peer's edit replayed into a local view ────────────────────
@@ -357,7 +355,7 @@ through \`applyRoomModelData(get(), roomModelId, { … })\`
 // `get().activeModelId`): banning the `get()` spelling only is evaded by
 // `const st = get;` … `st().ifcDataStore`, which is the same read with a
 // different name. These three fields have no legitimate reader in this region —
-// the room's equivalents are `roomModelIdOf` / `roomStore` / `roomMutationView`
+// the room's equivalents are `roomEntityTargetForPath` / `roomStoreFor` / `roomMutationViewFor`
 // — while `.models` (used for `toGlobalIdFromModels`) is model-agnostic and
 // stays allowed.
 //
@@ -369,17 +367,18 @@ through \`applyRoomModelData(get(), roomModelId, { … })\`
 // arbitrary one, not the specific wrong one the bug produced. Banning `.models`
 // outright would false-positive on `toGlobalIdFromModels`, and this guard does
 // not force a ban through a legitimate reader. Recorded, demonstrated, not fixed.
+// Since #4444 (one model per slot) the observer resolves the model BY PATH and
+// every handler re-gates on the model it was handed.
 assertRegion(region(collab, 'remoteApplyTeardown = attachRemoteApply(', 'collab inbound apply'), {
   // `.geometryResult` was missing here even though check 2b bans it one layer
   // down: this handler could inline `get().geometryResult?.meshes` instead of
   // calling the reconciler and stay green. Demonstrated, so banned.
   banned: ['.activeModelId', '.ifcDataStore', '.mutationViews', '.geometryResult'],
-  required: ['roomStore(get())', 'roomMutationView(get())', 'roomModelIdOf(get())'],
-  consequence: `A peer's edit carries an expressId in the ROOM's id space. Replaying it into
-the ACTIVE model writes it into the user's own file — into that model's view
-overlay and mutationHistory, i.e. the export path, where it survives a reload
-and ships in their exported IFC. Resolve through \`roomStore\` / \`roomMutationView\` /
-\`roomModelIdOf\` (apps/viewer/src/lib/collab/room-model-target.ts).`,
+  required: ['roomEntityTargetForPath(get(), path)', 'roomMutationViewFor(get(), modelId)', 'roomStoreFor(get(), modelId)'],
+  consequence: `A peer's edit carries an expressId in ONE room model's id space. Replaying it
+into the ACTIVE model writes it into the user's own file (view overlay and
+mutationHistory, i.e. the export path). Resolve the model from the path through
+\`roomEntityTargetForPath\` and gate every write on it (room-model-target.ts).`,
 });
 
 // ── 2b. The shared mesh reconciler the inbound region CALLS ────────────────
@@ -391,31 +390,29 @@ and ships in their exported IFC. Resolve through \`roomStore\` / \`roomMutationV
 // scans the handler, and the handler is one call long.
 //
 // The consequence is the defect this guard exists to prevent, one layer down.
-// The reconstructed room model is registered with `idOffset: 0` while a
-// recipient's own file generally has a non-zero offset, so with their own file
-// active a DELIVERED placement edit is turned into a globalId of the wrong
-// model — it moves an unrelated mesh, or none. Same for the rotate pivot, which
-// reads the bbox centre out of the active model's meshes.
+// A room model is registered in its own federation range while a recipient's
+// own file sits in another, so with their own file active a DELIVERED
+// placement edit is turned into a globalId of the wrong model — it moves an
+// unrelated mesh, or none. Same for the rotate pivot, which reads the bbox
+// centre out of the active model's meshes.
 //
 // A region that no longer exists fails closed via `region`, so extracting this
 // helper into its own module means re-pointing the guard, not dropping it.
 //
 // Both banned members are matched WITHOUT their receiver, like check 2's:
 // banning the `get().geometryResult` spelling only is evaded by
-// `const s = get(); … roomMeshes(get()) ?? s.geometryResult?.meshes`, which is
+// `const s = get(); … roomMeshesFor(get(), modelId) ?? s.geometryResult?.meshes`, which is
 // the same read under a different name and reinstates the fallback in full.
 assertRegion(region(collab, 'function reconcilePlacementMesh(', 'collab placement reconciler'), {
   // `.ifcDataStore` / `.mutationViews` complete the set: a reconciler that
   // re-derives a placement from the ACTIVE model's store or view is the same
   // wrong-model defect as reading its meshes, and was demonstrably unguarded.
   banned: ['.activeModelId', '.geometryResult', '.ifcDataStore', '.mutationViews'],
-  required: ['roomModelIdOf(get())', 'roomMeshes(get())'],
-  consequence: `The mesh this moves is addressed by \`globalId\`, which is \`idOffset + expressId\`
-of a NAMED model. The room's reconstructed model has \`idOffset: 0\` and the
-user's own file generally does not, so resolving against the ACTIVE model moves
-the wrong mesh — or none — for a peer edit that was delivered correctly.
-Resolve through \`roomModelIdOf\` / \`roomMeshes\`
-(apps/viewer/src/lib/collab/room-model-target.ts).`,
+  required: ['toGlobalIdFromModels(get().models, modelId, entityId)', 'roomMeshesFor(get(), modelId)'],
+  consequence: `The mesh this moves is addressed by \`globalId\` = \`idOffset + expressId\` of a
+NAMED model; resolving against the ACTIVE model moves the wrong mesh — or none —
+for a peer edit that was delivered correctly. Address it by the \`modelId\` the
+caller established; pivot from \`roomMeshesFor(get(), modelId)\` (room-model-target.ts).`,
 });
 
 // ── 3. Outbound: every entity action gates itself, by construction ─────────
@@ -489,7 +486,6 @@ SHARED model. Take \`modelId\` first and gate on
     // call while gating on precisely the wrong model. These ten regions read
     // none of the five members today, so the ban is exact, not approximate.
     banned: [
-      'roomStore(get())',
       '.models.get(modelId)',
       '.ifcDataStore',
       '.activeModelId',
@@ -520,8 +516,8 @@ const CALL_SITE_FLOOR = {
   mirrorAttributeEdit: 1,
   mirrorPlacementEdit: 3,
   mirrorEntityRemove: 1,
-  mirrorEntityCreate: 2,
-  mirrorEntityGeometry: 1,
+  mirrorEntityCreate: 1, // runInStoreElementBuilder: every add*, addColumn included
+  mirrorEntityGeometry: 1, // requestRemesh: every re-mesh (add*, resize, their undo / redo), one call per re-meshed element (#6232)
   readCollabPlacement: 3,
   collabTranslateEntity: 2,
   collabRotateEntity: 1,
@@ -530,26 +526,28 @@ const CALL_SITE_FLOOR = {
   const entityActionNames = new Set(entityActions.map((a) => a.name));
   const seen = new Map();
   const CALL_RE = /get\(\)\.((?:mirror|collab|readCollab)[A-Za-z]*)\(\s*([A-Za-z0-9_.()!]*)/g;
-  for (const m of mutation.clean.matchAll(CALL_RE)) {
-    const [, name, firstArg] = m;
-    if (!entityActionNames.has(name)) continue;
-    seen.set(name, (seen.get(name) ?? 0) + 1);
-    if (firstArg !== 'modelId') {
-      fail([
-        `${MUTATION_SLICE}:${mutation.lineOf(m.index)}: \`${name}\` is handed \`${firstArg}\`, not \`modelId\`.`,
-        '',
-        `The room gate inside \`${name}\` trusts the modelId it is given. Handing it
+  for (const file of [mutation, mutationWallResize, remeshService]) {
+    for (const m of file.clean.matchAll(CALL_RE)) {
+      const [, name, firstArg] = m;
+      if (!entityActionNames.has(name)) continue;
+      seen.set(name, (seen.get(name) ?? 0) + 1);
+      if (firstArg !== 'modelId') {
+        fail([
+          `${file.rel}:${file.lineOf(m.index)}: \`${name}\` is handed \`${firstArg}\`, not \`modelId\`.`,
+          '',
+          `The room gate inside \`${name}\` trusts the modelId it is given. Handing it
 anything but the model this edit was made ON — \`activeModelId\` above all —
 approves mirroring a PRIVATE model's edit into the shared room, which is the
 defect this guard exists to prevent.`,
-      ]);
+        ]);
+      }
     }
   }
   for (const [name, floor] of Object.entries(CALL_SITE_FLOOR)) {
     const count = seen.get(name) ?? 0;
     if (count < floor) {
       fail([
-        `collab call sites: \`${name}\` is called ${count}× in ${MUTATION_SLICE}, expected at least ${floor}.`,
+        `collab call sites: \`${name}\` is called ${count}× across ${MUTATION_SLICE}, ${MUTATION_WALL_RESIZE} and ${REMESH_SERVICE}, expected at least ${floor}.`,
         '',
         'A call site was removed or renamed. If the removal is deliberate, lower the',
         'floor in this guard in the same commit; otherwise an edit path silently',
@@ -569,6 +567,6 @@ if (failures.length > 0) {
 
 const callSiteTotal = Object.values(CALL_SITE_FLOOR).reduce((a, b) => a + b, 0);
 console.log(
-  `check-collab-room-model-target: OK (3 regions, ${entityActions.length} entity actions self-gated, ` +
+  `check-collab-room-model-target: OK (3 regions across 2 files, call sites across 3, ${entityActions.length} entity actions self-gated, ` +
     `${callSiteTotal} call sites bound to modelId)`,
 );

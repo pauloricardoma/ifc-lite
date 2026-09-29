@@ -16,8 +16,9 @@
  * access, no I/O.
  */
 
-import { generateIfcGuid, type RandomSource } from '@ifc-lite/encoding';
+import { generateIfcGuid, isValidIfcGuid, type RandomSource } from '@ifc-lite/encoding';
 import type { StoreEditor } from '@ifc-lite/mutations';
+import { completePlacementAxes } from '../ifc-creator-math.js';
 
 const POINT_EPSILON = 1e-6;
 
@@ -42,7 +43,8 @@ export function assertPositiveFinite(values: readonly number[], message: string)
  * Emit an IfcLocalPlacement chained to a parent. Wraps the cartesian
  * point + axis-placement bookkeeping. Pass `Axis` and/or `RefDirection`
  * as `[x, y, z]` to override defaults (otherwise IFC fills them with
- * world up / world X).
+ * world up / world X). Passing only one writes the other as its schema
+ * default, since IFC requires both or neither (#5469).
  */
 export function emitLocalPlacement(
   editor: StoreEditor,
@@ -52,12 +54,10 @@ export function emitLocalPlacement(
   refDirection?: [number, number, number],
 ): number {
   const originPt = editor.addEntity('IfcCartesianPoint', [location]).expressId;
-  const axisRef = axis !== undefined
-    ? `#${editor.addEntity('IfcDirection', [axis]).expressId}`
-    : null;
-  const refDirRef = refDirection !== undefined
-    ? `#${editor.addEntity('IfcDirection', [refDirection]).expressId}`
-    : null;
+  // Axis and RefDirection are written both or neither (#5469).
+  const axes = completePlacementAxes(axis, refDirection);
+  const axisRef = axes ? `#${editor.addEntity('IfcDirection', [axes.Axis]).expressId}` : null;
+  const refDirRef = axes ? `#${editor.addEntity('IfcDirection', [axes.RefDirection]).expressId}` : null;
   const axisPlacement = editor.addEntity('IfcAxis2Placement3D', [
     `#${originPt}`,
     axisRef,
@@ -201,12 +201,12 @@ export function ifcElementHeader(
   ownerHistoryId: number | null,
   placementId: number,
   productShapeId: number,
-  params: { Name?: string; Description?: string; ObjectType?: string; Tag?: string },
+  params: { GlobalId?: string; Name?: string; Description?: string; ObjectType?: string; Tag?: string },
   defaultName: string,
   random?: RandomSource,
 ): Array<unknown> {
   return [
-    generateIfcGuid(random),
+    productGuid(params, random),
     ownerHistoryRef(ownerHistoryId),
     params.Name ?? defaultName,
     params.Description ?? null,
@@ -215,6 +215,18 @@ export function ifcElementHeader(
     `#${productShapeId}`,
     params.Tag ?? null,
   ];
+}
+
+/**
+ * The product's GlobalId: the caller's when it supplies one (a re-runnable
+ * author such as a flow graph derives it from a stable key so a re-run
+ * updates the element instead of duplicating it), else freshly generated.
+ * A malformed GlobalId is refused rather than silently replaced.
+ */
+export function productGuid(params: { GlobalId?: string }, random?: RandomSource): string {
+  if (params.GlobalId === undefined) return generateIfcGuid(random);
+  if (!isValidIfcGuid(params.GlobalId)) throw new Error(`GlobalId "${params.GlobalId}" is not a valid 22-character IFC GUID`);
+  return params.GlobalId;
 }
 
 /** An RGB colour with channels in 0..1. */

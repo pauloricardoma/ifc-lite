@@ -6,6 +6,10 @@ Guide to querying IFC data with IFClite.
 
 IFClite provides multiple query interfaces:
 
+`IfcQuery`'s fluent and SQL bulk queries read the parsed `IfcDataStore` passed
+to its constructor. They do not include entities created or deleted in a
+session's mutation view. Use the SDK query backend for live edited models.
+
 ```mermaid
 flowchart TB
     subgraph Sources["Data Sources"]
@@ -233,15 +237,34 @@ const fillings = query.entity(openingId).filledBy();
 
 ### Relationship Types
 
-| Relationship | Description |
-|--------------|-------------|
-| `IfcRelContainedInSpatialStructure` | Element → Spatial container |
-| `IfcRelAggregates` | Parent → Children (decomposition) |
-| `IfcRelVoidsElement` | Element → Opening |
-| `IfcRelFillsElement` | Opening → Filling (door/window) |
-| `IfcRelAssociatesMaterial` | Element → Material |
-| `IfcRelDefinesByProperties` | Element → Property sets |
-| `IfcRelDefinesByType` | Element → Type definition |
+`related(ref, relationshipType, direction)` accepts the exact EXPRESS name of
+every schema-resolvable concrete `IfcRelationship` subtype available in the
+model's IFC schema. IFC2X3 `IfcRelAssociates` is excluded because it has no
+`Relating*` attribute. Names are never shortened aliases. For example, use `IfcRelContainedInSpatialStructure`,
+`IfcRelAggregates`, `IfcRelNests`, `IfcRelDefinesByObject`,
+`IfcRelAssociatesMaterial`, `IfcRelConnectsPorts`, `IfcRelSequence`, or
+`IfcRelPositions` (IFC4X3). `forward` follows the EXPRESS relating-to-related
+slots; `inverse` walks them in reverse.
+
+The SDK's `bim.relationships(ref)` also returns `relations`, alongside
+the convenience `voids`, `fills`, `groups`, and `connections` arrays. Each
+entry identifies one relationship record and its opposite endpoint:
+
+```typescript
+const { relations = [] } = bim.relationships({ modelId, expressId: wallId });
+for (const edge of relations) {
+  console.log(
+    edge.relationshipId,   // express id of the IfcRel* record
+    edge.relationshipType, // exact name, such as IfcRelVoidsElement
+    edge.direction,        // forward or inverse relative to wallRef
+    edge.entity,           // { id, type, name? } at the other end
+  );
+}
+```
+
+`relationshipId` distinguishes separate IFC relationship records even when
+they connect the same pair of entities. It is `0` only for payloads from an
+older server that did not provide relationship record ids.
 
 ## SQL Queries
 
@@ -332,7 +355,7 @@ interface RelationshipsTable {
 
 ```sql
 -- Find walls with their storey names
--- ContainsElements edges run storey (source_id) -> element (target_id)
+-- IfcRelContainedInSpatialStructure edges run storey (source_id) -> element (target_id)
 SELECT
   e.express_id,
   e.name as wall_name,
@@ -341,7 +364,7 @@ FROM entities e
 JOIN relationships r ON e.express_id = r.target_id
 JOIN entities s ON r.source_id = s.express_id
 WHERE e.type LIKE 'IfcWall%'
-  AND r.rel_type = 'ContainsElements'
+  AND r.rel_type = 'IfcRelContainedInSpatialStructure'
   AND s.type = 'IfcBuildingStorey';
 
 -- Calculate total area by entity type
@@ -441,5 +464,6 @@ const alsoExternalWalls = query
 
 ## Next Steps
 
+- [Selector Syntax](selector-syntax.md) - the IfcOpenShell one-line filter syntax, and what each construct maps to here
 - [Export Guide](exporting.md) - Export query results
 - [API Reference](../api/typescript.md) - Complete API docs

@@ -28,10 +28,14 @@ import {
 } from 'react';
 import { GeometryProcessor, type MeshData } from '@ifc-lite/geometry';
 import { cn } from '@/lib/utils';
+import { useTranslation } from '@/i18n';
+import { resolveLiveMessage, type LiveTranslationMessage } from '@/i18n/live-message';
 import { useThreeScene } from './useThreeScene';
 import { createScene } from './playground-scene';
 import type { SceneHandle, ViewerController } from './playground-viewer-types';
 import type { LoadedPlaygroundModel } from './playground-dispatcher';
+import { playgroundGeometrySource } from './playground-geometry-source';
+import type { IfcDataStore } from '@ifc-lite/parser';
 
 const ACCENT = 0xd6ff3f;
 const BG_COLOR = '#0e0e12';
@@ -46,9 +50,11 @@ interface GeometryLoadCallbacks {
    *  when the model changes or the component unmounts mid-flight. */
   isCancelled: () => boolean;
   setPhase: (phase: 'processing' | 'ready' | 'error') => void;
-  setPhaseMsg: (msg: string) => void;
+  setPhaseMsg: (msg: LiveTranslationMessage) => void;
   /** Fired once with the non-empty mesh list on the success path. */
-  onMeshes: (meshes: MeshData[]) => void;
+  onMeshes: (meshes: MeshData[], store: IfcDataStore) => void;
+  /** Clear meshes from a previous revision when the current one cannot be shown. */
+  onEmpty?: () => void;
   onReady?: () => void;
 }
 
@@ -66,7 +72,7 @@ export async function loadPlaygroundGeometry(
   cb: GeometryLoadCallbacks,
 ): Promise<void> {
   cb.setPhase('processing');
-  cb.setPhaseMsg('booting geometry pipeline…');
+  cb.setPhaseMsg({ key: 'mcp.playgroundViewer.bootingPipeline' });
   try {
     // Construction can't throw synchronously here (no wasm work happens
     // until init()), so once we're past this line `processor` is a real
@@ -74,12 +80,13 @@ export async function loadPlaygroundGeometry(
     const processor = new GeometryProcessor({ preferNative: false });
     try {
       await processor.init();
-      cb.setPhaseMsg('extracting geometry…');
-      // Use our owning byte snapshot — store.source can be a sub-view that
-      // the parser detached internally on big files.
+      cb.setPhaseMsg({ key: 'mcp.playgroundViewer.extractingGeometry' });
+      const source = await playgroundGeometrySource(model);
+      if (cb.isCancelled()) return;
+      // @raw-entity-enumeration-ok the mesher requires the index parsed from source.bytes, which already includes pending edits.
       const result = await processor.process(
-        model.bytes,
-        model.store.entityIndex.byId as unknown as Map<number, unknown>,
+        source.bytes,
+        source.store.entityIndex.byId as unknown as Map<number, unknown>,
       );
       if (cb.isCancelled()) return;
       const meshes = result.meshes ?? [];
@@ -90,11 +97,12 @@ export async function loadPlaygroundGeometry(
         coordinateInfo: result.coordinateInfo,
       });
       if (meshes.length === 0) {
+        cb.onEmpty?.();
         cb.setPhase('error');
-        cb.setPhaseMsg('No drawable geometry — model may be schema-only.');
+        cb.setPhaseMsg({ key: 'mcp.playgroundViewer.noDrawableGeometry' });
         return;
       }
-      cb.onMeshes(meshes);
+      cb.onMeshes(meshes, source.store);
       cb.setPhase('ready');
       cb.onReady?.();
     } finally {
@@ -102,10 +110,11 @@ export async function loadPlaygroundGeometry(
     }
   } catch (err) {
     if (cb.isCancelled()) return;
+    cb.onEmpty?.();
     // eslint-disable-next-line no-console
     console.error('[playground-viewer] geometry processing failed', err);
     cb.setPhase('error');
-    cb.setPhaseMsg(err instanceof Error ? err.message : String(err));
+    cb.setPhaseMsg({ text: err instanceof Error ? err.message : String(err) });
   }
 }
 
@@ -114,6 +123,8 @@ export async function loadPlaygroundGeometry(
 export interface PlaygroundViewerProps {
   /** Currently loaded model (or null). When this changes, the viewer reloads. */
   model: LoadedPlaygroundModel | null;
+  /** Increments after a live model edit so geometry is materialized again. */
+  revision?: number;
   /** Notified once geometry has been processed. */
   onReady?: () => void;
   /** Optional className to control sizing. */
@@ -127,9 +138,10 @@ export interface PlaygroundViewerProps {
  * panel collapses (saves GPU memory on long sessions).
  */
 export const PlaygroundViewer = forwardRef<ViewerController, PlaygroundViewerProps>(function PlaygroundViewer(
-  { model, onReady, className },
+  { model, revision, onReady, className },
   ref,
 ) {
+  const { t } = useTranslation();
   // Guarded mount: a device that refuses a WebGL context must lose the canvas
   // only, not the whole /mcp/playground page (#2401). The parser, the agent
   // transcript and every non-viewer tool around us need no GPU.
@@ -138,7 +150,8 @@ export const PlaygroundViewer = forwardRef<ViewerController, PlaygroundViewerPro
     createScene,
   );
   const [phase, setPhase] = useState<'idle' | 'processing' | 'ready' | 'error'>('idle');
-  const [phaseMsg, setPhaseMsg] = useState<string>('');
+  const [phaseMsg, setPhaseMsg] = useState<LiveTranslationMessage | null>(null);
+  const phaseMsgText = resolveLiveMessage(t, phaseMsg);
   const [meshCount, setMeshCount] = useState(0);
 
   useImperativeHandle(
@@ -202,18 +215,24 @@ export const PlaygroundViewer = forwardRef<ViewerController, PlaygroundViewerPro
       setMeshCount(0);
       return;
     }
+    sceneHandleRef.current.unloadModel();
+    setMeshCount(0);
     void loadPlaygroundGeometry(model, {
       isCancelled: () => cancelled,
       setPhase,
       setPhaseMsg,
-      onMeshes: (meshes) => {
-        sceneHandleRef.current?.loadMeshes(meshes, model);
+      onMeshes: (meshes, store) => {
+        sceneHandleRef.current?.loadMeshes(meshes, store === model.store ? model : { ...model, store });
         setMeshCount(meshes.length);
+      },
+      onEmpty: () => {
+        sceneHandleRef.current?.unloadModel();
+        setMeshCount(0);
       },
       onReady,
     });
     return () => { cancelled = true; };
-  }, [model, onReady, sceneHandleRef]);
+  }, [model, revision, onReady, sceneHandleRef]);
 
   return (
     // The outer wrapper must be a positioning context for the absolute
@@ -250,10 +269,9 @@ export const PlaygroundViewer = forwardRef<ViewerController, PlaygroundViewerPro
             textAlign: 'center',
           }}
         >
-          <span>3D preview unavailable on this device</span>
+          <span>{t('mcp.playgroundViewer.webglUnavailableTitle')}</span>
           <span style={{ fontSize: 10, opacity: 0.75, maxWidth: 320 }}>
-            Your browser could not provide graphics for the viewer. Loading, queries
-            and every other tool still work.
+            {t('mcp.playgroundViewer.webglUnavailableBody')}
           </span>
         </div>
       )}
@@ -274,7 +292,7 @@ export const PlaygroundViewer = forwardRef<ViewerController, PlaygroundViewerPro
             opacity: 0.7,
           }}
         >
-          ● {meshCount} meshes
+          ● {t('mcp.playgroundViewer.meshCount', { count: meshCount })}
         </div>
       )}
       {!unavailable && phase !== 'ready' && (
@@ -295,11 +313,11 @@ export const PlaygroundViewer = forwardRef<ViewerController, PlaygroundViewerPro
         >
           {phase === 'processing' && (
             <span>
-              <span className="inline-block animate-pulse">●</span> {phaseMsg || 'preparing…'}
+              <span className="inline-block animate-pulse">●</span> {phaseMsg === null ? t('mcp.playgroundViewer.preparing') : phaseMsgText}
             </span>
           )}
-          {phase === 'error' && <span>⚠ {phaseMsg}</span>}
-          {phase === 'idle' && <span>load a model first</span>}
+          {phase === 'error' && <span>⚠ {phaseMsgText}</span>}
+          {phase === 'idle' && <span>{t('mcp.playgroundViewer.loadModelFirst')}</span>}
         </div>
       )}
     </div>

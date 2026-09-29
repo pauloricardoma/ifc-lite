@@ -11,15 +11,14 @@
  * - Applying viewpoints to the viewer (camera, selection, visibility)
  */
 
-import { useCallback, useRef } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useViewerStore } from '@/store';
 import type { BCFTopic, BCFViewpoint, BCFHeaderFile } from '@ifc-lite/bcf';
 import {
   createViewpoint,
   extractViewpointState,
-  computeMarkerPositions,
+  computeMarkerPositions, translateViewpoint, viewpointFromWorld,
   type ViewerCameraState,
-  type ViewerSectionPlane,
   type ViewerBounds,
   type OverlayBBox,
 } from '@ifc-lite/bcf';
@@ -27,11 +26,22 @@ import type { Renderer } from '@ifc-lite/renderer';
 import type { EntityRef } from '@/store/types';
 import {
   globalIdToExpressId as globalIdToExpressIdLookup,
-  expressIdToGlobalId as expressIdToGlobalIdLookup,
+  resolveCapturedRefGlobalIds,
+  resolveUniqueGlobalIds,
+  type ComponentRef,
 } from './bcfIdLookup';
+import { resolveEntityRefGlobalIdFromState } from '@/store/resolveEntityRef';
 import { fromGlobalIdFromModels } from '@/store/globalId';
-import { resolveIsolationIds } from '@/lib/isolation/resolveIsolationIds';
+import { resolvePresentationIds } from '@/lib/presentation/resolvePresentationIds';
 import { deriveHeaderFiles } from './bcfHeaderFiles';
+import { toast } from '@/components/ui/toast';
+import { captureVisibility, describeVisibilityNotice } from './bcf/visibility-capture';
+import { visibilityModelIdsForCapture } from './bcf/visibility-model-ids';
+import { capturedSectionPlaneInput, type CapturedSectionPlane } from './bcf/section-plane-position';
+import { bcfWorldOffset, renderFrameBounds, topicToRenderFrame } from './bcf/viewpoint-world-frame';
+import { focusedClashComponents } from './bcf/focused-clash-components';
+import { activeSectionPlane, cardinalSectionFlipped, clearSectionCut, showSectionCut } from '@/store/section-active';
+import { SectionRestoreSession } from './bcf/section-restore';
 
 // ============================================================================
 // Types
@@ -42,17 +52,47 @@ interface UseBCFOptions {
   canvasRef?: React.RefObject<HTMLCanvasElement | null>;
   /** Ref to the renderer for camera access */
   rendererRef?: React.RefObject<Renderer | null>;
+  /** The BCF panel only: on unmount, give back the section cut viewpoints replaced (#5829). */
+  restoreSectionOnUnmount?: boolean;
 }
 
 interface CreateViewpointOptions {
   /** Include a snapshot image */
   includeSnapshot?: boolean;
+  /** Already-rendered PNG; camera/clipping still use the canonical conversion. */ snapshotOverride?: string;
+  /** Exact cut rendered by a 2D section snapshot, independent of 3D clipping. */ capturedSectionPlane?: CapturedSectionPlane;
   /** Include selected entities */
   includeSelection?: boolean;
   /** Include hidden entities */
   includeHidden?: boolean;
+  /**
+   * Federated entity refs to record in the viewpoint's `<Selection>` as
+   * "found objects", INDEPENDENT of the live viewer selection (merged in
+   * alongside whatever `includeSelection` derives, deduped). When omitted and
+   * `includeSelection` is on, the focused clash's painted elements are used
+   * (`focusedClashComponents`): `focusClash` clears the live selection and
+   * paints the pair only through the clash colour channel (#1277/#1339), so
+   * without this every capture made while a clash is focused had no
+   * `<Selection>` at all (#4806).
+   */
+  additionalSelectedRefs?: ComponentRef[];
+  /** IFC GlobalIds already bound to a validated model revision by the caller. */
+  additionalSelectedGuids?: string[];
+  /**
+   * Federated entity refs to record as BCF `<Coloring>`, grouped by an ARGB
+   * hex colour (e.g. `'FFFF8000'`, matching `BCFColoring.color`). Defaults
+   * like `additionalSelectedRefs`, to the focused clash's on-screen tint.
+   */
+  additionalColoredRefs?: { color: string; refs: ComponentRef[] }[];
+  /** Coloring already bound to a validated model revision by the caller. */
+  additionalColoredGuids?: { color: string; guids: string[] }[];
+  /** Model-bound GUIDs that supplement an active numeric isolation allowlist. */
+  additionalVisibleGuids?: string[];
+  /** Abort when caller-owned scene identity changes while snapshot capture yields. */
+  isCaptureStillValid?: () => boolean;
+  /** Exact source models represented by the visibility state bound for this capture. */
+  onVisibilityModelIdsCaptured?: (modelIds: readonly string[]) => void;
 }
-
 interface UseBCFResult {
   /** Create a viewpoint from current viewer state */
   createViewpointFromState: (options?: CreateViewpointOptions) => Promise<BCFViewpoint | null>;
@@ -63,6 +103,7 @@ interface UseBCFResult {
   headerFilesForViewpoints: (
     viewpoints: readonly BCFViewpoint[],
     date?: string,
+    exactModelIds?: readonly string[],
   ) => BCFHeaderFile[];
   /** Apply a viewpoint to the viewer */
   applyViewpoint: (viewpoint: BCFViewpoint, animate?: boolean) => void;
@@ -114,12 +155,9 @@ export function getGlobalRenderer(): Renderer | null {
  * Read `clientHeight`/`clientWidth`, never `width`/`height`. The attributes are
  * the BACKING STORE size, which is conventionally `css * devicePixelRatio`, and
  * reading them for a physical-size derivation is wrong by exactly that ratio on
- * a Retina display. Today this particular canvas happens to be sized straight
- * from `getBoundingClientRect()` with no DPR factor (`packages/renderer`), so
- * the two coincide - which is precisely why the rule is written as a rule: the
- * day the renderer starts scaling its backing store, a caller that reached for
- * `width` silently starts reporting a scale that is off by the ratio, and
- * nothing about the resulting PDF looks wrong.
+ * a Retina display. Since #5383 the renderer does scale this canvas's backing
+ * store by the pixel ratio, so a caller that reached for `width` reports a
+ * scale off by that ratio, and nothing about the resulting PDF looks wrong.
  */
 export function getGlobalCanvas(): HTMLCanvasElement | null {
   return globalCanvasRef?.current ?? null;
@@ -153,23 +191,15 @@ function applyCameraState(
 // ============================================================================
 
 export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
+  const restoreSection = options.restoreSectionOnUnmount === true;
+  const [sectionRestore] = useState(() => new SectionRestoreSession());
+  useEffect(() => restoreSection ? () => { sectionRestore.restore(useViewerStore.getState, useViewerStore.setState); } : undefined, [restoreSection, sectionRestore]);
   const localCanvasRef = useRef<React.RefObject<HTMLCanvasElement | null> | null>(
     options.canvasRef ?? null
   );
   const localRendererRef = useRef<React.RefObject<Renderer | null> | null>(
     options.rendererRef ?? null
   );
-
-  // Store selectors
-  const sectionPlane = useViewerStore((s) => s.sectionPlane);
-  const hiddenEntities = useViewerStore((s) => s.hiddenEntities);
-  const isolatedEntities = useViewerStore((s) => s.isolatedEntities);
-  const selectedEntityId = useViewerStore((s) => s.selectedEntityId);
-  const selectedEntityIds = useViewerStore((s) => s.selectedEntityIds);
-  const setSectionPlaneAxis = useViewerStore((s) => s.setSectionPlaneAxis);
-  const setSectionPlanePosition = useViewerStore((s) => s.setSectionPlanePosition);
-  const toggleSectionPlane = useViewerStore((s) => s.toggleSectionPlane);
-  const flipSectionPlane = useViewerStore((s) => s.flipSectionPlane);
 
   // Selection and visibility actions
   const setSelectedEntityId = useViewerStore((s) => s.setSelectedEntityId);
@@ -259,6 +289,11 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
     const target = camera.getTarget();
     const up = camera.getUp();
     const fov = camera.getFOV();
+    // BCF 3.0 requires <AspectRatio> on every camera and `@ifc-lite/bcf`
+    // refuses to invent one, so a viewpoint captured without it makes the
+    // WHOLE export throw -- what a user hit after importing another tool's
+    // 3.0 archive (readBCF keeps its version) and adding a topic (#3612).
+    const aspectRatio = camera.getAspect();
 
     return {
       position,
@@ -266,30 +301,19 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
       up, // Use actual camera up vector
       fov,
       isOrthographic: false,
+      aspectRatio,
     };
   }, [getRenderer]);
 
   /**
    * Get model bounds from loaded models
    */
-  const getBounds = useCallback((): ViewerBounds | null => {
-    // Get bounds from first loaded model's geometry result
-    for (const model of models.values()) {
-      if (model.geometryResult?.coordinateInfo?.shiftedBounds) {
-        return model.geometryResult.coordinateInfo.shiftedBounds;
-      }
-    }
-    return null;
-  }, [models]);
+  const getBounds = useCallback((): ViewerBounds | null => renderFrameBounds(models), [models]);
 
-  /**
-   * Convert expressId (with model offset) to IFC GlobalId string
-   * Handles multi-model federation by finding the correct model and subtracting offset
-   */
-  const expressIdToGlobalId = useCallback(
-    (expressId: number): string | null =>
-      expressIdToGlobalIdLookup(expressId, models, ifcDataStore),
-    [models, ifcDataStore]
+  /** Render frame -> IFC world, IFC Z-up (#4806). BCF positions are world. */
+  const getWorldOffset = useCallback(
+    () => bcfWorldOffset(models, useViewerStore.getState().geometryResult),
+    [models],
   );
 
   /**
@@ -308,10 +332,88 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
   const createViewpointFromState = useCallback(
     async (opts: CreateViewpointOptions = {}): Promise<BCFViewpoint | null> => {
       const {
-        includeSnapshot = true,
+        includeSnapshot = true, snapshotOverride, capturedSectionPlane,
         includeSelection = true,
         includeHidden = true,
       } = opts;
+      const componentState = useViewerStore.getState();
+      if (opts.isCaptureStillValid && !opts.isCaptureStillValid()) return null;
+      // Default the found objects to the focused clash, whichever panel is capturing (#4806).
+      const focusedClash = includeSelection
+        ? focusedClashComponents(componentState.clashHighlightColors)
+        : null;
+      const additionalSelectedRefs = opts.additionalSelectedRefs ?? focusedClash?.selectedRefs;
+      const additionalColoredRefs = opts.additionalColoredRefs ?? focusedClash?.coloredRefs;
+      const resolveCapturedRef = (ref: ComponentRef): string[] => resolveCapturedRefGlobalIds(
+        ref,
+        componentState.models.keys(),
+        (modelId, globalId) => componentState.resolveGlobalIdInModel(modelId, globalId),
+        entityRef => resolveEntityRefGlobalIdFromState(componentState, entityRef),
+      );
+      const isCapturedRefPending = (globalId: number): boolean => {
+        for (const [modelId, model] of componentState.models) {
+          if (!componentState.resolveGlobalIdInModel(modelId, globalId)) continue;
+          if (!model.ifcDataStore && model.loadState !== 'error') return true;
+        }
+        return false;
+      };
+      const hasCapturedRefWithoutGlobalId = (globalId: number): boolean => {
+        for (const modelId of componentState.models.keys()) {
+          const entityRef = componentState.resolveGlobalIdInModel(modelId, globalId);
+          if (!entityRef) continue;
+          if (!resolveEntityRefGlobalIdFromState(componentState, entityRef)) return true;
+        }
+        return false;
+      };
+      // Bind component identity before snapshot capture can yield. A model
+      // replacement may reuse the same local express id for another entity.
+      const selectedRefs: ComponentRef[] = [];
+      if (includeSelection) {
+        if (componentState.selectedEntityId !== null) selectedRefs.push(componentState.selectedEntityId);
+        for (const id of componentState.selectedEntityIds) {
+          if (id !== componentState.selectedEntityId) selectedRefs.push(id);
+        }
+      }
+      selectedRefs.push(...(additionalSelectedRefs ?? []));
+      const selectedGuids = resolveUniqueGlobalIds(selectedRefs, resolveCapturedRef);
+      for (const guid of opts.additionalSelectedGuids ?? []) {
+        if (!selectedGuids.includes(guid)) selectedGuids.push(guid);
+      }
+      const emittedColoredGuids = new Set<string>();
+      const coloredGuids = [
+        ...(additionalColoredRefs ?? []).map(({ color, refs }) => ({
+          color, guids: resolveUniqueGlobalIds(refs, resolveCapturedRef, emittedColoredGuids),
+        })),
+        ...(opts.additionalColoredGuids ?? []).map(({ color, guids }) => ({
+          color, guids: resolveUniqueGlobalIds(guids, (guid) => guid, emittedColoredGuids),
+        })),
+      ].filter((entry) => entry.guids.length > 0);
+      // Capture visibility in the same pre-await state as the drawing buffer.
+      // GPU completion below can yield long enough for another UI action to
+      // mutate the store; mixing that newer state with the older PNG makes a
+      // viewpoint reopen differently from its snapshot.
+      const visibilityState = includeHidden ? componentState : undefined;
+      if (visibilityState && opts.onVisibilityModelIdsCaptured) {
+        opts.onVisibilityModelIdsCaptured(
+          visibilityModelIdsForCapture(visibilityState, (id) => resolveCapturedRef(id)),
+        );
+      }
+
+      // Snapshot FIRST, camera after: the PNG and the camera's `aspectRatio`
+      // describe one frame, so they must come from one drawing buffer.
+      // `captureSnapshot` awaits `queue.onSubmittedWorkDone()` before
+      // `toDataURL`, and the render loop resizes the canvas and calls
+      // `camera.setAspect` inside that wait (`renderer/src/index.ts`, the
+      // `dimensionsChanged` branch). Reading the camera after closes the
+      // window: an `await` resumes in a microtask, a rAF render is a task.
+      let snapshot: string | undefined = snapshotOverride;
+      if (!snapshot && includeSnapshot) {
+        const captured = await captureSnapshot();
+        if (opts.isCaptureStillValid && !opts.isCaptureStillValid()) return null;
+        if (captured) {
+          snapshot = captured;
+        }
+      }
 
       const cameraState = getCameraState();
       if (!cameraState) {
@@ -319,91 +421,63 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
         return null;
       }
 
-      // Get snapshot if requested
-      let snapshot: string | undefined;
-      if (includeSnapshot) {
-        const captured = await captureSnapshot();
-        if (captured) {
-          snapshot = captured;
-        }
-      }
-
-      // Convert section plane state
-      const viewerSectionPlane: ViewerSectionPlane | undefined = sectionPlane.enabled
-        ? {
-            axis: sectionPlane.axis,
-            position: sectionPlane.position,
-            enabled: true,
-            flipped: sectionPlane.flipped,
-          }
-        : undefined;
-
-      // Get bounds for section plane conversion
       const bounds = getBounds() ?? undefined;
+      const capturedSection = capturedSectionPlane ? capturedSectionPlaneInput(capturedSectionPlane, bounds) : null;
+      // Only the cut on screen: `enabled` outlives the Section tool (#4806).
+      const shown = activeSectionPlane(useViewerStore.getState());
+      const viewerSectionPlane = capturedSection?.sectionPlane
+        ?? (shown ? { axis: shown.axis, position: shown.position, enabled: true, flipped: cardinalSectionFlipped(shown) } : undefined);
+      const viewpointBounds = capturedSection?.bounds ?? bounds;
 
-      // Get selected GUIDs - convert expressIds to IFC GlobalId strings
-      const selectedGuids: string[] | undefined = includeSelection
-        ? (() => {
-            const guids: string[] = [];
-            if (selectedEntityId !== null) {
-              const guid = expressIdToGlobalId(selectedEntityId);
-              if (guid) guids.push(guid);
-            }
-            for (const id of selectedEntityIds) {
-              if (id !== selectedEntityId) {
-                const guid = expressIdToGlobalId(id);
-                if (guid) guids.push(guid);
-              }
-            }
-            return guids.length > 0 ? guids : undefined;
-          })()
-        : undefined;
-
-      // Get visibility GUIDs - either hidden (normal mode) or visible (isolation mode)
+      // Visibility GUIDs — the isolate allowlist or the hide-list, whichever the
+      // viewer is in; what could not be named is reported to the author.
+      // Pure decision in hooks/bcf/visibility-capture.ts (#4509, #4529).
       let hiddenGuids: string[] | undefined;
       let visibleGuids: string[] | undefined;
-
-      if (includeHidden) {
-        if (isolatedEntities !== null && isolatedEntities.size > 0) {
-          // Isolation mode: capture visible entities (defaultVisibility=false)
-          const guids: string[] = [];
-          for (const id of isolatedEntities) {
-            const guid = expressIdToGlobalId(id);
-            if (guid) guids.push(guid);
-          }
-          visibleGuids = guids.length > 0 ? guids : undefined;
-        } else if (hiddenEntities.size > 0) {
-          // Normal mode: capture hidden entities (defaultVisibility=true)
-          const guids: string[] = [];
-          for (const id of hiddenEntities) {
-            const guid = expressIdToGlobalId(id);
-            if (guid) guids.push(guid);
-          }
-          hiddenGuids = guids.length > 0 ? guids : undefined;
+      if (visibilityState) {
+        const capture = captureVisibility(
+          visibilityState.isolatedEntities,
+          visibilityState.hiddenEntities,
+          resolveCapturedRef,
+          isCapturedRefPending,
+          hasCapturedRefWithoutGlobalId,
+        );
+        ({ visibleGuids, hiddenGuids } = capture);
+        let notice = capture.notice;
+        if (visibilityState.isolatedEntities !== null
+          && opts.additionalVisibleGuids?.length
+          && !notice?.pending) {
+          visibleGuids = [...new Set([...(visibleGuids ?? []), ...opts.additionalVisibleGuids])];
+          if (notice && visibleGuids.length > 0) notice = { ...notice, omitted: false };
+        }
+        if (notice) {
+          const { unnameable, total, kind, omitted, pending, ids } = notice;
+          console.warn(
+            `[useBCF] ${unnameable} of ${total} ${kind} entities have no resolvable IFC GlobalId${pending ? ' (model metadata still loading)' : ''}; ${omitted ? 'omitting the viewpoint visibility component' : 'recording the rest'}. Global ids: ${ids.join(', ')}`,
+          );
+          const message = describeVisibilityNotice(notice);
+          if (message) toast.info(message);
         }
       }
 
-      // Create viewpoint
-      return createViewpoint({
+      // Camera and section plane are captured in the render frame; the
+      // viewpoint is stored and written in world coordinates (#4806).
+      return translateViewpoint(createViewpoint({
         camera: cameraState,
         sectionPlane: viewerSectionPlane,
-        bounds,
+        bounds: viewpointBounds,
         snapshot,
         selectedGuids,
         hiddenGuids,
         visibleGuids,
-      });
+        coloredGuids,
+      }), getWorldOffset());
     },
     [
+      getWorldOffset,
       getCameraState,
       captureSnapshot,
-      sectionPlane,
       getBounds,
-      selectedEntityId,
-      selectedEntityIds,
-      hiddenEntities,
-      isolatedEntities,
-      expressIdToGlobalId,
     ]
   );
 
@@ -413,8 +487,8 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
    * a lone-model topic still records its source file.
    */
   const headerFilesForViewpoints = useCallback(
-    (viewpoints: readonly BCFViewpoint[], date?: string): BCFHeaderFile[] => {
-      const modelIds = new Set<string>();
+    (viewpoints: readonly BCFViewpoint[], date?: string, exactModelIds?: readonly string[]): BCFHeaderFile[] => {
+      const modelIds = new Set(exactModelIds);
 
       // Primary source: the live selection's model ids. A topic is created from
       // the current selection, and the selection knows each element's model
@@ -423,7 +497,7 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
       // federations), collapsing every component onto the first match.
       const selected = useViewerStore.getState().selectedEntitiesSet;
       for (const key of selected) {
-        const modelId = key.slice(0, key.indexOf(':'));
+        const modelId = key.slice(0, key.lastIndexOf(':'));
         if (modelId) modelIds.add(modelId);
       }
 
@@ -468,7 +542,7 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
 
       const bounds = getBounds() ?? undefined;
       const state = extractViewpointState(
-        viewpoint,
+        viewpointFromWorld(viewpoint, getWorldOffset(), bounds),
         bounds,
         renderer.getCamera().getDistance(),
       );
@@ -476,7 +550,7 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
         applyCameraState(renderer, state.camera, animate);
       }
     },
-    [getRenderer, getBounds],
+    [getRenderer, getBounds, getWorldOffset],
   );
 
   /**
@@ -494,7 +568,7 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
 
       // Extract state from viewpoint (once, reused for camera, section plane, and selection)
       const state = extractViewpointState(
-        viewpoint,
+        viewpointFromWorld(viewpoint, getWorldOffset(), bounds), // world -> render frame (#4806)
         bounds,
         renderer.getCamera().getDistance() // Use current distance as reference
       );
@@ -504,24 +578,16 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
         applyCameraState(renderer, camera, animate);
       }
 
-      // Apply section plane
-      if (viewpointSectionPlane) {
-        // Set axis and position
-        setSectionPlaneAxis(viewpointSectionPlane.axis);
-        setSectionPlanePosition(viewpointSectionPlane.position);
-
-        // Toggle enabled state if needed
-        const currentEnabled = sectionPlane.enabled;
-        if (viewpointSectionPlane.enabled !== currentEnabled) {
-          toggleSectionPlane();
-        }
-
-        // Toggle flip state if needed
-        const currentFlipped = sectionPlane.flipped;
-        if (viewpointSectionPlane.flipped !== currentFlipped) {
-          flipSectionPlane();
-        }
+      // A viewpoint with clipping planes shows its cut (opening the Section
+      // tool — the renderer draws a cut nowhere else); one without clears any
+      // cut, parked ones included, so the view matches the topic (#4910).
+      if (restoreSection) sectionRestore.noteBeforeViewpoint(useViewerStore.getState());
+      if (viewpointSectionPlane?.enabled) {
+        showSectionCut(useViewerStore.getState, viewpointSectionPlane);
+      } else {
+        clearSectionCut(useViewerStore.getState);
       }
+      if (restoreSection) sectionRestore.noteAfterViewpoint(useViewerStore.getState());
 
       // Apply selection from BCF components. A federated viewpoint can select
       // elements across several models, so drive BOTH selection channels:
@@ -561,7 +627,17 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
 
       // Apply visibility from BCF components: isolation mode (visibleGuids
       // with defaultVisibility=false) or normal (hiddenGuids, default true).
-      if (state.visibleGuids.length > 0) {
+      // `state.visibleGuids` is meaningfully nullable (`extractViewpointState`,
+      // packages/bcf/src/viewpoint.ts): `null` means the viewpoint carries no
+      // isolation channel, while a non-null array -- EMPTY included -- means
+      // isolation WAS active when the viewpoint was captured, down to
+      // "matched nothing". A `.length > 0` check here would read a captured
+      // empty viewport (a real, spec-valid `DefaultVisibility="false"` with
+      // no exceptions) as "no isolation" and fall into the `hiddenGuids`
+      // branch below, restoring an unfiltered view instead of an empty one --
+      // the read-side mirror of the same collapse fixed on the write side
+      // above and in `createViewpoint`'s `hasVisible`.
+      if (state.visibleGuids !== null) {
         // Isolation mode: only specified entities are visible
         const isolatedExpressIds = new Set<number>();
         for (const guid of state.visibleGuids) {
@@ -569,12 +645,24 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
           if (result) isolatedExpressIds.add(result.expressId);
         }
 
-        if (isolatedExpressIds.size > 0) {
+        if (state.visibleGuids.length > 0 && isolatedExpressIds.size === 0) {
+          // THIRD state. The viewpoint names elements, and NONE of them is in
+          // the model currently loaded -- the ordinary case for a BCF file
+          // authored against a different (or differently versioned) model.
+          // That is not "isolation matched nothing": the isolation could not
+          // be evaluated here at all. Applying it as an empty isolate would
+          // hide every element of a model the viewpoint never spoke about,
+          // which is indistinguishable from a broken viewer. Leave the
+          // isolation channel off and say why, so the camera and selection
+          // the viewpoint DOES carry still land on a visible model.
+          setIsolatedEntities(null);
+          toast.info(
+            "Viewpoint visibility not applied: none of its elements are in the loaded model."
+          );
+        } else {
           // #3338: a viewpoint guid may name a geometry-less assembly whose parts carry the mesh.
           const resolver = useViewerStore.getState().cameraCallbacks.resolveHighlightIds;
-          setIsolatedEntities(new Set(resolveIsolationIds(resolver, [...isolatedExpressIds])));
-        } else {
-          setIsolatedEntities(null);
+          setIsolatedEntities(new Set(resolvePresentationIds(resolver, [...isolatedExpressIds])));
         }
       } else if (state.hiddenGuids.length > 0) {
         // Normal mode: specified entities are hidden
@@ -597,11 +685,7 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
     [
       getRenderer,
       getBounds,
-      sectionPlane,
-      setSectionPlaneAxis,
-      setSectionPlanePosition,
-      toggleSectionPlane,
-      flipSectionPlane,
+      getWorldOffset,
       globalIdToExpressId,
       models,
       setSelectedEntityId,
@@ -611,6 +695,8 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
       clearEntitySelection,
       setHiddenEntities,
       setIsolatedEntities,
+      restoreSection,
+      sectionRestore,
     ]
   );
 
@@ -629,7 +715,7 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
         return renderer.getScene().getEntityBoundingBox(result.expressId);
       };
 
-      const markers = computeMarkerPositions([topic], boundsLookup, {
+      const markers = computeMarkerPositions([topicToRenderFrame(topic, getWorldOffset(), getBounds())], boundsLookup, {
         targetDistance: renderer.getCamera().getDistance(),
       });
 
@@ -662,7 +748,7 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
       // Fallback: camera from latest viewpoint only — preserve selection/visibility
       applyViewpointCamera(topic.viewpoints[topic.viewpoints.length - 1], true);
     },
-    [applyViewpointCamera, getRenderer, globalIdToExpressId],
+    [applyViewpointCamera, getRenderer, globalIdToExpressId, getWorldOffset, getBounds],
   );
 
   return {

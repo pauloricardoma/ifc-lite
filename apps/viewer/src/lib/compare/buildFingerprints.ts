@@ -22,9 +22,8 @@
  * RTC- and origin-relative and would report a moved element as stationary.
  *
  * A federated model whose vertices were re-baked into the anchor's frame has
- * had its boxes re-framed with them (`hooks/ingest/federationAlignAabb.ts`),
- * so both sides of a compare are read in one frame no matter which of them
- * the federation anchored on.
+ * had its boxes re-framed with them (`hooks/ingest/federationAlignAabb.ts`), so
+ * both sides of a compare are read in one frame regardless of anchor.
  *
  * The proved enclosed volume (#1993) rides on `MeshData.geometryVolume` from
  * that same pass, and is the one fingerprint that does NOT survive a federation
@@ -45,36 +44,23 @@
  * the composed transform, not the local one: re-georeferencing rewrites the
  * placement *expression* of objects that did not move.
  *
- * The data fingerprint also carries the entity's RESOLVED MATERIAL NAMES
- * (through every `IfcMaterial*` indirection) and, for a Qto_ Length/Area/Volume
- * quantity, the value SCALED TO BASE SI (`quantitySiScale`) rather than the raw
- * project-unit number — so a model re-authored in a different length unit, with
- * no physical quantity actually changed, does not read as modified.
+ * The data fingerprint also carries the entity's RESOLVED MATERIAL NAMES,
+ * resolved CLASSIFICATION REFERENCES, and, for a Qto_ Length/Area/Volume
+ * quantity, the value SCALED TO BASE SI (`quantitySiScale`) — so a re-authored
+ * length unit with no physical quantity change does not read as modified.
  */
 
 import {
   buildComponentFingerprints,
   buildDataFingerprint,
-  type DataFingerprintInput,
   type EntityFingerprint,
 } from '@ifc-lite/diff';
-import { RelationshipType } from '@ifc-lite/data';
-import {
-  extractAllEntityAttributes,
-  extractAllMaterialsOnDemand,
-  extractProjectUnits,
-  extractPropertiesOnDemand,
-  extractQuantitiesOnDemand,
-  quantitySiScale,
-  roundToScale,
-  scaledPropertyValue,
-  type IfcDataStore, type ProjectUnits,
-} from '@ifc-lite/parser';
-import { lensMaterialNames } from '../lens-material-names.js';
+import { extractProjectUnits, spatialContainerPath, type IfcDataStore } from '@ifc-lite/parser';
 import type { EntityWorldAabb, MeshData } from '@ifc-lite/geometry';
-import { comparableProductIds } from './compareScope.js';
-import { isGeometricDataName } from './geometricData.js';
-import { isTypeObjectClass, typeObjectTag } from './typeObjectTag.js';
+import { authoredKeyOwnerIds, comparableProductIds } from './compareScope.js';
+import { resolveAuthoredKeys, type ExtractedPropertySets } from './authoredKeys.js';
+import { buildDataInput } from './buildDataInput.js';
+export { AUTHORED_KEY_PREFIX } from './authoredKeys.js';
 import { worldPlacementFingerprint, type PlacementComposeCache } from './worldPlacement.js';
 
 /**
@@ -164,7 +150,17 @@ export interface BuildFingerprintsModel {
   geometryVolumesTrusted?: boolean;
   /** This model's federation id offset (0 for the anchor / single-model load). */
   idOffset: number;
+  /**
+   * An authored key to compare on instead of GlobalId (issue #4955): `Tag` or
+   * `<PsetName>.<PropertyName>`. An entity carrying a non-empty, unique value
+   * is keyed `prop:<value>`; every other entity keeps its GlobalId, and a
+   * value two entities share is refused for both (`duplicateAuthoredKeys`).
+   */
+  keyProperty?: string;
+  /** Receives every authored value more than one entity carried. */
+  duplicateAuthoredKeys?: Map<string, number[]>;
 }
+
 
 /**
  * Build one {@link EntityFingerprint} per compared entity in a model — every
@@ -296,12 +292,25 @@ export async function buildEntityFingerprints(
     }
   }
 
+  // A Pset.Property key uses the same extraction as the data fingerprint.
+  // Cache that pre-pass so large models do not parse every property set twice.
+  const propertySetsById = new Map<number, ExtractedPropertySets>();
+  const authoredKeyOwners = new Set(geometryByLocalId.keys());
+  for (const localId of authoredKeyOwnerIds(store)) authoredKeyOwners.add(localId);
+  const authoredKeys = await resolveAuthoredKeys(
+    store,
+    authoredKeyOwners,
+    model.keyProperty,
+    model.duplicateAuthoredKeys,
+    propertySetsById,
+  );
+
   const fingerprints: EntityFingerprint<CompareRef>[] = [];
   let processed = 0;
   for (const [localId, geometryHash] of geometryByLocalId) {
     const ifcType = store.entities.getTypeName(localId) || 'IfcProduct';
     const globalId = store.entities.getGlobalId(localId);
-    const key = globalId || `missing:${modelId}:${localId}`;
+    const key = authoredKeys.get(localId) ?? (globalId || `missing:${modelId}:${localId}`);
 
     // One extraction, two fingerprints. `components` is the collision guard on
     // content matching's destructive path (#1891): retiring a real add+delete
@@ -310,7 +319,7 @@ export async function buildEntityFingerprints(
     // the 64-bit data hash cannot. Both are computed from the SAME input
     // object - a sub-hash over a different projection would stop being a
     // collision guard and start rejecting genuine re-export matches.
-    const dataInput = buildDataInput(store, localId, ifcType, units);
+    const dataInput = buildDataInput(store, localId, ifcType, units, propertySetsById.get(localId));
 
     // The box goes on ONLY when the pass produced one: the engine's contract is
     // that a missing box is `undefined`, and a NaN-bearing object would pass
@@ -321,6 +330,10 @@ export async function buildEntityFingerprints(
     // Same rule for the volume, and the same reason: `NaN` was resolved to
     // absent at the wasm boundary, so a number reaching here is a proved one.
     const volume = volumeByLocalId.get(localId);
+    // Where the element sits, as a name path, for the successor stage's
+    // `position` profile (issue #4955). Absent when the store's hierarchy does
+    // not contain it, which the engine reads as "no evidence", never as "moved".
+    const container = spatialContainerPath(store, localId);
 
     fingerprints.push({
       key,
@@ -330,6 +343,7 @@ export async function buildEntityFingerprints(
       geometryHash,
       ...(aabb ? { aabb } : {}),
       ...(volume !== undefined ? { volume } : {}),
+      ...(container !== undefined ? { container } : {}),
       ref: { modelId, localId, globalId: localId + idOffset, meshed: !geometryless.has(localId) },
     });
 
@@ -344,98 +358,3 @@ export async function buildEntityFingerprints(
 
   return fingerprints;
 }
-
-/**
- * Assemble the canonical {@link DataFingerprintInput} for one entity from the
- * store's on-demand extractors. Mirrors the extraction in
- * `examples/threejs-viewer/src/compare.ts`; `@ifc-lite/diff` does the sorting
- * + hashing so base and head produce byte-identical hashes for an unchanged
- * entity.
- */
-function buildDataInput(
-  store: IfcDataStore,
-  localId: number,
-  ifcType: string,
-  units: ProjectUnits, // scales Qto_ quantities and measure properties to base SI
-): DataFingerprintInput {
-  const predefinedType = extractAllEntityAttributes(store, localId).find(
-    (attribute) => attribute.name === 'PredefinedType',
-  )?.value;
-  // `Tag`, and only for a TYPE OBJECT (issue #2021). Type objects reach this
-  // adapter because the wasm pass emits type geometry too (#957/#994 —
-  // geometryClass 1 orphan, 2 instanced type library), and they are exactly the
-  // entities the data hash cannot separate on its own: same name, same class,
-  // no occurrence attributes, differing only in `Tag`. On an OCCURRENCE it stays
-  // out, because there it is the authoring tool's element id rather than design
-  // content and `dataHash` is the content bucket key; see
-  // `DataFingerprintInput.tag`.
-  const tag = isTypeObjectClass(ifcType)
-    ? typeObjectTag(store, localId, ifcType)
-    : undefined;
-
-  // Data vs geometry: placement/coordinate data (elevation, level offsets, …)
-  // is owned by the geometry hash, so strip it from the data fingerprint — a
-  // pure move must read as a geometry change only, never "data · geometry"
-  // (see geometricData.ts).
-  const propertySets = extractPropertiesOnDemand(store, localId)
-    .filter((set) => !isGeometricDataName(set.name))
-    .map((set) => ({
-      name: set.name,
-      properties: set.properties
-        .filter((property) => !isGeometricDataName(property.name))
-        .map((property) => ({ name: property.name, value: scaledPropertyValue(property.value, property.dataType, units) })),
-    }))
-    .filter((set) => set.properties.length > 0);
-
-  // Quantities (Volume/Area/Length/…) ARE part of the data story: adding or
-  // removing a quantity set, or editing a quantity, is a real change a
-  // coordinator needs to see (#1198 — they were previously excluded wholesale
-  // and so never reported). They're geometry-*derived*, so a reshape also
-  // recomputes them and reads as "data · geometry" — that's correct, the
-  // numbers genuinely changed. A pure translation leaves Volume/Area/Length
-  // untouched, so it stays a geometry-only change. Values are rounded to the
-  // panel's display precision so re-export float noise can't fabricate a diff.
-  const quantitySets = extractQuantitiesOnDemand(store, localId)
-    .filter((set) => !isGeometricDataName(set.name))
-    .map((set) => ({
-      name: set.name,
-      quantities: set.quantities
-        .filter((quantity) => !isGeometricDataName(quantity.name))
-        // Scaled to base SI, then rounded (`quantitySiScale`/`roundToScale`).
-        .map((quantity) => ({ name: quantity.name, value: roundToScale(quantity.value * quantitySiScale(quantity, units)) })),
-    }))
-    .filter((set) => set.quantities.length > 0);
-
-  const typeAssignments = store.relationships
-    .getRelated(localId, RelationshipType.DefinesByType, 'inverse')
-    .map((typeId) => ({
-      globalId: store.entities.getGlobalId(typeId) || undefined,
-      name: store.entities.getName(typeId) || undefined,
-      type: store.entities.getTypeName(typeId) || undefined,
-    }));
-
-  // Resolved material NAMES (never entity references — express ids are
-  // reassigned on every save). `extractAllMaterialsOnDemand` is the parser's
-  // canonical resolver: it follows `IfcMaterialLayerSetUsage` /
-  // `IfcMaterialProfileSetUsage` to their sets, and occurrence associations
-  // take precedence over the type's; `lensMaterialNames` then takes the
-  // individual layer / constituent / profile / list-member names, falling back
-  // to the top-level name only when the element has no sub-structure. Two
-  // proxies re-specified from `Soil1` to `topsoil` went unreported before this
-  // — materials were in no comparison channel at all.
-  const materials = extractAllMaterialsOnDemand(store, localId).flatMap(lensMaterialNames);
-
-  return {
-    ifcType,
-    name: store.entities.getName(localId) || undefined,
-    description: store.entities.getDescription(localId) || undefined,
-    objectType: store.entities.getObjectType(localId) || undefined,
-    predefinedType: predefinedType != null ? String(predefinedType) : undefined,
-    tag: tag != null ? String(tag) : undefined,
-    propertySets,
-    quantitySets,
-    typeAssignments,
-    materials,
-  };
-}
-

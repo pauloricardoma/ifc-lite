@@ -6,36 +6,35 @@
  * Ribbon · Elements tab — selection actions and class visibility.
  */
 
-import { useCallback } from 'react';
-import { ClassVisibility, CopyGuid, ElementTooltips, FocusSelected, HideSelected, IsolateSelected, Search, DisplayAll, Spatial, Class, Type, Material, Group } from '@/icons';
+import { useCallback, useContext } from 'react';
+import { ClassVisibility, CopyGuid, ElementTooltips, EntityActions, FocusSelected, HideSelected, IsolateSelected, Search, Select, DisplayAll, Spatial, Class, Type, Material, Group } from '@/icons';
 import { DropdownMenu, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
-import { resolveGlobalId, useViewerStore, type HierarchyMode } from '@/store';
-import { executeBasketIsolate } from '@/store/basket/basketCommands';
-import { resetVisibilityForHomeFromStore } from '@/store/homeView';
+import { resolveGlobalId, useViewerStore } from '@/store';
+import { useTranslation } from '@/i18n';
+import { BimReactContext } from '@/sdk/BimProvider';
+import { surfaceCommand } from '../../surface-commands';
 import { ClassVisibilityMenuContent, useVisibleClassCount } from '../../toolbar/ClassVisibilityMenu';
 import {
   RibbonGroup,
   RibbonGroupDivider,
-  RibbonLargeButton,
-  RibbonSmallButton,
   RibbonSmallStack,
 } from '../primitives';
+import { RibbonCommandLargeButton, RibbonCommandSmallButton } from '../command-button';
 
 export function ElementsTab() {
+  const { t } = useTranslation();
+  const bim = useContext(BimReactContext);
+  const toggleCollection = surfaceCommand('vis:toggle-iso', 'ribbon');
+  const resetColors = surfaceCommand('vis:reset-colors', 'ribbon');
+  const collabRole = useViewerStore((s) => s.collabRole);
+  const canEditInSession = collabRole === null || collabRole === 'editor' || collabRole === 'admin';
   const selectedEntityId = useViewerStore((state) => state.selectedEntityId);
   const selectedEntityIds = useViewerStore((state) => state.selectedEntityIds);
-  const hideEntities = useViewerStore((state) => state.hideEntities);
-  const clearSelection = useViewerStore((state) => state.clearSelection);
-  const cameraCallbacks = useViewerStore((state) => state.cameraCallbacks);
+  const openContextMenu = useViewerStore((state) => state.openContextMenu);
   const hoverTooltipsEnabled = useViewerStore((state) => state.hoverTooltipsEnabled);
-  const toggleHoverTooltips = useViewerStore((state) => state.toggleHoverTooltips);
+  const hoverHighlightEnabled = useViewerStore((state) => state.hoverHighlightEnabled);
   const mergeLayers = useViewerStore((state) => state.mergeLayers);
-  const setSearchModalOpen = useViewerStore((state) => state.setSearchModalOpen);
-  const setSearchModalTab = useViewerStore((state) => state.setSearchModalTab);
   const hierarchyMode = useViewerStore((state) => state.hierarchyMode);
-  const setHierarchyMode = useViewerStore((state) => state.setHierarchyMode);
-  const setLeftPanelCollapsed = useViewerStore((state) => state.setLeftPanelCollapsed);
-  const setPanelShownInSidebar = useViewerStore((state) => state.setPanelShownInSidebar);
   const { visible: visibleClassCount } = useVisibleClassCount();
 
   // Selection size uses the multi-select set when present; falls back to
@@ -46,18 +45,6 @@ export function ElementsTab() {
     : (selectedEntityId !== null ? 1 : 0);
   const hasSelection = selectionCount > 0;
 
-  const handleHide = useCallback(() => {
-    // Hide ALL selected entities (multi-select or single)
-    const state = useViewerStore.getState();
-    const ids: number[] = state.selectedEntityIds.size > 0
-      ? Array.from(state.selectedEntityIds)
-      : selectedEntityId !== null ? [selectedEntityId] : [];
-    if (ids.length > 0) {
-      hideEntities(ids);
-      clearSelection();
-    }
-  }, [selectedEntityId, hideEntities, clearSelection]);
-
   const handleCopyGuid = useCallback(() => {
     if (selectedEntityId === null) return;
 
@@ -65,133 +52,119 @@ export function ElementsTab() {
     if (globalId) void navigator.clipboard.writeText(globalId);
   }, [selectedEntityId]);
 
-  const handleHierarchyMode = useCallback((mode: HierarchyMode) => {
-    setHierarchyMode(mode);
-    setPanelShownInSidebar('hierarchy', true);
-    setLeftPanelCollapsed(false);
-  }, [setHierarchyMode, setLeftPanelCollapsed, setPanelShownInSidebar]);
-
   return (
     <>
       {/* Selection actions stay put (no appearing/disappearing chrome —
           the ribbon's fixed geography is the point) and read their
           availability from the disabled state. The group label carries
           the live count so scene state is visible at a glance. */}
-      <RibbonGroup label="Elements">
-        <RibbonLargeButton
+      <RibbonGroup label={t('ribbon.elements.elementsGroup')}>
+        <RibbonCommandLargeButton
+          commandId="elements:search"
           icon={Search}
-          label="Search"
-          tooltip="Search and filter elements"
-          onClick={() => {
-            setSearchModalTab('search');
-            setSearchModalOpen(true);
-          }}
         />
-        <RibbonLargeButton
+        <RibbonCommandLargeButton
+          commandId="vis:show"
           icon={DisplayAll}
-          label="Show all"
-          tooltip="Show all (reset filters)"
-          shortcut="A"
-          onClick={resetVisibilityForHomeFromStore}
         />
-        <RibbonLargeButton
+        <RibbonCommandLargeButton
+          commandId="pref:tooltips"
           icon={ElementTooltips}
-          label="Hover tips"
-          tooltip="Show entity tooltips on hover"
           active={hoverTooltipsEnabled}
-          onClick={() => toggleHoverTooltips()}
+        />
+        <RibbonCommandLargeButton
+          commandId="pref:hover-outline"
+          icon={Select}
+          active={hoverHighlightEnabled}
         />
       </RibbonGroup>
 
       <RibbonGroupDivider />
 
-      <RibbonGroup label={hasSelection ? `Selection · ${selectionCount}` : 'Selection'}>
-        <RibbonLargeButton
+      <RibbonGroup label={hasSelection ? t('ribbon.elements.selectionGroupCount', { count: selectionCount }) : t('ribbon.elements.selectionGroup')}>
+        <RibbonCommandLargeButton
+          commandId="vis:isolate"
           icon={IsolateSelected}
-          label="Isolate"
-          tooltip="Isolate selection (set basket)"
-          shortcut="I"
           disabled={!hasSelection}
-          onClick={() => executeBasketIsolate()}
         />
-        <RibbonLargeButton
+        <RibbonCommandLargeButton
+          commandId="vis:hide"
           icon={HideSelected}
-          label="Hide"
-          tooltip="Hide selection"
-          shortcut="Del / Space"
           disabled={!hasSelection}
-          onClick={handleHide}
         />
         <RibbonSmallStack>
-          <RibbonSmallButton
+          <RibbonCommandSmallButton
+            commandId="view:frame"
             icon={FocusSelected}
-            label="Frame"
-            tooltip="Frame selection"
-            shortcut="F"
             disabled={!hasSelection}
-            onClick={() => cameraCallbacks.frameSelection?.()}
           />
-          <RibbonSmallButton
+          <RibbonCommandSmallButton
+            commandId="context:copy-global-id"
             icon={CopyGuid}
-            label="Copy guid"
-            tooltip="Copy GlobalID"
             disabled={selectedEntityId === null}
-            onClick={handleCopyGuid}
+            commandContext={{ contextAction: handleCopyGuid }}
+          />
+          <RibbonCommandSmallButton
+            commandId="elements:entity-actions"
+            icon={EntityActions}
+            disabled={!hasSelection}
+            commandContext={(event) => ({
+              contextAction: () => {
+                const targetId = selectedEntityIds.size > 0
+                  ? (selectedEntityId !== null && selectedEntityIds.has(selectedEntityId)
+                      ? selectedEntityId : selectedEntityIds.values().next().value)
+                  : selectedEntityId;
+                if (targetId === undefined || targetId === null) return;
+                const rect = event.currentTarget.getBoundingClientRect();
+                openContextMenu(targetId, Math.max(1, rect.left + rect.width / 2), Math.max(1, rect.bottom));
+              },
+            })}
           />
         </RibbonSmallStack>
       </RibbonGroup>
 
       <RibbonGroupDivider />
 
-      <RibbonGroup label="Hierarchy">
-        <RibbonLargeButton
+      <RibbonGroup label={t('ribbon.elements.hierarchyGroup')}>
+        <RibbonCommandLargeButton
+          commandId="elements:spatial"
           icon={Spatial}
-          label="Spatial"
-          tooltip="Displays ifc spatial structure"
           active={hierarchyMode === 'spatial'}
-          onClick={() => handleHierarchyMode('spatial')}
         />
-        <RibbonLargeButton
+        <RibbonCommandLargeButton
+          commandId="elements:class"
           icon={Class}
-          label="Class"
-          tooltip="Displays class of elements"
           active={hierarchyMode === 'type'}
-          onClick={() => handleHierarchyMode('type')}
         />
-        <RibbonLargeButton
+        <RibbonCommandLargeButton
+          commandId="elements:type"
           icon={Type}
-          label="Type"
-          tooltip="Displays type of elements"
           active={hierarchyMode === 'ifc-type'}
-          onClick={() => handleHierarchyMode('ifc-type')}
         />
-        <RibbonLargeButton
+        <RibbonCommandLargeButton
+          commandId="elements:materials"
           icon={Material}
-          label="Materials"
-          tooltip="Displays materials of the model"
           active={hierarchyMode === 'material'}
-          onClick={() => handleHierarchyMode('material')}
         />
-        <RibbonLargeButton
+        <RibbonCommandLargeButton
+          commandId="elements:groups"
           icon={Group}
-          label="Groups"
-          tooltip="Displays groups of the model"
           active={hierarchyMode === 'groups'}
-          onClick={() => handleHierarchyMode('groups')}
         />
       </RibbonGroup>
       <RibbonGroupDivider />
 
-      <RibbonGroup label="Visibility">
+      <RibbonGroup label={t('ribbon.elements.visibilityGroup')}>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
-            <RibbonLargeButton
+            <RibbonCommandLargeButton
+              commandId="elements:class-filter"
+              triggerOnly
               icon={ClassVisibility}
-              label="Filter"
               hasMenu
               tooltip={mergeLayers
-                ? `Class visibility (${visibleClassCount} on) · Merge Multilayer Walls is on`
-                : `Class visibility (${visibleClassCount} on)`}
+                ? t('ribbon.elements.filterMergedTooltip', { count: visibleClassCount })
+                : t('ribbon.elements.filterTooltip', { count: visibleClassCount })}
               badge={mergeLayers ? (
                 // Tiny accent dot announcing that a non-default load
                 // setting is active. Decorative — semantics live on the
@@ -202,6 +175,22 @@ export function ElementsTab() {
           </DropdownMenuTrigger>
           <ClassVisibilityMenuContent align="start" />
         </DropdownMenu>
+        <RibbonSmallStack>
+          {[toggleCollection, resetColors].map((command) => (
+            <RibbonCommandSmallButton
+              key={command.id}
+              commandId={command.id}
+              tooltip={t(command.labelKey)}
+              disabled={!command.enabled({ canEditInSession })}
+              commandContext={{
+                resetColors: () => {
+                  if (!bim) throw new Error('Reset Colors requires a BimProvider');
+                  bim.viewer.resetColors();
+                },
+              }}
+            />
+          ))}
+        </RibbonSmallStack>
       </RibbonGroup>
     </>
   );

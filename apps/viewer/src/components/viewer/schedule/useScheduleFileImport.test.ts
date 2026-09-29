@@ -25,7 +25,7 @@ import type { ScheduleImportResult } from './import/index.js';
 
 function makeResult(over: Partial<ScheduleImportResult> = {}): ScheduleImportResult {
   return {
-    extraction: { workSchedules: [], tasks: [], sequences: [], hasSchedule: true },
+    extraction: { workSchedules: [], tasks: [], sequences: [], hasSchedule: true, workCalendars: [] },
     warnings: [],
     format: 'csv',
     taskCount: 3,

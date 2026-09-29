@@ -25,6 +25,7 @@ import { Play, AlertCircle, Download, ListPlus, Equal } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { useViewerStore } from '@/store';
 import { toGlobalIdFromModels } from '@/store/globalId';
+import { useTranslation } from '@/i18n';
 import { Button } from '@/components/ui/button';
 import {
   DropdownMenu,
@@ -33,7 +34,9 @@ import {
   DropdownMenuItem,
 } from '@/components/ui/dropdown-menu';
 import { cn } from '@/lib/utils';
-import { evaluateFilterRulesFederated } from '@/lib/search/filter-evaluate';
+import { evaluateFilterGroupsFederated } from '@ifc-lite/rules';
+import { totalRuleCount } from '@ifc-lite/rules';
+import { definedModelTagIdsOf, evaluatorModelsFromState } from '@/lib/model-tags/evaluator-models';
 import { runTier0Scan, type ScanModel } from '@/lib/search/tier0-scan';
 import { queryTier1Indexes, type Tier1Index } from '@/lib/search/tier1-index';
 import { downloadResult } from '@/lib/search/result-export';
@@ -47,6 +50,7 @@ import { selectionKeyColumnIndex } from '@/lib/search/selection-key-column';
 import type { ListDefinition } from '@/lib/lists';
 import { toast } from '@/components/ui/toast';
 import { SearchModalFilterBuilder } from './SearchModal.filter.builder';
+import { RuleSummary } from './SearchModal.filter.ruleSummary';
 
 /** Rows per virtualizer page — tuned for the result table row height. */
 const RESULT_ROW_HEIGHT = 28;
@@ -55,6 +59,7 @@ const FILTER_CHUNK_SIZE = 20_000;
 const DEFAULT_LIMIT = 5_000;
 
 export function SearchModalFilter() {
+  const { t } = useTranslation();
   const {
     searchFilter,
     searchFilterResult,
@@ -114,6 +119,7 @@ export function SearchModalFilter() {
   const activeModel = activeModelId ? models.get(activeModelId) : undefined;
   const activeStore = activeModel?.ifcDataStore ?? null;
   const multiModel = models.size > 1;
+  const filterRuleCount = totalRuleCount(searchFilter.groups);
 
   // ── Run lifecycle: progress, cancel, limit-hit badge ──────────────────
   const runController = useRef<AbortController | null>(null);
@@ -122,8 +128,8 @@ export function SearchModalFilter() {
 
   const runFilter = useCallback(async () => {
     if (searchFilterRunning) return;
-    if (searchFilter.rules.length === 0) {
-      setSearchFilterError('Add at least one rule before running.');
+    if (totalRuleCount(searchFilter.groups) === 0) {
+      setSearchFilterError(t('searchModal.filterRun.noRulesError'));
       return;
     }
 
@@ -138,10 +144,8 @@ export function SearchModalFilter() {
 
     const start = performance.now();
     try {
-      const modelArgs: Array<{ id: string; store: typeof activeStore }> = [];
-      for (const m of models.values()) {
-        if (m.ifcDataStore) modelArgs.push({ id: m.id, store: m.ifcDataStore });
-      }
+      // Tag sets are read here, once — the run's membership is a snapshot (#4215).
+      const modelArgs = evaluatorModelsFromState(useViewerStore.getState()).filter((m) => m.store);
 
       // Fold the inline search query in as a Tier-1/Tier-0 candidate
       // set when present. Empty query → no narrowing (full scan with
@@ -181,12 +185,12 @@ export function SearchModalFilter() {
       }
 
       const limit = searchFilter.limit > 0 ? searchFilter.limit : DEFAULT_LIMIT;
-      const matched = await evaluateFilterRulesFederated(
+      const matched = await evaluateFilterGroupsFederated(
         modelArgs,
-        searchFilter.rules,
-        searchFilter.combinator,
+        searchFilter.groups,
         {
           limit,
+          definedModelTagIds: definedModelTagIdsOf(useViewerStore.getState()),
           chunkSize: FILTER_CHUNK_SIZE,
           candidateExpressIdsByModel: candidatesByModel,
           signal: controller.signal,
@@ -242,7 +246,7 @@ export function SearchModalFilter() {
   useEffect(() => {
     if (!autoRunPending) return;
     setAutoRunPending(false);
-    if (searchFilter.rules.length === 0) {
+    if (totalRuleCount(searchFilter.groups) === 0) {
       // Hierarchy cleared the last rule — drop the stale table rather than
       // run an empty filter (which the runner rejects anyway).
       setSearchFilterResult(null);
@@ -251,7 +255,7 @@ export function SearchModalFilter() {
     }
   }, [
     autoRunPending,
-    searchFilter.rules.length,
+    searchFilter.groups,
     searchFilterRunning,
     setAutoRunPending,
     setSearchFilterResult,
@@ -330,7 +334,7 @@ export function SearchModalFilter() {
       (r) => r.modelId === rowModelId && r.expressId === expressId,
     );
     if (cycleIndex >= 0) {
-      enterVimCycle(`filter: ${searchFilter.rules.length} rule${searchFilter.rules.length === 1 ? '' : 's'}`, cycleResults, cycleIndex);
+      enterVimCycle(`filter: ${filterRuleCount} rule${filterRuleCount === 1 ? '' : 's'}`, cycleResults, cycleIndex);
     }
     // Close the modal so the framing is actually visible. The dialog overlay
     // is `fixed inset-0 bg-black/80` (ui/dialog.tsx:23), so without this the
@@ -343,7 +347,7 @@ export function SearchModalFilter() {
     // (store/index.ts:544), never on close, so reopening shows the same table
     // without re-running the filter.
     setSearchModalOpen(false);
-  }, [activeModelId, cameraCallbacks, cycleResults, enterVimCycle, models, modelIdColumnIndex, searchFilter.rules.length, selectionKeyIndex, setSearchModalOpen, setSelectedEntity, setSelectedEntityId, setSelectedEntityIds]);
+  }, [activeModelId, cameraCallbacks, cycleResults, enterVimCycle, models, modelIdColumnIndex, filterRuleCount, selectionKeyIndex, setSearchModalOpen, setSelectedEntity, setSelectedEntityId, setSelectedEntityIds]);
 
   const handleExport = useCallback((format: 'csv' | 'json') => {
     if (!searchFilterResult || searchFilterResult.rows.length === 0) return;
@@ -379,7 +383,7 @@ export function SearchModalFilter() {
     });
 
     if (globalIds.length === 0) {
-      toast.error('Nothing to isolate — every matched row belongs to a model that is no longer loaded.');
+      toast.error(t('searchModal.filterRun.nothingToIsolate'));
       return;
     }
 
@@ -441,7 +445,7 @@ export function SearchModalFilter() {
     if (alreadyIsolated) {
       isolateEntities(isolationIds);
       setSelectedEntityIds([]);
-      toast.info('Isolation cleared — showing the full model.');
+      toast.info(t('searchModal.filterRun.isolationCleared'));
       setSearchModalOpen(false);
       return;
     }
@@ -483,7 +487,7 @@ export function SearchModalFilter() {
     setSelectedEntityIds([...isolationIds, ...globalIds]);
 
     if (limitHit !== null) {
-      toast.info(`Isolating the first ${limitHit.toLocaleString()} matches — the filter hit its row limit.`);
+      toast.info(t('searchModal.filterRun.isolatingLimited', { limit: limitHit.toLocaleString() }));
     }
 
     // frameEntities takes the explicit id set directly rather than reading it
@@ -534,7 +538,7 @@ export function SearchModalFilter() {
       { id: 'attr-class', source: 'attribute', propertyName: 'Class', label: 'Class' },
     ];
     const seenCol = new Set<string>();
-    for (const rule of searchFilter.rules) {
+    for (const rule of searchFilter.groups.flatMap((g) => g.rules)) {
       if (rule.kind === 'property' && rule.setName && rule.propertyName) {
         const key = `property:${rule.setName}:${rule.propertyName}`;
         if (seenCol.has(key)) continue;
@@ -568,23 +572,23 @@ export function SearchModalFilter() {
       updatedAt: now,
       entityTypes: [],
       expressIdsByModel: byModel,
-      conditions: [],
+      groups: [],
       columns,
     };
     setPendingListDraft(draft);
     setListPanelVisible(true);
     setSearchModalOpen(false);
-  }, [searchFilterResult, searchFilter.rules, activeModelId, setPendingListDraft, setListPanelVisible, setSearchModalOpen]);
+  }, [searchFilterResult, searchFilter.groups, activeModelId, setPendingListDraft, setListPanelVisible, setSearchModalOpen]);
 
   if (!activeStore) {
     return (
       <div className="flex flex-1 items-center justify-center p-8 text-center text-sm text-muted-foreground">
-        Load an IFC file first — the filter runs against the active model&apos;s data.
+        {t('searchModal.filterRun.noModelLoaded')}
       </div>
     );
   }
 
-  const canRun = searchFilter.rules.length > 0;
+  const canRun = filterRuleCount > 0;
 
   return (
     <div className="flex flex-1 min-h-0 flex-col">
@@ -596,10 +600,11 @@ export function SearchModalFilter() {
       </div>
 
       {/* ── Run bar: status · run/cancel · export ──────────────────────── */}
-      <div className="flex items-center gap-2 border-b px-3 py-2 text-[11px]">
+      <div className="flex items-center gap-2 border-b px-3 py-2 text-2xs">
         <RuleSummary
-          ruleCount={searchFilter.rules.length}
-          combinator={searchFilter.combinator}
+          ruleCount={filterRuleCount}
+          groupCount={searchFilter.groups.length}
+          combinator={searchFilter.groups[0]?.combinator ?? 'AND'}
           limit={searchFilter.limit}
         />
 
@@ -620,22 +625,25 @@ export function SearchModalFilter() {
         )}
         {progress && progress.total <= 0 && (
           <span className="font-mono text-muted-foreground">
-            scanned {progress.scanned.toLocaleString()}
+            {t('searchModal.filterRun.scannedCount', { count: progress.scanned.toLocaleString() })}
           </span>
         )}
 
         {!searchFilterRunning && limitHit !== null && (
           <span
-            className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-900 dark:bg-amber-900/40 dark:text-amber-200"
-            title="Increase the limit or narrow the rules to see more matches"
+            className="rounded bg-amber-100 px-1.5 py-0.5 text-2xs font-semibold text-amber-900 dark:bg-amber-900/40 dark:text-amber-200"
+            title={t('searchModal.filterRun.limitedToTitle')}
           >
-            limited to {limitHit.toLocaleString()}
+            {t('searchModal.filterRun.limitedToBadge', { limit: limitHit.toLocaleString() })}
           </span>
         )}
 
         {searchFilterResult && !searchFilterRunning && (
           <span className="text-muted-foreground">
-            ⏱ {searchFilterResult.runMs} ms · {searchFilterResult.rows.length.toLocaleString()} rows
+            {t('searchModal.filterRun.timingSummary', {
+              runMs: searchFilterResult.runMs,
+              rows: searchFilterResult.rows.length.toLocaleString(),
+            })}
           </span>
         )}
 
@@ -646,9 +654,9 @@ export function SearchModalFilter() {
             disabled={!searchFilterResult || searchFilterResult.rows.length === 0}
             onClick={handleCreateList}
             className="h-7 gap-1 text-xs"
-            title="Freeze these results into a new list"
+            title={t('searchModal.filterRun.createListTitle')}
           >
-            <ListPlus className="h-3 w-3" /> Create list
+            <ListPlus className="h-3 w-3" /> {t('searchModal.filterRun.createListLabel')}
           </Button>
           <Button
             variant="ghost"
@@ -656,9 +664,9 @@ export function SearchModalFilter() {
             disabled={!searchFilterResult || searchFilterResult.rows.length === 0}
             onClick={handleIsolateResult}
             className="h-7 gap-1 text-xs"
-            title="Isolate these results in the 3D view"
+            title={t('searchModal.filterRun.isolateTitle')}
           >
-            <Equal className="h-3 w-3" /> Isolate in 3D
+            <Equal className="h-3 w-3" /> {t('searchModal.filterRun.isolateLabel')}
           </Button>
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
@@ -667,17 +675,17 @@ export function SearchModalFilter() {
                 size="sm"
                 disabled={!searchFilterResult || searchFilterResult.rows.length === 0}
                 className="h-7 gap-1 text-xs"
-                title="Export results"
+                title={t('searchModal.filterRun.exportTitle')}
               >
-                <Download className="h-3 w-3" /> Export
+                <Download className="h-3 w-3" /> {t('searchModal.filterRun.exportLabel')}
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
               <DropdownMenuItem onSelect={() => handleExport('csv')}>
-                Download CSV
+                {t('searchModal.filterRun.downloadCsv')}
               </DropdownMenuItem>
               <DropdownMenuItem onSelect={() => handleExport('json')}>
-                Download JSON
+                {t('searchModal.filterRun.downloadJson')}
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
@@ -689,7 +697,7 @@ export function SearchModalFilter() {
               onClick={cancelFilter}
               className="h-7 gap-1 text-xs"
             >
-              Cancel
+              {t('searchModal.filterRun.cancel')}
             </Button>
           ) : (
             <Button
@@ -698,19 +706,18 @@ export function SearchModalFilter() {
               onClick={runFilter}
               disabled={!canRun}
               className="h-7 gap-1 text-xs"
-              title={canRun ? 'Run the filter against every loaded model' : 'Add a rule first'}
+              title={t(canRun ? 'searchModal.filterRun.runTitleReady' : 'searchModal.filterRun.runTitleDisabled')}
             >
               <Play className="h-3 w-3" />
-              Run
+              {t('searchModal.filterRun.run')}
             </Button>
           )}
         </div>
       </div>
 
       {multiModel && (
-        <div className="border-b bg-zinc-50 px-3 py-1.5 text-[11px] text-muted-foreground dark:bg-zinc-900/30">
-          Filtering across all {models.size} loaded models. Click any row to
-          select that element in the right model.
+        <div className="border-b bg-zinc-50 px-3 py-1.5 text-2xs text-muted-foreground dark:bg-zinc-900/30">
+          {t('searchModal.filterRun.multiModelNote', { count: models.size })}
         </div>
       )}
 
@@ -727,42 +734,14 @@ export function SearchModalFilter() {
 
 // ── Sub-components ────────────────────────────────────────────────────
 
-function RuleSummary({
-  ruleCount,
-  combinator,
-  limit,
-}: {
-  ruleCount: number;
-  combinator: 'AND' | 'OR';
-  limit: number;
-}) {
-  if (ruleCount === 0) {
-    return (
-      <span className="text-muted-foreground italic">No rules — add one to run.</span>
-    );
-  }
-  return (
-    <span className="text-muted-foreground">
-      <span className="font-mono text-foreground">{ruleCount}</span>{' '}
-      rule{ruleCount === 1 ? '' : 's'}
-      <span className="mx-1">·</span>
-      <span className="font-mono">{combinator}</span>
-      <span className="mx-1">·</span>
-      limit{' '}
-      <span className="font-mono text-foreground">
-        {limit > 0 ? limit.toLocaleString() : '∞'}
-      </span>
-    </span>
-  );
-}
-
 function FilterErrorBox({ raw }: { raw: string }) {
+  const { t } = useTranslation();
   return (
     <div className="border-b bg-red-50/50 px-4 py-3 dark:bg-red-950/20">
       <div className="flex items-start gap-2">
         <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-600 dark:text-red-400" />
         <div className="min-w-0 flex-1 text-xs">
-          <div className="font-semibold text-red-900 dark:text-red-200">Filter failed</div>
+          <div className="font-semibold text-red-900 dark:text-red-200">{t('searchModal.filterRun.filterFailed')}</div>
           <div className="mt-1 break-words text-red-800 dark:text-red-300">{raw}</div>
         </div>
       </div>
@@ -777,6 +756,7 @@ interface FilterResultTableProps {
 }
 
 function FilterResultTable({ result, selectionKeyIndex, onRowClick }: FilterResultTableProps) {
+  const { t } = useTranslation();
   const scrollRef = useRef<HTMLDivElement>(null);
   const virtualizer = useVirtualizer({
     count: result?.rows.length ?? 0,
@@ -788,7 +768,7 @@ function FilterResultTable({ result, selectionKeyIndex, onRowClick }: FilterResu
   if (!result) {
     return (
       <div className="flex flex-1 items-center justify-center text-xs text-muted-foreground">
-        Add rules and click Run.
+        {t('searchModal.filterRun.addRulesPrompt')}
       </div>
     );
   }
@@ -796,14 +776,14 @@ function FilterResultTable({ result, selectionKeyIndex, onRowClick }: FilterResu
   if (result.rows.length === 0) {
     return (
       <div className="flex flex-1 items-center justify-center text-xs text-muted-foreground">
-        0 matches — broaden the rules, lower the limit, or try OR.
+        {t('searchModal.filterRun.noMatches')}
       </div>
     );
   }
 
   return (
     <div className="flex flex-1 min-h-0 flex-col">
-      <div className="flex items-center border-b bg-zinc-50/50 px-3 py-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground dark:bg-zinc-900/30">
+      <div className="flex items-center border-b bg-zinc-50/50 px-3 py-1 text-2xs font-semibold uppercase tracking-wider text-muted-foreground dark:bg-zinc-900/30">
         {result.columns.map((c) => (
           <div key={c} className="flex-1 truncate px-2 font-mono">
             {c}
@@ -816,7 +796,7 @@ function FilterResultTable({ result, selectionKeyIndex, onRowClick }: FilterResu
             const row = result.rows[vRow.index];
             const clickable = selectionKeyIndex >= 0;
             return (
-              <div
+              <button type="button" disabled={!clickable}
                 key={vRow.key}
                 style={{
                   position: 'absolute',
@@ -827,17 +807,17 @@ function FilterResultTable({ result, selectionKeyIndex, onRowClick }: FilterResu
                   transform: `translateY(${vRow.start}px)`,
                 }}
                 className={cn(
-                  'flex items-center border-b border-zinc-100 px-3 text-[11px] dark:border-zinc-900',
+                  'flex w-full items-center border-b border-zinc-100 px-3 text-left text-2xs dark:border-zinc-900 focus-visible:ring-2 focus-visible:ring-ring',
                   clickable && 'cursor-pointer hover:bg-zinc-100 dark:hover:bg-zinc-800',
                 )}
-                onClick={() => clickable && onRowClick(row)}
+                onClick={() => onRowClick(row)}
               >
                 {result.columns.map((_, i) => (
-                  <div key={i} className="flex-1 truncate px-2 font-mono">
+                  <span key={i} className="flex-1 truncate px-2 font-mono">
                     {formatCell(row[i])}
-                  </div>
+                  </span>
                 ))}
-              </div>
+              </button>
             );
           })}
         </div>

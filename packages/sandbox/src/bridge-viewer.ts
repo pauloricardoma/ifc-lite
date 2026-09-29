@@ -96,12 +96,15 @@ export function buildViewerNamespace(): NamespaceSchema {
       },
       {
         name: 'resetColors',
-        doc: 'Reset colors. Omit entities (or pass none) to reset every color override; pass entities to reset only theirs.',
-        args: ['entityRefs'],
+        doc: 'Reset colors. Omit entities to reset every color override; an empty list is a no-op; pass entities to reset only theirs.',
+        // Unlike export.ifc's nullish optional list, null remains a script
+        // error here: treating it as absence would turn a typo into a global
+        // destructive reset (#4789).
+        args: ['entityRefsUndefined?'],
         paramNames: ['entities'],
         tsParamTypes: ['BimEntity[] | undefined'],
         call: (sdk, args) => {
-          sdk.viewer.resetColors(args[0] as EntityRef[]);
+          sdk.viewer.resetColors(args[0] as EntityRef[] | undefined);
         },
         returns: 'void',
       },

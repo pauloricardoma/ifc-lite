@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * BCFPanel - BIM Collaboration Format issue management panel
+ * BCFPanel - BIM Collaboration Format topic management panel
  *
  * Provides:
  * - Topic list with filtering
@@ -15,22 +15,22 @@
 
 import React, { useCallback, useEffect, useState, useMemo, useRef } from 'react';
 import {
-  X,
   MessageSquare,
   Upload,
-  Download,
   User,
   MapPin,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { IconButton } from '@/components/ui/icon-button';
 import { tourAnchor, TOUR_ANCHORS } from '@/lib/tours/anchors';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { useViewerStore } from '@/store';
-import { posthog } from '@/lib/analytics';
+import { posthog, trackExportCompleted } from '@/lib/analytics';
+import { toast } from '@/components/ui/toast';
+import { useTranslation } from '@/i18n';
 import type { BCFTopic, BCFViewpoint } from '@ifc-lite/bcf';
 import {
-  readBCF,
   writeBCF,
   createBCFProject,
   createBCFTopic,
@@ -41,9 +41,12 @@ import { BCFTopicList } from './bcf/BCFTopicList';
 import { BCFTopicDetail } from './bcf/BCFTopicDetail';
 import { BCFCreateTopicForm } from './bcf/BCFCreateTopicForm';
 import { BCFServerControl } from './bcf/BCFServerControl';
+import { AnalysisPanel } from './analysis/AnalysisPanel';
+import { AnalysisExportMenu } from './analysis/AnalysisExportMenu';
 import { openGenericFileDialog } from '@/services/file-dialog';
 import { downloadBlob, sanitizeFilename } from '@/lib/export/download';
-
+import { readBCFWithDiagnostics, warnIfNoModelLoaded, warnIfImportTruncated, warnIfUnsupportedVersion } from './bcf/bcfImportGuidance';
+import { useSectionViewpointCapture } from '@/hooks/bcf/useSectionViewpointCapture';
 // ============================================================================
 // Main BCF Panel Component
 // ============================================================================
@@ -52,6 +55,7 @@ interface BCFPanelProps {
 }
 
 export function BCFPanel({ onClose }: BCFPanelProps) {
+  const { t } = useTranslation();
   const fileInputRef = useRef<HTMLInputElement>(null);
   // Store state
   const bcfProject = useViewerStore((s) => s.bcfProject);
@@ -85,14 +89,25 @@ export function BCFPanel({ onClose }: BCFPanelProps) {
     }
     return count;
   }, [selectedEntityId, selectedEntityIds]);
-  const hasIsolation = isolatedEntities !== null && isolatedEntities.size > 0;
+  // `isolatedEntities` is meaningfully nullable (`Set<number> | null`):
+  // `null` means no isolation channel is active, while a non-null Set --
+  // EMPTY included -- means one is and currently matches nothing (the
+  // convention `packages/renderer/src/entity-visibility.ts`'s
+  // `isEntityVisible` already enforces). A `.size > 0` check would read an
+  // active-but-empty isolate (reachable via `pinboardSlice.ts`'s
+  // `addToBasket`/`removeFromBasket` aliasing two `EntityRef`s onto one
+  // globalId, #4509) as "no isolation" and show "Hidden objects" -- or
+  // nothing at all -- instead of correctly reflecting that isolation is
+  // active. `useBCF.ts`'s `createViewpointFromState` has the same guard.
+  const hasIsolation = isolatedEntities !== null;
   const hasHiddenEntities = hiddenEntities.size > 0;
   const setBcfError = useViewerStore((s) => s.setBcfError);
+  const bcfError = useViewerStore((s) => s.bcfError);
+  const bcfLoading = useViewerStore((s) => s.bcfLoading);
   const models = useViewerStore((s) => s.models);
 
-  // BCF hook for camera/snapshot integration
-  const { createViewpointFromState, headerFilesForViewpoints, applyViewpoint, zoomToTopic, canZoomToTopic } = useBCF();
-
+  const { createViewpointFromState, headerFilesForViewpoints, applyViewpoint, zoomToTopic, canZoomToTopic } = useBCF({ restoreSectionOnUnmount: true });
+  const sectionCapture = useSectionViewpointCapture(createViewpointFromState);
   // Local state
   const [statusFilter, setStatusFilter] = useState('all');
   const [showCreateForm, setShowCreateForm] = useState(false);
@@ -121,15 +136,15 @@ export function BCFPanel({ onClose }: BCFPanelProps) {
     if (models.size === 0) {
       // No models loaded, use date-based name
       const date = new Date().toISOString().split('T')[0];
-      return `BCF_Issues_${date}`;
+      return `BCF_Topics_${date}`;
     }
-    // Use first model's name (without extension) + "_Issues"
+    // Use first model's name (without extension) + "_Topics"
     const firstModel = models.values().next().value;
     if (firstModel?.name) {
       const baseName = firstModel.name.replace(/\.(ifc|ifczip)$/i, '');
-      return `${baseName}_Issues`;
+      return `${baseName}_Topics`;
     }
-    return `BCF_Issues_${new Date().toISOString().split('T')[0]}`;
+    return `BCF_Topics_${new Date().toISOString().split('T')[0]}`;
   }, [models]);
 
   // Initialize project if needed
@@ -146,16 +161,17 @@ export function BCFPanel({ onClose }: BCFPanelProps) {
     try {
       setBcfLoading(true);
       setBcfError(null);
-      const project = await readBCF(file);
+      const { project, readWarningCount, versionWarning } = await readBCFWithDiagnostics(file);
       setBcfProject(project);
+      warnIfNoModelLoaded(useViewerStore.getState().models.size);
+      warnIfImportTruncated(readWarningCount);
+      warnIfUnsupportedVersion(versionWarning);
     } catch (error) {
       console.error('Failed to import BCF:', error);
-      setBcfError(error instanceof Error ? error.message : 'Failed to import BCF file');
+      setBcfError(error instanceof Error ? error.message : t('bcf.panel.importError'));
     } finally {
       setBcfLoading(false);
-      if (fileInputRef.current) {
-        fileInputRef.current.value = '';
-      }
+      if (fileInputRef.current) fileInputRef.current.value = '';
     }
   }, [setBcfProject, setBcfLoading, setBcfError]);
 
@@ -165,10 +181,10 @@ export function BCFPanel({ onClose }: BCFPanelProps) {
 
   const importFromDialog = useCallback(async (): Promise<boolean> => {
     const file = await openGenericFileDialog({
-      title: 'Import BCF File',
+      title: t('bcf.panel.importDialogTitle'),
       filters: [
-        { name: 'BCF Files', extensions: ['bcfzip', 'bcf'] },
-        { name: 'All Files', extensions: ['*'] },
+        { name: t('bcf.panel.bcfFilterName'), extensions: ['bcfzip', 'bcf'] },
+        { name: t('bcf.panel.allFilesFilterName'), extensions: ['*'] },
       ],
     });
     if (file) {
@@ -179,33 +195,30 @@ export function BCFPanel({ onClose }: BCFPanelProps) {
   }, [handleImportFile]);
 
   const handleImportClick = useCallback(async () => {
-    const imported = await importFromDialog();
-    if (imported) {
-      return;
-    }
+    if (await importFromDialog()) return;
     fileInputRef.current?.click();
   }, [importFromDialog]);
 
   // Export BCF file
   const handleExport = useCallback(async () => {
     if (!bcfProject) return;
-
     try {
       setBcfLoading(true);
+      setBcfError(null);
       const blob = await writeBCF(bcfProject);
       // Use project name, or generate from model name, or date-based fallback
-      const fileName = sanitizeFilename(bcfProject.name || getDefaultProjectName(), { fallback: 'issues' });
+      const fileName = sanitizeFilename(bcfProject.name || getDefaultProjectName(), { fallback: 'topics' });
       downloadBlob(blob, `${fileName}.bcfzip`);
+      trackExportCompleted({ format: 'bcfzip', surface: 'bcf_panel', topic_count: bcfProject.topics.size });
       posthog.capture('bcf_exported', { topic_count: bcfProject.topics.size });
     } catch (error) {
       console.error('Failed to export BCF:', error);
-      setBcfError(error instanceof Error ? error.message : 'Failed to export BCF file');
+      setBcfError(error instanceof Error ? error.message : t('bcf.panel.exportError'));
     } finally {
       setBcfLoading(false);
     }
   }, [bcfProject, setBcfLoading, setBcfError, getDefaultProjectName]);
 
-  // Create new topic
   // Capture the current view (camera + snapshot + selection) for the create
   // form's preview and the new topic's attached viewpoint.
   const captureCreateViewpoint = useCallback(async () => {
@@ -254,7 +267,7 @@ export function BCFPanel({ onClose }: BCFPanelProps) {
         });
       }
       const topic = createBCFTopic({
-        title: data.title || 'Untitled',
+        title: data.title || t('bcf.panel.untitledTopic'),
         description: data.description,
         author: bcfAuthor,
         topicType: data.topicType,
@@ -294,7 +307,6 @@ export function BCFPanel({ onClose }: BCFPanelProps) {
     [activeTopicId, bcfAuthor, addComment]
   );
 
-  // Capture viewpoint from current viewer state
   const handleCaptureViewpoint = useCallback(async () => {
     if (!activeTopicId) return;
 
@@ -308,9 +320,9 @@ export function BCFPanel({ onClose }: BCFPanelProps) {
     if (viewpoint) {
       addViewpoint(activeTopicId, viewpoint);
     } else {
-      console.warn('[BCFPanel] Failed to capture viewpoint - no camera available');
+      toast.error(t('bcf.panel.captureViewpointFailed'));
     }
-  }, [activeTopicId, addViewpoint, createViewpointFromState]);
+  }, [activeTopicId, addViewpoint, createViewpointFromState, t]);
 
   // Activate viewpoint - apply camera and state to viewer
   const handleActivateViewpoint = useCallback((viewpoint: BCFViewpoint) => {
@@ -346,7 +358,7 @@ export function BCFPanel({ onClose }: BCFPanelProps) {
     (data: Partial<BCFTopic>) => {
       if (!activeTopicId) return;
       updateTopic(activeTopicId, {
-        title: data.title?.trim() || activeTopic?.title || 'Untitled',
+        title: data.title?.trim() || activeTopic?.title || t('bcf.panel.untitledTopic'),
         description: data.description,
         topicType: data.topicType,
         topicStatus: data.topicStatus,
@@ -378,19 +390,20 @@ export function BCFPanel({ onClose }: BCFPanelProps) {
   }, [tempAuthor, setBcfAuthor]);
 
   return (
-    <div className="flex flex-col h-full bg-background">
-      {/* Header */}
-      <div className="flex items-center justify-between px-3 py-2 border-b border-border">
-        <div className="flex items-center gap-2">
-          <MessageSquare className="h-4 w-4" />
-          <h2 className="font-medium text-sm">BCF Issues</h2>
-          {topics.length > 0 && (
-            <Badge variant="secondary" className="text-xs">
-              {topics.length}
-            </Badge>
-          )}
-        </div>
-        <div className="flex items-center gap-1">
+    <AnalysisPanel
+      icon={<MessageSquare />}
+      title={t('bcf.panel.title')}
+      badge={topics.length > 0 && (
+        <Badge variant="secondary" className="text-xs">
+          {topics.length}
+        </Badge>
+      )}
+      onClose={onClose}
+      error={bcfError}
+      onDismissError={() => setBcfError(null)}
+      progress={bcfLoading ? { label: t('bcf.panel.busy') } : null}
+      actions={(
+        <>
           <input
             ref={fileInputRef}
             type="file"
@@ -398,54 +411,41 @@ export function BCFPanel({ onClose }: BCFPanelProps) {
             onChange={handleImport}
             className="hidden"
           />
-          <Button
-            variant="ghost"
-            size="icon"
+          <IconButton
+            label={t('bcf.panel.importTitle')}
             className="h-7 w-7"
             onClick={() => { void handleImportClick(); }}
-            title="Import BCF"
           >
             <Upload className="h-4 w-4" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-7 w-7"
-            onClick={handleExport}
+          </IconButton>
+          <AnalysisExportMenu
+            compact
             disabled={!bcfProject || topics.length === 0}
-            title="Export BCF"
-            {...tourAnchor(TOUR_ANCHORS.bcfExport)}
-          >
-            <Download className="h-4 w-4" />
-          </Button>
+            formats={[{ id: 'bcfzip', label: t('bcf.panel.formatBcfzip'), title: t('bcf.panel.exportTitle'), onExport: () => { void handleExport(); } }]}
+            buttonProps={tourAnchor(TOUR_ANCHORS.bcfExport)}
+          />
           <BCFServerControl />
-          <Button
+          <IconButton
+            label={bcfOverlayVisible ? t('bcf.panel.hideMarkers') : t('bcf.panel.showMarkers')}
             variant={bcfOverlayVisible ? 'secondary' : 'ghost'}
-            size="icon"
             className="h-7 w-7"
             onClick={toggleBcfOverlay}
-            title={bcfOverlayVisible ? 'Hide 3D markers' : 'Show 3D markers'}
           >
             <MapPin className="h-4 w-4" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
+          </IconButton>
+          <IconButton
+            label={t('bcf.panel.setAuthorTitle')}
             className="h-7 w-7"
             onClick={() => {
               setTempAuthor(bcfAuthor);
               setShowAuthorDialog(true);
             }}
-            title="Set author"
           >
             <User className="h-4 w-4" />
-          </Button>
-          <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="Close" onClick={onClose}>
-            <X className="h-4 w-4" />
-          </Button>
-        </div>
-      </div>
-
+          </IconButton>
+        </>
+      )}
+    >
       {/* Content */}
       <div className="flex-1 overflow-hidden relative">
         {showCreateForm ? (
@@ -470,8 +470,8 @@ export function BCFPanel({ onClose }: BCFPanelProps) {
               onCancel={() => setShowEditForm(false)}
               author={bcfAuthor}
               initialTopic={activeTopic}
-              heading="Edit Topic"
-              submitLabel="Save Changes"
+              heading={t('bcf.createForm.editTopicHeading')}
+              submitLabel={t('bcf.createForm.saveChangesSubmitLabel')}
             />
           </div>
         ) : activeTopic ? (
@@ -481,6 +481,8 @@ export function BCFPanel({ onClose }: BCFPanelProps) {
             onEditTopic={() => setShowEditForm(true)}
             onAddComment={handleAddComment}
             onAddViewpoint={handleCaptureViewpoint}
+            onAddSectionViewpoint={() => void sectionCapture.capture()}
+            sectionViewpointBlockReason={sectionCapture.disabledReason}
             onActivateViewpoint={handleActivateViewpoint}
             onDeleteViewpoint={handleDeleteViewpoint}
             onUpdateStatus={handleUpdateStatus}
@@ -507,25 +509,21 @@ export function BCFPanel({ onClose }: BCFPanelProps) {
         {showAuthorDialog && (
           <div className="absolute inset-0 bg-background/90 flex items-center justify-center p-4">
             <div className="bg-card border rounded-lg p-4 w-full max-w-xs">
-              <h4 className="font-medium mb-3">Set Author Email</h4>
-              <Input
+              <h4 className="font-medium mb-3">{t('bcf.panel.setAuthorHeading')}</h4>
+              <Input aria-label={t('bcf.panel.authorEmailLabel')}
                 value={tempAuthor}
                 onChange={(e) => setTempAuthor(e.target.value)}
-                placeholder="your@email.com"
+                placeholder={t('bcf.shared.emailPlaceholder')}
                 className="mb-4"
               />
               <div className="flex gap-2 justify-end">
-                <Button variant="outline" size="sm" onClick={() => setShowAuthorDialog(false)}>
-                  Cancel
-                </Button>
-                <Button size="sm" onClick={handleSaveAuthor}>
-                  Save
-                </Button>
+                <Button variant="outline" size="sm" onClick={() => setShowAuthorDialog(false)}>{t('bcf.shared.cancel')}</Button>
+                <Button size="sm" onClick={handleSaveAuthor}>{t('bcf.shared.save')}</Button>
               </div>
             </div>
           </div>
         )}
       </div>
-    </div>
+    </AnalysisPanel>
   );
 }

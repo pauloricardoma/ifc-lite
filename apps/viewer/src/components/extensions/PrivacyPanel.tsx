@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * `PrivacyPanel` — local privacy controls.
+ * `PrivacyPanel` — local privacy controls shown in Settings.
  *
  * Surfaces the no-content rule from RFC §06 §7 in prose, plus three
  * actions the user can take any time:
@@ -13,13 +13,15 @@
  *   - Edit the prompt overlay (their personal notes the assistant
  *     sees alongside the system prompt).
  *
- * Everything here is local. Nothing here triggers a network call.
+ * The action-log and overlay controls are local. Analytics consent updates
+ * the browser's capture policy without sending a consent event.
  *
  * Spec: docs/architecture/ai-customization/06-self-improvement.md §7.
  */
 
+import { trackExportCompleted } from '@/lib/analytics';
 import { useEffect, useRef, useState } from 'react';
-import { Brain, Download, Eraser, ScrollText, Save, Shield, X } from 'lucide-react';
+import { Brain, Download, Eraser, ScrollText, Save, Shield } from 'lucide-react';
 import {
   clampOverlay,
   extractMemoryProposals,
@@ -31,16 +33,18 @@ import {
 import { useViewerStore } from '@/store';
 import { downloadFile } from '@/lib/export/download';
 import { Button } from '@/components/ui/button';
-import { ScrollArea } from '@/components/ui/scroll-area';
 import { useExtensionHost } from '@/sdk/ExtensionHostProvider';
 import { toast } from '@/components/ui/toast';
+import { confirmDialog } from '@/components/ui/confirm-dialog';
+import { useTranslation } from '@/i18n';
 import { HelpHint } from './HelpHint';
+import { localizedFlavorName } from './localized-flavor-metadata';
+import { styleInterpolatedValues } from '@/i18n/richInterpolate';
+import { formatLocaleNumber } from '@/i18n/intlFormat';
+import { AnalyticsConsentSection } from '@/components/viewer/settings/AnalyticsConsentSection';
 
-interface PrivacyPanelProps {
-  onClose?: () => void;
-}
-
-export function PrivacyPanel({ onClose }: PrivacyPanelProps) {
+export function PrivacyPanel() {
+  const { t, locale } = useTranslation();
   const host = useExtensionHost();
   const [logSize, setLogSize] = useState({ events: 0, bytes: 0 });
   const [activeFlavor, setActiveFlavor] = useState<Flavor | undefined>();
@@ -85,11 +89,12 @@ export function PrivacyPanel({ onClose }: PrivacyPanelProps) {
   const handleExportLog = () => {
     const json = host.actionLog.exportJson();
     downloadFile(json, `ifclite-action-log-${new Date().toISOString().slice(0, 10)}.json`, 'application/json');
-    toast.success('Action log exported.');
+    trackExportCompleted({ format: 'json', surface: 'extension_panel' });
+    toast.success(t('extensionsPanels.privacyPanel.exportLogToast'));
   };
 
-  const handleClearLog = () => {
-    if (!confirm('Clear the local action log? Suggestions reset until you build up new patterns.')) return;
+  const handleClearLog = async () => {
+    if (!await confirmDialog({ description: t('extensionsPanels.privacyPanel.clearLogConfirm'), destructive: true })) return;
     host.actionLog.clear();
     // Wipe the IDB mirror too — otherwise reload would resurrect the
     // events the user just asked to forget.
@@ -97,7 +102,7 @@ export function PrivacyPanel({ onClose }: PrivacyPanelProps) {
       console.warn('[PrivacyPanel] clear persisted action log failed:', err);
     });
     setLogSize({ events: 0, bytes: 0 });
-    toast.success('Action log cleared.');
+    toast.success(t('extensionsPanels.privacyPanel.clearLogToast'));
   };
 
   const handleExtractMemory = () => {
@@ -108,9 +113,12 @@ export function PrivacyPanel({ onClose }: PrivacyPanelProps) {
     const next = extractMemoryProposals(transcript);
     setProposals(next);
     if (next.length === 0) {
-      toast.info('No stable preferences detected in this session yet.');
+      toast.info(t('extensionsPanels.privacyPanel.noPreferencesToast'));
     } else {
-      toast.success(`Found ${next.length} candidate preference${next.length === 1 ? '' : 's'}.`);
+      toast.success(t('extensionsPanels.privacyPanel.foundPreferencesToast', {
+        count: next.length,
+        countDisplay: formatLocaleNumber(locale, next.length),
+      }));
     }
   };
 
@@ -119,12 +127,15 @@ export function PrivacyPanel({ onClose }: PrivacyPanelProps) {
     setOverlayDraft(next);
     setDirty(true);
     setProposals([]);
-    toast.success(`Added ${proposals.length} preference${proposals.length === 1 ? '' : 's'} to the overlay. Save to keep them.`);
+    toast.success(t('extensionsPanels.privacyPanel.addedPreferencesToast', {
+      count: proposals.length,
+      countDisplay: formatLocaleNumber(locale, proposals.length),
+    }));
   };
 
   const handleSaveOverlay = async () => {
     if (!activeFlavor) {
-      toast.error('No active flavor — switch to one before editing its overlay.');
+      toast.error(t('extensionsPanels.privacyPanel.noActiveFlavorError'));
       return;
     }
     setBusy(true);
@@ -137,151 +148,149 @@ export function PrivacyPanel({ onClose }: PrivacyPanelProps) {
       setOverlayDraft(clamped.overlay.content);
       setDirty(false);
       if (clamped.truncated) {
-        toast.info(`Overlay clamped to ~${clamped.estimatedTokens} tokens.`);
+        toast.info(t('extensionsPanels.privacyPanel.overlayClampedToast', {
+          tokens: formatLocaleNumber(locale, clamped.estimatedTokens),
+        }));
       } else {
-        toast.success(`Overlay saved (${clamped.estimatedTokens} tokens).`);
+        toast.success(t('extensionsPanels.privacyPanel.overlaySavedToast', {
+          tokens: formatLocaleNumber(locale, clamped.estimatedTokens),
+        }));
       }
     } catch (err) {
-      toast.error(`Save failed: ${err instanceof Error ? err.message : String(err)}`);
+      toast.error(t('extensionsPanels.privacyPanel.saveFailedToast', {
+        error: err instanceof Error ? err.message : String(err),
+      }));
     } finally {
       setBusy(false);
     }
   };
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="space-y-4">
+      <AnalyticsConsentSection />
       <div className="flex items-center justify-between border-b px-4 py-3">
         <div className="flex items-center gap-2">
           <Shield className="h-4 w-4" />
-          <h2 className="text-sm font-semibold">Privacy</h2>
-          <HelpHint label="Privacy">
+          <h2 className="text-sm font-semibold">{t('extensionsPanels.privacyPanel.title')}</h2>
+          <HelpHint label={t('extensionsPanels.privacyPanel.helpLabel')}>
             <p>
-              IFClite keeps a <strong>content-free action log</strong>{' '}
-              of intents you perform (model loads, lens applies,
-              exports) — used by the pattern miner to suggest one-click
-              tools. The log never records model content, chat content,
-              file names, or API keys.
+              {t('extensionsPanels.privacyPanel.helpIntro')}
             </p>
             <p>
-              The <strong>prompt overlay</strong> on the active flavor
-              is appended to every chat system prompt — use it for
-              stable preferences. <strong>Extract from chat</strong>{' '}
-              scans the current session for explicit preferences and
-              proposes them.
+              {t('extensionsPanels.privacyPanel.helpOverlay')}
             </p>
           </HelpHint>
         </div>
-        {onClose && (
-          <Button size="icon" variant="ghost" onClick={onClose} aria-label="Close">
-            <X className="h-3.5 w-3.5" />
-          </Button>
-        )}
       </div>
 
-      <ScrollArea className="flex-1">
-        <div className="px-4 py-3 space-y-4 text-xs">
+      <div className="px-4 py-3 space-y-4 text-xs">
           <section className="space-y-1.5">
-            <h3 className="text-[11px] uppercase tracking-wide font-semibold text-muted-foreground">
-              What we store locally
+            <h3 className="text-2xs uppercase tracking-wide font-semibold text-muted-foreground">
+              {t('extensionsPanels.privacyPanel.storeHeading')}
             </h3>
             <p className="text-muted-foreground leading-relaxed">
-              ifc-lite keeps a content-free <strong>action log</strong> of the
-              high-level intents you perform (model loads, lens applies,
-              exports). We use it to mine recurring patterns and surface
-              one-click tool suggestions. The log never records model
-              content, chat content, file names, or API keys.
+              {t('extensionsPanels.privacyPanel.storeBody1')}
             </p>
             <p className="text-muted-foreground leading-relaxed">
-              Suggestions, the audit log, the prompt overlay, and your
-              flavor library are all stored in your browser's IndexedDB —
-              nothing here is sent off device unless you explicitly export.
+              {t('extensionsPanels.privacyPanel.storeBody2')}
             </p>
           </section>
 
           <section className="space-y-1.5">
-            <h3 className="text-[11px] uppercase tracking-wide font-semibold text-muted-foreground">
-              Action log
+            <h3 className="text-2xs uppercase tracking-wide font-semibold text-muted-foreground">
+              {t('extensionsPanels.privacyPanel.actionLogHeading')}
             </h3>
             <div className="rounded border bg-muted/30 px-3 py-2">
               <div>
-                {logSize.events} events · {(logSize.bytes / 1024).toFixed(1)} KiB
+                {t('extensionsPanels.privacyPanel.actionLogStats', {
+                  events: formatLocaleNumber(locale, logSize.events),
+                  kib: formatLocaleNumber(locale, logSize.bytes / 1024, {
+                    minimumFractionDigits: 1,
+                    maximumFractionDigits: 1,
+                  }),
+                })}
               </div>
               <div className="mt-2 flex flex-wrap gap-1.5">
                 <Button size="sm" variant="outline" onClick={handleExportLog} disabled={logSize.events === 0}>
                   <Download className="mr-1 h-3.5 w-3.5" />
-                  Export JSON
+                  {t('extensionsPanels.privacyPanel.exportJsonButton')}
                 </Button>
                 <Button size="sm" variant="outline" onClick={handleClearLog} disabled={logSize.events === 0}>
                   <Eraser className="mr-1 h-3.5 w-3.5" />
-                  Clear
+                  {t('extensionsPanels.privacyPanel.clearButton')}
                 </Button>
               </div>
             </div>
           </section>
 
           <section className="space-y-1.5">
-            <h3 className="text-[11px] uppercase tracking-wide font-semibold text-muted-foreground">
-              Prompt overlay
+            <h3 className="text-2xs uppercase tracking-wide font-semibold text-muted-foreground">
+              {t('extensionsPanels.privacyPanel.overlayHeading')}
             </h3>
             <p className="text-muted-foreground">
-              Notes appended to the AI assistant's system prompt for the
-              active flavor. Use it for stable preferences ("write CSV
-              exports with semicolons", "default to red color for IfcWall").
-              Capped at ~4000 tokens.
+              {t('extensionsPanels.privacyPanel.overlayIntro')}
             </p>
             {!activeFlavor ? (
               <div className="rounded border bg-muted/30 px-3 py-2 text-muted-foreground italic">
-                No active flavor. Activate or import one to attach overlay
-                notes to it.
+                {t('extensionsPanels.privacyPanel.noActiveFlavor')}
               </div>
             ) : (
               <>
-                <div className="text-[10px] text-muted-foreground flex items-center gap-1">
+                <div className="text-2xs text-muted-foreground flex items-center gap-1">
                   <ScrollText className="h-3 w-3" />
-                  Editing overlay for{' '}
-                  <span className="font-medium text-foreground">{activeFlavor.name}</span>
+                  {styleInterpolatedValues(t, 'extensionsPanels.privacyPanel.editingOverlayFor', [
+                    ['name', (
+                      <span key="flavor-name" className="font-medium text-foreground">
+                        {localizedFlavorName(activeFlavor, t)}
+                      </span>
+                    )],
+                  ])}
                 </div>
                 <textarea
-                  className="w-full min-h-[160px] rounded border bg-background p-2 font-mono text-[11px] leading-relaxed"
+                  className="w-full min-h-[160px] rounded border bg-background p-2 font-mono text-2xs leading-relaxed"
                   value={overlayDraft}
                   onChange={(e) => {
                     setOverlayDraft(e.target.value);
                     setDirty(true);
                   }}
-                  placeholder="e.g. Always export CSV with semicolon separators. Default lens for IfcWall: by-fire-rating."
+                  placeholder={t('extensionsPanels.privacyPanel.overlayPlaceholder')}
+                  aria-label={t('extensionsPanels.privacyPanel.overlayInputLabel')}
                 />
                 <div className="flex items-center justify-between gap-2 flex-wrap">
-                  <span className="text-[10px] text-muted-foreground">
-                    {Math.ceil(overlayDraft.length / 4)} approx tokens
+                  <span className="text-2xs text-muted-foreground">
+                    {t('extensionsPanels.privacyPanel.approxTokens', {
+                      tokens: formatLocaleNumber(locale, Math.ceil(overlayDraft.length / 4)),
+                    })}
                   </span>
                   <div className="flex items-center gap-1">
                     <Button size="sm" variant="outline" onClick={handleExtractMemory} disabled={chatMessages.length === 0}>
                       <Brain className="mr-1 h-3.5 w-3.5" />
-                      Extract from chat
+                      {t('extensionsPanels.privacyPanel.extractFromChat')}
                     </Button>
                     <Button size="sm" onClick={() => void handleSaveOverlay()} disabled={busy || !dirty}>
                       <Save className="mr-1 h-3.5 w-3.5" />
-                      Save overlay
+                      {t('extensionsPanels.privacyPanel.saveOverlayButton')}
                     </Button>
                   </div>
                 </div>
 
                 {proposals.length > 0 && (
                   <div className="rounded border bg-muted/30 px-3 py-2 space-y-2">
-                    <div className="text-[11px] font-medium">
-                      {proposals.length} candidate preference{proposals.length === 1 ? '' : 's'}
+                    <div className="text-2xs font-medium">
+                      {t('extensionsPanels.privacyPanel.candidatePreferenceCount', {
+                        count: proposals.length,
+                        countDisplay: formatLocaleNumber(locale, proposals.length),
+                      })}
                     </div>
-                    <div className="text-[10px] text-amber-700 dark:text-amber-400 italic">
-                      Rule-based scan — review each line before saving.
-                      The extractor uses a heuristic blocklist; it is not
-                      a guarantee that no content slips through.
+                    <div className="text-2xs text-amber-700 dark:text-amber-400 italic">
+                      {t('extensionsPanels.privacyPanel.ruleBasedWarning')}
                     </div>
-                    <ul className="space-y-1 text-[11px]">
+                    <ul className="space-y-1 text-2xs">
                       {proposals.map((p, i) => (
                         <li key={i} className="flex items-start gap-2">
                           <span className="text-muted-foreground">·</span>
                           <span className="flex-1">{p.phrasing}</span>
-                          <span className="text-[10px] text-muted-foreground">
+                          <span className="text-2xs text-muted-foreground">
                             {Math.round(p.confidence * 100)}%
                           </span>
                         </li>
@@ -289,10 +298,10 @@ export function PrivacyPanel({ onClose }: PrivacyPanelProps) {
                     </ul>
                     <div className="flex items-center justify-end gap-1">
                       <Button size="sm" variant="ghost" onClick={() => setProposals([])}>
-                        Discard
+                        {t('extensionsPanels.privacyPanel.discardButton')}
                       </Button>
                       <Button size="sm" onClick={handleAcceptProposals}>
-                        Add to overlay
+                        {t('extensionsPanels.privacyPanel.addToOverlayButton')}
                       </Button>
                     </div>
                   </div>
@@ -300,8 +309,7 @@ export function PrivacyPanel({ onClose }: PrivacyPanelProps) {
               </>
             )}
           </section>
-        </div>
-      </ScrollArea>
+      </div>
     </div>
   );
 }

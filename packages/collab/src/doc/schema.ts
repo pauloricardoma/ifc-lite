@@ -23,6 +23,21 @@ export const TOP = {
    * (snapshotToIfcx only walks ENTITIES) — markup is room overlay data, not BIM.
    */
   ANNOTATIONS: 'annotations',
+  /**
+   * Model slots (#4444): `slotId → ModelSlotRecord`, one per model the owner
+   * shared into the room. Entity paths are qualified by slot
+   * (`/<slotId>/<GlobalId>`, see `model-slot.ts`), so two copies of one file
+   * — same bytes, same GlobalIds — are two slots and never one merged entity
+   * set. A room seeded before slots existed has an empty map; readers treat
+   * that as a single implicit slot over the unqualified `/<GlobalId>` paths.
+   */
+  MODELS: 'models',
+  /**
+   * Per-path overlay-tombstone registry (`path → boolean`), owned by
+   * `snapshot/overlay-tombstones.ts`. Root-level, not nested under `META`,
+   * so concurrent peers merge into one map instead of racing (#5219).
+   */
+  OVERLAY_TOMBSTONES: 'overlay.tombstones.registry',
 } as const;
 
 /** Origin tag used for transactions originated by the local CollabSession. */
@@ -160,6 +175,8 @@ export function createCollabDoc(opts: { gc?: boolean } = {}): Y.Doc {
   doc.getMap(TOP.GEOMETRY);
   doc.getMap(TOP.META);
   doc.getMap(TOP.ANNOTATIONS);
+  doc.getMap(TOP.MODELS);
+  doc.getMap(TOP.OVERLAY_TOMBSTONES);
   return doc;
 }
 
@@ -178,6 +195,10 @@ export function geometryMap(doc: Y.Doc): Y.Map<Y.Map<unknown>> {
 
 export function metaMap(doc: Y.Doc): Y.Map<unknown> {
   return doc.getMap(TOP.META);
+}
+
+export function modelsMap(doc: Y.Doc): Y.Map<unknown> {
+  return doc.getMap(TOP.MODELS);
 }
 
 /**

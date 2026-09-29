@@ -7,8 +7,13 @@
 //! Split out of `element.rs` under the ~400-line module rule. This half is
 //! a pure function of (geometry id, style map) with its own bounded walk;
 //! the mesh production it serves stays in `element.rs`.
+//!
+//! Each colour walk here first answers WHICH styled item the colour comes from
+//! (its "style source"); the colour is that item's entry in the style map. The
+//! finish join (`crate::style::finish_join`, #5984) asks these same walks the
+//! same question, so a mesh's finish can only come from the style its colour
+//! came from: one traversal, one bound, no second copy to drift.
 
-use crate::processor::get_refs_from_list;
 use crate::style::{FullIndexedColourMap, GeometryStyleInfo};
 use ifc_lite_core::{DecodedEntity, EntityDecoder, IfcType};
 // Re-exported, not merely imported: the depth-cap test reads it back through
@@ -26,8 +31,22 @@ pub(crate) fn find_geometry_item_color(
     geometry_styles: &FxHashMap<u32, GeometryStyleInfo>,
     decoder: &mut EntityDecoder,
 ) -> Option<[f32; 4]> {
+    let source = find_geometry_item_style_source(geometry_id, &|id| geometry_styles.contains_key(&id), decoder)?;
+    geometry_styles.get(&source).map(|style| style.color)
+}
+
+/// The styled item [`find_geometry_item_color`] takes its colour from:
+/// `geometry_id` itself when it carries a style, else the first styled item
+/// the bounded `IfcMappedItem` chase reaches. `has_style` is the style map's
+/// membership test, so a caller holding the colour map in another shape (the
+/// wasm batch's `id -> rgba`) walks exactly the same path.
+pub(crate) fn find_geometry_item_style_source(
+    geometry_id: u32,
+    has_style: &dyn Fn(u32) -> bool,
+    decoder: &mut EntityDecoder,
+) -> Option<u32> {
     let mut visited = FxHashMap::default();
-    find_geometry_item_color_at(geometry_id, geometry_styles, decoder, 0, &mut visited)
+    find_geometry_item_style_source_at(geometry_id, has_style, decoder, 0, &mut visited)
 }
 
 /// The visited map is GLOBAL to one resolution, not path-scoped: the geometry
@@ -48,16 +67,16 @@ pub(crate) fn find_geometry_item_color(
 /// lead back into the cycle costs `O(k^depth)` decodes, so four self-references
 /// at depth 32 is ~2^64 calls — no stack overflow, just a worker pinned
 /// forever. Trading an abort for a hang would not have been a fix (#2863).
-fn find_geometry_item_color_at(
+fn find_geometry_item_style_source_at(
     geometry_id: u32,
-    geometry_styles: &FxHashMap<u32, GeometryStyleInfo>,
+    has_style: &dyn Fn(u32) -> bool,
     decoder: &mut EntityDecoder,
     depth: u32,
     visited: &mut FxHashMap<u32, u32>,
-) -> Option<[f32; 4]> {
+) -> Option<u32> {
     // Direct style on this exact geometry item wins.
-    if let Some(style) = geometry_styles.get(&geometry_id) {
-        return Some(style.color);
+    if has_style(geometry_id) {
+        return Some(geometry_id);
     }
 
     // Otherwise, if it's a mapped item, chase the mapping to the underlying
@@ -85,12 +104,12 @@ fn find_geometry_item_color_at(
     let mapped_representation_id = representation_map.get_ref(1)?;
     let mapped_representation = decoder.decode_by_id(mapped_representation_id).ok()?;
     // IfcShapeRepresentation.Items (attr 3).
-    let items = get_refs_from_list(&mapped_representation, 3)?;
+    let items = mapped_representation.get_refs(3)?;
     for underlying in items {
-        if let Some(color) =
-            find_geometry_item_color_at(underlying, geometry_styles, decoder, depth + 1, visited)
+        if let Some(source) =
+            find_geometry_item_style_source_at(underlying, has_style, decoder, depth + 1, visited)
         {
-            return Some(color);
+            return Some(source);
         }
     }
     None
@@ -105,22 +124,64 @@ pub(crate) fn resolve_color_for_representation_map(
     geometry_style_index: &FxHashMap<u32, GeometryStyleInfo>,
     decoder: &mut EntityDecoder,
 ) -> Option<[f32; 4]> {
+    let source =
+        representation_map_style_source(rep_map_id, &|id| geometry_style_index.contains_key(&id), decoder)?;
+    geometry_style_index.get(&source).map(|style| style.color)
+}
+
+/// The styled item [`resolve_color_for_representation_map`] takes its colour
+/// from: the first of the map's `MappedRepresentation.Items` that resolves,
+/// each through [`find_geometry_item_style_source`].
+pub(crate) fn representation_map_style_source(
+    rep_map_id: u32,
+    has_style: &dyn Fn(u32) -> bool,
+    decoder: &mut EntityDecoder,
+) -> Option<u32> {
     let rep_map = decoder.decode_by_id(rep_map_id).ok()?;
     // IfcRepresentationMap.MappedRepresentation = attr 1.
     let mapped_rep_id = rep_map.get_ref(1)?;
     let mapped_rep = decoder.decode_by_id(mapped_rep_id).ok()?;
     // IfcShapeRepresentation.Items = attr 3.
-    let item_ids = get_refs_from_list(&mapped_rep, 3)?;
-    for item_id in item_ids {
-        if let Some(style) = geometry_style_index.get(&item_id) {
-            return Some(style.color);
-        }
-        if let Some(color) = find_geometry_item_color(item_id, geometry_style_index, decoder) {
-            return Some(color);
+    let item_ids = mapped_rep.get_refs(3)?;
+    item_ids
+        .into_iter()
+        .find_map(|item_id| find_geometry_item_style_source(item_id, has_style, decoder))
+}
+
+/// The styled item an element's representation-level colour comes from
+/// (`processor::color_layer`'s element colour): each `IfcShapeRepresentation`
+/// of the `IfcProductDefinitionShape` in order, each of its items through
+/// [`find_geometry_item_style_source`], first hit wins.
+///
+/// `color_layer` used to walk this inline, one hop deep, so a styled leaf two
+/// or more mapped-item hops down resolved through the canonical chase but not
+/// through that fallback; widening the local walk instead of delegating would
+/// have reintroduced the unbounded recursion #2863/#2864 bounded. Delegating
+/// to the one guarded chase is what keeps them from diverging.
+pub(crate) fn product_shape_style_source(
+    product_definition_shape_id: u32,
+    has_style: &dyn Fn(u32) -> bool,
+    decoder: &mut EntityDecoder,
+) -> Option<u32> {
+    let shape = decoder.decode_by_id(product_definition_shape_id).ok()?;
+    // IfcProductDefinitionShape.Representations = attr 2.
+    for shape_repr_id in shape.get_refs(2)? {
+        let Ok(shape_repr) = decoder.decode_by_id(shape_repr_id) else {
+            continue;
+        };
+        // IfcShapeRepresentation.Items = attr 3.
+        let Some(items) = shape_repr.get_refs(3) else {
+            continue;
+        };
+        for item_id in items {
+            if let Some(source) = find_geometry_item_style_source(item_id, has_style, decoder) {
+                return Some(source);
+            }
         }
     }
     None
 }
+
 
 /// Find the first representation item of `entity` that carries a full
 /// `IfcIndexedColourMap` (#858). Drives the element-level palette split on
@@ -132,10 +193,10 @@ pub(crate) fn find_indexed_colour_for_element<'a>(
 ) -> Option<&'a FullIndexedColourMap> {
     let pds_id = entity.get_ref(6)?;
     let pds = decoder.decode_by_id(pds_id).ok()?;
-    let repr_ids = get_refs_from_list(&pds, 2)?;
+    let repr_ids = pds.get_refs(2)?;
     for repr_id in repr_ids {
         if let Ok(repr) = decoder.decode_by_id(repr_id) {
-            if let Some(items) = get_refs_from_list(&repr, 3) {
+            if let Some(items) = repr.get_refs(3) {
                 for item_id in items {
                     if let Some(full) = indexed_colour_full.get(&item_id) {
                         return Some(full);
@@ -145,6 +206,45 @@ pub(crate) fn find_indexed_colour_for_element<'a>(
         }
     }
     None
+}
+
+/// Whether any body item of `entity`, directly or through `IfcMappedItem`s,
+/// is a face set carrying a multi-colour `IfcIndexedColourMap` (a single-colour
+/// map is never split, #1807). Such an element's
+/// triangles are later mapped back to source faces by index (#858), so the
+/// router must keep their order (#5313).
+///
+/// Walks items iteratively with a visited set (mapped representations are
+/// file-supplied and may be cyclic or shared).
+pub(crate) fn element_reaches_indexed_colour(
+    entity: &DecodedEntity,
+    indexed_colour_full: &FxHashMap<u32, FullIndexedColourMap>,
+    decoder: &mut EntityDecoder,
+) -> bool {
+    let Some(pds_id) = entity.get_ref(6) else { return false };
+    let Ok(pds) = decoder.decode_by_id(pds_id) else { return false };
+    let mut reps: Vec<u32> = pds.get_refs(2).unwrap_or_default();
+    let mut visited = rustc_hash::FxHashSet::default();
+    while let Some(rep_id) = reps.pop() {
+        if !visited.insert(rep_id) {
+            continue;
+        }
+        let Ok(rep) = decoder.decode_by_id(rep_id) else { continue };
+        for item_id in rep.get_refs(3).unwrap_or_default() {
+            if indexed_colour_full.get(&item_id).is_some_and(FullIndexedColourMap::has_multiple_colours) {
+                return true;
+            }
+            let Ok(item) = decoder.decode_by_id(item_id) else { continue };
+            if item.ifc_type != IfcType::IfcMappedItem {
+                continue;
+            }
+            // IfcMappedItem.MappingSource -> IfcRepresentationMap.MappedRepresentation.
+            if let Some(map) = item.get_ref(0).and_then(|id| decoder.decode_by_id(id).ok()) {
+                reps.extend(map.get_ref(1));
+            }
+        }
+    }
+    false
 }
 
 fn is_opening_with_subparts(ifc_type: &IfcType) -> bool {

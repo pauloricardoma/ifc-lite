@@ -13,7 +13,11 @@ import {
   readFreshFile,
   supportsFileSystemAccess,
 } from './file-system-access.js';
-import { MODEL_FILE_EXTENSIONS, isSupportedModelFile } from './supported-model-files.js';
+import {
+  MODEL_FILE_EXTENSIONS,
+  isSupportedMobileModelFile,
+  isSupportedModelFile,
+} from './supported-model-files.js';
 
 type FSFileHandleLike = {
   name: string;
@@ -57,6 +61,10 @@ describe('file-system-access', () => {
       (window as unknown as Record<string, unknown>).showOpenFilePicker = async () => [];
       assert.equal(supportsFileSystemAccess(), true);
     });
+  });
+
+  it('accepts mixed-case LandXML names from the mobile picker (#4937)', () => {
+    assert.equal(isSupportedMobileModelFile(fakeFile('Survey.XML')), true);
   });
 
   describe('openIfcFilesWithHandles', () => {
@@ -276,6 +284,22 @@ describe('file-system-access', () => {
       const dt = fakeDataTransfer([{ kind: 'file', getAsFileSystemHandle: async () => dirHandle }]);
       const result = await handlesFromDataTransfer(dt);
       assert.equal(result, null);
+    });
+
+    it('falls back to dropped files when a handle request rejects (#5851)', async () => {
+      (window as unknown as Record<string, unknown>).showOpenFilePicker = async () => [];
+      const dt = fakeDataTransfer([{ kind: 'file', getAsFileSystemHandle: async () => {
+        throw new Error('handle permission denied');
+      } }]);
+      const originalWarn = console.warn;
+      const warnings: unknown[][] = [];
+      console.warn = (...args) => { warnings.push(args); };
+      try {
+        assert.equal(await handlesFromDataTransfer(dt), null);
+        assert.match(String(warnings[0]?.[0]), /using dropped files instead/);
+      } finally {
+        console.warn = originalWarn;
+      }
     });
   });
 });

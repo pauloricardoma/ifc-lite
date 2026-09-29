@@ -3,30 +3,26 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * The two content-matching sections of the compare results list (issue #1891),
- * kept out of `CompareResultsList` so both stay under the module-size house
- * rule (AGENTS.md).
+ * The **Matched** section of the compare results list (issue #1891), kept out
+ * of `CompareResultsList` so both stay under the module-size house rule
+ * (AGENTS.md).
  *
  * These rows do not come from `diff.entries` at all - they come from
- * `diff.contentMatches`:
+ * `diff.contentMatches`, and only its RETIRING kinds (`renamed` / `moved` /
+ * `reshaped` / `respecified`): the engine retired these elements'
+ * `added`/`deleted` entries, so without this section their counts drop out of
+ * the panel with no row saying where they went.
  *
- * - **Matched** (`renamed` / `moved` / `reshaped`): the engine retired these
- *   elements' `added`/`deleted` entries. Without this section their counts drop
- *   out of the panel with no row saying where they went.
- * - **Needs review** (`duplicated` / `deduplicated` / `ambiguous`): the engine
- *   retired nothing, so these elements are ALSO listed above under Added /
- *   Deleted in their own colours. This section badges the grouping the engine
- *   found without claiming a resolution it declined to make.
+ * The non-retiring kinds (`duplicated` / `deduplicated` / `ambiguous`) are
+ * listed in `CompareSuggestions` (#4955), where a user can decide a pair.
  */
 
-import { Link2, TriangleAlert, MousePointerClick } from 'lucide-react';
+import { Link2, MousePointerClick } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useTranslation } from '@/i18n';
 import { COMPARE_COLORS, rgbaCss, type RGBA } from '@/lib/compare/overlay';
 import { MATCH_KIND_HINT, MATCH_KIND_LABEL } from '@/lib/compare/contentMatches';
 import { MAX_ROWS_PER_GROUP, type CompareMatchRow } from './changeRow';
-
-/** Amber, matching the panel's existing warning text colour (`#e0af68`). */
-const REVIEW_COLOR: RGBA = [0.878, 0.686, 0.408, 1];
 
 /** Right-hand summary for a row: the kind, plus the group shape when the match
  *  is not a simple pair, plus the move distance when the engine measured one. */
@@ -54,6 +50,7 @@ function MatchSection({
   color,
   Icon,
 }: MatchSectionProps & { label: string; title: string; color: RGBA; Icon: typeof Link2 }) {
+  const { t } = useTranslation();
   if (rows.length === 0) return null;
   // Same display cap as the Added/Changed/Deleted buckets. Content matching is
   // on by default and a from-scratch re-export can produce one match record per
@@ -88,12 +85,12 @@ function MatchSection({
           >
             <span className="h-2.5 w-2.5 rounded-sm shrink-0" style={{ backgroundColor: rgbaCss(color) }} />
             <span className="min-w-0 flex-1 truncate text-xs">{row.name || row.ifcType}</span>
-            <span className="shrink-0 text-[10px] text-muted-foreground">{matchRowSummary(row)}</span>
+            <span className="shrink-0 text-2xs text-muted-foreground">{matchRowSummary(row)}</span>
           </button>
         ))}
         {truncated > 0 && (
-          <p className="px-2 py-1 text-[10px] text-muted-foreground">
-            +{truncated} more not shown
+          <p className="px-2 py-1 text-2xs text-muted-foreground">
+            {t('comparePanel.moreNotShown', { count: truncated })}
           </p>
         )}
       </div>
@@ -102,30 +99,17 @@ function MatchSection({
 }
 
 export function CompareMatchGroups({ rows, selectedKey, onFocus, onFocusGroup }: MatchSectionProps) {
-  const matched = rows.filter((row) => row.retiring);
-  const review = rows.filter((row) => !row.retiring);
+  const { t } = useTranslation();
   return (
-    <>
-      <MatchSection
-        rows={matched}
-        selectedKey={selectedKey}
-        onFocus={onFocus}
-        onFocusGroup={onFocusGroup}
-        label="Matched"
-        title="Select all content-matched elements in 3D"
-        color={COMPARE_COLORS.matched}
-        Icon={Link2}
-      />
-      <MatchSection
-        rows={review}
-        selectedKey={selectedKey}
-        onFocus={onFocus}
-        onFocusGroup={onFocusGroup}
-        label="Needs review"
-        title="Select every candidate in the unresolved match groups"
-        color={REVIEW_COLOR}
-        Icon={TriangleAlert}
-      />
-    </>
+    <MatchSection
+      rows={rows.filter((row) => row.retiring)}
+      selectedKey={selectedKey}
+      onFocus={onFocus}
+      onFocusGroup={onFocusGroup}
+      label={t('comparePanel.matchGroups.matchedLabel')}
+      title={t('comparePanel.matchGroups.selectAllTitle')}
+      color={COMPARE_COLORS.matched}
+      Icon={Link2}
+    />
   );
 }

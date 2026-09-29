@@ -16,3 +16,24 @@ export { QueryResultEntity } from './query-result-entity.js';
 export { DuckDBIntegration, type SQLResult } from './duckdb-integration.js';
 export { findPropertyInSets, findQuantityInSets, findAllPropertiesInSets, findAllQuantitiesInSets } from './pset-lookup.js';
 export { normalizeBooleanValue, compareFilterValue, type FilterComparisonOp } from './filter-predicate.js';
+export { matchesPropertyFilter } from './property-filter-match.js';
+export { parseSelector } from './selector/parse.js';
+export { trimSelectorWhitespace } from './selector/tokenize.js';
+export {
+  selectorToQueryDescriptor,
+  SelectorUnsupportedError,
+  type QueryFilterLike,
+  type QueryDescriptorLike,
+} from './selector/to-query-descriptor.js';
+// The union and the result types only: a caller narrows on `filter.kind`
+// rather than naming each member interface, so those stay module-internal
+// until something actually consumes one.
+export type {
+  SelectorOp,
+  SelectorText,
+  SelectorValue,
+  SelectorFilter,
+  SelectorQuery,
+  SelectorParseError,
+  SelectorParseResult,
+} from './selector/ast.js';

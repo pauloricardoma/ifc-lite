@@ -23,6 +23,7 @@ type RelAssignMethodName =
   | 'addIfcRelNests'
   | 'assignTasksToWorkSchedule'
   | 'assignSchedulesToWorkPlan'
+  | 'assignCalendarToTasks'
   | 'assignProductsToTask'
   | 'nestTasks';
 
@@ -58,9 +59,9 @@ function relAssign(
  * `bridge-create.ts` — exposed so the two files stay in sync.
  */
 export const SCHEDULE_SPECIAL_METHOD_NAMES = [
-  'addIfcWorkSchedule', 'addIfcWorkPlan', 'addIfcTask', 'addIfcRelSequence',
+  'addIfcWorkSchedule', 'addIfcWorkPlan', 'addIfcWorkCalendar', 'addIfcTask', 'addIfcRelSequence',
   'addIfcRelAssignsToControl', 'addIfcRelAssignsToProcess', 'addIfcRelNests',
-  'assignTasksToWorkSchedule', 'assignSchedulesToWorkPlan',
+  'assignTasksToWorkSchedule', 'assignSchedulesToWorkPlan', 'assignCalendarToTasks',
   'assignProductsToTask', 'nestTasks',
 ] as const;
 
@@ -108,6 +109,29 @@ export function buildScheduleMethods(): MethodSchema[] {
       taskTags: ['create'],
       requiredKeys: ['Name', 'StartTime'],
       useWhen: 'Use when the user needs multiple schedules grouped under a single plan. Otherwise prefer addIfcWorkSchedule.',
+    },
+  });
+
+  methods.push({
+    name: 'addIfcWorkCalendar',
+    doc: 'Create an IfcWorkCalendar (working / non-working time calendar). Returns calendar expressId.',
+    args: ['number', 'dump'],
+    paramNames: ['handle', 'params'],
+    tsParamTypes: [undefined, "{ Name: string; Description?: string; ObjectType?: string; Identification?: string; PredefinedType?: 'FIRSTSHIFT' | 'SECONDSHIFT' | 'THIRDSHIFT' | 'USERDEFINED' | 'NOTDEFINED'; WorkingTimes?: { Name?: string; DataOrigin?: string; UserDefinedDataOrigin?: string; Start?: string; Finish?: string; RecurrencePattern?: { RecurrenceType: 'DAILY' | 'WEEKLY' | 'MONTHLY_BY_DAY_OF_MONTH' | 'MONTHLY_BY_POSITION' | 'BY_DAY_COUNT' | 'BY_WEEKDAY_COUNT' | 'YEARLY_BY_DAY_OF_MONTH' | 'YEARLY_BY_POSITION'; DayComponent?: number[]; WeekdayComponent?: number[]; MonthComponent?: number[]; Position?: number; Interval?: number; Occurrences?: number; TimePeriods?: { StartTime: string; EndTime: string }[] } }[]; ExceptionTimes?: { Name?: string; DataOrigin?: string; UserDefinedDataOrigin?: string; Start?: string; Finish?: string; RecurrencePattern?: { RecurrenceType: 'DAILY' | 'WEEKLY' | 'MONTHLY_BY_DAY_OF_MONTH' | 'MONTHLY_BY_POSITION' | 'BY_DAY_COUNT' | 'BY_WEEKDAY_COUNT' | 'YEARLY_BY_DAY_OF_MONTH' | 'YEARLY_BY_POSITION'; DayComponent?: number[]; WeekdayComponent?: number[]; MonthComponent?: number[]; Position?: number; Interval?: number; Occurrences?: number; TimePeriods?: { StartTime: string; EndTime: string }[] } }[] }"],
+    tsReturn: 'number',
+    call: (_sdk, args, context) => {
+      const creator = creatorRegistry.getForSession(context.sandboxSessionId, args[0] as number);
+      return creator.addIfcWorkCalendar(args[1] as Parameters<typeof creator.addIfcWorkCalendar>[0]);
+    },
+    returns: 'value',
+    llmSemantics: {
+      taskTags: ['create'],
+      requiredKeys: ['Name'],
+      useWhen: 'Author a working-time calendar, then bind it with assignCalendarToTasks(calendarId, taskIds). WorkingTimes/ExceptionTimes Start/Finish are ISO dates ("2024-05-01"), not datetimes.',
+      cautions: [
+        'A calendar records WHEN work may happen; it does not itself shift any task date ifc-lite computes.',
+        'WeekdayComponent is 1 (Monday) through 7 (Sunday).',
+      ],
     },
   });
 
@@ -206,6 +230,16 @@ export function buildScheduleMethods(): MethodSchema[] {
     {
       taskTags: ['create'],
       useWhen: 'Group schedules under a plan — only needed for multi-schedule projects.',
+    },
+  ));
+
+  methods.push(relAssign(
+    'assignCalendarToTasks',
+    ['handle', 'calendarId', 'taskIds'],
+    'Ergonomic alias for addIfcRelAssignsToControl — assign an IfcWorkCalendar to tasks (or to work schedules). Returns relationship expressId.',
+    {
+      taskTags: ['create'],
+      useWhen: 'Bind a calendar created with addIfcWorkCalendar to the tasks or schedules it governs.',
     },
   ));
 

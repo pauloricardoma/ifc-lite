@@ -18,7 +18,6 @@ import type {
 } from '@ifc-lite/sdk';
 import type { StoreApi } from './types.js';
 import { EntityNode, findAllPropertiesInSets, compareFilterValue } from '@ifc-lite/query';
-import { IfcTypeEnum, IfcTypeEnumFromString } from '@ifc-lite/data';
 import { getModelForRef, getAllModelEntries } from './model-compat.js';
 import {
   extractAllEntityAttributes,
@@ -27,47 +26,21 @@ import {
   extractTypePropertiesOnDemand,
   extractDocumentsOnDemand,
   extractRelationshipsOnDemand,
+  extractExactRelatedIds,
   expandTypes,
   QUERY_REL_TYPE_MAP,
+  resolveEffectiveEntityRecord,
 } from '@ifc-lite/parser';
-import { applyAttributeMutationsToEntityData, mergeAttributeMutations } from './mutation-view.js';
-import { evaluateFilterRules } from '../../lib/search/filter-evaluate.js';
-
-/**
- * Check if a type name represents a product/spatial entity.
- *
- * Uses IfcTypeEnum as a whitelist — only known IFC types pass.
- * Excludes relationships, properties, quantities, element quantities,
- * and type objects (IfcWallType, IfcDoorType, etc.).
- *
- * Type names from entityIndex.byType are UPPERCASE (e.g. IFCWALLSTANDARDCASE).
- */
-function isProductType(type: string): boolean {
-  const enumVal = IfcTypeEnumFromString(type);
-  // Unknown = not a recognized product/spatial type (geometry definitions, placements, etc.)
-  if (enumVal === IfcTypeEnum.Unknown) return false;
-  // Exclude relationships, properties, quantities
-  const upper = type.toUpperCase();
-  if (upper.startsWith('IFCREL')) return false;
-  if (upper.startsWith('IFCPROPERTY')) return false;
-  if (upper.startsWith('IFCQUANTITY')) return false;
-  if (upper === 'IFCELEMENTQUANTITY') return false;
-  // Exclude type objects (IfcWallType, IfcDoorType, etc.) — metadata, not instances
-  if (upper.endsWith('TYPE')) return false;
-  return true;
-}
-
-function normalizePropertyValue(value: unknown): string | number | boolean | null {
-  if (value == null) return null;
-  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
-    return value;
-  }
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
-}
+import { applyAttributeMutationsToEntityData, getMutationViewForModel, mergeAttributeMutations } from './mutation-view.js';
+import { effectiveMutationRelationships, foldMutationRelated } from './query-overlay-relations.js';
+import { overlayProperties, overlayQuantities } from './query-adapter-overlay.js';
+import { foldRelationshipData } from './query-relationship-fold.js';
+import { isProductType } from './query-entity-filter.js';
+import { iterateEffectiveEntityIds } from '@ifc-lite/mutations';
+import { normalizePropertyValue } from './query-property-value.js';
+import { evaluateFilterGroups } from '@ifc-lite/rules';
+import { totalRuleCount } from '@ifc-lite/rules';
+import { definedModelTagIdsOf } from '../../lib/model-tags/evaluator-models.js';
 
 export function createQueryAdapter(store: StoreApi): QueryBackendMethods {
   function getEntityData(ref: EntityRef): EntityData | null {
@@ -75,6 +48,27 @@ export function createQueryAdapter(store: StoreApi): QueryBackendMethods {
     const model = getModelForRef(state, ref.modelId);
     if (!model?.ifcDataStore) return null;
 
+    const view = getMutationViewForModel(store, ref.modelId);
+    if (view?.isDeleted(ref.expressId)) return null;
+    const created = view?.getNewEntity(ref.expressId);
+    if (created && view) {
+      // Effective class + name-relaid attributes, exactly as export writes them.
+      const { type, attributes, names } = resolveEffectiveEntityRecord(created, {
+        retype: view.getEntityTypeMutation(ref.expressId)?.newType,
+        named: view.getAttributeMutationsForEntity(ref.expressId).map(({ name, value }) => [name, value] as const),
+        positional: view.getPositionalMutationsForEntity(ref.expressId) ?? [],
+      }, model.ifcDataStore.schemaVersion);
+      const text = (name: string): string => {
+        const value = attributes[names.indexOf(name)];
+        if (typeof value !== 'string' || value === '$' || value === '*') return '';
+        const trimmed = value.trim();
+        return trimmed.length >= 2 && trimmed.startsWith("'") && trimmed.endsWith("'")
+          ? trimmed.slice(1, -1).replace(/''/g, "'")
+          : trimmed;
+      };
+      return { ref, globalId: text('GlobalId'), name: text('Name'), type,
+        description: text('Description'), objectType: text('ObjectType') };
+    }
     const node = new EntityNode(model.ifcDataStore, ref.expressId);
     return applyAttributeMutationsToEntityData(store, ref.modelId, ref.expressId, {
       ref,
@@ -90,6 +84,10 @@ export function createQueryAdapter(store: StoreApi): QueryBackendMethods {
     const state = store.getState();
     const model = getModelForRef(state, ref.modelId);
     if (!model?.ifcDataStore) return [];
+
+    // The overlay is the whole answer once it exists (see query-adapter-overlay.ts).
+    const overlaid = overlayProperties(getMutationViewForModel(store, ref.modelId), ref);
+    if (overlaid) return overlaid;
 
     const node = new EntityNode(model.ifcDataStore, ref.expressId);
     return node.properties().map((pset) => ({
@@ -119,6 +117,9 @@ export function createQueryAdapter(store: StoreApi): QueryBackendMethods {
     const state = store.getState();
     const model = getModelForRef(state, ref.modelId);
     if (!model?.ifcDataStore) return [];
+
+    const overlaid = overlayQuantities(getMutationViewForModel(store, ref.modelId), ref);
+    if (overlaid) return overlaid;
 
     const node = new EntityNode(model.ifcDataStore, ref.expressId);
     return node.quantities().map(qset => ({
@@ -179,7 +180,9 @@ export function createQueryAdapter(store: StoreApi): QueryBackendMethods {
     if (!model?.ifcDataStore) {
       return { voids: [], fills: [], groups: [], connections: [] };
     }
-    return extractRelationshipsOnDemand(model.ifcDataStore, ref.expressId);
+    const view = getMutationViewForModel(store, ref.modelId);
+    if (!view) return extractRelationshipsOnDemand(model.ifcDataStore, ref.expressId);
+    return foldRelationshipData(model.ifcDataStore, view, ref, getEntityData);
   }
 
   function queryEntities(descriptor: QueryDescriptor): EntityData[] {
@@ -193,25 +196,30 @@ export function createQueryAdapter(store: StoreApi): QueryBackendMethods {
     for (const [modelId, model] of modelEntries) {
       if (!model?.ifcDataStore) continue;
 
-      let entityIds: number[];
-      if (descriptor.types && descriptor.types.length > 0) {
-        // Expand types to include IFC4 subtypes (e.g., IfcWall → IfcWallStandardCase)
-        entityIds = [];
-        for (const type of expandTypes(descriptor.types)) {
-          const typeIds = model.ifcDataStore.entityIndex.byType.get(type) ?? [];
-          for (const id of typeIds) entityIds.push(id);
+      const view = getMutationViewForModel(store, modelId);
+
+      // Expand types to every schema-declared descendant (IfcWall →
+      // IfcWallStandardCase, IfcBuildingElement → its concrete leaves),
+      // resolved against this model's own schema: buildingSMART re-parented
+      // entities between versions, so the version argument is load-bearing.
+      const types = descriptor.types && descriptor.types.length > 0
+        ? expandTypes(descriptor.types, model.ifcDataStore.schemaVersion)
+        : undefined;
+      // A type filter that expands to nothing matches nothing. The iterator
+      // reads an empty list as "no filter", so it must not reach it.
+      if (types && types.length === 0) continue;
+      // The session's effective entities (#5249): tombstones out, overlay
+      // creations in, a retyped entity under its new class — the same shared
+      // iterator the CLI and MCP query backends use.
+      for (const { expressId, type, overlayCreated } of iterateEffectiveEntityIds(model.ifcDataStore, view, types)) {
+        // No type filter — product entities only (skip relationships, property defs).
+        if (!types && !isProductType(type)) continue;
+        if (overlayCreated) {
+          // Effective class and name-relaid attributes, as export writes them.
+          const created = getEntityData({ modelId, expressId });
+          if (created) results.push(created);
+          continue;
         }
-      } else {
-        // No type filter — return product entities only (skip relationships, property defs)
-        entityIds = [];
-        for (const [typeName, ids] of model.ifcDataStore.entityIndex.byType) {
-          if (isProductType(typeName)) {
-            for (const id of ids) entityIds.push(id);
-          }
-        }
-      }
-      for (const expressId of entityIds) {
-        if (expressId === 0) continue;
         const node = new EntityNode(model.ifcDataStore, expressId);
         results.push(applyAttributeMutationsToEntityData(store, modelId, expressId, {
           ref: { modelId, expressId },
@@ -286,7 +294,7 @@ export function createQueryAdapter(store: StoreApi): QueryBackendMethods {
    * scripted exports (e.g. the CSV quantity take-off) honour the current
    * filtered view instead of always exporting everything (issue #1107, item 11).
    *
-   * Re-evaluates `searchFilter.rules` per model with the synchronous evaluator —
+   * Re-evaluates `searchFilter.groups` (OR-of-AND, #4904) per model with the synchronous evaluator —
    * the same logic that backs the modal — with no row cap, so the export covers
    * the full filtered set rather than the modal's display limit. Hidden/isolated
    * visibility is intentionally NOT consulted: the chosen semantics are
@@ -295,20 +303,34 @@ export function createQueryAdapter(store: StoreApi): QueryBackendMethods {
   function entitiesMatchingActiveFilter(): EntityData[] | null {
     const state = store.getState();
     const filter = state.searchFilter;
-    if (!filter || filter.rules.length === 0) return null;
+    if (!filter || totalRuleCount(filter.groups) === 0) return null;
 
     const results: EntityData[] = [];
     for (const [modelId, model] of getAllModelEntries(state)) {
       if (!model?.ifcDataStore) continue;
-      const matched = evaluateFilterRules(
+      const matched = evaluateFilterGroups(
         modelId,
         model.ifcDataStore,
-        filter.rules,
-        filter.combinator,
-        { limit: Number.MAX_SAFE_INTEGER },
+        filter.groups,
+        {
+          limit: Number.MAX_SAFE_INTEGER,
+          modelTagIds: state.modelTagAssignments.get(modelId),
+          definedModelTagIds: definedModelTagIdsOf(state),
+        },
       );
+      const view = getMutationViewForModel(store, modelId);
       for (const m of matched) {
         if (m.expressId === 0) continue;
+        // Tombstoned this session — `evaluateFilterGroups` matches straight
+        // off `ifcDataStore` and has no notion of the overlay, so a wall the
+        // user deleted still comes back as a match here unless excluded.
+        // Deliberately NOT folding overlay-created entities here (unlike
+        // `queryEntities()`): matches come from `evaluateFilterGroups`
+        // running rules against `ifcDataStore`, and there is no mechanism to
+        // evaluate those rules against a synthetic created entity. The CLI's
+        // own implementation is `entitiesMatchingActiveFilter: () => null`
+        // for the same reason — no reference to fold against exists.
+        if (view?.isDeleted(m.expressId)) continue;
         const node = new EntityNode(model.ifcDataStore, m.expressId);
         results.push(applyAttributeMutationsToEntityData(store, modelId, m.expressId, {
           ref: { modelId, expressId: m.expressId },
@@ -341,8 +363,20 @@ export function createQueryAdapter(store: StoreApi): QueryBackendMethods {
       if (!model?.ifcDataStore) return [];
       const relEnum = QUERY_REL_TYPE_MAP[relType];
       if (relEnum === undefined) return [];
-      const targets = model.ifcDataStore.relationships.getRelated(ref.expressId, relEnum, direction);
-      return targets.map((expressId: number) => ({ modelId: ref.modelId, expressId }));
+      const view = getMutationViewForModel(store, ref.modelId);
+      if (view?.isDeleted(ref.expressId)) return [];
+      const seen = new Set<number>();
+      const targets: number[] = [];
+      const take = (expressId: number) => {
+        if (view?.isDeleted(expressId) || seen.has(expressId)) return;
+        seen.add(expressId);
+        targets.push(expressId);
+      };
+      const effective = view ? effectiveMutationRelationships(model.ifcDataStore, view) : null;
+      for (const target of extractExactRelatedIds(model.ifcDataStore, ref.expressId, relType, direction,
+        id => view?.isDeleted(id) === true || effective?.supersededSourceIds.has(id) === true)) take(target);
+      if (view) for (const target of foldMutationRelated(model.ifcDataStore, view, relType, direction, ref.expressId)) take(target);
+      return targets.map((expressId) => ({ modelId: ref.modelId, expressId }));
     },
   };
 }

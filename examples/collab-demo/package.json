@@ -1,21 +1,23 @@
 {
   "name": "ifc-lite-collab-demo",
-  "version": "1.0.2",
+  "version": "1.0.8",
   "private": true,
   "type": "module",
   "license": "MPL-2.0",
   "description": "Two-tab live demo of @ifc-lite/collab",
   "scripts": {
     "dev": "vite --port 5174",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
     "server": "node ../../packages/collab-server/dist/bin.js"
   },
   "dependencies": {
     "@ifc-lite/collab": "workspace:*",
-    "yjs": "^13.6.32"
+    "yjs": "^13.6.33"
   },
   "devDependencies": {
     "typescript": "^6.0.3",
-    "vite": "^8.2.2",
+    "vite": "^8.3.1",
     "vite-plugin-top-level-await": "^1.6.0",
     "vite-plugin-wasm": "^3.6.0"
   }

@@ -21,6 +21,7 @@
 //! - `POST /api/v1/parse/parquet/optimized` - ara3d BOS-optimized format (~50x smaller)
 //! - `GET /api/v1/parse/symbolic/:cache_key` - 2D symbol stream (IfcAnnotation + IfcGrid) as JSON
 //! - `GET /api/v1/cache/:key` - Retrieve cached result
+//! - `DELETE /api/v1/cache/:key` - Invalidate every cache entry for the source file a `cache_key` names
 
 // Native global allocator (#1623): the platform system heap's global lock was
 // ~70% of native geometry self-time and capped rayon scaling to ~1.8x on
@@ -50,9 +51,12 @@ mod admission;
 mod config;
 mod mem_policy;
 mod error;
+mod in_flight;
 mod middleware;
+mod panic_strategy;
 mod routes;
 mod services;
+mod write_timeout;
 mod types;
 
 /// Slack added on top of `max_file_size_mb` for the raw framework-level body
@@ -91,7 +95,7 @@ fn build_cors_layer(config: &Config) -> CorsLayer {
 
         CorsLayer::new()
             .allow_origin(origins)
-            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+            .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
             .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION, header::ACCEPT])
             .max_age(Duration::from_secs(3600))
     }
@@ -135,6 +139,10 @@ pub struct AppState {
     pub cache: Arc<DiskCache>,
     pub config: Arc<Config>,
     pub admission: Arc<admission::Admission>,
+    /// Cache keys with a data-model write in flight right now (#5129):
+    /// `get_data_model` answers 202 only for a key in this set, and 404 for
+    /// everything else it cannot read.
+    pub data_model_in_flight: Arc<in_flight::InFlightKeys>,
 }
 
 /// Build the application router with all routes and middleware.
@@ -192,7 +200,10 @@ fn build_router(state: AppState) -> Router {
             get(routes::parse::get_symbolic),
         )
         // Cache endpoints
-        .route("/api/v1/cache/{key}", get(routes::cache::get_cached))
+        .route(
+            "/api/v1/cache/{key}",
+            get(routes::cache::get_cached).delete(routes::cache::delete_cached),
+        )
         .route("/api/v1/cache/check/{hash}", get(routes::parse::check_cache))
         .route(
             "/api/v1/cache/geometry/{hash}",
@@ -220,11 +231,19 @@ fn build_router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(
             (config.max_file_size_mb + BODY_LIMIT_SLACK_MB) * 1024 * 1024,
         ))
-        .layer(CompressionLayer::new()) // Compress responses (gzip)
         // Note: Request decompression handled manually in extract_file() to support multipart
         .layer(TimeoutLayer::new(Duration::from_secs(
             config.request_timeout_secs,
         )))
+        // One error body for every route (#5750): wraps the responses no
+        // handler writes (extractor rejections, unknown route, wrong method,
+        // the timeout above) in the `{"error", "code"}` envelope `ApiError`
+        // renders. Outside the timeout so its empty `408` is covered, and
+        // INSIDE compression so it only ever reads an uncompressed body.
+        .layer(axum::middleware::map_response(
+            middleware::error_envelope::envelope_errors,
+        ))
+        .layer(CompressionLayer::new()) // Compress responses (gzip)
         .layer(TraceLayer::new_for_http())
         .layer(build_cors_layer(&config))
         // Outermost: turn any panic that unwinds out of a request handler into a
@@ -232,12 +251,34 @@ fn build_router(state: AppState) -> Router {
         // (`panic = "unwind"`), this contains a malformed-IFC panic to the single
         // offending request rather than crashing the whole server. Requires the
         // `tower-http` `catch-panic` feature and a build profile that unwinds.
-        .layer(CatchPanicLayer::new())
+        // Its `500` is rendered as the shared error envelope directly, since it
+        // sits outside the envelope layer; the panic payload stays in the log.
+        .layer(CatchPanicLayer::custom(
+            middleware::error_envelope::panic_response,
+        ))
         .with_state(state)
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Build-profile self-check, before anything else starts. The release
+    // pipeline runs the SHIPPED binary with this flag to prove it unwinds,
+    // because `CatchPanicLayer` below is inert under `panic = "abort"` and
+    // nothing about an aborting binary looks wrong until the first malformed
+    // upload kills the process for every tenant on it. Under `abort` this
+    // call never returns (SIGABRT), which is the failure the CI step reads.
+    if std::env::args().skip(1).any(|arg| arg == panic_strategy::SELFTEST_FLAG) {
+        if panic_strategy::panic_unwinds() {
+            println!("{}", panic_strategy::UNWIND_VERDICT);
+            return Ok(());
+        }
+        anyhow::bail!(
+            "panic-strategy: NOT unwind. This binary was built with a non-unwinding \
+             panic strategy, so CatchPanicLayer cannot contain a malformed-IFC panic \
+             to one request. Build with `--profile server-release`."
+        );
+    }
+
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -320,6 +361,7 @@ async fn main() -> anyhow::Result<()> {
         cache,
         config: Arc::new(config.clone()),
         admission,
+        data_model_in_flight: Arc::new(in_flight::InFlightKeys::default()),
     };
 
     // Build router
@@ -331,6 +373,10 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind to {addr}"))?;
+    let listener = write_timeout::WriteTimeoutListener::new(
+        listener,
+        Duration::from_secs(config.stream_idle_timeout_secs),
+    );
     axum::serve(listener, app)
         .await
         .context("server exited with an error")?;
@@ -341,29 +387,4 @@ async fn main() -> anyhow::Result<()> {
 mod auth_and_cache_tests;
 
 #[cfg(test)]
-mod memory_admission_log_level_tests {
-    use super::{memory_admission_log_level, LogDecision};
-
-    /// #1547: unset/unparseable `IFC_MEM_BUDGET_MB` (auto-detection found no
-    /// readable memory ceiling) must warn, not silently stay quiet.
-    #[test]
-    fn unset_warns() {
-        assert_eq!(memory_admission_log_level(None), LogDecision::Warn);
-    }
-
-    /// `IFC_MEM_BUDGET_MB=0` is a deliberate opt-out, not a degradation.
-    #[test]
-    fn explicit_zero_is_opt_out_info() {
-        assert_eq!(memory_admission_log_level(Some(0)), LogDecision::Info);
-    }
-
-    /// A positive explicit budget is neither the info nor the warn "gate
-    /// off" case (main's `config.mem_budget_mb == 0` guard means this
-    /// variant is never actually reached at the call site, but the pure
-    /// function itself must be total and correct over its whole domain).
-    #[test]
-    fn positive_budget_is_active() {
-        assert_eq!(memory_admission_log_level(Some(1)), LogDecision::Active);
-        assert_eq!(memory_admission_log_level(Some(4096)), LogDecision::Active);
-    }
-}
+mod memory_admission_log_level_tests;

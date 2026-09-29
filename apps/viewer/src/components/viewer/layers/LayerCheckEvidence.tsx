@@ -12,9 +12,11 @@
  * which were minted in a different parse.
  */
 
+import { trackExportCompleted } from '@/lib/analytics';
 import { useCallback, useEffect, useState } from 'react';
 import { Download } from 'lucide-react';
 import { useViewerStore } from '@/store';
+import { useTranslation } from '@/i18n';
 import { LayerRegistryClient } from '@/lib/layers/registry-client';
 import { downloadBlob } from '@/lib/export/download';
 
@@ -45,6 +47,7 @@ function failureReasonOf(entity: ReportEntity): string | undefined {
 }
 
 export function LayerCheckEvidence({ digest }: { digest: string }) {
+  const { t } = useTranslation();
   const collabToken = useViewerStore((s) => s.collabSelfToken);
   const pathToId = useViewerStore((s) => s.layerStackPathToId);
   const [state, setState] = useState<
@@ -100,16 +103,19 @@ export function LayerCheckEvidence({ digest }: { digest: string }) {
       new Blob([state.raw], { type: 'application/json' }),
       `${digest.replace(/^blake3:/, '').slice(0, 12)}-report.json`,
     );
+    trackExportCompleted({ format: 'json', surface: 'layer_evidence' });
   }, [state, digest]);
 
-  if (state.kind === 'loading') return <p className="text-[10px] text-muted-foreground">Fetching evidence…</p>;
+  if (state.kind === 'loading') {
+    return <p className="text-2xs text-muted-foreground">{t('layersPanel.checkEvidence.loading')}</p>;
+  }
   if (state.kind === 'offline') {
-    return <p className="text-[10px] text-muted-foreground">Connect a collab server to fetch evidence.</p>;
+    return <p className="text-2xs text-muted-foreground">{t('layersPanel.checkEvidence.offline')}</p>;
   }
   if (state.kind === 'missing') {
-    return <p className="text-[10px] text-muted-foreground">Evidence not on the registry (digest stays verifiable).</p>;
+    return <p className="text-2xs text-muted-foreground">{t('layersPanel.checkEvidence.missing')}</p>;
   }
-  if (state.kind === 'error') return <p className="text-[10px] text-red-500">{state.message}</p>;
+  if (state.kind === 'error') return <p className="text-2xs text-red-500">{state.message}</p>;
 
   const specs = state.parsed?.report?.specificationResults ?? [];
   const failures = specs.flatMap((spec) =>
@@ -121,23 +127,26 @@ export function LayerCheckEvidence({ digest }: { digest: string }) {
 
   return (
     <div className="flex flex-col gap-0.5 pt-0.5">
-      <div className="flex items-center gap-1 text-[10px] text-muted-foreground">
+      <div className="flex items-center gap-1 text-2xs text-muted-foreground">
         {state.parsed?.summary ? (
           <span>
-            {state.parsed.summary.failedSpecifications ?? 0}/{state.parsed.summary.totalSpecifications ?? 0} specs
-            failing, {failures.length} entity failure{failures.length === 1 ? '' : 's'}
+            {t('layersPanel.checkEvidence.summary', {
+              failed: state.parsed.summary.failedSpecifications ?? 0,
+              total: state.parsed.summary.totalSpecifications ?? 0,
+              count: failures.length,
+            })}
           </span>
         ) : (
-          <span>Evidence fetched (not an ids report)</span>
+          <span>{t('layersPanel.checkEvidence.notIdsReport')}</span>
         )}
         <button
           type="button"
           onClick={download}
           className="ml-auto inline-flex items-center gap-0.5 rounded px-1 hover:bg-muted/60"
-          aria-label="Download evidence report"
+          aria-label={t('layersPanel.checkEvidence.downloadAriaLabel')}
         >
           <Download className="size-2.5" aria-hidden />
-          raw
+          {t('layersPanel.checkEvidence.downloadLabel')}
         </button>
       </div>
       {shown.map(({ spec, entity }, i) => {
@@ -149,10 +158,14 @@ export function LayerCheckEvidence({ digest }: { digest: string }) {
             type="button"
             disabled={!linkable}
             onClick={() => entity.globalId && selectEntity(entity.globalId)}
-            className={`rounded border bg-card/40 px-1 py-0.5 text-left text-[10px] ${
+            className={`rounded border bg-card/40 px-1 py-0.5 text-left text-2xs ${
               linkable ? 'hover:bg-muted/60' : 'cursor-default opacity-70'
             }`}
-            title={linkable ? 'Select in 3D' : 'Not in the current composition'}
+            title={
+              linkable
+                ? t('layersPanel.checkEvidence.selectTitle')
+                : t('layersPanel.checkEvidence.notInCompositionTitle')
+            }
           >
             <span className="font-medium">{entity.entityName ?? entity.globalId ?? entity.entityType}</span>
             <span className="text-muted-foreground"> · {entity.entityType}</span>
@@ -162,8 +175,8 @@ export function LayerCheckEvidence({ digest }: { digest: string }) {
         );
       })}
       {failures.length > shown.length && (
-        <p className="text-[10px] text-muted-foreground">
-          …and {failures.length - shown.length} more (download the raw report).
+        <p className="text-2xs text-muted-foreground">
+          {t('layersPanel.checkEvidence.moreFailures', { count: failures.length - shown.length })}
         </p>
       )}
     </div>

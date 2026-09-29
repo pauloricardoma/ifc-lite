@@ -2,15 +2,33 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Round-26 mutation-audit fixtures for the two never-mutated magic
-//! constants in this file: the `cut_changed_mesh` volume-drift tolerance
-//! (1.0e-3, relative to `vol_before`) and `drop_faces_outside_host`'s
-//! `VERTEX_CLEARANCE` (1.0e-3, absolute). Both had zero unit-level coverage
-//! before this round — only exercised transitively through full IFC-fixture
-//! integration tests, which never probed the boundary magnitude.
+//! Round-26 mutation-audit fixture for a never-mutated magic constant in this
+//! file: `drop_faces_outside_host`'s `VERTEX_CLEARANCE` (1.0e-3, absolute). It
+//! had zero unit-level coverage before that round, only exercised
+//! transitively through full IFC-fixture integration tests, which never probed
+//! the boundary magnitude. Also `mesh_to_keep`'s three arms (#4692).
 
 use super::*;
+use crate::csg::GroupReject;
 use crate::Vector3;
+
+/// `mesh_to_keep` keeps a `Cut` even at the host's triangle count (the #4692
+/// fix), keeps a re-tessellated miss only when its count moved, and keeps
+/// nothing for a rejection. The re-tessellation arm is what the geometry
+/// census depends on and the census does not run on PRs: dropping it (keeping
+/// the original host for every miss) regressed 25 or more census hosts.
+#[test]
+fn mesh_to_keep_keeps_a_cut_and_a_count_changing_retessellation_4692() {
+    let host = box_mesh((0.0, 0.0, 0.0), (1.0, 1.0, 1.0));
+    let mut regrown = host.clone();
+    regrown.merge(&needle_and_anchor(0.0));
+
+    let kept = |outcome| mesh_to_keep(outcome, &host).map(|m| m.triangle_count());
+    assert_eq!(kept(GroupCut::Cut(host.clone())), Some(12), "a cut at the host's count is still a cut");
+    assert_eq!(kept(GroupCut::Retessellated(regrown.clone())), Some(14), "a count-changing miss is kept");
+    assert_eq!(kept(GroupCut::Retessellated(host.clone())), None, "a same-count miss leaves the host");
+    assert_eq!(kept(GroupCut::Rejected(GroupReject::GateRejected)), None, "a rejection leaves the host");
+}
 
 /// Axis-aligned box mesh, outward-wound, `min`..`max`. Volume is exactly
 /// `(max-min).x * (max-min).y * (max-min).z` (up to f32 rounding).
@@ -51,31 +69,6 @@ fn box_mesh(min: (f64, f64, f64), max: (f64, f64, f64)) -> Mesh {
         m.add_triangle(b, b + 2, b + 3);
     }
     m
-}
-
-#[test]
-fn cut_changed_mesh_volume_drift_boundary_is_1e_3_relative() {
-    // Unit cube -> mesh_signed_volume magnitude is exactly 1.0.
-    let cube = box_mesh((0.0, 0.0, 0.0), (1.0, 1.0, 1.0));
-    let vol_after = mesh_signed_volume(&cube).abs();
-    assert!((vol_after - 1.0).abs() < 1e-6, "sanity: unit cube volume ~1.0, got {vol_after}");
-    let tris = cube.triangle_count();
-
-    // Just under the 1e-3 relative-to-vol_before threshold -> NOT changed.
-    // vol_before = 0.99901: diff = 0.00099, threshold = 0.99901 * 1e-3 = 0.00099901.
-    let not_changed = cut_changed_mesh(&cube, tris, 0.99901);
-    assert!(
-        !not_changed,
-        "a 0.099% volume drift is inside the 0.1% tolerance and must read as unchanged"
-    );
-
-    // Just over the threshold -> changed.
-    // vol_before = 0.99899: diff = 0.00101, threshold = 0.99899 * 1e-3 = 0.00099899.
-    let changed = cut_changed_mesh(&cube, tris, 0.99899);
-    assert!(
-        changed,
-        "a 0.101% volume drift exceeds the 0.1% tolerance and must read as changed"
-    );
 }
 
 /// Two triangles: a "needle" triangle with two vertices deep inside the
@@ -125,4 +118,43 @@ fn drop_faces_outside_host_vertex_clearance_boundary_is_1e_3() {
         "a 1.1mm poke exceeds the 1mm vertex clearance; the needle triangle must be dropped, \
          leaving only the anchor triangle"
     );
+}
+
+/// A sliver whose centroid probes BOTH land outside the host is kept when it
+/// sits within the 1 mm clearance of the reference surface (#5127): a flush
+/// cap grazing the host by ~10 µm leaves such a strip along the host's edge,
+/// connected to the closed skin, and dropping it tore ISSUE_068 #1401204. The
+/// same sliver 2 mm off the host is still swept.
+#[test]
+fn drop_faces_outside_host_keeps_a_grazing_sliver_within_centroid_clearance_5127() {
+    let host = box_mesh((0.0, 0.0, 0.0), (1.0, 1.0, 1.0));
+    // Sliver past the +y face at the x=1 edge, tilted so `centroid ± 50 µm·n`
+    // exits the box on both sides (n ≈ (-0.894, -0.447, 0)): the -n probe
+    // lands past y=1, the +n probe past x=1.
+    let sliver = |past_y: f64| {
+        let mut m = Mesh::with_capacity(6, 6);
+        let n = Vector3::new(-0.894, -0.447, 0.0);
+        m.add_vertex(Point3::new(1.0, 1.0 + past_y, 0.4), n);
+        m.add_vertex(Point3::new(1.0, 1.0 + past_y, 0.6), n);
+        m.add_vertex(Point3::new(0.99998, 1.0 + past_y + 0.00004, 0.5), n);
+        m.add_triangle(0, 1, 2);
+        // Anchor: comfortably inside, so the all-dropped bailout cannot mask
+        // a wrong drop.
+        m.add_vertex(Point3::new(0.2, 0.2, 0.2), n);
+        m.add_vertex(Point3::new(0.3, 0.2, 0.2), n);
+        m.add_vertex(Point3::new(0.2, 0.3, 0.2), n);
+        m.add_triangle(3, 4, 5);
+        m
+    };
+
+    let grazing = drop_faces_outside_host(sliver(0.00001), &host);
+    assert_eq!(
+        grazing.triangle_count(),
+        2,
+        "a sliver 10 µm past the host, both probes outside, is within the 1 mm \
+         centroid clearance and must be kept"
+    );
+
+    let far = drop_faces_outside_host(sliver(0.002), &host);
+    assert_eq!(far.triangle_count(), 1, "the same sliver 2 mm off the host is a shard and is swept");
 }

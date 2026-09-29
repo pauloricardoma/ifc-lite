@@ -21,12 +21,13 @@ import {
   type ReactNode,
   useCallback,
   useEffect,
-  useMemo,
   useRef,
   useState,
 } from 'react';
-import { ArrowLeft, Box, ChevronDown, ChevronRight, Download, Loader2, Upload, FileText, AlertTriangle, Trash2 } from 'lucide-react';
+import { ArrowLeft, Box, ChevronDown, ChevronRight, Download, Upload, AlertTriangle, Trash2 } from 'lucide-react';
+import { Spinner } from '@/components/ui/spinner';
 import { cn } from '@/lib/utils';
+import { useTranslation } from '@/i18n';
 import { useDocumentMeta, useFonts } from './use-mcp-page';
 import {
   parsePlaygroundModel,
@@ -36,9 +37,9 @@ import {
 } from './playground-dispatcher';
 import { PlaygroundChat } from './PlaygroundChat';
 import { PlaygroundViewer } from './PlaygroundViewer';
+import { ModelSummary } from './playground-model-summary';
 import type { ViewerController } from './playground-viewer-types';
 import { playgroundFiles, usePlaygroundFiles, formatBytes as formatFileBytes } from './playground-files';
-
 const NIGHT = '#0a0a0c';
 const PANEL = '#101014';
 const RULE = 'rgba(237, 228, 211, 0.08)';
@@ -66,7 +67,7 @@ interface SampleEntry {
   url: string;
   approxBytes: number;
 }
-
+// hello-wall.ifc/infra-bridge.ifc urls below are also asset-usage.mjs's only covered reference to those Rust test fixtures — don't drop without re-checking TEXT_EXTENSIONS there.
 const SAMPLES: SampleEntry[] = [
   { id: 'hello-wall',          label: 'Hello Wall',          blurb: 'IFC4 minimal · 1 wall, 1 storey',          url: '/samples/hello-wall.ifc',          approxBytes:  78_000 },
   { id: 'building-architecture', label: 'Building / Architecture', blurb: 'buildingSMART sample · 444 entities, IFC4', url: '/samples/building-architecture.ifc', approxBytes: 220_000 },
@@ -74,12 +75,13 @@ const SAMPLES: SampleEntry[] = [
 ];
 
 export function McpPlayground(): ReactNode {
-  useFonts(
+  const { t } = useTranslation(); useFonts(
     'https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Bricolage+Grotesque:opsz,wght@12..96,300;12..96,400;12..96,500;12..96,600;12..96,700&family=JetBrains+Mono:wght@400;500;600&display=swap',
   );
-  useDocumentMeta('@ifc-lite/mcp · playground', NIGHT);
+  useDocumentMeta(t('mcp.mcpPlayground.documentTitle'), NIGHT);
 
   const [model, setModel] = useState<LoadedPlaygroundModel | null>(null);
+  const [modelRevision, setModelRevision] = useState(0);
   const [loadingId, setLoadingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [viewerOpen, setViewerOpen] = useState(false);
@@ -93,8 +95,10 @@ export function McpPlayground(): ReactNode {
     () => ({
       viewer: viewerRef.current ?? null,
       openViewerPanel: () => setViewerOpen(true),
+      onModelChanged: () => setModelRevision((revision) => revision + 1),
+      translate: t,
     }),
-    [],
+    [t],
   );
 
   const loadFromUrl = useCallback(async (entry: SampleEntry) => {
@@ -139,13 +143,13 @@ export function McpPlayground(): ReactNode {
         >
           <div>
             <h2
-              className="text-[26px] leading-none tracking-tight"
+              className="text-2xl leading-none tracking-tight"
               style={{ ...display, fontStyle: 'italic' }}
             >
-              Playground.
+              {t('mcp.mcpPlayground.title')}
             </h2>
-            <p className="mt-1.5 text-[12.5px] leading-snug" style={{ color: PAPER_DIM }}>
-              Pick a sample IFC. Then chat. The agent drives the same {supportedToolNames().length} tools the stdio MCP exposes — query, mutate, validate, BCF, export. Models stay in your browser.
+            <p className="mt-1.5 text-xs leading-snug" style={{ color: PAPER_DIM }}>
+              {t('mcp.mcpPlayground.subtitle', { count: supportedToolNames().length })}
             </p>
           </div>
 
@@ -154,13 +158,13 @@ export function McpPlayground(): ReactNode {
           <DropZone disabled={loadingId !== null} onFile={loadFromFile} />
 
           {error && (
-            <div className="rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-[12px] text-red-200">
+            <div className="rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-200">
               <AlertTriangle size={12} className="mr-1 inline" />
               {error}
             </div>
           )}
 
-          {model && <ModelSummary model={model} />}
+          {model && <ModelSummary model={model} revision={modelRevision} />}
 
           <DownloadsPanel />
 
@@ -174,6 +178,7 @@ export function McpPlayground(): ReactNode {
         <section className="flex min-h-0 flex-col">
           <ViewerPanel
             model={model}
+            revision={modelRevision}
             open={viewerOpen}
             onToggle={() => setViewerOpen((o) => !o)}
             controllerRef={viewerRef}
@@ -190,30 +195,30 @@ export function McpPlayground(): ReactNode {
 // ── top bar ────────────────────────────────────────────────────────────────
 
 function TopBar({ onClose, hasModel }: { onClose: () => void; hasModel: boolean }): ReactNode {
-  return (
+  const { t } = useTranslation(); return (
     <div className="flex items-center justify-between border-b border-white/10 px-5 py-3">
-      <a href="/mcp" className="flex items-center gap-2 text-[13px] text-white/70 hover:text-white">
+      <a href="/mcp" className="flex items-center gap-2 text-sm text-white/70 hover:text-white">
         <ArrowLeft size={14} />
-        <span>back to /mcp</span>
+        <span>{t('mcp.mcpPlayground.backToMcp')}</span>
       </a>
       <div className="flex items-center gap-3">
         <a
           href="/"
-          className="hidden items-center gap-1 text-[10.5px] uppercase tracking-[0.22em] text-white/40 hover:text-white sm:inline-flex"
+          className="hidden items-center gap-1 text-2xs uppercase tracking-[0.22em] text-white/40 hover:text-white sm:inline-flex"
           style={mono}
         >
-          viewer
+          {t('mcp.mcpPlayground.topBarViewerLink')}
         </a>
-        <span style={{ ...mono, color: PAPER_DIM }} className="text-[10px] uppercase tracking-[0.22em]">
-          /mcp/playground
+        <span style={{ ...mono, color: PAPER_DIM }} className="text-2xs uppercase tracking-[0.22em]">
+          {t('mcp.mcpPlayground.playgroundPath')}
         </span>
         {hasModel && (
           <button
             onClick={onClose}
-            className="inline-flex items-center gap-1 rounded border border-white/15 px-2 py-1 text-[10.5px] hover:bg-white/5"
+            className="inline-flex items-center gap-1 rounded border border-white/15 px-2 py-1 text-2xs hover:bg-white/5"
             style={{ ...mono, color: PAPER_DIM }}
           >
-            <Trash2 size={11} /> unload
+            <Trash2 size={11} /> {t('mcp.mcpPlayground.unload')}
           </button>
         )}
       </div>
@@ -234,10 +239,10 @@ function SampleList({
   activeId: string | null;
   onPick: (s: SampleEntry) => void;
 }): ReactNode {
-  return (
+  const { t } = useTranslation(); return (
     <div className="flex flex-col gap-2">
-      <span style={{ ...mono, color: PAPER_DIM }} className="text-[10px] uppercase tracking-[0.22em]">
-        sample models
+      <span style={{ ...mono, color: PAPER_DIM }} className="text-2xs uppercase tracking-[0.22em]">
+        {t('mcp.mcpPlayground.sampleModels')}
       </span>
       <ul className="flex flex-col gap-1.5">
         {samples.map((s) => {
@@ -258,17 +263,17 @@ function SampleList({
               >
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
-                    <span className="text-[13.5px] font-medium" style={{ color: PAPER }}>
+                    <span className="text-sm font-medium" style={{ color: PAPER }}>
                       {s.label}
                     </span>
-                    {isLoading && <Loader2 size={11} className="animate-spin" style={{ color: ACCENT }} />}
+                    {isLoading && <Spinner size="xs" style={{ color: ACCENT }} />}
                   </div>
-                  <p className="mt-0.5 text-[11px]" style={{ color: PAPER_DIM }}>
+                  <p className="mt-0.5 text-2xs" style={{ color: PAPER_DIM }}>
                     {s.blurb}
                   </p>
                 </div>
-                <span style={{ ...mono, color: PAPER_DIM }} className="shrink-0 text-[10px]">
-                  {formatBytes(s.approxBytes)}
+                <span style={{ ...mono, color: PAPER_DIM }} className="shrink-0 text-2xs">
+                  {formatFileBytes(s.approxBytes)}
                 </span>
               </button>
             </li>
@@ -286,7 +291,7 @@ function DropZone({
   onFile: (file: File) => void;
   disabled: boolean;
 }): ReactNode {
-  const [hover, setHover] = useState(false);
+  const { t } = useTranslation(); const [hover, setHover] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   return (
     <label
@@ -306,7 +311,7 @@ function DropZone({
       style={{ color: PAPER_DIM }}
     >
       <Upload size={14} />
-      <span className="text-[11.5px]">drop an .ifc/.ifczip, or click to pick</span>
+      <span className="text-xs">{t('mcp.mcpPlayground.dropHint')}</span>
       <input
         ref={inputRef}
         type="file"
@@ -321,78 +326,20 @@ function DropZone({
   );
 }
 
-// ── model summary ─────────────────────────────────────────────────────────
-
-function ModelSummary({ model }: { model: LoadedPlaygroundModel }): ReactNode {
-  const top = useMemo(() => {
-    const counts: Array<{ type: string; count: number }> = [];
-    for (const [type, ids] of model.store.entityIndex.byType) counts.push({ type, count: ids.length });
-    counts.sort((a, b) => b.count - a.count);
-    return counts.slice(0, 8);
-  }, [model]);
-
-  return (
-    <div className="flex flex-col gap-2 rounded-md border border-white/10 bg-white/[0.02] p-3">
-      <div className="flex items-center gap-2">
-        <FileText size={12} style={{ color: ACCENT }} />
-        <span className="text-[11.5px]" style={{ color: PAPER }}>
-          {model.name}
-        </span>
-      </div>
-      <dl className="grid grid-cols-3 gap-2 text-[11px]" style={{ ...mono, color: PAPER_DIM }}>
-        <div>
-          <dt className="text-[9px] uppercase tracking-[0.2em]">schema</dt>
-          <dd style={{ color: PAPER }}>{model.store.schemaVersion}</dd>
-        </div>
-        <div>
-          <dt className="text-[9px] uppercase tracking-[0.2em]">entities</dt>
-          <dd style={{ color: PAPER }}>{model.store.entityCount.toLocaleString()}</dd>
-        </div>
-        <div>
-          <dt className="text-[9px] uppercase tracking-[0.2em]">file</dt>
-          <dd style={{ color: PAPER }}>{formatBytes(model.fileSize)}</dd>
-        </div>
-      </dl>
-
-      <div className="mt-1 border-t border-white/10 pt-2">
-        <div className="mb-1 text-[9px] uppercase tracking-[0.22em]" style={{ ...mono, color: PAPER_DIM }}>
-          top entity types
-        </div>
-        <ul className="flex flex-col gap-0.5">
-          {top.map((row) => (
-            <li key={row.type} className="flex items-baseline justify-between gap-2 text-[11.5px]">
-              <span className="truncate" style={{ ...mono, color: PAPER_DIM }}>
-                {row.type}
-              </span>
-              <span style={{ ...mono, color: PAPER }}>{row.count}</span>
-            </li>
-          ))}
-        </ul>
-      </div>
-    </div>
-  );
-}
-
 // ── footer ─────────────────────────────────────────────────────────────────
 
 function FooterLinks(): ReactNode {
-  return (
-    <div className="mt-auto flex items-center justify-between gap-2 border-t border-white/10 pt-3 text-[10.5px]" style={{ ...mono, color: PAPER_DIM }}>
-      <a href="/mcp" className="hover:text-white">tools</a>
-      <a href="https://github.com/LTplus-AG/ifc-lite" className="hover:text-white">github</a>
-      <a href="https://www.npmjs.com/package/@ifc-lite/mcp" className="hover:text-white">npm</a>
-      <a href="/" className="hover:text-white">viewer</a>
+  const { t } = useTranslation(); return (
+    <div className="mt-auto flex items-center justify-between gap-2 border-t border-white/10 pt-3 text-2xs" style={{ ...mono, color: PAPER_DIM }}>
+      <a href="/mcp" className="hover:text-white">{t('mcp.mcpPlayground.footerTools')}</a>
+      <a href="https://github.com/LTplus-AG/ifc-lite" className="hover:text-white">{t('mcp.mcpPlayground.footerGithub')}</a>
+      <a href="https://www.npmjs.com/package/@ifc-lite/mcp" className="hover:text-white">{t('mcp.mcpPlayground.footerNpm')}</a>
+      <a href="/" className="hover:text-white">{t('mcp.mcpPlayground.footerViewer')}</a>
     </div>
   );
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────
-
-function formatBytes(bytes: number): string {
-  if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
-  if (bytes >= 1024) return (bytes / 1024).toFixed(0) + ' KB';
-  return bytes + ' B';
-}
 
 function modelIdFor(model: LoadedPlaygroundModel): string {
   // The dispatcher derives ids from the filename; we encode SAMPLES with the
@@ -409,20 +356,20 @@ function modelIdFor(model: LoadedPlaygroundModel): string {
 // never auto-triggered.
 
 function DownloadsPanel(): ReactNode {
-  const files = usePlaygroundFiles();
+  const { t } = useTranslation(); const files = usePlaygroundFiles();
   if (files.length === 0) return null;
   return (
     <div className="flex flex-col gap-2">
       <div className="flex items-baseline justify-between">
-        <span style={{ ...mono, color: PAPER_DIM }} className="text-[10px] uppercase tracking-[0.22em]">
-          downloads · {files.length}
+        <span style={{ ...mono, color: PAPER_DIM }} className="text-2xs uppercase tracking-[0.22em]">
+          {t('mcp.mcpPlayground.downloadsCount', { count: files.length })}
         </span>
         <button
           onClick={() => playgroundFiles.clear()}
           style={{ ...mono, color: PAPER_DIM }}
-          className="text-[10px] uppercase tracking-[0.18em] hover:text-white"
+          className="text-2xs uppercase tracking-[0.18em] hover:text-white"
         >
-          clear
+          {t('mcp.mcpPlayground.clear')}
         </button>
       </div>
       <ul className="flex flex-col gap-1.5">
@@ -432,38 +379,38 @@ function DownloadsPanel(): ReactNode {
             className="flex flex-col gap-1.5 rounded-md border border-white/10 bg-white/[0.02] px-3 py-2"
           >
             <div className="flex items-baseline justify-between gap-2">
-              <span className="truncate text-[12.5px]" style={{ color: PAPER }} title={f.filename}>
+              <span className="truncate text-xs" style={{ color: PAPER }} title={f.filename}>
                 {f.filename}
               </span>
-              <span style={{ ...mono, color: PAPER_DIM }} className="shrink-0 text-[10px]">
+              <span style={{ ...mono, color: PAPER_DIM }} className="shrink-0 text-2xs">
                 {formatFileBytes(f.size)}
               </span>
             </div>
             {f.description && (
-              <span className="text-[10.5px] leading-snug" style={{ color: PAPER_DIM }}>
+              <span className="text-2xs leading-snug" style={{ color: PAPER_DIM }}>
                 {f.description}
               </span>
             )}
             <div className="flex items-center justify-between gap-2 pt-0.5">
-              <span style={{ ...mono, color: PAPER_DIM }} className="text-[9.5px] uppercase tracking-[0.18em]">
-                from {f.source}
+              <span style={{ ...mono, color: PAPER_DIM }} className="text-2xs uppercase tracking-[0.18em]">
+                {t('mcp.mcpPlayground.fromSource', { source: f.source })}
               </span>
               <div className="flex items-center gap-1">
                 <button
                   onClick={() => playgroundFiles.remove(f.id)}
                   className="rounded p-1 text-white/40 hover:bg-white/5 hover:text-white"
-                  aria-label="Remove"
-                  title="Remove from list"
+                  aria-label={t('mcp.mcpPlayground.removeAriaLabel')}
+                  title={t('mcp.mcpPlayground.removeTitle')}
                 >
                   <Trash2 size={12} />
                 </button>
                 <button
                   onClick={() => playgroundFiles.download(f.id)}
-                  className="inline-flex items-center gap-1 rounded px-2 py-1 text-[10.5px] font-semibold"
+                  className="inline-flex items-center gap-1 rounded px-2 py-1 text-2xs font-semibold"
                   style={{ background: ACCENT, color: NIGHT, ...mono }}
                 >
                   <Download size={11} />
-                  download
+                  {t('mcp.mcpPlayground.download')}
                 </button>
               </div>
             </div>
@@ -478,16 +425,18 @@ function DownloadsPanel(): ReactNode {
 
 function ViewerPanel({
   model,
+  revision,
   open,
   onToggle,
   controllerRef,
 }: {
   model: LoadedPlaygroundModel | null;
+  revision: number;
   open: boolean;
   onToggle: () => void;
   controllerRef: React.MutableRefObject<ViewerController | null>;
 }): ReactNode {
-  return (
+  const { t } = useTranslation(); return (
     <div className={cn('border-b border-white/10 transition-[height]')}>
       <button
         onClick={onToggle}
@@ -495,17 +444,17 @@ function ViewerPanel({
       >
         <span className="flex items-center gap-2">
           <Box size={13} style={{ color: ACCENT }} />
-          <span className="text-[12px]" style={{ color: PAPER }}>
-            3D viewer
+          <span className="text-xs" style={{ color: PAPER }}>
+            {t('mcp.mcpPlayground.viewer3d')}
           </span>
-          <span style={{ ...mono, color: PAPER_DIM }} className="text-[10px] uppercase tracking-[0.22em]">
-            {open ? 'on' : 'off'} · inline · agent-driven
+          <span style={{ ...mono, color: PAPER_DIM }} className="text-2xs uppercase tracking-[0.22em]">
+            {open ? t('mcp.mcpPlayground.viewerStatusOn') : t('mcp.mcpPlayground.viewerStatusOff')}
           </span>
         </span>
         <span className="flex items-center gap-2">
           {!model && (
-            <span style={{ ...mono, color: PAPER_DIM }} className="text-[10px]">
-              load a model first
+            <span style={{ ...mono, color: PAPER_DIM }} className="text-2xs">
+              {t('mcp.mcpPlayground.loadModelFirst')}
             </span>
           )}
           {open ? <ChevronDown size={14} style={{ color: PAPER_DIM }} /> : <ChevronRight size={14} style={{ color: PAPER_DIM }} />}
@@ -516,6 +465,7 @@ function ViewerPanel({
           <PlaygroundViewer
             ref={controllerRef}
             model={model}
+            revision={revision}
             className="absolute inset-0"
           />
         </div>

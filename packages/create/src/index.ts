@@ -28,6 +28,35 @@
 
 export { IfcCreator } from './ifc-creator.js';
 
+// Terrain & survey emitters (IFC4X3) — the entity set the LandXML→IFC v1
+// mapping needs. See `docs/architecture/landxml-to-ifc-mapping.md`.
+export type {
+  GeoreferencingParams, SurveyPointParams, SurveyPropertySetParams,
+  TerrainSurfaceParams, TerrainSurfaceResult, TerrainWriter,
+} from './ifc-creator-terrain.js';
+
+// LandXML → IFC4X3 v1. Contract: `docs/architecture/landxml-to-ifc-mapping.md`.
+export {
+  LANDXML_IFC_MAPPING_VERSION, landXmlGlobalId, landXmlToIfc, type LandXmlIfcOptions,
+} from './landxml/landxml-to-ifc.js';
+export {
+  TRANSVERSE_MERCATOR_BOUNDS, checkCoordinateOrder, type CrsPlausibilityBounds,
+} from './landxml/coordinate-plausibility.js';
+export {
+  alignmentMappingOf, alignmentRefusalMessage, collectRefusals, isMappableSurface, refusalReason,
+} from './landxml/refusals.js';
+export {
+  ALIGNMENT_POSITION_TOLERANCE_M, cogoPointResolver, isAlignmentRecord, mapAlignments,
+  type AlignmentMapping, type HorizontalSegment, type HorizontalSegmentType, type MappedAlignment,
+  type PointResolver, type RefusedAlignment,
+} from './landxml/alignment-mapping.js';
+export type { AlignmentParams, AlignmentResult } from './ifc-creator-alignment.js';
+export type { AlignmentVerticalParams } from './ifc-creator-alignment-vertical.js';
+export type { VerticalSegment, VerticalSegmentType } from './landxml/profile-geometry.js';
+export type { StationEquationParams } from './ifc-creator-alignment-referents.js';
+export type * from './landxml/source-types.js';
+export type * from './landxml/result-types.js';
+
 // In-store builders — emit elements into an existing parsed IfcDataStore
 // via a `StoreEditor` overlay (closes the merge-roundtrip gap from #592).
 export { addColumnToStore, type ColumnInStoreParams, type ColumnBuildResult } from './in-store/column.js';
@@ -36,6 +65,40 @@ export { addSlabToStore, type SlabInStoreParams, type SlabRectangleParams, type 
 export { addBeamToStore, type BeamInStoreParams, type BeamBuildResult } from './in-store/beam.js';
 export { addDoorToStore, type DoorInStoreParams, type DoorBuildResult } from './in-store/door.js';
 export { addWindowToStore, type WindowInStoreParams, type WindowBuildResult } from './in-store/window.js';
+export {
+  addOpeningToStore,
+  type OpeningInStoreParams,
+  type WallOpeningInStoreParams,
+  type SlabOpeningInStoreParams,
+  type OpeningBuildResult,
+} from './in-store/opening.js';
+export {
+  addHostedDoorToStore,
+  addHostedWindowToStore,
+  type HostedDoorInStoreParams,
+  type HostedWindowInStoreParams,
+  type HostedFillBuildResult,
+} from './in-store/hosted-fill.js';
+export {
+  addElementTypeToStore,
+  assignTypeInStore,
+  type AuthoringAnchor,
+  type ElementTypeInStoreParams,
+  type ElementTypeBuildResult,
+} from './in-store/element-type.js';
+export {
+  addMaterialToStore,
+  addMaterialLayerSetToStore,
+  addMaterialLayerSetUsageToStore,
+  assignMaterialInStore,
+  type MaterialInStoreParams,
+  type MaterialLayerInStoreParams,
+  type MaterialLayerSetInStoreParams,
+  type MaterialLayerSetBuildResult,
+  type MaterialLayerSetUsageInStoreParams,
+} from './in-store/material.js';
+export type { OneToManyResult } from './in-store/relate.js';
+export { resolveAuthoringAnchor, readRelatedLists, liveEntityType, liveEntityConforms } from './in-store/resolve-relations.js';
 export { addSpaceToStore, type SpaceInStoreParams, type SpaceRectangleParams, type SpacePolygonParams, type SpaceBuildResult } from './in-store/space.js';
 export {
   addSpatialZonesToStore,
@@ -56,8 +119,17 @@ export {
 export { addRoofToStore, type RoofInStoreParams, type RoofRectangleParams, type RoofPolygonParams, type RoofBuildResult } from './in-store/roof.js';
 export { addPlateToStore, type PlateInStoreParams, type PlateRectangleParams, type PlatePolygonParams, type PlateBuildResult } from './in-store/plate.js';
 export { addMemberToStore, type MemberInStoreParams, type MemberBuildResult } from './in-store/member.js';
+export {
+  addCostScheduleToStore, addCostItemToStore, addCostValueToStore, addCostQuantityToStore,
+  nestCostItemsInStore, assignCostItemsToScheduleInStore, assignObjectsToCostItemInStore,
+  attachCostValuesToItemInStore,
+  type CostAnchor, type ExistingRelatedList,
+} from './in-store/cost.js';
+export { removeCostEntityInStore, type CostRemovalReferrers } from './in-store/cost-removal.js';
 export { resolveSpatialAnchor } from './in-store/resolve-anchor.js';
-export type { SpatialAnchor } from './in-store/anchor.js';
+export { resolveHostAnchor } from './in-store/resolve-host.js';
+export { toNativeLength, fromNativeLength } from './in-store/anchor.js';
+export type { SpatialAnchor, HostAnchor, HostBounds, HostKind } from './in-store/anchor.js';
 export {
   duplicateInStore,
   type SourceAttributes,
@@ -80,6 +152,12 @@ export {
   type WallExtractionResult,
 } from './in-store/extract-walls.js';
 export {
+  storeyPlanFrame,
+  toStoreyLocal,
+  fromStoreyLocal,
+  type StoreyPlanFrame,
+} from './in-store/storey-plan-frame.js';
+export {
   generateSpacesFromWalls,
   offsetRoomFootprint,
   GENERATED_SPACE_OBJECTTYPE,
@@ -95,6 +173,72 @@ export {
   type GenerateSpacesStoreyResult,
   type StoreyInfo,
 } from './in-store/generate-spaces-all.js';
+// Structural analysis authoring (#5167 task S.1) — IfcStructuralAnalysisModel
+// and its members/connections/loads/relationships.
+export {
+  addStructuralAnalysisModelToStore,
+  type StructuralAnalysisModelInStoreParams,
+  type StructuralAnalysisModelBuildResult,
+  type StructuralAnalysisModelType,
+} from './in-store/structural-analysis-model.js';
+export {
+  addStructuralCurveMemberToStore,
+  type StructuralCurveMemberInStoreParams,
+  type StructuralCurveMemberBuildResult,
+  type StructuralCurveMemberType,
+} from './in-store/structural-curve-member.js';
+export {
+  addStructuralPointConnectionToStore,
+  type StructuralPointConnectionInStoreParams,
+  type StructuralPointConnectionBuildResult,
+  type StructuralBoundaryConditionParams,
+} from './in-store/structural-point-connection.js';
+export {
+  addStructuralLoadGroupToStore,
+  type StructuralLoadGroupInStoreParams,
+  type StructuralLoadGroupBuildResult,
+  type StructuralLoadGroupType,
+  type StructuralActionType,
+  type StructuralActionSourceType,
+} from './in-store/structural-load-group.js';
+export {
+  addStructuralPointActionToStore,
+  addStructuralLinearActionToStore,
+  type StructuralPointActionInStoreParams,
+  type StructuralPointActionBuildResult,
+  type StructuralLinearActionInStoreParams,
+  type StructuralLinearActionBuildResult,
+  type StructuralGlobalOrLocal,
+} from './in-store/structural-action.js';
+export {
+  connectStructuralMemberToConnectionInStore,
+  connectStructuralActivityToItemInStore,
+  assignToStructuralGroupInStore,
+} from './in-store/structural-relationships.js';
+
+export {
+  addDrawingMarkupToStore,
+  addMeasureMarkupToStore,
+  addPolygonAreaMarkupToStore,
+  addTextMarkupToStore,
+  addCloudMarkupToStore,
+  DRAWING_MARKUP_OBJECTTYPE,
+  DRAWING_MARKUP_PSET_NAME,
+  DRAWING_MARKUP_QSET_NAME,
+  type DrawingMarkupObjectType,
+  type MarkupAnchor,
+  type MarkupPoint2D,
+  type MeasureMarkupParams,
+  type MeasureMarkupResult,
+  type PolygonAreaMarkupParams,
+  type PolygonAreaMarkupResult,
+  type TextMarkupParams,
+  type TextMarkupResult,
+  type CloudMarkupParams,
+  type CloudMarkupResult,
+  type DrawingMarkupBatchInput,
+  type DrawingMarkupBatchResult,
+} from './in-store/drawing-markup.js';
 
 export type {
   // Geometry primitives
@@ -144,6 +288,7 @@ export type {
 
   // Properties & quantities
   PropertyType,
+  PropertyMeasureType,
   PropertyDef,
   PropertySetDef,
   QuantityKind,
@@ -160,27 +305,55 @@ export type {
   BuildingParams,
   StoreyParams,
 
-  // Scheduling / 4D (IfcWorkSchedule, IfcTask, IfcRelSequence)
+  // Scheduling / 4D (IfcWorkSchedule, IfcTask, IfcRelSequence, IfcWorkCalendar)
   // Canonical IFC-prefixed names are preferred; legacy short names are kept
   // as aliases for existing callers.
   IfcWorkScheduleParams,
   IfcWorkPlanParams,
   IfcTaskParams,
   IfcRelSequenceParams,
+  IfcWorkCalendarParams,
+  IfcWorkTimeParams,
+  IfcRecurrencePatternParams,
+  IfcTimePeriodParams,
   IfcWorkScheduleType,
   IfcTaskPredefinedType,
   IfcTaskDurationType,
   IfcRelSequenceType,
+  IfcWorkCalendarType,
+  IfcRecurrenceType,
   WorkScheduleParams,
   WorkPlanParams,
   TaskParams,
   SequenceParams,
+  WorkCalendarParams,
+  WorkTimeParams,
+  RecurrencePatternParams,
+  TimePeriodParams,
   WorkScheduleType,
   TaskPredefinedType,
   TaskDurationType,
   SequenceType,
+  WorkCalendarType,
+  RecurrenceType,
 
   // Results
   CreatedEntity,
   CreateResult,
 } from './types.js';
+
+// Cost / 5D authoring (IfcCostSchedule, IfcCostItem, IfcCostValue)
+export type {
+  CostArithmeticOperator,
+  CostItemParams,
+  CostItemPredefinedType,
+  CostMeasureType,
+  CostQuantityKind,
+  CostQuantityParams,
+  CostScheduleParams,
+  CostSchedulePredefinedType,
+  CostSIUnitType,
+  CostTypedValue,
+  CostValueParams,
+  SIUnitParams,
+} from './types-cost.js';

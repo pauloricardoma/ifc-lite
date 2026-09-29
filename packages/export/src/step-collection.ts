@@ -29,7 +29,9 @@
 
 import type { IfcDataStore } from '@ifc-lite/parser';
 import type { MutablePropertyView } from '@ifc-lite/mutations';
-import { collectReferencedEntityIds, getVisibleEntityIds, collectStyleEntities } from './reference-collector.js';
+import { collectReferencedEntityIds, getVisibleEntityIds } from './reference-collector.js';
+import { collectStyleEntities } from './style-closure.js';
+import { collectGeoreferencingEntities } from './georef-closure.js';
 import { getSubsetEntityIds } from './subset-roots.js';
 import { buildRelDefinesByPropertiesIndex } from './step-property-set-index.js';
 import { collectPropertyAndQuantitySetMutations } from './step-property-set-collection.js';
@@ -146,7 +148,7 @@ export function collectModifications(
     // below previously walked every entity in `entityIndex.byId` per
     // modified entity (O(E·N)); the index keeps the per-entity step
     // O(K) where K is the number of rels referencing that entity.
-    const { byEntity: relDefinesByEntity, relatedByRel } = buildRelDefinesByPropertiesIndex(ctx.propertySetContext());
+    const { byEntity: relDefinesByEntity, relatedByRel } = buildRelDefinesByPropertiesIndex(ctx.propertySetContext(), pass.effective);
 
     // A source IfcRelDefinesByProperties whose EVERY related object the
     // session deleted has nothing left to relate, and emitting it leaves a
@@ -162,7 +164,7 @@ export function collectModifications(
     collectPropertyAndQuantitySetMutations(
       pass,
       options,
-      { entityPropMutations, entityQuantMutations, relDefinesByEntity },
+      { entityPropMutations, entityQuantMutations, relDefinesByEntity, relatedByRel },
       ctx.propertySetContext(),
     );
 
@@ -233,12 +235,30 @@ function applyExportClosure(
     excludeIds,
     pass.isRefExcludedDuringClosureWalk,
   );
-  // Second pass: collect IFCSTYLEDITEM entities that reference included
-  // geometry. Styled items reference geometry items but nothing references
-  // them back, so the forward closure misses them.
+  // Second pass: collect IFCSTYLEDITEM/layer-assignment entities that
+  // reference included geometry. These reference geometry items but nothing
+  // references them back, so the forward closure misses them. `excludeIds`
+  // is passed through — see `style-closure.ts` for why a shared
+  // IFCPRESENTATIONLAYERASSIGNMENT (one CAD layer naming both a visible and
+  // a hidden product's geometry) needs it, not just the styled-item case.
   collectStyleEntities(
     pass.allowedEntityIds,
     ctx.dataStore.source,
     { byId: pass.effective, byType: pass.effective.byType },
+    excludeIds,
+  );
+  // Third pass: collect IFCMAPCONVERSION (+ its IFCPROJECTEDCRS) when the
+  // context it converts is already in the closure. IfcMapConversion.SourceCRS
+  // points AT the context, never the other way, so the forward closure never
+  // reaches it — without this a visible-only/subset export of a georeferenced
+  // model silently drops its georeferencing. `excludeIds` is passed through so
+  // a deliberately-excluded map conversion (e.g. `subset-roots.ts`'s
+  // `IDENTIFYING_TYPES` when the anonymize-export "remove georeferencing"
+  // option is on) stays excluded rather than being resurrected here.
+  collectGeoreferencingEntities(
+    pass.allowedEntityIds,
+    ctx.dataStore.source,
+    { byId: pass.effective, byType: pass.effective.byType },
+    excludeIds,
   );
 }

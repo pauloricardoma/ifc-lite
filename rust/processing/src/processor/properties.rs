@@ -15,7 +15,7 @@ pub(super) struct PropertySetDefinition {
 
 #[derive(Debug, Clone)]
 pub(super) struct RelDefinesByPropertiesLink {
-    property_set_id: u32,
+    property_set_ids: Vec<u32>,
     related_object_ids: Vec<u32>,
 }
 
@@ -65,7 +65,17 @@ pub(super) fn collect_property_set_definition(property_set: &DecodedEntity) -> O
 pub(super) fn collect_rel_defines_by_properties_link(
     rel_defines: &DecodedEntity,
 ) -> Option<RelDefinesByPropertiesLink> {
-    let property_set_id = rel_defines.get_ref(5).or_else(|| rel_defines.get_ref(3))?;
+    // RelatingPropertyDefinition's IfcPropertySetDefinitionSet alternative is
+    // a grouped SET, written inline as `(#20,#22)`; get_ref only recognises a
+    // bare ref and silently dropped the whole relationship for that shape.
+    // get_refs accepts both, mirroring the TS/WASM path and #4773's fix for
+    // the same bug in apps/server::extract_relationship. The `get_refs(3)` /
+    // `get_list(2)` fallbacks predate this fix; their origin is undetermined
+    // (index 3 isn't RelatingPropertyDefinition in any bundled schema, no
+    // fixture exercises them) — preserved conservatively on both branches.
+    let property_set_ids = rel_defines
+        .get_refs(5)
+        .or_else(|| rel_defines.get_refs(3))?;
     let related_object_ids = rel_defines
         .get_list(4)
         .or_else(|| rel_defines.get_list(2))
@@ -82,7 +92,7 @@ pub(super) fn collect_rel_defines_by_properties_link(
     }
 
     Some(RelDefinesByPropertiesLink {
-        property_set_id,
+        property_set_ids,
         related_object_ids,
     })
 }
@@ -192,28 +202,31 @@ fn build_space_zone_properties_by_entity(
     let mut properties_by_entity: FxHashMap<u32, BTreeMap<String, String>> = FxHashMap::default();
 
     for link in rel_defines_by_properties {
-        let Some(property_set) = property_sets_by_id.get(&link.property_set_id) else {
-            continue;
-        };
-
-        for related_id in &link.related_object_ids {
-            if !target_space_zone_ids.contains_key(related_id) {
+        for property_set_id in &link.property_set_ids {
+            let Some(property_set) = property_sets_by_id.get(property_set_id) else {
                 continue;
-            }
+            };
 
-            let attributes = properties_by_entity.entry(*related_id).or_default();
-            for property_id in &property_set.property_ids {
-                let Some((property_name, property_value)) = property_values_by_id.get(property_id)
-                else {
+            for related_id in &link.related_object_ids {
+                if !target_space_zone_ids.contains_key(related_id) {
                     continue;
-                };
+                }
 
-                add_space_zone_property(
-                    attributes,
-                    property_set.name.as_deref(),
-                    property_name,
-                    property_value,
-                );
+                let attributes = properties_by_entity.entry(*related_id).or_default();
+                for property_id in &property_set.property_ids {
+                    let Some((property_name, property_value)) =
+                        property_values_by_id.get(property_id)
+                    else {
+                        continue;
+                    };
+
+                    add_space_zone_property(
+                        attributes,
+                        property_set.name.as_deref(),
+                        property_name,
+                        property_value,
+                    );
+                }
             }
         }
     }
@@ -259,7 +272,7 @@ pub(super) fn assign_space_zone_properties(
 ///      the eager path built (target filtering stays inside `assign`);
 ///   3. decode ONLY the property sets a space/zone actually references — gated to
 ///      genuine `IfcPropertySet` entities, mirroring the eager scan's exact
-///      `type_name == "IFCPROPERTYSET"` branch so a stray ref to a non-pset entity
+///      `keyword_eq(type_name, "IFCPROPERTYSET")` branch so a stray ref to a non-pset entity
 ///      cannot mint phantom properties — and only the property atoms those sets
 ///      list, resolving each by id through the completed entity index.
 ///
@@ -341,34 +354,37 @@ pub(super) fn resolve_space_zone_properties_lazy(
         {
             continue;
         }
-        if property_sets_by_id.contains_key(&link.property_set_id) {
-            continue;
-        }
-        let Ok(property_set) = decoder.decode_by_id(link.property_set_id) else {
-            continue;
-        };
-        // Type gate: the eager scan only stashed exact `IFCPROPERTYSET` matches,
-        // so a link whose RelatingPropertyDefinition resolves to some other
-        // entity (a malformed ref, or an `IfcElementQuantity`) must contribute
-        // nothing rather than have `collect_property_set_definition` mine a stray
-        // ref-list at attr 4/2 into invented properties.
-        if property_set.ifc_type != IfcType::IfcPropertySet {
-            continue;
-        }
-        let Some(definition) = collect_property_set_definition(&property_set) else {
-            continue;
-        };
-        for &property_id in &definition.property_ids {
-            if property_values_by_id.contains_key(&property_id) {
+        for &property_set_id in &link.property_set_ids {
+            if property_sets_by_id.contains_key(&property_set_id) {
                 continue;
             }
-            if let Ok(property_entity) = decoder.decode_by_id(property_id) {
-                if let Some((name, value)) = extract_property_name_and_value(&property_entity) {
-                    property_values_by_id.insert(property_id, (name, value));
+            let Ok(property_set) = decoder.decode_by_id(property_set_id) else {
+                continue;
+            };
+            // Type gate: the eager scan only stashed exact `IFCPROPERTYSET` matches,
+            // so a link whose RelatingPropertyDefinition resolves to some other
+            // entity (a malformed ref, or an `IfcElementQuantity`) must contribute
+            // nothing rather than have `collect_property_set_definition` mine a stray
+            // ref-list at attr 4/2 into invented properties.
+            if property_set.ifc_type != IfcType::IfcPropertySet {
+                continue;
+            }
+            let Some(definition) = collect_property_set_definition(&property_set) else {
+                continue;
+            };
+            for &property_id in &definition.property_ids {
+                if property_values_by_id.contains_key(&property_id) {
+                    continue;
+                }
+                if let Ok(property_entity) = decoder.decode_by_id(property_id) {
+                    if let Some((name, value)) = extract_property_name_and_value(&property_entity)
+                    {
+                        property_values_by_id.insert(property_id, (name, value));
+                    }
                 }
             }
+            property_sets_by_id.insert(property_set_id, definition);
         }
-        property_sets_by_id.insert(link.property_set_id, definition);
     }
 
     assign_space_zone_properties(
@@ -378,3 +394,7 @@ pub(super) fn resolve_space_zone_properties_lazy(
         &rel_defines_by_properties,
     );
 }
+
+#[cfg(test)]
+#[path = "properties_tests.rs"]
+mod tests;

@@ -23,6 +23,20 @@
 //! floating point; [`verify_recomposition`] bounds the residual and the unit
 //! tests assert it stays within a micrometre.
 //!
+//! `rep_identity` (a 128-bit geometry hash for direct items) is not proven
+//! collision-free, and a merged multi-model file has measured one (#3666):
+//! two unrelated occurrences shared a hash and one reconstructed up to 2m
+//! away from where it actually was, with nothing erroring. `collate_refs`
+//! therefore does not just trust the identity for the exact tier: it
+//! reconstructs each candidate occurrence from `(template, rel)` and
+//! verifies it against that occurrence's own baked vertices before trusting
+//! the group, falling the WHOLE group back to the flat path on any failure
+//! (a mis-grouped occurrence means the template pairing is in doubt, not
+//! just the one member that happened to fail first). The one exception is a
+//! #1623 don't-bake placeholder: it has no geometry of its own, so flat is not
+//! a place it can go — it stays instanced against the template (with the
+//! template itself) rather than disappearing from the output entirely.
+//!
 //! ## Instanced wire format ("IFNS")
 //!
 //! Little-endian, mirroring the packed-shard conventions (header + tables +
@@ -42,7 +56,10 @@
 //!                   transform(16× f32, row-major rel_k) — followed by whatever
 //!                   trailing fields the stride makes room for. Trailing field 1
 //!                   is itemId(u32) at offset 88, so a shard carrying it declares
-//!                   a stride of 92.
+//!                   a stride of 92. Trailing field 2 (#5984, v3) is the
+//!                   occurrence's IFC-authored finish, metallic(f32) +
+//!                   roughness(f32) at offset 92, NaN where unauthored: stride
+//!                   100, written only when some occurrence authors one.
 //!   Data: positions (f32 × positionsLen), normals (f32 × normalsLen),
 //!         indices (u32 × indicesLen). Offsets/lengths are ELEMENT counts; indices
 //!         stay local to each template's vertex range (0-based).
@@ -91,17 +108,23 @@
 //! [`InstanceMeta`]: crate::mesh::InstanceMeta
 
 mod collate;
+mod dont_bake;
+mod group;
+mod verify;
 mod wire;
+mod wire_decode;
 
 #[cfg(test)]
 mod tests;
 
 pub use collate::{
-    bake_source_at_world, collate_instances, collate_refs, compose_instance_world_row_major,
+    bake_source_at_world, collate_instances, compose_instance_world_row_major,
     instance_rel_row_major_f32, verify_recomposition, Collated, InstanceMeshRef,
     InstanceOccurrence, InstanceTemplate,
 };
+pub use group::{collate_refs, collate_refs_in_basis, collate_refs_verified_in};
 pub use wire::{
-    collate_and_encode, decode_instanced, encode_instanced, encode_refs, DecodedInstance,
+    collate_and_encode, encode_instanced, encode_refs, encode_refs_with_finishes, DecodedInstance,
     DecodedInstanced, DecodedTemplate, INSTANCED_MAGIC, INSTANCED_VERSION,
 };
+pub use wire_decode::{decode_instance_finishes, decode_instanced};

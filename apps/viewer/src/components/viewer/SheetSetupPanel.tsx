@@ -15,8 +15,6 @@
 
 import React, { useCallback, useState, useMemo } from 'react';
 import {
-  X,
-  FileText,
   ChevronDown,
   ChevronRight,
   Ruler,
@@ -27,6 +25,7 @@ import {
   Plus,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { IconButton } from '@/components/ui/icon-button';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
 import { Input } from '@/components/ui/input';
@@ -43,18 +42,15 @@ import {
   CollapsibleTrigger,
 } from '@/components/ui/collapsible';
 import { useViewerStore } from '@/store';
+import { useTranslation, type TranslationKey } from '@/i18n';
 import {
   PAPER_SIZE_REGISTRY,
-  FRAME_PRESETS,
-  TITLE_BLOCK_PRESETS,
   COMMON_SCALES,
   type FrameStyle,
   type TitleBlockLayout,
-  type DrawingScale,
 } from '@ifc-lite/drawing-2d';
 
 interface SheetSetupPanelProps {
-  onClose: () => void;
   onOpenTitleBlockEditor?: () => void;
 }
 
@@ -65,20 +61,21 @@ const PAPER_SIZE_GROUPS = {
   ARCH: ['ARCH_A', 'ARCH_B', 'ARCH_C', 'ARCH_D', 'ARCH_E', 'ARCH_E1'],
 };
 
-const FRAME_STYLE_OPTIONS: { value: FrameStyle; label: string }[] = [
-  { value: 'simple', label: 'Simple' },
-  { value: 'professional', label: 'Professional' },
-  { value: 'minimal', label: 'Minimal' },
-  { value: 'iso', label: 'ISO Standard' },
+const FRAME_STYLE_OPTIONS: { value: FrameStyle; labelKey: TranslationKey }[] = [
+  { value: 'simple', labelKey: 'sheetsPdf.sheetSetup.frameStyleSimple' },
+  { value: 'professional', labelKey: 'sheetsPdf.sheetSetup.frameStyleProfessional' },
+  { value: 'minimal', labelKey: 'sheetsPdf.sheetSetup.frameStyleMinimal' },
+  { value: 'iso', labelKey: 'sheetsPdf.sheetSetup.frameStyleIso' },
 ];
 
-const TITLE_BLOCK_LAYOUT_OPTIONS: { value: TitleBlockLayout; label: string }[] = [
-  { value: 'standard', label: 'Standard (Bottom Right)' },
-  { value: 'extended', label: 'Extended (Full Width)' },
-  { value: 'compact', label: 'Compact (Smaller)' },
+const TITLE_BLOCK_LAYOUT_OPTIONS: { value: TitleBlockLayout; labelKey: TranslationKey }[] = [
+  { value: 'standard', labelKey: 'sheetsPdf.sheetSetup.layoutStandard' },
+  { value: 'extended', labelKey: 'sheetsPdf.sheetSetup.layoutExtended' },
+  { value: 'compact', labelKey: 'sheetsPdf.sheetSetup.layoutCompact' },
 ];
 
-export function SheetSetupPanel({ onClose, onOpenTitleBlockEditor }: SheetSetupPanelProps): React.ReactElement {
+export function SheetSetupPanel({ onOpenTitleBlockEditor }: SheetSetupPanelProps): React.ReactElement {
+  const { t } = useTranslation();
   const activeSheet = useViewerStore((s) => s.activeSheet);
   const sheetEnabled = useViewerStore((s) => s.sheetEnabled);
   const setSheetEnabled = useViewerStore((s) => s.setSheetEnabled);
@@ -102,6 +99,7 @@ export function SheetSetupPanel({ onClose, onOpenTitleBlockEditor }: SheetSetupP
   const [scaleBarOpen, setScaleBarOpen] = useState(true);
   const [templatesOpen, setTemplatesOpen] = useState(false);
   const [newTemplateName, setNewTemplateName] = useState('');
+  const templateNameLabel = t('sheetsPdf.sheetSetup.templateNamePlaceholder');
 
   // Get current paper size ID
   const currentPaperId = useMemo(() => {
@@ -156,36 +154,24 @@ export function SheetSetupPanel({ onClose, onOpenTitleBlockEditor }: SheetSetupP
   }, [newTemplateName, saveAsTemplate]);
 
   return (
-    <div className="flex flex-col h-full bg-background border-l">
-      {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b bg-muted/50">
-        <div className="flex items-center gap-2">
-          <FileText className="h-5 w-5 text-primary" />
-          <h2 className="font-semibold text-sm">Drawing Sheet</h2>
-        </div>
-        <div className="flex items-center gap-2">
-          <Switch
-            checked={sheetEnabled}
-            onCheckedChange={handleEnableSheet}
-          />
-          <Button variant="ghost" size="icon-sm" onClick={onClose}>
-            <X className="h-4 w-4" />
-          </Button>
-        </div>
+    <div className="flex flex-col h-full bg-background">
+      {/* The inspector tab (#5495) carries the title; this row keeps only the
+          functional enable/disable toggle, not a redundant close button. */}
+      <div className="flex items-center justify-between px-4 py-2 border-b bg-muted/50">
+        <Label className="text-xs font-medium">{t('sheetsPdf.sheetSetup.enabledToggleLabel')}</Label>
+        <Switch
+          checked={sheetEnabled}
+          onCheckedChange={handleEnableSheet}
+        />
       </div>
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto">
         {!activeSheet && !sheetEnabled ? (
           <div className="p-4 text-center text-muted-foreground">
-            <p className="text-sm">Enable drawing sheet to configure paper size, frame, and title block.</p>
-            <Button
-              variant="outline"
-              size="sm"
-              className="mt-4"
-              onClick={() => handleEnableSheet(true)}
-            >
-              Enable Sheet
+            <p className="text-sm">{t('sheetsPdf.sheetSetup.enablePrompt')}</p>
+            <Button variant="outline" size="sm" className="mt-4" onClick={() => handleEnableSheet(true)}>
+              {t('sheetsPdf.sheetSetup.enableButton')}
             </Button>
           </div>
         ) : (
@@ -194,7 +180,7 @@ export function SheetSetupPanel({ onClose, onOpenTitleBlockEditor }: SheetSetupP
             <Collapsible open={paperSizeOpen} onOpenChange={setPaperSizeOpen}>
               <CollapsibleTrigger asChild>
                 <button className="w-full flex items-center justify-between px-4 py-2 hover:bg-muted/50 transition-colors border-b">
-                  <span className="text-sm font-medium">Paper Size</span>
+                  <span className="text-sm font-medium">{t('sheetsPdf.sheetSetup.paperSizeHeading')}</span>
                   {paperSizeOpen ? (
                     <ChevronDown className="h-4 w-4 text-muted-foreground" />
                   ) : (
@@ -218,7 +204,7 @@ export function SheetSetupPanel({ onClose, onOpenTitleBlockEditor }: SheetSetupP
                             const paper = PAPER_SIZE_REGISTRY[id];
                             return (
                               <SelectItem key={id} value={id}>
-                                {paper.name} ({paper.widthMm}×{paper.heightMm}mm)
+                                {t('sheetsPdf.sheetSetup.paperOption', { name: paper.name, width: paper.widthMm, height: paper.heightMm })}
                               </SelectItem>
                             );
                           })}
@@ -229,7 +215,7 @@ export function SheetSetupPanel({ onClose, onOpenTitleBlockEditor }: SheetSetupP
 
                   {activeSheet && (
                     <div className="text-xs text-muted-foreground">
-                      {activeSheet.paper.widthMm} × {activeSheet.paper.heightMm} mm
+                      {t('sheetsPdf.sheetSetup.paperDimensions', { width: activeSheet.paper.widthMm, height: activeSheet.paper.heightMm })}
                     </div>
                   )}
                 </div>
@@ -240,7 +226,7 @@ export function SheetSetupPanel({ onClose, onOpenTitleBlockEditor }: SheetSetupP
             <Collapsible open={frameOpen} onOpenChange={setFrameOpen}>
               <CollapsibleTrigger asChild>
                 <button className="w-full flex items-center justify-between px-4 py-2 hover:bg-muted/50 transition-colors border-b">
-                  <span className="text-sm font-medium">Frame Style</span>
+                  <span className="text-sm font-medium">{t('sheetsPdf.sheetSetup.frameStyleHeading')}</span>
                   {frameOpen ? (
                     <ChevronDown className="h-4 w-4 text-muted-foreground" />
                   ) : (
@@ -260,7 +246,7 @@ export function SheetSetupPanel({ onClose, onOpenTitleBlockEditor }: SheetSetupP
                     <SelectContent>
                       {FRAME_STYLE_OPTIONS.map((opt) => (
                         <SelectItem key={opt.value} value={opt.value}>
-                          {opt.label}
+                          {t(opt.labelKey)}
                         </SelectItem>
                       ))}
                     </SelectContent>
@@ -268,7 +254,7 @@ export function SheetSetupPanel({ onClose, onOpenTitleBlockEditor }: SheetSetupP
 
                   {activeSheet && (
                     <div className="text-xs text-muted-foreground">
-                      Margins: {activeSheet.frame.margins.top}/{activeSheet.frame.margins.right}/{activeSheet.frame.margins.bottom}/{activeSheet.frame.margins.left}mm
+                      {t('sheetsPdf.sheetSetup.margins', { top: activeSheet.frame.margins.top, right: activeSheet.frame.margins.right, bottom: activeSheet.frame.margins.bottom, left: activeSheet.frame.margins.left })}
                     </div>
                   )}
                 </div>
@@ -281,7 +267,7 @@ export function SheetSetupPanel({ onClose, onOpenTitleBlockEditor }: SheetSetupP
                 <button className="w-full flex items-center justify-between px-4 py-2 hover:bg-muted/50 transition-colors border-b">
                   <div className="flex items-center gap-2">
                     <Ruler className="h-4 w-4 text-muted-foreground" />
-                    <span className="text-sm font-medium">Drawing Scale</span>
+                    <span className="text-sm font-medium">{t('sheetsPdf.sheetSetup.drawingScaleHeading')}</span>
                   </div>
                   {scaleOpen ? (
                     <ChevronDown className="h-4 w-4 text-muted-foreground" />
@@ -315,7 +301,7 @@ export function SheetSetupPanel({ onClose, onOpenTitleBlockEditor }: SheetSetupP
             <Collapsible open={titleBlockOpen} onOpenChange={setTitleBlockOpen}>
               <CollapsibleTrigger asChild>
                 <button className="w-full flex items-center justify-between px-4 py-2 hover:bg-muted/50 transition-colors border-b">
-                  <span className="text-sm font-medium">Title Block</span>
+                  <span className="text-sm font-medium">{t('sheetsPdf.sheetSetup.titleBlockHeading')}</span>
                   {titleBlockOpen ? (
                     <ChevronDown className="h-4 w-4 text-muted-foreground" />
                   ) : (
@@ -326,7 +312,7 @@ export function SheetSetupPanel({ onClose, onOpenTitleBlockEditor }: SheetSetupP
               <CollapsibleContent>
                 <div className="px-4 py-3 space-y-3">
                   <div>
-                    <Label className="text-xs">Layout</Label>
+                    <Label className="text-xs">{t('sheetsPdf.sheetSetup.layoutLabel')}</Label>
                     <Select
                       value={activeSheet?.titleBlock.layout || 'standard'}
                       onValueChange={handleTitleBlockLayoutChange}
@@ -337,7 +323,7 @@ export function SheetSetupPanel({ onClose, onOpenTitleBlockEditor }: SheetSetupP
                       <SelectContent>
                         {TITLE_BLOCK_LAYOUT_OPTIONS.map((opt) => (
                           <SelectItem key={opt.value} value={opt.value}>
-                            {opt.label}
+                            {t(opt.labelKey)}
                           </SelectItem>
                         ))}
                       </SelectContent>
@@ -346,20 +332,15 @@ export function SheetSetupPanel({ onClose, onOpenTitleBlockEditor }: SheetSetupP
 
                   {activeSheet && (
                     <div className="text-xs text-muted-foreground">
-                      {activeSheet.titleBlock.widthMm} × {activeSheet.titleBlock.heightMm}mm
+                      {t('sheetsPdf.sheetSetup.titleBlockDimensions', { width: activeSheet.titleBlock.widthMm, height: activeSheet.titleBlock.heightMm })}
                       <br />
-                      {activeSheet.titleBlock.fields.length} fields configured
+                      {t('sheetsPdf.sheetSetup.fieldsConfigured', { count: activeSheet.titleBlock.fields.length })}
                     </div>
                   )}
 
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="w-full"
-                    onClick={onOpenTitleBlockEditor}
-                  >
+                  <Button variant="outline" size="sm" className="w-full" onClick={onOpenTitleBlockEditor}>
                     <Edit3 className="h-4 w-4 mr-2" />
-                    Edit Title Block Fields
+                    {t('sheetsPdf.sheetSetup.editTitleBlockFieldsButton')}
                   </Button>
                 </div>
               </CollapsibleContent>
@@ -371,7 +352,7 @@ export function SheetSetupPanel({ onClose, onOpenTitleBlockEditor }: SheetSetupP
                 <button className="w-full flex items-center justify-between px-4 py-2 hover:bg-muted/50 transition-colors border-b">
                   <div className="flex items-center gap-2">
                     <Compass className="h-4 w-4 text-muted-foreground" />
-                    <span className="text-sm font-medium">Scale Bar & North Arrow</span>
+                    <span className="text-sm font-medium">{t('sheetsPdf.sheetSetup.scaleBarNorthArrowHeading')}</span>
                   </div>
                   {scaleBarOpen ? (
                     <ChevronDown className="h-4 w-4 text-muted-foreground" />
@@ -384,7 +365,7 @@ export function SheetSetupPanel({ onClose, onOpenTitleBlockEditor }: SheetSetupP
                 <div className="px-4 py-3 space-y-3">
                   {/* Scale Bar Toggle */}
                   <div className="flex items-center justify-between">
-                    <Label className="text-xs">Scale Bar</Label>
+                    <Label className="text-xs">{t('sheetsPdf.sheetSetup.scaleBarLabel')}</Label>
                     <Switch
                       checked={activeSheet?.scaleBar.visible ?? true}
                       onCheckedChange={toggleScaleBar}
@@ -393,7 +374,7 @@ export function SheetSetupPanel({ onClose, onOpenTitleBlockEditor }: SheetSetupP
 
                   {/* North Arrow Toggle */}
                   <div className="flex items-center justify-between">
-                    <Label className="text-xs">North Arrow</Label>
+                    <Label className="text-xs">{t('sheetsPdf.sheetSetup.northArrowLabel')}</Label>
                     <Switch
                       checked={(activeSheet?.northArrow.style ?? 'simple') !== 'none'}
                       onCheckedChange={toggleNorthArrow}
@@ -407,7 +388,7 @@ export function SheetSetupPanel({ onClose, onOpenTitleBlockEditor }: SheetSetupP
             <Collapsible open={templatesOpen} onOpenChange={setTemplatesOpen}>
               <CollapsibleTrigger asChild>
                 <button className="w-full flex items-center justify-between px-4 py-2 hover:bg-muted/50 transition-colors border-b">
-                  <span className="text-sm font-medium">Saved Templates</span>
+                  <span className="text-sm font-medium">{t('sheetsPdf.sheetSetup.savedTemplatesHeading')}</span>
                   <div className="flex items-center gap-2">
                     <span className="text-xs text-muted-foreground">
                       {savedSheetTemplates.length}
@@ -425,25 +406,27 @@ export function SheetSetupPanel({ onClose, onOpenTitleBlockEditor }: SheetSetupP
                   {/* Save current as template */}
                   <div className="flex gap-2">
                     <Input
-                      placeholder="Template name..."
+                      placeholder={templateNameLabel}
+                      aria-label={templateNameLabel}
                       value={newTemplateName}
                       onChange={(e) => setNewTemplateName(e.target.value)}
                       className="h-8 text-sm flex-1"
                     />
-                    <Button
+                    <IconButton
+                      label={t('sheetsPdf.sheetSetup.saveTemplate')}
                       variant="outline"
                       size="sm"
                       onClick={handleSaveTemplate}
                       disabled={!newTemplateName.trim() || !activeSheet}
                     >
                       <Save className="h-4 w-4" />
-                    </Button>
+                    </IconButton>
                   </div>
 
                   {/* Template list */}
                   {savedSheetTemplates.length === 0 ? (
                     <div className="text-xs text-muted-foreground text-center py-2">
-                      No saved templates
+                      {t('sheetsPdf.sheetSetup.noSavedTemplates')}
                     </div>
                   ) : (
                     <div className="space-y-1">
@@ -454,22 +437,24 @@ export function SheetSetupPanel({ onClose, onOpenTitleBlockEditor }: SheetSetupP
                         >
                           <span className="truncate flex-1">{template.name}</span>
                           <div className="flex gap-1">
-                            <Button
+                            <IconButton
+                              label={t('sheetsPdf.sheetSetup.loadTemplate', { name: template.name })}
                               variant="ghost"
                               size="icon-sm"
                               className="h-6 w-6"
                               onClick={() => loadTemplate(template.id)}
                             >
                               <Plus className="h-3 w-3" />
-                            </Button>
-                            <Button
+                            </IconButton>
+                            <IconButton
+                              label={t('sheetsPdf.sheetSetup.deleteTemplate', { name: template.name })}
                               variant="ghost"
                               size="icon-sm"
                               className="h-6 w-6 text-destructive hover:text-destructive"
                               onClick={() => deleteTemplate(template.id)}
                             >
                               <Trash2 className="h-3 w-3" />
-                            </Button>
+                            </IconButton>
                           </div>
                         </div>
                       ))}
@@ -484,12 +469,11 @@ export function SheetSetupPanel({ onClose, onOpenTitleBlockEditor }: SheetSetupP
               <div className="px-4 py-3 border-t">
                 <div className="text-xs text-muted-foreground space-y-1">
                   <div>
-                    <strong>Drawing Area:</strong>{' '}
-                    {activeSheet.viewportBounds.width.toFixed(1)} ×{' '}
-                    {activeSheet.viewportBounds.height.toFixed(1)} mm
+                    <strong>{t('sheetsPdf.sheetSetup.drawingAreaLabel')}</strong>{' '}
+                    {t('sheetsPdf.sheetSetup.drawingAreaValue', { width: activeSheet.viewportBounds.width.toFixed(1), height: activeSheet.viewportBounds.height.toFixed(1) })}
                   </div>
                   <div>
-                    <strong>Scale:</strong> {activeSheet.scale.name}
+                    <strong>{t('sheetsPdf.sheetSetup.scaleLabel')}</strong> {activeSheet.scale.name}
                   </div>
                 </div>
               </div>

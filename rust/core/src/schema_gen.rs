@@ -94,8 +94,15 @@ impl AttributeValue {
             Token::TypedValue(type_name, args) => {
                 // For typed values like IFCPARAMETERVALUE(0.), extract the inner value
                 // Store as a list with the type name first, followed by args
+                //
+                // The name is a STEP keyword, so its case is not significant
+                // (ISO 10303-21). Fold it to the EXPRESS spelling here, once, so
+                // every consumer can match uppercase literals and every exporter
+                // emits the canonical name (#4707). Still one allocation: an
+                // uppercase name is borrowed until `into_owned`.
+                let name = String::from_utf8_lossy(type_name);
                 let mut values = vec![AttributeValue::String(
-                    String::from_utf8_lossy(type_name).into_owned(),
+                    crate::schema_helpers::normalise_uppercase(&name).into_owned(),
                 )];
                 values.extend(args.iter().map(Self::from_token));
                 AttributeValue::List(values)
@@ -323,6 +330,17 @@ impl DecodedEntity {
     pub fn get_list(&self, index: usize) -> Option<&[AttributeValue]> {
         self.get(index).and_then(|v| v.as_list())
     }
+
+    /// Get entity references from a list attribute. A bare reference is a
+    /// tolerated one-element list; non-reference list members are skipped.
+    pub fn get_refs(&self, index: usize) -> Option<Vec<u32>> {
+        let attr = self.get(index)?;
+        let refs = match attr.as_list() {
+            Some(list) => list.iter().filter_map(AttributeValue::as_entity_ref).collect(),
+            None => vec![attr.as_entity_ref()?],
+        };
+        (!refs.is_empty()).then_some(refs)
+    }
 }
 
 /// IFC schema metadata for dynamic processing
@@ -431,56 +449,6 @@ impl IfcSchema {
     /// Check if type is a profile
     pub fn is_profile_type(&self, ifc_type: &IfcType) -> bool {
         self.profile_types.contains_key(ifc_type)
-    }
-
-    /// Check if type has geometry
-    pub fn has_geometry(&self, ifc_type: &IfcType) -> bool {
-        // Building elements, furnishing, etc.
-        let name = ifc_type.name();
-        (matches!(
-            ifc_type,
-            IfcType::IfcWall
-                | IfcType::IfcWallStandardCase
-                | IfcType::IfcSlab
-                | IfcType::IfcBeam
-                | IfcType::IfcColumn
-                | IfcType::IfcRoof
-                | IfcType::IfcStair
-                | IfcType::IfcRamp
-                | IfcType::IfcRailing
-                | IfcType::IfcPlate
-                | IfcType::IfcMember
-                | IfcType::IfcFooting
-                | IfcType::IfcPile
-                | IfcType::IfcCovering
-                | IfcType::IfcCurtainWall
-                | IfcType::IfcDoor
-                | IfcType::IfcWindow
-                | IfcType::IfcChimney
-                | IfcType::IfcShadingDevice
-                | IfcType::IfcBuildingElementProxy
-                | IfcType::IfcBuildingElementPart
-        ) || name.contains("Reinforc"))
-            || matches!(
-                ifc_type,
-                IfcType::IfcFurnishingElement
-                | IfcType::IfcFurniture
-                | IfcType::IfcDuctSegment
-                | IfcType::IfcPipeSegment
-                | IfcType::IfcCableSegment
-                | IfcType::IfcProduct // Base type for all products
-                | IfcType::IfcDistributionElement
-                | IfcType::IfcFlowSegment
-                | IfcType::IfcFlowFitting
-                | IfcType::IfcFlowTerminal
-            )
-            // Spatial elements with geometry (for visibility toggling)
-            || matches!(
-                ifc_type,
-                IfcType::IfcSpace
-                | IfcType::IfcOpeningElement
-                | IfcType::IfcSite
-            )
     }
 }
 

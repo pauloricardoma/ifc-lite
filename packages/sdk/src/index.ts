@@ -151,6 +151,7 @@ export type {
   LensBackendMethods,
   FilesBackendMethods,
   ScheduleBackendMethods,
+  CostBackendMethods,
 
   // Schedule data
   ScheduleExtractionData,
@@ -158,9 +159,36 @@ export type {
   ScheduleTaskTimeData,
   ScheduleSequenceData,
   WorkScheduleData,
+  WorkCalendarData,
+  WorkTimeData,
+  RecurrencePatternData,
+  TimePeriodData,
   ScheduleSequenceType,
   ScheduleTaskDurationType,
+
+  StructuralBackendMethods,
+
+  // Structural analysis data
+  StructuralExtractionData,
+  StructuralAnalysisModelData,
+  StructuralMemberData,
+  StructuralConnectionData,
+  StructuralActivityData,
+  StructuralLoadGroupData,
+  StructuralResultGroupData,
+  StructuralLoadData,
+  StructuralLoadConfigurationData,
+  StructuralLoadConfigurationEntryData,
+  StructuralLoadDropReason,
+  BoundaryConditionData,
 } from './types.js';
+
+export type {
+  CostSchemaVersion, CostQuantityDimension, CostDiagnosticCode, CostDiagnosticData,
+  CostScheduleData, CostAppliedValueData, CostValueData, CostItemData, CostQuantityData,
+  CostUnitData, CostMeasureWithUnitData, CostRelationshipType, CostRelationshipData,
+  CostGraphData, CostEvaluationOptions, CostEvaluationData, CostReadOptions,
+} from './cost-types.js';
 
 export { entityRefToString, stringToEntityRef, dispatchToBackend } from './types.js';
 
@@ -169,21 +197,34 @@ export { entityRefToString, stringToEntityRef, dispatchToBackend } from './types
 // ============================================================================
 
 export { QueryBuilder, QueryNamespace } from './namespaces/query.js';
+// Re-exported from @ifc-lite/query so a `.select()` caller can `instanceof`
+// check the failure without depending on @ifc-lite/query directly (#4094).
+export { SelectorUnsupportedError } from '@ifc-lite/query';
 export { ModelNamespace } from './namespaces/model.js';
 export { ViewerNamespace } from './namespaces/viewer.js';
 export { MutateNamespace } from './namespaces/mutate.js';
 export { StoreNamespace } from './namespaces/store.js';
 export { LensNamespace } from './namespaces/lens.js';
 export { ExportNamespace } from './namespaces/export.js';
-export type { ExportCsvOptions, ExportGltfOptions, ExportStepOptions, ExportHbjsonOptions, ExportDfjsonOptions } from './namespaces/export.js';
+export type { ExportCsvOptions, ExportStepOptions, ExportHbjsonOptions, ExportDfjsonOptions } from './namespaces/export.js';
 
 // IDS — full validation, facets, constraints, translation
 export { IDSNamespace } from './namespaces/ids.js';
 export type { IDSValidationSummary, IDSSupportedLocale, IDSValidateOptions } from './namespaces/ids.js';
 
 // BCF — full collaboration: topics, viewpoints, comments, GUID, colors, IDS→BCF
-export { BCFNamespace } from './namespaces/bcf.js';
-export type { TopicOptions, CommentOptions, ViewpointOptions, IDSBCFOptions } from './namespaces/bcf.js';
+export {
+  BCFNamespace,
+  IncompleteCameraStateError,
+  MissingSectionBoundsError,
+} from './namespaces/bcf.js';
+export type {
+  TopicOptions,
+  CommentOptions,
+  ViewpointOptions,
+  ExtractedViewpointState,
+  IDSBCFOptions,
+} from './namespaces/bcf.js';
 
 // Drawing — section cuts, styles, symbols, sheets, SVG, graphic overrides
 export { DrawingNamespace } from './namespaces/drawing.js';
@@ -198,6 +239,19 @@ export { EventsNamespace } from './namespaces/events.js';
 export { CreateNamespace } from './namespaces/create.js';
 export { FilesNamespace } from './namespaces/files.js';
 export { ScheduleNamespace } from './namespaces/schedule.js';
+export { StructuralNamespace } from './namespaces/structural.js';
+export { CostNamespace } from './namespaces/cost.js';
+export { createCostBackend } from './cost-backend.js';
+export { createEffectiveRecordOverlay } from './effective-record-overlay.js';
+export type { CostModelResolver, ResolvedCostModel } from './cost-backend.js';
+export { createCostStoreBackend } from './cost-store-backend.js';
+export { resolveLiveOwnerHistoryId } from './cost-owner-history.js';
+export { createStructuralStoreBackend, type StructuralStoreModelResolver } from './store-structural-backend.js';
+export type { CostStoreModelResolution, CostStoreModelResolver } from './cost-store-backend.js';
+export type { CostStoreBackendMethods } from './store-cost-types.js';
+export type { StructuralStoreBackendMethods } from './store-structural-types.js';
+export { createModellingStoreBackend, type ModellingStoreModelResolver } from './store-modelling-backend.js';
+export type { ModellingStoreBackendMethods } from './store-modelling-types.js';
 
 // Clash — geometric interference detection over caller-provided ClashElement[]
 export { ClashNamespace } from './namespaces/clash.js';
@@ -206,7 +260,8 @@ export { StyleNamespace, type ColorBatch } from './namespaces/style.js';
 // Re-exported so a TypeScript consumer can name `bim.style.apply`'s return
 // type without taking a direct dependency on @ifc-lite/create.
 export type { ApplyStyleOptions, ApplyStyleResult, SurfaceStyleColor } from '@ifc-lite/create';
-export { createHeadlessMutateAdapter, propertyValueTypeOf } from './headless-mutate.js';
+export { createEffectiveEntityCheck, createHeadlessMutateAdapter, propertyValueTypeOf } from './headless-mutate.js';
+export type { EntityRefCheck } from './headless-mutate.js';
 export type { ClashGroupBy, ClashRunOptions, ClashMatrixOptions } from './namespaces/clash.js';
 // Re-export the clash core types so hosts can type elements/rules/results
 // without taking a second direct dependency on @ifc-lite/clash.

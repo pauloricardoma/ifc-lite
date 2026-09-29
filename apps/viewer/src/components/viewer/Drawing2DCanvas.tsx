@@ -2,6 +2,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import { drawDxfUnderlaysScreenSpace } from './drawing-underlays';
+import { drawReferenceImages } from './drawing-reference-images';
+import { useReferenceImagesForDrawing } from '@/hooks/useReferenceImagesForDrawing';
 import React, { useRef, useState, useEffect } from 'react';
 import {
   GraphicOverrideEngine,
@@ -19,45 +22,10 @@ import type { ScanBandPoint } from '@/hooks/scanSectionMath';
 import { type CachedSheetTransform } from '@/lib/drawing/sheet-geometry-key';
 import { resolveSheetTransform } from '@/lib/drawing/sheet-transform';
 import { useDrawingElementPropertiesLookup } from '@/hooks/useDrawingElementPropertiesLookup';
-
-// Fill colors for IFC types (architectural convention)
-const IFC_TYPE_FILL_COLORS: Record<string, string> = {
-  // Structural elements - solid gray
-  IfcWall: '#b0b0b0',
-  IfcWallStandardCase: '#b0b0b0',
-  IfcColumn: '#909090',
-  IfcBeam: '#909090',
-  IfcSlab: '#c8c8c8',
-  IfcRoof: '#d0d0d0',
-  IfcFooting: '#808080',
-  IfcPile: '#707070',
-
-  // Windows/Doors - lighter
-  IfcWindow: '#e8f4fc',
-  IfcDoor: '#f5e6d3',
-
-  // Stairs/Railings
-  IfcStair: '#d8d8d8',
-  IfcStairFlight: '#d8d8d8',
-  IfcRailing: '#c0c0c0',
-
-  // MEP - distinct colors
-  IfcPipeSegment: '#a0d0ff',
-  IfcDuctSegment: '#c0ffc0',
-
-  // Furniture
-  IfcFurnishingElement: '#ffe0c0',
-
-  // Spaces (usually not shown in section)
-  IfcSpace: '#f0f0f0',
-
-  // Default
-  default: '#d0d0d0',
-};
-
-export function getFillColorForType(ifcType: string): string {
-  return IFC_TYPE_FILL_COLORS[ifcType] || IFC_TYPE_FILL_COLORS.default;
-}
+import { markActiveDrawingCanvasRendered, registerActiveDrawingCanvas } from '@/lib/drawing/active-canvas-snapshot';
+import { getFillColorForType } from './drawing/ifc-fill-colors';
+import { resolveDrawingPaperTheme, type DrawingPaperTheme } from './drawing/paper-theme';
+export { getFillColorForType } from './drawing/ifc-fill-colors';
 
 // ─── IFC annotation overlay helpers (issue #812) ─────────────────────────────
 
@@ -195,103 +163,6 @@ function drawIfcAnnotationsScreenSpace(
   }
 }
 
-// ─── DXF reference underlays (issue #1782) ───────────────────────────────────
-
-/** Map a DXF vertical justification onto a canvas text baseline. */
-function dxfValignToBaseline(valign: 'baseline' | 'bottom' | 'middle' | 'top'): CanvasTextBaseline {
-  switch (valign) {
-    case 'bottom': return 'bottom';
-    case 'middle': return 'middle';
-    case 'top': return 'top';
-    default: return 'alphabetic';
-  }
-}
-
-/**
- * Render imported DXF underlays beneath the generated drawing, in screen
- * pixels. Geometry arrives pre-mapped to drawing space (render-frame
- * shift, flipped-section mirror, and user placement already applied by
- * useDxfUnderlaysForDrawing — plan sections only), so the caller supplies
- * the plain drawing→screen transform. Text is drawn in screen space (like
- * the IFC annotation overlay) so canvas scaling never mirrors glyphs.
- */
-function drawDxfUnderlaysScreenSpace(
-  ctx: CanvasRenderingContext2D,
-  underlays: readonly DxfUnderlayRenderData[] | undefined,
-  modelToScreen: (x: number, y: number) => { x: number; y: number },
-  mmLineToScreen: (mmWeight: number) => number,
-  worldHeightToScreenPx: (worldHeight: number) => number,
-): void {
-  if (!underlays || underlays.length === 0) return;
-
-  for (const data of underlays) {
-    if (data.opacity <= 0) continue;
-    ctx.save();
-    ctx.globalAlpha = data.opacity;
-
-    // Fills first so linework composites on top.
-    for (const fill of data.fills) {
-      ctx.fillStyle = fill.color;
-      ctx.globalAlpha = data.opacity * (fill.pattern ? 0.25 : 1);
-      ctx.beginPath();
-      for (const ring of fill.loops) {
-        if (ring.length < 3) continue;
-        const first = modelToScreen(ring[0].x, ring[0].y);
-        ctx.moveTo(first.x, first.y);
-        for (let i = 1; i < ring.length; i++) {
-          const p = modelToScreen(ring[i].x, ring[i].y);
-          ctx.lineTo(p.x, p.y);
-        }
-        ctx.closePath();
-      }
-      ctx.fill('evenodd');
-      ctx.globalAlpha = data.opacity;
-    }
-
-    for (const line of data.lines) {
-      if (line.points.length < 2) continue;
-      ctx.strokeStyle = line.color;
-      ctx.lineWidth = mmLineToScreen(line.widthMm ?? 0.18);
-      ctx.setLineDash(line.dashed ? [5, 4] : []);
-      ctx.beginPath();
-      const first = modelToScreen(line.points[0].x, line.points[0].y);
-      ctx.moveTo(first.x, first.y);
-      for (let i = 1; i < line.points.length; i++) {
-        const p = modelToScreen(line.points[i].x, line.points[i].y);
-        ctx.lineTo(p.x, p.y);
-      }
-      if (line.closed) ctx.closePath();
-      ctx.stroke();
-    }
-    ctx.setLineDash([]);
-
-    for (const text of data.texts) {
-      const fontPx = worldHeightToScreenPx(text.height);
-      if (fontPx < 4) continue; // declutter when zoomed far out
-      const anchor = modelToScreen(text.x, text.y);
-      const tip = modelToScreen(text.x + text.dirX, text.y + text.dirY);
-      const sx = tip.x - anchor.x;
-      const sy = tip.y - anchor.y;
-      const angle = Math.abs(sx) + Math.abs(sy) > 1e-6 ? Math.atan2(sy, sx) : 0;
-
-      ctx.save();
-      ctx.fillStyle = text.color;
-      ctx.font = `${fontPx}px system-ui, sans-serif`;
-      ctx.textAlign = text.align;
-      ctx.textBaseline = dxfValignToBaseline(text.valign);
-      ctx.translate(anchor.x, anchor.y);
-      ctx.rotate(angle);
-      const lines = text.text.split('\n');
-      for (let i = 0; i < lines.length; i++) {
-        ctx.fillText(lines[i], 0, i * fontPx * 1.3);
-      }
-      ctx.restore();
-    }
-
-    ctx.restore();
-  }
-}
-
 /** Dot half-size in screen pixels — constant regardless of zoom, like the DXF underlay's text. */
 const SCAN_DOT_HALF_PX = 0.75;
 const SCAN_DOT_NEUTRAL_COLOR = '#8a8a8a';
@@ -332,7 +203,6 @@ function drawScanSectionScreenSpace(
   ctx.restore();
 }
 
-// Static constants to avoid creating new objects/arrays on every render
 const CANVAS_STYLE = { imageRendering: 'crisp-edges' as const };
 const EMPTY_MEASURE_RESULTS: Measure2DResultData[] = [];
 const EMPTY_UNIT_DISPLAY_OVERRIDES: Record<string, string> = {};
@@ -346,6 +216,7 @@ export interface Measure2DResultData {
 
 interface Drawing2DCanvasProps {
   drawing: Drawing2D;
+  snapshotSourceDrawing?: Drawing2D;
   transform: { x: number; y: number; scale: number };
   showHiddenLines: boolean;
   overrideEngine: GraphicOverrideEngine;
@@ -392,10 +263,18 @@ interface Drawing2DCanvasProps {
   // `unitDisplayOverrides` but left this canvas's own `formatDistance()`
   // calls on the pre-#2199 no-argument (always-metric) form).
   unitDisplayOverrides?: Record<string, string>;
+  // Paper/ink follow the app theme in direct mode; sheet mode's paper stays
+  // white regardless (#5496). Defaults to the light-theme reading so every
+  // existing caller (there is exactly one, `DrawingCanvasView`) that doesn't
+  // pass it yet keeps today's white-paper look.
+  paperTheme?: DrawingPaperTheme;
 }
+
+const DEFAULT_PAPER_THEME: DrawingPaperTheme = resolveDrawingPaperTheme('light', false);
 
 export function Drawing2DCanvas({
   drawing,
+  snapshotSourceDrawing = drawing,
   transform,
   showHiddenLines,
   overrideEngine,
@@ -428,13 +307,14 @@ export function Drawing2DCanvas({
   scanPoints,
   scanOpacity = 1,
   unitDisplayOverrides = EMPTY_UNIT_DISPLAY_OVERRIDES,
+  paperTheme = DEFAULT_PAPER_THEME,
 }: Drawing2DCanvasProps): React.ReactElement {
+  const referenceImages = useReferenceImagesForDrawing(drawing.config.plane);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [canvasSize, setCanvasSize] = useState({ width: 0, height: 0 });
   // Resolved once per (model set, polygon set) change, never per draw frame.
   const getElementProperties = useDrawingElementPropertiesLookup(drawing, overrideEngine, overridesEnabled);
-
-  // ResizeObserver to track canvas size changes
+  useEffect(() => canvasRef.current ? registerActiveDrawingCanvas(canvasRef.current, snapshotSourceDrawing) : undefined, [snapshotSourceDrawing]);
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -469,8 +349,10 @@ export function Drawing2DCanvas({
     canvas.height = canvasSize.height * dpr;
     ctx.scale(dpr, dpr);
 
-    // Clear with light gray background (shows paper edge when in sheet mode)
-    ctx.fillStyle = sheetEnabled && activeSheet ? '#e5e5e5' : '#ffffff';
+    // Clear with the desk (shows the paper edge when in sheet mode) or the
+    // theme's paper colour in direct mode (#5496: dark paper in dark theme,
+    // print preview always white).
+    ctx.fillStyle = sheetEnabled && activeSheet ? paperTheme.desk : paperTheme.paper;
     ctx.fillRect(0, 0, canvasSize.width, canvasSize.height);
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -492,6 +374,9 @@ export function Drawing2DCanvas({
       // ─────────────────────────────────────────────────────────────────────
       // 1. Draw paper background (white with shadow)
       // ─────────────────────────────────────────────────────────────────────
+      // Always white regardless of theme (#5496): a sheet models a physical
+      // printed page, and only the desk around it (the clear above) follows
+      // the theme.
       ctx.save();
       // Paper shadow
       ctx.shadowColor = 'rgba(0, 0, 0, 0.2)';
@@ -785,6 +670,8 @@ export function Drawing2DCanvas({
           // Sheet mm to screen
           return { x: mmToScreenX(sheetX), y: mmToScreenY(sheetY) };
         };
+
+        drawReferenceImages(ctx, referenceImages, modelToScreen);
 
         // Line width in screen pixels (convert mm to screen)
         const mmLineToScreen = (mmWeight: number) => Math.max(0.5, mmToScreen(mmWeight / drawingTransform.scaleFactor * 0.001));
@@ -1146,6 +1033,7 @@ export function Drawing2DCanvas({
       // - 'side': also flip X to look from conventional direction
       const scaleX = sectionAxis === 'side' ? -transform.scale : transform.scale;
       const scaleY = sectionAxis === 'down' ? transform.scale : -transform.scale;
+      drawReferenceImages(ctx, referenceImages, (x, y) => ({ x: x * scaleX + transform.x, y: y * scaleY + transform.y }));
 
       // DXF reference underlays render first, beneath the cut geometry
       // (issue #1782). Data is pre-mapped drawing space and exists only
@@ -1169,8 +1057,10 @@ export function Drawing2DCanvas({
       // 1. FILL CUT POLYGONS (with color from IFC materials, override engine, or type fallback)
       // ═══════════════════════════════════════════════════════════════════════
       for (const polygon of drawing.cutPolygons) {
-        // Get fill color - priority: IFC materials > override engine > IFC type fallback
-        let fillColor = getFillColorForType(polygon.ifcType), strokeColor = '#000000', opacity = 1;
+        // Get fill color - priority: IFC materials > override engine > IFC type fallback.
+        // Direct mode only (#5496): the dark-paper analogue applies here, never
+        // in sheet mode above, which stays on white paper.
+        let fillColor = getFillColorForType(polygon.ifcType, paperTheme.isDark), strokeColor = paperTheme.ink, opacity = 1;
 
         // Use actual IFC material colors from the mesh data
         if (useIfcMaterials) {
@@ -1227,7 +1117,7 @@ export function Drawing2DCanvas({
       // 2. STROKE CUT POLYGON OUTLINES (with color from override engine)
       // ═══════════════════════════════════════════════════════════════════════
       for (const polygon of drawing.cutPolygons) {
-        let strokeColor = '#000000';
+        let strokeColor = paperTheme.ink;
         let lineWeight = 0.5;
 
         if (overridesEnabled) {
@@ -1292,15 +1182,16 @@ export function Drawing2DCanvas({
           continue;
         }
 
-        // Set line style based on category
-        let strokeColor = '#000000';
+        // Set line style based on category. Ink follows the paper (#5496):
+        // direct mode only, sheet mode above stays black-on-white.
+        let strokeColor = paperTheme.ink;
         let lineWidth = 0.25;
         let dashPattern: number[] = [];
 
         switch (line.category) {
           case 'projection':
             lineWidth = 0.25;
-            strokeColor = '#000000';
+            strokeColor = paperTheme.ink;
             break;
           case 'hidden':
             lineWidth = 0.18;
@@ -1309,19 +1200,19 @@ export function Drawing2DCanvas({
             break;
           case 'silhouette':
             lineWidth = 0.35;
-            strokeColor = '#000000';
+            strokeColor = paperTheme.ink;
             break;
           case 'crease':
             lineWidth = 0.18;
-            strokeColor = '#000000';
+            strokeColor = paperTheme.ink;
             break;
           case 'boundary':
             lineWidth = 0.25;
-            strokeColor = '#000000';
+            strokeColor = paperTheme.ink;
             break;
           case 'annotation':
             lineWidth = 0.13;
-            strokeColor = '#000000';
+            strokeColor = paperTheme.ink;
             break;
         }
 
@@ -1734,7 +1625,6 @@ export function Drawing2DCanvas({
       ctx.setLineDash([]);
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
     // 8. RENDER SELECTION HIGHLIGHT
     // ═══════════════════════════════════════════════════════════════════════
     if (selectedAnnotation) {
@@ -1830,7 +1720,8 @@ export function Drawing2DCanvas({
         }
       }
     }
-  }, [drawing, transform, showHiddenLines, canvasSize, overrideEngine, overridesEnabled, getElementProperties, entityColorMap, useIfcMaterials, measureMode, measureStart, measureCurrent, measureResults, measureSnapPoint, sheetEnabled, activeSheet, sectionAxis, isPinned, annotation2DActiveTool, annotation2DCursorPos, polygonAreaPoints, polygonAreaResults, textAnnotations, textAnnotationEditing, cloudAnnotationPoints, cloudAnnotations, selectedAnnotation, ifcAnnotationLines, ifcAnnotationTexts, ifcAnnotationFills, dxfUnderlays, scanPoints, scanOpacity, unitDisplayOverrides]);
+    markActiveDrawingCanvasRendered(canvas, snapshotSourceDrawing, textAnnotationEditing === null);
+  }, [referenceImages, drawing, snapshotSourceDrawing, transform, showHiddenLines, canvasSize, overrideEngine, overridesEnabled, getElementProperties, entityColorMap, useIfcMaterials, measureMode, measureStart, measureCurrent, measureResults, measureSnapPoint, sheetEnabled, activeSheet, sectionAxis, isPinned, annotation2DActiveTool, annotation2DCursorPos, polygonAreaPoints, polygonAreaResults, textAnnotations, textAnnotationEditing, cloudAnnotationPoints, cloudAnnotations, selectedAnnotation, ifcAnnotationLines, ifcAnnotationTexts, ifcAnnotationFills, dxfUnderlays, scanPoints, scanOpacity, unitDisplayOverrides, paperTheme]);
 
   return (
     <canvas

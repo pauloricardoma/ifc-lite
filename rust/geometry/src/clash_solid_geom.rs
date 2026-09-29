@@ -2,34 +2,16 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Geometric helpers for [`super::intersection_solid`]: enclosed volume of a
-//! triangle soup, connected-component partitioning of the kernel's raw
-//! arrangement output, and the per-operand near-band used to size the trust
-//! gate. Split out of `clash_solid.rs` so that file stays under the
-//! module-size rule; `intersection_solid` itself, and the reasoning for HOW
-//! these are used, stays there.
+//! Geometric helpers for [`super::intersection_solid`]: connected-component
+//! partitioning of the kernel's raw arrangement output, and the per-operand
+//! near-band used to size the trust gate. Split out of `clash_solid.rs` so
+//! that file stays under the module-size rule; `intersection_solid` itself,
+//! and the reasoning for HOW these are used, stays there.
 
 use crate::clash_contact_axes::dot3;
 use crate::kernel::arrangement::Tri;
 use crate::kernel::near_band::NearBand;
 use crate::mesh::Mesh;
-
-/// Enclosed volume of a closed f64 triangle soup (divergence theorem).
-pub(super) fn tri_volume(tris: &[Tri]) -> f64 {
-    tris.iter()
-        .map(|t| {
-            let (a, b, c) = (t[0], t[1], t[2]);
-            let cr = [
-                b[1] * c[2] - b[2] * c[1],
-                b[2] * c[0] - b[0] * c[2],
-                b[0] * c[1] - b[1] * c[0],
-            ];
-            a[0] * cr[0] + a[1] * cr[1] + a[2] * cr[2]
-        })
-        .sum::<f64>()
-        .abs()
-        / 6.0
-}
 
 /// Partitions `tris` into disjoint connected components by shared-vertex
 /// adjacency, returning each component as a list of indices into `tris`.
@@ -121,12 +103,19 @@ pub(super) fn component_groups(tris: &[Tri]) -> Vec<Vec<usize>> {
         }
     }
 
-    let mut groups: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    // Groups come out in lowest-triangle-index order, not hash order, so a
+    // tie in the trust gate's report resolves the same way on every run.
+    let mut group_of_root = vec![usize::MAX; tris.len()];
+    let mut groups: Vec<Vec<usize>> = Vec::new();
     for i in 0..tris.len() {
         let root = find(&mut parent, i);
-        groups.entry(root).or_default().push(i);
+        if group_of_root[root] == usize::MAX {
+            group_of_root[root] = groups.len();
+            groups.push(Vec::new());
+        }
+        groups[group_of_root[root]].push(i);
     }
-    groups.into_values().collect()
+    groups
 }
 
 /// Per-axis coordinate extents across both operands, for sizing the trust
@@ -151,9 +140,10 @@ pub(super) fn component_groups(tris: &[Tri]) -> Vec<Vec<usize>> {
 /// inside that axis's OWN `TRUST_BAND_MULTIPLE`-scaled band projected via
 /// `band.scaled_band2` — the pair must be withheld. `None` when every single
 /// one of them clears its own band — the pair can be trusted. The returned
-/// pair is the (component, axis) with the SMALLEST extent, kept only for
-/// `DegenerateReason::BelowKernelResolution`'s report; it does not select
-/// which band was consulted (see below).
+/// pair is the thinnest VIOLATING (component, axis) and its own band, kept
+/// only for `DegenerateReason::BelowKernelResolution`'s report, so the
+/// report always reads `thickness < required`
+/// (`clash_solid_tests::withheld_pair_reports_the_violating_axis`).
 ///
 /// PR #2923 review finding, fixed here: the previous form tracked a single
 /// global argmin-thickness `(thickness, required)` pair and compared ONLY
@@ -168,9 +158,9 @@ pub(super) fn component_groups(tris: &[Tri]) -> Vec<Vec<usize>> {
 /// only `required_Z` (~0.49 mm, so 0.6 mm passed) — while X (2 mm) was never
 /// checked against `required_X` (~9.5 mm, since the X-normal faces at 10 km
 /// sit inside a ~2.4 mm near band), and X is precisely the axis the kernel
-/// already collapsed. `untrusted` now accumulates `t < required` across
-/// EVERY (component, axis) pair independently, so no axis's own violation
-/// can be shadowed by another axis being thinner still.
+/// already collapsed. Every (component, axis) pair is now compared against
+/// its OWN band independently, so no axis's own violation can be shadowed
+/// by another axis being thinner still.
 pub(super) fn trust_gate_reason(
     tris: &[Tri],
     axes: &[[f64; 3]],
@@ -179,7 +169,6 @@ pub(super) fn trust_gate_reason(
 ) -> Option<(f64, f64)> {
     let mut thickness = f64::INFINITY;
     let mut required = 0.0;
-    let mut untrusted = false;
     for group in component_groups(tris) {
         for axis in axes {
             let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
@@ -192,16 +181,13 @@ pub(super) fn trust_gate_reason(
             }
             let t = hi - lo;
             let req = trust_band_multiple * band.scaled_band2(*axis, 1.0).sqrt();
-            if t < req {
-                untrusted = true;
-            }
-            if t < thickness {
+            if t < req && t < thickness {
                 thickness = t;
                 required = req;
             }
         }
     }
-    if untrusted { Some((thickness, required)) } else { None }
+    (thickness < required).then_some((thickness, required))
 }
 
 pub(super) fn operand_near_band(a: &Mesh, b: &Mesh) -> NearBand {

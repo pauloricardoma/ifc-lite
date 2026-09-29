@@ -264,7 +264,7 @@ impl GeometryRouter {
         // is skipped only when the element ALSO carries direct body geometry.
         let has_direct_geometry = reps.iter().any(|sr| {
             sr.ifc_type == IfcType::IfcShapeRepresentation
-                && crate::router::effective_rep_type(sr)
+                && crate::router::effective_element_rep_type(element, sr)
                     .map(crate::router::is_direct_body_representation)
                     .unwrap_or(false)
         });
@@ -273,7 +273,7 @@ impl GeometryRouter {
             if sr.ifc_type != IfcType::IfcShapeRepresentation {
                 continue;
             }
-            let Some(rt) = crate::router::effective_rep_type(&sr) else {
+            let Some(rt) = crate::router::effective_element_rep_type(element, &sr) else {
                 continue;
             };
             if rt == "MappedRepresentation" && has_direct_geometry {
@@ -493,7 +493,7 @@ impl GeometryRouter {
             if shape_rep.ifc_type != IfcType::IfcShapeRepresentation {
                 continue;
             }
-            if let Some(rep_type) = crate::router::effective_rep_type(&shape_rep) {
+            if let Some(rep_type) = crate::router::effective_element_rep_type(element, &shape_rep) {
                 if !is_body_representation(rep_type) {
                     continue;
                 }
@@ -508,17 +508,29 @@ impl GeometryRouter {
             };
 
             for item in items {
-                let mut mesh = match self.process_representation_item(&item, decoder) {
+                // A raw national-grid cutter rebases in this opening's own
+                // frame, like the host it cuts (#5698).
+                let item_mesh = match self.process_raw_item_for_element(&item, element, decoder) {
+                    Ok(Some(mesh)) => Ok(mesh),
+                    Ok(None) => self.process_representation_item(&item, decoder),
+                    Err(error) => Err(error),
+                };
+                let mut mesh = match item_mesh {
                     Ok(m) if !m.is_empty() => m,
                     _ => continue,
                 };
 
-                // Keep the host in absolute world/RTC coordinates here: the void cut
-                // (`apply_void_context`) matches it against world-coordinate opening
-                // cutters, so relativizing the host now would silently break every
-                // cut. The per-element local-origin relativization is applied to the
-                // CSG OUTPUT instead (shared host+cutter frame).
-                self.transform_mesh_world_framed(&mut mesh, &placement_transform, false);
+                // Keep ordinary opening cutters in the world/RTC frame. A large
+                // mapped origin would lose its fractional translation when the
+                // world point is cast to f32; the void context folds each cutter's
+                // origin into the host frame before cutting.
+                let frame_mapped_origin =
+                    self.mapped_origin_needs_local_frame(&mesh, &placement_transform);
+                self.transform_mesh_world_framed(
+                    &mut mesh,
+                    &placement_transform,
+                    frame_mapped_origin,
+                );
 
                 item_meshes.push(mesh);
             }
@@ -568,7 +580,7 @@ impl GeometryRouter {
             }
 
             // Check representation type
-            if let Some(rep_type) = crate::router::effective_rep_type(&shape_rep) {
+            if let Some(rep_type) = crate::router::effective_element_rep_type(element, &shape_rep) {
                 if !is_body_representation(rep_type) {
                     continue;
                 }
@@ -614,7 +626,9 @@ impl GeometryRouter {
                     _ => continue,
                 };
 
-                // Get bounds and transform to world coordinates
+                // Mesh::bounds is local to mesh.positions. Mapped items can
+                // carry a large f64 origin that must be folded in before the
+                // element placement, or the cutter box lands near zero.
                 let (mesh_min, mesh_max) = mesh.bounds();
 
                 // Transform corner points to world coordinates
@@ -632,7 +646,14 @@ impl GeometryRouter {
                 // Transform all corners and compute new AABB
                 let transformed: Vec<Point3<f64>> = corners
                     .iter()
-                    .map(|p| placement_transform.transform_point(p))
+                    .map(|p| {
+                        let source = Point3::new(
+                            p.x + mesh.origin[0],
+                            p.y + mesh.origin[1],
+                            p.z + mesh.origin[2],
+                        );
+                        placement_transform.transform_point(&source)
+                    })
                     .collect();
 
                 let world_min = Point3::new(

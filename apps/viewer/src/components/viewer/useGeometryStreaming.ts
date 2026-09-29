@@ -1,7 +1,7 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
-
+import { flushPlacementGeometry } from '@/lib/model-placement/bounds-revision';
 /**
  * Geometry streaming hook for the 3D viewport.
  *
@@ -19,17 +19,18 @@
  */
 
 import { useEffect, useRef, type MutableRefObject } from 'react';
-import type { Renderer, SceneContents } from '@ifc-lite/renderer';
+import type { Renderer } from '@ifc-lite/renderer';
 import type { MeshData, CoordinateInfo, DecodedInstance } from '@ifc-lite/geometry';
 import { decodeInstancedShard, NORMAL_COORD_THRESHOLD_M } from '@ifc-lite/geometry';
 import { toast } from '../ui/toast.js';
+import { reshapeSceneKeepingPresentInstanced } from './geometry-rebuild';
 import { runGpuUpload } from './gpu-upload-guard';
 import { createRobustFitBoundsAccumulator } from './robustFitBoundsAccumulator.js';
+import { liftNewInstancedOccurrences, placeNewMeshesAtCurrentLevel } from '@/lib/level-arrival';
+import { useColorOverlaySync } from './useColorOverlaySync.js';
+import { useMeshEditDrain } from './useMeshEditDrain.js';
+import { invalidateLandXmlGpuOwnershipAfterSceneClear, takeLandXmlGpuUploaded } from '../../hooks/ingest/landXmlGpuOwnership.js';
 
-// Session-scoped flag so the linear-infrastructure hint fires at most once
-// per page load (model swaps included). Stored at module scope rather than
-// in component state because federation re-mounts the streaming hook on
-// every model load — a useRef wouldn't survive.
 let linearFitHintShown = false;
 
 /**
@@ -62,6 +63,8 @@ export interface UseGeometryStreamingParams {
   rendererRef: MutableRefObject<Renderer | null>;
   isInitialized: boolean;
   geometry: MeshData[] | null;
+  /** Full loaded source geometry, including hidden models, for retained appearance history. */
+  appearanceSourceGeometry?: readonly MeshData[];
   /** Monotonic counter — triggers the streaming effect even when the geometry
    *  array reference is stable (incremental filtering reuses the same array). */
   geometryVersion?: number;
@@ -109,6 +112,9 @@ export interface UseGeometryStreamingParams {
    * processGeometryBatchInstanced.
    */
   pendingInstancedShards: Array<{ modelId: string; bytes: ArrayBuffer }> | null;
+  /** Current absolute renderer-Y lifts, keyed by global entity id. New arrivals
+   * inherit them before upload; later level changes still use pending deltas. */
+  currentLevelY?: ReadonlyMap<number, number>;
   /**
    * modelId → renderer modelIndex (same map ViewportContainer stamps onto
    * flat meshes / point clouds — reused here rather than re-derived, so a
@@ -139,15 +145,22 @@ export interface UseGeometryStreamingParams {
    * instanced buffers) and reconcile ownership against this set — any
    * modelIndex the scene still holds templates for but that is NOT in this
    * set gets torn down via `removeInstancedTemplatesForModel`, so a
-   * genuinely removed/hidden model's instanced geometry does not linger.
+   * genuinely removed model's instanced geometry does not linger.
    * `undefined` defaults to "only modelIndex 0 is present" — the
    * non-federated case, where `addInstancedShard` has always defaulted new
-   * templates to modelIndex 0.
+   * templates to modelIndex 0. Hidden models remain present and masked (#4428).
    */
   presentInstancedModelIndices?: ReadonlySet<number>;
   clearPendingMeshColorUpdates: () => void;
   clearPendingColorUpdates: () => void;
   clearPendingMeshRemovals: () => void;
+  /**
+   * Prunes drained ids out of the store's `geometryResult.meshes` and
+   * subtracts their triangle/vertex counts — see `pruneGeometryMeshes` in
+   * `dataSlice.ts`. Called right after `scene.removeMeshesForEntities` so
+   * the store stops disagreeing with what the renderer already dropped.
+   */
+  pruneGeometryMeshes: (ids: Set<number>) => void;
   clearPendingMeshTranslations: () => void;
   clearPendingMeshRotations: () => void;
   clearInstancedShards: () => void;
@@ -182,41 +195,13 @@ function traceGeometrySync(message: string): void {
   console.log(`[GeomSync] ${message}`);
 }
 
-// Non-federated default: only the primary model (modelIndex 0, what
-// `addInstancedShard` has always defaulted new templates to) survives a
-// reshape when the caller has no per-model presence info.
-const DEFAULT_PRESENT_INSTANCED_MODEL_INDICES: ReadonlySet<number> = new Set([0]);
-
-/**
- * Reshape the scene for a non-streaming geometry change WITHOUT destroying
- * instanced templates that belong to a model still present (#2073). Clears
- * flat/batched geometry unconditionally (that always needs a full rebuild on
- * a reshape), then reconciles instanced ownership: any modelIndex the scene
- * still holds templates for but that is missing from
- * `presentInstancedModelIndices` gets torn down via
- * `removeInstancedTemplatesForModel` so a genuinely removed/hidden model's
- * repeated geometry does not linger on screen. See the
- * `presentInstancedModelIndices` param doc for the full rationale.
- */
-function reshapeSceneKeepingPresentInstanced(
-  scene: SceneContents,
-  presentInstancedModelIndices: ReadonlySet<number> | undefined,
-): void {
-  scene.clearFlatGeometry();
-  const present = presentInstancedModelIndices ?? DEFAULT_PRESENT_INSTANCED_MODEL_INDICES;
-  for (const modelIndex of scene.getInstancedModelIndices()) {
-    if (!present.has(modelIndex)) {
-      scene.removeInstancedTemplatesForModel(modelIndex);
-    }
-  }
-}
-
 export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
   const {
     rendererRef,
     isInitialized,
     geometry,
     geometryVersion,
+    appearanceSourceGeometry,
     geometryContentVersion,
     coordinateInfo,
     isStreaming,
@@ -228,16 +213,17 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
     pendingMeshTranslations,
     pendingMeshRotations,
     pendingInstancedShards,
+    currentLevelY,
     modelIdToIndex,
     modelIdToOffset,
     presentInstancedModelIndices,
     clearPendingMeshColorUpdates,
     clearPendingColorUpdates,
     clearPendingMeshRemovals,
+    pruneGeometryMeshes,
     clearPendingMeshTranslations,
     clearPendingMeshRotations,
     clearInstancedShards,
-    clearColorRef,
     releaseGeometryAfterFinalize = false,
     onGeometryReleased,
   } = params;
@@ -274,7 +260,9 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
       const pipeline = renderer.getPipeline();
       const scene = renderer.getScene();
       if (!device || !pipeline || !scene.hasQueuedMeshes()) return;
-      const flushed = runGpuUpload('flushPending:pump', () => scene.flushPending(device, pipeline)) ?? false;
+      // Hidden tab: nobody can be navigating. If the tab turned visible before this
+      // timer fired, keep the short slice as if the user were (#6436).
+      const flushed = runGpuUpload('flushPending:pump', () => flushPlacementGeometry(scene, device, pipeline, !globalThis.document?.hidden)) ?? false;
       if (flushed) {
         renderer.clearCaches();
         renderer.requestRender();
@@ -284,6 +272,13 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
       }
     }, 0);
   };
+
+  // Declared BEFORE the main effect: it swaps edited meshes in the scene and
+  // advances the refs below past them (see useMeshEditDrain.ts).
+  useMeshEditDrain({
+    rendererRef, isInitialized, isStreaming, geometry, pendingMeshRemovals, clearPendingMeshRemovals,
+    pruneGeometryMeshes, lastGeometryLengthRef, lastGeometryRef, processedMeshIdsRef,
+  });
 
   // ─── Main geometry effect ────────────────────────────────────────────
   // Runs on every geometry change (new file, incremental batch, visibility toggle).
@@ -304,6 +299,7 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
         robustFitAccRef.current.reset();
         if (renderer && isInitialized) {
           renderer.getScene().clear();
+          invalidateLandXmlGpuOwnershipAfterSceneClear();
           renderer.getCamera().reset();
           geometryBoundsRef.current = { ...DEFAULT_BOUNDS };
           renderer.requestRender();
@@ -366,7 +362,8 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
     const isCleared = currentLength === 0;
 
     if (isCleared) {
-      reshapeSceneKeepingPresentInstanced(scene, presentInstancedModelIndices);
+      reshapeSceneKeepingPresentInstanced(scene, presentInstancedModelIndices, geometry, appearanceSourceGeometry);
+      invalidateLandXmlGpuOwnershipAfterSceneClear();
       processedMeshIdsRef.current.clear();
       lastGeometryLengthRef.current = 0;
       lastGeometryRef.current = null;
@@ -376,12 +373,9 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
 
     if (isNewFile) {
       traceGeometrySync(`new file currentLength=${currentLength} lastLength=${lastLength} releaseAfterFinalize=${releaseGeometryAfterFinalize}`);
-      // #2073: a genuine first load has no existing instanced templates, so
-      // this is a no-op reconcile; a content-version bump (in-place mutation)
-      // disguises itself as "new file" by resetting lastGeometryLengthRef to 0
-      // above — retention must still apply here, not just at the bump site,
-      // or this branch would immediately undo it with a blind clear().
-      reshapeSceneKeepingPresentInstanced(scene, presentInstancedModelIndices);
+      // Reconcile flat geometry while retaining present instanced templates.
+      reshapeSceneKeepingPresentInstanced(scene, presentInstancedModelIndices, geometry, appearanceSourceGeometry);
+      invalidateLandXmlGpuOwnershipAfterSceneClear();
       scene.setEphemeralStreamingMode(releaseGeometryAfterFinalize);
       processedMeshIdsRef.current.clear();
       cameraFittedRef.current = false;
@@ -395,11 +389,9 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
     } else if (!isIncremental && currentLength !== lastLength) {
       if (currentLength < lastLength) {
         traceGeometrySync(`geometry rebuilt after shrink currentLength=${currentLength} lastLength=${lastLength}`);
-        // Length decreased (model hidden) — rebuild scene, keep camera.
-        // #2073: reconcile instanced ownership instead of a blind clear() so
-        // a model that is STILL present keeps its instanced geometry; only
-        // the model(s) missing from presentInstancedModelIndices lose theirs.
-        reshapeSceneKeepingPresentInstanced(scene, presentInstancedModelIndices);
+        // Length decreased (model hidden): rebuild while retaining the camera.
+        reshapeSceneKeepingPresentInstanced(scene, presentInstancedModelIndices, geometry, appearanceSourceGeometry);
+        invalidateLandXmlGpuOwnershipAfterSceneClear();
         scene.setEphemeralStreamingMode(releaseGeometryAfterFinalize);
         processedMeshIdsRef.current.clear();
         lastGeometryLengthRef.current = 0;
@@ -407,7 +399,8 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
       } else {
         traceGeometrySync(`geometry rebuilt after replace currentLength=${currentLength} lastLength=${lastLength} releaseAfterFinalize=${releaseGeometryAfterFinalize}`);
         // New file while another was open — full reset
-        reshapeSceneKeepingPresentInstanced(scene, presentInstancedModelIndices);
+        reshapeSceneKeepingPresentInstanced(scene, presentInstancedModelIndices, geometry, appearanceSourceGeometry);
+        invalidateLandXmlGpuOwnershipAfterSceneClear();
         scene.setEphemeralStreamingMode(releaseGeometryAfterFinalize);
         processedMeshIdsRef.current.clear();
         cameraFittedRef.current = false;
@@ -442,7 +435,8 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
 
     // Visibility toggle while NOT streaming — array rebuilt from scratch
     if (isIncremental && !isStreaming && !prevIsStreamingRef.current) {
-      reshapeSceneKeepingPresentInstanced(scene, presentInstancedModelIndices);
+      reshapeSceneKeepingPresentInstanced(scene, presentInstancedModelIndices, geometry, appearanceSourceGeometry);
+      invalidateLandXmlGpuOwnershipAfterSceneClear();
       processedMeshIdsRef.current.clear();
       lastGeometryLengthRef.current = 0;
       lastGeometryRef.current = geometry;
@@ -480,7 +474,12 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
     }
 
     // ── Route meshes to scene ──
+    // A LandXML provisional transaction may have uploaded these exact
+    // store-owned meshes after its registry range became pickable. Consume the
+    // one-shot marker so normal scene rebuilds still own later re-uploads.
+    newMeshes = newMeshes.filter((mesh) => !takeLandXmlGpuUploaded(mesh));
     if (newMeshes.length > 0) {
+      newMeshes = placeNewMeshesAtCurrentLevel(newMeshes, currentLevelY ?? new Map());
       const pipeline = renderer.getPipeline();
       if (pipeline) {
         if (isStreaming) {
@@ -550,12 +549,12 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
       // tail, leaving the shiftedBounds / computeBounds paths below untouched.
       // `sceneBoundsFull` is the FULL AABB and is what feeds setSceneBounds —
       // near/far clipping + section ranges must still cover the far meshes.
-      const rbEarly = geometry.length > 0 ? robustFitAccRef.current.update(geometry) : null;
+      const rbEarly = geometry.length > 0 ? robustFitAccRef.current.update(geometry, { streaming: isStreaming }) : null;
       const robustEarly = rbEarly?.robust ?? null;
       let sceneBoundsFull: Bounds | null = null;
       if (robustEarly) {
         const canvas = renderer.getCanvas();
-        const canvasShort = Math.min(canvas?.height ?? 0, canvas?.width ?? 0);
+        const canvasShort = Math.min(canvas?.clientHeight ?? 0, canvas?.clientWidth ?? 0); // CSS px (#5383)
         const policy = renderer.getCamera().fitBoundsAdaptive(
           robustEarly,
           { viewportShortPx: canvasShort > 0 ? canvasShort : undefined },
@@ -570,7 +569,7 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
         const maxSize = Math.max(sb.max.x - sb.min.x, sb.max.y - sb.min.y, sb.max.z - sb.min.z);
         if (maxSize > 0 && Number.isFinite(maxSize)) {
           const canvas = renderer.getCanvas();
-          const canvasShort = Math.min(canvas?.height ?? 0, canvas?.width ?? 0);
+          const canvasShort = Math.min(canvas?.clientHeight ?? 0, canvas?.clientWidth ?? 0); // CSS px (#5383)
           const policy = renderer.getCamera().fitBoundsAdaptive(
             { min: sb.min, max: sb.max },
             { viewportShortPx: canvasShort > 0 ? canvasShort : undefined },
@@ -586,7 +585,7 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
         const bounds = computeBounds(geometry);
         if (bounds) {
           const canvas = renderer.getCanvas();
-          const canvasShort = Math.min(canvas?.height ?? 0, canvas?.width ?? 0);
+          const canvasShort = Math.min(canvas?.clientHeight ?? 0, canvas?.clientWidth ?? 0); // CSS px (#5383)
           const policy = renderer.getCamera().fitBoundsAdaptive(
             bounds,
             { viewportShortPx: canvasShort > 0 ? canvasShort : undefined },
@@ -624,7 +623,7 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
     }
 
     renderer.requestRender();
-  }, [geometry, geometryVersion, geometryContentVersion, coordinateInfo, isInitialized, isStreaming, modelCount]);
+  }, [geometry, geometryVersion, geometryContentVersion, appearanceSourceGeometry, coordinateInfo, isInitialized, isStreaming, modelCount]);
 
   useEffect(() => {
     return () => {
@@ -686,7 +685,7 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
             if (exactBounds) {
               if (!userMovedCamera(r, cameraSnapshotRef.current)) {
                 const canvas = r.getCanvas();
-                const canvasShort = Math.min(canvas?.height ?? 0, canvas?.width ?? 0);
+                const canvasShort = Math.min(canvas?.clientHeight ?? 0, canvas?.clientWidth ?? 0); // CSS px (#5383)
                 const policy = r.getCamera().fitBoundsAdaptive(
                   exactBounds,
                   { viewportShortPx: canvasShort > 0 ? canvasShort : undefined },
@@ -779,37 +778,6 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
     }
   }, [pendingMeshColorUpdates, isInitialized, clearPendingMeshColorUpdates]);
 
-  // ─── Mesh removals (split / delete) ───────────────────────────────────
-  // Authoring actions push globalIds into pendingMeshRemovals; drain
-  // here so the renderer actually drops them rather than leaving the
-  // mesh hidden via the visibility set. The bucket rebuild rides
-  // along on the existing rebuildPendingBatches path the streaming
-  // queue already exercises every frame.
-  useEffect(() => {
-    if (pendingMeshRemovals === null || !isInitialized) return;
-    const renderer = rendererRef.current;
-    if (!renderer) return;
-    const device = renderer.getGPUDevice();
-    const pipeline = renderer.getPipeline();
-    const scene = renderer.getScene();
-    if (!device || !pipeline) return;
-
-    if (pendingMeshRemovals.size > 0) {
-      scene.removeMeshesForEntities(pendingMeshRemovals);
-      if (scene.hasPendingBatches()) {
-        const rebuilt = runGpuUpload(
-          'rebuildPendingBatches:removals',
-          () => { scene.rebuildPendingBatches(device, pipeline); return true; },
-        ) ?? false;
-        // Leave the pending map intact on failure so the next mutation retries
-        // this rebuild instead of dropping it.
-        if (!rebuilt) return;
-      }
-      renderer.requestRender();
-    }
-    clearPendingMeshRemovals();
-  }, [pendingMeshRemovals, isInitialized, clearPendingMeshRemovals]);
-
   // ─── GPU-instancing shards ───────────────────────────────────────────
   // The geometry worker collates each batch into an IFNS shard; the loader
   // pushes the raw bytes into pendingInstancedShards, tagged with the owning
@@ -828,7 +796,7 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
     if (pendingInstancedShards.length > 0) {
       for (const { modelId, bytes } of pendingInstancedShards) {
         // CRITICAL: never let a shard decode/upload throw OUT of this effect.
-        // addInstancedShard creates GPU buffers (mappedAtCreation); on a degraded
+        // addInstancedShard creates GPU buffers; on a degraded
         // backend whose device is being lost (e.g. CI's SwiftShader), createBuffer
         // throws — and an uncaught throw in a React effect tears down the Viewport
         // subtree via the error boundary, unmounting the <canvas> entirely. Instanced
@@ -838,6 +806,7 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
           const shard = decodeInstancedShard(new Uint8Array(bytes));
           if (!shard) continue;
           applyFederationOffsetToShard(shard, modelIdToOffset?.get(modelId) ?? 0);
+          liftNewInstancedOccurrences(shard, currentLevelY ?? new Map());
           const modelIndex = modelIdToIndex?.get(modelId) ?? 0;
           scene.addInstancedShard(device, shard, modelIndex);
         } catch (err) {
@@ -927,24 +896,13 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
   }, [pendingMeshRotations, isInitialized, clearPendingMeshRotations]);
 
   // ─── Lens color overlays ─────────────────────────────────────────────
-  useEffect(() => {
-    if (pendingColorUpdates === null || !isInitialized) return;
-    const renderer = rendererRef.current;
-    if (!renderer) return;
-
-    const device = renderer.getGPUDevice();
-    const pipeline = renderer.getPipeline();
-    const scene = renderer.getScene();
-    if (device && pipeline) {
-      if (pendingColorUpdates.size === 0) {
-        scene.clearColorOverrides();
-      } else {
-        scene.setColorOverrides(pendingColorUpdates, device, pipeline);
-      }
-      renderer.requestRender();
-      clearPendingColorUpdates();
-    }
-  }, [pendingColorUpdates, isInitialized, clearPendingColorUpdates]);
+  useColorOverlaySync({
+    rendererRef,
+    isInitialized,
+    pendingColorUpdates,
+    clearPendingColorUpdates,
+    geometryVersion,
+  });
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────

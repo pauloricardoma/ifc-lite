@@ -6,7 +6,7 @@
  * BCFTopicList - Topic list with filtering and sorting for the BCF panel.
  */
 
-import React, { useCallback, useState, useMemo } from 'react';
+import React, { useCallback, useState, useMemo, useId } from 'react';
 import {
   Plus,
   MessageSquare,
@@ -17,6 +17,8 @@ import {
   Calendar,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { AnalysisEmptyState } from '../analysis/AnalysisEmptyState';
+import { AnalysisResultList } from '../analysis/AnalysisResultList';
 import { tourAnchor, TOUR_ANCHORS } from '@/lib/tours/anchors';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -27,8 +29,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { ScrollArea } from '@/components/ui/scroll-area';
 import type { BCFTopic } from '@ifc-lite/bcf';
+import { useTranslation } from '@/i18n';
 import { StatusBadge, PriorityBadge, formatDate, TOPIC_STATUSES } from './bcfHelpers';
 
 // ============================================================================
@@ -58,6 +60,8 @@ export function BCFTopicList({
   author,
   onSetAuthor,
 }: BCFTopicListProps) {
+  const { t } = useTranslation();
+  const emailInputId = useId();
   const [editingEmail, setEditingEmail] = useState(false);
   const [emailInput, setEmailInput] = useState(author);
   const isDefaultEmail = author === 'user@example.com';
@@ -91,10 +95,10 @@ export function BCFTopicList({
         <Filter className="h-4 w-4 text-muted-foreground" />
         <Select value={statusFilter} onValueChange={onStatusFilterChange}>
           <SelectTrigger className="h-8 flex-1">
-            <SelectValue placeholder="All statuses" />
+            <SelectValue placeholder={t('bcf.topicList.allStatuses')} />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="all">All statuses</SelectItem>
+            <SelectItem value="all">{t('bcf.topicList.allStatuses')}</SelectItem>
             {TOPIC_STATUSES.map((status) => (
               <SelectItem key={status} value={status.toLowerCase()}>
                 {status}
@@ -102,36 +106,83 @@ export function BCFTopicList({
             ))}
           </SelectContent>
         </Select>
-        <Button size="sm" variant="outline" aria-label="New topic" onClick={onCreateTopic} {...tourAnchor(TOUR_ANCHORS.bcfNewTopic)}>
+        <Button size="sm" variant="outline" aria-label={t('bcf.topicList.newTopicAria')} onClick={onCreateTopic} {...tourAnchor(TOUR_ANCHORS.bcfNewTopic)}>
           <Plus className="h-4 w-4" />
         </Button>
       </div>
 
       {/* Topic List */}
-      <ScrollArea className="flex-1">
-        {sortedTopics.length === 0 ? (
+      <AnalysisResultList
+        className="flex-1 min-h-0"
+        rowClassName="border-b border-border"
+        items={sortedTopics}
+        getKey={(topic) => topic.guid}
+        estimateSize={() => 88}
+        renderRow={(topic) => (
+          <button
+            onClick={() => onSelectTopic(topic.guid)}
+            className="w-full text-left p-3 hover:bg-accent/50 transition-colors"
+          >
+            <div className="flex items-start justify-between gap-2 mb-1">
+              <h4 className="font-medium text-sm line-clamp-1 flex-1">
+                {topic.title}
+              </h4>
+              <StatusBadge status={topic.topicStatus} />
+            </div>
+            {topic.description && (
+              <p className="text-xs text-muted-foreground line-clamp-2 mb-2">
+                {topic.description}
+              </p>
+            )}
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <PriorityBadge priority={topic.priority} />
+              {topic.creationAuthor && (
+                <span className="flex items-center gap-1">
+                  <User className="h-3 w-3" />
+                  {topic.creationAuthor.split('@')[0]}
+                </span>
+              )}
+              {topic.creationDate && (
+                <span className="flex items-center gap-1">
+                  <Calendar className="h-3 w-3" />
+                  {formatDate(topic.creationDate)}
+                </span>
+              )}
+              {topic.comments.length > 0 && (
+                <span className="flex items-center gap-1">
+                  <MessageSquare className="h-3 w-3" />
+                  {topic.comments.length}
+                </span>
+              )}
+              {topic.viewpoints.length > 0 && (
+                <span className="flex items-center gap-1">
+                  <Camera className="h-3 w-3" />
+                  {topic.viewpoints.length}
+                </span>
+              )}
+            </div>
+          </button>
+        )}
+      >
+        {sortedTopics.length === 0 && (
           <div className="flex flex-col items-center justify-center py-8 px-4 text-muted-foreground text-sm">
-            <MessageSquare className="h-8 w-8 mb-2 opacity-50" />
-            <p>No topics</p>
-            <Button
-              variant="link"
-              size="sm"
-              onClick={onCreateTopic}
-              className="mt-1"
-            >
-              Create first topic
-            </Button>
+            <AnalysisEmptyState
+              icon={<MessageSquare className="size-8" />}
+              title={t('bcf.topicList.noTopics')}
+              action={<Button variant="link" size="sm" onClick={onCreateTopic}>{t('bcf.topicList.createFirstTopic')}</Button>}
+            />
 
             {/* Email setup nudge */}
             <div className="mt-6 w-full max-w-xs">
               <div className="border border-border rounded-lg p-3 bg-muted/30">
                 {editingEmail ? (
                   <div className="space-y-2">
-                    <Label className="text-xs text-muted-foreground">Your email for BCF authorship</Label>
+                    <Label htmlFor={emailInputId} className="text-xs text-muted-foreground">{t('bcf.topicList.emailAuthorshipLabel')}</Label>
                     <Input
+                      id={emailInputId}
                       value={emailInput}
                       onChange={(e) => setEmailInput(e.target.value)}
-                      placeholder="your@email.com"
+                      placeholder={t('bcf.shared.emailPlaceholder')}
                       className="h-8 text-sm"
                       onKeyDown={(e) => {
                         if (e.key === 'Enter') handleSaveEmail();
@@ -149,7 +200,7 @@ export function BCFTopicList({
                         }}
                         className="h-7 text-xs"
                       >
-                        Cancel
+                        {t('bcf.shared.cancel')}
                       </Button>
                       <Button
                         size="sm"
@@ -157,14 +208,14 @@ export function BCFTopicList({
                         disabled={!emailInput.trim() || !emailInput.includes('@')}
                         className="h-7 text-xs"
                       >
-                        Save
+                        {t('bcf.shared.save')}
                       </Button>
                     </div>
                   </div>
                 ) : (
                   <div className="flex items-center justify-between gap-2">
                     <div className="flex-1 min-w-0">
-                      <p className="text-xs text-muted-foreground mb-0.5">Author</p>
+                      <p className="text-xs text-muted-foreground mb-0.5">{t('bcf.topicList.authorLabel')}</p>
                       <p className={`text-sm truncate ${isDefaultEmail ? 'text-amber-600 dark:text-amber-400' : 'text-foreground'}`}>
                         {author}
                       </p>
@@ -177,71 +228,22 @@ export function BCFTopicList({
                         setEditingEmail(true);
                       }}
                       className="h-7 text-xs shrink-0"
-                      aria-label={isDefaultEmail ? undefined : 'Edit author email'}
+                      aria-label={isDefaultEmail ? undefined : t('bcf.topicList.editAuthorEmailAria')}
                     >
-                      {isDefaultEmail ? 'Set email' : <Edit2 className="h-3 w-3" />}
+                      {isDefaultEmail ? t('bcf.topicList.setEmail') : <Edit2 className="h-3 w-3" />}
                     </Button>
                   </div>
                 )}
               </div>
               {isDefaultEmail && !editingEmail && (
                 <p className="text-xs text-muted-foreground mt-2 text-center">
-                  Set your email to identify your issues and comments
+                  {t('bcf.topicList.setEmailNudge')}
                 </p>
               )}
             </div>
           </div>
-        ) : (
-          <div className="divide-y divide-border">
-            {sortedTopics.map((topic) => (
-              <button
-                key={topic.guid}
-                onClick={() => onSelectTopic(topic.guid)}
-                className="w-full text-left p-3 hover:bg-accent/50 transition-colors"
-              >
-                <div className="flex items-start justify-between gap-2 mb-1">
-                  <h4 className="font-medium text-sm line-clamp-1 flex-1">
-                    {topic.title}
-                  </h4>
-                  <StatusBadge status={topic.topicStatus} />
-                </div>
-                {topic.description && (
-                  <p className="text-xs text-muted-foreground line-clamp-2 mb-2">
-                    {topic.description}
-                  </p>
-                )}
-                <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                  <PriorityBadge priority={topic.priority} />
-                  {topic.creationAuthor && (
-                    <span className="flex items-center gap-1">
-                      <User className="h-3 w-3" />
-                      {topic.creationAuthor.split('@')[0]}
-                    </span>
-                  )}
-                  {topic.creationDate && (
-                    <span className="flex items-center gap-1">
-                      <Calendar className="h-3 w-3" />
-                      {formatDate(topic.creationDate)}
-                    </span>
-                  )}
-                  {topic.comments.length > 0 && (
-                    <span className="flex items-center gap-1">
-                      <MessageSquare className="h-3 w-3" />
-                      {topic.comments.length}
-                    </span>
-                  )}
-                  {topic.viewpoints.length > 0 && (
-                    <span className="flex items-center gap-1">
-                      <Camera className="h-3 w-3" />
-                      {topic.viewpoints.length}
-                    </span>
-                  )}
-                </div>
-              </button>
-            ))}
-          </div>
         )}
-      </ScrollArea>
+      </AnalysisResultList>
     </div>
   );
 }

@@ -5,13 +5,21 @@
 //! Handler-level tests for `POST /api/v1/parse/metadata` (`parse_metadata`) —
 //! previously exercised only via status-code assertions elsewhere
 //! (`parity_tests.rs`'s admission tests); this file pins the actual counted
-//! response values.
+//! response values. Also `POST /api/v1/parse` (`parse_full`): where its
+//! encode runs (#4696).
 
+use super::cache_keys::{json_response_cache_key, request_cache_key, symbolic_cache_key};
+use super::worker_thread_tests::{
+    assert_off_the_worker, await_threads_that_logged, record_event_threads, threads_that_logged,
+    SYMBOLIC_CACHED,
+};
+use super::ParseQuery;
 use crate::config::Config;
 use crate::services::cache::DiskCache;
 use crate::{build_router, AppState};
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Request, StatusCode};
+use ifc_lite_processing::TessellationQuality;
 use serde_json::Value;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -49,7 +57,7 @@ ENDSEC;
 END-ISO-10303-21;
 "#;
 
-fn multipart_body(content: &[u8]) -> (String, Vec<u8>) {
+pub(super) fn multipart_body(content: &[u8]) -> (String, Vec<u8>) {
     let mut body = Vec::new();
     body.extend_from_slice(
         format!(
@@ -62,7 +70,7 @@ fn multipart_body(content: &[u8]) -> (String, Vec<u8>) {
     (format!("multipart/form-data; boundary={BOUNDARY}"), body)
 }
 
-async fn test_state(label: &str) -> AppState {
+pub(super) async fn test_state(label: &str) -> AppState {
     let dir = std::env::temp_dir().join(format!(
         "ifc-lite-server-r31-metadata-{}-{}",
         std::process::id(),
@@ -82,6 +90,7 @@ async fn test_state(label: &str) -> AppState {
                 shed_pct: 85,
             },
         )),
+        data_model_in_flight: Arc::new(crate::in_flight::InFlightKeys::default()),
     }
 }
 
@@ -105,4 +114,263 @@ async fn parse_metadata_counts_entities_and_geometry_separately() {
     assert_eq!(json["geometry_count"].as_u64().unwrap(), 1);
     assert_eq!(json["schema_version"].as_str().unwrap(), "IFC4");
     assert_eq!(json["file_size"].as_u64().unwrap(), FIXTURE.len() as u64);
+}
+/// The intact fixture with one extra record appended, whose instance name is
+/// `u32::MAX + 2` and so cannot be represented in the `u32` every express-id
+/// column in this workspace uses. DERIVED from `FIXTURE` rather than copied,
+/// so the two cannot drift into differing by something other than the record
+/// under test — a second copy is a second thing to keep in sync, and a
+/// divergence there would move the counts this test reads.
+fn fixture_with_oversized_id() -> String {
+    let derived = FIXTURE.replace(END_OF_DATA, &format!("{OVERSIZED_RECORD}\n{END_OF_DATA}"));
+    assert!(
+        derived.contains(OVERSIZED_RECORD),
+        "the splice must actually fire; a no-op replace would hand back the intact fixture"
+    );
+    derived
+}
+
+/// The intact fixture with `#302`'s first string literal left unterminated,
+/// so `find_entity_end` runs off the end of the buffer and the scan stops
+/// there (#3695) — every record after it is silently absent from the count.
+/// Derived for the same reason as above.
+fn fixture_with_unterminated_string() -> String {
+    let derived = FIXTURE.replace(INTACT_302, BROKEN_302);
+    assert!(
+        derived.contains(BROKEN_302) && !derived.contains(INTACT_302),
+        "the corruption must actually fire; a no-op replace would hand back the intact fixture"
+    );
+    derived
+}
+
+/// The two lines that close the fixture's DATA section, i.e. where a record
+/// gets appended.
+const END_OF_DATA: &str = "ENDSEC;\nEND-ISO-10303-21;";
+/// `#4294967297` is `u32::MAX + 2`: a regression that wraps yields `1` and
+/// collides with a real entity rather than merely erroring.
+const OVERSIZED_RECORD: &str = "#4294967297=IFCWALL('Wall00000000000000002',$,'W2',$,$,#40,#306,$,$);";
+const INTACT_302: &str = "#302=IFCRECTANGLEPROFILEDEF(.AREA.,$,#301,1.0,0.2);";
+const BROKEN_302: &str = "#302=IFCRECTANGLEPROFILEDEF(.AREA.,'unterminated,#301,1.0,0.2);";
+
+/// How many records `FIXTURE` declares before the one that
+/// `fixture_with_unterminated_string` breaks.
+///
+/// Counted off the fixture TEXT (one record per line), not off a parse, so
+/// the expected value does not come from the scanner whose behaviour is
+/// under test.
+fn records_before_302() -> u64 {
+    FIXTURE
+        .lines()
+        .take_while(|line| !line.starts_with("#302="))
+        .filter(|line| line.starts_with('#'))
+        .count() as u64
+}
+
+/// POST `content` to `/api/v1/parse/metadata` and return the decoded body.
+async fn metadata_json(label: &str, content: &str) -> Value {
+    let state = test_state(label).await;
+    let (content_type, body) = multipart_body(content.as_bytes());
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/parse/metadata")
+        .header(header::CONTENT_TYPE, content_type)
+        .body(Body::from(body))
+        .unwrap();
+    let response = build_router(state).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// `entity_count` from a metadata response.
+fn entity_count(json: &Value) -> u64 {
+    json["entity_count"].as_u64().expect("entity_count must be a number")
+}
+
+/// #3791: the handler walks its own `EntityScanner` and returned a 200 whose
+/// `entity_count` was computed over the bytes before a refusal — with nothing
+/// in the response distinguishing that from a whole file. Asserted through the
+/// HTTP response, not the scanner, because the response is what a client sees.
+#[tokio::test]
+async fn parse_metadata_reports_a_refused_oversized_id() {
+    let baseline = entity_count(&metadata_json("oversized-baseline", FIXTURE).await);
+    let json = metadata_json("oversized", &fixture_with_oversized_id()).await;
+
+    // The appended record really is gone: the same count as the fixture it
+    // was derived from, measured rather than written down, so the assertion
+    // cannot go stale when someone edits FIXTURE.
+    assert_eq!(
+        entity_count(&json),
+        baseline,
+        "the extra record is refused, so the count is indistinguishable from the intact file"
+    );
+    assert_eq!(json["oversized_id_count"].as_u64().unwrap(), 1);
+    assert!(!json["malformed_record_found"].as_bool().unwrap());
+}
+
+/// The other stop, same surface: an unterminated string ends the scan, so the
+/// count covers only the records before it.
+#[tokio::test]
+async fn parse_metadata_reports_a_malformed_record_stop() {
+    let baseline = entity_count(&metadata_json("malformed-baseline", FIXTURE).await);
+    let json = metadata_json("malformed", &fixture_with_unterminated_string()).await;
+
+    let counted = entity_count(&json);
+    assert!(
+        counted < baseline,
+        "the scan must come back short of the intact fixture's {baseline}, got {counted}"
+    );
+    assert_eq!(
+        counted,
+        records_before_302(),
+        "the scan stops at #302, so exactly the records before it are counted"
+    );
+    assert!(json["malformed_record_found"].as_bool().unwrap());
+    assert_eq!(json["oversized_id_count"].as_u64().unwrap(), 0);
+}
+
+/// The other direction: an intact file must report neither, or a client would
+/// learn to ignore both fields.
+#[tokio::test]
+async fn parse_metadata_reports_nothing_on_an_intact_file() {
+    let json = metadata_json("intact", FIXTURE).await;
+
+    assert_eq!(json["oversized_id_count"].as_u64().unwrap(), 0);
+    assert!(!json["malformed_record_found"].as_bool().unwrap());
+}
+
+// ---------------------------------------------------------------------
+// POST /api/v1/parse encodes off the async runtime (#4696).
+// ---------------------------------------------------------------------
+
+/// What `parse_full` logs right after it encodes a response body.
+const RESPONSE_ENCODED: &str = "JSON parse response encoded";
+
+/// POST `content` to `/api/v1/parse`; returns the content type and the body.
+async fn parse_full_json(state: &AppState, content: &str) -> (String, Value) {
+    let (content_type, body) = multipart_body(content.as_bytes());
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/parse")
+        .header(header::CONTENT_TYPE, content_type)
+        .body(Body::from(body))
+        .unwrap();
+    let response = build_router(state.clone()).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response.headers()[header::CONTENT_TYPE].to_str().unwrap().to_string();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (content_type, serde_json::from_slice(&bytes).unwrap())
+}
+
+/// `POST /api/v1/parse` encodes the whole model, on a miss and on a hit, and
+/// the symbolic sidecar, on the blocking pool, not on the async worker that
+/// resumes the handler. How this observes it: see `worker_thread_tests`. The
+/// fixture is unique to this test so its `cache_key` is.
+///
+/// Regression for #4696.
+#[tokio::test]
+async fn parse_full_encodes_off_the_async_worker() {
+    record_event_threads();
+    let state = test_state("off-runtime-4696").await;
+    let content = FIXTURE.replace("'W1'", "'W-4696'");
+    let cache_key =
+        request_cache_key(content.as_bytes(), &ParseQuery::default(), TessellationQuality::default());
+
+    let (content_type, miss) = parse_full_json(&state, &content).await;
+    assert_eq!(content_type, "application/json");
+    assert_eq!(miss["cache_key"], cache_key.as_str());
+    assert_eq!(miss["meshes"].as_array().map(Vec::len), Some(1), "the fixture's one wall");
+    assert_eq!(miss["stats"]["from_cache"], false);
+
+    let symbolic =
+        await_threads_that_logged(SYMBOLIC_CACHED, &symbolic_cache_key(&cache_key)).await;
+    assert_off_the_worker(&symbolic, "the symbolic sidecar encode");
+
+    // The response entry is written after the sidecar, by the same detached
+    // task; the second request must be a hit.
+    let response_key = json_response_cache_key(&cache_key);
+    let mut stored = false;
+    for _ in 0..400 {
+        stored = matches!(state.cache.get_bytes(&response_key).await, Ok(Some(_)));
+        if stored {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(stored, "the response entry for {cache_key} was never written");
+    let (content_type, hit) = parse_full_json(&state, &content).await;
+    assert_eq!(content_type, "application/json");
+    assert_eq!(hit["stats"]["from_cache"], true, "the second request must be a cache hit");
+    assert_eq!(hit["meshes"], miss["meshes"]);
+
+    let encodes = threads_that_logged(RESPONSE_ENCODED, &cache_key);
+    assert_eq!(encodes.len(), 2, "one encode for the miss and one for the hit, got {encodes:?}");
+    assert_off_the_worker(&encodes, "the response encode");
+}
+
+/// `in_flight` from the admission gauges.
+fn admission_in_flight(state: &AppState) -> u64 {
+    let text = state.admission.metrics_text();
+    let line = text
+        .lines()
+        .find(|line| line.starts_with("ifc_server_admission_in_flight "))
+        .expect("the in-flight gauge is exported");
+    line.rsplit(' ').next().unwrap().parse().unwrap()
+}
+
+/// A cache hit cancelled while its decode runs on the blocking pool keeps its
+/// admission slot until that decode exits, the same as the miss path's parse.
+/// Once the hit's decode moved into `spawn_blocking` (#4696), a guard left in
+/// the handler was released by a disconnect or the `TimeoutLayer` while the
+/// orphaned decode still held the model, so a retry was admitted on top.
+///
+/// The hit is inflated to many copies of the fixture's mesh so its decode
+/// outlasts the few polls between the `Cache HIT` log and the abort.
+#[tokio::test]
+async fn a_cancelled_cache_hit_keeps_its_admission_slot_while_it_decodes() {
+    record_event_threads();
+    let state = test_state("hit-admission-4696").await;
+    let content = FIXTURE.replace("'W1'", "'W-4696-hit-admission'");
+    let cache_key =
+        request_cache_key(content.as_bytes(), &ParseQuery::default(), TessellationQuality::default());
+
+    let (_, mut miss) = parse_full_json(&state, &content).await;
+    let response_key = json_response_cache_key(&cache_key);
+    let mut stored = false;
+    for _ in 0..400 {
+        stored = matches!(state.cache.get_bytes(&response_key).await, Ok(Some(_)));
+        if stored {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(stored, "the response entry for {cache_key} was never written");
+    let mesh = miss["meshes"][0].clone();
+    miss["meshes"] = Value::Array(vec![mesh; 20_000]);
+    let inflated = serde_json::to_vec(&miss).unwrap();
+    state.cache.set_bytes(&response_key, &inflated).await.unwrap();
+    assert_eq!(admission_in_flight(&state), 0);
+
+    let hit = {
+        let state = state.clone();
+        tokio::spawn(async move { parse_full_json(&state, &content).await })
+    };
+    while threads_that_logged("Cache HIT", &cache_key).is_empty() {
+        tokio::task::yield_now().await;
+    }
+    hit.abort();
+    assert!(hit.await.unwrap_err().is_cancelled(), "the hit finished before it could be cancelled");
+
+    assert_eq!(
+        admission_in_flight(&state),
+        1,
+        "the cancelled hit released its slot while its decode was still running"
+    );
+    for _ in 0..400 {
+        if admission_in_flight(&state) == 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("the slot was never released after the orphaned decode exited");
 }

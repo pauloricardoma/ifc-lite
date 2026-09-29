@@ -2,15 +2,26 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! JavaScript API for IFC-Lite: modern async/await parsing. Kept short: this
-//! file is AT its `module_size_ratchet` budget, so a new `mod` costs a line.
+//! JavaScript API for IFC-Lite; feature methods live in focused child modules.
 
 mod alignment_lines;
+mod analytic_serialization;
+mod appearance;
+mod appearance_page;
+mod appearance_atlas;
+mod appearance_transfer;
+mod annotation_plane;
+mod captured_mesh;
+mod appearance_calibration;
+mod scan_registration;
+mod pdf_vector;
 mod bool2d;
 mod clash;
 mod clash_solid;
 mod csg_diagnostics;
 mod diagnose;
+mod entity_index;
+mod extrusion_definitions;
 mod export_data;
 mod export_dfjson;
 mod export_glb;
@@ -20,10 +31,14 @@ mod export_step;
 mod extract_profiles;
 mod gpu_meshes;
 mod grid_lines;
+mod landxml;
+mod landxml_stream;
 mod mesh_outline;
+mod overlay_frame;
 mod parsing;
 mod pipeline_diagnostics;
 mod simplify;
+mod swept_disk_descriptions;
 mod space_plate;
 mod space_plate_input;
 pub(crate) mod styling;
@@ -241,6 +256,23 @@ pub struct IfcAPI {
             )>,
         )>,
     >,
+    /// #5582: authored metallic/roughness per style id, installed by
+    /// `setStyleFinishes` from the prepass `styleFinishes` wire and stamped on
+    /// each batch mesh by its representation item id. Tagged with the
+    /// `styleIds` signature it was set for, so a batch only applies finishes
+    /// that belong to its own style wire. Cleared by `clearPrePassCache`.
+    #[allow(clippy::type_complexity)]
+    style_finishes: std::sync::Mutex<
+        Option<(
+            (usize, u32, u32),
+            std::sync::Arc<rustc_hash::FxHashMap<u32, ifc_lite_processing::style::SpecularMaterial>>,
+        )>,
+    >,
+    /// #5582, sharded pre-pass: the shard-merged geometry finishes stashed by
+    /// `setPrepassGeometryFinishes` and taken by the next
+    /// `finalizePrepassStyles`, which has no finishes argument of its own.
+    pending_geometry_finishes:
+        std::sync::Mutex<Option<rustc_hash::FxHashMap<u32, ifc_lite_processing::style::SpecularMaterial>>>,
 
     /// Per-load structured pipeline diagnostics (`PipelineDiagnostics`
     /// contract, see `api::pipeline_diagnostics`): every
@@ -285,6 +317,8 @@ impl IfcAPI {
             skip_small_cuts: std::sync::atomic::AtomicBool::new(false),
             cached_plane_angle_to_radians: std::sync::Mutex::new(None),
             cached_geometry_styles: std::sync::Mutex::new(None),
+            style_finishes: std::sync::Mutex::new(None),
+            pending_geometry_finishes: std::sync::Mutex::new(None),
             pipeline_diagnostics: std::sync::Mutex::new(
                 ifc_lite_processing::PipelineDiagnostics::default(),
             ),
@@ -364,6 +398,8 @@ impl IfcAPI {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
+        // So do the #5582 style finishes, and any unconsumed sharded stash.
+        self.clear_style_finishes();
         // The content-dedup cache holds the previous model's item meshes, keyed by
         // a content hash of that model's entities. Drop it so a new file on the
         // same reused IfcAPI starts with an empty cache (bounds memory across
@@ -394,104 +430,6 @@ impl IfcAPI {
         // can read getPipelineDiagnostics(). Diagnostics are an accumulator, not
         // a cache, so they reset only at load START (set_entity_index), unlike
         // cached_item_dedup which is safe to drop on every clear.
-    }
-
-    /// Populate `cached_entity_index` from pre-extracted column arrays.
-    ///
-    /// Used by the streaming pre-pass to share its already-built entity
-    /// index across worker realms via SAB-backed Uint32Arrays — every
-    /// process worker would otherwise re-scan the entire file in
-    /// `processGeometryBatch`'s lazy build path (~5 s on a 1 GB IFC),
-    /// even though the pre-pass worker built the same index minutes
-    /// earlier.
-    ///
-    /// Builds a compact [`ColumnarEntityIndex`] from the three input slices
-    /// (sorted `u32` columns + binary search) instead of a per-worker
-    /// `FxHashMap` — ~229 MB vs ~436 MB on a 19.1 M-entity model (#1682).
-    /// [`ColumnarEntityIndex::from_columns`] verifies the id ordering once
-    /// (O(n)) and only argsorts if the producer did not emit sorted columns.
-    ///
-    /// `lengths[i]` is the byte length of entity `ids[i]`, so lookup returns
-    /// `(start, start + length)` to match the existing `(start, end)` layout.
-    ///
-    /// Idempotent in the sense that repeated calls REPLACE the cache —
-    /// supports the parser-worker pattern of reusing one IfcAPI across
-    /// multiple loads with different files.
-    #[wasm_bindgen(js_name = setEntityIndex)]
-    pub fn set_entity_index(&self, ids: &[u32], starts: &[u32], lengths: &[u32]) {
-        let n = ids.len();
-        if n == 0 || starts.len() != n || lengths.len() != n {
-            return;
-        }
-        let index = ColumnarEntityIndex::from_columns(ids, starts, lengths);
-        let mut slot = self
-            .cached_entity_index
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *slot = Some(std::sync::Arc::new(index));
-        drop(slot);
-
-        // Swapping the entity index means a different file. The other caches are
-        // content-scoped (keyed off the previous load) — carrying them into the
-        // next file would wrongly suppress/keep orphan type geometry, reuse a
-        // stale texture index, or skip the wrong parts. Drop them so they
-        // rebuild against the new content (#962 review). Mirrors clearPrePassCache.
-        self.cached_parts_to_skip
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        self.cached_material_layer_index
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        self.cached_referenced_repmaps
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        self.cached_instantiated_type_ids
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        self.cached_mapped_instance_plan
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        self.cached_texture_index
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        self.cached_indexed_colour_maps
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        self.cached_plane_angle_to_radians
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        // The geometry-style maps belong to the previous load's wire styles —
-        // drop them on content swap so a reused IfcAPI can't reuse a stale map
-        // (the (len,first,last) signature would otherwise collide rarely).
-        self.cached_geometry_styles
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        // The content-dedup cache holds the previous model's item meshes — drop it
-        // on content swap so a reused IfcAPI starts the new file with an empty
-        // cache (bounds memory across loads).
-        self.cached_item_dedup
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        // The mapped-item source cache holds the previous model's source meshes —
-        // drop it on content swap so a reused IfcAPI starts the new file empty
-        // (bounds memory across loads; #1623).
-        self.cached_mapped_item
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        // A new entity index means a new file — the pipeline diagnostics
-        // describe the previous load, so start fresh.
-        self.reset_pipeline_diagnostics();
     }
 
     /// Install the pre-computed set of `IfcRepresentationMap` ids referenced by
@@ -848,7 +786,7 @@ impl IfcAPI {
         // memmem (SIMD O(n)) not the naive O(n*k) `windows().any()`: this runs on
         // the whole file on each worker's first batch call, so on a 200-340MB model
         // the naive scan cost ~100-400ms per worker. Byte-identical boolean.
-        let has_layer_set = memchr::memmem::find(content, LAYER_SET_KW).is_some();
+        let has_layer_set = ifc_lite_core::find_keyword(content, LAYER_SET_KW).is_some();
         let index = if has_layer_set {
             ifc_lite_geometry::MaterialLayerIndex::from_content(content, decoder)
         } else {
@@ -1012,7 +950,7 @@ impl IfcAPI {
         // IfcIndexedColourMap pay only a single substring search (SIMD memmem),
         // not a full entity scan + decode, on the first batch of every worker.
         // The empty result is still cached so later batches skip even that.
-        if memchr::memmem::find(content, b"IFCINDEXEDCOLOURMAP").is_none() {
+        if ifc_lite_core::find_keyword(content, b"IFCINDEXEDCOLOURMAP").is_none() {
             let arc = std::sync::Arc::new(map);
             let mut slot = self
                 .cached_indexed_colour_maps
@@ -1023,7 +961,7 @@ impl IfcAPI {
         }
         let mut scanner = ifc_lite_core::EntityScanner::new(content);
         while let Some((_id, type_name, start, end)) = scanner.next_entity() {
-            if type_name == "IFCINDEXEDCOLOURMAP" {
+            if ifc_lite_core::keyword_eq(type_name, "IFCINDEXEDCOLOURMAP") {
                 if let Ok(icm) = decoder.decode_at(start, end) {
                     if let Some(full) =
                         ifc_lite_processing::style::resolve_indexed_colour_map_full(&icm, decoder)

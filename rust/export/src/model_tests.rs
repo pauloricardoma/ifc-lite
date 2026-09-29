@@ -8,6 +8,38 @@
 use super::*;
 use std::sync::Arc;
 
+/// #4203: bounded exporter strata are geometry-bearing product aliases, but
+/// retain their exact owned keyword instead of being remapped to an EXPRESS
+/// neighbour. The ordinary vendor-unknown direction must remain closed.
+#[test]
+fn exporter_stratum_aliases_emit_exact_rows_but_vendor_unknowns_do_not() {
+    for &alias in ifc_lite_core::EXPORTER_STRATUM_ALIASES {
+        let ifc = format!("ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4X3'));\nENDSEC;\nDATA;\n#1=IFCPROJECT('0$ScRe4drECQ4DMSqUjd6c',$,'P',$,$,$,$,(#2),#3);\n#2=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#5,$);\n#3=IFCUNITASSIGNMENT((#6));\n#4=IFCCARTESIANPOINT((0.,0.,0.));\n#5=IFCAXIS2PLACEMENT3D(#4,$,$);\n#6=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);\n#43={alias}('0$ScRe4drECQ4DMSqUjd6d',$,'Stratum',$,$,#44,#45,$);\n#44=IFCLOCALPLACEMENT($,#5);\n#45=IFCPRODUCTDEFINITIONSHAPE($,$,(#46));\n#46=IFCSHAPEREPRESENTATION(#2,'Body','Tessellation',(#48));\n#48=IFCTRIANGULATEDFACESET(#49,$,.T.,((1,2,3)),$);\n#49=IFCCARTESIANPOINTLIST3D(((0.,0.,0.),(1.,0.,0.),(0.,1.,0.)));\nENDSEC;\nEND-ISO-10303-21;");
+        let mesh = ifc_lite_processing::process_geometry(ifc.as_bytes())
+            .meshes
+            .into_iter()
+            .find(|mesh| mesh.express_id == 43)
+            .unwrap_or_else(|| panic!("{alias} must produce geometry"));
+        assert_eq!(mesh.ifc_type, alias, "{alias} mesh must retain its exact label");
+        let mut rows = Vec::new();
+        stream_export_model(ifc.as_bytes(), |row| rows.push(row));
+        let row = rows
+            .iter()
+            .find(|row| row.express_id == 43)
+            .unwrap_or_else(|| panic!("{alias} must produce a product row"));
+        assert_eq!(row.ifc_type, alias, "{alias} must retain its exact label");
+        assert_eq!(row.ifc_type, mesh.ifc_type, "{alias} row and mesh labels must agree");
+    }
+
+    let vendor = b"ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4X3'));\nENDSEC;\nDATA;\n#1=IFCVENDORSTRATUM('0$ScRe4drECQ4DMSqUjd6d',$,'Vendor',$,$,$,$);\nENDSEC;\nEND-ISO-10303-21;";
+    let mut rows = Vec::new();
+    stream_export_model(vendor, |row| rows.push(row));
+    assert!(
+        rows.is_empty(),
+        "unsupported vendor keywords must not become products"
+    );
+}
+
 /// #1518: a buildingSMART annex-E showcase file declares its geometry ONLY on
 /// an `IfcBoilerType` (an IfcTypeProduct, not an IfcProduct). #957 Route B
 /// meshes it under the type's expressId; the attribute pass must now emit a
@@ -34,7 +66,10 @@ fn type_only_geometry_emits_attribute_row() {
 
     // build == stream still holds with type rows present.
     let collected = build_export_model(&bytes).entities;
-    assert_eq!(collected, rows, "build and stream must agree with type rows");
+    assert_eq!(
+        collected, rows,
+        "build and stream must agree with type rows"
+    );
 }
 
 /// The adversarial join test: EVERY mesh the geometry pass tags as
@@ -69,10 +104,16 @@ fn type_product_meshes_all_have_rows() {
         let mut rows = Vec::new();
         stream_export_model(&bytes, |r| rows.push(r));
         for (id, ty) in &type_meshes {
-            let row = rows.iter().find(|r| r.express_id == *id).unwrap_or_else(|| {
-                panic!("{rel}: meshed type-product #{id} ({ty}) has no attribute row")
-            });
-            assert_eq!(&row.ifc_type, ty, "{rel}: #{id} row type must match its mesh");
+            let row = rows
+                .iter()
+                .find(|r| r.express_id == *id)
+                .unwrap_or_else(|| {
+                    panic!("{rel}: meshed type-product #{id} ({ty}) has no attribute row")
+                });
+            assert_eq!(
+                &row.ifc_type, ty,
+                "{rel}: #{id} row type must match its mesh"
+            );
         }
     }
 }
@@ -80,16 +121,27 @@ fn type_product_meshes_all_have_rows() {
 #[test]
 fn duplex_model_has_products_and_psets() {
     let model = build_export_model(&fixture_or_skip!("ara3d/duplex.ifc"));
-    assert!(model.entities.len() > 50, "expected many products, got {}", model.entities.len());
+    assert!(
+        model.entities.len() > 50,
+        "expected many products, got {}",
+        model.entities.len()
+    );
 
     // Every row carries a GlobalId + type.
     for e in &model.entities {
         assert!(!e.ifc_type.is_empty());
     }
-    assert!(model.entities.iter().any(|e| e.global_id.is_some()), "some GlobalIds");
+    assert!(
+        model.entities.iter().any(|e| e.global_id.is_some()),
+        "some GlobalIds"
+    );
 
     // At least one element carries property sets with named single values.
-    let with_psets = model.entities.iter().filter(|e| !e.property_sets.is_empty()).count();
+    let with_psets = model
+        .entities
+        .iter()
+        .filter(|e| !e.property_sets.is_empty())
+        .count();
     assert!(with_psets > 0, "expected elements with property sets");
     let any_prop = model
         .entities
@@ -112,7 +164,10 @@ fn stream_matches_build_row_for_row() {
     let mut streamed = Vec::new();
     stream_export_model(&bytes, |r| streamed.push(r));
     assert!(!streamed.is_empty(), "expected products");
-    assert_eq!(collected, streamed, "stream and collect must agree row-for-row");
+    assert_eq!(
+        collected, streamed,
+        "stream and collect must agree row-for-row"
+    );
 }
 
 #[test]
@@ -127,7 +182,10 @@ fn stream_with_index_matches_plain() {
     let mut shared = Vec::new();
     stream_export_model_with_index(&bytes, &idx, |r| shared.push(r));
     assert!(!plain.is_empty(), "expected products");
-    assert_eq!(plain, shared, "injected-index rows must match self-indexed rows");
+    assert_eq!(
+        plain, shared,
+        "injected-index rows must match self-indexed rows"
+    );
 }
 
 #[test]
@@ -136,6 +194,55 @@ fn fmt_num_is_clean() {
     assert_eq!(fmt_num(1.5), "1.5");
     assert_eq!(fmt_num(2.500000), "2.5");
     assert_eq!(fmt_num(0.0), "0");
+}
+
+/// `fmt_num` used to format with `{:.6}` and trim, so a magnitude below 5e-7
+/// became the string `"0"` and the JSON exporter re-parsed it as `0.0`, the
+/// same number a file that actually recorded zero produces; and any value
+/// with more than six decimals lost them. The output has to parse back to
+/// the value the file said.
+#[test]
+fn fmt_num_round_trips_small_and_precise_values() {
+    for v in [2.5e-7, 1234.56789012, 1e-12, -3.0e-9, 0.1 + 0.2] {
+        let s = fmt_num(v);
+        assert_eq!(
+            s.parse::<f64>().ok(),
+            Some(v),
+            "fmt_num({v:?}) = {s:?} must parse back to {v:?}"
+        );
+    }
+    assert_ne!(
+        fmt_num(2.5e-7),
+        "0",
+        "a small nonzero must not collapse to zero"
+    );
+    assert_eq!(fmt_num(1234.56789012), "1234.56789012");
+}
+
+/// The same loss through the public JSON export: a small property value must
+/// come out as the file's number, not as `0.0`.
+#[test]
+fn json_export_keeps_a_property_value_below_the_old_six_decimal_floor() {
+    use crate::json::export_json;
+    let src = concat!(
+        "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n",
+        "#1=IFCWALL('0WALL0000000000000000A',$,'W',$,$,$,$,$,.SOLIDWALL.);\n",
+        "#10=IFCPROPERTYSINGLEVALUE('Leakage',$,IFCREAL(2.5E-7),$);\n",
+        "#11=IFCPROPERTYSET('0PSET0000000000000000A',$,'Pset_X',$,(#10));\n",
+        "#12=IFCRELDEFINESBYPROPERTIES('0REL00000000000000000A',$,$,$,(#1),#11);\n",
+        "ENDSEC;\nEND-ISO-10303-21;\n"
+    );
+    let json = export_json(src.as_bytes(), &Default::default());
+    let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    let leakage = v
+        .as_array()
+        .expect("export_json emits an array")
+        .iter()
+        .flat_map(|e| e["propertySets"].as_array().cloned().unwrap_or_default())
+        .flat_map(|ps| ps["properties"].as_array().cloned().unwrap_or_default())
+        .find(|p| p["name"] == "Leakage")
+        .unwrap_or_else(|| panic!("Leakage property in JSON export: {json}"));
+    assert_eq!(leakage["value"].as_f64(), Some(2.5e-7), "got {leakage}");
 }
 
 /// A 22-character IFC GlobalId, padded from a readable tag. Synthetic: these
@@ -360,7 +467,10 @@ fn the_placement_chain_composes_parent_then_local() {
 
     let opts = ModelOptions::default().with_placements(true);
     let rows = rows_with(&content, &opts);
-    let t = row_named(&rows, "W").placement.expect("placed").translation();
+    let t = row_named(&rows, "W")
+        .placement
+        .expect("placed")
+        .translation();
 
     let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
     assert!(
@@ -394,11 +504,19 @@ fn the_callback_receives_the_entity_each_row_was_built_from() {
     let mut seen = Vec::new();
     stream_export_model_with_options(bytes, &index, &ModelOptions::default(), |row, entity| {
         let entity = entity.expect("an IfcProduct row has an occurrence entity");
-        assert_eq!(entity.id, row.express_id, "the row's own entity, not another");
+        assert_eq!(
+            entity.id, row.express_id,
+            "the row's own entity, not another"
+        );
         // Attribute 2 is Name for every rooted entity. A consumer should reach
         // it through `IfcType::attribute_index("Name")` rather than a literal;
         // this asserts the entity arrives, which is what the argument is for.
-        seen.push(entity.get(2).and_then(|a| a.as_string()).map(str::to_string));
+        seen.push(
+            entity
+                .get(2)
+                .and_then(|a| a.as_string())
+                .map(str::to_string),
+        );
     });
     assert_eq!(seen, vec![Some("W".to_string()), Some("U".to_string())]);
 }
@@ -469,7 +587,11 @@ fn a_type_without_geometry_never_gets_a_row_of_its_own() {
     assert!(
         !model.entities.iter().any(|r| r.ifc_type.ends_with("Type")),
         "expected no type row, got {:?}",
-        model.entities.iter().map(|r| &r.ifc_type).collect::<Vec<_>>()
+        model
+            .entities
+            .iter()
+            .map(|r| &r.ifc_type)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -555,7 +677,10 @@ fn quantity_sets_inherit_from_the_type_too() {
     );
 
     let off = wall_row(&ifc, &ModelOptions::default());
-    assert!(off.quantity_sets.is_empty(), "unreachable without the option");
+    assert!(
+        off.quantity_sets.is_empty(),
+        "unreachable without the option"
+    );
 
     let opts = ModelOptions::default().with_inherit_type_properties(true);
     let on = wall_row(&ifc, &opts);
@@ -644,7 +769,13 @@ fn type_specific_attributes_are_rendered_by_schema_name() {
 
     // The row's own fields are not repeated here, and neither are the
     // reference-valued attributes, which would render as dangling ids.
-    for skipped in ["GlobalId", "Name", "Description", "ObjectType", "OwnerHistory"] {
+    for skipped in [
+        "GlobalId",
+        "Name",
+        "Description",
+        "ObjectType",
+        "OwnerHistory",
+    ] {
         assert!(
             !bar.attributes.iter().any(|a| a.name == skipped),
             "{skipped} must not be duplicated into attributes"
@@ -724,7 +855,7 @@ fn inheritance_survives_the_streaming_path_identically() {
 ///
 /// `IfcDoorStyle` is an `IfcTypeProduct` in IFC2X3, so a real IFC2X3 file can
 /// hang its door geometry off one. Both this pass and the geometry pass gated
-/// on a bare `IfcType::from_str`, which answers `Unknown` for it, so BOTH
+/// on a bare `IfcType::from_str`, which answered `Unknown` for it, so BOTH
 /// dropped it and the join was vacuously satisfied by rendering nothing. Now
 /// that both resolve legacy-aware they must still agree: a mesh and a row, or
 /// neither.
@@ -757,7 +888,10 @@ END-ISO-10303-21;
         .iter()
         .filter(|m| m.express_id == 43)
         .count();
-    assert_eq!(meshed, 1, "the geometry pass must mesh the IfcDoorStyle's orphan map");
+    assert_eq!(
+        meshed, 1,
+        "the geometry pass must mesh the IfcDoorStyle's orphan map"
+    );
 
     let mut rows = Vec::new();
     stream_export_model(ifc.as_bytes(), |r| rows.push(r));
@@ -766,9 +900,404 @@ END-ISO-10303-21;
         .find(|r| r.express_id == 43)
         .expect("the meshed IfcDoorStyle must get an attribute row, not an orphan GLB node");
     assert_eq!(
-        row.ifc_type, "IfcDoorType",
-        "the row carries the legacy-resolved name, matching the mesh's ifcType"
+        row.ifc_type, "IfcDoorStyle",
+        "the row preserves the exact schema name, matching the mesh's ifcType"
     );
     assert_eq!(row.global_id.as_deref(), Some("2n5ASfQfT84eP9h$zLLJ4A"));
     assert_eq!(row.name.as_deref(), Some("Door"));
+}
+
+/// #4203: an `IfcType`-resolvable-only attribute export left legacy
+/// (IFC2X3/IFC4, removed-by-IFC4X3) entities with an EMPTY `attributes` list,
+/// even for names `legacy_entities.rs` already resolves to a base type for
+/// geometry/rootedness purposes — `entity.ifc_type` was decoded via a bare
+/// `IfcType::from_str`, which was `Unknown` for these, and
+/// `Unknown::attribute_names()` is `&[]`. Exact variants now exist, but their
+/// attribute names still must come from the older schema's table.
+///
+/// `IFCDOORSTYLE`'s OWN declared attributes end `…, OperationType,
+/// ConstructionType, ParameterTakesPrecedence, Sizeable` — different names,
+/// same length, from its resolved base type `IfcDoorType`'s `…,
+/// PredefinedType, OperationType, ParameterTakesPrecedence,
+/// UserDefinedOperationType` past index 8. This also pins that the fix reads
+/// the entity's OWN schema-version attribute names rather than the base
+/// type's (which would exist, but rename `Sizeable`'s value to
+/// `UserDefinedOperationType` — wrong, not merely empty).
+#[test]
+fn a_legacy_type_products_own_attributes_use_its_own_schema_names_not_the_base_types() {
+    let ifc = "ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('issue-4203'),'2;1');
+FILE_NAME('t.ifc','2026-09-10',(''),(''),'','','');
+FILE_SCHEMA(('IFC2X3'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0$ScRe4drECQ4DMSqUjd6d',$,'P',$,$,$,$,(#2),#3);
+#2=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#5,$);
+#3=IFCUNITASSIGNMENT((#6));
+#4=IFCCARTESIANPOINT((0.,0.,0.));
+#5=IFCAXIS2PLACEMENT3D(#4,$,$);
+#6=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#43=IFCDOORSTYLE('2n5ASfQfT84eP9h$zLLJ4A',$,'Door',$,$,$,(#44),$,.SINGLE_SWING_LEFT.,.PANEL_TYPE.,.F.,.T.);
+#44=IFCREPRESENTATIONMAP(#45,#46);
+#45=IFCAXIS2PLACEMENT3D(#4,$,$);
+#46=IFCSHAPEREPRESENTATION(#2,'Body','Tessellation',(#48));
+#48=IFCTRIANGULATEDFACESET(#49,$,.T.,((1,2,3),(1,2,4),(1,4,3),(2,3,4)),$);
+#49=IFCCARTESIANPOINTLIST3D(((0.,0.,0.),(1.,0.,0.),(0.,1.,0.),(0.,0.,1.)));
+ENDSEC;
+END-ISO-10303-21;
+";
+    let opts = ModelOptions::default().with_attributes(true);
+    let rows = rows_with(ifc, &opts);
+    let row = rows
+        .iter()
+        .find(|r| r.express_id == 43)
+        .expect("the meshed IfcDoorStyle must get an attribute row");
+    assert_eq!(row.ifc_type, "IfcDoorStyle");
+
+    let names: Vec<&str> = row.attributes.iter().map(|p| p.name.as_str()).collect();
+    assert!(
+        !names.is_empty(),
+        "IFCDOORSTYLE's own attributes must come from its older-schema table"
+    );
+    assert!(
+        names.contains(&"OperationType"),
+        "got {names:?}; OperationType is IFCDOORSTYLE's own 9th attribute"
+    );
+    assert!(
+        names.contains(&"Sizeable"),
+        "got {names:?}; Sizeable is IFCDOORSTYLE's own last attribute — its \
+         resolved base type IfcDoorType has no Sizeable attribute at all, so \
+         this fails if attribute names were ever borrowed from the base type"
+    );
+    assert!(
+        !names.contains(&"PredefinedType") && !names.contains(&"UserDefinedOperationType"),
+        "got {names:?}; both are IfcDoorType-only names IFCDOORSTYLE does not \
+         declare — their presence would mean the base type's attribute list \
+         leaked in instead of IFCDOORSTYLE's own"
+    );
+
+    let sizeable = row
+        .attributes
+        .iter()
+        .find(|p| p.name == "Sizeable")
+        .expect("Sizeable attribute present");
+    assert_eq!(
+        sizeable.value, "true",
+        "Sizeable is IFCDOORSTYLE's 12th positional attribute (.T. in the fixture); \
+         a value at the wrong index would surface as a wrong value here first"
+    );
+}
+
+/// #4203: a class shared by schema versions must use the declared source
+/// schema's positional names, not the canonical IFC4X3 enum's names.
+#[test]
+fn attribute_export_uses_the_source_schema_for_a_shared_entity() {
+    fn rows(schema: &str, attributes: &str) -> Vec<EntityRow> {
+        let ifc = format!(
+            "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('{schema}'));\nENDSEC;\nDATA;\n#1=IFCWALL('wall-guid',$,'Wall',$,$,$,$,{attributes});\nENDSEC;\nEND-ISO-10303-21;\n"
+        );
+        rows_with(&ifc, &ModelOptions::default().with_attributes(true))
+    }
+
+    let ifc2x3 = rows("IFC2X3", "'legacy-tag'");
+    let ifc4 = rows("IFC4", "'ifc4-tag',.NOTDEFINED.");
+    let ifc2x3_names: Vec<&str> = ifc2x3[0]
+        .attributes
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect();
+    let ifc4_names: Vec<&str> = ifc4[0].attributes.iter().map(|p| p.name.as_str()).collect();
+
+    assert_eq!(ifc2x3_names, vec!["Tag"]);
+    assert_eq!(ifc4_names, vec!["Tag", "PredefinedType"]);
+}
+
+/// #4203: a valid FILE_SCHEMA population may list more than one identifier.
+/// An unsupported vendor identifier must not hide a later bundled schema and
+/// silently drop every positional attribute from export.
+#[test]
+fn attribute_export_uses_the_first_supported_declared_schema() {
+    let ifc = "ISO-10303-21;
+HEADER;
+FILE_SCHEMA(('VENDOR_SCHEMA','IFC4'));
+ENDSEC;
+DATA;
+#1=IFCWALL('wall-guid',$,'Wall',$,$,$,$,'wall-tag',.NOTDEFINED.);
+ENDSEC;
+END-ISO-10303-21;
+";
+    let rows = rows_with(ifc, &ModelOptions::default().with_attributes(true));
+    let names: Vec<_> = rows[0]
+        .attributes
+        .iter()
+        .map(|value| value.name.as_str())
+        .collect();
+
+    assert_eq!(names, vec!["Tag", "PredefinedType"]);
+}
+
+/// #4203: the data registry includes IFC4.1 transitional entities which are
+/// absent from both pinned IFC4 ADD2 and IFC4X3 EXPRESS inputs. Preserve their
+/// existing positional labels until a matching EXPRESS source is bundled.
+#[test]
+fn attribute_export_preserves_transitional_ifc4_metadata() {
+    let entity = DecodedEntity::new(
+        1,
+        IfcType::from_str("IFCALIGNMENTCURVE"),
+        vec![
+            ifc_lite_core::AttributeValue::Null,
+            ifc_lite_core::AttributeValue::Null,
+            ifc_lite_core::AttributeValue::String("alignment-tag".to_string()),
+        ],
+    );
+    let attributes = render_attributes(&entity, "IFCALIGNMENTCURVE", Some("IFC4X1"));
+
+    assert_eq!(attributes.len(), 1);
+    assert_eq!(attributes[0].name, "Tag");
+    assert_eq!(attributes[0].value, "alignment-tag");
+}
+
+/// #4996 review: IFC4.1/4.2 `IfcAlignment` carried `Axis` at slot 7 ahead of
+/// `PredefinedType`; the IFC4X3 layout dropped `Axis`, and the bundled IFC4
+/// registry never had the class, so without an explicit transitional layout
+/// the slot-8 enum was silently dropped.
+#[test]
+fn attribute_export_preserves_transitional_ifc4_alignment_layout() {
+    for schema in ["IFC4X1", "IFC4X2"] {
+        let entity = DecodedEntity::new(
+            1,
+            IfcType::from_str("IFCALIGNMENT"),
+            vec![
+                ifc_lite_core::AttributeValue::Null,
+                ifc_lite_core::AttributeValue::Null,
+                ifc_lite_core::AttributeValue::Null,
+                ifc_lite_core::AttributeValue::Null,
+                ifc_lite_core::AttributeValue::Null,
+                ifc_lite_core::AttributeValue::Null,
+                ifc_lite_core::AttributeValue::Null,
+                ifc_lite_core::AttributeValue::EntityRef(7),
+                ifc_lite_core::AttributeValue::Enum("USERDEFINED".to_string()),
+            ],
+        );
+        let attributes = render_attributes(&entity, "IFCALIGNMENT", Some(schema));
+        let names: Vec<_> = attributes.iter().map(|value| value.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["PredefinedType"],
+            "{schema}: Axis is a reference (omitted), PredefinedType is slot 8"
+        );
+        assert_eq!(attributes[0].value, "USERDEFINED");
+    }
+}
+
+/// #4203: IFC4.1 and IFC4.2 retained ordinary IFC4 entities, so those common
+/// entities keep their IFC4 slots even though neither transitional registry is
+/// bundled independently.
+#[test]
+fn attribute_export_uses_ifc4_layout_for_transitional_ifc4_entities() {
+    for schema in ["IFC4X1", "IFC4X2"] {
+        let ifc = format!(
+            "ISO-10303-21;
+HEADER;
+FILE_SCHEMA(('{schema}'));
+ENDSEC;
+DATA;
+#1=IFCWALL('wall-guid',$,'Wall',$,$,$,$,'wall-tag',.NOTDEFINED.);
+ENDSEC;
+END-ISO-10303-21;"
+        );
+        let rows = rows_with(&ifc, &ModelOptions::default().with_attributes(true));
+        let names: Vec<_> = rows[0]
+            .attributes
+            .iter()
+            .map(|value| value.name.as_str())
+            .collect();
+
+        assert_eq!(names, vec!["Tag", "PredefinedType"], "{schema}");
+    }
+}
+
+/// #4203 review: IFC4.2 introduced bridge classes which are absent from IFC4,
+/// while IFC4.3 later inserted `UsageType` into the facility-part hierarchy.
+#[test]
+fn attribute_export_preserves_ifc4x2_bridge_slots() {
+    for entity in ["IFCBRIDGE", "IFCBRIDGEPART"] {
+        let ifc = format!(
+            "ISO-10303-21;
+HEADER;
+FILE_SCHEMA(('IFC4X2'));
+ENDSEC;
+DATA;
+#1={entity}('bridge-guid',$,'Bridge',$,$,$,$,'Long bridge',.ELEMENT.,.GIRDER.);
+ENDSEC;
+END-ISO-10303-21;"
+        );
+        let rows = rows_with(&ifc, &ModelOptions::default().with_attributes(true));
+        let attributes: Vec<_> = rows[0]
+            .attributes
+            .iter()
+            .map(|value| (value.name.as_str(), value.value.as_str()))
+            .collect();
+
+        assert_eq!(
+            attributes,
+            vec![
+                ("LongName", "Long bridge"),
+                ("CompositionType", "ELEMENT"),
+                ("PredefinedType", "GIRDER"),
+            ],
+            "{entity}"
+        );
+    }
+}
+
+/// #4203: transitional IFC4.1 metadata must not become a fallback schema for
+/// future or otherwise unsupported declarations.
+#[test]
+fn attribute_export_does_not_apply_ifc4x1_metadata_to_ifc5() {
+    let entity = DecodedEntity::new(
+        1,
+        IfcType::from_str("IFCALIGNMENTCURVE"),
+        vec![
+            ifc_lite_core::AttributeValue::Null,
+            ifc_lite_core::AttributeValue::Null,
+            ifc_lite_core::AttributeValue::String("must-not-be-labelled".to_string()),
+        ],
+    );
+
+    assert!(render_attributes(&entity, "IFCALIGNMENTCURVE", Some("IFC5")).is_empty());
+}
+
+/// #4203: positional labels require an explicit source schema. The STEP writer
+/// may default a missing declaration to IFC4, but attribute export must not
+/// silently apply IFC4 names to slots whose schema is unknown.
+#[test]
+fn attribute_export_fails_closed_without_a_declared_schema() {
+    let ifc = "ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('issue-4203'),'2;1');
+ENDSEC;
+DATA;
+#1=IFCWALL('wall-guid',$,'Wall',$,$,$,$,'unknown-slot',.NOTDEFINED.);
+ENDSEC;
+END-ISO-10303-21;
+";
+    let rows = rows_with(ifc, &ModelOptions::default().with_attributes(true));
+
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].attributes.is_empty());
+}
+
+/// #4203: when a known canonical IFC4X3 entity is absent from the declared
+/// older schema, its canonical names must not label that older record's slots.
+#[test]
+fn attribute_export_does_not_borrow_names_from_a_newer_schema() {
+    let ifc = "ISO-10303-21;
+HEADER;
+FILE_SCHEMA(('IFC2X3'));
+ENDSEC;
+DATA;
+#1=IFCALIGNMENT('alignment-guid',$,'Alignment',$,$,$,$,.ROAD.);
+ENDSEC;
+END-ISO-10303-21;
+";
+    let rows = rows_with(ifc, &ModelOptions::default().with_attributes(true));
+
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].attributes.is_empty());
+}
+
+/// A lowercase STEP keyword must resolve the same legacy attribute names as
+/// its uppercase form. `legacy_attribute_names` used to do a case-sensitive
+/// exact match while `legacy_aware_ifc_type` (used for the row's DISPLAY
+/// type, via `model.rs`'s `ty`) normalises case first -- so a lowercase-typed
+/// row's DISPLAY type matched its uppercase sibling while its OWN ATTRIBUTE
+/// VALUES were silently relabelled with the resolved BASE type's names
+/// instead of just being dropped: `ifcproxy`'s `ProxyType`/`Tag` came back
+/// tagged `Tag`/`PredefinedType` (`IfcBuildingElementProxy`'s own names),
+/// worse than the pre-#4203 empty-list behaviour the doc comments on
+/// `render_attributes`/`legacy_attribute_names` warn against.
+#[test]
+fn a_lowercase_legacy_keyword_gets_the_same_attribute_names_as_its_uppercase_form() {
+    fn fixture(keyword: &str, id: u32) -> String {
+        format!(
+            "#{id}={keyword}('2n5ASfQfT84eP9h$zLLJ4A',$,'Proxy{id}',$,$,$,$,.USERDEFINED.,'TAG{id}');\n"
+        )
+    }
+    let ifc = format!(
+        "ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('issue-4203'),'2;1');
+FILE_NAME('t.ifc','2026-09-10',(''),(''),'','','');
+FILE_SCHEMA(('IFC2X3'));
+ENDSEC;
+DATA;
+{}{}ENDSEC;
+END-ISO-10303-21;
+",
+        fixture("IFCPROXY", 10),
+        fixture("ifcproxy", 20),
+    );
+    let opts = ModelOptions::default().with_attributes(true);
+    let rows = rows_with(&ifc, &opts);
+
+    let upper = rows
+        .iter()
+        .find(|r| r.express_id == 10)
+        .expect("uppercase row");
+    let lower = rows
+        .iter()
+        .find(|r| r.express_id == 20)
+        .expect("lowercase row");
+
+    // The DISPLAY type already normalised before this fix -- pin that it
+    // still does, so this test isolates the ATTRIBUTE-NAME divergence.
+    assert_eq!(upper.ifc_type, "IfcProxy");
+    assert_eq!(
+        lower.ifc_type, "IfcProxy",
+        "display type already normalises case"
+    );
+
+    let upper_names: Vec<&str> = upper.attributes.iter().map(|p| p.name.as_str()).collect();
+    let lower_names: Vec<&str> = lower.attributes.iter().map(|p| p.name.as_str()).collect();
+
+    assert_eq!(
+        lower_names, upper_names,
+        "a lowercase-typed legacy entity must produce the SAME attribute \
+         names as its uppercase form; got upper={upper_names:?} lower={lower_names:?}"
+    );
+    assert_eq!(
+        upper_names,
+        vec!["ProxyType", "Tag"],
+        "IFCPROXY's own legacy names, not IfcBuildingElementProxy's \
+         resolved base-type names (Tag, PredefinedType)"
+    );
+
+    let upper_tag = upper
+        .attributes
+        .iter()
+        .find(|p| p.name == "Tag")
+        .expect("Tag present");
+    let lower_tag = lower
+        .attributes
+        .iter()
+        .find(|p| p.name == "Tag")
+        .expect("Tag present");
+    assert_eq!(upper_tag.value, "TAG10");
+    assert_eq!(
+        lower_tag.value, "TAG20",
+        "Tag is IFCPROXY's own last positional attribute (index 8); under the \
+         bug this position was mislabelled PredefinedType instead for the \
+         lowercase row, not merely dropped"
+    );
+}
+
+/// Modern entities use their generated schema attributes directly.
+#[test]
+fn a_modern_entity_uses_generated_schema_attributes() {
+    assert_eq!(
+        ifc_lite_core::IfcType::IfcWall.attribute_names()[0],
+        "GlobalId"
+    );
 }

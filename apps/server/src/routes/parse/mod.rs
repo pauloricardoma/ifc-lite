@@ -4,26 +4,35 @@
 
 //! Parse endpoints for IFC file processing.
 
-mod cache_keys;
+pub(crate) mod cache_keys;
 mod cached_replay;
+mod stream_batch;
+mod stream_event;
+mod stream_progress;
 mod fetch;
 mod instanced;
 mod json;
 mod parquet;
+mod parquet_optimized;
+mod parquet_optimized_replay;
 mod parquet_stream;
+mod replay_header;
 
 pub use fetch::{check_cache, get_cached_geometry, get_data_model, get_symbolic};
 pub use instanced::parse_instanced;
 pub use json::{parse_full, parse_metadata, parse_stream};
-pub use parquet::{parse_parquet, parse_parquet_optimized};
+pub use parquet::parse_parquet;
+pub use parquet_optimized::parse_parquet_optimized;
 pub use parquet_stream::parse_parquet_stream;
 
 use crate::error::ApiError;
-use crate::services::OpeningFilterMode;
+use crate::services::cache::DiskCache;
+use crate::services::{DataModelEntities, OpeningFilterMode, ParquetLayout, StreamShapes};
 use axum::extract::Multipart;
 use flate2::read::GzDecoder;
-use ifc_lite_processing::TessellationQuality;
+use ifc_lite_processing::{SymbolicDataWithProvenance, TessellationQuality};
 use std::io::{Cursor, Read};
+use std::sync::Arc;
 
 /// Query parameters shared by all parse endpoints.
 #[derive(serde::Deserialize, Default)]
@@ -37,9 +46,59 @@ pub struct ParseQuery {
     /// `setTessellationQuality`, keeping client and server meshes in parity).
     #[serde(default)]
     pub tessellation_quality: Option<String>,
+    /// Flat-Parquet mesh-table layout (#3888): "flat" (default) or
+    /// "shared-shapes" — see [`ParquetLayout`] for why it is opt-in. A query
+    /// parameter rather than a header because every endpoint it has to reach
+    /// (both parse routes, the cache check, the cached-geometry fetch) already
+    /// takes this struct, so the signal travels with the cache identity.
+    #[serde(default)]
+    pub parquet_layout: ParquetLayout,
+    /// Whether `POST /api/v1/parse/parquet-stream` may share shapes ACROSS
+    /// batches (#5407): "batch-local" (default) or "cross-batch", which needs
+    /// `parquet_layout=shared-shapes`. See [`StreamShapes`] for why it is a
+    /// second opt-in rather than implied by the layout. Ignored by every other
+    /// route, and not part of the cache identity.
+    #[serde(default)]
+    pub stream_shapes: StreamShapes,
+    /// Which rows the data model's entities table carries (#6034): "all"
+    /// (default, every STEP instance) or "rooted" (objects with a GlobalId,
+    /// plus every instance another data-model table references). See
+    /// [`DataModelEntities`]. Read by every route that writes the data model
+    /// (`/parse/parquet`, `/parse/parquet/optimized`, `/parse/parquet-stream`)
+    /// and by `/cache/check`, because it selects WHICH data-model entry has to
+    /// exist; the geometry and metadata entries are the same for both.
+    #[serde(default)]
+    pub data_model_entities: DataModelEntities,
+    /// SHA-256 of the file the client is asking about, hex, lowercase (#3901).
+    ///
+    /// Read by `POST /api/v1/parse/parquet-stream` and (since #5128)
+    /// `POST /api/v1/parse/parquet/optimized`, and only when the request
+    /// carries no multipart body: see [`cached_replay::replay_by_client_hash`]
+    /// and [`parquet_optimized_replay::replay_optimized_by_client_hash`] for
+    /// what each does and what it is not allowed to do. It lives on this
+    /// struct rather than in a header so it travels with the rest of the cache
+    /// identity (`opening_filter`, `tessellation_quality`, `parquet_layout`)
+    /// through the one place every parse route already parses. A hash paired
+    /// with the wrong layout names a different entry, and splitting one
+    /// identity across two transports is how such pairings drift apart.
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
 impl ParseQuery {
+    /// The stream's batch-sharing mode, refusing cross-batch sharing on the
+    /// flat layout: that layout has no rotation columns and must stay
+    /// byte-identical to v5, so it cannot share anything, and a client asking
+    /// for it has misread the contract.
+    fn resolved_stream_shapes(&self) -> Result<StreamShapes, ApiError> {
+        if self.stream_shapes == StreamShapes::CrossBatch && !self.parquet_layout.has_rotation() {
+            return Err(ApiError::BadRequest(
+                "stream_shapes=cross-batch requires parquet_layout=shared-shapes".to_string(),
+            ));
+        }
+        Ok(self.stream_shapes)
+    }
+
     /// Resolve and validate the requested tessellation level.
     fn resolved_tessellation_quality(&self) -> Result<TessellationQuality, ApiError> {
         match self.tessellation_quality.as_deref() {
@@ -50,6 +109,28 @@ impl ParseQuery {
                 ))
             }),
         }
+    }
+}
+
+/// Write the symbolic sidecar through [`cache_keys::cache_symbolic_data`] on
+/// the blocking pool (#4696).
+///
+/// That call JSON-encodes the whole 2D symbol stream before it writes, and
+/// awaited on an async worker the encode holds that worker for its whole
+/// length. Every parse route writes the sidecar through here. The write itself
+/// is async, so the blocking thread drives it with `Handle::block_on`.
+async fn cache_symbolic_data_off_runtime(
+    cache: Arc<DiskCache>,
+    cache_key: String,
+    symbolic: SymbolicDataWithProvenance,
+) {
+    let runtime = tokio::runtime::Handle::current();
+    let written = tokio::task::spawn_blocking(move || {
+        runtime.block_on(cache_keys::cache_symbolic_data(&cache, &cache_key, &symbolic))
+    })
+    .await;
+    if let Err(e) = written {
+        tracing::error!(error = %e, "Symbolic data cache task failed");
     }
 }
 
@@ -261,7 +342,16 @@ mod ifczip_tests;
 mod parquet_tests;
 
 #[cfg(test)]
+mod parquet_optimized_tests;
+
+#[cfg(test)]
 mod json_tests;
+
+#[cfg(test)]
+mod finish_tests;
+
+#[cfg(test)]
+mod worker_thread_tests;
 
 #[cfg(test)]
 mod fetch_tests;
@@ -270,113 +360,21 @@ mod fetch_tests;
 mod cache_keys_symbolic_tests;
 
 #[cfg(test)]
-mod resolved_tessellation_quality_tests {
-    use super::*;
-    use crate::error::ApiError;
-
-    /// Omitting the query parameter must resolve to the documented default
-    /// (`Medium`, byte-identical to pre-enum behavior) — not silently to some
-    /// other level. Coverage gap found via mutation testing: swapping this arm
-    /// to `TessellationQuality::Highest` survived the full `ifc-lite-server`
-    /// suite (83/83 passed) with zero test hitting this code path.
-    #[test]
-    fn none_resolves_to_medium_default() {
-        let query = ParseQuery {
-            tessellation_quality: None,
-            ..Default::default()
-        };
-        assert_eq!(
-            query.resolved_tessellation_quality().unwrap(),
-            TessellationQuality::Medium
-        );
-    }
-
-    /// Every documented label round-trips through `resolved_tessellation_quality`,
-    /// case-insensitively.
-    #[test]
-    fn every_documented_label_parses() {
-        let cases = [
-            ("lowest", TessellationQuality::Lowest),
-            ("Low", TessellationQuality::Low),
-            ("MEDIUM", TessellationQuality::Medium),
-            ("high", TessellationQuality::High),
-            ("Highest", TessellationQuality::Highest),
-        ];
-        for (label, expected) in cases {
-            let query = ParseQuery {
-                tessellation_quality: Some(label.to_string()),
-                ..Default::default()
-            };
-            assert_eq!(
-                query.resolved_tessellation_quality().unwrap(),
-                expected,
-                "label {label:?} should resolve to {expected:?}"
-            );
-        }
-    }
-
-    /// An unknown level must be rejected as a client error (`400 BadRequest`),
-    /// not swallowed or reported as a server-side `Internal` error — the two
-    /// map to different HTTP statuses and log at different severities.
-    /// Coverage gap found via mutation testing: replacing `ApiError::BadRequest`
-    /// with `ApiError::Internal` on this arm survived the full suite (83/83
-    /// passed) — no test asserted the error path at all, let alone which variant.
-    #[test]
-    fn unknown_label_is_bad_request_not_internal() {
-        let query = ParseQuery {
-            tessellation_quality: Some("ultra".to_string()),
-            ..Default::default()
-        };
-        let err = query.resolved_tessellation_quality().unwrap_err();
-        match err {
-            ApiError::BadRequest(msg) => {
-                assert!(
-                    msg.contains("ultra"),
-                    "error message should name the rejected value, got: {msg}"
-                );
-            }
-            other => panic!("expected ApiError::BadRequest, got {other:?}"),
-        }
-    }
-}
+mod cache_keys_tests;
 
 #[cfg(test)]
-mod apple_double_tests {
-    use super::is_apple_double;
+mod data_model_entities_tests;
 
-    // macOS Finder writes `__MACOSX/._<name>` beside each entry when
-    // compressing, keeping the original extension - so it matched the .ifc
-    // filter and every Mac-made archive was rejected as containing two models
-    // (#2812).
-    #[test]
-    fn recognises_the_macosx_directory_sidecar() {
-        assert!(is_apple_double("__MACOSX/._model.ifc"));
-        assert!(is_apple_double("project/__MACOSX/._model.ifc"));
-    }
+#[cfg(test)]
+mod cached_replay_tests;
 
-    // Several unzip/rezip round trips drop the directory but keep the sidecar
-    // next to its original, so the prefix alone is not enough.
-    #[test]
-    fn recognises_a_bare_sidecar_beside_its_original() {
-        assert!(is_apple_double("._model.ifc"));
-        assert!(is_apple_double("project/._model.ifc"));
-    }
+#[cfg(test)]
+mod cached_replay_batches_tests;
 
-    // The ambiguity error exists for a reason: skipping sidecars must not skip
-    // a real second model, including one in a folder or one whose name merely
-    // contains the marker.
-    #[test]
-    fn leaves_genuine_models_alone() {
-        assert!(!is_apple_double("model.ifc"));
-        assert!(!is_apple_double("project/model.ifc"));
-        assert!(!is_apple_double("nested/b.ifc"));
-        // A file NAMED after the marker is still content.
-        assert!(!is_apple_double("__MACOSX_backup.ifc"));
-        // ...and so is a real model inside a folder called `__MACOSX`. The
-        // sidecar test is the basename; matching the directory would drop it.
-        assert!(!is_apple_double("__MACOSX/model.ifc"));
-        // ...and `._` INSIDE a name is not a sidecar prefix: only a basename
-        // that STARTS with it is.
-        assert!(!is_apple_double("v1._final.ifc"));
-    }
-}
+#[cfg(test)]
+#[path = "resolved_tessellation_quality_tests.rs"]
+mod resolved_tessellation_quality_tests;
+
+#[cfg(test)]
+#[path = "apple_double_tests.rs"]
+mod apple_double_tests;

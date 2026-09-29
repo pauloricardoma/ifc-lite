@@ -188,10 +188,12 @@ describe('searchSlice — filter rule actions', () => {
     store = createStore<SearchSlice>((set, get, api) => createSearchSlice(set, get, api));
   });
 
-  it('starts with the empty filter state', () => {
+  it('starts with the empty filter state — one empty AND group', () => {
     const s = store.getState();
-    assert.deepStrictEqual(s.searchFilter.rules, []);
-    assert.strictEqual(s.searchFilter.combinator, 'AND');
+    assert.strictEqual(s.searchFilter.groups.length, 1);
+    assert.deepStrictEqual(s.searchFilter.groups[0].rules, []);
+    assert.strictEqual(s.searchFilter.groups[0].combinator, 'AND');
+    assert.strictEqual(s.searchFilterActiveGroup, 0);
     assert.strictEqual(s.searchFilter.limit, 500);
     assert.strictEqual(s.searchFilterSchema.size, 0);
     assert.strictEqual(s.searchFilterResult, null);
@@ -199,17 +201,15 @@ describe('searchSlice — filter rule actions', () => {
     assert.strictEqual(s.searchFilterError, null);
   });
 
-  it('setFilterCombinator / setFilterLimit patch the filter state', () => {
-    store.getState().setFilterCombinator('OR');
-    assert.strictEqual(store.getState().searchFilter.combinator, 'OR');
+  it('setFilterLimit patches the filter state', () => {
     store.getState().setFilterLimit(100);
     assert.strictEqual(store.getState().searchFilter.limit, 100);
   });
 
-  it('addFilterRule appends a rule', () => {
+  it('addFilterRule appends a rule to the active group', () => {
     const r = { kind: 'ifcType' as const, values: ['IfcWall'], op: 'in' as const };
     store.getState().addFilterRule(r);
-    const rules = store.getState().searchFilter.rules;
+    const rules = store.getState().searchFilter.groups[0].rules;
     assert.strictEqual(rules.length, 1);
     assert.deepStrictEqual(rules[0], r);
   });
@@ -219,7 +219,7 @@ describe('searchSlice — filter rule actions', () => {
     const r2 = { kind: 'ifcType' as const, values: ['IfcDoor'], op: 'in' as const };
     store.getState().addFilterRule(r1);
     store.getState().updateFilterRule(0, r2);
-    assert.deepStrictEqual(store.getState().searchFilter.rules[0], r2);
+    assert.deepStrictEqual(store.getState().searchFilter.groups[0].rules[0], r2);
   });
 
   it('updateFilterRule is a no-op for out-of-range indices', () => {
@@ -236,7 +236,7 @@ describe('searchSlice — filter rule actions', () => {
     store.getState().addFilterRule(r1);
     store.getState().addFilterRule(r2);
     store.getState().removeFilterRule(0);
-    const rules = store.getState().searchFilter.rules;
+    const rules = store.getState().searchFilter.groups[0].rules;
     assert.strictEqual(rules.length, 1);
     assert.strictEqual(rules[0].kind, 'name');
   });
@@ -247,27 +247,69 @@ describe('searchSlice — filter rule actions', () => {
     assert.strictEqual(store.getState().searchFilter, before);
   });
 
-  it('clearFilterRules empties rules but preserves combinator + limit', () => {
-    store.getState().setFilterCombinator('OR');
+  it('clearFilterRules empties the active group but preserves its combinator + limit', () => {
+    // `setFilterCombinator` was removed with its last caller (#5138 PR 5 —
+    // `FilterGroupEditor.tsx` now owns combinator edits through its own
+    // `onChange` updater); seed the group's combinator directly to keep
+    // this test's own assertion — clearFilterRules leaves it alone.
+    store.setState((s) => ({ searchFilter: { ...s.searchFilter, groups: [{ ...s.searchFilter.groups[0], combinator: 'OR' }] } }));
     store.getState().setFilterLimit(123);
     store.getState().addFilterRule({
       kind: 'ifcType' as const, values: ['IfcWall'], op: 'in' as const,
     });
     store.getState().clearFilterRules();
     const f = store.getState().searchFilter;
-    assert.deepStrictEqual(f.rules, []);
-    assert.strictEqual(f.combinator, 'OR');
+    assert.deepStrictEqual(f.groups[0].rules, []);
+    assert.strictEqual(f.groups[0].combinator, 'OR');
     assert.strictEqual(f.limit, 123);
   });
 
   it('setSearchFilter replaces the whole filter state', () => {
     const next = {
-      rules: [{ kind: 'name' as const, op: 'eq' as const, value: 'X' }],
-      combinator: 'OR' as const,
+      groups: [{ rules: [{ kind: 'name' as const, op: 'eq' as const, value: 'X' }], combinator: 'OR' as const }],
       limit: 42,
     };
     store.getState().setSearchFilter(next);
     assert.strictEqual(store.getState().searchFilter, next);
+  });
+});
+
+describe('searchSlice — filter groups (#4904)', () => {
+  let store: StoreApi<SearchSlice>;
+
+  beforeEach(() => {
+    store = createStore<SearchSlice>((set, get, api) => createSearchSlice(set, get, api));
+  });
+
+  // `addFilterGroup`/`removeFilterGroup` were removed with their last
+  // production caller (#5138 PR 5): `FilterGroupEditor.tsx` now adds/
+  // removes groups itself through its controlled `onChange` updater, not a
+  // store action. The behavioural invariants they carried (new group
+  // becomes active; a PRECEDING removal keeps the SAME logical group
+  // active; removing the active group picks a neighbour; the last group
+  // can never be dropped) moved to `FilterGroupEditor.test.tsx`, which
+  // asserts them on rendered output instead.
+
+  it('clearAllFilterGroups empties every group, not just a multi-group filter’s active one', () => {
+    store.setState({
+      searchFilter: {
+        groups: [
+          { rules: [{ kind: 'ifcType', values: ['IfcWall'], op: 'in' }], combinator: 'AND' },
+          { rules: [{ kind: 'ifcType', values: ['IfcDoor'], op: 'in' }], combinator: 'AND' },
+        ],
+        limit: 500,
+      },
+      searchFilterActiveGroup: 1,
+    });
+    store.getState().clearAllFilterGroups();
+    const s = store.getState();
+    assert.deepStrictEqual(s.searchFilter.groups, [{ rules: [], combinator: 'AND' }]);
+    assert.strictEqual(s.searchFilterActiveGroup, 0);
+  });
+
+  it('setActiveFilterGroup clamps to the valid range', () => {
+    store.getState().setActiveFilterGroup(5);
+    assert.strictEqual(store.getState().searchFilterActiveGroup, 0);
   });
 });
 

@@ -26,42 +26,36 @@ import type {
   WallDoorParams, WallWindowParams, DoorParams, WindowParams, RampParams, RailingParams,
   PlateParams, MemberParams, FootingParams, PileParams,
   SpaceParams, CurtainWallParams, FurnishingParams, ProxyParams,
-  ProjectParams, SiteParams, BuildingParams, StoreyParams,
-  PropertySetDef, PropertyDef, QuantitySetDef, QuantityDef,
-  MaterialDef, MaterialLayerDef,
+  ProjectParams, StoreyParams,
+  PropertySetDef, QuantitySetDef,
+  MaterialDef,
   WorkScheduleParams, WorkPlanParams, TaskParams, SequenceParams,
+  WorkCalendarParams,
   CreatedEntity, CreateResult,
 } from './types.js';
 
+import type {
+  CostItemParams, CostQuantityParams, CostScheduleParams, CostTypedValue,
+  CostValueParams, SIUnitParams,
+} from './types-cost.js';
 import {
   esc, stepLine, num, vecLen, vecNorm, vecCross,
-  NON_ELEMENT_TYPES, assertPositiveFinite, assertFinitePoint3,
+  optStr, optEnum,
+  NON_ELEMENT_TYPES, assertPositiveFinite, assertFinitePoint3, completePlacementAxes,
 } from './ifc-creator-math.js';
+import { emitWorkCalendar, emitTaskTime } from './ifc-creator-scheduling.js';
+import {
+  assertCostSchema, emitCostItem, emitCostSchedule, emitCostValue,
+  emitMeasureWithUnit, emitMonetaryUnit, emitPhysicalQuantity,
+  emitRelAssignsToProduct, emitSIUnit,
+} from './ifc-creator-cost.js';
+import { emitElementQuantity, emitPropertySet, type DefinitionContext } from './ifc-creator-definitions.js';
+import { createTerrainWriter, type TerrainContext, type TerrainWriter } from './ifc-creator-terrain.js';
+import { emitRelFillsElement, emitSpatialRelationships } from './ifc-creator-relationships.js';
+import { emitDefaultStyle, emitStyledItems } from './ifc-creator-styles.js';
+import { buildStepHeader } from './ifc-creator-header.js';
 import { generateIfcGuid, isValidIfcGuid } from '@ifc-lite/encoding';
-
-// ============================================================================
-// STEP attribute helpers (scheduling — optional strings / enums / numbers)
-// ============================================================================
-
-/** Emit an optional STEP string: `'value'` when present, `$` otherwise. */
-function optStr(v: string | undefined | null): string {
-  return v === undefined || v === null || v === '' ? '$' : `'${esc(v)}'`;
-}
-
-/** Emit an optional STEP enum: `.VALUE.` when present, `$` otherwise. */
-function optEnum(v: string | undefined | null): string {
-  return v === undefined || v === null || v === '' ? '$' : `.${v}.`;
-}
-
-/** Emit an optional STEP boolean: `.T.`/`.F.`/`$`. */
-function optBool(v: boolean | undefined | null): string {
-  return v === undefined || v === null ? '$' : v ? '.T.' : '.F.';
-}
-
-/** Emit an optional STEP real number; `$` when absent. */
-function optReal(v: number | undefined | null): string {
-  return v === undefined || v === null || !Number.isFinite(v) ? '$' : num(v);
-}
+import { fileSchemaIdentifier } from '@ifc-lite/data';
 
 // ============================================================================
 // IfcCreator
@@ -110,6 +104,16 @@ export class IfcCreator {
   private dirX = 0;
   private worldPlacementId = 0;
   private unitAssignmentId = 0;
+
+  // Products contained directly in the site rather than a storey: terrain and
+  // survey annotations have no storey, and inventing one would put them on a
+  // datum the source never declared.
+  private siteElements: number[] = [];
+  /** Products aggregated by the project itself — `IfcAlignment` (§11 of the LandXML mapping). */
+  private projectElements: number[] = [];
+  private georeferenced = false;
+  /** The length `IfcNamedUnit` `IfcProjectedCRS.MapUnit` points at. */
+  private lengthUnitId = 0;
 
   // Guard against repeated toIfc() calls (relationships are not idempotent)
   private finalized = false;
@@ -275,7 +279,7 @@ export class IfcCreator {
     const tag = params.Tag ? `'${esc(params.Tag)}'` : '$';
 
     this.line(wallId, 'IFCWALL',
-      `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${desc},${objType},#${placementId},#${prodShapeId},${tag},.STANDARD.`);
+      `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${desc},${objType},#${placementId},#${prodShapeId},${tag}${this.ifc4Only('.STANDARD.')}`);
 
     this.elementSolids.set(wallId, [solidId]);
     this.trackElement(storeyId, wallId);
@@ -390,7 +394,7 @@ export class IfcCreator {
     const tag = params.Tag ? `'${esc(params.Tag)}'` : '$';
 
     this.line(colId, 'IFCCOLUMN',
-      `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${desc},${objType},#${placementId},#${prodShapeId},${tag},.COLUMN.`);
+      `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${desc},${objType},#${placementId},#${prodShapeId},${tag}${this.ifc4Only('.COLUMN.')}`);
 
     this.elementSolids.set(colId, [solidId]);
     this.trackElement(storeyId, colId);
@@ -433,7 +437,7 @@ export class IfcCreator {
     const tag = params.Tag ? `'${esc(params.Tag)}'` : '$';
 
     this.line(beamId, 'IFCBEAM',
-      `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${desc},${objType},#${placementId},#${prodShapeId},${tag},.BEAM.`);
+      `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${desc},${objType},#${placementId},#${prodShapeId},${tag}${this.ifc4Only('.BEAM.')}`);
 
     this.elementSolids.set(beamId, [solidId]);
     this.trackElement(storeyId, beamId);
@@ -1081,7 +1085,6 @@ export class IfcCreator {
     const name = params.Name ?? 'Space';
     const desc = params.Description ? `'${esc(params.Description)}'` : '$';
     const objType = params.ObjectType ? `'${esc(params.ObjectType)}'` : '$';
-    const tag = params.Tag ? `'${esc(params.Tag)}'` : '$';
     const longName = params.LongName ? `'${esc(params.LongName)}'` : '$';
 
     this.line(spaceId, 'IFCSPACE',
@@ -1234,7 +1237,7 @@ export class IfcCreator {
     const tag = params.Tag ? `'${esc(params.Tag)}'` : '$';
 
     this.line(colId, 'IFCCOLUMN',
-      `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${desc},${objType},#${placementId},#${prodShapeId},${tag},.COLUMN.`);
+      `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${desc},${objType},#${placementId},#${prodShapeId},${tag}${this.ifc4Only('.COLUMN.')}`);
 
     this.elementSolids.set(colId, [solidId]);
     this.trackElement(storeyId, colId);
@@ -1291,7 +1294,7 @@ export class IfcCreator {
     const tag = params.Tag ? `'${esc(params.Tag)}'` : '$';
 
     this.line(beamId, 'IFCBEAM',
-      `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${desc},${objType},#${placementId},#${prodShapeId},${tag},.BEAM.`);
+      `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${desc},${objType},#${placementId},#${prodShapeId},${tag}${this.ifc4Only('.BEAM.')}`);
 
     this.elementSolids.set(beamId, [solidId]);
     this.trackElement(storeyId, beamId);
@@ -1489,7 +1492,7 @@ export class IfcCreator {
     const tag = params.Tag ? `'${esc(params.Tag)}'` : '$';
 
     this.line(colId, 'IFCCOLUMN',
-      `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${desc},${objType},#${placementId},#${prodShapeId},${tag},.COLUMN.`);
+      `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${desc},${objType},#${placementId},#${prodShapeId},${tag}${this.ifc4Only('.COLUMN.')}`);
 
     this.elementSolids.set(colId, [solidId]);
     this.trackElement(storeyId, colId);
@@ -1545,7 +1548,7 @@ export class IfcCreator {
     const tag = params.Tag ? `'${esc(params.Tag)}'` : '$';
 
     this.line(beamId, 'IFCBEAM',
-      `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${desc},${objType},#${placementId},#${prodShapeId},${tag},.BEAM.`);
+      `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${desc},${objType},#${placementId},#${prodShapeId},${tag}${this.ifc4Only('.BEAM.')}`);
 
     this.elementSolids.set(beamId, [solidId]);
     this.trackElement(storeyId, beamId);
@@ -1554,59 +1557,73 @@ export class IfcCreator {
   }
 
   // ============================================================================
+  // Public API — Terrain & survey (IFC4X3, LandXML→IFC mapping)
+  // ============================================================================
+
+  /**
+   * The terrain/survey authoring surface: TIN surfaces, survey points, their
+   * property sets and the file's georeferencing.
+   *
+   * One accessor rather than four methods: each needs the same creator
+   * internals and nothing else. `ifc-creator-terrain.ts` documents each call.
+   */
+  terrain(): TerrainWriter {
+    return createTerrainWriter(this.terrainContext(), {
+      trackSiteProduct: (expressId, type, name) => {
+        this.siteElements.push(expressId);
+        this.entities.push({ expressId, type, Name: name });
+      },
+      lengthUnitRef: () => `#${this.lengthUnitId}`,
+      siteId: () => this.siteId,
+      trackProjectProduct: (expressId, type, name) => {
+        this.projectElements.push(expressId);
+        this.entities.push({ expressId, type, Name: name });
+      },
+      claimGeoreferencing: () => {
+        if (this.georeferenced) {
+          throw new Error('setGeoreferencing: already called — a file has at most one IfcMapConversion for its model context');
+        }
+        this.georeferenced = true;
+      },
+    });
+  }
+
+  /** The creator hooks `ifc-creator-terrain.ts`'s emitters need. */
+  private terrainContext(): TerrainContext {
+    return {
+      emit: this.emitEntity,
+      newGlobalId: () => this.newGlobalId(),
+      ownerRef: `#${this.ownerHistoryId}`,
+      modelContextRef: `#${this.contextId}`,
+      bodyContextRef: `#${this.subContextBody}`,
+      axisContextRef: `#${this.subContextAxis}`,
+      sitePlacementRef: `#${this.worldPlacementId}`,
+      assertSchema: (feature: string) => {
+        if (this.schema !== 'IFC4X3') {
+          throw new Error(`${feature} requires the IFC4X3 schema — IfcTriangulatedIrregularNetwork and the survey/terrain predefined types do not exist in ${this.schema}`);
+        }
+      },
+    };
+  }
+
+  // ============================================================================
   // Public API — Properties & Quantities
   // ============================================================================
 
   /** Attach a property set to an element */
   addIfcPropertySet(elementId: number, pset: PropertySetDef): number {
-    const propIds: number[] = [];
-
-    for (const prop of pset.Properties) {
-      const propId = this.id();
-      const valueStr = this.serializePropertyValue(prop);
-      this.line(propId, 'IFCPROPERTYSINGLEVALUE',
-        `'${esc(prop.Name)}',$,${valueStr},$`);
-      propIds.push(propId);
-    }
-
-    const psetId = this.id();
-    const globalId = this.newGlobalId();
-    const refs = propIds.map(id => `#${id}`).join(',');
-    this.line(psetId, 'IFCPROPERTYSET',
-      `'${globalId}',#${this.ownerHistoryId},'${esc(pset.Name)}',$,(${refs})`);
-
-    const relId = this.id();
-    const relGlobalId = this.newGlobalId();
-    this.line(relId, 'IFCRELDEFINESBYPROPERTIES',
-      `'${relGlobalId}',#${this.ownerHistoryId},$,$,(#${elementId}),#${psetId}`);
-
-    return psetId;
+    return emitPropertySet(elementId, pset, this.definitionContext());
   }
 
   /** Attach element quantities to an element */
   addIfcElementQuantity(elementId: number, qset: QuantitySetDef): number {
-    const qtyIds: number[] = [];
+    return emitElementQuantity(elementId, qset, this.definitionContext());
+  }
 
-    for (const qty of qset.Quantities) {
-      const qtyId = this.id();
-      const valueField = this.quantityValueField(qty);
-      this.line(qtyId, qty.Kind.toUpperCase(),
-        `'${esc(qty.Name)}',$,${valueField}`);
-      qtyIds.push(qtyId);
-    }
-
-    const qsetId = this.id();
-    const globalId = this.newGlobalId();
-    const refs = qtyIds.map(id => `#${id}`).join(',');
-    this.line(qsetId, 'IFCELEMENTQUANTITY',
-      `'${globalId}',#${this.ownerHistoryId},'${esc(qset.Name)}',$,$,(${refs})`);
-
-    const relId = this.id();
-    const relGlobalId = this.newGlobalId();
-    this.line(relId, 'IFCRELDEFINESBYPROPERTIES',
-      `'${relGlobalId}',#${this.ownerHistoryId},$,$,(#${elementId}),#${qsetId}`);
-
-    return qsetId;
+  /** The creator hooks `ifc-creator-definitions.ts`'s emitters need. */
+  private definitionContext(): DefinitionContext {
+    return { emit: this.emitEntity, newGlobalId: () => this.newGlobalId(),
+      ownerRef: `#${this.ownerHistoryId}`, ifc4Only: (v: string) => this.ifc4Only(v) };
   }
 
   // ============================================================================
@@ -1667,7 +1684,7 @@ export class IfcCreator {
   }
 
   // ============================================================================
-  // Public API — Scheduling / 4D  (IfcWorkSchedule, IfcTask, IfcRelSequence)
+  // Public API — Scheduling / 4D  (IfcWorkSchedule, IfcTask, IfcRelSequence, IfcWorkCalendar)
   // ============================================================================
 
   /**
@@ -1685,6 +1702,34 @@ export class IfcCreator {
   addIfcWorkPlan(params: WorkPlanParams): number {
     return this.buildWorkControl('IFCWORKPLAN', params);
   }
+
+  /**
+   * Create an IfcWorkCalendar — the working / non-working time calendar an
+   * IfcTask or IfcWorkSchedule can be assigned to. `WorkingTimes` /
+   * `ExceptionTimes` entries become nested IfcWorkTime entities (with their
+   * IfcRecurrencePattern / IfcTimePeriod when the entry carries a
+   * recurrence), the same way `addIfcTask` emits its IfcTaskTime. Assign it
+   * with `assignCalendarToTasks`. Returns the calendar expressId.
+   */
+  addIfcWorkCalendar(params: WorkCalendarParams): number {
+    if (this.schema === 'IFC2X3') {
+      throw new Error('addIfcWorkCalendar is not supported for IFC2X3');
+    }
+    const id = emitWorkCalendar(params, this.newGlobalId(), `#${this.ownerHistoryId}`, this.emitEntity);
+    this.entities.push({ expressId: id, type: 'IfcWorkCalendar', Name: params.Name });
+    return id;
+  }
+
+  /**
+   * Allocate an express id, write its STEP line, and hand the id back — the
+   * one hook `ifc-creator-scheduling.ts`'s emitters need from the creator.
+   * An arrow property so it can be passed by reference without binding.
+   */
+  private emitEntity = (type: string, attrs: string): number => {
+    const entityId = this.id();
+    this.line(entityId, type, attrs);
+    return entityId;
+  };
 
   /**
    * Create an IfcTask. If any Schedule/Actual/Early/Late time field, IsCritical,
@@ -1711,7 +1756,7 @@ export class IfcCreator {
       params.DurationType !== undefined ||
       params.Completion !== undefined;
 
-    const taskTimeId = hasTaskTime ? this.addIfcTaskTime(params) : 0;
+    const taskTimeId = hasTaskTime ? emitTaskTime(params, this.emitEntity) : 0;
     const taskId = this.id();
     const globalId = this.newGlobalId();
     const name = params.Name;
@@ -1731,44 +1776,6 @@ export class IfcCreator {
 
     this.entities.push({ expressId: taskId, type: 'IfcTask', Name: name });
     return taskId;
-  }
-
-  /**
-   * Build an IfcTaskTime from the task params (internal helper — prefer
-   * setting the time fields on the task itself via `addIfcTask`).
-   */
-  private addIfcTaskTime(params: TaskParams): number {
-    const ttId = this.id();
-    // [0] Name, [1] DataOrigin, [2] UserDefinedDataOrigin,
-    // [3] DurationType, [4] ScheduleDuration, [5] ScheduleStart, [6] ScheduleFinish,
-    // [7..10] Early/Late Start/Finish, [11] FreeFloat, [12] TotalFloat,
-    // [13] IsCritical, [14] StatusTime,
-    // [15] ActualDuration, [16] ActualStart, [17] ActualFinish,
-    // [18] RemainingTime, [19] Completion
-    const attrs: string[] = [
-      '$',                                      // Name
-      '$',                                      // DataOrigin
-      '$',                                      // UserDefinedDataOrigin
-      optEnum(params.DurationType),             // DurationType
-      optStr(params.ScheduleDuration),          // ScheduleDuration
-      optStr(params.ScheduleStart),             // ScheduleStart
-      optStr(params.ScheduleFinish),            // ScheduleFinish
-      optStr(params.EarlyStart),                // EarlyStart
-      optStr(params.EarlyFinish),               // EarlyFinish
-      optStr(params.LateStart),                 // LateStart
-      optStr(params.LateFinish),                // LateFinish
-      optStr(params.FreeFloat),                 // FreeFloat
-      optStr(params.TotalFloat),                // TotalFloat
-      optBool(params.IsCritical),               // IsCritical
-      optStr(params.StatusTime),                // StatusTime
-      optStr(params.ActualDuration),            // ActualDuration
-      optStr(params.ActualStart),               // ActualStart
-      optStr(params.ActualFinish),              // ActualFinish
-      optStr(params.RemainingTime),             // RemainingTime
-      optReal(params.Completion),               // Completion
-    ];
-    this.line(ttId, 'IFCTASKTIME', attrs.join(','));
-    return ttId;
   }
 
   /**
@@ -1797,7 +1804,7 @@ export class IfcCreator {
     }
 
     this.line(relId, 'IFCRELSEQUENCE',
-      `'${globalId}',#${this.ownerHistoryId},$,$,#${predecessorTaskId},#${successorTaskId},${lagRef},${seqType},${userDef}`);
+      `'${globalId}',#${this.ownerHistoryId},$,$,#${predecessorTaskId},#${successorTaskId},${lagRef},${seqType}${this.ifc4Only(userDef)}`);
     return relId;
   }
 
@@ -1830,6 +1837,16 @@ export class IfcCreator {
    */
   assignSchedulesToWorkPlan(planId: number, scheduleIds: number[]): number {
     return this.addIfcRelAssignsToControl(planId, scheduleIds);
+  }
+
+  /**
+   * Ergonomic alias — assign an IfcWorkCalendar to tasks (or work
+   * schedules; same relation either way). Delegates to
+   * {@link addIfcRelAssignsToControl}, which accepts a calendar because
+   * IfcWorkCalendar is an IfcControl.
+   */
+  assignCalendarToTasks(calendarId: number, taskIds: number[]): number {
+    return this.addIfcRelAssignsToControl(calendarId, taskIds);
   }
 
   /**
@@ -1869,6 +1886,81 @@ export class IfcCreator {
   /** Ergonomic alias — delegates to {@link addIfcRelNests}. */
   nestTasks(parentTaskId: number, childTaskIds: number[]): number {
     return this.addIfcRelNests(parentTaskId, childTaskIds);
+  }
+
+  // Public API — Cost / 5D. Every method delegates to `ifc-creator-cost.ts` and refuses
+  // IFC2X3 by name (its cost entity layout differs, so IFC4 records would parse and mislead).
+  /** Create an IfcCostSchedule (IFC4 / IFC4X3 only). Returns its expressId. */
+  addIfcCostSchedule(params: CostScheduleParams): number {
+    assertCostSchema(this.schema, 'addIfcCostSchedule');
+    const id = emitCostSchedule(params, this.newGlobalId(), `#${this.ownerHistoryId}`, this.emitEntity);
+    this.entities.push({ expressId: id, type: 'IfcCostSchedule', Name: params.Name });
+    return id;
+  }
+
+  /** Create an IfcCostItem (IFC4 / IFC4X3 only). Returns its expressId. */
+  addIfcCostItem(params: CostItemParams): number {
+    assertCostSchema(this.schema, 'addIfcCostItem');
+    const id = emitCostItem(params, this.newGlobalId(), `#${this.ownerHistoryId}`, this.emitEntity);
+    this.entities.push({ expressId: id, type: 'IfcCostItem', Name: params.Name });
+    return id;
+  }
+
+  /** Create an IfcCostValue (IFC4 / IFC4X3 only). Returns its expressId. */
+  addIfcCostValue(params: CostValueParams): number {
+    assertCostSchema(this.schema, 'addIfcCostValue');
+    const id = emitCostValue(params, this.schema, this.emitEntity);
+    this.entities.push({ expressId: id, type: 'IfcCostValue', Name: params.Name });
+    return id;
+  }
+
+  /** Create an IfcMonetaryUnit for `currency`. No default — omit it to leave the currency unstated. */
+  addIfcMonetaryUnit(currency: string): number {
+    assertCostSchema(this.schema, 'addIfcMonetaryUnit');
+    return emitMonetaryUnit(currency, this.emitEntity);
+  }
+
+  /** Create an IfcSIUnit, for use as an IfcMeasureWithUnit or quantity unit. */
+  addIfcSIUnit(params: SIUnitParams): number {
+    assertCostSchema(this.schema, 'addIfcSIUnit');
+    return emitSIUnit(params, this.emitEntity);
+  }
+
+  /** Create an IfcMeasureWithUnit — what a UnitBasis or entity-valued AppliedValue points at. */
+  addIfcMeasureWithUnit(value: CostTypedValue, unitId: number): number {
+    assertCostSchema(this.schema, 'addIfcMeasureWithUnit');
+    return emitMeasureWithUnit(value, unitId, this.schema, this.emitEntity);
+  }
+
+  /** Create a standalone IfcPhysicalSimpleQuantity for IfcCostItem.CostQuantities. */
+  addIfcPhysicalQuantity(params: CostQuantityParams): number {
+    assertCostSchema(this.schema, 'addIfcPhysicalQuantity');
+    return emitPhysicalQuantity(params, this.schema, this.emitEntity);
+  }
+
+  /** Emit an IfcRelAssignsToProduct — see {@link emitRelAssignsToProduct} for the direction rule. */
+  addIfcRelAssignsToProduct(relatingProductId: number, relatedObjectIds: number[]): number {
+    return emitRelAssignsToProduct(relatingProductId, relatedObjectIds,
+      () => this.newGlobalId(), `#${this.ownerHistoryId}`, this.emitEntity);
+  }
+
+  // Ergonomic aliases over the canonical relationships: cost items under a
+  // schedule, cost items pricing a product, tasks bound to a cost item (an
+  // IfcCostItem is an IfcControl), and the cost breakdown hierarchy.
+  assignCostItemsToSchedule(scheduleId: number, costItemIds: number[]): number {
+    return this.addIfcRelAssignsToControl(scheduleId, costItemIds);
+  }
+
+  assignCostItemsToProduct(productId: number, costItemIds: number[]): number {
+    return this.addIfcRelAssignsToProduct(productId, costItemIds);
+  }
+
+  assignTasksToCostItem(costItemId: number, taskIds: number[]): number {
+    return this.addIfcRelAssignsToControl(costItemId, taskIds);
+  }
+
+  nestCostItems(parentCostItemId: number, childCostItemIds: number[]): number {
+    return this.addIfcRelNests(parentCostItemId, childCostItemIds);
   }
 
   /**
@@ -1933,20 +2025,8 @@ export class IfcCreator {
   }
 
   private buildHeader(): string {
-    const now = new Date(this.nowMs()).toISOString().replace(/\.\d{3}Z$/, ''); // ISO 8601 time_stamp: keep '-'/':', drop only ms+'Z'
-    const desc = 'Created by ifc-lite';
-    const author = this.projectParams.Author ?? '';
-    const org = this.projectParams.Organization ?? '';
-    const app = 'ifc-lite';
-    const filename = 'created.ifc';
-
-    return `ISO-10303-21;
-HEADER;
-FILE_DESCRIPTION(('${esc(desc)}'),'2;1');
-FILE_NAME('${filename}','${now}',('${esc(author)}'),('${esc(org)}'),'${app}','${app}','');
-FILE_SCHEMA(('${this.schema}'));
-ENDSEC;
-`;
+    return buildStepHeader(this.nowMs(), this.projectParams.Author ?? '', this.projectParams.Organization ?? '',
+      fileSchemaIdentifier(this.schema));
   }
 
   // ============================================================================
@@ -1997,10 +2077,10 @@ ENDSEC;
       `$,'Axis',*,*,*,*,#${this.contextId},$,.GRAPH_VIEW.,$`);
 
     // Units
-    this.unitAssignmentId = this.buildUnits(params.LengthUnit ?? 'METRE');
+    this.unitAssignmentId = this.buildUnits(params.LengthUnit ?? 'METRE', params.Currency);
 
     // Default surface style — light grey with some specularity
-    this.defaultStyleId = this.buildDefaultStyle();
+    this.defaultStyleId = emitDefaultStyle({ emit: this.emitEntity });
 
     // IfcProject
     this.projectId = this.id();
@@ -2026,7 +2106,7 @@ ENDSEC;
     this.entities.push({ expressId: this.buildingId, type: 'IfcBuilding', Name: 'Building' });
   }
 
-  private buildUnits(lengthUnit: string): number {
+  private buildUnits(lengthUnit: string, currency?: string): number {
     const dimExpId = this.id();
     this.line(dimExpId, 'IFCDIMENSIONALEXPONENTS', '0,0,0,0,0,0,0');
 
@@ -2049,69 +2129,30 @@ ENDSEC;
     const siAngleId = this.id();
     this.line(siAngleId, 'IFCSIUNIT', `*,.PLANEANGLEUNIT.,$,.RADIAN.`);
 
+    // Absent currency stays absent: no IfcMonetaryUnit is written at all, so
+    // the cost read model reports no project currency rather than a guess.
+    const units = [lengthUnitId, siAreaId, siVolumeId, siAngleId];
+    if (currency !== undefined) {
+      assertCostSchema(this.schema, 'ProjectParams.Currency'); // IFC2X3 Currency is an enum
+      units.push(emitMonetaryUnit(currency, this.emitEntity));
+    }
+
+    this.lengthUnitId = lengthUnitId;
+
     const assignmentId = this.id();
-    this.line(assignmentId, 'IFCUNITASSIGNMENT',
-      `(#${lengthUnitId},#${siAreaId},#${siVolumeId},#${siAngleId})`);
+    this.line(assignmentId, 'IFCUNITASSIGNMENT', `(${units.map(id => `#${id}`).join(',')})`);
 
     return assignmentId;
   }
 
-  /** Create a default IfcSurfaceStyle with a neutral colour (RGB 0.75, 0.73, 0.68) */
-  private buildDefaultStyle(): number {
-    // IfcColourRgb — warm concrete grey
-    const colourId = this.id();
-    this.line(colourId, 'IFCCOLOURRGB', `$,0.75,0.73,0.68`);
-
-    // IfcSurfaceStyleRendering — surface + specular
-    const renderingId = this.id();
-    this.line(renderingId, 'IFCSURFACESTYLERENDERING',
-      `#${colourId},0.,$,$,$,$,IFCNORMALISEDRATIOMEASURE(0.5),IFCSPECULAREXPONENT(64.),.NOTDEFINED.`);
-
-    // IfcSurfaceStyle
-    const styleId = this.id();
-    this.line(styleId, 'IFCSURFACESTYLE', `'Default',.BOTH.,(#${renderingId})`);
-
-    return styleId;
-  }
-
-  /** Create all IfcStyledItem entities — custom colour or default per element */
+  /**
+   * Create all `IfcStyledItem` rows — a custom colour where one was assigned,
+   * the default grey otherwise. See `ifc-creator-styles.ts`.
+   */
   private finalizeStyles(): void {
-    // Cache: colour key → styleId so identical colours share one style entity
-    const styleCache = new Map<string, number>();
-    for (const [elementId, solidIds] of this.elementSolids) {
-      const color = this.elementColors.get(elementId);
-      let styleId: number;
-      if (color) {
-        const key = `${color.name}|${color.rgb.join(',')}`;
-        const cached = styleCache.get(key);
-        if (cached !== undefined) {
-          styleId = cached;
-        } else {
-          styleId = this.buildColorStyle(color.name, color.rgb);
-          styleCache.set(key, styleId);
-        }
-      } else {
-        styleId = this.defaultStyleId;
-      }
-      for (const solidId of solidIds) {
-        const styledItemId = this.id();
-        this.line(styledItemId, 'IFCSTYLEDITEM', `#${solidId},(#${styleId}),$`);
-      }
-    }
-  }
-
-  /** Create a named IfcSurfaceStyle with the given RGB colour */
-  private buildColorStyle(name: string, rgb: [number, number, number]): number {
-    const colourId = this.id();
-    this.line(colourId, 'IFCCOLOURRGB', `$,${num(rgb[0])},${num(rgb[1])},${num(rgb[2])}`);
-
-    const renderingId = this.id();
-    this.line(renderingId, 'IFCSURFACESTYLERENDERING',
-      `#${colourId},0.,$,$,$,$,IFCNORMALISEDRATIOMEASURE(0.5),IFCSPECULAREXPONENT(64.),.NOTDEFINED.`);
-
-    const styleId = this.id();
-    this.line(styleId, 'IFCSURFACESTYLE', `'${esc(name)}',.BOTH.,(#${renderingId})`);
-    return styleId;
+    emitStyledItems(this.elementSolids, this.elementColors, this.defaultStyleId, {
+      emit: this.emitEntity,
+    });
   }
 
   // ============================================================================
@@ -2153,13 +2194,16 @@ ENDSEC;
   // Internal — Geometry helpers
   // ============================================================================
 
+  // Every builder's Position/Start/opening point is written here (#5217).
   private addCartesianPoint(p: Point3D): number {
+    assertFinitePoint3({ IfcCartesianPoint: p }, 'IfcCreator');
     const id = this.id();
     this.line(id, 'IFCCARTESIANPOINT', `(${num(p[0])},${num(p[1])},${num(p[2])})`);
     return id;
   }
 
   private addCartesianPoint2D(p: Point2D): number {
+    if (!p.every(Number.isFinite)) throw new Error('IfcCreator: IfcCartesianPoint must have finite coordinates');
     const id = this.id();
     this.line(id, 'IFCCARTESIANPOINT', `(${num(p[0])},${num(p[1])})`);
     return id;
@@ -2186,17 +2230,8 @@ ENDSEC;
    */
   addLocalPlacement(relativeTo: number, placement: Placement3D): number {
     const originId = this.addCartesianPoint(placement.Location);
-    let axisId: number | undefined;
-    let refDirId: number | undefined;
-
-    if (placement.Axis) {
-      axisId = this.addDirection(placement.Axis);
-    }
-    if (placement.RefDirection) {
-      refDirId = this.addDirection(placement.RefDirection);
-    }
-
-    const axis2Id = this.addAxis2Placement3D(originId, axisId, refDirId);
+    const axes = completePlacementAxes(placement.Axis, placement.RefDirection); // both or neither (#5469)
+    const axis2Id = this.addAxis2Placement3D(originId, axes && this.addDirection(axes.Axis), axes && this.addDirection(axes.RefDirection));
 
     const id = this.id();
     this.line(id, 'IFCLOCALPLACEMENT', `#${relativeTo},#${axis2Id}`);
@@ -2709,82 +2744,32 @@ ENDSEC;
     return openingId;
   }
 
-  // ============================================================================
-  // Internal — Property/quantity serialization
-  // ============================================================================
-
-  private serializePropertyValue(prop: PropertyDef): string {
-    const val = prop.NominalValue;
-    if (typeof val === 'string') {
-      const typeName = prop.Type ?? 'IfcLabel';
-      return `${typeName.toUpperCase()}('${esc(val)}')`;
-    }
-    if (typeof val === 'number') {
-      const typeName = prop.Type ?? (Number.isInteger(val) ? 'IfcInteger' : 'IfcReal');
-      return typeName === 'IfcInteger' ? `IFCINTEGER(${Math.round(val)})` : `IFCREAL(${num(val)})`;
-    }
-    if (typeof val === 'boolean') {
-      // `Type: 'IfcLogical'` (tri-state) must not be downgraded to IFCBOOLEAN.
-      const typeName = prop.Type === 'IfcLogical' ? 'IFCLOGICAL' : 'IFCBOOLEAN';
-      return `${typeName}(${val ? '.T.' : '.F.'})`;
-    }
-    return '$';
-  }
-
-  private quantityValueField(qty: QuantityDef): string {
-    switch (qty.Kind) {
-      case 'IfcQuantityLength':
-      case 'IfcQuantityArea':
-      case 'IfcQuantityVolume':
-      case 'IfcQuantityWeight':
-        return `$,${num(qty.Value)}`;
-      case 'IfcQuantityCount':
-        return `$,${Math.round(qty.Value)}`;
-      default:
-        return `$,${num(qty.Value)}`;
-    }
-  }
+  // `serializePropertyValue` / `quantityValueField` moved to `ifc-creator-math.ts`.
+  private ifc4Only(v: string): string { return this.schema === 'IFC2X3' ? '' : `,${v}`; } // trailing IFC4/4X3-only attribute
 
   // ============================================================================
   // Internal — Relationship finalization
   // ============================================================================
 
   private finalizeRelationships(): void {
-    this.addIfcRelAggregates(this.projectId, [this.siteId]);
-    this.addIfcRelAggregates(this.siteId, [this.buildingId]);
-
-    if (this.storeyIds.length > 0) {
-      this.addIfcRelAggregates(this.buildingId, this.storeyIds);
-    }
-
-    for (const [storeyId, elementIds] of this.storeyElements) {
-      if (elementIds.length > 0) {
-        this.addIfcRelContainedInSpatialStructure(storeyId, elementIds);
-      }
-    }
-  }
-
-  private addIfcRelAggregates(relatingId: number, relatedIds: number[]): void {
-    const relId = this.id();
-    const globalId = this.newGlobalId();
-    const refs = relatedIds.map(id => `#${id}`).join(',');
-    this.line(relId, 'IFCRELAGGREGATES',
-      `'${globalId}',#${this.ownerHistoryId},$,$,#${relatingId},(${refs})`);
-  }
-
-  private addIfcRelContainedInSpatialStructure(storeyId: number, elementIds: number[]): void {
-    const relId = this.id();
-    const globalId = this.newGlobalId();
-    const refs = elementIds.map(id => `#${id}`).join(',');
-    this.line(relId, 'IFCRELCONTAINEDINSPATIALSTRUCTURE',
-      `'${globalId}',#${this.ownerHistoryId},$,$,(${refs}),#${storeyId}`);
+    emitSpatialRelationships({
+      emit: this.emitEntity,
+      newGlobalId: () => this.newGlobalId(),
+      ownerRef: `#${this.ownerHistoryId}`,
+      projectId: this.projectId,
+      siteId: this.siteId,
+      buildingId: this.buildingId,
+      storeyIds: this.storeyIds,
+      storeyElements: this.storeyElements,
+      siteElements: this.siteElements,
+      projectElements: this.projectElements,
+    });
   }
 
   private addIfcRelFillsElement(openingId: number, fillingId: number): void {
-    const relId = this.id();
-    const globalId = this.newGlobalId();
-    this.line(relId, 'IFCRELFILLSELEMENT',
-      `'${globalId}',#${this.ownerHistoryId},$,$,#${openingId},#${fillingId}`);
+    emitRelFillsElement(openingId, fillingId, {
+      emit: this.emitEntity, newGlobalId: () => this.newGlobalId(), ownerRef: `#${this.ownerHistoryId}`,
+    });
   }
 
   // ============================================================================

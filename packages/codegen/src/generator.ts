@@ -12,6 +12,7 @@
  * - Rust types and type IDs
  */
 
+import { ENTITIES_IFC4, IFC_DATA_TYPES } from '@ifc-lite/data';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join, isAbsolute } from 'node:path';
 import { parseExpressSchema, type ExpressSchema } from './express-parser.js';
@@ -20,6 +21,7 @@ import { generateTypeIds } from './type-ids-generator.js';
 import { generateSerializers } from './serialization-generator.js';
 import { generateRust, type RustGeneratedCode } from './rust-generator.js';
 import { findCollisions } from './crc32.js';
+import { entityCatalogSchema } from './rust-schema-queries.js';
 
 export interface FullGeneratedCode extends GeneratedCode {
   typeIds: string;
@@ -31,6 +33,10 @@ export interface GeneratorOptions {
   rust?: boolean;
   /** Rust output directory (relative to outputDir or absolute) */
   rustDir?: string;
+  /** Keep generated Rust types visible only inside their consuming crate. */
+  rustCratePrivate?: boolean;
+  /** Additional EXPRESS files whose entity names extend the Rust IfcType universe. */
+  rustSupplementalSchemaPaths?: string[];
   /** Skip type ID collision check */
   skipCollisionCheck?: boolean;
 }
@@ -58,8 +64,26 @@ export function generateFromSchema(
   outputDir: string,
   options: GeneratorOptions = {}
 ): FullGeneratedCode {
+  // Normalize line endings so a CRLF (or lone-CR) source file can never leak
+  // a stray \r into a generated string literal downstream (#4220). This is
+  // the single boundary both generateFromFile and direct callers funnel
+  // through before the content reaches the parser.
+  schemaContent = schemaContent.replace(/\r\n?/g, '\n');
+
   console.log('📖 Parsing EXPRESS schema...');
   const schema = parseExpressSchema(schemaContent);
+  const rustSupplementalSchemas = options.rust
+    ? [
+        ...(options.rustSupplementalSchemaPaths ?? []).map((path) =>
+          parseExpressSchema(readFileSync(path, 'utf-8').replace(/\r\n?/g, '\n'))
+        ),
+        // The IFC4-family catalog widens the CANONICAL exact-name universe
+        // (#4203); a crate-private per-schema registry is exactly its own
+        // schema and must not be widened, or `attribute_names_for_schema`
+        // could answer for a class the declared FILE_SCHEMA never knew.
+        ...(options.rustCratePrivate ? [] : [entityCatalogSchema('IFC4_FAMILY', ENTITIES_IFC4, IFC_DATA_TYPES)]),
+      ]
+    : [];
 
   console.log(`✓ Parsed ${schema.name}`);
   console.log(`  - ${schema.entities.length} entities`);
@@ -70,8 +94,17 @@ export function generateFromSchema(
   // Check for CRC32 collisions
   if (!options.skipCollisionCheck) {
     console.log('\n🔍 Checking for CRC32 collisions...');
-    const entityNames = schema.entities.map((e) => e.name);
-    const collisions = findCollisions(entityNames);
+    const entityNames = [...schema.entities];
+    const knownNames = new Set(entityNames.map((entity) => entity.name.toUpperCase()));
+    for (const supplemental of rustSupplementalSchemas) {
+      for (const entity of supplemental.entities) {
+        if (!knownNames.has(entity.name.toUpperCase())) {
+          entityNames.push(entity);
+          knownNames.add(entity.name.toUpperCase());
+        }
+      }
+    }
+    const collisions = findCollisions(entityNames.map((entity) => entity.name));
     if (collisions.size > 0) {
       console.warn('⚠️  CRC32 collisions detected:');
       for (const [hash, names] of collisions) {
@@ -139,7 +172,7 @@ export * from './serializers.js';
   // Generate Rust code if requested
   if (options.rust) {
     console.log('\n🦀 Generating Rust code...');
-    const rustCode = generateRust(schema);
+    const rustCode = generateRust(schema, rustSupplementalSchemas, options.rustCratePrivate);
     // Use absolute path directly, or join relative path with outputDir
     const rustDir = options.rustDir
       ? isAbsolute(options.rustDir)
@@ -156,7 +189,8 @@ export * from './serializers.js';
     console.log(`  ✓ ${rustDir}/schema.rs`);
 
     // Write mod.rs
-    const modContent = `// This Source Code Form is subject to the terms of the Mozilla Public
+    const modContent = options.rustCratePrivate
+      ? `// This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
@@ -169,8 +203,34 @@ export * from './serializers.js';
 mod type_ids;
 mod schema;
 
+// The full generated ID universe is intentionally available to sibling modules.
+#[allow(unused_imports)]
+pub(crate) use type_ids::*;
+pub(crate) use schema::*;
+`
+      : `// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! Auto-generated IFC Schema Types
+//!
+//! Generated from EXPRESS schema: ${schema.name}
+//!
+//! DO NOT EDIT - This file is auto-generated by @ifc-lite/codegen
+
+mod ifc2x3;
+mod ifc4;
+mod ifc4x1;
+mod ifc4x2;
+mod schema;
+pub(crate) mod schema_registry;
+mod type_ids;
+
 pub use type_ids::*;
-pub use schema::*;
+pub use schema::{IfcType, UnknownIfcType, ALL as IFC_TYPES};
+pub use schema_registry::{
+    attribute_names_for_schema, entity_info_for_schema, is_subtype_of_for_schema, SchemaEntityInfo,
+};
 `;
     writeFileSync(`${rustDir}/mod.rs`, modContent);
     console.log(`  ✓ ${rustDir}/mod.rs`);
@@ -240,7 +300,7 @@ console.log('  STEP line:', stepLine);
 }
 
 /**
- * Generate code for both IFC4 and IFC4X3 schemas
+ * Generate code for IFC4, IFC4X3 and IFC2X3 schemas
  */
 export function generateAll(
   schemasDir: string,
@@ -250,6 +310,7 @@ export function generateAll(
   const schemas = [
     { name: 'IFC4', file: 'IFC4_ADD2_TC1.exp', dir: 'ifc4' },
     { name: 'IFC4X3', file: 'IFC4X3.exp', dir: 'ifc4x3' },
+    { name: 'IFC2X3', file: 'IFC2X3_TC1.exp', dir: 'ifc2x3' },
   ];
 
   for (const schema of schemas) {

@@ -12,6 +12,8 @@
 import type { MeshData } from '@ifc-lite/geometry';
 import { BATCH_CONSTANTS } from './constants.js';
 import type { BoundingBox } from './scene-raycaster.js';
+import { worldBounds } from './scene-precision.js';
+export { originPreservesTriangleTopology, topologySafeBatchOrigin } from './scene-precision.js';
 
 /** The subset of `MeshData` a world-space AABB needs. */
 export interface AabbPiece {
@@ -84,20 +86,20 @@ const MAX_ENCODED_ENTITY_ID = 0xFFFFFF;
 let warnedEntityIdRange = false;
 
 /**
- * Per-vertex z-nudge salt (issue: lens/overlay colouring).
+ * Per-vertex z-nudge salt.
  *
  * The anti-z-fight depth nudge in `main.wgsl.ts` must produce the SAME depth for
- * a given surface in BOTH the base opaque pass and the lens/IDS/compare/4D
- * OVERLAY pass (the overlay pipeline uses `depthCompare: 'equal'`, so any depth
- * difference rejects every overlay fragment — colour silently fails to paint).
+ * a given surface in every draw of it: its batch, a partial sub-batch drawn
+ * instead of it, and the selection highlight (`greater-equal`) drawn over it.
+ * (It was introduced for the equal-depth colour-overlay pass, retired in #6076.)
  *
  * Material-layer slices share their parent's expressId, so the nudge can't
  * separate their coincident coplanar caps from the id alone — it needs the
  * material colour. We bake an 8-bit hash of `MeshData.color` into the HIGH 8
  * bits of the per-vertex entityId lane (the low 24 bits stay the picking id;
  * `encodeId24` masks the salt off). Because the salt comes from the geometry's
- * OWN colour — not the per-draw `baseColor` uniform — the base and overlay
- * passes compute an identical nudge, while distinct layers still separate.
+ * OWN colour — not the per-draw `baseColor` uniform — every redraw computes an
+ * identical nudge, while distinct layers still separate.
  *
  * Returns a byte in [0,255]. Stamp it as `(id & 0x00FFFFFF) | (salt << 24)`.
  */
@@ -115,6 +117,23 @@ export function colorSaltByte(color?: readonly number[] | null): number {
 /** Stamp the colour salt into the high 8 bits, picking id into the low 24. */
 export function packEntityLane(rawId: number, saltByte: number): number {
   return (((rawId >>> 0) & 0x00FFFFFF) | ((saltByte & 0xFF) << 24)) >>> 0;
+}
+
+/**
+ * Release every GPU buffer a batch (or sub-batch clone) owns.
+ *
+ * Lives here rather than in `scene.ts` so the partial sub-batch cache can free
+ * clones without importing back into the Scene that owns it. Structurally
+ * typed on the buffer fields, so it serves `BatchedMesh`, individual `Mesh`
+ * and the sub-batch clones alike.
+ */
+export function destroyGpuResources(
+  m: { vertexBuffer: GPUBuffer; indexBuffer: GPUBuffer; uniformBuffer?: GPUBuffer; lod1IndexBuffer?: GPUBuffer },
+): void {
+  m.vertexBuffer.destroy();
+  m.indexBuffer.destroy();
+  if (m.uniformBuffer) m.uniformBuffer.destroy();
+  if (m.lod1IndexBuffer) m.lod1IndexBuffer.destroy();
 }
 
 /**
@@ -163,19 +182,7 @@ export function mergeGeometry(
   // magnitudes small (≈ half the batch's spatial spread) regardless of the
   // model's world placement — which is what prevents f32 fan collapse. A mesh
   // without an origin contributes its absolute positions (legacy no-op shift).
-  let minX = Infinity, minY = Infinity, minZ = Infinity;
-  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-  for (const mesh of meshDataArray) {
-    const p = mesh.positions;
-    const ox = mesh.origin ? mesh.origin[0] : 0;
-    const oy = mesh.origin ? mesh.origin[1] : 0;
-    const oz = mesh.origin ? mesh.origin[2] : 0;
-    for (let i = 0; i < p.length; i += 3) {
-      const x = p[i] + ox, y = p[i + 1] + oy, z = p[i + 2] + oz;
-      if (x < minX) minX = x; if (y < minY) minY = y; if (z < minZ) minZ = z;
-      if (x > maxX) maxX = x; if (y > maxY) maxY = y; if (z > maxZ) maxZ = z;
-    }
-  }
+  const { minX, minY, minZ, maxX, maxY, maxZ } = worldBounds(meshDataArray);
   // Prefer the caller's shared scene origin (consistent across all batches → no
   // seam z-fight); fall back to this batch's own world bbox centre.
   const batchOrigin: [number, number, number] = forcedOrigin
@@ -207,9 +214,8 @@ export function mergeGeometry(
       }
       entityId = entityId & MAX_ENCODED_ENTITY_ID;
     }
-    // High-8-bit material-colour salt → identical nudge in base & overlay passes
-    // (so the lens/IDS/compare/4D overlay's depthCompare:'equal' matches). See
-    // colorSaltByte() above.
+    // High-8-bit material-colour salt → identical nudge in every redraw of this
+    // geometry. See colorSaltByte() above.
     const saltByte = colorSaltByte(mesh.color);
     const hasNormals = normals.length > 0;
     for (let i = 0; i < vertexCount; i++) {
@@ -299,4 +305,15 @@ export function splitMeshDataForBufferLimit(meshDataArray: MeshData[], maxBuffer
   }
 
   return chunks;
+}
+
+/** Never cache an empty sentinel: a later streaming fragment may add vertices. */
+export function cachedWorldAabb(
+  id: number, pieces: readonly AabbPiece[] | undefined, cache: Map<number, BoundingBox>,
+): BoundingBox | null {
+  const cached = cache.get(id);
+  if (cached) return cached;
+  const box = worldAabbFromPieces(pieces);
+  if (box) cache.set(id, box);
+  return box;
 }

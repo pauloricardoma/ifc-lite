@@ -2,8 +2,11 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import { Spinner } from '@/components/ui/spinner';
+
 import type { ComponentType } from 'react';
-import { Loader2 } from 'lucide-react';
+
+import { useTranslation } from '@/i18n';
 
 interface SourceEntityListProps<T extends { id: string; name: string }> {
   items: readonly T[];
@@ -24,7 +27,7 @@ export function SourceEntityList<T extends { id: string; name: string }>({
   if (loading) {
     return (
       <div className="flex items-center justify-center py-8">
-        <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+        <Spinner size="lg" className="text-muted-foreground" />
       </div>
     );
   }
@@ -59,6 +62,7 @@ interface LoadMoreRowProps {
 /** Explicit continuation affordance for paged listings — renders nothing when
  *  the provider reported no further page, so a complete list stays clean. */
 export function LoadMoreRow({ hasMore, loading, onLoadMore, label }: LoadMoreRowProps) {
+  const { t } = useTranslation();
   if (!hasMore) return null;
   return (
     <div className="px-3 py-2">
@@ -68,8 +72,8 @@ export function LoadMoreRow({ hasMore, loading, onLoadMore, label }: LoadMoreRow
         disabled={loading}
         onClick={onLoadMore}
       >
-        {loading && <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />}
-        {loading ? 'Loading…' : label}
+        {loading && <Spinner size="sm" />}
+        {loading ? t('sources.sourceEntityList.loading') : label}
       </button>
     </div>
   );

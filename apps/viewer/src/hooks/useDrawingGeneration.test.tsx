@@ -20,12 +20,18 @@
  */
 
 import '@/test/setup-dom.js';
-import { describe, it } from 'node:test';
+import { describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { act } from 'react';
+import { act, StrictMode, useCallback, useState } from 'react';
+import { flushSync } from 'react-dom';
 import { createRoot, type Root } from 'react-dom/client';
-import type { Drawing2D } from '@ifc-lite/drawing-2d';
+import { Drawing2DGenerator, GraphicOverrideEngine, type Drawing2D } from '@ifc-lite/drawing-2d';
+import { createBCFProject, createBCFTopic } from '@ifc-lite/bcf';
 import type { GeometryResult, MeshData } from '@ifc-lite/geometry';
+import { BCFPanel } from '../components/viewer/BCFPanel.js';
+import { Drawing2DCanvas } from '../components/viewer/Drawing2DCanvas.js';
+import { TooltipProvider } from '../components/ui/tooltip.js';
+import { useViewerStore } from '../store/index.js';
 import { useDrawingGeneration } from './useDrawingGeneration.js';
 
 // ─── Fixture ─────────────────────────────────────────────────────────────
@@ -89,6 +95,7 @@ async function generate(geometryResult: GeometryResult): Promise<Drawing2D | nul
 
   function Harness(): null {
     const { generateDrawing } = useDrawingGeneration({
+      activeTool: 'select',
       geometryResult,
       ifcDataStore: null,
       sectionPlane: { axis: 'down', position: 50, flipped: false },
@@ -203,4 +210,399 @@ describe('useDrawingGeneration type-library geometry (#2058)', () => {
     assert.ok(ids.has(OCCURRENCE_ID), 'occurrence geometry must still be drawn');
     assert.ok(!ids.has(TYPE_ID), 'orphan type-library geometry must not be drawn alongside it');
   });
+});
+
+// Cold loads must not cut an invisible drawing merely because the user's
+// persisted 3D-overlay preference is enabled. These exercise the real cutter.
+type DrawingInputs = Omit<Parameters<typeof useDrawingGeneration>[0],
+  'drawing' | 'setDrawing' | 'setDrawingStatus' | 'setDrawingProgress' | 'setDrawingError'>;
+
+const OVERLAY_OPTIONS: DrawingInputs['displayOptions'] = {
+  showHiddenLines: false, useSymbolicRepresentations: false, show3DOverlay: true,
+  scale: 50, showConstructionProjection: false,
+};
+
+async function drawingActivityHarness(initial: Partial<DrawingInputs> = {}, strict = false, renderCanvas = false) {
+  let inputs: DrawingInputs = {
+    geometryResult: null,
+    ifcDataStore: null,
+    sectionPlane: { axis: 'down', position: 50, flipped: false },
+    displayOptions: OVERLAY_OPTIONS,
+    typeVisibility: { spaces: true, spatialZones: true, openings: true, virtualElements: true, site: true, ifcAnnotations: true },
+    combinedHiddenIds: new Set(), combinedIsolatedIds: null, computedIsolatedIds: null,
+    models: new Map([['m0', { id: 'm0', visible: true }]]),
+    panelVisible: false, activeTool: 'select',
+    ...initial,
+  };
+  let published: Drawing2D | null = null;
+  const publications: Set<number>[] = [];
+  let starts = 0;
+  let run: (() => Promise<void>) | undefined;
+  let regenerate: (() => Promise<void>) | undefined;
+  let repaint: (() => void) | undefined;
+  const status = (value: 'idle' | 'generating' | 'ready' | 'error') => {
+    if (value === 'generating') starts++;
+    if (renderCanvas) useViewerStore.setState({ drawing2DStatus: value });
+  };
+  const noop = () => {};
+  function Harness({ value }: { value: DrawingInputs }) {
+    const [drawing, setLocalDrawing] = useState<Drawing2D | null>(null);
+    const [panX, setPanX] = useState(100);
+    const publish = useCallback((next: Drawing2D | null) => {
+      published = next;
+      if (next) publications.push(entityIds(next));
+      if (renderCanvas) useViewerStore.setState({ drawing2D: next });
+      setLocalDrawing(next);
+    }, []);
+    const { generateDrawing, doRegenerate } = useDrawingGeneration({
+      ...value, drawing, setDrawing: publish, setDrawingStatus: status,
+      setDrawingProgress: noop, setDrawingError: noop,
+    });
+    run = generateDrawing;
+    regenerate = doRegenerate;
+    repaint = () => setPanX((value) => value + 1);
+    return renderCanvas ? <TooltipProvider>
+      {drawing ? <Drawing2DCanvas
+        drawing={drawing}
+        transform={{ x: panX, y: 100, scale: 10 }}
+        showHiddenLines={false}
+        overrideEngine={new GraphicOverrideEngine()}
+        overridesEnabled={false}
+        entityColorMap={new Map()}
+        useIfcMaterials={false}
+        sectionAxis="down"
+      /> : null}
+      <BCFPanel onClose={() => {}} />
+    </TooltipProvider> : null;
+  }
+  const container = document.createElement('div');
+  document.body.appendChild(container);
+  const root = createRoot(container);
+  const update = async (patch: Partial<DrawingInputs>) => {
+    inputs = { ...inputs, ...patch };
+    await act(async () => {
+      const view = <Harness value={inputs} />;
+      root.render(strict ? <StrictMode>{view}</StrictMode> : view);
+    });
+  };
+  await update({});
+  return {
+    update,
+    async activateSectionThenOpenPanel() {
+      await act(async () => {
+        inputs = { ...inputs, activeTool: 'section' };
+        flushSync(() => root.render(<Harness value={inputs} />));
+        assert.equal(starts, 1, 'section activation begins the real generation');
+        assert.equal(published, null, 'exercise panel opening while generation is in flight');
+        inputs = { ...inputs, panelVisible: true };
+        flushSync(() => root.render(<Harness value={inputs} />));
+        assert.equal(starts, 1, 'panel auto-opening must reuse the in-flight section drawing');
+      });
+    },
+    async replaceGeometryInFlight() {
+      await act(async () => {
+        for (const id of [100, 200, 300]) {
+          inputs = { ...inputs, geometryResult: activityGeometry(id), panelVisible: true };
+          flushSync(() => root.render(<Harness value={inputs} />));
+          assert.equal(starts, 1, 'PR #3921: geometry changes queue behind the running cut');
+        }
+      });
+    },
+    async replaceAfterCutStarted(started: Promise<void>, release: () => void) {
+      await act(async () => {
+        inputs = { ...inputs, geometryResult: activityGeometry(), panelVisible: true };
+        flushSync(() => root.render(<Harness value={inputs} />));
+        await started;
+        try {
+          inputs = { ...inputs, geometryResult: activityGeometry(400) };
+          flushSync(() => root.render(<Harness value={inputs} />));
+          assert.equal(starts, 1, 'new input must wait for the running generator');
+        } finally { release(); }
+      });
+    },
+    get publications() { return publications; },
+    get drawing() { return published; },
+    get starts() { return starts; },
+    get canvas() { return container.querySelector('canvas'); },
+    get captureButton() {
+      return container.querySelector<HTMLButtonElement>('[aria-label="Capture current 2D section as viewpoint"]');
+    },
+    async generate() { await act(async () => { assert.ok(run); await run(); }); },
+    regenerate() { assert.ok(regenerate); return regenerate(); },
+    async repaintCanvas() { await act(async () => { assert.ok(repaint); repaint(); }); },
+    async dispose() { await act(async () => root.unmount()); container.remove(); },
+  };
+}
+
+function activityGeometry(firstId = 100) {
+  return geometry([
+    box(firstId, 'IfcWall', 0, [0, 0, 0], [2, 3, 0.2]),
+    box(firstId + 1, 'IfcWall', 0, [4, 0, 0], [6, 3, 0.2]),
+  ], [6, 3, 0.2]);
+}
+
+describe('useDrawingGeneration active drawing demand', () => {
+  it('shares one generation when section activation auto-opens the panel', async () => {
+    const h = await drawingActivityHarness();
+    try {
+      await h.update({ geometryResult: activityGeometry() });
+      await h.activateSectionThenOpenPanel();
+      assert.equal(h.starts, 1);
+      assert.deepEqual(entityIds(h.drawing), new Set([100, 101]));
+      await h.update({ panelVisible: false });
+      await h.update({ panelVisible: true });
+      assert.equal(h.starts, 1, 'opening a second consumer of the finished drawing also needs no duplicate');
+      await h.update({ geometryResult: activityGeometry(200) });
+      assert.equal(h.starts, 2, 'same-count geometry replacement remains a real input change');
+      assert.deepEqual(entityIds(h.drawing), new Set([200, 201]));
+    } finally { await h.dispose(); }
+  });
+  it('does no automatic cutting during a normal load with the overlay preference enabled', async () => {
+    const h = await drawingActivityHarness();
+    try {
+      await h.update({ geometryResult: activityGeometry() });
+      await h.update({ geometryResult: activityGeometry(200), sectionPlane: { axis: 'down', position: 25, flipped: false } });
+      assert.equal(h.starts, 0, 'an invisible section must not begin generating');
+      assert.equal(h.drawing, null);
+      await h.generate();
+      assert.equal(h.starts, 1, 'explicit generation/export remains available while hidden');
+      assert.deepEqual(entityIds(h.drawing), new Set([200, 201]));
+    } finally { await h.dispose(); }
+  });
+
+  it('generates when the panel opens even with the overlay disabled', async () => {
+    const h = await drawingActivityHarness();
+    try {
+      await h.update({ geometryResult: activityGeometry(), displayOptions: { ...OVERLAY_OPTIONS, show3DOverlay: false } });
+      assert.equal(h.starts, 0);
+      await h.update({ panelVisible: true });
+      assert.equal(h.starts, 1);
+      assert.deepEqual(entityIds(h.drawing), new Set([100, 101]));
+    } finally { await h.dispose(); }
+  });
+
+  it('generates for an active section overlay as geometry arrives and respects its toggle', async () => {
+    const h = await drawingActivityHarness();
+    try {
+      await h.update({ activeTool: 'section' });
+      assert.equal(h.starts, 0, 'section activation without geometry does no cutting');
+      await h.update({ geometryResult: activityGeometry() });
+      assert.equal(h.starts, 1);
+      assert.deepEqual(entityIds(h.drawing), new Set([100, 101]));
+      await h.update({ displayOptions: { ...OVERLAY_OPTIONS, show3DOverlay: false } });
+      await h.update({ geometryResult: activityGeometry(200) });
+      assert.equal(h.starts, 1, 'disabled overlay with closed panel does no cutting');
+      await h.update({ displayOptions: OVERLAY_OPTIONS });
+      assert.equal(h.starts, 2);
+      assert.deepEqual(entityIds(h.drawing), new Set([200, 201]));
+    } finally { await h.dispose(); }
+  });
+
+  for (const activation of ['panel', 'section'] as const) {
+    it(`refreshes hidden input changes when the ${activation} becomes active again`, async () => {
+      const h = await drawingActivityHarness();
+      try {
+        const on = activation === 'panel' ? { panelVisible: true } : { activeTool: 'section' };
+        await h.update({ geometryResult: activityGeometry(), ...on });
+        assert.deepEqual(entityIds(h.drawing), new Set([100, 101]));
+        await h.update({ panelVisible: false, activeTool: 'select' });
+        const starts = h.starts;
+        await h.update({
+          geometryResult: activityGeometry(300), // same mesh count, different model input
+          combinedHiddenIds: new Set([300]),
+          sectionPlane: { axis: 'down', position: 25, flipped: false },
+        });
+        assert.equal(h.starts, starts, 'hidden geometry changes must remain deferred');
+        await h.update(on);
+        assert.equal(h.starts, starts + 1);
+        assert.deepEqual(entityIds(h.drawing), new Set([301]), 'activation must replace stale geometry and honor current visibility');
+      } finally { await h.dispose(); }
+    });
+  }
+});
+
+// PR #3921 review: automatic geometry and filter changes must use current inputs.
+describe('useDrawingGeneration latest inputs (#3921)', () => {
+  it('serializes geometry replacements and coalesces them to the newest real cut', async () => {
+    const h = await drawingActivityHarness();
+    try {
+      await h.replaceGeometryInFlight();
+      assert.equal(h.starts, 2, 'only the running cut and newest replacement run');
+      assert.deepEqual(entityIds(h.drawing), new Set([300, 301]));
+    } finally { await h.dispose(); }
+  });
+
+  it('refreshes active hiding and both isolation inputs without moving the plane', async () => {
+    const h = await drawingActivityHarness();
+    try {
+      await h.update({ geometryResult: activityGeometry(), panelVisible: true });
+      await h.update({ combinedHiddenIds: new Set([100]) });
+      assert.deepEqual(entityIds(h.drawing), new Set([101]));
+      await h.update({ combinedHiddenIds: new Set(), combinedIsolatedIds: new Set([100]) });
+      assert.deepEqual(entityIds(h.drawing), new Set([100]));
+      await h.update({ combinedIsolatedIds: null, computedIsolatedIds: new Set([101]) });
+      assert.deepEqual(entityIds(h.drawing), new Set([101]));
+    } finally { await h.dispose(); }
+  });
+
+  it('an active-but-empty computedIsolatedIds isolates nothing, not the whole model', async () => {
+    // `computedIsolatedIds` (ViewportContainer's storey/class/manual-isolation
+    // intersection) is meaningfully nullable: `null`/`undefined` means no
+    // isolation channel is active, while a non-null EMPTY Set means an
+    // isolation channel IS active and matches nothing — the same convention
+    // `packages/renderer/src/entity-visibility.ts`'s `isEntityVisible` and
+    // `shadow-occluders.ts`'s `anyVisible` already enforce.
+    //
+    // Two production routes still reach exactly this shape. `computedIsolatedIds`
+    // is itself an INTERSECTION of every active filter (`ViewportContainer.tsx`
+    // intersects the storey isolation, the Class-tab `classFilter`, and the
+    // `isolatedEntities` store channel), and two non-empty filters that share
+    // no element intersect to a non-null, zero-size Set — a class filter for
+    // doors while a storey containing none of them is selected. Separately,
+    // applying a BCF viewpoint captured with `DefaultVisibility="false"` and no
+    // exceptions installs an active-but-empty `isolatedEntities` through
+    // `useBCF.ts`'s `applyViewpoint` (pinned by
+    // `useBCF.viewpoint-isolation.test.tsx`).
+    const h = await drawingActivityHarness();
+    try {
+      await h.update({ geometryResult: activityGeometry(), panelVisible: true });
+      await h.update({ combinedIsolatedIds: null, computedIsolatedIds: new Set([101]) });
+      assert.deepEqual(entityIds(h.drawing), new Set([101]));
+
+      await h.update({ computedIsolatedIds: new Set() });
+      assert.deepEqual(
+        entityIds(h.drawing),
+        new Set(),
+        'an active empty isolate set must draw nothing, not fall back to the whole model',
+      );
+    } finally { await h.dispose(); }
+  });
+});
+
+// Hold a REAL cutter result at its async boundary, rather than fabricating meshes.
+it('never publishes a superseded cut that completes after replacement (#3921)', async () => {
+  const original = Drawing2DGenerator.prototype.generate;
+  let signal!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>(resolve => { signal = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  let calls = 0;
+  Drawing2DGenerator.prototype.generate = async function (...args) {
+    const first = ++calls === 1;
+    const result = await original.call(this, ...args);
+    if (first) { signal(); await held; }
+    return result;
+  };
+  const h = await drawingActivityHarness();
+  try {
+    await h.replaceAfterCutStarted(started, release);
+    assert.equal(calls, 2);
+    assert.deepEqual(h.publications, [new Set([400, 401])], 'the completed old cut must not publish');
+  } finally {
+    release();
+    Drawing2DGenerator.prototype.generate = original;
+    await h.dispose();
+  }
+});
+
+it('restarts active drawing demand after StrictMode effect cleanup (#3921)', async () => {
+  const h = await drawingActivityHarness({ geometryResult: activityGeometry(), panelVisible: true }, true);
+  try {
+    assert.deepEqual(entityIds(h.drawing), new Set([100, 101]));
+    assert.deepEqual(h.publications, [new Set([100, 101])]);
+  } finally { await h.dispose(); }
+});
+
+it('keeps a repainted production canvas stale until regeneration publishes its replacement (#4802)', async () => {
+  const project = createBCFProject({ name: 'Regeneration capture' });
+  const topic = createBCFTopic({ title: 'Held generation', author: 'reviewer@example.invalid' });
+  project.topics.set(topic.guid, topic);
+  useViewerStore.setState({
+    bcfProject: project,
+    activeTopicId: topic.guid,
+    drawing2DPanelVisible: true,
+    textAnnotation2DEditing: null,
+  });
+  const original = Drawing2DGenerator.prototype.generate;
+  const originalResizeObserver = globalThis.ResizeObserver;
+  const originalWindowResizeObserver = window.ResizeObserver;
+  class ImmediateResizeObserver implements ResizeObserver {
+    constructor(private readonly callback: ResizeObserverCallback) {}
+    observe(target: Element): void {
+      this.callback([{ target, contentRect: { width: 640, height: 480 } } as unknown as ResizeObserverEntry], this);
+    }
+    unobserve(): void {}
+    disconnect(): void {}
+  }
+  Object.defineProperty(globalThis, 'ResizeObserver', { configurable: true, writable: true, value: ImmediateResizeObserver });
+  Object.defineProperty(window, 'ResizeObserver', { configurable: true, writable: true, value: ImmediateResizeObserver });
+  const context = new Proxy({}, {
+    get(_target, property) {
+      if (property === 'measureText') return () => ({ width: 0 });
+      return () => undefined;
+    },
+    set() { return true; },
+  }) as unknown as CanvasRenderingContext2D;
+  mock.method(HTMLCanvasElement.prototype, 'getContext', () => context);
+  let signal!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>(resolve => { signal = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  let h: Awaited<ReturnType<typeof drawingActivityHarness>> | undefined;
+  try {
+    const harness = await drawingActivityHarness({ geometryResult: activityGeometry() }, false, true);
+    h = harness;
+    await harness.generate();
+    await harness.repaintCanvas();
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+    assert.ok(harness.captureButton, 'the production BCF panel exposes 2D capture');
+    assert.equal(harness.captureButton.disabled, false,
+      `the production canvas painted the initial drawing (${harness.canvas?.width}x${harness.canvas?.height}, client ${harness.canvas?.clientWidth}x${harness.canvas?.clientHeight})`);
+    Drawing2DGenerator.prototype.generate = async function (...args) {
+      signal();
+      await held;
+      return original.call(this, ...args);
+    };
+    let pending!: Promise<void>;
+    await act(async () => {
+      pending = harness.regenerate();
+      await started;
+    });
+    assert.equal(harness.captureButton?.disabled, true, 'the old bitmap must be blocked while the new cut is pending');
+    await harness.repaintCanvas();
+    assert.equal(harness.captureButton?.disabled, true, 'panning must not revalidate the old drawing during regeneration');
+    release();
+    await act(async () => pending);
+    assert.equal(harness.captureButton?.disabled, false, 'the completed replacement becomes capturable after its paint');
+  } finally {
+    release();
+    Drawing2DGenerator.prototype.generate = original;
+    Object.defineProperty(globalThis, 'ResizeObserver', { configurable: true, writable: true, value: originalResizeObserver });
+    Object.defineProperty(window, 'ResizeObserver', { configurable: true, writable: true, value: originalWindowResizeObserver });
+    mock.restoreAll();
+    if (h) await h.dispose();
+  }
+});
+
+// #3921: a new coplanar face pick changes the projection origin, not its normal.
+it('refreshes the real cut after a coplanar face pick changes its anchor (#3921)', async () => {
+  const custom: NonNullable<DrawingInputs['sectionPlane']['custom']> = {
+    normal: [0, 1, 0], distance: 1.5, pickedAt: [0, 1.5, 0],
+    tangent: [1, 0, 0], bitangent: [0, 0, 1],
+  };
+  const sectionPlane: DrawingInputs['sectionPlane'] = { axis: 'down', position: 50, flipped: false, custom };
+  const h = await drawingActivityHarness({ geometryResult: activityGeometry(), panelVisible: true, sectionPlane });
+  try {
+    const first = h.drawing;
+    assert.ok(first);
+    const firstX = Math.min(...first.lines.filter(line => line.category === 'cut').map(line => line.line.start.x));
+    assert.ok(Number.isFinite(firstX), 'the fixture must produce real cut lines');
+    await h.update({ sectionPlane: { ...sectionPlane, custom: { ...custom, pickedAt: [5, 1.5, 0] } } });
+    const second = h.drawing;
+    assert.ok(second);
+    const secondX = Math.min(...second.lines.filter(line => line.category === 'cut').map(line => line.line.start.x));
+    assert.equal(second.config.plane.customPlane?.origin.x, 5);
+    assert.equal(secondX, firstX - 5, 'cut coordinates must follow the new in-plane origin');
+    assert.deepEqual(entityIds(second), entityIds(first), 'moving the anchor must not change which solids are cut');
+  } finally { await h.dispose(); }
 });

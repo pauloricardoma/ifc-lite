@@ -14,10 +14,12 @@
  * axes and IfcAnnotation curves render as thin lines.
  *
  * Unlike annotations there is no visibility toggle: alignment lines render
- * whenever a loaded model has alignments. The parse runs once per model source
- * and is cached module-globally, so federated views share one parse per source.
+ * whenever a loaded model has alignments. The parse runs once per source and
+ * exact RTC frame, and is cached module-globally for compatible consumers.
  */
 
+import { displayedTranslation } from '@/lib/model-placement/state';
+import { toRenderTranslation } from '@/lib/model-placement/translation';
 import { useEffect, useMemo, useState } from 'react';
 import { useViewerStore } from '@/store';
 import { useShallow } from 'zustand/react/shallow';
@@ -25,12 +27,18 @@ import type { IfcDataStore } from '@ifc-lite/parser';
 import { sourceKey } from './source-key.js';
 import { hasEntityType } from './has-entity-type.js';
 import { getWholeSourceForWorker, parseOverlayLines } from '@/lib/overlay-parse';
+import { overlayRtcContextFor } from '@/lib/overlay-parse/rtc-context';
+import type { RtcFrame } from '@ifc-lite/geometry';
+import { anchorWorldLineVertices, type RendererLineVertices } from '@/lib/renderer/line-overlay-rte';
 
 const EMPTY_F32 = new Float32Array(0);
 
+/** Renderer-owned local line payload, partitioned when a span exceeds 8,192m. */
+export type AlignmentLines3D = RendererLineVertices;
+
 // ─── Shared parse cache ──────────────────────────────────────────────────────
-// One WASM walk per model source; cached so re-renders (and federated views
-// that share a source) don't re-parse.
+// One WASM walk per source/frame pair; cached so compatible re-renders and
+// federated views don't re-parse.
 const PARSE_CACHE = new Map<string, Float32Array>();
 const PARSE_INFLIGHT = new Map<string, Promise<void>>();
 
@@ -40,7 +48,10 @@ function notifyCacheChange(): void {
   for (const fn of CACHE_LISTENERS) fn();
 }
 
-async function parseAlignmentLinesFor(store: IfcDataStore): Promise<Float32Array> {
+async function parseAlignmentLinesFor(
+  store: IfcDataStore,
+  frame?: RtcFrame,
+): Promise<Float32Array> {
   const source = store.source;
   if (!source || source.byteLength === 0) return EMPTY_F32;
   // Most models (all buildings) have no alignments. Skip the full-source WASM
@@ -49,20 +60,23 @@ async function parseAlignmentLinesFor(store: IfcDataStore): Promise<Float32Array
   if (!hasEntityType(store, 'IfcAlignment', 'IfcAlignmentCurve')) return EMPTY_F32;
   // Off the main thread (#2183): this decodes the whole source and grows a
   // WASM heap that never shrinks. See lib/overlay-parse.
-  const verts = await parseOverlayLines('alignment-lines', getWholeSourceForWorker(store));
+  const verts = await parseOverlayLines('alignment-lines', getWholeSourceForWorker(store), frame);
   return verts.length > 0 ? verts : EMPTY_F32;
 }
 
 function ensureParseFor(stores: IfcDataStore[]): void {
   for (const store of stores) {
-    const key = sourceKey(store);
-    if (!key) continue;
+    const rtc = overlayRtcContextFor(store);
+    if (rtc.mode === 'pending') continue;
+    const source = sourceKey(store);
+    if (!source) continue;
+    const key = `${source}|${rtc.key}`;
     if (PARSE_CACHE.has(key)) continue;
     if (PARSE_INFLIGHT.has(key)) continue;
 
     const promise = (async () => {
       try {
-        const verts = await parseAlignmentLinesFor(store);
+        const verts = await parseAlignmentLinesFor(store, rtc.frame);
         PARSE_CACHE.set(key, verts);
         notifyCacheChange();
       } catch (error) {
@@ -80,19 +94,24 @@ function ensureParseFor(stores: IfcDataStore[]): void {
 }
 
 /** Read the active store set from the viewer store. Federation-aware. */
-function useActiveStores(): IfcDataStore[] {
-  const { models, ifcDataStore } = useViewerStore(
-    useShallow((s) => ({ models: s.models, ifcDataStore: s.ifcDataStore })),
+function useActiveStores(): { id: string; store: IfcDataStore }[] {
+  const { models, ifcDataStore, geometryResult, loading } = useViewerStore(
+    useShallow((s) => ({
+      models: s.models,
+      ifcDataStore: s.ifcDataStore,
+      geometryResult: s.geometryResult,
+      loading: s.loading,
+    })),
   );
   return useMemo(() => {
-    const out: IfcDataStore[] = [];
+    const out: { id: string; store: IfcDataStore }[] = [];
     if (models.size > 0) {
-      for (const [, m] of models) if (m.ifcDataStore) out.push(m.ifcDataStore);
+      for (const [id, m] of models) if (m.ifcDataStore) out.push({ id, store: m.ifcDataStore });
     } else if (ifcDataStore) {
-      out.push(ifcDataStore);
+      out.push({ id: '', store: ifcDataStore });
     }
     return out;
-  }, [models, ifcDataStore]);
+  }, [models, ifcDataStore, geometryResult, loading]);
 }
 
 /**
@@ -101,12 +120,13 @@ function useActiveStores(): IfcDataStore[] {
  * RTC-subtracted, metres). Returns a stable empty array when no model carries
  * an alignment. Always parses (no toggle) — see the file header.
  */
-export function useAlignmentLines3D(): Float32Array {
+export function useAlignmentLines3D(): AlignmentLines3D {
   const stores = useActiveStores();
+  const placement = useViewerStore((state) => state.modelPlacement);
   const [version, setVersion] = useState(0);
 
   useEffect(() => {
-    ensureParseFor(stores);
+    ensureParseFor(stores.map(({ store }) => store));
     const listener: CacheListener = () => setVersion((v) => v + 1);
     CACHE_LISTENERS.add(listener);
     return () => {
@@ -116,25 +136,38 @@ export function useAlignmentLines3D(): Float32Array {
 
   return useMemo(() => {
     void version; // depend on parse-completion ticks
-    const arrays: Float32Array[] = [];
+    const arrays: { vertices: Float32Array; delta: [number, number, number] }[] = [];
     let total = 0;
-    for (const store of stores) {
-      const key = sourceKey(store);
-      if (!key) continue;
+    for (const { id, store } of stores) {
+      const rtc = overlayRtcContextFor(store);
+      if (rtc.mode === 'pending') continue;
+      const source = sourceKey(store);
+      if (!source) continue;
+      const key = `${source}|${rtc.key}`;
       const cached = PARSE_CACHE.get(key);
       if (cached && cached.length > 0) {
-        arrays.push(cached);
+        const delta = toRenderTranslation(displayedTranslation(placement, id));
+        arrays.push({ vertices: cached, delta });
         total += cached.length;
       }
     }
     if (total === 0) return EMPTY_F32;
-    if (arrays.length === 1) return arrays[0];
-    const merged = new Float32Array(total);
-    let offset = 0;
-    for (const a of arrays) {
-      merged.set(a, offset);
-      offset += a.length;
+    // Anchor all source frames before Float32 materialisation. A conditional
+    // world-f32 fast path would reintroduce a precision cliff above the 8,192m
+    // normal-site envelope. Source deltas are subtracted in f64 so a 15.625 mm
+    // placement residual survives the line upload. A camera cannot render
+    // arbitrarily separated sources in one RTE frame, and the renderer
+    // deliberately rejects such an invalid frame.
+    const world: number[] = [];
+    for (const { vertices, delta } of arrays) {
+      for (let i = 0; i < vertices.length; i++) {
+        world.push(vertices[i] + delta[i % 3]);
+      }
     }
-    return merged;
-  }, [stores, version]);
+    const directLocal = world.every((coordinate) => Math.abs(coordinate) <= 8_192)
+      && world.every((coordinate, index) => index % 6 < 3
+        || Math.abs(coordinate - world[index - 3]) <= 8_192);
+    if (directLocal) return new Float32Array(world);
+    return anchorWorldLineVertices(world);
+  }, [stores, version, placement]);
 }

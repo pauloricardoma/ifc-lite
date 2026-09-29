@@ -4,13 +4,13 @@
 
 /**
  * Ribbon rendering of the export registry: the File tab's Export group. Every
- * button is generated from `EXPORT_COMMANDS`, so the ribbon cannot fall behind
- * the classic strip — see `toolbar/export-commands.ts`.
+ * button is generated from `EXPORT_COMMANDS`, the single format/order/gating
+ * registry — see `toolbar/export-commands.ts`.
  *
  * The icon set arrives as a prop rather than being imported here: the ribbon's
  * icons come from `@/icons`, which resolves through the `unplugin-icons` Vite
  * plugin and therefore cannot be loaded by the node test runner. Injecting it
- * keeps this component renderable in `export-ui-parity.test.tsx`, while the
+ * keeps this component renderable in `export-ui-ribbon.test.tsx`, while the
  * real set (`RIBBON_EXPORT_ICONS`) stays exhaustive at the type level.
  */
 
@@ -22,13 +22,14 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
+import { useTranslation } from '@/i18n';
 import {
   groupExportCommands,
   type CsvExportType,
   type ExportIconSet,
 } from '../../toolbar/export-commands';
 import { useExportCommands, type ResolvedExportCommand } from '../../toolbar/useExportCommands';
-import { RibbonGroup, RibbonLargeButton, RibbonSmallButton, RibbonSmallStack } from '../primitives';
+import { RibbonGroup, RibbonContentLargeButton, RibbonContentSmallButton, RibbonSmallStack } from '../primitives';
 
 interface RibbonExportButtonProps extends ResolvedExportCommand {
   icons: ExportIconSet;
@@ -43,18 +44,21 @@ function RibbonExportButton({
   onExportCsv,
   onRunAction,
 }: RibbonExportButtonProps) {
-  const Button = command.emphasis === 'large' ? RibbonLargeButton : RibbonSmallButton;
+  const { t } = useTranslation();
+  const Button = command.emphasis === 'large' ? RibbonContentLargeButton : RibbonContentSmallButton;
   const shared = {
     icon: icons[command.id],
-    label: command.label,
-    tooltip: command.tooltip,
+    contentLabel: t(command.labelKey),
+    contentSource: 'export' as const,
+    contentId: command.id,
+    tooltip: t(command.tooltipKey),
     disabled,
     'data-export-command': command.id,
   };
 
   if (command.kind === 'dialog') {
     const { Dialog } = command;
-    return <Dialog trigger={<Button {...shared} />} />;
+    return <Dialog surface="ribbon" trigger={<Button {...shared} />} />;
   }
 
   if (command.kind === 'table-menu') {
@@ -70,7 +74,7 @@ function RibbonExportButton({
               {item.separatorBefore && <DropdownMenuSeparator />}
               <DropdownMenuItem onClick={() => onExportCsv(item.type)}>
                 <Icon className="h-4 w-4 mr-2" />
-                {item.label}
+                {t(item.labelKey)}
               </DropdownMenuItem>
             </React.Fragment>
           ))}
@@ -89,11 +93,14 @@ function RibbonExportButton({
  * parsed data store for the table exports.
  */
 export function RibbonExportGroup({ icons }: { icons: ExportIconSet }) {
-  const { commands, handleExportCSV, runExportAction } = useExportCommands();
+  const { t } = useTranslation();
+  const {
+    commands, handleExportCSV, runExportAction, extensionExporters, extensionExportRunning, runExtensionExporter,
+  } = useExportCommands('ribbon');
   const groups = groupExportCommands(commands, (resolved) => resolved.command.group);
 
   return (
-    <RibbonGroup label="Export">
+    <RibbonGroup label={t('ribbon.file.exportGroup')}>
       {groups.map((group) => {
         const buttons = group.map((resolved) => (
           <RibbonExportButton
@@ -111,6 +118,24 @@ export function RibbonExportGroup({ icons }: { icons: ExportIconSet }) {
           <RibbonSmallStack key={group[0].command.id}>{buttons}</RibbonSmallStack>
         );
       })}
+      {/* Extension exporters (#5838): stacks of three, like every small group. */}
+      {groupExportCommands(extensionExporters, (_, index) => Math.floor(index / 3)).map((stack) => (
+        <RibbonSmallStack key={stack[0].key}>
+          {stack.map((exporter) => (
+            <RibbonContentSmallButton
+              key={exporter.key}
+              icon={icons.extension}
+              contentSource="extension"
+              contentId={exporter.key}
+              contentLabel={exporter.name}
+              tooltip={exporter.extension}
+              disabled={extensionExportRunning}
+              data-export-extension={exporter.key}
+              onClick={() => void runExtensionExporter(exporter.key)}
+            />
+          ))}
+        </RibbonSmallStack>
+      ))}
     </RibbonGroup>
   );
 }

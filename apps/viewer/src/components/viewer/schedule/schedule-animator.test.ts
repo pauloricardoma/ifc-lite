@@ -34,7 +34,7 @@ function makeTask(overrides: Partial<ScheduleTaskInfo>): ScheduleTaskInfo {
 }
 
 function makeSchedule(tasks: ScheduleTaskInfo[]): ScheduleExtraction {
-  return { hasSchedule: true, workSchedules: [], sequences: [], tasks };
+  return { hasSchedule: true, workCalendars: [], workSchedules: [], sequences: [], tasks };
 }
 
 // Tests exercise the colour pipeline, which requires at least one
@@ -238,7 +238,7 @@ describe('computeAnimationFrame — style / flag behaviour', () => {
 
   it('style=minimal still removes demolished products after their task finishes', () => {
     const demo: ScheduleExtraction = {
-      hasSchedule: true, workSchedules: [], sequences: [],
+      hasSchedule: true, workCalendars: [], workSchedules: [], sequences: [],
       tasks: [{
         expressId: 0, globalId: 'd', name: 'Demo', isMilestone: false,
         predefinedType: 'DEMOLITION', childGlobalIds: [],

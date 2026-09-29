@@ -5,7 +5,7 @@
 //! Core element processing: resolving representations, processing items, and caching.
 
 use super::transforms::{instancing_enabled, mat4_to_row_major};
-use super::GeometryRouter;
+use super::{GeometryProcessor, GeometryRouter};
 use crate::{Error, InstanceMeta, Mesh, Result, SubMeshCollection};
 
 /// High tag bit distinguishing direct-solid rep_identity (a 128-bit local-mesh
@@ -17,7 +17,7 @@ const DIRECT_SOLID_TAG: u128 = 1u128 << 127;
 
 /// Row-major 4x4 identity; placeholder `InstanceMeta::transform` before the
 /// element's world placement is folded in by `apply_placement`.
-const IDENTITY_ROW_MAJOR: [f64; 16] = [
+pub(crate) const IDENTITY_ROW_MAJOR: [f64; 16] = [
     1.0, 0.0, 0.0, 0.0, //
     0.0, 1.0, 0.0, 0.0, //
     0.0, 0.0, 1.0, 0.0, //
@@ -25,12 +25,108 @@ const IDENTITY_ROW_MAJOR: [f64; 16] = [
 ];
 use ifc_lite_core::{DecodedEntity, EntityDecoder, IfcType};
 use rustc_hash::FxHashSet;
+use std::rc::Rc;
 use std::sync::Arc;
 
 // Maximum nested IfcMappedItem depth for a single geometry item. Shared with
 // `ifc_lite_processing::element` and the wasm styling colour resolver, which
 // walk the same chain; the constant's own docs say why they must agree.
 use ifc_lite_core::MAX_MAPPED_ITEM_DEPTH;
+
+/// The nearest f32 that does not shrink the interval: rounds a minimum down
+/// and a maximum up, so an f32 box always encloses the f64 geometry.
+pub(super) fn enclosing_f32(value: f64, is_min: bool) -> f32 {
+    let rounded = value as f32;
+    match (is_min, (rounded as f64).partial_cmp(&value)) {
+        (true, Some(std::cmp::Ordering::Greater)) => rounded.next_down(),
+        (false, Some(std::cmp::Ordering::Less)) => rounded.next_up(),
+        _ => rounded,
+    }
+}
+
+/// Publish object-frame `local_bounds` for a mesh rebased by `offset`
+/// (metres, item frame). No-op for an empty mesh.
+///
+/// Public bounds stay in the pre-RTC object frame (the contract
+/// `local_to_world` pairs with), reconstituted from the rebased f32 positions
+/// in f64 and then rounded OUTWARD to the enclosing f32 box: at a 5,000,000 m
+/// offset the f32 ULP is 0.5 m, so a 0.125 m face would otherwise round both
+/// faces onto one value and publish a zero extent (#5026 review).
+fn publish_object_frame_bounds(mesh: &mut Mesh, offset: (f64, f64, f64)) {
+    if mesh.positions.is_empty() {
+        return;
+    }
+    let rebased = mesh_bounds(mesh);
+    let offset = [offset.0, offset.1, offset.2];
+    let mut bounds = [0.0f32; 6];
+    for axis in 0..3 {
+        let min = rebased[axis] as f64 + offset[axis];
+        let max = rebased[axis + 3] as f64 + offset[axis];
+        bounds[axis] = enclosing_f32(min, true);
+        bounds[axis + 3] = enclosing_f32(max, false);
+        if max > min && bounds[axis + 3] <= bounds[axis] {
+            bounds[axis + 3] = bounds[axis].next_up();
+        }
+    }
+    mesh.local_bounds = Some(bounds);
+}
+
+fn mesh_bounds(mesh: &Mesh) -> [f32; 6] {
+    let mut bounds = [
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+    ];
+    for point in mesh.positions.chunks_exact(3) {
+        for axis in 0..3 {
+            bounds[axis] = bounds[axis].min(point[axis]);
+            bounds[axis + 3] = bounds[axis + 3].max(point[axis]);
+        }
+    }
+    bounds
+}
+
+fn union_bounds(accumulator: &mut Option<[f32; 6]>, incoming: [f32; 6]) {
+    if let Some(bounds) = accumulator {
+        for axis in 0..3 {
+            bounds[axis] = bounds[axis].min(incoming[axis]);
+            bounds[axis + 3] = bounds[axis + 3].max(incoming[axis + 3]);
+        }
+    } else {
+        *accumulator = Some(incoming);
+    }
+}
+
+/// Which source hygiene an element's meshes get before placement (#5313).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum SourceHygiene {
+    /// [`Mesh::clean_degenerate_watertight`]: drops slivers without opening a
+    /// T-junction. The default for output meshes.
+    Watertight,
+    /// [`Mesh::clean_degenerate`]: drops slivers, indices only. For meshes that
+    /// are about to be boolean operands (void hosts, opening cutters): moving
+    /// those inputs changed the cut on ~20 void hosts of the public corpus, so
+    /// it is a separate, measured change.
+    IndexOnly,
+}
+
+impl SourceHygiene {
+    /// `self`, downgraded to `IndexOnly` while the router is told to keep
+    /// triangle order (see `GeometryRouter::set_preserve_triangle_order`).
+    fn for_router(self, router: &GeometryRouter) -> Self {
+        if router.preserve_triangle_order.get() { Self::IndexOnly } else { self }
+    }
+
+    fn apply(self, mesh: &mut Mesh) {
+        match self {
+            Self::Watertight => mesh.clean_degenerate_watertight(),
+            Self::IndexOnly => mesh.clean_degenerate(),
+        }
+    }
+}
 
 impl GeometryRouter {
     /// Process building element (IfcWall, IfcBeam, etc.) into mesh
@@ -41,6 +137,17 @@ impl GeometryRouter {
         &self,
         element: &DecodedEntity,
         decoder: &mut EntityDecoder,
+    ) -> Result<Mesh> {
+        self.process_element_with_hygiene(element, decoder, SourceHygiene::Watertight)
+    }
+
+    /// [`Self::process_element`] with an explicit [`SourceHygiene`]; the void
+    /// path passes `IndexOnly` for hosts and cutters.
+    pub(super) fn process_element_with_hygiene(
+        &self,
+        element: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+        hygiene: SourceHygiene,
     ) -> Result<Mesh> {
         // IfcAlignment carries its directrix curve in a dedicated `Axis`
         // attribute (IFC4X1) instead of (or in addition to) a normal
@@ -87,6 +194,8 @@ impl GeometryRouter {
 
         // Process all representations and merge meshes
         let mut combined_mesh = Mesh::new();
+        let mut rebased_mesh = Mesh::new();
+        let mut captured_local_bounds: Option<[f32; 6]> = None;
 
         // Instancing: an element is cleanly shareable only when its whole body is
         // exactly ONE representation item that itself carried instance metadata
@@ -96,46 +205,36 @@ impl GeometryRouter {
         let mut single_instance_meta: Option<InstanceMeta> = None;
         let mut instanceable_item_count: usize = 0;
 
-        // First pass: check if we have any direct geometry representations
-        // This prevents duplication when both direct and MappedRepresentation exist
-        let has_direct_geometry = representations.iter().any(|rep| {
-            rep.ifc_type == IfcType::IfcShapeRepresentation
-                && super::effective_rep_type(rep)
-                    .map(super::is_direct_body_representation)
-                    .unwrap_or(false)
-        });
-
-        for shape_rep in representations {
-            if shape_rep.ifc_type != IfcType::IfcShapeRepresentation {
-                continue;
-            }
-
-            // Check the effective representation type (RepresentationType, falling
-            // back to RepresentationIdentifier when the type is blank - #1661).
-            // Skip 'Axis', 'Curve2D', 'FootPrint', etc. - only process 'Body', 'SweptSolid', 'Brep', etc.
-            if let Some(rep_type) = super::effective_rep_type(&shape_rep) {
-                // Skip MappedRepresentation if we already have direct geometry
-                // This prevents duplication when an element has both direct and mapped representations
-                if rep_type == "MappedRepresentation" && has_direct_geometry {
-                    continue;
-                }
-
-                // Only process solid/surface geometry representations
-                if !super::is_body_representation(rep_type) {
-                    continue; // Skip non-solid representations like 'Axis', 'Curve2D', etc.
-                }
-            }
-
+        // Body representations only ('Axis', 'FootPrint', 'Box' are skipped), and
+        // a MappedRepresentation is skipped when direct geometry duplicates it.
+        for shape_rep in super::meshed_representations(element, &representations) {
             // Get items list (attribute 3)
             let items_attr = shape_rep.get(3).ok_or_else(|| {
                 Error::geometry("IfcShapeRepresentation missing Items".to_string())
             })?;
 
             let items = decoder.resolve_ref_list(items_attr)?;
+            let fill_only = super::annotation::is_fill_only_representation(element, shape_rep);
 
             // Process each representation item
             for item in items {
-                let mesh = self.process_representation_item(&item, decoder)?;
+                let mesh = if element.ifc_type == IfcType::IfcAnnotation
+                    && item.ifc_type == IfcType::IfcAnnotationFillArea
+                {
+                    self.process_annotation_fill(&item, decoder)?
+                } else if fill_only {
+                    continue; // symbolic annotation item, never meshed (#5389)
+                } else if let Some(mesh) =
+                    self.process_raw_item_for_element(&item, element, decoder)?
+                {
+                    mesh
+                } else {
+                    self.process_representation_item(&item, decoder)?
+                };
+                if !mesh.positions.is_empty() {
+                    let bounds = mesh.local_bounds.unwrap_or_else(|| mesh_bounds(&mesh));
+                    union_bounds(&mut captured_local_bounds, bounds);
+                }
                 if instancing_enabled() && !mesh.positions.is_empty() {
                     instanceable_item_count += 1;
                     single_instance_meta = if instanceable_item_count == 1 {
@@ -144,8 +243,18 @@ impl GeometryRouter {
                         None
                     };
                 }
-                combined_mesh.merge(&mesh);
+                // #5684: early f64 processors and ordinary f32 processors can
+                // return different RTC frames. Merge only like frames until
+                // placement has brought both into the world/RTC frame.
+                if mesh.rtc_applied {
+                    rebased_mesh.merge(&mesh);
+                } else {
+                    combined_mesh.merge(&mesh);
+                }
             }
+        }
+        if combined_mesh.positions.is_empty() {
+            std::mem::swap(&mut combined_mesh, &mut rebased_mesh);
         }
 
         // Re-attach single-item instance metadata so apply_placement can fold the
@@ -153,17 +262,26 @@ impl GeometryRouter {
         if instancing_enabled() {
             combined_mesh.instance_meta = single_instance_meta;
         }
+        combined_mesh.local_bounds = captured_local_bounds;
 
-        // Mesh hygiene before placement (rigid transform preserves geometry, so
-        // welding/dropping in local coords is identical and uses smaller f32
-        // magnitudes). Single chokepoint downstream of every per-item branch,
-        // incl. CSG output — restores the cleanup #1024 lost with Manifold:
-        // redundant/coincident source vertices that otherwise triangulate into
-        // visible needle spikes and jagged silhouettes. See clean_degenerate.
-        combined_mesh.clean_degenerate();
+        // Source-triangle hygiene before placement (rigid transforms preserve
+        // degeneracy, while the element-local frame retains more f32 precision).
+        // This is the merged-mesh router's choke point: downstream facet weld /
+        // refinement passes canonicalize geometry but do not replace this input
+        // cleanup or promise hygienic output. See `SourceHygiene` (#5313).
+        // Cut-created candidates require separate, path-specific handling. See
+        // #4797.
+        hygiene.for_router(self).apply(&mut combined_mesh);
 
         // Apply placement transformation
         self.apply_placement(element, decoder, &mut combined_mesh)?;
+        if !rebased_mesh.positions.is_empty() {
+            hygiene.for_router(self).apply(&mut rebased_mesh);
+            self.apply_placement(element, decoder, &mut rebased_mesh)?;
+            // Mesh::merge accounts for each mesh's f64 origin. Keep the local
+            // bucket's origin so a distant raw item cannot quantize it early.
+            combined_mesh.merge(&rebased_mesh);
+        }
 
         Ok(combined_mesh)
     }
@@ -183,7 +301,7 @@ impl GeometryRouter {
         // (`process_element_with_submeshes_and_voids`) calls the impl below with
         // `allow_instancing = false` — a voided occurrence must materialize its cut
         // geometry, never instance an un-cut shared template.
-        self.process_element_with_submeshes_impl(element, decoder, true, None)
+        self.process_element_with_submeshes_impl(element, decoder, true, None, SourceHygiene::Watertight)
     }
 
     /// [`Self::process_element_with_submeshes`] with an explicit don't-bake gate.
@@ -200,6 +318,7 @@ impl GeometryRouter {
         texture_index: Option<
             &rustc_hash::FxHashMap<u32, crate::processors::texture::ResolvedTextureMap>,
         >,
+        hygiene: SourceHygiene,
     ) -> Result<SubMeshCollection> {
         // If a material-layer buildup is attached, try slicing single-solid
         // elements (walls / slabs with IfcMaterialLayerSetUsage) first so each
@@ -242,40 +361,48 @@ impl GeometryRouter {
 
         let mut sub_meshes = SubMeshCollection::new();
 
-        // Check if we have direct geometry
-        let has_direct_geometry = representations.iter().any(|rep| {
-            rep.ifc_type == IfcType::IfcShapeRepresentation
-                && super::effective_rep_type(rep)
-                    .map(super::is_direct_body_representation)
-                    .unwrap_or(false)
-        });
-
-        for shape_rep in representations {
-            if shape_rep.ifc_type != IfcType::IfcShapeRepresentation {
-                continue;
-            }
-
-            if let Some(rep_type) = super::effective_rep_type(&shape_rep) {
-                // Skip MappedRepresentation if we have direct geometry
-                if rep_type == "MappedRepresentation" && has_direct_geometry {
-                    continue;
-                }
-
-                // Only process solid/surface geometry representations
-                if !super::is_body_representation(rep_type) {
-                    continue;
-                }
-            }
-
+        for shape_rep in super::meshed_representations(element, &representations) {
             // Get items list (attribute 3)
             let items_attr = shape_rep.get(3).ok_or_else(|| {
                 Error::geometry("IfcShapeRepresentation missing Items".to_string())
             })?;
 
             let items = decoder.resolve_ref_list(items_attr)?;
+            let fill_only = super::annotation::is_fill_only_representation(element, shape_rep);
 
             // Process each representation item, preserving geometry IDs
             for item in items {
+                if element.ifc_type == IfcType::IfcAnnotation
+                    && item.ifc_type == IfcType::IfcAnnotationFillArea
+                {
+                    sub_meshes.add(item.id, self.process_annotation_fill(&item, decoder)?);
+                    continue;
+                }
+                if fill_only {
+                    continue; // symbolic annotation item, never meshed (#5389)
+                }
+                // A textured face set keeps its UV channel (#1781) and, like
+                // any raw item, rebases in its own frame (#5698). A failed
+                // textured build falls through to the untextured paths.
+                // A terrain TIN is a face set that only appends `Flags` (#5942).
+                let texture = texture_index
+                    .and_then(|index| index.get(&item.id))
+                    .filter(|_| matches!(
+                        item.ifc_type,
+                        IfcType::IfcTriangulatedFaceSet | IfcType::IfcTriangulatedIrregularNetwork
+                    ));
+                if let Some(map) = texture {
+                    let offset = self.element_frame_rtc(element, decoder)?;
+                    if self.add_textured_face_set(&item, decoder, map, offset, &mut sub_meshes) {
+                        continue;
+                    }
+                }
+                if let Some(mesh) = self.process_raw_item_for_element(&item, element, decoder)? {
+                    if !mesh.is_empty() {
+                        sub_meshes.add(item.id, mesh);
+                    }
+                    continue;
+                }
                 self.collect_submeshes_from_item(
                     &item,
                     decoder,
@@ -286,13 +413,19 @@ impl GeometryRouter {
             }
         }
 
-        // Mesh hygiene before placement — same chokepoint as process_element,
-        // applied per sub-mesh for the multi-item (per-style) channel. Rigid
-        // placement preserves geometry, so order is immaterial. (The layered
-        // and textured channels are cleaned at their own sites:
-        // try_layered_sub_meshes and process_representation_map_with_texture.)
+        // Source-triangle hygiene before placement — the per-style counterpart
+        // to `process_element`'s choke point. Facet canonicalizers downstream do
+        // not replace this cleanup or promise hygienic output; cut-created
+        // candidates require path-specific handling. Positions are never
+        // removed, so unreferenced ones may remain. See `SourceHygiene`
+        // (#5313); a textured sub-mesh stays `IndexOnly` because an appended
+        // apex vertex would desynchronise its parallel UV array. The layered
+        // and textured early-return channels clean at their own sites and are
+        // not switched (#5313 left them unmeasured). See #4797.
         for sub in &mut sub_meshes.sub_meshes {
-            sub.mesh.clean_degenerate();
+            let own =
+                if sub.uvs.is_some() { SourceHygiene::IndexOnly } else { hygiene.for_router(self) };
+            own.apply(&mut sub.mesh);
         }
 
         self.apply_submesh_placement(&mut sub_meshes, element, decoder)?;
@@ -470,6 +603,15 @@ impl GeometryRouter {
             // after the normal materialize below (see the retag after the loop).
             let mapped_items_start = sub_meshes.len();
 
+            // One scope for this source's walk. It covers the loop below AND the
+            // recursion beneath it: an unsupported item of this source is dropped
+            // one level down, by the plain-item arm at the end of this function,
+            // not by the loop here — so a gate written at this loop's own drop
+            // site would never see the case it exists for. Body-only, and once
+            // per source rather than once per occurrence; see
+            // `GeometryRouter::enter_unsupported_source`.
+            let _drop_scope = self.enter_unsupported_source(source_id, &mapped_repr);
+
             // Get items from the mapped representation
             if let Some(items_attr) = mapped_repr.get(3) {
                 let items = decoder.resolve_ref_list(items_attr)?;
@@ -487,6 +629,7 @@ impl GeometryRouter {
                         false,
                         texture_index,
                     ) {
+                        self.record_unsupported_item(nested_item.ifc_type.clone());
                         crate::diag::diag_debug!(
                             { item_id = nested_item.id, ifc_type = ?nested_item.ifc_type,
                               error = %_e, "skipping unsupported nested geometry item" }
@@ -563,17 +706,12 @@ impl GeometryRouter {
             // the occurrence path renders its image like the type-geometry path
             // (#961) always did. Bypasses the content-dedup cache — the cached
             // mesh has no UV channel, and UVs are per-face-set anyway. Falls
-            // through to the plain path if the textured build fails.
-            if item.ifc_type == IfcType::IfcTriangulatedFaceSet {
-                if let Some(map) = texture_index.and_then(|ti| ti.get(&item.id)) {
-                    let proc = crate::processors::TriangulatedFaceSetProcessor::new();
-                    if let Ok((mut mesh, uvs)) = proc.process_with_texture(item, decoder, map) {
-                        if !mesh.is_empty() {
-                            self.scale_mesh(&mut mesh); // UVs are unaffected by scale
-                            sub_meshes.add_textured(item.id, mesh, uvs, map.attachment());
-                            return Ok(());
-                        }
-                    }
+            // through to the plain path if the textured build fails. A nested
+            // (mapped) face set rebases in the model frame (#5698).
+            if let Some(map) = texture_index.and_then(|ti| ti.get(&item.id)) {
+                if self.add_textured_face_set(item, decoder, map, Some(self.rtc_offset), sub_meshes)
+                {
+                    return Ok(());
                 }
             }
             // Regular geometry item - process and record with its ID
@@ -585,6 +723,7 @@ impl GeometryRouter {
                     }
                 }
                 Err(_e) => {
+                    self.record_unsupported_item(item.ifc_type.clone());
                     crate::diag::diag_debug!(
                         { item_id = item.id, ifc_type = ?item.ifc_type, error = %_e,
                           "skipping unsupported geometry item" }
@@ -617,6 +756,201 @@ impl GeometryRouter {
         item: &DecodedEntity,
         decoder: &mut EntityDecoder,
     ) -> Result<Mesh> {
+        // Every path below (mapped-item cache, dedup-cache hit, uncached
+        // build) can trip the thread-local curve-capped flag (#4901) -- a
+        // mapped source walks its own processors directly
+        // (`process_mapped_item_cached`), bypassing the inline drain this
+        // function used to have right after the uncached build, which left a
+        // capped edge inside a mapped item unreported AND the flag still set
+        // for whichever unrelated item happened to be processed next
+        // (Macroscope review). Draining exactly ONCE here, around every
+        // path, keeps the flag scoped to the item that actually set it,
+        // regardless of which branch below produced (or skipped) new work.
+        self.process_representation_item_in_frame(item, decoder, self.rtc_offset)
+    }
+
+    /// [`Self::process_representation_item`] with the model RTC offset
+    /// expressed in the item's own frame (`offset_meters`, #5698), so an
+    /// element-frame rebase shares the content-dedup cache and direct-solid
+    /// instancing of the model-frame path.
+    fn process_representation_item_in_frame(
+        &self,
+        item: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+        offset_meters: (f64, f64, f64),
+    ) -> Result<Mesh> {
+        let result = self.process_representation_item_body(item, decoder, offset_meters);
+        if crate::processors::take_curve_capped() {
+            self.record_unsupported_item(IfcType::IfcBSplineCurveWithKnots);
+        }
+        result
+    }
+
+    /// Mesh a raw-coordinate item (tessellated, Brep, surface model or
+    /// direct face) in an element-local RTC frame.
+    ///
+    /// Model RTC is world-space; subtracting it directly from object-space
+    /// coordinates is only correct for an identity placement. Pull the RTC
+    /// vector through the placement's inverse linear transform so the later
+    /// placement produces `M(p) - rtc` for rotated/scaled elements as well.
+    /// `None` when the item is not a raw-coordinate item beyond the RTC
+    /// threshold; the ordinary item path then handles it.
+    pub(in crate::router) fn process_raw_item_for_element(
+        &self,
+        item: &DecodedEntity,
+        element: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+    ) -> Result<Option<Mesh>> {
+        if !self.has_rtc_offset()
+            || !self
+                .representation_item_first_vertex_meters(item, decoder)
+                .is_some_and(crate::coord_is_large)
+        {
+            return Ok(None);
+        }
+        if self.processors.get(&item.ifc_type, self.schema).is_none() {
+            return Ok(None);
+        }
+        let Some(offset) = self.element_frame_rtc(element, decoder)? else {
+            return Ok(None);
+        };
+        // The ordinary item path, in the element's frame: it keeps content
+        // dedup and direct-solid instancing (keyed by the offset), and a
+        // declined rebase is decided in the right frame too (#5684).
+        self.process_representation_item_in_frame(item, decoder, offset).map(Some)
+    }
+
+    /// The model RTC offset expressed in `element`'s object frame (metres):
+    /// pulled through the placement's inverse linear transform, so placing
+    /// a mesh rebased by it yields `M(p) - rtc`. `None` for a singular
+    /// placement, where no object-frame offset exists.
+    fn element_frame_rtc(
+        &self,
+        element: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+    ) -> Result<Option<(f64, f64, f64)>> {
+        let mut placement = self.get_placement_transform_from_element(element, decoder)?;
+        self.scale_transform(&mut placement);
+        let linear = placement.fixed_view::<3, 3>(0, 0).into_owned();
+        Ok(linear.try_inverse().map(|inverse| {
+            let rtc = inverse
+                * nalgebra::Vector3::new(self.rtc_offset.0, self.rtc_offset.1, self.rtc_offset.2);
+            (rtc.x, rtc.y, rtc.z)
+        }))
+    }
+
+    /// Add a textured `IfcTriangulatedFaceSet` as its own UV-carrying
+    /// sub-mesh (#1781), rebased by `offset_meters` (item frame) when that
+    /// preserves precision (#5698). `false` when the textured build fails or
+    /// is empty, so the caller falls through to the plain path.
+    fn add_textured_face_set(
+        &self,
+        item: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+        map: &crate::processors::texture::ResolvedTextureMap,
+        offset_meters: Option<(f64, f64, f64)>,
+        sub_meshes: &mut SubMeshCollection,
+    ) -> bool {
+        // A terrain TIN is a face set that only appends `Flags` (#5942).
+        if !matches!(item.ifc_type, IfcType::IfcTriangulatedFaceSet | IfcType::IfcTriangulatedIrregularNetwork) {
+            return false;
+        }
+        let rtc = offset_meters.and_then(|offset| {
+            self.raw_item_rtc_file_units(item, decoder, offset)
+                .zip(Some(offset))
+        });
+        let proc = crate::processors::TriangulatedFaceSetProcessor::new();
+        let Ok((mut mesh, uvs)) = proc.process_with_texture_rebased(
+            item,
+            decoder,
+            map,
+            rtc.map(|(file_units, _)| file_units),
+        ) else {
+            return false;
+        };
+        if mesh.is_empty() {
+            return false;
+        }
+        self.scale_mesh(&mut mesh); // UVs are unaffected by scale
+        if let Some((_, offset)) = rtc {
+            publish_object_frame_bounds(&mut mesh, offset);
+        }
+        sub_meshes.add_textured(item.id, mesh, uvs, map.attachment());
+        true
+    }
+
+    /// Mesh one item, rebasing it by `offset_meters` (model RTC expressed in
+    /// the item's own coordinate frame) before f32 narrowing.
+    ///
+    /// The rebase runs only when it reduces the item's coordinate magnitude
+    /// (#5684: site-local vertices kilometres from a national-grid site must
+    /// stay local) and the processor implements
+    /// [`GeometryProcessor::process_in_rtc_frame`]. Every built-in
+    /// raw-coordinate processor does; they subtract in f64 so detail below one
+    /// f32 ULP at national-grid magnitude survives (#5698). Otherwise the
+    /// ordinary output keeps its object frame and final placement applies RTC
+    /// in f64: shifting already-f32 output cannot recover precision.
+    ///
+    /// Returns the unit-scaled mesh. A rebased mesh carries `rtc_applied`
+    /// and object-frame `local_bounds`.
+    fn process_item_in_rtc_frame(
+        &self,
+        processor: &dyn GeometryProcessor,
+        item: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+        offset_meters: (f64, f64, f64),
+    ) -> Result<Mesh> {
+        let rebased = self
+            .raw_item_rtc_file_units(item, decoder, offset_meters)
+            .and_then(|rtc_file_units| {
+                processor.process_in_rtc_frame(
+                    item,
+                    decoder,
+                    self.schema,
+                    self.tessellation_quality,
+                    rtc_file_units,
+                )
+            });
+        let rtc_applied = rebased.is_some();
+        let mut mesh = match rebased {
+            Some(result) => result?,
+            None => processor.process(item, decoder, self.schema, self.tessellation_quality)?,
+        };
+        // Safety net: strip any out-of-bounds indices before downstream use
+        mesh.validate_indices();
+        self.scale_mesh(&mut mesh);
+        if rtc_applied {
+            publish_object_frame_bounds(&mut mesh, offset_meters);
+        }
+        Ok(mesh)
+    }
+
+    /// `offset_meters` in file units when rebasing `item` by it before f32
+    /// narrowing reduces the item's coordinate magnitude; `None` when there
+    /// is no model RTC or the item is not raw-coordinate geometry (#5684).
+    fn raw_item_rtc_file_units(
+        &self,
+        item: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+        offset_meters: (f64, f64, f64),
+    ) -> Option<(f64, f64, f64)> {
+        (self.has_rtc_offset()
+            && self.representation_item_benefits_from_rtc(item, decoder, offset_meters))
+        .then(|| {
+            (
+                offset_meters.0 / self.unit_scale,
+                offset_meters.1 / self.unit_scale,
+                offset_meters.2 / self.unit_scale,
+            )
+        })
+    }
+
+    fn process_representation_item_body(
+        &self,
+        item: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+        offset_meters: (f64, f64, f64),
+    ) -> Result<Mesh> {
         // MappedItem has its own instancing cache (the source representation is
         // already shared), so it never enters the structural-hash path. It also
         // sets its own instance_meta, so the direct-solid tagging below is skipped.
@@ -627,9 +961,10 @@ impl GeometryRouter {
         // `None` ⇒ dedup disabled (no hash overhead). On a hit, clone the cached
         // item mesh and stamp its STORED rep_identity (no per-occurrence re-hash);
         // meshing is skipped entirely.
-        let dedup_key = self.item_dedup_key(item, decoder);
+        let dedup_key = self.item_dedup_key_in_frame(item, decoder, offset_meters);
         if let (Some(key), Some(cache)) = (dedup_key, self.item_dedup_cache.as_ref()) {
             let hit = cache
+                .meshes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&key)
@@ -640,7 +975,48 @@ impl GeometryRouter {
             }
         }
 
-        let mesh = self.process_representation_item_uncached(item, decoder)?;
+        // #4083 (double-count half only — see the module-level cross-reference
+        // below): snapshot the item's processor's own failure log BEFORE the
+        // uncached build, so any record it adds during THIS call can be
+        // attributed to `dedup_key` and, if a racing router sharing this cache
+        // already claimed that key, retracted below. `None` when the item's
+        // type has no registered processor (nothing to snapshot, nothing to
+        // retract) or dedup is disabled (`dedup_key` is `None`).
+        let failure_mark = dedup_key.and_then(|_| {
+            self.processors
+                .get(&item.ifc_type, self.schema)
+                .map(|p| p.bool_failure_count())
+        });
+
+        // The curve-capped flag (#4901) is drained by the public
+        // `process_representation_item` wrapper around this whole function,
+        // not here — see its doc comment for why (mapped items bypass this
+        // uncached path entirely).
+        let mesh = self.process_representation_item_uncached(item, decoder, offset_meters)?;
+
+        // If this call's processor recorded anything new, decide whether THIS
+        // router keeps it: the item-dedup cache's `diagnostic_claimed` set
+        // (shared with every router built from the same
+        // `enable_content_dedup_shared` cache) lets exactly one racing router
+        // keep the diagnostic for one `item_dedup_key`; every other one
+        // retracts its own copy of the same logical operation's record.
+        //
+        // Fixes ONLY the double-count half of #4083: two racing MISSES each
+        // computing (and each initially recording) the same tear now collapse
+        // to one record. Does NOT fix the omission half — a cache HIT never
+        // reaches this code at all (it returns early above, before
+        // `process_representation_item_uncached` runs), so it still reports
+        // zero diagnostics regardless of what the warm MISS recorded.
+        if let (Some(key), Some(before), Some(cache)) =
+            (dedup_key, failure_mark, self.item_dedup_cache.as_ref())
+        {
+            if let Some(processor) = self.processors.get(&item.ifc_type, self.schema) {
+                if processor.bool_failure_count() > before && !cache.claim_diagnostic(key) {
+                    processor.truncate_bool_failures_to(before);
+                }
+            }
+        }
+
         // Compute the instancing rep_identity ONCE for this unique shape so cache
         // hits can reuse it instead of re-hashing the full mesh per occurrence.
         let rep = self.direct_rep_identity(&mesh);
@@ -660,6 +1036,7 @@ impl GeometryRouter {
                 // single-Mutex critical section serializes the pool on every miss.
                 let cached = Arc::new((mesh.clone(), rep));
                 cache
+                    .meshes
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(key, cached);
@@ -703,149 +1080,20 @@ impl GeometryRouter {
         mesh
     }
 
-    /// Cache key for an item: its structural hash combined with the router params
-    /// that change the meshed output (tessellation quality / unit scale / RTC), or
-    /// `None` when dedup is disabled (skips the hash walk so disabled = zero
-    /// overhead). The quality fold is what keeps `setTessellationQuality` correct —
-    /// the shared cache persists across quality changes on a worker, so the key
-    /// must distinguish them (#976).
-    fn item_dedup_key(&self, item: &DecodedEntity, decoder: &mut EntityDecoder) -> Option<u128> {
-        self.item_dedup_cache.as_ref()?;
-        // Dedup the geometry types whose repeated instances dominate real models:
-        // IfcFacetedBrep (tessellated steel) AND the procedural boolean/extrusion
-        // hot path (clipped beams/columns — IfcBooleanResult /
-        // IfcBooleanClippingResult / IfcExtrudedAreaSolid). #1177 had restricted
-        // this to IfcFacetedBrep because the structural hash re-decoded the subtree
-        // per item; it is now memoized (`content_sig_memo`), so shared subtrees
-        // (the same cutter/profile referenced by hundreds of parts) are hashed once
-        // and the dedup is a measured net win, byte-identical: a 20 MB boolean-clip
-        // steel model (170_KM) drops geometry 16.4 s → 2.8 s (5.8×), and procedural
-        // arch models improve too (advanced_model 3.1×, ISSUE_068 1.7×) with no
-        // regression on the tested corpus. The IfcMappedItem instancing cache is a
-        // separate path, always on.
-        let base = matches!(
-            item.ifc_type,
-            IfcType::IfcFacetedBrep
-                | IfcType::IfcBooleanResult
-                | IfcType::IfcBooleanClippingResult
-                | IfcType::IfcExtrudedAreaSolid
-        );
-        // Additive, flagged OFF by default: faceset / surface-model families. Their
-        // generic byte signature (`sig_walk_bytes`) is already complete; gated so a
-        // low-reuse model never pays the hash for no payback (the #1177 trap).
-        let extra = Self::build_dedup_extra_enabled()
-            && matches!(
-                item.ifc_type,
-                IfcType::IfcPolygonalFaceSet
-                    | IfcType::IfcTriangulatedFaceSet
-                    | IfcType::IfcShellBasedSurfaceModel
-                    | IfcType::IfcFaceBasedSurfaceModel
-            );
-        if !(base || extra) {
-            return None;
-        }
-        // Skip the hash walk entirely for a faceted BREP too large for dedup to
-        // ever pay off (#1909): `try_faceted_brep_signature` mirrors the
-        // mesher's own face/bound/loop/point traversal, so on a huge one-off
-        // BREP (a single ~2.5M-triangle import, no sibling item to match) the
-        // hash is a full second traversal with zero possible payback — it
-        // measured ~30s where the equivalent web-ifc load took ~2.85s, almost
-        // entirely this walk. The face-count probe is a cheap O(faces) prefix
-        // of the same walk (shell ref + face list, no per-point decode), so
-        // bailing here costs nothing extra. Below the threshold (Tekla-style
-        // small repeated parts, the case this cache exists for) behavior is
-        // unchanged. Skipping this pre-mesh cache does NOT disable dedup for a
-        // genuinely repeated large BREP: the post-mesh `get_or_cache_by_hash`
-        // (sampled, O(1) regardless of mesh size) and the instancing
-        // `rep_identity` (`direct_rep_identity`, computed unconditionally after
-        // meshing) both still run, so repeated large geometry still collapses
-        // to one GPU-instanced template — it just re-meshes each occurrence
-        // instead of skipping the mesh on a cache hit.
-        if item.ifc_type == IfcType::IfcFacetedBrep {
-            if let Some(face_count) = super::content_hash::faceted_brep_face_count(decoder, item.id) {
-                if face_count > super::content_hash::FACETED_BREP_DEDUP_FACE_LIMIT {
-                    return None;
-                }
-            }
-        }
-        let structural = {
-            let mut memo = self.content_sig_memo.borrow_mut();
-            super::content_hash::item_signature(decoder, item.id, &mut memo)
-        };
-        Some(super::content_hash::key_with_params(
-            structural,
-            self.tessellation_quality.to_index(),
-            self.unit_scale,
-            self.rtc_offset,
-        ))
-    }
-
     /// The meshing body of [`Self::process_representation_item`] (everything except
     /// the MappedItem path and the content-dedup wrapper).
     fn process_representation_item_uncached(
         &self,
         item: &DecodedEntity,
         decoder: &mut EntityDecoder,
+        offset_meters: (f64, f64, f64),
     ) -> Result<Mesh> {
-        // For raw world-coordinate FacetedBrep with RTC: subtract RTC from f64
-        // coordinates BEFORE f32 conversion. Do not use this path for ordinary
-        // local Breps whose large position comes from IfcObjectPlacement; those
-        // are shifted uniformly during the final world transform.
-        if item.ifc_type == IfcType::IfcFacetedBrep
-            && self.has_rtc_offset()
-            && self.representation_item_uses_raw_large_coordinates(item, decoder)
-        {
-            let processor = crate::processors::FacetedBrepProcessor::new();
-            let rtc_file_units = (
-                self.rtc_offset.0 / self.unit_scale,
-                self.rtc_offset.1 / self.unit_scale,
-                self.rtc_offset.2 / self.unit_scale,
-            );
-            let mut mesh =
-                processor.process_with_rtc(item, decoder, &self.schema, rtc_file_units)?;
-            mesh.validate_indices();
-            self.scale_mesh(&mut mesh);
-            // Mark positions as already RTC-shifted by setting a flag
-            // (positions are small values near origin, not world-space)
-            if !mesh.positions.is_empty() {
-                let cached = self.get_or_cache_by_hash(mesh);
-                return Ok((*cached).clone());
-            }
-            return Ok(mesh);
-        }
-
-        // Check if we have a processor for this type
-        if let Some(processor) = self.processors.get(&item.ifc_type) {
-            let mut mesh =
-                processor.process(item, decoder, &self.schema, self.tessellation_quality)?;
-            // Safety net: strip any out-of-bounds indices before downstream use
-            mesh.validate_indices();
-
-            // For raw world-coordinate meshes: apply RTC before unit scaling
-            // to avoid jitter from f32 truncation at world-space scale.
-            // This covers FaceBasedSurface, ShellBasedSurface, and any other
-            // processor that stores raw world-space coordinates as f32.
-            if self.has_rtc_offset()
-                && !mesh.rtc_applied
-                && !mesh.positions.is_empty()
-                && self.representation_item_uses_raw_large_coordinates(item, decoder)
-            {
-                // Positions are in file units (pre-scale). RTC offset is in meters.
-                // Convert RTC to file units for consistent subtraction.
-                let rtc_fu = (
-                    self.rtc_offset.0 / self.unit_scale,
-                    self.rtc_offset.1 / self.unit_scale,
-                    self.rtc_offset.2 / self.unit_scale,
-                );
-                for chunk in mesh.positions.chunks_exact_mut(3) {
-                    chunk[0] = (chunk[0] as f64 - rtc_fu.0) as f32;
-                    chunk[1] = (chunk[1] as f64 - rtc_fu.1) as f32;
-                    chunk[2] = (chunk[2] as f64 - rtc_fu.2) as f32;
-                }
-                mesh.rtc_applied = true;
-            }
-
-            self.scale_mesh(&mut mesh);
+        // Raw-coordinate items rebase in the model frame here; element
+        // walkers take `process_raw_item_for_element` first for their own
+        // items, so this frame matters for mapped and opening items.
+        if let Some(processor) = self.processors.get(&item.ifc_type, self.schema) {
+            let mesh =
+                self.process_item_in_rtc_frame(processor.as_ref(), item, decoder, offset_meters)?;
 
             // Deduplicate by hash - buildings with repeated floors have identical geometry
             if !mesh.positions.is_empty() {
@@ -867,252 +1115,6 @@ impl GeometryRouter {
         )))
     }
 
-    /// Process MappedItem with caching for repeated geometry
-    #[inline]
-    pub(super) fn process_mapped_item_cached(
-        &self,
-        item: &DecodedEntity,
-        decoder: &mut EntityDecoder,
-    ) -> Result<Mesh> {
-        let mut visited = FxHashSet::default();
-        let mut truncated = false;
-        self.process_mapped_item_cached_inner(item, decoder, 0, &mut visited, &mut truncated)
-    }
-
-    /// Recursion body of [`Self::process_mapped_item_cached`]. `depth`/`visited`
-    /// bound the walk exactly as [`Self::collect_submeshes_from_item_inner`]
-    /// does, so a malformed model with a cyclic (or absurdly deep) mapped-item
-    /// chain terminates instead of overflowing the stack.
-    ///
-    /// `truncated` is set when this level's mesh is missing geometry a bound cut
-    /// off — either a nested item whose error this level swallowed, or a nested
-    /// item that was itself truncated. The caller ORs it into its own, so the
-    /// flag reaches every enclosing level whose merged mesh is short.
-    fn process_mapped_item_cached_inner(
-        &self,
-        item: &DecodedEntity,
-        decoder: &mut EntityDecoder,
-        depth: usize,
-        visited: &mut FxHashSet<u32>,
-        truncated: &mut bool,
-    ) -> Result<Mesh> {
-        if depth >= MAX_MAPPED_ITEM_DEPTH as usize {
-            return Err(Error::geometry(format!(
-                "MappedItem nesting exceeded maximum depth of {} at #{}",
-                MAX_MAPPED_ITEM_DEPTH, item.id
-            )));
-        }
-        if !visited.insert(item.id) {
-            return Err(Error::geometry(format!(
-                "Detected cyclic IfcMappedItem reference at #{}",
-                item.id
-            )));
-        }
-        let result = self.process_mapped_item_cached_body(item, decoder, depth, visited, truncated);
-        visited.remove(&item.id);
-        result
-    }
-
-    fn process_mapped_item_cached_body(
-        &self,
-        item: &DecodedEntity,
-        decoder: &mut EntityDecoder,
-        depth: usize,
-        visited: &mut FxHashSet<u32>,
-        truncated: &mut bool,
-    ) -> Result<Mesh> {
-        // IfcMappedItem attributes:
-        // 0: MappingSource (IfcRepresentationMap)
-        // 1: MappingTarget (IfcCartesianTransformationOperator)
-
-        // Get mapping source (RepresentationMap)
-        let source_attr = item
-            .get(0)
-            .ok_or_else(|| Error::geometry("MappedItem missing MappingSource".to_string()))?;
-
-        let source_entity = decoder
-            .resolve_ref(source_attr)?
-            .ok_or_else(|| Error::geometry("Failed to resolve MappingSource".to_string()))?;
-
-        let source_id = source_entity.id;
-
-        // MappingTarget (attr 1) composed over the map's MappingOrigin (attr 0),
-        // which applies innermost. #1985
-        let mapping_transform = self.mapped_item_transform(item, &source_entity, decoder)?;
-
-        // Check cache first. The model-wide shared cache (#1623) takes precedence
-        // over the per-router RefCell fallback so a source shared across owning
-        // elements is meshed once model-wide (a fresh router — hence a fresh
-        // RefCell — is built per element). Only a brief get/clone runs under the
-        // shared lock; the source build below (which nests faceted-brep's rayon
-        // `par_iter`) runs OUTSIDE any lock, so a lock is never held across a nested
-        // join (the #1587 deadlock class).
-        let cached_source: Option<Arc<Mesh>> = match &self.shared_mapped_item_cache {
-            Some(shared) => shared
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&source_id)
-                .cloned(),
-            None => self.mapped_item_cache.borrow().get(&source_id).cloned(),
-        };
-        if let Some(cached_mesh) = cached_source {
-            let mut mesh = cached_mesh.as_ref().clone();
-            let mut local_rm = None;
-            if let Some(mut transform) = mapping_transform {
-                self.scale_transform(&mut transform);
-                if instancing_enabled() {
-                    local_rm = Some(mat4_to_row_major(&transform));
-                }
-                self.transform_mesh_local(&mut mesh, &transform);
-            }
-            // Instancing: all occurrences of this RepresentationMap share the
-            // cached source-coords geometry; `local_transform` is the mapping
-            // (canonical -> element-local), `transform` is filled later by the
-            // element's apply_placement (element-local -> world).
-            if instancing_enabled() {
-                mesh.instance_meta = Some(InstanceMeta {
-                    transform: IDENTITY_ROW_MAJOR,
-                    local_transform: local_rm,
-                    canonical_transform: None,
-                    rep_identity: source_id as u128,
-                    instanceable: true,
-                });
-            }
-            return Ok(mesh);
-        }
-
-        // Cache miss - process the geometry
-        // IfcRepresentationMap has:
-        // 0: MappingOrigin (IfcAxis2Placement)
-        // 1: MappedRepresentation (IfcRepresentation)
-
-        let mapped_rep_attr = source_entity.get(1).ok_or_else(|| {
-            Error::geometry("RepresentationMap missing MappedRepresentation".to_string())
-        })?;
-
-        let mapped_rep = decoder
-            .resolve_ref(mapped_rep_attr)?
-            .ok_or_else(|| Error::geometry("Failed to resolve MappedRepresentation".to_string()))?;
-
-        // Get representation items
-        let items_attr = mapped_rep
-            .get(3)
-            .ok_or_else(|| Error::geometry("Representation missing Items".to_string()))?;
-
-        let items = decoder.resolve_ref_list(items_attr)?;
-
-        // Process all items and merge. A nested MappedItem recurses (bounded by
-        // `depth`/`visited` above) — it used to be skipped outright, which
-        // silently dropped its geometry. The recursive call returns an
-        // already-scaled mesh with its own MappingTarget baked in, so composing
-        // this level's (scaled) transform over the merge below is the same
-        // algebra `collect_submeshes_from_item_inner` applies per sub-mesh.
-        let mut mesh = Mesh::new();
-        // Set when a bound cut this level's mesh short (see the shared-cache guard
-        // below); ORed into the caller's flag on the way out.
-        let mut level_truncated = false;
-        for sub_item in items {
-            if sub_item.ifc_type == IfcType::IfcMappedItem {
-                match self.process_mapped_item_cached_inner(
-                    &sub_item,
-                    decoder,
-                    depth + 1,
-                    visited,
-                    &mut level_truncated,
-                ) {
-                    Ok(sub_mesh) => mesh.merge(&sub_mesh),
-                    Err(_e) => {
-                        level_truncated = true;
-                        crate::diag::diag_debug!(
-                            { item_id = sub_item.id, error = %_e,
-                              "skipping nested IfcMappedItem" }
-                            else {
-                                #[cfg(debug_assertions)]
-                                eprintln!(
-                                    "[ifc-lite] Skipping nested IfcMappedItem #{}: {}",
-                                    sub_item.id, _e
-                                );
-                            }
-                        );
-                    }
-                }
-                continue;
-            }
-            if let Some(processor) = self.processors.get(&sub_item.ifc_type) {
-                if let Ok(mut sub_mesh) =
-                    processor.process(&sub_item, decoder, &self.schema, self.tessellation_quality)
-                {
-                    sub_mesh.validate_indices();
-                    self.scale_mesh(&mut sub_mesh);
-                    mesh.merge(&sub_mesh);
-                }
-            }
-        }
-        // The merge above is short, so every enclosing level's is too.
-        *truncated |= level_truncated;
-
-        // Store in cache (before transformation, so cached mesh is in source
-        // coordinates). Shared model-wide cache first (#1623), else the per-router
-        // RefCell. A concurrent miss on the same source by another router rebuilds
-        // an identical source-coords mesh, so an overwrite here is byte-identical.
-        // Brief lock only — the source build above ran outside it (no join held).
-        let source_arc = Arc::new(mesh.clone());
-        match &self.shared_mapped_item_cache {
-            Some(shared) => {
-                // Mirror the item-dedup #1257 guard: a mapped source can contain
-                // IfcBooleanResult/IfcCsgSolid, and on a per-element CSG-budget trip
-                // the boolean bails and returns the UNCUT host. Caching that degraded
-                // source MODEL-WIDE would serve the wrong (uncut) mesh to a later
-                // occurrence in a fresh-budget element that would otherwise get the
-                // full exact cut. Skip the shared insert on a trip (or empty mesh) —
-                // the next occurrence re-meshes and a clean element caches it. The
-                // RefCell fallback arm below stays UNGUARDED: it is per-element
-                // (consistent budget within the element), reproducing main exactly.
-                //
-                // `level_truncated` is the same shape for the nesting bounds this
-                // walk introduced: the depth cap and the visited set depend on where
-                // in the walk the source was reached, which `source_id` does not
-                // encode. A source first met at depth 31 loses everything below it,
-                // and caching that model-wide would serve the short mesh to a later
-                // occurrence reached at depth 0, which would otherwise walk the
-                // whole chain. Non-empty and budget-clean, so only this catches it.
-                if !mesh.positions.is_empty()
-                    && !crate::kernel::budget::tripped()
-                    && !level_truncated
-                {
-                    shared
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(source_id, source_arc);
-                }
-            }
-            None => {
-                self.mapped_item_cache.borrow_mut().insert(source_id, source_arc);
-            }
-        }
-
-        // Apply MappingTarget transformation to this instance
-        let mut local_rm = None;
-        if let Some(mut transform) = mapping_transform {
-            self.scale_transform(&mut transform);
-            if instancing_enabled() {
-                local_rm = Some(mat4_to_row_major(&transform));
-            }
-            self.transform_mesh_local(&mut mesh, &transform);
-        }
-        if instancing_enabled() {
-            mesh.instance_meta = Some(InstanceMeta {
-                transform: IDENTITY_ROW_MAJOR,
-                local_transform: local_rm,
-                        canonical_transform: None,
-                rep_identity: source_id as u128,
-                instanceable: true,
-            });
-        }
-
-        Ok(mesh)
-    }
-
     /// Run an `IfcAlignment` through the dedicated alignment processor, then
     /// apply the standard unit scale + placement transform. Returns `None`
     /// when the alignment has no recognisable directrix curve (the caller
@@ -1122,12 +1124,12 @@ impl GeometryRouter {
         element: &DecodedEntity,
         decoder: &mut EntityDecoder,
     ) -> Result<Option<Mesh>> {
-        let processor = match self.processors.get(&IfcType::IfcAlignment) {
-            Some(p) => Arc::clone(p),
+        let processor = match self.processors.get(&IfcType::IfcAlignment, self.schema) {
+            Some(p) => Rc::clone(p),
             None => return Ok(None),
         };
         let mut mesh =
-            match processor.process(element, decoder, &self.schema, self.tessellation_quality) {
+            match processor.process(element, decoder, self.schema, self.tessellation_quality) {
             Ok(m) => m,
             // Missing Axis or unparseable curve isn't fatal — fall back so
             // the caller can still walk a normal representation if present.
@@ -1140,6 +1142,11 @@ impl GeometryRouter {
         self.scale_mesh(&mut mesh);
         self.apply_placement(element, decoder, &mut mesh)?;
         Ok(Some(mesh))
+    }
+
+    /// Drain refs the content-hash walk refused above `u32::MAX` (#3421/#3752).
+    pub fn take_content_hash_oversized_ref_drops(&self) -> usize {
+        std::mem::take(&mut *self.content_hash_oversized_ref_drops.borrow_mut())
     }
 }
 

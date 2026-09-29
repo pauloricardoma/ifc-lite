@@ -19,19 +19,28 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { ENTITIES_IFC2X3, ENTITIES_IFC4, ENTITIES_IFC4X3, type IfcEntityInfo } from '@ifc-lite/data';
+import { getSchemaRegistryForVersion, type SchemaVersionWithRegistry } from '@ifc-lite/parser';
 import { convertStepLine, type IfcSchemaVersion } from './schema-converter.js';
 
-function table(entities: readonly IfcEntityInfo[]): Map<string, readonly string[]> {
+// Derived from `@ifc-lite/parser`'s EXPRESS-derived schema registries —
+// deliberately NOT from `@ifc-lite/data`'s `ENTITIES_IFC2X3`/`ENTITIES_IFC4`/
+// `ENTITIES_IFC4X3`, which are generated from buildingSMART's vendored C#
+// `SchemaInfo` source and (issue #5204) misfile several IFC4X3-only entities
+// into their IFC4 section — an independently-wrong ground truth would make
+// this file agree with `schema-converter.ts`'s bug instead of catching it.
+function table(version: SchemaVersionWithRegistry): Map<string, readonly string[]> {
+  const registry = getSchemaRegistryForVersion(version);
   const m = new Map<string, readonly string[]>();
-  for (const e of entities) m.set(e.name.toUpperCase(), e.attributes);
+  for (const [name, meta] of Object.entries(registry.entities)) {
+    m.set(name.toUpperCase(), (meta.allAttributes ?? meta.attributes).map((a) => a.name));
+  }
   return m;
 }
 
 const TABLES: Record<string, Map<string, readonly string[]>> = {
-  IFC2X3: table(ENTITIES_IFC2X3),
-  IFC4: table(ENTITIES_IFC4),
-  IFC4X3: table(ENTITIES_IFC4X3),
+  IFC2X3: table('IFC2X3'),
+  IFC4: table('IFC4'),
+  IFC4X3: table('IFC4X3'),
 };
 
 /** True when `short` is a strict prefix of `long` by attribute NAME. */
@@ -56,7 +65,7 @@ function makeLine(type: string, n: number): string {
  * an IFCPROXY placeholder.
  */
 function isDivertedByConversion(type: string, from: IfcSchemaVersion, to: IfcSchemaVersion): boolean {
-  const out = convertStepLine(makeLine(type, 1), from, to);
+  const out = convertStepLine(makeLine(type, 1), from, to)!;
   return !out.startsWith(`#1=${type}(`);
 }
 
@@ -86,7 +95,7 @@ describe.each([
   it('trims every entity whose target form is a strict prefix of the source form', () => {
     const wrong = shrinks
       .map(([type, srcN, tgtN]) => {
-        const got = argCount(convertStepLine(makeLine(type, srcN), from, to));
+        const got = argCount(convertStepLine(makeLine(type, srcN), from, to)!);
         return got === tgtN ? null : `${type}: expected ${tgtN} args, got ${got}`;
       })
       .filter((x): x is string => x !== null);
@@ -96,7 +105,7 @@ describe.each([
   it('never trims an entity whose attributes were inserted mid-list, not appended', () => {
     const wrong = notPrefix
       .map(([type, srcN]) => {
-        const got = argCount(convertStepLine(makeLine(type, srcN), from, to));
+        const got = argCount(convertStepLine(makeLine(type, srcN), from, to)!);
         return got === srcN ? null : `${type}: expected ${srcN} args untouched, got ${got}`;
       })
       .filter((x): x is string => x !== null);
@@ -115,7 +124,7 @@ describe.each([
       const srcAttrs = src.get(type);
       if (!srcAttrs || srcAttrs.length === 0 || srcAttrs.length !== tgtAttrs.length) continue;
       if (isDivertedByConversion(type, from, to)) continue;
-      const got = argCount(convertStepLine(makeLine(type, srcAttrs.length), from, to));
+      const got = argCount(convertStepLine(makeLine(type, srcAttrs.length), from, to)!);
       if (got !== srcAttrs.length) wrong.push(`${type}: expected ${srcAttrs.length} args, got ${got}`);
     }
     expect(wrong).toEqual([]);

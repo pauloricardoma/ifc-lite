@@ -8,9 +8,15 @@ import assert from 'node:assert';
 import type { MapConversion, ProjectedCRS } from '@ifc-lite/parser';
 import type { CoordinateInfo } from '@ifc-lite/geometry';
 
-import { detectDoubleGeoreference, formatApproxDistance, trimFloat } from './double-georeference.js';
+import {
+  detectDoubleGeoreference,
+  exportCorrectionInstruction,
+  formatApproxDistance,
+  overriddenScaleNote,
+  trimFloat,
+} from './double-georeference.js';
 import { effectiveMapConversionForGeometry } from './map-absolute.js';
-import { getEffectiveHorizontalScale } from './geo-scale.js';
+import { getEffectiveAxisScales, getEffectiveHorizontalScale } from './geo-scale.js';
 
 /**
  * Build a CoordinateInfo whose model centre lands on the given IFC world
@@ -72,6 +78,23 @@ const ISSUE_2526_CENTER = { x: 311988.18054, y: 5996148.56499 };
 const METRE_CRS: Pick<ProjectedCRS, 'mapUnitScale'> = { mapUnitScale: 1 };
 
 describe('detectDoubleGeoreference', () => {
+  it('quotes the displacement with IfcMapConversionScaled factors per axis (#4615)', () => {
+    // Metre project and CRS, identity axis, FactorX 2, FactorY 0.5, geometry
+    // already at the anchor: a literal tool puts the centre at
+    // (500000 + 2 * 500000, 5000000 + 0.5 * 5000000), 1 000 km east and
+    // 2 500 km north. One uniform Scale of 1 would quote hypot(500 km, 5 000 km).
+    const conversion: MapConversion = {
+      id: 1, sourceCRS: 2, targetCRS: 3, eastings: 500_000, northings: 5_000_000,
+      orthogonalHeight: 0, xAxisAbscissa: 1, xAxisOrdinate: 0, scale: 1, factorX: 2, factorY: 0.5,
+    };
+    const found = detectDoubleGeoreference(conversion, METRE_CRS, coordInfoAt(500_000, 5_000_000), 1);
+    assert.ok(found, 'expected a double georeference report');
+    assert.ok(
+      Math.abs(found!.displacement - Math.hypot(1_000_000, 2_500_000)) < 1,
+      `displacement ${found!.displacement}`,
+    );
+  });
+
   it('reports the issue #2526 file and quotes the displacement a literal tool would produce', () => {
     const found = detectDoubleGeoreference(
       ISSUE_2526_CONVERSION,
@@ -262,6 +285,103 @@ describe('detectDoubleGeoreference', () => {
       assert.strictEqual(
         getEffectiveHorizontalScale(found!.scaleForExport!, 1, 0.001),
         1,
+      );
+    });
+
+    it('names the IfcMapConversionScaled factors the export must reset (#4675)', () => {
+      // Metre units, Scale 1, FactorX 2 on a doubly georeferenced file. The
+      // guard clears the factors with the Scale, so the value to write back is
+      // FactorX 1. Scale is already the bridge (1 / 1), and quoting only
+      // "Scale to 1" tells the author to set what the file already has.
+      const conversion: MapConversion = { ...ISSUE_2526_CONVERSION, scale: 1, factorX: 2, factorZ: 1 };
+      const found = detectDoubleGeoreference(
+        conversion,
+        METRE_CRS,
+        coordInfoAt(ISSUE_2526_CENTER.x, ISSUE_2526_CENTER.y),
+        1,
+      );
+      assert.ok(found);
+      assert.strictEqual(found!.scaleForExport, 1);
+      assert.deepStrictEqual(found!.factorsForExport, ['FactorX']);
+      assert.strictEqual(
+        exportCorrectionInstruction(found!),
+        'set Eastings and Northings to 0, Angle to Grid North to 0, and Scale to 1, then use Export IFC (with changes).'
+          + ' FactorX is not editable in ifc-lite; set it to 1 in the authoring tool, or the exported file is still scaled by it.',
+      );
+      assert.strictEqual(
+        overriddenScaleNote(found!),
+        'Its Scale and FactorX are not applied either: on map-sized coordinates they would re-scale the model about the map origin.',
+      );
+      // The export written that way reads at 1 on both horizontal axes.
+      const exported = { scale: found!.scaleForExport!, factorX: 1, factorY: conversion.factorY };
+      assert.deepStrictEqual(getEffectiveAxisScales(exported, 1, 1), { x: 1, y: 1, z: 1 });
+    });
+
+    it('names Scale alone when no factor is authored', () => {
+      const scaled: MapConversion = { ...ISSUE_2526_CONVERSION, scale: 1000 };
+      const found = detectDoubleGeoreference(
+        scaled,
+        METRE_CRS,
+        coordInfoAt(ISSUE_2526_CENTER.x, ISSUE_2526_CENTER.y),
+        0.001,
+      );
+      assert.ok(found);
+      assert.deepStrictEqual(found!.factorsForExport, []);
+      assert.strictEqual(
+        exportCorrectionInstruction(found!),
+        'set Eastings and Northings to 0, Angle to Grid North to 0, and Scale to 0.001, then use Export IFC (with changes).',
+      );
+      assert.strictEqual(
+        overriddenScaleNote(found!),
+        'Its Scale is not applied either: on map-sized coordinates it would re-scale the model about the map origin.',
+      );
+      assert.strictEqual(overriddenScaleNote({ scaleForExport: null, factorsForExport: [] }), null);
+    });
+
+    it('names a FactorZ the guard drops even when the horizontal scale is already 1 (#4675)', () => {
+      // Metre units, Scale 1, FactorZ 2: X and Y read 1, so there is no Scale
+      // to write, but the guard clears FactorZ and the viewer draws heights at
+      // 1. Leaving it out, the exported file doubles its heights once the
+      // zeroed anchor stops the guard firing.
+      const conversion: MapConversion = { ...ISSUE_2526_CONVERSION, scale: 1, factorZ: 2 };
+      const found = detectDoubleGeoreference(
+        conversion,
+        METRE_CRS,
+        coordInfoAt(ISSUE_2526_CENTER.x, ISSUE_2526_CENTER.y),
+        1,
+      );
+      assert.ok(found);
+      assert.strictEqual(found!.scaleForExport, null);
+      assert.deepStrictEqual(found!.factorsForExport, ['FactorZ']);
+      assert.strictEqual(
+        exportCorrectionInstruction(found!),
+        'set Eastings and Northings to 0 and Angle to Grid North to 0, then use Export IFC (with changes).'
+          + ' FactorZ is not editable in ifc-lite; set it to 1 in the authoring tool, or the exported file is still scaled by it.',
+      );
+      assert.strictEqual(overriddenScaleNote(found!), 'Its FactorZ is not applied either.');
+    });
+
+    it('asks for the Scale bridge when the factors hide an off Scale (#4675)', () => {
+      // Scale 2 x FactorX/FactorY 0.5 reads 1, but the export resets the
+      // factors to 1, after which Scale 2 alone would draw the file at 2.
+      const conversion: MapConversion = { ...ISSUE_2526_CONVERSION, scale: 2, factorX: 0.5, factorY: 0.5 };
+      const found = detectDoubleGeoreference(
+        conversion,
+        METRE_CRS,
+        coordInfoAt(ISSUE_2526_CENTER.x, ISSUE_2526_CENTER.y),
+        1,
+      );
+      assert.ok(found);
+      assert.strictEqual(found!.scaleForExport, 1);
+      assert.deepStrictEqual(found!.factorsForExport, ['FactorX', 'FactorY']);
+      assert.strictEqual(
+        exportCorrectionInstruction(found!),
+        'set Eastings and Northings to 0, Angle to Grid North to 0, and Scale to 1, then use Export IFC (with changes).'
+          + ' FactorX and FactorY are not editable in ifc-lite; set them to 1 in the authoring tool, or the exported file is still scaled by them.',
+      );
+      assert.strictEqual(
+        exportCorrectionInstruction({ ...found!, scaleForExport: null, factorsForExport: [] }),
+        'set Eastings and Northings to 0 and Angle to Grid North to 0, then use Export IFC (with changes).',
       );
     });
 

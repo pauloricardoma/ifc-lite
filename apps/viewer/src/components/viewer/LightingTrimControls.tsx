@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * WebGPU shading trim controls for the Sun & Sky panel: Exposure, Light
+ * WebGPU shading trim controls for the Environment panel: Exposure, Light
  * hardness and Terminator softness. All three are user trims composed onto the
  * active lighting preset (the preset supplies the base; switching preset
  * changes the base, the trims persist), so they share one control shape — a
@@ -13,6 +13,7 @@
  * by Cesium, so the caller gates this on `!cesiumEnabled`.
  */
 
+import { useId } from 'react';
 import { useViewerStore } from '@/store';
 import { cn } from '@/lib/utils';
 
@@ -24,29 +25,31 @@ function TrimSlider({ label, resetTitle, value, min, max, onChange }: {
   max: number;
   onChange: (value: number) => void;
 }) {
+  const sliderId = useId();
   return (
-    <label className="flex flex-col gap-0.5">
-      <span className="flex justify-between text-[9px] uppercase tracking-wider text-muted-foreground">
-        <span>{label}</span>
+    <div className="flex flex-col gap-0.5">
+      <span className="flex justify-between text-2xs uppercase tracking-wider text-muted-foreground">
+        <label htmlFor={sliderId}>{label}</label>
         <button
           type="button"
           onClick={() => onChange(1)}
           title={resetTitle}
-          className={cn('tabular-nums transition-colors', value !== 1 && 'text-foreground hover:text-teal-600')}
+          className={cn('tabular-nums transition-colors', value !== 1 && 'text-foreground hover:text-primary')}
         >
           {value.toFixed(2)}×
         </button>
       </span>
       <input
+        id={sliderId}
         type="range"
         min={min}
         max={max}
         step={0.05}
         value={value}
         onChange={(e) => onChange(Number(e.target.value))}
-        className="w-full accent-teal-600"
+        className="w-full accent-primary"
       />
-    </label>
+    </div>
   );
 }
 

@@ -27,6 +27,8 @@ export interface SpatialAnchor {
   bodyContextId: number;
   /** IfcGeometricRepresentationSubContext for 'Axis' (or its IfcGeometricRepresentationContext fallback). */
   axisContextId: number;
+  /** Root 3D IfcGeometricRepresentationContext, when resolved; optional for anchors constructed by callers. */
+  rootContextId?: number | null;
   /** The target IfcBuildingStorey expressId. */
   storeyId: number;
   /** The IfcLocalPlacement that the storey itself sits on. New element placements are chained from this. */
@@ -62,11 +64,31 @@ export interface SpatialAnchor {
  * Convert a metre value to the anchor's native length unit for STEP emit.
  * Rounded to 9 decimals to absorb the float noise the division introduces
  * (2.8 / 0.001 = 2799.9999999999995 → 2800).
+ *
+ * Takes only `{ lengthUnitScale }` rather than a full `SpatialAnchor` so
+ * narrower anchor shapes (e.g. `drawing-markup.ts`'s `MarkupAnchor`, which
+ * has no `bodyContextId`/`axisContextId`/`storeyId` — markup geometry has no
+ * use for them) can share this one conversion instead of re-implementing it.
  */
-export function toNativeLength(anchor: SpatialAnchor, metres: number): number {
+export function toNativeLength(anchor: Pick<SpatialAnchor, 'lengthUnitScale'>, metres: number): number {
   const scale = anchor.lengthUnitScale;
   if (!scale || !Number.isFinite(scale) || scale <= 0 || scale === 1) return metres;
   return Math.round((metres / scale) * 1e9) / 1e9;
+}
+
+/**
+ * Inverse of {@link toNativeLength}: convert a value stored in the anchor's
+ * native length unit back to metres. Used by read-side translators (e.g.
+ * `apps/viewer`'s drawing-markup reader) to invert a derived value a writer
+ * scaled with `toNativeLength` before storing it in a quantity set — the
+ * mathematical inverse of that function's rounding rule, kept next to it so
+ * a future change to the rounding constant cannot update one side without
+ * the other.
+ */
+export function fromNativeLength(anchor: Pick<SpatialAnchor, 'lengthUnitScale'>, native: number): number {
+  const scale = anchor.lengthUnitScale;
+  if (!scale || !Number.isFinite(scale) || scale <= 0 || scale === 1) return native;
+  return Math.round(native * scale * 1e9) / 1e9;
 }
 
 /** 2D point variant of {@link toNativeLength}. */
@@ -77,4 +99,32 @@ export function toNativePoint2(anchor: SpatialAnchor, p: readonly [number, numbe
 /** 3D point variant of {@link toNativeLength}. */
 export function toNativePoint3(anchor: SpatialAnchor, p: readonly [number, number, number]): [number, number, number] {
   return [toNativeLength(anchor, p[0]), toNativeLength(anchor, p[1]), toNativeLength(anchor, p[2])];
+}
+
+/** The host an opening voids: which placement frame it is cut in, and how. */
+export type HostKind = 'wall' | 'slab';
+
+/**
+ * Axis-aligned bounds of a host's Body geometry, expressed in the host's own
+ * `ObjectPlacement` frame and the file's native length unit. For a wall that
+ * frame is the usual `X` along the axis, `Y` across the thickness, `Z` up; for
+ * a slab `Z` spans the thickness.
+ */
+export interface HostBounds {
+  min: [number, number, number];
+  max: [number, number, number];
+}
+
+/**
+ * A `SpatialAnchor` for an element that is cut into (or fills an opening in)
+ * an existing host. The storey fields are the HOST's containing storey, so a
+ * filling lands in the same storey as the element it is hosted by.
+ */
+export interface HostAnchor extends SpatialAnchor {
+  hostId: number;
+  hostKind: HostKind;
+  /** The host's own IfcLocalPlacement; openings are placed relative to it. */
+  hostPlacementId: number;
+  /** `null` when the host's Body is not a shape the resolver can bound. */
+  hostBounds: HostBounds | null;
 }

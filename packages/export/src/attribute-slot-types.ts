@@ -48,14 +48,14 @@ import {
   getAttributeNamesAcrossSchemas,
   resolveEntityNameAlias,
 } from '@ifc-lite/parser';
-import { ENTITIES_IFC2X3, ENTITIES_IFC4, ENTITIES_IFC4X3, type IfcEntityInfo } from '@ifc-lite/data';
+import { ENTITIES_IFC2X3, ENTITIES_IFC4_EXPRESS, ENTITIES_IFC4X3, type IfcEntityInfo } from '@ifc-lite/data';
 import { escapeStepString, resolveExpressBase } from './step-serialization.js';
 
 /** Union of every bundled schema, later schemas winning — mirrors the fallback
  *  inside `getAttributeNamesAcrossSchemas` so the two agree on indices. */
 const UNION_BY_UPPER: Map<string, IfcEntityInfo> = (() => {
   const map = new Map<string, IfcEntityInfo>();
-  for (const list of [ENTITIES_IFC2X3, ENTITIES_IFC4, ENTITIES_IFC4X3]) {
+  for (const list of [ENTITIES_IFC2X3, ENTITIES_IFC4_EXPRESS, ENTITIES_IFC4X3]) {
     for (const entity of list) map.set(entity.name.toUpperCase(), entity);
   }
   return map;
@@ -243,13 +243,16 @@ export function serializeEnumToken(value: string): string {
  * only legal tokens are a quoted string and the null/derived markers, so there
  * is nothing to infer.
  *
- * `''`, `$` and `*` keep their existing meaning as those markers — that is
- * unchanged behaviour, and `''` is already the caller's way to clear a value.
+ * `$` and `*` keep their existing meaning as those markers, matching the
+ * source file's own STEP tokens for "unset" and "derived". `''` does NOT fold
+ * into `$`: STEP distinguishes a genuinely empty string (`''`) from an absent
+ * one (`$`), IfcOpenShell preserves that distinction on read, and #4881/#4909
+ * made the read side keep it too. Folding an edited `''` into `$` here made
+ * an explicit empty `IfcLabel`/`IfcText` collapse to absent the moment it was
+ * touched (#4931) — the caller's way to mark an attribute absent is to write
+ * the `$` token itself, not the empty string.
  */
 export function serializeStringSlot(value: string): string {
-  const trimmed = value.trim();
-  if (value === '' || trimmed === '$' || trimmed === '*') {
-    return trimmed === '*' ? '*' : '$';
-  }
+  if (value === '$' || value === '*') return value;
   return `'${escapeStepString(value)}'`;
 }

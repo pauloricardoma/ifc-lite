@@ -4,6 +4,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { generateIfcGuid, isValidIfcGuid, ifcGuidToUuid, uuidToIfcGuid } from '@ifc-lite/encoding';
+import { IfcParser, extractScheduleOnDemand } from '@ifc-lite/parser';
 import { IfcCreator } from './ifc-creator.js';
 
 describe('IfcCreator', () => {
@@ -21,6 +22,14 @@ describe('IfcCreator', () => {
     expect(result.stats.entityCount).toBeGreaterThan(10);
     expect(result.stats.fileSize).toBeGreaterThan(0);
     expect(result.entities.some(e => e.type === 'IfcProject')).toBe(true);
+  });
+
+  it('writes an IfcMonetaryUnit for ProjectParams.Currency (#4856)', () => {
+    const creator = new IfcCreator({ Name: 'Test Project', Currency: 'EUR' });
+    const result = creator.toIfc();
+
+    expect(result.content).toContain('IFCMONETARYUNIT');
+    expect(result.content).toContain("'EUR'");
   });
 
   it('adds a storey and includes it in aggregation', () => {
@@ -334,6 +343,64 @@ describe('IfcCreator', () => {
     expect(result.content).toContain('IFCQUANTITYAREA');
     expect(result.content).toContain('IFCQUANTITYVOLUME');
     expect(result.content).toContain("'Qto_SlabBaseQuantities'");
+
+    // IfcPhysicalSimpleQuantity subtypes (IfcQuantityArea/Volume/…) declare
+    // 5 attributes from IFC4 on: Name, Description, Unit, <Value>, Formula.
+    // Formula is trailing-optional but STEP still requires an explicit `$`
+    // slot for it — a record with only 4 fields is one attribute short of
+    // what the default IFC4 schema declares
+    // (packages/data/src/ifc-schema/generated/entities-ifc4.ts).
+    const areaLine = result.content.split('\n').find(l => l.includes('IFCQUANTITYAREA('));
+    const volumeLine = result.content.split('\n').find(l => l.includes('IFCQUANTITYVOLUME('));
+    expect(areaLine).toMatch(/^#\d+=IFCQUANTITYAREA\('GrossArea',\$,\$,80\.,\$\);$/);
+    expect(volumeLine).toMatch(/^#\d+=IFCQUANTITYVOLUME\('GrossVolume',\$,\$,24\.,\$\);$/);
+  });
+
+  it('attaches quantity sets in IFC2X3 without the Formula attribute', () => {
+    // entities-ifc2x3.ts declares only 4 attributes for IfcQuantityArea/
+    // Volume/…: Name, Description, Unit, <Value> — no Formula (added in
+    // IFC4). A creator targeting IFC2X3 must NOT write the trailing `$`
+    // the IFC4 branch needs, or the record has one attribute too many.
+    const creator = new IfcCreator({ Schema: 'IFC2X3' });
+    const storey = creator.addIfcBuildingStorey({ Name: 'GF', Elevation: 0 });
+    const slabId = creator.addIfcSlab(storey, {
+      Position: [0, 0, 0], Thickness: 0.3, Width: 10, Depth: 8,
+    });
+
+    creator.addIfcElementQuantity(slabId, {
+      Name: 'Qto_SlabBaseQuantities',
+      Quantities: [
+        { Name: 'GrossArea', Value: 80, Kind: 'IfcQuantityArea' },
+        { Name: 'GrossVolume', Value: 24, Kind: 'IfcQuantityVolume' },
+      ],
+    });
+
+    const result = creator.toIfc();
+    const areaLine = result.content.split('\n').find(l => l.includes('IFCQUANTITYAREA('));
+    const volumeLine = result.content.split('\n').find(l => l.includes('IFCQUANTITYVOLUME('));
+    expect(areaLine).toMatch(/^#\d+=IFCQUANTITYAREA\('GrossArea',\$,\$,80\.\);$/);
+    expect(volumeLine).toMatch(/^#\d+=IFCQUANTITYVOLUME\('GrossVolume',\$,\$,24\.\);$/);
+  });
+
+  it('drops the trailing IFC4-only attribute for IfcWall/Column/Beam/RelSequence in IFC2X3', () => {
+    // entities-ifc2x3.ts gives IfcWall/IfcColumn/IfcBeam 8 attributes (no
+    // PredefinedType) and IfcRelSequence 8 (no UserDefinedSequenceType) —
+    // all four gained one trailing attribute only from IFC4 on.
+    const creator = new IfcCreator({ Schema: 'IFC2X3' });
+    const storey = creator.addIfcBuildingStorey({ Name: 'GF', Elevation: 0 });
+    creator.addIfcWall(storey, { Start: [0, 0, 0], End: [5, 0, 0], Thickness: 0.2, Height: 3 });
+    creator.addIfcColumn(storey, { Position: [0, 0, 0], Width: 0.3, Depth: 0.3, Height: 3 });
+    creator.addIfcBeam(storey, { Start: [0, 0, 0], End: [3, 0, 0], Width: 0.2, Height: 0.4 });
+    const t1 = creator.addIfcTask({ Name: 'T1' });
+    const t2 = creator.addIfcTask({ Name: 'T2' });
+    creator.addIfcRelSequence(t1, t2, { UserDefinedSequenceType: 'custom' });
+
+    const result = creator.toIfc();
+    const find = (tag: string) => result.content.split('\n').find(l => l.includes(`${tag}(`));
+    expect(find('IFCWALL')).toMatch(/,\$\);$/);
+    expect(find('IFCCOLUMN')).toMatch(/,\$\);$/);
+    expect(find('IFCBEAM')).toMatch(/,\$\);$/);
+    expect(find('IFCRELSEQUENCE')).toMatch(/,\.FINISH_START\.\);$/);
   });
 
   it('attaches a simple material via IfcRelAssociatesMaterial', () => {
@@ -604,6 +671,136 @@ describe('IfcCreator — scheduling / 4D', () => {
     const t = c.addIfcTask({ Name: 'T' });
     expect(() => c.assignProductsToTask(t, [])).toThrow(/empty/);
     expect(() => c.nestTasks(t, [])).toThrow(/empty/);
+  });
+});
+
+describe('IfcCreator — IfcWorkCalendar (#4830)', () => {
+  /** Parse emitted STEP with the real parser, not a hand-rolled scanner. */
+  async function extractSchedule(content: string) {
+    const bytes = new TextEncoder().encode(content);
+    const store = await new IfcParser().parseColumnar(bytes.buffer as ArrayBuffer);
+    return extractScheduleOnDemand(store);
+  }
+
+  it('emits IFCWORKCALENDAR with its IfcWorkTime / IfcRecurrencePattern / IfcTimePeriod', () => {
+    const c = new IfcCreator();
+    const calId = c.addIfcWorkCalendar({
+      Name: 'Site calendar',
+      Description: 'Five-day week',
+      Identification: 'CAL-1',
+      PredefinedType: 'FIRSTSHIFT',
+      WorkingTimes: [{
+        Name: 'Weekdays',
+        Start: '2024-05-01',
+        Finish: '2024-12-31',
+        RecurrencePattern: {
+          RecurrenceType: 'WEEKLY',
+          WeekdayComponent: [1, 2, 3, 4, 5],
+          Interval: 1,
+          Occurrences: 30,
+          TimePeriods: [{ StartTime: '07:00:00', EndTime: '16:00:00' }],
+        },
+      }],
+      ExceptionTimes: [{ Name: 'Shutdown', Start: '2024-08-01', Finish: '2024-08-14' }],
+    });
+    const result = c.toIfc();
+    expect(calId).toBeGreaterThan(0);
+    expect(result.content).toContain('IFCWORKCALENDAR');
+    expect(result.content).toContain("'Site calendar'");
+    expect(result.content).toContain('.FIRSTSHIFT.');
+    expect(result.content).toContain('.WEEKLY.');
+    expect(result.content).toContain('(1,2,3,4,5)');
+    expect(result.content).toContain("IFCTIMEPERIOD('07:00:00','16:00:00')");
+    // One IfcWorkTime per entry in each list.
+    expect((result.content.match(/=IFCWORKTIME\(/g) ?? []).length).toBe(2);
+    // The exception time carries no recurrence — only one pattern is emitted.
+    expect((result.content.match(/=IFCRECURRENCEPATTERN\(/g) ?? []).length).toBe(1);
+    // The calendar is reported in the created-entity list like other entities.
+    expect(result.entities.some(e => e.type === 'IfcWorkCalendar' && e.Name === 'Site calendar')).toBe(true);
+  });
+
+  it('emits no IfcWorkTime entities for a calendar with no times', () => {
+    const c = new IfcCreator();
+    c.addIfcWorkCalendar({ Name: 'Bare', PredefinedType: 'NOTDEFINED' });
+    const result = c.toIfc();
+    expect(result.content).toContain('IFCWORKCALENDAR');
+    expect(result.content).not.toContain('IFCWORKTIME');
+    expect(result.content).not.toContain('IFCRECURRENCEPATTERN');
+  });
+
+  it('rejects IfcWorkCalendar before allocating nested entities in IFC2X3', () => {
+    const c = new IfcCreator({ Schema: 'IFC2X3' });
+    expect(() => c.addIfcWorkCalendar({
+      Name: 'Unsupported',
+      WorkingTimes: [{ RecurrencePattern: { RecurrenceType: 'DAILY', Interval: 1 } }],
+    })).toThrow(/not supported for IFC2X3/);
+    expect(c.toIfc().content).not.toContain('IFCWORK');
+  });
+
+  it.each([
+    ['fractional day', { RecurrenceType: 'MONTHLY_BY_DAY_OF_MONTH' as const, DayComponent: [1.5] }],
+    ['out-of-range weekday', { RecurrenceType: 'WEEKLY' as const, WeekdayComponent: [8] }],
+    ['out-of-range month', { RecurrenceType: 'YEARLY_BY_DAY_OF_MONTH' as const, DayComponent: [1], MonthComponent: [13] }],
+    ['non-finite occurrence', { RecurrenceType: 'DAILY' as const, Occurrences: Number.POSITIVE_INFINITY }],
+    ['non-positive interval', { RecurrenceType: 'DAILY' as const, Interval: 0 }],
+    ['invalid component combination', { RecurrenceType: 'DAILY' as const, WeekdayComponent: [1] }],
+  ])('rejects invalid recurrence input: %s', (_label, recurrencePattern) => {
+    const c = new IfcCreator();
+    expect(() => c.addIfcWorkCalendar({
+      Name: 'Invalid',
+      WorkingTimes: [{ RecurrencePattern: recurrencePattern }],
+    })).toThrow(/IfcRecurrencePattern/);
+  });
+
+  it('round-trips through the parser: the extractor reads back what we wrote', async () => {
+    const c = new IfcCreator();
+    const calId = c.addIfcWorkCalendar({
+      Name: 'Site calendar',
+      Identification: 'CAL-1',
+      PredefinedType: 'SECONDSHIFT',
+      WorkingTimes: [{
+        Name: 'Weekdays',
+        Start: '2024-05-01',
+        Finish: '2024-12-31',
+        RecurrencePattern: {
+          RecurrenceType: 'WEEKLY',
+          WeekdayComponent: [1, 2, 3, 4, 5],
+          Interval: 2,
+          TimePeriods: [{ StartTime: '07:00:00', EndTime: '16:00:00' }],
+        },
+      }],
+    });
+    const scheduleId = c.addIfcWorkSchedule({ Name: 'Main', StartTime: '2024-05-01T08:00:00' });
+    const taskId = c.addIfcTask({ Name: 'Install walls', ScheduleStart: '2024-05-06T08:00:00' });
+    c.assignTasksToWorkSchedule(scheduleId, [taskId]);
+    c.assignCalendarToTasks(calId, [taskId]);
+
+    const parsed = await extractSchedule(c.toIfc().content);
+
+    expect(parsed.workCalendars).toHaveLength(1);
+    const cal = parsed.workCalendars![0];
+    expect(cal.name).toBe('Site calendar');
+    expect(cal.identification).toBe('CAL-1');
+    expect(cal.predefinedType).toBe('SECONDSHIFT');
+    expect(cal.workingTimes).toHaveLength(1);
+    expect(cal.workingTimes[0].start).toBe('2024-05-01');
+    const pattern = cal.workingTimes[0].recurrencePattern!;
+    expect(pattern.recurrenceType).toBe('WEEKLY');
+    expect(pattern.weekdayComponent).toEqual([1, 2, 3, 4, 5]);
+    expect(pattern.interval).toBe(2);
+    expect(pattern.timePeriods).toEqual([{ start: '07:00:00', end: '16:00:00' }]);
+
+    // The two assignments live on independent fields — neither clobbers the other.
+    const task = parsed.tasks[0];
+    expect(task.name).toBe('Install walls');
+    expect(task.calendarGlobalIds).toEqual([cal.globalId]);
+    expect(task.controllingScheduleGlobalIds).toEqual([parsed.workSchedules[0].globalId]);
+  });
+
+  it('assignCalendarToTasks rejects an empty id list like its sibling helpers', () => {
+    const c = new IfcCreator();
+    const calId = c.addIfcWorkCalendar({ Name: 'Cal' });
+    expect(() => c.assignCalendarToTasks(calId, [])).toThrow(/empty/);
   });
 });
 
@@ -988,6 +1185,93 @@ describe('IfcCreator dimension validation', () => {
     const creator = new IfcCreator();
     const storeyId = creator.addIfcBuildingStorey({ Name: 'GF', Elevation: 0 });
     expect(() => build(creator, storeyId)).toThrow(/finite coordinates/);
+  });
+
+  // Non-finite Position gap (LTplus-AG/ifc-lite#5217): `serializeStepValue`
+  // turns a non-finite number into `$`, which is valid syntax for an
+  // *omitted* attribute but invalid as a member of a mandatory
+  // `LIST [1:3] OF IfcLengthMeasure` (IfcCartesianPoint.Coordinates). These
+  // seven methods accepted a non-finite Position without validation, unlike
+  // addIfcWall/addIfcBeam/addIfcMember, which already guard Start/End.
+  const positionCases: Array<{ label: string; build: Build }> = [
+    {
+      label: 'addIfcColumn Position=[NaN,0,0]',
+      build: (c, s) => c.addIfcColumn(s, { Position: [NaN, 0, 0], Width: 0.3, Depth: 0.4, Height: 3 }),
+    },
+    {
+      label: 'addIfcDoor Position=[0,Infinity,0]',
+      build: (c, s) => c.addIfcDoor(s, { Position: [0, Infinity, 0], Width: 0.9, Height: 2.1 }),
+    },
+    {
+      label: 'addIfcWindow Position=[0,0,NaN]',
+      build: (c, s) => c.addIfcWindow(s, { Position: [0, 0, NaN], Width: 1.2, Height: 1.5 }),
+    },
+    {
+      label: 'addIfcSlab Position=[Infinity,0,0]',
+      build: (c, s) => c.addIfcSlab(s, { Position: [Infinity, 0, 0], Thickness: 0.2, Width: 5, Depth: 5 }),
+    },
+    {
+      label: 'addIfcRoof Position=[0,NaN,0]',
+      build: (c, s) => c.addIfcRoof(s, { Position: [0, NaN, 0], Width: 6, Depth: 4, Thickness: 0.3 }),
+    },
+    {
+      label: 'addIfcPlate Position=[0,0,Infinity]',
+      build: (c, s) => c.addIfcPlate(s, { Position: [0, 0, Infinity], Width: 1, Depth: 1, Thickness: 0.01 }),
+    },
+    {
+      label: 'addIfcSpace Position=[NaN,0,0]',
+      build: (c, s) => c.addIfcSpace(s, { Position: [NaN, 0, 0], Width: 4, Depth: 4, Height: 2.5 }),
+    },
+    // The guard lives where every point is written (`addCartesianPoint`), so
+    // builders the issue did not list are covered by the same line.
+    {
+      label: 'addIfcStair Position=[NaN,0,0]',
+      build: (c, s) => c.addIfcStair(s, { Position: [NaN, 0, 0], NumberOfRisers: 3, RiserHeight: 0.18, TreadLength: 0.28, Width: 1 }),
+    },
+    {
+      label: 'addIfcRamp Position=[0,Infinity,0]',
+      build: (c, s) => c.addIfcRamp(s, { Position: [0, Infinity, 0], Width: 1.2, Length: 5, Thickness: 0.2 }),
+    },
+    {
+      label: 'addIfcGableRoof Position=[0,0,NaN]',
+      build: (c, s) => c.addIfcGableRoof(s, { Position: [0, 0, NaN], Width: 6, Depth: 4, Thickness: 0.3, Slope: 0.5 }),
+    },
+    {
+      label: 'addIfcFooting Position=[NaN,0,0]',
+      build: (c, s) => c.addIfcFooting(s, { Position: [NaN, 0, 0], Width: 1, Depth: 1, Height: 0.5 }),
+    },
+    {
+      label: 'addIfcPile Position=[0,NaN,0]',
+      build: (c, s) => c.addIfcPile(s, { Position: [0, NaN, 0], Length: 10, Diameter: 0.4 }),
+    },
+    {
+      label: 'addIfcFurnishingElement Position=[Infinity,0,0]',
+      build: (c, s) => c.addIfcFurnishingElement(s, { Position: [Infinity, 0, 0], Width: 1, Depth: 1, Height: 1 }),
+    },
+    {
+      label: 'addIfcBuildingElementProxy Position=[0,0,NaN]',
+      build: (c, s) => c.addIfcBuildingElementProxy(s, { Position: [0, 0, NaN], Width: 1, Depth: 1, Height: 1 }),
+    },
+  ];
+
+  it.each(positionCases.map((c) => [c.label, c.build] as const))('rejects %s', (_label, build) => {
+    const creator = new IfcCreator();
+    const storeyId = creator.addIfcBuildingStorey({ Name: 'GF', Elevation: 0 });
+    expect(() => build(creator, storeyId)).toThrow(/finite coordinates/);
+  });
+
+  // No-regression pin: an ordinary finite Position must still be accepted,
+  // for every one of the seven newly-guarded methods.
+  it('still accepts a finite Position for every newly-guarded method', () => {
+    const creator = new IfcCreator();
+    const storeyId = creator.addIfcBuildingStorey({ Name: 'GF', Elevation: 0 });
+    expect(() => creator.addIfcColumn(storeyId, { Position: [1, 2, 0], Width: 0.3, Depth: 0.4, Height: 3 })).not.toThrow();
+    expect(() => creator.addIfcDoor(storeyId, { Position: [1, 2, 0], Width: 0.9, Height: 2.1 })).not.toThrow();
+    expect(() => creator.addIfcWindow(storeyId, { Position: [1, 2, 0], Width: 1.2, Height: 1.5 })).not.toThrow();
+    expect(() => creator.addIfcSlab(storeyId, { Position: [1, 2, 0], Thickness: 0.2, Width: 5, Depth: 5 })).not.toThrow();
+    expect(() => creator.addIfcRoof(storeyId, { Position: [1, 2, 0], Width: 6, Depth: 4, Thickness: 0.3 })).not.toThrow();
+    expect(() => creator.addIfcPlate(storeyId, { Position: [1, 2, 0], Width: 1, Depth: 1, Thickness: 0.01 })).not.toThrow();
+    expect(() => creator.addIfcSpace(storeyId, { Position: [1, 2, 0], Width: 4, Depth: 4, Height: 2.5 })).not.toThrow();
   });
 
   // Pin the pre-existing `<= 0` behaviour: still rejected after the fix.

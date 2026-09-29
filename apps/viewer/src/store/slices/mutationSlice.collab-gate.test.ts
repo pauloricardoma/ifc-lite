@@ -15,6 +15,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { createMutationSlice, type MutationSlice } from './mutationSlice.js';
+import type { Mutation } from '@ifc-lite/mutations';
 import type { ViewerState } from '../index.js';
 
 /** Records the first argument every `mirror*` call was handed. */
@@ -47,7 +48,8 @@ function buildSlice(canEdit: boolean, editedModelId = 'm1') {
   const spy = makeViewSpy();
   const mirrors: MirrorCall[] = [];
   let state: Record<string, unknown> = {
-    models: new Map(),
+    models: new Map([[editedModelId, { ifcDataStore: {} }]]),
+    editEnabled: true,
     // Deliberately NOT the edited model in the wiring tests below: a room's
     // mirror gates on the modelId it is handed, so handing it the active model
     // instead of the edited one re-opens the corruption.
@@ -88,6 +90,32 @@ function buildSlice(canEdit: boolean, editedModelId = 'm1') {
 }
 
 describe('mutationSlice — collab role gate on property mutations', () => {
+  it('clearMutationView discards numeric-id undo and redo state before a model is replaced (#5008)', () => {
+    const { state } = buildSlice(true);
+    const s = state();
+    const mutation: Mutation = {
+      id: 'stale-id-keyed-mutation',
+      type: 'UPDATE_ATTRIBUTE',
+      timestamp: 0,
+      modelId: 'm1',
+      entityId: 1,
+      attributeName: 'Name',
+      oldValue: 'old',
+      newValue: 'stale',
+    };
+    s.undoStacks.set('m1', [mutation]);
+    s.redoStacks.set('m1', [mutation]);
+    s.mutationBatchTags.set(mutation.id, 'batch');
+    s.mutationMeshTranslations.set(mutation.id, { globalId: 1, rendererDelta: [1, 0, 0] });
+
+    s.clearMutationView('m1');
+
+    assert.equal(state().undoStacks.has('m1'), false);
+    assert.equal(state().redoStacks.has('m1'), false);
+    assert.equal(state().mutationBatchTags.has(mutation.id), false);
+    assert.equal(state().mutationMeshTranslations.has(mutation.id), false);
+  });
+
   it('viewer role: property writes are rejected BEFORE touching the local view', () => {
     const { spy, state } = buildSlice(false);
     const s = state();
@@ -202,6 +230,9 @@ describe('mutationSlice — mirrors are handed the EDITED model, not the active 
   it('readEntityPosition / readEntityRotation forward their own modelId to readCollabPlacement', () => {
     const seen: unknown[] = [];
     const { state } = buildSlice(true, 'edited');
+    // These reads deliberately exercise the no-STEP-chain fallback. The
+    // property-write harness above supplies only a minimal store sentinel.
+    state().models.set('edited', { ifcDataStore: null } as never);
     (state() as unknown as Record<string, unknown>).readCollabPlacement = (modelId: unknown) => {
       seen.push(modelId);
       return null;
@@ -363,6 +394,9 @@ describe('mutationSlice -- every writer is role-gated, not just the sampled ones
     assert.notStrictEqual(s.setEntityType('m1', 1, 'IfcSlab'), null);
     assert.deepStrictEqual(spy.calls, ['deletePropertySet', 'setEntityType']);
 
+    // The positive property-write spy needs a store sentinel; creation tools
+    // need a real parsed IFC store, so exercise their missing-store branch.
+    state().models.set('m1', { ifcDataStore: null } as never);
     const dup = s.duplicateEntity('m1', 1) as { error?: string };
     assert.notStrictEqual(dup.error, ROLE_REASON, 'an editor is past the role gate');
 

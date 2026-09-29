@@ -19,6 +19,14 @@
 
 use super::super::geom::{mesh_point, point_inside_mesh_agreed, project_aabb_in_frame};
 use super::super::{OpeningFrame, NORMALIZE_EPSILON};
+// Re-exported (not just imported) so `exit_cap::any_vertex_is_large` and
+// `exit_cap::EXIT_CAP_FAR_FIELD_THRESHOLD_METERS` keep resolving for
+// `synthesis_tests.rs`, which reaches this constant through the `exit_cap`
+// path rather than `exit_cap_far_field` directly. The constant itself is
+// test-only from here (production reads it only inside `any_vertex_is_large`).
+pub(in crate::router::voids) use super::exit_cap_far_field::any_vertex_is_large;
+#[cfg(test)]
+pub(in crate::router::voids) use super::exit_cap_far_field::EXIT_CAP_FAR_FIELD_THRESHOLD_METERS;
 use crate::{Mesh, Point3, Vector3};
 
 /// A facet counts as parallel to a cap at |n·d| ≥ this. 0.985 ≈ 10°: absorbs
@@ -347,11 +355,7 @@ pub(super) fn detect(host: &Mesh, f: &CutterFrame, pad: f64) -> ExitCaps {
     let qualified = min_has_surface || max_has_surface;
     // `any`, not a max fold: the threshold is all that is asked, so the first
     // far vertex answers it.
-    let far_field = qualified
-        && host
-            .positions
-            .iter()
-            .any(|&v| (v as f64).abs() >= crate::LARGE_COORD_THRESHOLD_METERS);
+    let far_field = qualified && any_vertex_is_large(host);
     // `then`, not `filter`: projecting the host and discarding the result is
     // the whole cost of the call.
     let probe = (qualified && !far_field)

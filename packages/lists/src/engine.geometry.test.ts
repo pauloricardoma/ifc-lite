@@ -34,8 +34,8 @@ function createProvider(positions: Map<number, Pos>): ListDataProvider {
   };
 }
 
-function walls(columns: ListDefinition['columns'], conditions: ListDefinition['conditions'] = []): ListDefinition {
-  return { id: 't', name: 'T', createdAt: 0, updatedAt: 0, entityTypes: [IfcTypeEnum.IfcWall], conditions, columns };
+function walls(columns: ListDefinition['columns'], conditions: NonNullable<ListDefinition['legacyConditions']> = []): ListDefinition {
+  return { id: 't', name: 'T', createdAt: 0, updatedAt: 0, entityTypes: [IfcTypeEnum.IfcWall], groups: [], legacyConditions: conditions, columns };
 }
 
 describe('geometry (World Coordinate) column/condition (#3671)', () => {
@@ -46,8 +46,56 @@ describe('geometry (World Coordinate) column/condition (#3671)', () => {
   ]);
 
   it('resolves the X axis by default', () => {
-    const result = executeList(walls([{ id: 'g', source: 'geometry', propertyName: 'X' }]), createProvider(positions));
+    // Empty axis, not 'X': this is the default branch in getWorldCoordinateValue.
+    // With 'X' the explicit case answers and an implementation that defaulted to
+    // Y would still pass, so the test would not name the mutation it kills.
+    const result = executeList(walls([{ id: 'g', source: 'geometry', propertyName: '' }]), createProvider(positions));
     expect(result.rows.find(r => r.entityId === 1)!.values[0]).toBe(100.5);
+  });
+
+  it('an axis that is not X/Y/Z resolves to null, not to X (#3734)', () => {
+    // `case 'X'` and `default` used to share a body, so a column whose axis is
+    // anything else reported the X coordinate under a header saying something
+    // else. A blank cell is a visible gap; a plausible number under the wrong
+    // label is a wrong answer that reads as a right one.
+    const result = executeList(walls([{ id: 'g', source: 'geometry', propertyName: 'Q' }]), createProvider(positions));
+    expect(result.rows.find(r => r.entityId === 1)!.values[0]).toBeNull();
+  });
+
+  it('a blank axis still means X, which is the documented default (#3734)', () => {
+    // The narrowing above must not swallow the default. Whitespace-only counts
+    // as absent, matching how a blank name is treated elsewhere in the repo.
+    for (const axis of ['', '  ', '\t']) {
+      const result = executeList(walls([{ id: 'g', source: 'geometry', propertyName: axis }]), createProvider(positions));
+      expect(result.rows.find(r => r.entityId === 1)!.values[0], `axis ${JSON.stringify(axis)}`).toBe(100.5);
+    }
+  });
+
+  it('an unknown-axis CONDITION matches nothing, including exists (#3734)', () => {
+    // The same resolver backs conditions, so narrowing the cell narrows the
+    // filter too. `exists` is the one worth pinning: it now answers "no element
+    // has a world position" for a bad axis, which is chosen behaviour, not
+    // inherited. The builder cannot construct a geometry condition at all, so
+    // this is reachable only from a hand-edited or imported definition.
+    const unknown = (operator: 'exists' | 'equals', value?: number) =>
+      executeList(
+        walls([{ id: 'g', source: 'geometry', propertyName: 'X' }], [
+          { id: 'c', source: 'geometry', propertyName: 'Q', operator, value } as never,
+        ]),
+        createProvider(positions),
+      ).rows.length;
+    expect(unknown('exists')).toBe(0);
+    expect(unknown('equals', 100.5)).toBe(0);
+
+    // A known axis still filters, so the zero above is the axis and not a
+    // condition path that stopped working.
+    const known = executeList(
+      walls([{ id: 'g', source: 'geometry', propertyName: 'X' }], [
+        { id: 'c', source: 'geometry', propertyName: 'X', operator: 'equals', value: 100.5 } as never,
+      ]),
+      createProvider(positions),
+    );
+    expect(known.rows.length).toBe(1);
   });
 
   it('resolves the Y axis', () => {

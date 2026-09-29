@@ -56,7 +56,7 @@ export interface SceneContents {
   // ─── Streaming queue and GPU upload ──────────────────────────────────
   queueMeshes(meshes: MeshData[]): void;
   hasQueuedMeshes(): boolean;
-  flushPending(device: GPUDevice, pipeline: RenderPipeline): boolean;
+  flushPending(device: GPUDevice, pipeline: RenderPipeline, budgetMs?: number): boolean;
   appendToBatches(
     meshDataArray: MeshData[],
     device: GPUDevice,
@@ -81,12 +81,57 @@ export interface SceneContents {
   getMeshes(): Mesh[];
   getBatchedMeshes(): BatchedMesh[];
   getMeshDataPieces(expressId: number, modelIndex?: number): MeshData[] | undefined;
+  /**
+   * The single-mesh accessor: one representative mesh per entity, or
+   * `undefined` when the entity has no flat mesh data. When an entity's
+   * pieces share a colour their geometry is MERGED into that one mesh; when
+   * colours differ, the first piece is returned so per-piece colours stay
+   * correct (mirrors `Scene.getMeshData`).
+   * `getMeshDataPieces` returns every piece; reach for this one when a
+   * caller is written against one representative mesh per entity (#4357).
+   */
+  getMeshData(expressId: number, modelIndex?: number): MeshData | undefined;
+  /**
+   * Visits every flat mesh piece in the scene. `getAllMeshDataExpressIds`
+   * gives only the id set; this is the accessor for consumers that need the
+   * mesh data itself while walking it, such as feeding a whole-scene
+   * geometry pass (#4357).
+   */
+  forEachMeshData(visit: (md: MeshData) => void): void;
+  /** Place a canonical model-local source in the current registered model frame. */
+  placeAppearanceSource?(mesh: MeshData): MeshData;
+  /** Recover model-local geometry before publishing an appearance edit to model state. */
+  appearanceSourceMesh?(mesh: MeshData): MeshData;
+  /**
+   * O(1) "is this id in the flat mesh map" — the presence question, without
+   * `getMeshDataPieces`' per-entity extraction out of a colour-merged batch.
+   * Pair it with `isInstancedEntity` to ask the same thing of both geometry
+   * paths (`useColorOverlaySync` does, per settled geometry batch).
+   */
+  hasMeshData(expressId: number, modelIndex?: number): boolean;
   getAllMeshDataExpressIds(): number[];
   getBounds(): {
     min: { x: number; y: number; z: number };
     max: { x: number; y: number; z: number };
   } | null;
   getEntityBoundingBox(expressId: number): BoundingBox | null;
+  /**
+   * The resolved local→world placement transform for one entity: row-major
+   * 4×4 (16 numbers), `Float64Array` for full georeferenced precision.
+   * Pairs with {@link getEntityLocalBounds} to reconstruct an entity's true
+   * oriented world box — `getEntityBoundingBox` above is post-transform and
+   * world-axis-aligned instead (#4357).
+   */
+  getEntityTransform(expressId: number): Float64Array | null;
+  /**
+   * An entity's bounds in its OWN local (pre-transform) frame, unioned across
+   * every occurrence sharing the `expressId` — unlike `getEntityBoundingBox`,
+   * which is a post-transform, world-axis-aligned box and cannot be unioned
+   * meaningfully across differently-placed occurrences (#4357).
+   */
+  getEntityLocalBounds(
+    expressId: number,
+  ): { min: [number, number, number]; max: [number, number, number] } | null;
 
   // ─── Instanced geometry ──────────────────────────────────────────────
   addInstancedShard(
@@ -96,6 +141,12 @@ export interface SceneContents {
   ): void;
   getAllInstancedMeshData(): MeshData[];
   getInstancedMeshDataPieces(expressId: number): MeshData[] | undefined;
+  /**
+   * O(1) instanced-membership test. `getInstancedMeshDataPieces` MATERIALIZES
+   * world-space triangles per occurrence, so it is never the right way to ask
+   * whether an id exists.
+   */
+  isInstancedEntity(expressId: number): boolean;
   getInstancedEntityBounds(expressId: number): BoundingBox | null;
   getInstancedEntityCount(): number;
   getInstancedEntityIds(): IterableIterator<number>;
@@ -104,11 +155,24 @@ export interface SceneContents {
   setInstancedVisible(visible: boolean): void;
 
   // ─── Authoring mutations ─────────────────────────────────────────────
-  removeMeshesForEntities(expressIds: Iterable<number>): number;
+  /** Com `device`+`pipeline`, reconstrói já os fragmentos de streaming afetados. */
+  removeMeshesForEntities(expressIds: Iterable<number>, device?: GPUDevice, pipeline?: RenderPipeline): number;
   translateMeshesForEntities(updates: Map<number, [number, number, number]>): number;
   rotateMeshesForEntities(
     updates: Map<number, { angle: number; pivot: [number, number, number] }>,
   ): number;
+  /**
+   * Turn `modelIndex`'s GPU-instanced occurrences about the render-frame
+   * pivot `(pivot[0], *, pivot[2])`; `angle === 0` clears the rotation
+   * (#4890). The GPU-instanced counterpart to `Renderer.setModelTranslation`
+   * — flat/authored/batched geometry rotates through the viewer's bake, not
+   * this method.
+   */
+  setModelRotation(
+    modelIndex: number,
+    angle: number,
+    pivot: readonly [number, number, number],
+  ): boolean;
 
   // ─── Colour overrides ────────────────────────────────────────────────
   setColorOverrides(
@@ -116,6 +180,14 @@ export interface SceneContents {
     device: GPUDevice,
     pipeline: RenderPipeline,
   ): void;
+  /**
+   * The overrides currently installed, or null when nothing is painted. The
+   * store's `pendingColorUpdates` is a one-shot signal that is nulled after it
+   * flushes, so this retained map is the only readable record of what is
+   * painted — `useColorOverlaySync` re-hands it back to `setColorOverrides` so
+   * meshes that streamed in after the flush get their colour (#3890).
+   */
+  getColorOverrides(): ReadonlyMap<number, readonly [number, number, number, number]> | null;
   clearColorOverrides(): void;
   updateMeshColors(
     updates: Map<number, [number, number, number, number]>,
@@ -141,5 +213,7 @@ export interface SceneContents {
 
   // ─── Teardown ────────────────────────────────────────────────────────
   clearFlatGeometry(): void;
+  /** Preserve only exactly matching committed appearance owners during source rebuild. */
+  clearFlatGeometryForRebuild?(geometry: readonly MeshData[], models: ReadonlySet<number>, sourceGeometry?: readonly MeshData[]): void;
   clear(): void;
 }

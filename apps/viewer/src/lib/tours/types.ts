@@ -11,7 +11,7 @@
  * skippable, so a tour can never trap the user.
  */
 
-import type { ViewerState, EntityRef, CameraViewpoint, RibbonTabId, SectionPlaneAxis, ToolbarStyle } from '@/store';
+import type { ViewerState, EntityRef, CameraViewpoint, RibbonTabId, SectionPlaneAxis } from '@/store';
 import type { SidebarMode } from '@/store';
 import type { WorkspacePanelId, BottomPanelId } from '@/lib/panels/registry';
 import type { TourAnchorId } from './anchors';
@@ -172,6 +172,14 @@ export interface UiSnapshot {
     selectedEntitiesSet: string[];
     selectedEntities: EntityRef[];
     selectedModelId: string | null;
+    /** Whether Charts authored the captured entity selection revision. */
+    chartOwned: boolean;
+    /** Exact chart ownership restored with the selection after tour steps mutate it. */
+    chartSlice: number[] | null;
+    chartSliceSource: string | null;
+    chartSliceBuckets: ViewerState['chartSliceBuckets'];
+    /** Chart-owned shared visibility captured with the slice; ids are serializable. */
+    chartVisibilityOwned: { channel: 'isolate' | 'ghost'; ids: number[] } | null;
   };
   activeStorey: EntityRef | null;
   selectedStoreys: number[];
@@ -179,19 +187,15 @@ export interface UiSnapshot {
     axis: SectionPlaneAxis;
     position: number;
     enabled: boolean;
+    /** A cut parked outside the Section tool (`store/section-active.ts`). */
+    parked: boolean;
     flipped: boolean;
     /** Face-picked plane params; captured so an abort can restore a
      *  pre-tour custom cut, not just the cardinal fields. */
     custom: ViewerState['sectionPlane']['custom'];
   };
   activeLensId: string | null;
-  /**
-   * Toolbar style, open ribbon tab, and collapsed state. Captured because
-   * the ribbon tour moves all three to teach them: a classic-toolbar user
-   * who starts it from the Learn hub gets their strip back when it ends,
-   * and someone who keeps the band collapsed gets it collapsed again.
-   */
-  toolbarStyle: ToolbarStyle;
+  /** Ribbon tour state is restored after a tour without changing preferences. */
   ribbonTab: RibbonTabId;
   ribbonCollapsed: boolean;
   /** May be null before the renderer registered camera callbacks. */

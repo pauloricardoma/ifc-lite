@@ -1,6 +1,7 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+import { appearanceReferenceTeardown } from './slices/appearanceReferenceSlice.js';
 
 /**
  * The store's assembled teardown: every slice's contribution, in one list.
@@ -45,6 +46,9 @@
 import { composeTeardown, createTeardownRegistry, type AnySliceTeardown } from './teardown.js';
 
 import { loadingTeardown } from './slices/loadingSlice.js';
+import { chartTeardown } from './slices/chartSlice.js';
+import { flowTeardown } from './slices/flowSlice.teardown.js';
+import { documentTeardown } from './slices/documentSlice.js';
 import { selectionTeardown } from './slices/selectionSlice.teardown.js';
 import { visibilityTeardown } from './slices/visibilitySlice.teardown.js';
 import { uiTeardown } from './slices/uiSlice.teardown.js';
@@ -58,6 +62,7 @@ import { drawing2DTeardown } from './slices/drawing2DSlice.teardown.js';
 import { sheetTeardown } from './slices/sheetSlice.teardown.js';
 import { bcfTeardown } from './slices/bcfSlice.teardown.js';
 import { idsTeardown } from './slices/idsSlice.teardown.js';
+import { validationDraftTeardown } from './slices/validationDraftSlice.js';
 import { listTeardown } from './slices/listSlice.js';
 import { pinboardTeardown } from './slices/pinboardSlice.teardown.js';
 import { lensTeardown } from './slices/lensSlice.js';
@@ -70,8 +75,14 @@ import { playbackTeardown } from './slices/playbackSlice.js';
 import { searchTeardown } from './slices/searchSlice.teardown.js';
 import { annotationsTeardown } from './slices/annotationsSlice.teardown.js';
 import { addElementTeardown } from './slices/addElementSlice.teardown.js';
+import { authoringSessionTeardown } from './slices/authoringSessionSlice.js';
+import { authoringDefaultsTeardown } from './slices/authoringDefaultsSlice.js';
+import { modelPlacementTeardown } from './slices/modelPlacementSlice.js';
 import { pointCloudTeardown } from './slices/pointCloudSlice.js';
 import { zonesTeardown } from './slices/zonesSlice.js';
+import { layerStackTeardown } from './slices/layerStackSlice.teardown.js';
+import { modelTagsTeardown } from './slices/modelTagsSlice.teardown.js';
+import { sceneStateTeardown } from './slices/sceneStateSlice.js';
 
 /**
  * Every slice teardown the viewer store knows about.
@@ -95,6 +106,7 @@ export const viewerTeardownRegistry: readonly AnySliceTeardown[] = createTeardow
   sheetTeardown,
   bcfTeardown,
   idsTeardown,
+  validationDraftTeardown,
   listTeardown,
   pinboardTeardown,
   lensTeardown,
@@ -107,8 +119,18 @@ export const viewerTeardownRegistry: readonly AnySliceTeardown[] = createTeardow
   searchTeardown,
   annotationsTeardown,
   addElementTeardown,
+  authoringSessionTeardown,
+  authoringDefaultsTeardown,
   pointCloudTeardown,
+  modelPlacementTeardown,
+  appearanceReferenceTeardown,
   zonesTeardown,
+  layerStackTeardown,
+  modelTagsTeardown,
+  chartTeardown,
+  flowTeardown,
+  documentTeardown,
+  sceneStateTeardown,
 ]);
 
 /**

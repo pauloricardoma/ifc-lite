@@ -61,11 +61,32 @@
 //! constrained-Delaunay, still watertight) — quality is best-effort, validity
 //! is not.
 
+mod enc_grid;
+mod insertion;
 mod predicates;
 
+static RECOVERY_STUCK: AtomicU64 = AtomicU64::new(0);
+static RECOVERY_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
+
+/// Read + reset `(stuck, exhausted)`: constraint segments
+/// [`Cdt::recover_segment`] gave up on since the last call, each of which made
+/// `build_from` return `None` so the caller ear-clipped. `stuck` is the "no
+/// flippable crossing edge" exit (crossing constraints, a duplicate vertex the
+/// segment names); `exhausted` is the 100 000-flip guard. Process-global
+/// relaxed atomics, like [`crate::take_bool2d_stats`]: a stale read under
+/// concurrency mis-reports a diagnostic count, never geometry.
+pub fn take_cdt_recovery_fallbacks() -> (u64, u64) {
+    (
+        RECOVERY_STUCK.swap(0, Ordering::Relaxed),
+        RECOVERY_EXHAUSTED.swap(0, Ordering::Relaxed),
+    )
+}
+
 use crate::Point2;
+use enc_grid::EncGrid;
 use predicates::{dist2, rings_to_pslg, segments_properly_cross, strictly_between};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Target minimum angle for refinement, expressed as `cos(angle)` so the
 /// skinny test is a transcendental-free `cos θ > COS_MIN_ANGLE` comparison (see
@@ -199,23 +220,10 @@ struct Cdt {
     /// returns `None`, so the caller falls back to ear-clipping — matching how
     /// every other degenerate case in this module degrades.
     failed: bool,
-}
-
-/// Broad-phase over the constraint segments' diametral circles, for the
-/// per-candidate encroachment test. CSR uniform grid + an "oversized disk"
-/// list; `nx == 0` = not built.
-#[derive(Default)]
-struct EncGrid {
-    mid: Vec<P2>,
-    r2: Vec<f64>,
-    minx: f64,
-    miny: f64,
-    inv: f64,
-    nx: usize,
-    ny: usize,
-    starts: Vec<u32>,
-    items: Vec<u32>,
-    big: Vec<u32>,
+    /// Whether the fixed legalization guard is a caller-visible work budget.
+    /// Ordinary geometry callers preserve their historical best-effort break;
+    /// hostile terrain parsing reports the bound explicitly.
+    fail_on_legalization_guard: bool,
 }
 
 impl Cdt {
@@ -223,28 +231,46 @@ impl Cdt {
     /// segment list is the source of truth for constraints (so refinement can
     /// add Steiner points and replace a segment with its two halves, then
     /// rebuild cleanly from scratch — no fragile in-place mutation).
-    fn build_from(
+    fn build_from(points: Vec<P2>, segments: &[(usize, usize)], steiner_cap: usize) -> Option<Cdt> {
+        Self::build_from_with_progress_mode(points, segments, steiner_cap, false, &mut || Ok(()))
+            .ok()
+            .flatten()
+    }
+
+    fn build_from_with_progress(
+        points: Vec<P2>,
+        segments: &[(usize, usize)],
+        steiner_cap: usize,
+        progress: &mut dyn FnMut() -> Result<(), crate::terrain_cdt::TerrainCdtError>,
+    ) -> Result<Option<Cdt>, crate::terrain_cdt::TerrainCdtError> {
+        Self::build_from_with_progress_mode(points, segments, steiner_cap, true, progress)
+    }
+
+    fn build_from_with_progress_mode(
         mut points: Vec<P2>,
         segments: &[(usize, usize)],
         steiner_cap: usize,
-    ) -> Option<Cdt> {
+        fail_on_legalization_guard: bool,
+        progress: &mut dyn FnMut() -> Result<(), crate::terrain_cdt::TerrainCdtError>,
+    ) -> Result<Option<Cdt>, crate::terrain_cdt::TerrainCdtError> {
         let n_input = points.len();
         if n_input < 3 {
-            return None;
+            return Ok(None);
         }
         let mut constraints = BTreeSet::new();
         for &(a, b) in segments {
+            progress()?;
             if a != b && a < n_input && b < n_input {
                 constraints.insert(ekey(a, b));
             }
         }
 
         // Super-triangle containing every input point with wide clearance.
-        let (mut minx, mut miny, mut maxx, mut maxy) =
-            (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        let (mut minx, mut miny, mut maxx, mut maxy) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
         for p in &points {
+            progress()?;
             if !p[0].is_finite() || !p[1].is_finite() {
-                return None;
+                return Ok(None);
             }
             minx = minx.min(p[0]);
             miny = miny.min(p[1]);
@@ -253,7 +279,7 @@ impl Cdt {
         }
         let span = (maxx - minx).max(maxy - miny);
         if !(span > 0.0) || !span.is_finite() {
-            return None;
+            return Ok(None);
         }
         let cx = (minx + maxx) * 0.5;
         let cy = (miny + maxy) * 0.5;
@@ -286,6 +312,7 @@ impl Cdt {
             track: false,
             cos_min_angle: COS_MIN_ANGLE,
             failed: false,
+            fail_on_legalization_guard,
         };
         cdt.tris.push(Tri {
             v: [super_base, super_base + 1, super_base + 2],
@@ -296,144 +323,17 @@ impl Cdt {
 
         // Incremental Delaunay insertion in canonical index order.
         for vi in 0..n_input {
-            cdt.insert_point(vi);
+            progress()?;
+            cdt.insert_point_with_progress(vi, progress)?;
         }
         if cdt.failed {
-            return None; // an insertion tripped a topology invariant — fall back to ear-clipping
+            return Ok(None); // an insertion tripped a topology invariant — fall back to ear-clipping
         }
-        if !cdt.enforce_constraints() {
-            return None;
+        if !cdt.enforce_constraints_with_progress(progress)? {
+            return Ok(None);
         }
-        cdt.restore_constrained_delaunay();
-        Some(cdt)
-    }
-
-    // ───────────────────────── Delaunay insertion ─────────────────────────
-
-    fn insert_point(&mut self, vi: usize) {
-        let p = self.points[vi];
-        let start = match self.walk_strict(self.last_loc, p) {
-            Some(t) => t,
-            None => match self.locate(p) {
-                Some(t) => t,
-                None => return,
-            },
-        };
-        self.insert_point_at(vi, start);
-    }
-
-    /// [`Cdt::insert_point`] with the containing triangle already located —
-    /// the incremental-refinement entry skips the O(T) `locate` scan (the
-    /// caller walked to it via [`Cdt::locate_from`]).
-    fn insert_point_at(&mut self, vi: usize, start: usize) {
-        if self.failed {
-            return; // a prior insertion tripped a topology invariant; stop touching topology
-        }
-        let p = self.points[vi];
-        // Region of the seed = region of every cavity triangle (the cavity BFS
-        // never crosses a constraint), inherited by the re-fan below.
-        let region = self.inside.get(start).copied().unwrap_or(false);
-
-        // CONSTRAINED Bowyer-Watson cavity: alive triangles whose circumcircle
-        // (strictly) contains p, found by BFS over adjacency from `start` — but
-        // the cavity is NEVER allowed to cross a constraint edge. Blocking at
-        // constraints keeps hole/boundary rings intact (a deleted triangle on
-        // the far side of a constraint would dissolve the constraint and merge
-        // a hole into the domain). The seed `start` contains p and is always
-        // bad; expansion only crosses NON-constraint edges.
-        let mut bad: Vec<usize> = Vec::new();
-        let mut in_bad: BTreeSet<usize> = BTreeSet::new();
-        let mut queue: VecDeque<usize> = VecDeque::new();
-        queue.push_back(start);
-        let mut visited: BTreeSet<usize> = BTreeSet::new();
-        visited.insert(start);
-        while let Some(ti) = queue.pop_front() {
-            if !self.tris[ti].alive {
-                continue;
-            }
-            let v = self.tris[ti].v;
-            if in_circle_sign(self.points[v[0]], self.points[v[1]], self.points[v[2]], p) > 0 {
-                bad.push(ti);
-                in_bad.insert(ti);
-                for e in 0..3 {
-                    let a = v[e];
-                    let b = v[(e + 1) % 3];
-                    if self.cset.contains(&ekey(a, b)) {
-                        continue; // do not let the cavity swallow a constraint
-                    }
-                    let nb = self.tris[ti].n[e];
-                    if nb != NONE && visited.insert(nb) {
-                        queue.push_back(nb);
-                    }
-                }
-            }
-        }
-        if bad.is_empty() {
-            // No strictly-containing circumcircle (point on existing edge or
-            // collinear). Edge-aware split: a point landing EXACTLY on an edge
-            // of `start` must split BOTH incident triangles in lockstep —
-            // `split_in_triangle` alone skips the degenerate child on the
-            // collinear edge, re-filling only one side and leaving a
-            // T-junction with the far triangle still linked to the dead
-            // parent. Genuinely interior points take the 3-way split.
-            self.split_at(start, vi);
-            self.last_loc = self.tris.len() - 1;
-            return;
-        }
-
-        // Cavity boundary: directed edges (a->b, CCW around the cavity) whose
-        // outside triangle is NOT bad. Collect with the outside neighbour.
-        let mut boundary: Vec<(usize, usize, usize)> = Vec::new();
-        for &ti in &bad {
-            let v = self.tris[ti].v;
-            for e in 0..3 {
-                let nb = self.tris[ti].n[e];
-                if nb == NONE || !in_bad.contains(&nb) {
-                    let a = v[e];
-                    let b = v[(e + 1) % 3];
-                    boundary.push((a, b, nb));
-                }
-            }
-        }
-        // Canonical order so new-triangle indices are platform-stable.
-        boundary.sort_unstable();
-
-        for &ti in &bad {
-            self.tris[ti].alive = false;
-        }
-
-        // Fan: new triangle (a, b, vi) per boundary edge. (a,b,vi) is CCW
-        // because (a->b) was CCW around the (convex) cavity and vi is inside.
-        let mut owner: BTreeMap<(usize, usize), (usize, usize)> = BTreeMap::new();
-        let mut new_tris: Vec<usize> = Vec::with_capacity(boundary.len());
-        for &(a, b, outside) in &boundary {
-            let ti = self.tris.len();
-            self.tris.push(Tri {
-                v: [a, b, vi],
-                n: [NONE; 3],
-                alive: true,
-            });
-            self.inside.push(region);
-            new_tris.push(ti);
-            // edge 0 is a->b (outer); neighbour = outside triangle.
-            self.tris[ti].n[0] = outside;
-            if outside != NONE {
-                if let Some(e) = self.tris[outside].edge_of(a, b) {
-                    self.tris[outside].n[e] = ti;
-                }
-            }
-            // edge 1 is b->vi ; edge 2 is vi->a — internal cavity edges.
-            self.link_internal(&mut owner, ekey(b, vi), ti, 1);
-            self.link_internal(&mut owner, ekey(vi, a), ti, 2);
-        }
-
-        // Legalize the outer edges (edge 0 of each new triangle).
-        let mut stack: Vec<(usize, usize)> = new_tris.iter().map(|&t| (t, 0usize)).collect();
-        self.legalize(&mut stack);
-        for t in new_tris {
-            self.track_tri(t);
-        }
-        self.last_loc = self.tris.len() - 1;
+        cdt.restore_constrained_delaunay_with_progress(progress)?;
+        Ok(Some(cdt))
     }
 
     /// Wire adjacency for an internal cavity edge once both owners are known.
@@ -454,20 +354,43 @@ impl Cdt {
 
     /// Split a triangle that strictly contains `vi` (or has `vi` on an edge)
     /// into up to three children and legalize. Fallback for the no-bad-tri case.
-    fn split_in_triangle(&mut self, t: usize, vi: usize) {
+    fn split_in_triangle_with_progress(
+        &mut self,
+        t: usize,
+        vi: usize,
+        progress: &mut dyn FnMut() -> Result<(), crate::terrain_cdt::TerrainCdtError>,
+    ) -> Result<(), crate::terrain_cdt::TerrainCdtError> {
         if !self.tris[t].alive {
-            return;
+            return Ok(());
         }
         let region = self.inside.get(t).copied().unwrap_or(false);
         let v = self.tris[t].v;
         let n = self.tris[t].n;
+        let degenerate: [bool; 3] = std::array::from_fn(|e| {
+            orient(
+                self.points[v[e]],
+                self.points[v[(e + 1) % 3]],
+                self.points[vi],
+            ) == 0
+        });
+        if degenerate.iter().filter(|&&d| d).count() >= 2 {
+            // `vi` coincides with a vertex of `t`: a duplicate input coordinate
+            // (`rings_to_pslg` does not dedup, so two rings sharing a corner
+            // arrive as two indices at one point). Retiring `t` for the single
+            // child that survives would leave the neighbours across the two
+            // skipped edges linked to a dead triangle. Leave `t` alone and skip
+            // the point: a constraint naming it then fails recovery and the
+            // caller falls back, and a free duplicate is merely unreferenced.
+            return Ok(());
+        }
         self.tris[t].alive = false;
         let mut owner: BTreeMap<(usize, usize), (usize, usize)> = BTreeMap::new();
         let mut children: Vec<usize> = Vec::new();
         for e in 0..3 {
+            progress()?;
             let a = v[e];
             let b = v[(e + 1) % 3];
-            if orient(self.points[a], self.points[b], self.points[vi]) == 0 {
+            if degenerate[e] {
                 continue; // degenerate child (vi on edge a-b)
             }
             let ti = self.tris.len();
@@ -488,10 +411,12 @@ impl Cdt {
             self.link_internal(&mut owner, ekey(vi, a), ti, 2);
         }
         let mut stack: Vec<(usize, usize)> = children.iter().map(|&c| (c, 0usize)).collect();
-        self.legalize(&mut stack);
+        self.legalize_with_progress(&mut stack, progress)?;
         for c in children {
+            progress()?;
             self.track_tri(c);
         }
+        Ok(())
     }
 
     /// Insertion fallback for an empty Bowyer–Watson cavity: route a point
@@ -499,21 +424,31 @@ impl Cdt {
     /// between the endpoints) to the lockstep both-sides split
     /// ([`Cdt::split_on_edge`]); everything else (genuinely interior) to
     /// [`Cdt::split_in_triangle`].
+    #[cfg(test)]
     fn split_at(&mut self, start: usize, vi: usize) {
+        let _ = self.split_at_with_progress(start, vi, &mut || Ok(()));
+    }
+
+    fn split_at_with_progress(
+        &mut self,
+        start: usize,
+        vi: usize,
+        progress: &mut dyn FnMut() -> Result<(), crate::terrain_cdt::TerrainCdtError>,
+    ) -> Result<(), crate::terrain_cdt::TerrainCdtError> {
         if !self.tris[start].alive {
-            return;
+            return Ok(());
         }
         let v = self.tris[start].v;
         let p = self.points[vi];
         for e in 0..3 {
+            progress()?;
             let a = self.points[v[e]];
             let b = self.points[v[(e + 1) % 3]];
             if orient(a, b, p) == 0 && strictly_between(a, b, p) {
-                self.split_on_edge(start, e, vi);
-                return;
+                return self.split_on_edge_with_progress(start, e, vi, progress);
             }
         }
-        self.split_in_triangle(start, vi);
+        self.split_in_triangle_with_progress(start, vi, progress)
     }
 
     /// Split triangle `t` around `vi`, which lies EXACTLY on `t`'s local edge
@@ -526,7 +461,13 @@ impl Cdt {
     /// edge), wires every adjacency, and legalizes the children's outer
     /// (parent-perimeter) edges; the spoke edges are incident to the freshly
     /// inserted `vi` and need no Delaunay test.
-    fn split_on_edge(&mut self, t: usize, e: usize, vi: usize) {
+    fn split_on_edge_with_progress(
+        &mut self,
+        t: usize,
+        e: usize,
+        vi: usize,
+        progress: &mut dyn FnMut() -> Result<(), crate::terrain_cdt::TerrainCdtError>,
+    ) -> Result<(), crate::terrain_cdt::TerrainCdtError> {
         let v = self.tris[t].v;
         let n = self.tris[t].n;
         let a = v[e];
@@ -559,8 +500,16 @@ impl Cdt {
             // Boundary edge: only `t` exists — split it into 2 children.
             let t1 = self.tris.len(); // (vi, b, c)
             let t2 = t1 + 1; //          (a, vi, c)
-            self.tris.push(Tri { v: [vi, b, c], n: [NONE, n_bc, t2], alive: true });
-            self.tris.push(Tri { v: [a, vi, c], n: [NONE, t1, n_ca], alive: true });
+            self.tris.push(Tri {
+                v: [vi, b, c],
+                n: [NONE, n_bc, t2],
+                alive: true,
+            });
+            self.tris.push(Tri {
+                v: [a, vi, c],
+                n: [NONE, t1, n_ca],
+                alive: true,
+            });
             self.inside.push(region_t);
             self.inside.push(region_t);
             for (ext, x, y, child) in [(n_bc, b, c, t1), (n_ca, c, a, t2)] {
@@ -571,10 +520,10 @@ impl Cdt {
                 }
             }
             let mut stack: Vec<(usize, usize)> = vec![(t1, 1), (t2, 2)];
-            self.legalize(&mut stack);
+            self.legalize_with_progress(&mut stack, progress)?;
             self.track_tri(t1);
             self.track_tri(t2);
-            return;
+            return Ok(());
         }
 
         // Interior (shared) edge: capture the neighbour's data, then split
@@ -587,10 +536,13 @@ impl Cdt {
             // — `t` is already retired above, so leave the CDT flagged
             // unbuildable and let the entry point return `None`.
             self.failed = true;
-            return;
+            return Ok(());
         };
         let outer_of = |s: &Self, t: usize, x: usize, y: usize| -> usize {
-            s.tris[t].edge_of(x, y).map(|oe| s.tris[t].n[oe]).unwrap_or(NONE)
+            s.tris[t]
+                .edge_of(x, y)
+                .map(|oe| s.tris[t].n[oe])
+                .unwrap_or(NONE)
         };
         let n_ad = outer_of(self, nb, a, d);
         let n_db = outer_of(self, nb, d, b);
@@ -602,10 +554,26 @@ impl Cdt {
         let t2 = t1 + 1; //          (a, vi, c) — t's side
         let t3 = t1 + 2; //          (b, vi, d) — neighbour's side
         let t4 = t1 + 3; //          (vi, a, d) — neighbour's side
-        self.tris.push(Tri { v: [vi, b, c], n: [t3, n_bc, t2], alive: true });
-        self.tris.push(Tri { v: [a, vi, c], n: [t4, t1, n_ca], alive: true });
-        self.tris.push(Tri { v: [b, vi, d], n: [t1, t4, n_db], alive: true });
-        self.tris.push(Tri { v: [vi, a, d], n: [t2, n_ad, t3], alive: true });
+        self.tris.push(Tri {
+            v: [vi, b, c],
+            n: [t3, n_bc, t2],
+            alive: true,
+        });
+        self.tris.push(Tri {
+            v: [a, vi, c],
+            n: [t4, t1, n_ca],
+            alive: true,
+        });
+        self.tris.push(Tri {
+            v: [b, vi, d],
+            n: [t1, t4, n_db],
+            alive: true,
+        });
+        self.tris.push(Tri {
+            v: [vi, a, d],
+            n: [t2, n_ad, t3],
+            alive: true,
+        });
         self.inside.push(region_t);
         self.inside.push(region_t);
         self.inside.push(region_nb);
@@ -628,20 +596,32 @@ impl Cdt {
         }
 
         let mut stack: Vec<(usize, usize)> = vec![(t1, 1), (t2, 2), (t3, 2), (t4, 1)];
-        self.legalize(&mut stack);
+        self.legalize_with_progress(&mut stack, progress)?;
         for ti in [t1, t2, t3, t4] {
+            progress()?;
             self.track_tri(ti);
         }
+        Ok(())
     }
 
     /// Lawson legalization. Each `(ti, e)` names an edge of a just-built
     /// triangle to test for the Delaunay (empty-circumcircle) condition.
     /// Constraint edges are skipped. Diagonal flips never touch constraints.
-    fn legalize(&mut self, stack: &mut Vec<(usize, usize)>) {
+    /// Progress-aware form used by untrusted terrain PSLGs. Keep the ordinary
+    /// insertion callers on the same deterministic stack order.
+    fn legalize_with_progress(
+        &mut self,
+        stack: &mut Vec<(usize, usize)>,
+        progress: &mut dyn FnMut() -> Result<(), crate::terrain_cdt::TerrainCdtError>,
+    ) -> Result<(), crate::terrain_cdt::TerrainCdtError> {
         let mut guard = 0usize;
         while let Some((ti, e)) = stack.pop() {
             guard += 1;
+            progress()?;
             if guard > 4_000_000 {
+                if self.fail_on_legalization_guard {
+                    return Err(crate::terrain_cdt::TerrainCdtError::WorkLimitExceeded);
+                }
                 break;
             }
             if !self.tris[ti].alive {
@@ -685,6 +665,7 @@ impl Cdt {
             }
             self.flip(ti, opp, a, b, apex, q, stack);
         }
+        Ok(())
     }
 
     /// Flip shared edge `a-b` of triangles `ti=(…apex…)` / `opp=(…q…)` to the
@@ -703,7 +684,10 @@ impl Cdt {
     ) {
         // Capture the four outer neighbours before rewriting.
         let outer = |s: &Self, t: usize, x: usize, y: usize| -> usize {
-            s.tris[t].edge_of(x, y).map(|e| s.tris[t].n[e]).unwrap_or(NONE)
+            s.tris[t]
+                .edge_of(x, y)
+                .map(|e| s.tris[t].n[e])
+                .unwrap_or(NONE)
         };
         let n_apex_a = outer(self, ti, apex, a); // ti edge apex-a
         let n_apex_b = outer(self, ti, apex, b); // ti edge apex-b
@@ -769,12 +753,7 @@ impl Cdt {
         }
 
         // Queue the four outer edges.
-        for (t, x, y) in [
-            (ti, apex, a),
-            (ti, q, a),
-            (opp, apex, b),
-            (opp, q, b),
-        ] {
+        for (t, x, y) in [(ti, apex, a), (ti, q, a), (opp, apex, b), (opp, q, b)] {
             if let Some(e) = self.tris[t].edge_of(x, y) {
                 stack.push((t, e));
             }
@@ -823,8 +802,17 @@ impl Cdt {
     /// (ascending-index) linear scan — deterministic and robust; regions here
     /// are small so the O(n) cost is acceptable.
     fn locate(&self, p: P2) -> Option<usize> {
+        self.locate_with_progress(p, &mut || Ok(())).ok().flatten()
+    }
+
+    fn locate_with_progress(
+        &self,
+        p: P2,
+        progress: &mut dyn FnMut() -> Result<(), crate::terrain_cdt::TerrainCdtError>,
+    ) -> Result<Option<usize>, crate::terrain_cdt::TerrainCdtError> {
         let mut on_edge = None;
         for ti in 0..self.tris.len() {
+            progress()?;
             if !self.tris[ti].alive {
                 continue;
             }
@@ -834,12 +822,12 @@ impl Cdt {
             let o2 = orient(self.points[v[2]], self.points[v[0]], p);
             if o0 >= 0 && o1 >= 0 && o2 >= 0 {
                 if o0 > 0 && o1 > 0 && o2 > 0 {
-                    return Some(ti);
+                    return Ok(Some(ti));
                 }
                 on_edge.get_or_insert(ti);
             }
         }
-        on_edge
+        Ok(on_edge)
     }
 
     /// [`Cdt::locate`] by deterministic straight-line walk from alive triangle
@@ -887,9 +875,14 @@ impl Cdt {
     /// hull exit, a step-cap hit — answers `None` and the caller falls back to
     /// the scan. That is what makes the walk a pure speedup and not a behaviour
     /// change.
-    fn walk_strict(&self, start: usize, p: P2) -> Option<usize> {
+    fn walk_strict_with_progress(
+        &self,
+        start: usize,
+        p: P2,
+        progress: &mut dyn FnMut() -> Result<(), crate::terrain_cdt::TerrainCdtError>,
+    ) -> Result<Option<usize>, crate::terrain_cdt::TerrainCdtError> {
         if !self.tris.get(start).is_some_and(|t| t.alive) {
-            return None;
+            return Ok(None);
         }
         let mut cur = start;
         // Any cap is safe (a miss just takes the scan); this one bounds the
@@ -897,12 +890,13 @@ impl Cdt {
         // practice.
         let cap = self.tris.len().min(4096) + 16;
         for _ in 0..cap {
+            progress()?;
             let v = self.tris[cur].v;
             let o0 = orient(self.points[v[0]], self.points[v[1]], p);
             let o1 = orient(self.points[v[1]], self.points[v[2]], p);
             let o2 = orient(self.points[v[2]], self.points[v[0]], p);
             if o0 > 0 && o1 > 0 && o2 > 0 {
-                return Some(cur);
+                return Ok(Some(cur));
             }
             let e = if o0 < 0 {
                 0
@@ -911,24 +905,23 @@ impl Cdt {
             } else if o2 < 0 {
                 2
             } else {
-                return None; // on the closed boundary — let `locate` tie-break
+                return Ok(None); // on the closed boundary — let `locate` tie-break
             };
             let nb = self.tris[cur].n[e];
             if nb == NONE || !self.tris[nb].alive {
-                return None;
+                return Ok(None);
             }
             cur = nb;
         }
-        None
+        Ok(None)
     }
 
     // ─────────────────────── constraint recovery ──────────────────────────
 
-    /// Ensure every constraint segment appears as an edge of the triangulation.
-    /// After Delaunay insertion of the ring vertices, most segments already
-    /// exist; any missing one is recovered by flipping the diagonals that cross
-    /// it. Returns false if a segment can't be recovered (caller falls back).
-    fn enforce_constraints(&mut self) -> bool {
+    fn enforce_constraints_with_progress(
+        &mut self,
+        progress: &mut dyn FnMut() -> Result<(), crate::terrain_cdt::TerrainCdtError>,
+    ) -> Result<bool, crate::terrain_cdt::TerrainCdtError> {
         // Materialise the alive edge set ONCE instead of re-scanning every
         // triangle per `edge_exists` probe (4.7e8 slot visits on ISSUE_129 —
         // the second-largest cost in the consolidate path). Recovery's only
@@ -936,47 +929,63 @@ impl Cdt {
         // exactly "drop u-w, add apex-q", so the set stays exact.
         let mut edges: rustc_hash::FxHashSet<(usize, usize)> = rustc_hash::FxHashSet::default();
         for t in self.tris.iter().filter(|t| t.alive) {
+            progress()?;
             for e in 0..3 {
                 edges.insert(ekey(t.v[e], t.v[(e + 1) % 3]));
             }
         }
         let segs: Vec<(usize, usize)> = self.constraints.iter().copied().collect();
         for (a, b) in segs {
-            if !self.recover_segment(a, b, &mut edges) {
-                return false;
+            progress()?;
+            if !self.recover_segment_with_progress(a, b, &mut edges, progress)? {
+                return Ok(false);
             }
         }
-        true
+        Ok(true)
     }
 
-    /// Recover a single constraint segment `a-b` by repeatedly flipping the
-    /// triangulation edge that crosses it. Deterministic: always processes the
-    /// crossing edge nearest `a`.
-    fn recover_segment(
+    /// Recover a single constraint segment `a-b` by repeatedly flipping a
+    /// triangulation edge that crosses it. Deterministic: each pass scans the
+    /// triangle slots in index order and flips the FIRST crossing edge whose
+    /// quad is convex, which is not the crossing nearest `a` (Sloan's order,
+    /// whose termination proof this does not inherit). The `guard` below is
+    /// the only bound, and it counts flips: every one of those passes is an
+    /// O(T) rescan with exact predicates, so an unrecoverable segment costs up
+    /// to 100 000 x T predicate evaluations before the caller falls back.
+    /// Reordering the walk would change the flip sequence and, on cocircular
+    /// input (every rectangular profile), the emitted triangulation, which
+    /// the mesh-determinism manifests pin; re-pin both if you reorder it.
+    fn recover_segment_with_progress(
         &mut self,
         a: usize,
         b: usize,
         edges: &mut rustc_hash::FxHashSet<(usize, usize)>,
-    ) -> bool {
+        progress: &mut dyn FnMut() -> Result<(), crate::terrain_cdt::TerrainCdtError>,
+    ) -> Result<bool, crate::terrain_cdt::TerrainCdtError> {
         if edges.contains(&ekey(a, b)) {
-            return true;
+            return Ok(true);
         }
         let pa = self.points[a];
         let pb = self.points[b];
         let mut guard = 0usize;
         loop {
+            progress()?;
             guard += 1;
             if guard > 100_000 {
-                return false;
+                RECOVERY_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+                return Ok(false);
             }
             if edges.contains(&ekey(a, b)) {
-                return true;
+                return Ok(true);
             }
             // Find an edge (u,v) strictly crossing segment a-b whose flip is
             // legal (the quad is convex). Scan triangles in index order for
             // determinism; pick the first crossing edge encountered.
             let mut flipped = false;
             'scan: for ti in 0..self.tris.len() {
+                if ti % 64 == 0 {
+                    progress()?;
+                }
                 if !self.tris[ti].alive {
                     continue;
                 }
@@ -999,11 +1008,7 @@ impl Cdt {
                     }
                     // Apex of ti opposite u-w, and apex of opp.
                     let apex = self.tris[ti].v[(e + 2) % 3];
-                    let q = self.tris[opp]
-                        .v
-                        .iter()
-                        .copied()
-                        .find(|&x| x != u && x != w);
+                    let q = self.tris[opp].v.iter().copied().find(|&x| x != u && x != w);
                     let Some(q) = q else { continue };
                     // Flip legal only if quad (u, apex, w, q) is convex, i.e.
                     // apex and q are on opposite sides of u-w (always true for
@@ -1034,7 +1039,11 @@ impl Cdt {
             if !flipped {
                 // No flippable crossing edge found — segment already present or
                 // unrecoverable. Re-check existence at loop top.
-                return edges.contains(&ekey(a, b));
+                if edges.contains(&ekey(a, b)) {
+                    return Ok(true);
+                }
+                RECOVERY_STUCK.fetch_add(1, Ordering::Relaxed);
+                return Ok(false);
             }
         }
     }
@@ -1050,16 +1059,20 @@ impl Cdt {
 
     /// Restore the Delaunay property everywhere EXCEPT across constraint edges
     /// (constrained Delaunay). Pushes every non-constraint edge once.
-    fn restore_constrained_delaunay(&mut self) {
+    fn restore_constrained_delaunay_with_progress(
+        &mut self,
+        progress: &mut dyn FnMut() -> Result<(), crate::terrain_cdt::TerrainCdtError>,
+    ) -> Result<(), crate::terrain_cdt::TerrainCdtError> {
         let mut stack: Vec<(usize, usize)> = Vec::new();
         for ti in 0..self.tris.len() {
+            progress()?;
             if self.tris[ti].alive {
                 for e in 0..3 {
                     stack.push((ti, e));
                 }
             }
         }
-        self.legalize(&mut stack);
+        self.legalize_with_progress(&mut stack, progress)
     }
 
     // ─────────────────────── domain classification ────────────────────────
@@ -1087,11 +1100,10 @@ impl Cdt {
             if !self.tris[ti].alive {
                 continue;
             }
-            if self.tris[ti].v.iter().any(|&x| x >= self.super_base)
-                && depth[ti] == -1 {
-                    depth[ti] = 0;
-                    queue.push_back(ti);
-                }
+            if self.tris[ti].v.iter().any(|&x| x >= self.super_base) && depth[ti] == -1 {
+                depth[ti] = 0;
+                queue.push_back(ti);
+            }
         }
 
         let bfs = |start_queue: &mut VecDeque<usize>, depth: &mut [i32]| {
@@ -1194,149 +1206,7 @@ impl Cdt {
         self.points[vi] = p;
         self.n_real += 1;
         // Constraints reference input vertices only (< n_input <= vi): unchanged.
-        self.insert_point_at(vi, loc);
-    }
-
-    /// Does point `p` lie inside the diametral circle of any constraint
-    /// segment?
-    ///
-    /// Existence only — the refinement driver never looks at WHICH segment — so
-    /// the answer is order-independent and a broad-phase is exact rather than
-    /// approximate. Every skinny candidate used to test every constraint
-    /// (5.9e7 disk tests on ISSUE_129); the grid built once per refinement
-    /// answers from one cell plus the few oversized disks.
-    fn is_encroached(&self, p: P2) -> bool {
-        let hit = |i: u32| {
-            let i = i as usize;
-            dist2(p, self.enc.mid[i]) < self.enc.r2[i] * (1.0 - 1e-12)
-        };
-        if self.enc.nx == 0 {
-            // No grid (constraints mutated mid-refinement, or none at all).
-            return self.constraints.iter().any(|&(a, b)| {
-                let (pa, pb) = (self.points[a], self.points[b]);
-                let mid = [(pa[0] + pb[0]) * 0.5, (pa[1] + pb[1]) * 0.5];
-                dist2(p, mid) < dist2(pa, pb) * 0.25 * (1.0 - 1e-12)
-            });
-        }
-        if self.enc.big.iter().copied().any(hit) {
-            return true;
-        }
-        let gx = (p[0] - self.enc.minx) * self.enc.inv;
-        let gy = (p[1] - self.enc.miny) * self.enc.inv;
-        if !(gx >= 0.0 && gy >= 0.0) {
-            return false;
-        }
-        let (gx, gy) = (gx as usize, gy as usize);
-        if gx >= self.enc.nx || gy >= self.enc.ny {
-            return false;
-        }
-        let c = gy * self.enc.nx + gx;
-        let (s, e) = (
-            self.enc.starts[c] as usize,
-            self.enc.starts[c + 1] as usize,
-        );
-        self.enc.items[s..e].iter().copied().any(hit)
-    }
-
-    /// Rebuild [`Cdt::enc`] from the current constraint set. `nx == 0` means
-    /// "no grid" and [`Cdt::is_encroached`] falls back to the linear scan.
-    fn build_enc_grid(&mut self) {
-        let mut mid: Vec<P2> = Vec::with_capacity(self.constraints.len());
-        let mut r2: Vec<f64> = Vec::with_capacity(self.constraints.len());
-        let mut rad: Vec<f64> = Vec::with_capacity(self.constraints.len());
-        for &(a, b) in &self.constraints {
-            let (pa, pb) = (self.points[a], self.points[b]);
-            mid.push([(pa[0] + pb[0]) * 0.5, (pa[1] + pb[1]) * 0.5]);
-            let d2 = dist2(pa, pb) * 0.25;
-            r2.push(d2);
-            rad.push(d2.sqrt());
-        }
-        self.enc = EncGrid {
-            mid,
-            r2,
-            ..EncGrid::default()
-        };
-        let n = self.enc.mid.len();
-        if n == 0 {
-            return;
-        }
-        let (mut minx, mut miny, mut maxx, mut maxy) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
-        for (m, r) in self.enc.mid.iter().zip(rad.iter()) {
-            minx = minx.min(m[0] - r);
-            miny = miny.min(m[1] - r);
-            maxx = maxx.max(m[0] + r);
-            maxy = maxy.max(m[1] + r);
-        }
-        let span = (maxx - minx).max(maxy - miny);
-        if !(span > 0.0) || !span.is_finite() {
-            return;
-        }
-        // ~1 cell per constraint, capped so the CSR stays small.
-        let side = ((n as f64).sqrt().ceil() as usize).clamp(1, 64);
-        let cell = span / side as f64;
-        let inv = 1.0 / cell;
-        let (nx, ny) = (side, side);
-        let cellrange = |m: P2, r: f64| -> (usize, usize, usize, usize) {
-            let c = |v: f64, lo: f64, hi: usize| {
-                let g = ((v - lo) * inv).floor();
-                if g < 0.0 {
-                    0
-                } else if g >= hi as f64 {
-                    hi - 1
-                } else {
-                    g as usize
-                }
-            };
-            (
-                c(m[0] - r, minx, nx),
-                c(m[0] + r, minx, nx),
-                c(m[1] - r, miny, ny),
-                c(m[1] + r, miny, ny),
-            )
-        };
-        let mut counts = vec![0u32; nx * ny + 1];
-        let mut big: Vec<u32> = Vec::new();
-        let mut is_big = vec![false; n];
-        for i in 0..n {
-            let (x0, x1, y0, y1) = cellrange(self.enc.mid[i], rad[i]);
-            if (x1 - x0 + 1) * (y1 - y0 + 1) > 32 {
-                big.push(i as u32);
-                is_big[i] = true;
-                continue;
-            }
-            for gy in y0..=y1 {
-                for gx in x0..=x1 {
-                    counts[gy * nx + gx + 1] += 1;
-                }
-            }
-        }
-        for i in 1..counts.len() {
-            counts[i] += counts[i - 1];
-        }
-        let total = counts[nx * ny] as usize;
-        let mut items = vec![0u32; total];
-        let mut cursor = counts.clone();
-        for i in 0..n {
-            if is_big[i] {
-                continue;
-            }
-            let (x0, x1, y0, y1) = cellrange(self.enc.mid[i], rad[i]);
-            for gy in y0..=y1 {
-                for gx in x0..=x1 {
-                    let c = gy * nx + gx;
-                    items[cursor[c] as usize] = i as u32;
-                    cursor[c] += 1;
-                }
-            }
-        }
-        self.enc.minx = minx;
-        self.enc.miny = miny;
-        self.enc.inv = inv;
-        self.enc.nx = nx;
-        self.enc.ny = ny;
-        self.enc.starts = counts;
-        self.enc.items = items;
-        self.enc.big = big;
+        let _ = self.insert_point_at_with_progress(vi, loc, &mut || Ok(()));
     }
 
     /// Is interior triangle `ti` skinny (smallest angle < the min-angle target)
@@ -1600,6 +1470,45 @@ pub(crate) fn triangulate_pslg(
         .map(|p| Point2::new(p[0], p[1]))
         .collect();
     Some((out_pts, indices))
+}
+
+pub(crate) fn triangulate_pslg_with_progress(
+    points: &[Point2<f64>],
+    segments: &[(usize, usize)],
+    progress: &mut dyn FnMut() -> Result<(), crate::terrain_cdt::TerrainCdtError>,
+) -> Result<Option<(Vec<Point2<f64>>, Vec<usize>)>, crate::terrain_cdt::TerrainCdtError> {
+    let pts: Vec<P2> = points.iter().map(p2).collect();
+    let Some(cdt) = Cdt::build_from_with_progress(pts, segments, 0, progress)? else {
+        return Ok(None);
+    };
+    let keep_upto = cdt.super_base;
+    let mut indices: Vec<usize> = Vec::new();
+    for tri in &cdt.tris {
+        progress()?;
+        if !tri.alive {
+            continue;
+        }
+        let v = tri.v;
+        if v.iter().any(|&x| x >= keep_upto) {
+            continue;
+        }
+        let a = cdt.points[v[0]];
+        let b = cdt.points[v[1]];
+        let c = cdt.points[v[2]];
+        if orient(a, b, c) >= 0 {
+            indices.extend_from_slice(&[v[0], v[1], v[2]]);
+        } else {
+            indices.extend_from_slice(&[v[0], v[2], v[1]]);
+        }
+    }
+    if indices.is_empty() {
+        return Ok(None);
+    }
+    let out_pts: Vec<Point2<f64>> = cdt.points[..keep_upto]
+        .iter()
+        .map(|p| Point2::new(p[0], p[1]))
+        .collect();
+    Ok(Some((out_pts, indices)))
 }
 
 #[cfg(test)]

@@ -2,7 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use super::output_cap::{SymbolicAccumulator, SymbolicTruncationReason};
+use super::output_cap::SymbolicAccumulator;
+use super::output_cap_types::SymbolicTruncationReason;
 use super::rebase::RenderFrameRebase;
 use ifc_lite_core::{DecodedEntity, EntityDecoder, IfcType};
 use std::collections::HashMap;
@@ -11,9 +12,10 @@ use super::item_walk::{extract_symbolic_item_at, ItemWalk};
 use super::fill::extract_annotation_fill_area;
 use super::primitives::{SymbolicCircle, SymbolicPolyline};
 use super::text::extract_text_literal;
+use super::conic::Conic;
 use super::transform::{
-    circle_center, compose_transforms, parse_axis2_placement_2d,
-    parse_cartesian_transformation_operator, Transform2D,
+    compose_transforms, parse_axis2_placement_2d, parse_cartesian_transformation_operator,
+    push_finite_point, Transform2D,
 };
 use super::trimmed_curve::extract_trimmed_curve;
 
@@ -162,10 +164,7 @@ pub(super) fn extract_symbolic_item_inner(
                         let (wx, wy) = transform.transform_point(local_x, local_y);
                         // Plan pair incl. the Y-flip to match section-cut handedness.
                         let (x, y) = rebase.plan(wx, wy);
-                        if x.is_finite() && y.is_finite() {
-                            points.push(x);
-                            points.push(y);
-                        }
+                        push_finite_point(&mut points, x, y);
                     }
                     if points.len() >= 4 {
                         let n = points.len();
@@ -202,10 +201,7 @@ pub(super) fn extract_symbolic_item_inner(
                 }
                 let (wx, wy) = transform.transform_point(local_x, local_y);
                 let (x, y) = rebase.plan(wx, wy);
-                if x.is_finite() && y.is_finite() {
-                    points.push(x);
-                    points.push(y);
-                }
+                push_finite_point(&mut points, x, y);
             }
             if points.len() >= 4 {
                 let n = points.len();
@@ -224,14 +220,13 @@ pub(super) fn extract_symbolic_item_inner(
             }
         }
         IfcType::IfcCircle => {
+            let Some(conic) = Conic::read(item, decoder, unit_scale) else { return };
             // × scale(): a scalar radius never passes through transform_point (#1985).
-            let r = item.get(1).and_then(|a| a.as_float()).unwrap_or(0.0) as f32;
-            let radius = r * unit_scale * transform.scale();
-            let (center_x, center_y, center_z) = circle_center(item, decoder, unit_scale);
-            if !(radius.is_finite() && radius > 0.0 && center_x.is_finite() && center_y.is_finite()) {
+            let radius = conic.semi_a * transform.scale();
+            if !(radius.is_finite() && radius > 0.0) {
                 return;
             }
-            let (wx, wy) = transform.transform_point(center_x, center_y);
+            let (wx, wy) = transform.transform_point(conic.basis.tx, conic.basis.ty);
             let (px, py) = rebase.plan(wx, wy);
             out.push_circle(SymbolicCircle::full(
                 express_id,
@@ -239,30 +234,21 @@ pub(super) fn extract_symbolic_item_inner(
                 px,
                 py,
                 radius,
-                rebase.elevation(center_z + transform.tz),
+                rebase.elevation(conic.basis.tz + transform.tz),
                 rep_identifier.to_string(),
             ));
         }
         IfcType::IfcEllipse => {
             // NOT × scale() (unlike IfcCircle): sampled points go through transform_point.
-            let semi_a = item.get(1).and_then(|a| a.as_float()).unwrap_or(0.0) as f32 * unit_scale;
-            let semi_b = item.get(2).and_then(|a| a.as_float()).unwrap_or(0.0) as f32 * unit_scale;
-            if semi_a <= 0.0 || semi_b <= 0.0 || !semi_a.is_finite() || !semi_b.is_finite() {
-                return;
-            }
-            let (cx_local, cy_local, cz_local) = circle_center(item, decoder, unit_scale);
+            let Some(conic) = Conic::read(item, decoder, unit_scale) else { return };
             const SEGMENTS: usize = 64;
             let mut points: Vec<f32> = Vec::with_capacity((SEGMENTS + 1) * 2);
             for i in 0..=SEGMENTS {
                 let t = (i as f32) * std::f32::consts::TAU / (SEGMENTS as f32);
-                let lx = cx_local + semi_a * t.cos();
-                let ly = cy_local + semi_b * t.sin();
+                let (lx, ly) = conic.point_at(t);
                 let (wx, wy) = transform.transform_point(lx, ly);
                 let (x, y) = rebase.plan(wx, wy);
-                if x.is_finite() && y.is_finite() {
-                    points.push(x);
-                    points.push(y);
-                }
+                push_finite_point(&mut points, x, y);
             }
             if points.len() >= 4 {
                 out.push_polyline(SymbolicPolyline {
@@ -270,7 +256,7 @@ pub(super) fn extract_symbolic_item_inner(
                     ifc_type: ifc_type.to_string(),
                     points,
                     closed: true,
-                    world_y: rebase.elevation(cz_local + transform.tz),
+                    world_y: rebase.elevation(conic.basis.tz + transform.tz),
                     representation: rep_identifier.to_string(),
                 });
             }
@@ -343,6 +329,7 @@ pub(super) fn extract_symbolic_item_inner(
                 rebase,
                 styled_items,
                 out,
+                walk.direct_item_id.filter(|id| depth == 0 && *id == item.id),
             );
         }
         _ => {
@@ -350,4 +337,3 @@ pub(super) fn extract_symbolic_item_inner(
         }
     }
 }
-

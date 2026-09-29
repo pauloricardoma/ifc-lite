@@ -262,6 +262,7 @@ ifc-lite query model.ifc --type IfcWall --limit 10 --offset 20
 |------|-------------|
 | `--type <T>` | Filter by IFC type (comma-separated) |
 | `--where <filter>` | Property filter: `PsetName.PropName=Value` |
+| `--select <selector>` | IfcOpenShell-style selector (classes union with `--type`; properties AND with `--where`) |
 | `--storey <name>` | Filter to elements in a storey |
 | `--props` | Include property sets in output |
 | `--quantities` | Include quantity sets in output |
@@ -284,6 +285,11 @@ ifc-lite query model.ifc --type IfcWall --limit 10 --offset 20
 | `--limit <N>` | Limit result count |
 | `--offset <N>` | Skip first N results |
 | `--json` | JSON output |
+
+`--select` accepts selector text directly — a lossless subset of the IfcOpenShell
+grammar; unsupported constructs throw. `--type` and `--where` remain the CLI's own
+filter surface for everything else. See [Selector Syntax](selector-syntax.md) for
+how each selector construct is spelled across surfaces.
 
 ---
 
@@ -353,6 +359,43 @@ ifc-lite export model.ifc --format csv --out walls.csv
 
 ---
 
+### `schedule` — Tabular Schedules
+
+Generate an AEC-style schedule (door schedule, window schedule, room schedule, material takeoff, …) for one IFC class: a filtered, columnar table with attribute/property/quantity columns, optional sort/group/subtotal rows, and CSV/JSON/Markdown/HTML output. Column values resolve through the same property/quantity resolver `export` uses and `--where` reuses `query`'s exact filter, so a schedule always agrees with the equivalent `query`/`export` invocation.
+
+```bash
+# Explicit columns, a property filter, JSON output
+ifc-lite schedule tests/models/ara3d/AC20-FZK-Haus.ifc --type IfcDoor \
+  --columns "Name, Mark=Tag, Width=Qto_DoorBaseQuantities.Width" \
+  --where "Pset_DoorCommon.IsExternal=true" --format json
+
+# A built-in preset — sensible columns with no other flags
+ifc-lite schedule tests/models/ara3d/AC20-FZK-Haus.ifc --preset door
+
+# Save the resolved definition, then reload it later with --spec
+ifc-lite schedule tests/models/ara3d/AC20-FZK-Haus.ifc --preset door --save door-schedule.json
+ifc-lite schedule tests/models/ara3d/AC20-FZK-Haus.ifc --spec door-schedule.json --format md
+```
+
+**Flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--type <T>` | IFC class to schedule (e.g. `IfcDoor`); auto-prefixes `Ifc` like `query`/`export` |
+| `--columns <spec>` | Comma-separated `Header=path` pairs; a bare `path` is its own header. `path` is an attribute name (`Name`, `Tag`, …), `PsetName.PropName`, or `QtoName.QtyName` |
+| `--where <filter>` | Property filter: `PsetName.PropName=Value` (same resolver as `query --where`) |
+| `--sort <spec>` | `"Header[:asc\|desc], ..."` — stable multi-key sort by column header; numeric when both cells parse as numbers, else string; missing values sort last |
+| `--group-by <headers>` | `"Header, ..."` — orders rows so each group is contiguous (group key ascending, or `--sort`'s direction when the group header is also a sort key) |
+| `--subtotals <spec>` | `"count \| sum:Header \| avg:Header \| min:Header \| max:Header, ..."` — a subtotal row after each group plus a grand total (grand total only, without `--group-by`) |
+| `--preset <name>` | `door \| window \| space \| wall \| material-takeoff` — default `--type`/`--columns` (and a default sort/group for `space`/`material-takeoff`); an explicit flag overrides the preset's corresponding default |
+| `--format <fmt>` | `csv` (default), `json`, `md`, or `html` |
+| `--spec <file.json>` | Load a reusable schedule definition (`type`/`columns`/`where`/`sort`/`groupBy`/`subtotals`/`format`, plus an optional `preset` to start from); beats a `--preset` default, but an explicit flag still beats both |
+| `--save <file.json>` | Write the schedule definition this invocation resolved to (after any `--preset`/`--spec` defaults are folded in), so it's self-contained and reloadable with `--spec` alone |
+
+A missing value is an empty CSV/Markdown cell or a JSON `null`. CSV/Markdown/HTML cells are escaped for their format (RFC-4180 CSV escaping with a formula-injection guard, `|`/backslash/newline escaping for Markdown, full HTML-entity escaping for HTML), since model text is untrusted.
+
+---
+
 ### `diagnose-geometry` - Geometry Diagnostics
 
 Run geometry extraction headlessly and report CSG / opening diagnostics: opening classification, per-reason failure breakdown, fast-path engagement, and the worst-failing host elements. This is the same diagnostics contract the viewer and server surface.
@@ -399,7 +442,7 @@ ifc-lite extract-entities model.ifc --detect --report --json
 ifc-lite extract-entities model.ifc --type IfcStair --out stairs.ifc --view
 ```
 
-Selectors are unioned. The output carries each selected product's full forward reference closure plus the shared context roots (IfcProject, units, geometric contexts, the site/building/storey skeleton), spatial-containment relations, and each kept host's openings and fillers (IfcRelVoidsElement / IfcRelFillsElement), so the subset parses and renders on its own.
+Selectors are unioned. The output carries each selected product's full forward reference closure plus the shared context roots (IfcProject, units, geometric contexts, and the backward closure of the selection's spatial-ancestor chain — only the spatial structures the selection actually sits under, not every spatial-structure instance in the model), spatial-containment relations, and each kept host's openings and fillers (IfcRelVoidsElement / IfcRelFillsElement), so the subset parses and renders on its own.
 
 **Flags:**
 
@@ -551,21 +594,21 @@ Returns pass/fail summary with exit code 0 (pass) or 1 (fail).
 Create, read, and manage BCF (BIM Collaboration Format) files.
 
 ```bash
-# Create a new BCF issue
-ifc-lite bcf create --title "Missing fire door" --description "Level 2, Room 201" --out issue.bcf
+# Create a new BCF topic
+ifc-lite bcf create --title "Missing fire door" --description "Level 2, Room 201" --out topic.bcf
 
 # List topics in a BCF file
-ifc-lite bcf list issues.bcf
+ifc-lite bcf list topics.bcf
 
 # Add a comment to a BCF file
-ifc-lite bcf add-comment --file issues.bcf --text "Fixed in revision 3" --out updated.bcf
+ifc-lite bcf add-comment --file topics.bcf --text "Fixed in revision 3" --out updated.bcf
 ```
 
 ---
 
 ### `clash` - Clash Detection
 
-Detect geometric clashes between elements. Meshes the model headlessly, then runs the clash engine with either a single ad-hoc rule (`--a` / `--b`) or the standard discipline matrix (`--matrix`). Results can be exported as a BCF archive.
+Detect geometric clashes between elements. Meshes the model headlessly, then runs the clash engine with either a single ad-hoc rule (`--a` / `--b`) or the standard discipline matrix (`--matrix`). Results can be exported as a BCF archive or as a flat CSV table for spreadsheets and BI tools.
 
 ```bash
 # Standard discipline matrix
@@ -577,6 +620,9 @@ ifc-lite clash model.ifc --a "IfcDuct*|IfcPipe*" --b "IfcWall*" --mode clearance
 
 # Export clashes as BCF topics
 ifc-lite clash model.ifc --matrix --bcf clashes.bcfzip
+
+# Export every clash as one CSV row (GlobalIds when the elements have them, plus types, names, storey, distance, review) for Excel / Power BI
+ifc-lite clash model.ifc --matrix --csv clashes.csv
 ```
 
 **Flags:**
@@ -589,17 +635,18 @@ ifc-lite clash model.ifc --matrix --bcf clashes.bcfzip
 | `--mode <m>` | `hard` (default) or `clearance` |
 | `--tolerance <m>` | Penetration tolerance in metres (hard mode) |
 | `--clearance <m>` | Required clearance in metres (clearance mode) |
-| `--bcf <file>` | Write results as a BCF archive |
+| `--bcf <file>` | Write results as a BCF archive. Viewpoint cameras are in the model's IFC world coordinates, so other BCF tools frame the clash on georeferenced models too |
 | `--group <g>` | BCF topic grouping: `cluster` (default), `rule`, `typePair`, `element` |
 | `--bcf-status <s>` | Topic status for exported BCF topics |
 | `--max-topics <N>` | Cap the number of BCF topics |
+| `--csv <file>` | Write every clash as one row of an RFC 4180 CSV table: `ClashId, Rule, Status, Severity, Review, ReviewComment, ReviewUpdatedAt, GlobalIdA, GlobalIdB, KeyA, KeyB, ModelA, ModelB, TypeA, TypeB, NameA, NameB, StoreyA, StoreyB, PointX, PointY, PointZ, Distance, DistanceKind, Group`. Uncapped (the `--json` limit is a display cap); `GlobalId*` is empty for an element without an IfcGUID while `Key*` always carries the run's durable key |
 | `--json` | JSON output (stdout carries exactly one JSON document; progress and geometry diagnostics go to stderr) |
 
 ---
 
 ### `create` — Create IFC Files
 
-Generate IFC building elements from CLI flags or JSON input. Supports **29 element types** with property sets, quantities, materials, and colors.
+Generate IFC building elements from CLI flags or JSON input. Supports **29 element types** (28 elements plus `storey`, which emits a bare project skeleton) with property sets, quantities, materials, and colors.
 
 > **Coordinates are storey-relative.** `--position`, `--start`, and `--end` are passed through unchanged to `@ifc-lite/create`, and every element is placed against the storey created by `--storey` / `--elevation`. The storey placement is what applies `--elevation`, exactly once — so an element standing on the floor of a storey created with `--elevation 3` takes `Z = 0`, not `Z = 3`.
 >
@@ -799,7 +846,7 @@ ifc-lite convert old-model.ifc --schema IFC4X3 --out modern.ifc
 ifc-lite convert model.ifc --schema IFC2X3 --out legacy.ifc --json
 ```
 
-Handles entity type mapping automatically (e.g., `IfcWallStandardCase` → `IfcWall` when upgrading from IFC2X3 to IFC4).
+Handles entity type mapping automatically (e.g., `IfcWallStandardCase` → `IfcWall` when upgrading from IFC2X3 to IFC4). An IFC4X3 target is declared as `FILE_SCHEMA(('IFC4X3_ADD2'))`, the ISO 16739-1:2024 identifier for the layouts ifc-lite writes (see [which schema identifier is written](exporting.md#which-schema-identifier-is-written)).
 
 **Flags:**
 
@@ -838,8 +885,15 @@ Reports:
 |------|-------------|
 | `--by-entity` | Compare every `IfcObjectDefinition` by GlobalId (added / removed / common) |
 | `--by-content` | Per-entity comparison via the `@ifc-lite/diff` engine, pairing re-GUIDed elements by content |
+| `--geometry` | Run the wasm mesh pass and attach world geometry hashes/boxes/volumes (implies `--by-content`; falls back to data-only with a warning if the wasm runtime isn't built) |
+| `--split-merge` | Opt into the split/merge detector (implies `--by-content`; needs `--geometry` to produce claims) |
+| `--successors` | Opt into the successor-match detector (implies `--by-content`; needs `--geometry` to produce claims) |
 | `--identity-out <file>` | Write the accepted matches to an identity-map sidecar (implies `--by-content`) |
 | `--identity-in <file>` | Replay a sidecar's claims so those elements are matched by key (implies `--by-content`) |
+| `--key-from <Tag\|Pset.Prop>` | Key the comparison on an authored identifier instead of GlobalId (implies `--by-content`) |
+| `--lineage-out <file>` | Write the lineage this comparison establishes, for `rekey` (implies `--by-content`) |
+| `--lineage-in <file>` | Replay a lineage's one-to-one entries and carry the rest forward (implies `--by-content`) |
+| `--accept <map.json>` | Fold reviewed claims into lineage: `successor:*` reasons become `replaced`; other accepted identities become `identity` |
 | `--json` | JSON output |
 
 Both comparison modes cover the same entities: every `IfcObjectDefinition` in the file. See [what gets compared](#what-gets-compared) below.
@@ -856,15 +910,52 @@ ifc-lite diff model-v1.ifc model-v2.ifc --by-content --identity-out renames.json
 ifc-lite diff model-v1.ifc model-v2.ifc --identity-in renames.json
 ```
 
-The sidecar pins the SHA-256 of both files, and `--identity-in` refuses a map that was verified against a different pair. Nothing in the files is ever rewritten: an identity map is a reviewable claim alongside the models, not an edit to them. This path compares **data only** — the CLI has no geometry pipeline — so every unambiguous match reports as `renamed`. See [Model Diff](model-diff.md#identity-maps) for the full semantics.
+The sidecar pins the SHA-256 of both files, and `--identity-in` refuses a map that was verified against a different pair. Nothing in the files is ever rewritten: an identity map is a reviewable claim alongside the models, not an edit to them. Without `--geometry` this path compares **data only**, so every unambiguous match reports as `renamed`; add `--geometry` (and `--split-merge` / `--successors`) to attach world geometry and tell `moved`/`reshaped` apart, and to produce split/merge and successor claims. See [Model Diff](model-diff.md#identity-maps) for the full semantics.
 
-`--identity-out` refuses to write over either input model.
+`--identity-out` and `--lineage-out` refuse to write over either input model.
+
+#### Authored keys and lineage
+
+When the model maintains an identifier on purpose — an asset code in a property set, a stable `Tag` — `--key-from` keys the comparison on it, and a redrawn element keeps its key. `--lineage-out` writes the one-to-many record `rekey` consumes when an element was split or merged:
+
+```bash
+ifc-lite diff model-v1.ifc model-v2.ifc --key-from Pset_Asset.AssetId --lineage-out lineage.json
+```
+
+See [Stable Element Identity](stable-identity.md) for the workflow end to end.
 
 #### What gets compared
 
 Both `--by-entity` and `--by-content` compare every `IfcObjectDefinition` in the file — every `IfcObject` (products, but also tasks, actors, controls, resources and groups), plus `IfcTypeObject` and `IfcProject`. The other two `IfcRoot` branches are left out on purpose: an `IfcRelationship` is identified by its endpoints rather than in its own right, and a property set's contents are already part of its owner's comparison, so including it would report every edited property twice.
 
 Membership comes from the schema inheritance chain, so an entity that is not an `IfcRoot` at all — a material, a surface style, a classification, a projected CRS — is not compared under its name, and a schedule task or actor is compared even though it carries no geometry. The chain is read from every schema ifc-lite bundles (IFC2X3, IFC4 and IFC4X3), so a class that only one of them declares — `IfcMove` and `IfcSpaceProgram` in IFC2X3, `IfcRoad` and `IfcAlignment` in IFC4X3 — is classified as what it is, not as an unknown. One consequence is deliberate: a vendor-specific `IfcRoot` subtype that no IFC schema declares is not compared unless its class name ends in `Type`, because there is no chain to prove it is an object rather than a resource.
+
+---
+
+### `rekey` — Carry a Table Across a Revision
+
+Rewrite a CSV or JSON table keyed on one revision's element keys to the next revision, through a lineage `diff --lineage-out` (or the viewer) wrote.
+
+```bash
+# Split rows are copied to every piece; rows with nowhere to go are set aside.
+ifc-lite rekey costs.csv --lineage lineage.json --key-column GlobalId --out costs-v2.csv --orphans orphans.csv
+
+# Follow the largest volume share instead, on a JSON array of objects.
+ifc-lite rekey rows.json --lineage lineage.json --key-column id --policy largest-share --out rows-v2.json
+```
+
+**Flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--lineage <file>` | The lineage sidecar (required) |
+| `--out <file>` | Where to write the rekeyed table (required) |
+| `--key-column <name>` | The column holding the old key (default `GlobalId`) |
+| `--policy <p>` | `copy-to-all` (default), `largest-share`, or `orphan-on-split` |
+| `--orphans <file>` | Where rows with nowhere to go are written (default `<out>.orphans.<ext>` when there are any) |
+| `--json` | JSON summary |
+
+A row whose key the lineage does not mention keeps its key unless the lineage's `deleted` list names it. The output gains `lineage_relation` and `lineage_from` columns. Orphans are never dropped. See [Stable Element Identity](stable-identity.md#step-3-carry-external-data-across-a-split).
 
 ---
 
@@ -985,6 +1076,62 @@ The full design lives in [Authoring Extensions](extension-authoring.md). For the
 
 ---
 
+### `layer` — Layered Change Tracking
+
+Publish content-addressed layers with provenance manifests over a local layer store (`.ifc-lite/` of the cwd, override with `--store <dir>`), diff composed states, merge candidates into refs, and derive log/bake/revert/rebase from the same state-based op model.
+
+```bash
+ifc-lite layer create --base main --intent "Relocate fire doors"
+ifc-lite layer publish delta.ifcx --base main --intent "Relocate fire doors" --check requirements.ids=report.json
+ifc-lite layer diff main --against candidate-layer-id --json
+ifc-lite layer merge candidate-layer-id --into main --preview
+ifc-lite layer log main --json
+```
+
+**Subcommands:**
+
+| Subcommand | Purpose |
+|------------|---------|
+| `publish <delta.ifcx>` | Publish a delta as a content-addressed layer. `--base <ref\|->`, `--intent "<text>"`, `--scope <claim>` (repeatable), `--check <spec.ids>=<report.json>` (repeatable), `--principal <id>`, `--kind human\|agent\|hybrid`, `--strict-scope`, `--json` |
+| `create` | Record a draft descriptor (`.ifc-lite/draft.json`). `--base <ref>`, `--intent "<text>"`, `--scope <claim>` |
+| `status` | Show the draft and whether its base ref moved |
+| `diff <side>` | Diff composed states; a side is a ref, layer id, or `.ifcx` file. `--against <side>`, `--components`, `--json` |
+| `merge <layer-id>` | Merge a candidate into a ref (fast-forward or three-way plan). `--into <ref>`, `--preview`, `--resolve ours\|theirs`, `--waive <spec> --reason "<text>"`, `--approved-by <principal>`, `--allow-unrelated`, `--json` |
+| `push <ref\|layer-id>` | Upload a ref's stack (or one layer) plus its check evidence to a layer registry. `--registry <url>`, `--token <bearer>`, `--set-ref`, `--json` |
+| `log <ref>` | Provenance log, newest first. `--json` |
+| `bake <ref> -o <out>` | Materialize a tombstone-free flat document |
+| `revert <layer-id>` | Publish an inverse layer and append it to a ref. `--in <ref>`, `--resolve ours\|theirs`, `--json` |
+| `rebase <layer-id>` | Re-plan a candidate onto a ref's current stack and publish the rebased layer. `--onto <ref>`, `--json` |
+
+All subcommands honour `--store <dir>` (default `<cwd>/.ifc-lite`). Exit codes:
+0 clean, 2 conflicts, 3 policy failure, 4 scope violation (with `--strict-scope`),
+5 unrelated merge base (override with `--allow-unrelated`), and 1 generic errors.
+
+---
+
+### `ref` — Manage Named Refs
+
+Manage named refs (branch-like pointers onto a layer stack) in the layer store.
+
+```bash
+ifc-lite ref list --json
+ifc-lite ref create feature-x --from main
+ifc-lite ref protect main --require-check requirements.ids --require-human-approval
+```
+
+**Subcommands:**
+
+| Subcommand | Purpose |
+|------------|---------|
+| `list` | List refs with layer counts and stack hashes. `--json`, `--store <dir>` |
+| `create <name>` | Create a ref, optionally copying another ref's layer stack (`--from <ref>`) |
+| `move <name>` | Point a ref at another ref's stack or at a comma-separated list of layer ids (`--to <target>`) |
+| `protect <name>` | Set merge policy on a ref. `--require-check <spec>` (repeatable), `--require-human-approval` |
+
+All subcommands honour `--store <dir>` (default `<cwd>/.ifc-lite`).
+
+---
+
 ### `eval` — Evaluate Expressions
 
 Evaluate JavaScript expressions against the BIM SDK. The `bim` object provides the full `@ifc-lite/sdk` API.
@@ -999,9 +1146,15 @@ ifc-lite eval model.ifc "bim.storeys().map(s => s.name)"
 # Get properties of a specific entity
 ifc-lite eval model.ifc "bim.properties({modelId:'default', expressId:42})"
 
+# Evaluate an IfcCostItem; amounts are decimal strings
+ifc-lite eval tests/models/cost/buildingsmart-cost-composition.ifc "bim.cost.evaluateItem({modelId:'default',expressId:42})" --json
+
 # Complex query
 ifc-lite eval model.ifc "bim.query().byType('IfcDoor').toArray().filter(d => d.name.includes('Fire'))"
 ```
+
+Cost reads use the loaded IFC source snapshot; pending generic mutation overlays
+are not included until the source is replaced or reloaded.
 
 !!! tip "Power Move for LLMs"
     The `eval` command is the most flexible tool. LLMs can write arbitrary SDK code and execute it without needing dedicated subcommands. The full API is discoverable via `ifc-lite schema`.
@@ -1067,7 +1220,7 @@ ifc-lite schema              # Full schema with params and return types
 ifc-lite schema --compact    # Minimal: names and descriptions only
 ```
 
-The schema includes the runtime SDK namespaces: `model`, `query`, `viewer`, `mutate`, `store`, `lens`, `create`, `files`, `schedule`, `clash`, `export`, and their methods with parameter names, return types, and LLM semantic hints.
+The dump matches the `bim` object `run`/`eval` hand to scripts: a root `bim` namespace with its top-level methods (`entity`, `properties`, `contains`, `on`, …), plus the runtime SDK namespaces `model`, `query`, `viewer`, `mutate`, `store`, `lens`, `create`, `files`, `schedule`, `clash`, `export` — where `query` is the builder chain reached via `bim.query()` (`.byType(...).where(...).toArray()`), not a flat namespace — and their methods with parameter names, return types, and LLM semantic hints.
 
 ---
 
@@ -1160,6 +1313,160 @@ a fresh generated episode. Episode generation dynamically imports
 clear error for `--seed` while `--model` keeps working. See the
 [`@ifc-lite/cli` README](https://github.com/LTplus-AG/ifc-lite/tree/main/packages/cli#gym)
 for the full protocol reference.
+
+---
+
+### `delivery` — Repeatable Delivery Check
+
+Run a saved, versioned model-delivery check: structural validation (the same
+rules `validate` runs), IDS validation (the same validator `ids` runs),
+and/or `.rules.json` information-validation rule sets (the same engine
+`check` runs) — any combination, against one or more models, in one
+invocation — with a consolidated JSON report and an optional standalone
+HTML report.
+
+```bash
+ifc-lite delivery recipe.json
+ifc-lite delivery recipe.json --json
+ifc-lite delivery recipe.json --json --html report.html
+ifc-lite delivery recipe.json --out report.json --html report.html
+```
+
+The recipe is a small JSON file, versioned alongside the models it checks:
+
+```json
+{
+  "models": ["model.ifc"],
+  "structural": true,
+  "ids": ["door-rules.ids"],
+  "rules": ["fire-rating.rules.json"]
+}
+```
+
+`models`, `ids` and `rules` paths resolve relative to the recipe file's own
+directory, not the current working directory. A recipe must declare at
+least one applicable check (`"structural": true` and/or a non-empty
+`"ids"`/`"rules"` list) — a zero-check recipe is a fatal error rather than a
+silent "pass".
+
+Every check reports one of three outcomes, never folded together:
+
+- **`pass`** — the check ran and found nothing to report.
+- **`fail`** — the check ran and found a violation (a structural error, a
+  failed IDS specification, or a `.rules.json` rule).
+- **`error`** — the check could **not** be run: an unreadable/empty/corrupt
+  model, an unreadable or unparsable IDS/rules file, an IDS document
+  declaring zero specifications, a rule set declaring zero rules, or a rule
+  the engine itself could not evaluate. An unevaluable check is never
+  counted as a pass.
+
+The overall **verdict** is `pass` only when every declared check on every
+declared model passed. An unreadable model, an empty IDS ruleset/rule set,
+or any failed check all produce a `fail` verdict — a delivery check can
+never report success on zero evidence.
+
+Each recipe's `rules` file runs against ONE model at a time, mirroring the
+`ids` loop — a rule federated across every model in the recipe (`targets`,
+`unique` scope `'federation'`) is [`check`](#check-rule-set-validation)'s
+job, not `delivery`'s.
+
+The consolidated report records, per model, its declared path and a SHA-256
+fingerprint of the bytes actually checked (or the load error, when
+unreadable); per check, the model, check type, source (the IDS/rules file),
+status, and the underlying `validate`/`ids`/`check` evidence
+(issues / specification / rule counts). Given the same recipe and the same
+bytes on disk, running `delivery` twice produces byte-identical `--json`
+output.
+
+A committed worked example — a passing model, a structurally-broken model,
+an unreadable model, an IDS specification that fails, and a `.rules.json`
+rule that passes — lives at
+[`packages/cli/examples/delivery/`](https://github.com/LTplus-AG/ifc-lite/tree/main/packages/cli/examples/delivery).
+
+**Flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--json` | Print the consolidated report as JSON instead of a human-readable summary |
+| `--out <file>` | Write the JSON report to a file instead of stdout |
+| `--html <file>` | Additionally write a standalone HTML report to `<file>` |
+
+### `check` — Rule-Set Validation
+
+Run a `.rules.json` information-validation rule set — the SAME
+`@ifc-lite/rules` engine the viewer's Data Validation panel runs (#5138 PR
+7b) — against one or more already-parsed models, in one invocation. No
+second evaluator: a rule set authored (or exported) in the viewer runs
+identically from the terminal.
+
+```bash
+ifc-lite check model.ifc --rules fire-rating.rules.json
+ifc-lite check arch.ifc struct.ifc --rules fire-rating.rules.json --format json
+ifc-lite check model.ifc --rules fire-rating.rules.json --fail-on warning
+```
+
+Every model is loaded and parsed before any rule runs; `targets` /
+`modelTagIds` in the rule set narrow which of the loaded models a given
+rule applies to, and `unique`/`aggregate` requirements with scope
+`'federation'` (the default) see every model passed on the command line as
+one federation — the same semantics the viewer runs, unlike `delivery`'s
+`rules` field, which checks one model at a time.
+
+**Exit codes**, tri-state and never folded together:
+
+| Exit | Meaning |
+|------|---------|
+| `0` | Every rule passed (or was not applicable). |
+| `1` | At least one rule failed at a severity `--fail-on` counts. Default `--fail-on error`: `severity: "warning"` rules never fail the run by themselves; pass `--fail-on warning` to make them count too. |
+| `2` | A model could not be read/parsed, or the engine itself could not evaluate a rule (e.g. a ReDoS-rejected regex) — this always wins over `1`, since an unevaluated rule is not pass/fail evidence. |
+
+**Flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--rules <file>` | Path to the `.rules.json` rule set (required) |
+| `--format json\|table` | `table` (default) prints one line per rule: status, applicable/passed/failed counts, set-check failures; `json` prints the full `ValidationReport` verbatim |
+| `--fail-on error\|warning` | Which rule severities count toward exit code `1` (default `error`) |
+---
+
+### `flow` — Run a Node Graph Headlessly
+
+Evaluate a `*.flow.json` node graph (see [Flow graphs](flow.md)) against a model with the same
+`@ifc-lite/flow-nodes` library the viewer's editor uses. Viewer nodes (`viewer.colorize`, …)
+run as no-ops headlessly and pass their entities through, so a graph that highlights failures in
+the viewer runs unchanged in CI.
+
+```bash
+# Player-style inputs override node params; --out writes the model with the graph's mutations
+ifc-lite flow run audit.flow.json model.ifc --input rating.value=REI90 --out audited.ifc --json
+
+# The graph's inputs/outputs schema (what a Player form or a Hops-style caller needs)
+ifc-lite flow describe audit.flow.json --json
+
+# Document validation plus a per-node availability report for this host
+ifc-lite flow validate audit.flow.json
+```
+
+**Subcommands:**
+
+| Subcommand | Purpose |
+|------------|---------|
+| `run <graph> <file.ifc>` | Evaluate the graph. `--input <nodeId.param=value>` (repeatable; JSON values parse, others are strings), `--out <file>` (IFC with the run's mutations applied), `--tracking <file>` / `--no-tracking` (element sets of tracked creation nodes; default `<graph>.tracking.json` beside the graph), `--json` |
+| `describe <graph>` | Print declared inputs (with param defaults) and outputs (with value kind and access). `--json` |
+| `validate <graph>` | Validate the document's wiring against the node registry (unknown types, missing ports, type-incompatible edges, unconnected required inputs, `inputs`/`outputs` markers that name nothing) and report each node as `ok`, `noop`, `unavailable` or `unknown` on this host. Exit 2 on any wiring problem or unrunnable node. `--json` |
+
+`run` exits 1 when any node failed; per-lane errors inside a lifted node do not fail the run
+(the lane yields `null`) and are listed under `errors` in the summary. Secrets are resolved from
+environment variables; a node that requires one the host lacks is reported as `unavailable`.
+
+A graph with a tracked creation node (`model.addElement`) re-run on its own output updates the
+elements it made — same GlobalIds, changed geometry — and removes the ones whose lanes vanished:
+
+```bash
+ifc-lite flow run columns.flow.json model.ifc --out v1.ifc
+ifc-lite flow run columns.flow.json v1.ifc --input column.height=4 --out v2.ifc
+ifc-lite diff v1.ifc v2.ifc --by-entity --json   # 0 added, 0 removed
+```
 
 ## Output Modes
 
@@ -1274,19 +1581,21 @@ Run `ifc-lite schema` to see the full API before writing eval expressions.
 | `query` | Query entities by type/properties/quantities |
 | `props` | All properties for a single entity |
 | `export` | Export data / geometry / energy model |
+| `schedule` | Tabular schedule of one class (csv/json/md/html) |
 | `diagnose-geometry` | CSG / opening diagnostics (failures, classification) |
 | `extract-entities` | Isolate entities into a small, viewable standalone IFC |
 | `anonymize` | Export selected objects + context as an anonymized IFC |
 | `ids` | Validate against IDS rules |
 | `bcf` | Work with BCF collaboration files |
 | `clash` | Detect geometric clashes between elements |
-| `create` | Create IFC elements (30+ types) |
+| `create` | Create IFC elements (29 types) |
 | `eval` | Evaluate SDK expression |
 | `run` | Execute a script against model |
 | `schema` | Dump SDK API schema (for LLM tools) |
 | `merge` | Merge multiple IFC files |
 | `convert` | Convert between IFC schema versions |
 | `diff` | Compare two IFC files |
+| `rekey` | Carry a table keyed on old element keys across a revision |
 | `validate` | Structural validation checks |
 | `bsdd` | buildingSMART Data Dictionary lookup |
 | `stats` | Auto-calculated model KPIs and health check |
@@ -1302,4 +1611,7 @@ Run `ifc-lite schema` to see the full API before writing eval expressions.
 | `layer` | Layered change tracking over a local store (.ifc-lite/) |
 | `ref` | Manage named refs in the layer store |
 | `gym` | reset/step/reward environment loop (JSONL over stdin/stdout) |
+| `delivery` | Repeatable delivery check (structural + IDS + rule sets) from a saved recipe |
+| `check` | Run a .rules.json information-validation rule set (same engine as the viewer) |
+| `flow` | Evaluate a node graph headlessly |
 <!-- END GENERATED: cli-commands -->

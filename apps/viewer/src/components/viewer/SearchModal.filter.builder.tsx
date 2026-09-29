@@ -3,23 +3,26 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * SearchModalFilterBuilder — chip palette over the unified
- * `FilterRule[]`. Storey / IFC type / Predefined type / Name / Property /
- * Quantity rules with AND/OR + IsSet/IsNotSet, schema-aware dropdowns
- * (storeys + types load eagerly, pset/qto names lazily), and saved
- * preset persistence.
+ * SearchModalFilterBuilder — a thin adapter over the search slice.
  *
- * UI-only: this component owns rule editing, not run lifecycle. The
- * parent `SearchModalFilter` reads the same slice state and triggers
- * the path-B evaluator from a single Run button.
+ * The group/rule chip UI (tabs, AND/OR, rule rows, "Add rule") moved to
+ * `FilterGroupEditor.tsx` as a CONTROLLED component (#5138 PR 5, so the
+ * information-validation rule editor can reuse it). This file keeps
+ * everything that is genuinely specific to the SEARCH tab — the search-bar
+ * "promote query as rule" button, saved-filter presets, the result limit —
+ * and wires the controlled editor to `useViewerStore`'s `searchFilter`
+ * slice. Behaviour is unchanged: `SearchModal.filter.wiring.test.tsx`,
+ * `.groups.test.tsx` and `.promote.test.tsx` assert on this component's
+ * rendered output and pass unmodified (the lift invariant).
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useState } from 'react';
 import { Plus, Trash2, X, Bookmark, Save } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { useViewerStore } from '@/store';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { promptDialog } from '@/components/ui/confirm-dialog';
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -28,17 +31,8 @@ import {
   DropdownMenuSeparator,
   DropdownMenuLabel,
 } from '@/components/ui/dropdown-menu';
-import { COMMON_IFC_TYPES } from '@/lib/search/common-ifc-types';
-import {
-  Rule,
-  type FilterRule,
-  type Combinator,
-} from '@/lib/search/filter-rules';
-import {
-  discoverFilterSchema,
-  discoverPropertyAndQuantitySchema,
-  discoverFilterValues,
-} from '@/lib/search/filter-schema';
+import { Rule, type FilterRule } from '@ifc-lite/rules';
+import { totalRuleCount } from '@ifc-lite/rules';
 import {
   loadSavedFilters,
   saveFilter,
@@ -46,165 +40,139 @@ import {
   type SavedFilterPreset,
 } from '@/lib/search/saved-filters';
 import { toast } from '@/components/ui/toast';
-import { RuleRow, RULE_KIND_LABEL } from './SearchModal.filter.editors';
+import { FilterGroupEditor, type FilterGroupEditorModel, type FilterGroupEditorState } from './FilterGroupEditor';
+import { SearchModalFilterSelector, useActiveSchemaVersion } from './SearchModal.filter.selector';
+import { readSelector } from '@/lib/search/selector-to-rules';
+import { useTranslation } from '@/i18n';
 
 export function SearchModalFilterBuilder() {
+  const { t } = useTranslation();
   const {
     filter,
-    schemaMap,
-    models,
-    activeModelId,
+    activeGroupIndex,
     searchQuery,
-    setFilterCombinator,
-    setFilterLimit,
+    models,
     addFilterRule,
-    updateFilterRule,
-    removeFilterRule,
     clearFilterRules,
-    setFilterSchema,
-    setFilterPsetQtoSchema,
-    setFilterValueSchema,
+    setActiveFilterGroup,
     setSearchFilter,
+    setFilterLimit,
   } = useViewerStore(
     useShallow((s) => ({
       filter: s.searchFilter,
-      schemaMap: s.searchFilterSchema,
-      models: s.models,
-      activeModelId: s.activeModelId,
+      activeGroupIndex: s.searchFilterActiveGroup,
       searchQuery: s.searchQuery,
-      setFilterCombinator: s.setFilterCombinator,
-      setFilterLimit: s.setFilterLimit,
+      models: s.models,
       addFilterRule: s.addFilterRule,
-      updateFilterRule: s.updateFilterRule,
-      removeFilterRule: s.removeFilterRule,
       clearFilterRules: s.clearFilterRules,
-      setFilterSchema: s.setFilterSchema,
-      setFilterPsetQtoSchema: s.setFilterPsetQtoSchema,
-      setFilterValueSchema: s.setFilterValueSchema,
+      setActiveFilterGroup: s.setActiveFilterGroup,
       setSearchFilter: s.setSearchFilter,
+      setFilterLimit: s.setFilterLimit,
     })),
   );
+  const schemaVersion = useActiveSchemaVersion();
 
   const [savedPresets, setSavedPresets] = useState<SavedFilterPreset[]>(() => loadSavedFilters());
 
-  const activeModel = activeModelId ? models.get(activeModelId) : undefined;
-  const activeStore = activeModel?.ifcDataStore ?? null;
-  const schemaEntry = activeModelId ? schemaMap.get(activeModelId) : undefined;
+  const activeGroup = filter.groups[activeGroupIndex] ?? filter.groups[0];
+  const activeRules = activeGroup?.rules ?? [];
+  const totalRules = totalRuleCount(filter.groups);
 
-  // Cheap schema discovery — runs once per active model.
-  useEffect(() => {
-    if (!activeModelId || !activeStore) return;
-    if (schemaMap.has(activeModelId)) return;
-    setFilterSchema(activeModelId, discoverFilterSchema(activeStore));
-  }, [activeModelId, activeStore, schemaMap, setFilterSchema]);
+  // Same `sourceFingerprint ?? id` fallback `useFilterRuleOptions` has
+  // always used for the search tab's `model` chip — unlike the validation
+  // editor (which only offers models WITH a fingerprint, so a persisted
+  // rule never carries a runtime id), search state is never written to
+  // disk, so the fallback is safe here and keeps this adapter's output
+  // identical to the pre-lift builder.
+  const modelList: FilterGroupEditorModel[] = Array.from(models.values(), (m) => ({
+    id: m.id,
+    name: m.name,
+    sourceFingerprint: m.sourceFingerprint ?? m.id,
+  }));
 
-  // Lazy pset/qto schema — fired the first time a property/quantity rule appears.
-  useEffect(() => {
-    if (!activeModelId || !activeStore) return;
-    const entry = schemaMap.get(activeModelId);
-    if (entry?.psetQto) return;
-    const needs = filter.rules.some((r) => r.kind === 'property' || r.kind === 'quantity');
-    if (!needs) return;
-    setFilterPsetQtoSchema(activeModelId, discoverPropertyAndQuantitySchema(activeStore));
-  }, [activeModelId, activeStore, filter.rules, schemaMap, setFilterPsetQtoSchema]);
-
-  // Lazy value discovery - distinct material / classification / property /
-  // predefined-type values for the chip value suggestions. Fired the first time
-  // a rule that benefits from them appears.
-  useEffect(() => {
-    if (!activeModelId || !activeStore) return;
-    const entry = schemaMap.get(activeModelId);
-    if (entry?.values) return;
-    const needs = filter.rules.some(
-      (r) =>
-        r.kind === 'property' ||
-        r.kind === 'material' ||
-        r.kind === 'classification' ||
-        r.kind === 'predefinedType',
-    );
-    if (!needs) return;
-    setFilterValueSchema(activeModelId, discoverFilterValues(activeStore));
-  }, [activeModelId, activeStore, filter.rules, schemaMap, setFilterValueSchema]);
-
-  const ifcTypeOptions = useMemo<string[]>(() => {
-    if (schemaEntry?.basic.ifcTypes && schemaEntry.basic.ifcTypes.length > 0) {
-      return schemaEntry.basic.ifcTypes;
-    }
-    return COMMON_IFC_TYPES.slice();
-  }, [schemaEntry]);
-  const storeyOptions = schemaEntry?.basic.storeys ?? [];
-
-  // The canonical IFC types the filter selects (ifcType "is one of" rules).
-  const selectedTypes = useMemo(() => {
-    const set = new Set<string>();
-    for (const r of filter.rules) {
-      if (r.kind === 'ifcType' && r.op === 'in') {
-        for (const v of r.values) if (v) set.add(v);
-      }
-    }
-    return Array.from(set);
-  }, [filter.rules]);
-
-  const hasPropOrQty = useMemo(
-    () => filter.rules.some((r) => r.kind === 'property' || r.kind === 'quantity'),
-    [filter.rules],
+  // Reads the store's CURRENT `searchFilter`/`searchFilterActiveGroup` at
+  // apply time, not the `filter`/`activeGroupIndex` this component closed
+  // over at its last render — see `FilterGroupEditor.tsx`'s docstring: a
+  // store mutation from elsewhere between renders must not be reverted by
+  // the next click this editor dispatches.
+  const handleGroupsChange = useCallback(
+    (updater: (prev: FilterGroupEditorState) => FilterGroupEditorState) => {
+      const state = useViewerStore.getState();
+      const next = updater({ groups: state.searchFilter.groups, activeGroup: state.searchFilterActiveGroup });
+      setSearchFilter({ groups: next.groups, limit: state.searchFilter.limit });
+      setActiveFilterGroup(next.activeGroup);
+    },
+    [setSearchFilter, setActiveFilterGroup],
   );
 
-  // Pset/Qto dropdown source: when the filter targets specific IFC types, scope
-  // discovery to just those elements so only their (legal + user-defined) psets
-  // show - no scrolling past unrelated MEP/structural sets - and read them
-  // directly so a pset missing from the on-demand map still appears. Otherwise
-  // use the cached whole-model schema. (#1462)
-  const psetQto = useMemo(() => {
-    const cached = schemaEntry?.psetQto ?? null;
-    if (!activeStore || !hasPropOrQty || selectedTypes.length === 0) return cached;
-    return discoverPropertyAndQuantitySchema(activeStore, selectedTypes);
-  }, [activeStore, hasPropOrQty, selectedTypes, schemaEntry?.psetQto]);
-
-  // ── Rule construction ─────────────────────────────────────────────
-
-  const addRuleOfKind = useCallback((kind: FilterRule['kind']) => {
-    let rule: FilterRule;
-    switch (kind) {
-      case 'storey':         rule = Rule.storey([], 'in'); break;
-      case 'ifcType':        rule = Rule.ifcType([], 'in'); break;
-      case 'predefinedType': rule = Rule.predefinedType([], 'in'); break;
-      case 'name':           rule = Rule.name('contains', ''); break;
-      case 'property':       rule = Rule.property('', '', 'eq', ''); break;
-      case 'quantity':       rule = Rule.quantity('', '', 'gt', 0); break;
-      case 'material':       rule = Rule.material('contains', ''); break;
-      case 'classification': rule = Rule.classification('', 'contains', ''); break;
-      case 'elevation':      rule = Rule.elevation('gt', 0); break;
-    }
-    addFilterRule(rule);
-  }, [addFilterRule]);
-
+  /**
+   * The search bar's text as rules, through the same reading the Selector
+   * field uses. `IfcWall, Name=/D[0-9]{2}/` becomes a type rule and a Name
+   * rule; text that is not a selector at all — a plain `Wand` — stays the
+   * `Name contains` it has always been.
+   *
+   * A selector the adapter can only partly carry now applies the part it can
+   * and NAMES the rest. It used to fall through to `Name contains` on the
+   * whole string, so `IfcWall, type=WT01` silently added a rule matching zero
+   * elements with nothing to read: the defect #4091 reported, reached from the
+   * other entry point. Two surfaces reading the same text cannot disagree
+   * about whether the user is owed an explanation.
+   *
+   * The fallback survives for text that PARSES but names nothing — `IFC`,
+   * `IFC-Export`, `Level=1`. Those reach here as a successful parse with no
+   * rule, and reporting them cost the button its oldest behaviour on the most
+   * ordinary input there is: `readsAsPlainText` is how the adapter separates
+   * them from a selector whose construct it genuinely cannot run.
+   */
   const promoteSearchQuery = useCallback(() => {
     const q = searchQuery.trim();
     if (!q) return;
-    addFilterRule(Rule.name('contains', q));
-  }, [addFilterRule, searchQuery]);
+    const reading = readSelector(q, { schemaVersion });
+    if (!reading.ok || reading.readsAsPlainText) {
+      addFilterRule(Rule.name('contains', q));
+      return;
+    }
+    if (reading.rules.length === 0) {
+      toast.error(t('searchModal.filterBuilder.noRuleMapped', { unsupported: reading.unsupported.join('; ') }));
+      return;
+    }
+    // A `+` union is refused here rather than silently promoting only
+    // `groups[0]` — review (PR #4987): this button predates groups and adds
+    // into the single ACTIVE one, so a naive promote of "IfcWall + IfcDoor"
+    // would add the IfcWall rule and drop the IfcDoor branch with nothing
+    // to read, the exact #4091 defect class this whole adapter exists to
+    // avoid. The Selector field above (which DOES carry the full union) is
+    // where `+` text is meant to go.
+    if (reading.groups.length > 1) {
+      toast.error(
+        t('searchModal.filterBuilder.unionNotSupported', { query: q, groupCount: reading.groups.length }),
+      );
+      return;
+    }
+    for (const rule of reading.rules) addFilterRule(rule);
+    if (reading.unsupported.length > 0) {
+      toast.info(t('searchModal.filterBuilder.addedWithoutParts', { unsupported: reading.unsupported.join('; ') }));
+    }
+  }, [addFilterRule, schemaVersion, searchQuery]);
 
   // ── Preset handlers ─────────────────────────────────────────────────
 
-  const handleSavePreset = useCallback(() => {
-    if (filter.rules.length === 0) return;
-    // eslint-disable-next-line no-alert
-    const name = window.prompt('Save filter as…', '');
+  const handleSavePreset = useCallback(async () => {
+    if (totalRules === 0) return;
+    const name = await promptDialog({ description: t('searchModal.filterBuilder.saveFilterPrompt'), defaultValue: '' });
     if (!name) return;
-    const result = saveFilter(name, filter.combinator, filter.rules);
+    const result = saveFilter(name, filter.groups);
     setSavedPresets(result.presets);
     // A refused write used to return the in-memory catalog as though saved —
     // the user saw the filter and lost it next session (#2089).
     if (!result.persisted) {
-      toast.error('Filter could not be saved — browser storage is unavailable or full.');
+      toast.error(t('searchModal.filterBuilder.saveFilterFailed'));
     }
-  }, [filter.combinator, filter.rules]);
+  }, [filter.groups, totalRules, t]);
 
   const handleLoadPreset = useCallback((preset: SavedFilterPreset) => {
     setSearchFilter({
-      rules: preset.rules.map((r) => ({ ...r }) as FilterRule),
-      combinator: preset.combinator,
+      groups: preset.groups.map((g) => ({ rules: g.rules.map((r) => ({ ...r }) as FilterRule), combinator: g.combinator })),
       limit: filter.limit,
     });
   }, [filter.limit, setSearchFilter]);
@@ -213,132 +181,89 @@ export function SearchModalFilterBuilder() {
     const result = deleteSavedFilter(name);
     setSavedPresets(result.presets);
     if (!result.persisted) {
-      toast.error('Filter could not be deleted — browser storage is unavailable or full.');
+      toast.error(t('searchModal.filterBuilder.deleteFilterFailed'));
     }
   }, []);
 
   return (
-    <div className="flex flex-col gap-3 p-4">
-      {/* ── Toolbar: AND/OR · Limit · promote-query · Presets · Save · Reset ── */}
-      <div className="flex flex-wrap items-center gap-2 text-xs">
-        <CombinatorToggle value={filter.combinator} onChange={setFilterCombinator} />
+    <div className="flex flex-col">
+      <SearchModalFilterSelector />
+      <div className="flex flex-col gap-3 p-4">
+        {/* ── Toolbar: Limit · promote-query · Presets · Save · Reset ── */}
+        <div className="flex flex-wrap items-center gap-2 text-xs">
+          <div className="flex items-center gap-1">
+            <label className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+              {t('searchModal.filterBuilder.limitLabel')}
+            </label>
+            <Input
+              type="number"
+              aria-label={t('searchModal.filterBuilder.limitLabel')}
+              min={0}
+              value={filter.limit}
+              onChange={(e) => setFilterLimit(Number.parseInt(e.target.value, 10) || 0)}
+              className="h-7 w-20 text-xs"
+            />
+            <span className="text-2xs text-muted-foreground">{t('searchModal.filterBuilder.limitZeroHint')}</span>
+          </div>
 
-        <div className="ml-1 flex items-center gap-1">
-          <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-            Limit
-          </label>
-          <Input
-            type="number"
-            min={0}
-            value={filter.limit}
-            onChange={(e) => setFilterLimit(Number.parseInt(e.target.value, 10) || 0)}
-            className="h-7 w-20 text-xs"
-          />
-          <span className="text-[10px] text-muted-foreground">0 = none</span>
-        </div>
-
-        {searchQuery.trim().length > 0 && (
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            onClick={promoteSearchQuery}
-            className="h-7 gap-1 text-[11px]"
-            title="Add a Name contains rule from the search bar query"
-          >
-            <Plus className="h-3 w-3" />
-            Add &ldquo;{truncate(searchQuery.trim(), 18)}&rdquo; as rule
-          </Button>
-        )}
-
-        <div className="ml-auto flex items-center gap-1">
-          <PresetMenu
-            presets={savedPresets}
-            onLoad={handleLoadPreset}
-            onDelete={handleDeletePreset}
-          />
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            onClick={handleSavePreset}
-            disabled={filter.rules.length === 0}
-            className="h-7 gap-1 text-[11px]"
-            title="Save the current rules as a named preset"
-          >
-            <Save className="h-3 w-3" /> Save
-          </Button>
-          {filter.rules.length > 0 && (
+          {searchQuery.trim().length > 0 && (
             <Button
               type="button"
               variant="ghost"
               size="sm"
-              onClick={clearFilterRules}
-              className="h-7 gap-1 text-[11px] text-muted-foreground"
+              onClick={promoteSearchQuery}
+              className="h-7 gap-1 text-2xs"
+              title={t('searchModal.filterBuilder.promoteQueryTitle')}
             >
-              <X className="h-3 w-3" /> Reset
+              <Plus className="h-3 w-3" />
+              {t('searchModal.filterBuilder.addQueryAsRule', { query: truncate(searchQuery.trim(), 18) })}
             </Button>
           )}
-        </div>
-      </div>
 
-      {/* ── Rules list ──────────────────────────────────────────────────── */}
-      <div className="flex flex-col gap-2">
-        {filter.rules.length === 0 && (
-          <p className="rounded border border-dashed border-zinc-300 bg-zinc-50 px-3 py-3 text-center text-xs italic text-muted-foreground dark:border-zinc-800 dark:bg-zinc-900/30">
-            Add a rule to start filtering — pick by storey, IFC type, name,
-            property, quantity, material, classification, or elevation.
-          </p>
-        )}
-        {filter.rules.map((rule, i) => (
-          <RuleRow
-            key={i}
-            rule={rule}
-            ifcTypeOptions={ifcTypeOptions}
-            storeyOptions={storeyOptions}
-            psetQto={psetQto}
-            valueSchema={schemaEntry?.values ?? null}
-            onChange={(next) => updateFilterRule(i, next)}
-            onRemove={() => removeFilterRule(i)}
-          />
-        ))}
-        <AddRuleMenu onAdd={addRuleOfKind} />
+          <div className="ml-auto flex items-center gap-1">
+            <PresetMenu
+              presets={savedPresets}
+              onLoad={handleLoadPreset}
+              onDelete={handleDeletePreset}
+            />
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={handleSavePreset}
+              disabled={totalRules === 0}
+              className="h-7 gap-1 text-2xs"
+              title={t('searchModal.filterBuilder.savePresetTitle')}
+            >
+              <Save className="h-3 w-3" /> {t('searchModal.filterBuilder.save')}
+            </Button>
+            {activeRules.length > 0 && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={clearFilterRules}
+                className="h-7 gap-1 text-2xs text-muted-foreground"
+              >
+                <X className="h-3 w-3" /> {t('searchModal.filterBuilder.reset')}
+              </Button>
+            )}
+          </div>
+        </div>
+
+        <FilterGroupEditor
+          groups={filter.groups}
+          activeGroup={activeGroupIndex}
+          onChange={handleGroupsChange}
+          schemaVersion={schemaVersion}
+          models={modelList}
+        />
       </div>
     </div>
   );
 }
 
 // ── Sub-components ────────────────────────────────────────────────────
-
-function CombinatorToggle({
-  value,
-  onChange,
-}: {
-  value: Combinator;
-  onChange: (next: Combinator) => void;
-}) {
-  return (
-    <div
-      className="inline-flex rounded border border-zinc-200 bg-white p-0.5 text-[11px] dark:border-zinc-800 dark:bg-zinc-950"
-      title="AND requires every rule to match. OR matches any rule."
-    >
-      {(['AND', 'OR'] as const).map((c) => (
-        <button
-          key={c}
-          type="button"
-          onClick={() => onChange(c)}
-          className={`rounded px-2 py-0.5 font-mono font-medium transition-colors ${
-            value === c
-              ? 'bg-primary text-primary-foreground'
-              : 'text-muted-foreground hover:text-foreground'
-          }`}
-        >
-          {c}
-        </button>
-      ))}
-    </div>
-  );
-}
 
 function PresetMenu({
   presets,
@@ -349,6 +274,7 @@ function PresetMenu({
   onLoad: (preset: SavedFilterPreset) => void;
   onDelete: (name: string) => void;
 }) {
+  const { t } = useTranslation();
   if (presets.length === 0) {
     return (
       <Button
@@ -356,10 +282,10 @@ function PresetMenu({
         variant="ghost"
         size="sm"
         disabled
-        className="h-7 gap-1 text-[11px] text-muted-foreground"
-        title="Save a preset first"
+        className="h-7 gap-1 text-2xs text-muted-foreground"
+        title={t('searchModal.filterBuilder.savePresetFirstTitle')}
       >
-        <Bookmark className="h-3 w-3" /> Presets
+        <Bookmark className="h-3 w-3" /> {t('searchModal.filterBuilder.presets')}
       </Button>
     );
   }
@@ -370,13 +296,13 @@ function PresetMenu({
           type="button"
           variant="ghost"
           size="sm"
-          className="h-7 gap-1 text-[11px]"
+          className="h-7 gap-1 text-2xs"
         >
-          <Bookmark className="h-3 w-3" /> Presets
+          <Bookmark className="h-3 w-3" /> {t('searchModal.filterBuilder.presets')}
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-72">
-        <DropdownMenuLabel className="text-[10px] uppercase">Saved presets</DropdownMenuLabel>
+        <DropdownMenuLabel className="text-2xs uppercase">{t('searchModal.filterBuilder.savedPresets')}</DropdownMenuLabel>
         <DropdownMenuSeparator />
         {presets.map((p) => (
           <DropdownMenuItem
@@ -386,13 +312,15 @@ function PresetMenu({
           >
             <div className="flex flex-col">
               <span className="font-medium">{p.name}</span>
-              <span className="text-[10px] text-muted-foreground">
-                {p.rules.length} rule{p.rules.length === 1 ? '' : 's'} · {p.combinator}
+              <span className="text-2xs text-muted-foreground">
+                {t('searchModal.filterBuilder.presetRuleCount', { count: totalRuleCount(p.groups) })}
+                {' · '}
+                {p.groups.length > 1 ? t('filterGroups.groupCountOr', { count: p.groups.length }) : p.combinator}
               </span>
             </div>
             <button
               type="button"
-              aria-label={`Delete preset ${p.name}`}
+              aria-label={t('searchModal.filterBuilder.deletePresetAriaLabel', { name: p.name })}
               onClick={(e) => {
                 e.stopPropagation();
                 onDelete(p.name);
@@ -401,32 +329,6 @@ function PresetMenu({
             >
               <Trash2 className="h-3 w-3" />
             </button>
-          </DropdownMenuItem>
-        ))}
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
-}
-
-function AddRuleMenu({
-  onAdd,
-}: {
-  onAdd: (kind: FilterRule['kind']) => void;
-}) {
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button variant="ghost" size="sm" className="h-7 gap-1 self-start text-xs">
-          <Plus className="h-3 w-3" />
-          Add rule
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="start">
-        <DropdownMenuLabel className="text-[10px] uppercase">Filter dimension</DropdownMenuLabel>
-        <DropdownMenuSeparator />
-        {(Object.keys(RULE_KIND_LABEL) as FilterRule['kind'][]).map((k) => (
-          <DropdownMenuItem key={k} onSelect={() => onAdd(k)}>
-            {RULE_KIND_LABEL[k]}
           </DropdownMenuItem>
         ))}
       </DropdownMenuContent>

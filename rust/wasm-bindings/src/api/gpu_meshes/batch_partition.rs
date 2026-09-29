@@ -15,6 +15,9 @@
 //! ineligible has nothing to instance against), and two copies is how they stop
 //! agreeing.
 
+use super::style_finishes::mesh_js_with_finish;
+use ifc_lite_processing::style::SpecularMaterial;
+use crate::zero_copy::MeshCollection;
 use ifc_lite_processing::MeshData;
 use rustc_hash::FxHashMap;
 
@@ -47,21 +50,124 @@ pub(super) const INSTANCE_MIN_OCCURRENCES: u32 = 8;
 /// fail when the suite runs -- clippy rejects it as `assertions_on_constants`,
 /// correctly. Placed HERE rather than in the cfg(test) sibling so it gates
 /// every build including the shipped wasm, not only the ones that compile tests.
+///
+/// What this still guarantees, now that the collator's `fall_back` can emit a
+/// template for a group BELOW `min_group`: that template always carries the
+/// group's own occurrence plus at least one #1623 don't-bake placeholder, so it
+/// is never a singleton. The count gate can be undershot by a pose-only group
+/// that would otherwise lose geometry entirely; it cannot be undershot down to
+/// one instance, which is the case this assertion is about.
 const _: () = assert!(
     INSTANCE_MIN_OCCURRENCES >= 2,
     "a gate below 2 instances singletons: O(unique-geometry) draws per frame in place of the flat path's few consolidated ones"
 );
 
+/// Which of the collator's `flat_indices` are MATERIALIZED members that must go
+/// back to the flat `MeshCollection` instead of riding the shard.
+///
+/// `encode_refs` emits every `flat_indices` entry as a ONE-INSTANCE template. So
+/// once the #3666 reconstruction check started refusing groups, a refused group
+/// of N arrived in the shard as N singleton templates: O(unique-geometry) draws
+/// per frame in place of the flat path's few consolidated ones, which is exactly
+/// the orbit-FPS regression [`INSTANCE_MIN_OCCURRENCES`] exists to prevent -
+/// reintroduced through a different door, and by a safety check rather than by a
+/// tuning mistake. This path HAS a flat collection, so refused members belong in
+/// it.
+///
+/// `refs` is the materialized meshes first, then the pose-only #1623 don't-bake
+/// placeholders, so an index below `materialized` addresses a mesh that can be
+/// drawn flat. A placeholder never appears in `flat_indices` (it has no geometry
+/// to draw), but the bound is asserted rather than assumed.
+/// Returned SORTED: `flat_indices` is built per group in first-seen group order,
+/// not in mesh order, so the caller cannot binary-search it as it comes.
+pub(super) fn rejected_to_flat(flat_indices: &[usize], materialized: usize) -> Vec<usize> {
+    let mut out: Vec<usize> =
+        flat_indices.iter().copied().filter(|&i| i < materialized).collect();
+    out.sort_unstable();
+    out
+}
+
+/// Encode the instanced shard, handing the refused members BACK to the caller
+/// for its flat collection instead of letting them ride as singleton templates.
+///
+/// [`INSTANCE_MIN_OCCURRENCES`] is passed as `min_group`, so the collator never
+/// re-flattens a group that already cleared the count gate; its own safety nets
+/// still can (a singular placement, a shape mismatch, or since #3666 a failed
+/// reconstruction). Returns the shard bytes, the sorted materialized indices the
+/// caller must draw flat, and `Collated::dropped_placeholders`.
+///
+/// That last one is not a diagnostic here, it is arithmetic the caller owes the
+/// viewer. A dropped placeholder is a pose-only occurrence that reaches NEITHER
+/// the shard nor the flat collection: its group had no invertible template
+/// placement, so there is no `rel` to place it with and no geometry of its own
+/// to draw. This is the only call site that feeds pose-only refs at all, so it
+/// is the only one that can subtract them from the occurrence count it
+/// reports.
+///
+/// `rtc` must be the model's post-RTC reduction (the same offset the other
+/// `collate_*` call site passes), or a rotated occurrence's relative transform
+/// flies out to twice the georeference offset.
+pub(super) fn encode_shard_routing_refusals_back(
+    refs: &[ifc_lite_geometry::InstanceMeshRef],
+    finishes: &[[f32; 2]],
+    materialized: usize,
+    rtc: [f64; 3],
+) -> (Vec<u8>, Vec<usize>, usize) {
+    let mut collated =
+        ifc_lite_geometry::collate_refs(refs, INSTANCE_MIN_OCCURRENCES as usize, rtc);
+    let rejected = rejected_to_flat(&collated.flat_indices, materialized);
+    let dropped = collated.dropped_placeholders;
+    collated.flat_indices.clear();
+    (ifc_lite_geometry::encode_refs_with_finishes(refs, &collated, finishes), rejected, dropped)
+}
+
+/// IFC classes the viewer shows and hides as a WHOLE class, by the mesh's
+/// `ifcType` (`IFC_TYPE_TO_VISIBILITY_KEY` in
+/// `apps/viewer/src/store/typeVisibilityFilter.ts`: Spaces, Zones, Openings,
+/// Virtual elements, Terrain & context, Annotations). Exact names, matched the
+/// way that table matches them.
+///
+/// The instanced shard carries an entity id and a colour per occurrence, and
+/// no class. Every class gate in the viewer (viewport, picking, PDF, Cesium,
+/// section) filters flat meshes by `ifcType`, so an occurrence of one of these
+/// classes that rode the shard ignored its toggle entirely (#5409). Keeping
+/// them flat is what lets the one gate see them. They are rarely repeated
+/// opaque shapes, so the draw-call cost is nil.
+///
+/// The wasm contract test builds its fixture from the TypeScript table and
+/// fails if any of its classes reaches the shard, so a class added there and
+/// not here is caught.
+pub(super) const CLASS_TOGGLED_TYPES: &[&str] = &[
+    "IfcSpace",
+    "IfcSpatialZone",
+    "IfcOpeningElement",
+    "IfcOpeningStandardCase",
+    "IfcVirtualElement",
+    "IfcSite",
+    "IfcGeographicElement",
+    "IfcAnnotation",
+];
+
+/// Does the viewer gate this class with a whole-class toggle? See
+/// [`CLASS_TOGGLED_TYPES`].
+pub(super) fn is_class_toggled(ifc_type: &str) -> bool {
+    CLASS_TOGGLED_TYPES.contains(&ifc_type)
+}
+
 /// May this mesh ride the instanced shard at all?
 ///
 /// Transparent (alpha below the cutoff), textured (the instanced pipeline has
-/// no UV slot) and type-product geometry (`geometry_class` 1 = orphan type map,
-/// 2 = instanced type map) must stay on the flat pipelines for correct
-/// blending, texturing and Model/Types view-mode gating. This is a gate on the
-/// mesh's own properties only — repetition is counted separately, by
+/// no UV slot), type-product geometry (`geometry_class` 1 = orphan type map,
+/// 2 = instanced type map) and class-toggled classes ([`CLASS_TOGGLED_TYPES`])
+/// must stay on the flat pipelines for correct blending, texturing,
+/// Model/Types view-mode gating and class-visibility gating. This is a gate on
+/// the mesh's own properties only — repetition is counted separately, by
 /// [`meets_instance_threshold`].
 pub(super) fn is_instancing_candidate(mesh: &MeshData) -> bool {
-    mesh.color[3] >= INSTANCED_ALPHA_CUTOFF && mesh.texture.is_none() && mesh.geometry_class == 0
+    mesh.color[3] >= INSTANCED_ALPHA_CUTOFF
+        && mesh.texture.is_none()
+        && mesh.geometry_class == 0
+        && !is_class_toggled(&mesh.ifc_type)
 }
 
 /// The rep-identity key this mesh contributes to the per-batch tally, or `None`
@@ -123,3 +229,31 @@ pub(super) fn style_colors_from_wire(
 #[cfg(test)]
 #[path = "batch_partition_tests.rs"]
 mod tests;
+
+/// Move the refused members into the flat collection, returning how many were
+/// ACTUALLY pushed.
+///
+/// Not `rejected.len()`: the caller subtracts this from the occurrence count it
+/// reports to the viewer, so returning an index count that the loop did not
+/// reach (a `rejected` entry at or past `instanced.len()`, which
+/// [`rejected_to_flat`]'s bound is supposed to make impossible) would undercount
+/// the shard's instances while the mesh stayed in it. Counting the pushes makes
+/// the returned number a fact about what happened rather than about the input.
+///
+/// `rejected` is sorted (see [`rejected_to_flat`]), so membership is a binary
+/// search rather than a set allocation on a path that runs per batch.
+pub(super) fn take_back_rejected(
+    instanced: Vec<(MeshData, Option<SpecularMaterial>)>,
+    rejected: &[usize],
+    collection: &mut MeshCollection,
+) -> usize {
+    let mut pushed = 0;
+    for (i, (mesh_data, finish)) in instanced.into_iter().enumerate() {
+        if rejected.binary_search(&i).is_ok() {
+            // Drawn flat after all, so it keeps its #5582 finish like any flat mesh.
+            collection.add(mesh_js_with_finish(mesh_data, finish));
+            pushed += 1;
+        }
+    }
+    pushed
+}

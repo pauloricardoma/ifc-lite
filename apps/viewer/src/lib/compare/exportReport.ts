@@ -16,6 +16,7 @@
  * not O(elements × meshes).
  */
 
+import { trackExportCompleted } from '@/lib/analytics';
 import { escapeCsvCell } from '@ifc-lite/export';
 import type { DiffEntry, DiffState } from '@ifc-lite/diff';
 import type { FederatedModel } from '../../store/types.js';
@@ -26,16 +27,17 @@ import { productTypeSplit, type ProductTypeTally } from './productTypeCounts.js'
 import {
   annotateReviewGroups,
   contentMatchReportRows,
+  exportedAuthoredKey,
   exportedGlobalId,
   type CompareReportRow,
 } from './reportRows.js';
 import {
   meshBoundsIndex,
   placementMoveSummary,
-  renderToWorldShift,
   summarizeGeometryChange,
   type WorldAabb,
 } from './geometrySummary.js';
+import { totalYupOffset } from '../geo/coordinate-frame.js';
 import { downloadBlob, sanitizeFilename } from '../export/download.js';
 
 export type { CompareReportRow } from './reportRows.js';
@@ -85,7 +87,7 @@ function boundsIndex(model: FederatedModel | undefined): Map<number, WorldAabb> 
   if (!model?.geometryResult) return new Map();
   return meshBoundsIndex(
     model.geometryResult.meshes,
-    renderToWorldShift(model.geometryResult.coordinateInfo),
+    totalYupOffset(model.geometryResult.coordinateInfo),
   );
 }
 
@@ -154,6 +156,8 @@ function classifyModified(
     }
   }
   if (entry.changeKinds.includes('data')) parts.push('Data changed');
+  // #5309: name the containment move rather than the generic 'Changed'.
+  if (entry.changeKinds.includes('container')) parts.push('Container changed');
 
   return { change: parts.join(', ') || 'Changed', movedDistance };
 }
@@ -188,6 +192,7 @@ export function buildCompareReport(
     // The fingerprint key is the GlobalId; synthetic "missing:" keys (entities
     // without a resolvable GlobalId) export blank rather than the placeholder.
     const globalId = exportedGlobalId(reportKey(entry));
+    const key = exportedAuthoredKey(reportKey(entry));
     const modelName = ref.modelId === result.headModelId ? result.headName : result.baseName;
 
     let change: string;
@@ -197,6 +202,7 @@ export function buildCompareReport(
     else ({ change, movedDistance } = classifyModified(entry, baseBounds, headBounds, baseModel, headModel));
 
     const row: CompareReportRow = { globalId, name, ifcType, state: entry.state, change, movedDistance, model: modelName };
+    if (key) row.key = key;
     rows.push(row);
     rowGlobalIds.set(row, ref.globalId);
   }
@@ -262,10 +268,16 @@ function csvField(value: string | number): string {
 
 /** Serialize the report as RFC-4180 CSV (one element per row). */
 export function reportToCsv(report: CompareReport): string {
-  // `Match` / `MatchedGlobalId` are appended, never inserted: an existing
-  // consumer reading the first six columns positionally keeps working (#1891).
+  // `Match` / `MatchedGlobalId` / `Key` are appended, never inserted: an
+  // existing consumer reading the first six columns positionally keeps working
+  // (#1891). `Key` is the authored key a row was compared on and appears ONLY
+  // when the comparison used one (issue #4955), so a GlobalId-keyed report is
+  // byte-identical to before; it is not a GlobalId and never lands in that
+  // column.
+  const withKey = report.rows.some((r) => r.key !== undefined);
   const header = [
     'GlobalId', 'Name', 'IfcType', 'Change', 'MovedDistance_m', 'Model', 'Match', 'MatchedGlobalId',
+    ...(withKey ? ['Key'] : []),
   ];
   const lines: string[] = [];
   // The row count below totals products AND type objects together (`Change`
@@ -303,6 +315,7 @@ export function reportToCsv(report: CompareReport): string {
       csvField(r.model),
       csvField(r.match ?? ''),
       csvField(r.matchedGlobalId ?? ''),
+      ...(withKey ? [csvField(r.key ?? '')] : []),
     ].join(','));
   }
   return lines.join('\r\n');
@@ -328,4 +341,5 @@ export function downloadCompareReport(
   const body = format === 'csv' ? reportToCsv(report) : reportToJson(report);
   const type = format === 'csv' ? 'text/csv;charset=utf-8;' : 'application/json;charset=utf-8;';
   downloadBlob(new Blob([body], { type }), `${name}.${format}`);
+  trackExportCompleted({ format, surface: 'compare_panel' });
 }

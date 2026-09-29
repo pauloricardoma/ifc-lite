@@ -12,7 +12,8 @@
  *   2. Caller constructs a `WorkerParser` and calls `parseColumnar(sab, …)`.
  *   3. The worker emits `progress`, `diagnostic`, optional `partial-store`,
  *      then `complete` (or `error`). This wrapper resolves the returned
- *      Promise on `complete` and self-terminates afterward.
+ *      Promise after receiving `complete` and hydrating the result. The
+ *      completed worker is terminated before receiver reconstruction.
  *
  * On `partial-store` the wrapper invokes `options.onSpatialReady` so the
  * viewer can render the spatial-hierarchy panel before the full parse
@@ -21,19 +22,32 @@
 
 import type { IfcDataStore } from './columnar-parser.js';
 import type { ParseOptions } from './index.js';
-import {
-  fromTransport,
-  type DataStoreTransport,
-  type ParserMemorySnapshot,
-} from './data-store-transport.js';
-import { contiguousSourceBytes } from './source-bytes.js';
+import { WorkerIndexReceiver, type WorkerStorePayload } from './worker-index-publication.js';
+import type { ParserMemorySnapshot } from './data-store-transport.js';
+import { contiguousSourceBytes, type IfcSourceBytes } from './source-bytes.js';
 import type {
   ParserWorkerInputMessage,
   ParserWorkerOutputMessage,
 } from './parser.worker.js';
 import { restashWasmPanicLocation } from './wasm-panic-forward.js';
 
+/**
+ * Build an `AbortError`-shaped error for a cancelled parse. Uses `DOMException`
+ * when available (browsers, modern Node) so `err.name === 'AbortError'` matches
+ * the same check callers already use for `fetch`/`AbortController` cancellation.
+ */
+function makeAbortError(message = 'Parser worker terminated'): Error {
+  if (typeof DOMException !== 'undefined') {
+    return new DOMException(message, 'AbortError') as unknown as Error;
+  }
+  const err = new Error(message);
+  err.name = 'AbortError';
+  return err;
+}
+
 export interface WorkerParserOptions extends ParseOptions {
+  /** Fresh per-request 16-byte prepass fingerprint cell; never awaited. */
+  sourceFingerprint?: SharedArrayBuffer;
   /** Override the worker URL. Default: bundler-resolved `parser.worker.ts`. */
   workerUrl?: URL | string;
   /** Optional callback receiving the per-parse memory snapshot at completion. */
@@ -44,12 +58,29 @@ export interface WorkerParserOptions extends ParseOptions {
    * entity index — saves a duplicate 6–10 s scan on huge files.
    */
   waitForEntityIndex?: boolean;
+  /**
+   * Cancel this parse. If already aborted when `parseColumnar` is called, the
+   * returned promise rejects immediately without spawning a worker. If
+   * aborted while the parse is in flight, only THIS request's worker is
+   * terminated and the promise rejects with `signal.reason`: a custom
+   * `abort(reason)` is passed through as-is, the default is an `AbortError`.
+   */
+  signal?: AbortSignal;
 }
 
 export class WorkerParser {
   private worker: Worker | null = null;
   private requestCounter = 0;
   private readonly workerUrl: URL | string | null;
+  /**
+   * One canceller per in-flight `parseColumnar` request. Each call spawns its
+   * OWN worker, so overlapping parses on one instance are possible: a
+   * request's `signal` cancels only that request (via its own closure), while
+   * `terminate()` cancels every entry, so the documented cancel path always
+   * settles each promise instead of leaving it pending forever (#4896).
+   * A request adds itself on spawn and removes itself in `settle()`.
+   */
+  private readonly activeCancels = new Set<(reason?: unknown) => void>();
   /**
    * Queued entity-index payload. If `setEntityIndex` is called before the
    * worker is spawned (rare — happens only if the caller races a parser
@@ -60,6 +91,7 @@ export class WorkerParser {
     starts: Uint32Array;
     lengths: Uint32Array;
     oversizedIdCount?: number;
+    malformedRecordCount?: number;
   } | null = null;
 
   /**
@@ -93,8 +125,12 @@ export class WorkerParser {
    * pre-pass). The worker neither transfers nor mutates the buffer.
    */
   parseColumnar(source: SharedArrayBuffer, options: WorkerParserOptions = {}): Promise<IfcDataStore> {
+    if (options.signal?.aborted) {
+      return Promise.reject(options.signal.reason ?? makeAbortError('Parse aborted before start'));
+    }
     return new Promise((resolve, reject) => {
       const id = `parse_${Date.now()}_${++this.requestCounter}`;
+      let onSignalAbort: (() => void) | null = null;
       let worker: Worker;
       try {
         // Inlining `new URL(..., import.meta.url)` inside `new Worker(...)`
@@ -107,7 +143,24 @@ export class WorkerParser {
         reject(new Error(`Failed to spawn parser worker: ${err instanceof Error ? err.message : String(err)}`));
         return;
       }
+      // `this.worker` is only the `setEntityIndex` target: the most recently
+      // spawned worker. Every path below clears it only while it still points
+      // at THIS request's worker, so settling one request never detaches another.
       this.worker = worker;
+
+      // Reject + terminate THIS request on demand, invoked by terminate() and by
+      // this request's own 'abort' listener. Removed from `activeCancels` in
+      // settle(), and the `settled` guard makes a stray late call a no-op.
+      let settled = false;
+      const cancel = (reason?: unknown) => {
+        if (settled) return;
+        settle(() => {
+          if (this.worker === worker) this.worker = null;
+          worker.terminate();
+        });
+        reject(reason ?? makeAbortError());
+      };
+      this.activeCancels.add(cancel);
 
       // ONE accessor, shared by the partial store and the final one. Both
       // alias the same SAB, so this is not merely tidy: `contentKey` is
@@ -118,14 +171,31 @@ export class WorkerParser {
       // on exactly the models #2183 is about. The previous code got one hash by
       // memoising on the shared Uint8Array; sharing the accessor is the same
       // guarantee without the side table.
-      const sourceBytes = contiguousSourceBytes(new Uint8Array(source));
+      let sourceBytes: IfcSourceBytes | undefined;
+      const indexReceiver = new WorkerIndexReceiver();
+      const hydrate = (payload: WorkerStorePayload) => {
+        // #3983: the worker hashes the source before the first UI publication.
+        // Retain one accessor across partial/full stores and compression swaps.
+        sourceBytes ??= contiguousSourceBytes(new Uint8Array(source), payload.sourceContentKey ?? undefined);
+        return indexReceiver.hydrate(payload, sourceBytes);
+      };
 
       const settle = (cleanup: () => void) => {
+        settled = true;
+        indexReceiver.clear();
         worker.onmessage = null;
         worker.onerror = null;
         worker.onmessageerror = null;
+        if (onSignalAbort && options.signal) options.signal.removeEventListener('abort', onSignalAbort);
+        this.activeCancels.delete(cancel);
         cleanup();
       };
+
+      if (options.signal) {
+        const signal = options.signal;
+        onSignalAbort = () => cancel(signal.reason);
+        options.signal.addEventListener('abort', onSignalAbort, { once: true });
+      }
 
       worker.onmessage = (event: MessageEvent<ParserWorkerOutputMessage>) => {
         const msg = event.data;
@@ -141,9 +211,10 @@ export class WorkerParser {
             return;
 
           case 'partial-store': {
-            if (!options.onSpatialReady) return;
             try {
-              const partial = fromTransport(msg.payload as DataStoreTransport, sourceBytes);
+              indexReceiver.capturePartial(msg.payload);
+              if (!options.onSpatialReady) return;
+              const partial = hydrate(msg.payload);
               options.onSpatialReady(partial);
             } catch (err) {
               // Don't fail the whole parse on partial deserialization
@@ -155,17 +226,18 @@ export class WorkerParser {
 
           case 'complete': {
             try {
-              const dataStore = fromTransport(msg.payload as DataStoreTransport, sourceBytes);
+              // #3985: the received message owns its transferred columns. Stop
+              // the completed sender before allocating receiver collections;
+              // retain indexReceiver's partial seed until hydration completes.
+              worker.terminate();
+              if (this.worker === worker) this.worker = null;
+              const dataStore = hydrate(msg.payload);
               options.onMemorySnapshot?.(msg.memory);
-              settle(() => {
-                worker.terminate();
-                this.worker = null;
-              });
+              settle(() => {});
               resolve(dataStore);
             } catch (err) {
               settle(() => {
-                worker.terminate();
-                this.worker = null;
+                if (this.worker === worker) this.worker = null;
               });
               reject(new Error(`complete hydrate failed: ${err instanceof Error ? err.message : String(err)}`));
             }
@@ -181,7 +253,7 @@ export class WorkerParser {
             restashWasmPanicLocation(globalThis, msg.wasmPanicLocation, msg.wasmPanicAt, msg.message);
             settle(() => {
               worker.terminate();
-              this.worker = null;
+              if (this.worker === worker) this.worker = null;
             });
             reject(new Error(msg.message));
             return;
@@ -191,7 +263,7 @@ export class WorkerParser {
       worker.onerror = (err) => {
         settle(() => {
           worker.terminate();
-          this.worker = null;
+          if (this.worker === worker) this.worker = null;
         });
         reject(new Error(`Parser worker error: ${err.message || 'unknown failure'}`));
       };
@@ -199,7 +271,7 @@ export class WorkerParser {
       worker.onmessageerror = () => {
         settle(() => {
           worker.terminate();
-          this.worker = null;
+          if (this.worker === worker) this.worker = null;
         });
         reject(new Error('Parser worker structured-clone error (likely corrupted message)'));
       };
@@ -217,6 +289,7 @@ export class WorkerParser {
             starts: queued.starts,
             lengths: queued.lengths,
             oversizedIdCount: queued.oversizedIdCount,
+            malformedRecordCount: queued.malformedRecordCount,
           });
         } catch (err) {
           console.warn('[WorkerParser] queued setEntityIndex failed:', err);
@@ -225,6 +298,8 @@ export class WorkerParser {
 
       const input: ParserWorkerInputMessage = {
         type: 'parse',
+        sourceFingerprint: options.sourceFingerprint,
+        indexTransport: 'packed-index-v1',
         id,
         source,
         yieldIntervalMs: options.yieldIntervalMs,
@@ -242,7 +317,7 @@ export class WorkerParser {
         // left running (and `this.worker` left pointing at it) forever.
         settle(() => {
           worker.terminate();
-          this.worker = null;
+          if (this.worker === worker) this.worker = null;
         });
         reject(err instanceof Error ? err : new Error(String(err)));
       }
@@ -259,15 +334,21 @@ export class WorkerParser {
    * id above the u32 bound (#3395). Pass it: the columns cannot carry a record
    * that was refused, so a caller that drops the number leaves the parse
    * reporting a clean load that is short by exactly that many entities.
+   *
+   * `malformedRecordCount` is the same handoff for the pre-pass stopping early
+   * at a record whose string or comment never closed (#3790). Pass it too: a
+   * stop costs the whole tail of the file, not one record, and the columns
+   * carry no trace of where it happened.
    */
   setEntityIndex(
     ids: Uint32Array,
     starts: Uint32Array,
     lengths: Uint32Array,
     oversizedIdCount?: number,
+    malformedRecordCount?: number,
   ): void {
     if (!this.worker) {
-      this.queuedEntityIndex = { ids, starts, lengths, oversizedIdCount };
+      this.queuedEntityIndex = { ids, starts, lengths, oversizedIdCount, malformedRecordCount };
       return;
     }
     try {
@@ -277,15 +358,35 @@ export class WorkerParser {
         starts,
         lengths,
         oversizedIdCount,
+        malformedRecordCount,
       });
     } catch (err) {
       console.warn('[WorkerParser] setEntityIndex postMessage failed:', err);
     }
   }
 
-  /** Terminate the worker if running. Safe to call repeatedly. */
+  /**
+   * Terminate the worker if running. Safe to call repeatedly.
+   *
+   * #4896: an in-flight `parseColumnar` promise only ever settled on
+   * `complete`/`error`/`onerror`/`onmessageerror` — none of which fire once
+   * the worker is killed, so the documented "call terminate() to cancel"
+   * path hung the caller's `await` forever. `terminate()` now rejects EVERY
+   * in-flight request with an `AbortError` and tears down each one's worker,
+   * so cancellation is distinguishable from both a successful parse and a
+   * parse failure. To cancel just one of several overlapping parses, abort
+   * that request's `signal` instead.
+   */
   terminate(): void {
+    // Snapshot: each cancel removes itself from the set while we iterate.
+    for (const cancel of [...this.activeCancels]) cancel();
     if (this.worker) {
+      // No in-flight promise to settle (e.g. called after a request already
+      // resolved/rejected but before a new one started) — just drop the
+      // worker's handlers and kill it.
+      this.worker.onmessage = null;
+      this.worker.onerror = null;
+      this.worker.onmessageerror = null;
       this.worker.terminate();
       this.worker = null;
     }

@@ -175,6 +175,7 @@ export const en = {
     propertyValueMismatch: 'Property "{pset}.{property}" is "{actual}", expected {expected}',
     propertyPatternMismatch: 'Property "{pset}.{property}" value "{actual}" does not match {expected}',
     propertyDatatypeMismatch: 'Property "{pset}.{property}" data type is "{actual}", expected {expected}',
+    propertyDatatypeUnknown: 'Property "{pset}.{property}" has no known data type, so it cannot be checked against {expected}',
     propertyOutOfBounds: 'Property "{pset}.{property}" value {actual} is out of range {expected}',
     propertyProhibited: 'Prohibited property "{pset}.{property}" exists with value "{actual}"',
 
@@ -185,9 +186,12 @@ export const en = {
     classificationValueMismatch: 'Classification code "{actual}" does not match expected {expected}',
     classificationValueMissingAvailable: 'Classification code {expected} not found. Available: {available}',
     classificationProhibited: 'Prohibited classification "{actual}" exists in system "{system}"',
+    classificationUnresolved: 'Entity is classified, but classification details cannot be read from this data source',
+    classificationPresenceUnresolved: 'Whether this entity is classified cannot be determined from this data source',
 
     // Material failures
     materialMissing: 'No material assigned',
+    materialUnresolved: 'Entity has a material, but its details cannot be read from this data source',
     materialValueMismatch: 'Material "{actual}" does not match expected {expected}',
     materialValueMissingAvailable: 'Material {expected} not found. Available: {available}',
     materialProhibited: 'Prohibited material "{actual}" is assigned',

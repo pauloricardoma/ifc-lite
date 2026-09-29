@@ -2,7 +2,7 @@
 //! Per-model indexing and plan helpers for the merged exporter. Ports the parts
 //! of `merged-exporter.ts` that operate on one model at a time: line indexing,
 //! the visibility forward-reference closure, `#`-reference rewriting, spatial
-//! unification, and redundant-`IfcRelAggregates` pruning.
+//! and spatial unification.
 
 use std::collections::{HashMap, HashSet};
 
@@ -10,11 +10,11 @@ use ifc_lite_core::EntityScanner;
 
 use super::guid::{extract_global_id_fast, is_relationship_type, GuidMinter};
 use super::spatial::{
-    nth_attr, ContainerMergeStrategy, SpatialLookup, StoreyMergeStrategy,
+    ContainerMergeStrategy, SpatialLookup, StoreyMergeStrategy,
 };
 use super::units::units_compatible;
 use super::MergedModel;
-use crate::step_text::refs_in_line;
+use crate::step_text::{refs_in_line, refs_in_line_counted};
 
 /// Entity types forming shared infrastructure — the first instance of each is
 /// unified across compatible models (later duplicates dropped + redirected).
@@ -31,7 +31,7 @@ pub struct ModelIndex<'a> {
     pub order: Vec<u32>,
     /// id → byte span of the raw entity line.
     line_of: HashMap<u32, (usize, usize)>,
-    /// id → uppercase STEP type token.
+    /// id → STEP type token, folded to uppercase.
     pub type_of: HashMap<u32, String>,
     /// Largest express id seen (drives the next model's offset).
     pub max_id: u32,
@@ -64,16 +64,18 @@ impl<'a> ModelIndex<'a> {
             if idx.line_of.insert(id, (start, end)).is_none() {
                 idx.order.push(id);
             }
-            match type_name {
+            // Every consumer of `type_of` reads it as uppercase; fold once here.
+            let type_upper = type_name.to_ascii_uppercase();
+            match type_upper.as_str() {
                 "IFCPROJECT" => idx.projects.push(id),
                 "IFCSITE" => idx.site_count += 1,
                 "IFCBUILDING" => idx.building_count += 1,
                 _ => {}
             }
-            if let Some(&shared) = SHARED_INFRASTRUCTURE_TYPES.iter().find(|&&t| t == type_name) {
+            if let Some(&shared) = SHARED_INFRASTRUCTURE_TYPES.iter().find(|&&t| t == type_upper) {
                 idx.first_infra.entry(shared).or_insert(id);
             }
-            idx.type_of.entry(id).or_insert_with(|| type_name.to_string());
+            idx.type_of.entry(id).or_insert(type_upper);
         }
         idx
     }
@@ -92,9 +94,39 @@ impl<'a> ModelIndex<'a> {
 /// Resolve the visible id set for a model: `None` ⇒ every entity; otherwise the
 /// forward-reference closure of `roots` (so a filtered export never dangles a
 /// `#ref`), mirroring `export_step_with_stats`.
-pub fn resolve_included(index: &ModelIndex, roots: &Option<Vec<u32>>) -> HashSet<u32> {
+///
+/// `refused`, when given, accumulates every `#<digits>` reference this walk
+/// discarded for exceeding `u32::MAX` (issue #3421), so a caller can surface
+/// it — see [`crate::step_text::refs_in_line_counted`]'s doc for why this
+/// does not exclude anything reachable that would otherwise have been
+/// included. `None` when a caller only needs the included set itself (e.g. a
+/// pre-pass whose own scan of this model is not the one that gets reported).
+pub fn resolve_included(
+    index: &ModelIndex,
+    roots: &Option<Vec<u32>>,
+    mut refused: Option<&mut usize>,
+) -> HashSet<u32> {
     match roots {
-        None => index.order.iter().copied().collect(),
+        None => {
+            // Every line, plus the highest id a line NAMES. A dangling `#N` has
+            // no line but `rewrite_refs` still moves it to `N + offset`, so
+            // `next_offset` must clear it (the `Some(roots)` closure below keeps
+            // such targets too). The scan also counts oversized refs (PR #3766).
+            let mut keep: HashSet<u32> = index.order.iter().copied().collect();
+            let (mut uncounted, mut refs, mut top) = (0usize, Vec::new(), 0u32);
+            let refused = refused.unwrap_or(&mut uncounted);
+            for &id in &index.order {
+                if let Some(bytes) = index.line_bytes(id) {
+                    refs.clear();
+                    refs_in_line_counted(bytes, &mut refs, refused);
+                    top = refs.iter().copied().fold(top, u32::max);
+                }
+            }
+            if top != 0 {
+                keep.insert(top);
+            }
+            keep
+        }
         Some(roots) => {
             let mut keep: HashSet<u32> = HashSet::new();
             let mut stack: Vec<u32> = roots.clone();
@@ -105,7 +137,10 @@ pub fn resolve_included(index: &ModelIndex, roots: &Option<Vec<u32>>) -> HashSet
                 }
                 if let Some(bytes) = index.line_bytes(id) {
                     refs.clear();
-                    refs_in_line(bytes, &mut refs);
+                    match refused.as_deref_mut() {
+                        Some(refused) => refs_in_line_counted(bytes, &mut refs, refused),
+                        None => refs_in_line(bytes, &mut refs),
+                    }
                     for &r in &refs {
                         if !keep.contains(&r) {
                             stack.push(r);
@@ -125,7 +160,8 @@ pub fn resolve_included(index: &ModelIndex, roots: &Option<Vec<u32>>) -> HashSet
 ///
 /// Bound by the largest VISIBLE id, not `index.max_id`: an excluded high id is
 /// never emitted, so it must not consume id space or omit a later model that
-/// would actually fit (CR #2952).
+/// would actually fit (CR #2952). A dangling id an emitted line names does
+/// count (`resolve_included` keeps it), or the next model's entity takes it.
 ///
 /// Single home for the rule because two callers must agree on it exactly: the
 /// emit loop, and the empty-container pre-pass (#3643), which has to stop at
@@ -180,38 +216,13 @@ pub fn unify_spatial(
     }
 }
 
-/// Drop an `IfcRelAggregates` whose relating object AND every related object was
-/// unified into the first model (its aggregation already exists there). A
-/// partially-shared relationship is kept (its refs are remapped at emit time so
-/// it points into the first model's tree).
-pub fn skip_redundant_rel_aggregates(
-    index: &ModelIndex,
-    shared_remap: &HashMap<u32, u32>,
-    skip: &mut HashSet<u32>,
-) {
-    for &id in &index.order {
-        if index.type_of.get(&id).map(String::as_str) != Some("IFCRELAGGREGATES") {
-            continue;
-        }
-        let Some(line) = index.line_str(id) else { continue };
-        let Some(relating) = nth_attr(&line, 4).and_then(parse_single_ref) else { continue };
-        let related = nth_attr(&line, 5).map(parse_ref_list).unwrap_or_default();
-        if shared_remap.contains_key(&relating)
-            && !related.is_empty()
-            && related.iter().all(|r| shared_remap.contains_key(r))
-        {
-            skip.insert(id);
-        }
-    }
-}
-
 /// Parse a single `#N` reference token (`"#4"` → `4`).
 fn parse_single_ref(arg: &str) -> Option<u32> {
     arg.trim().strip_prefix('#')?.parse().ok()
 }
 
 /// Parse a `(#a,#b,…)` list of references into ids.
-fn parse_ref_list(arg: &str) -> Vec<u32> {
+pub(super) fn parse_ref_list(arg: &str) -> Vec<u32> {
     arg.trim()
         .trim_start_matches('(')
         .trim_end_matches(')')
@@ -285,7 +296,8 @@ pub(super) fn build_plan(
                 plan.skip.insert(this_id);
             }
         }
-        // Unify spatial containers, then drop now-redundant aggregations.
+        // Unify spatial containers. Aggregations they make redundant are
+        // stripped at emit time, on the final line (`single_parents`, #5727).
         unify_spatial(
             ctx.spatial_lookup,
             index,
@@ -296,7 +308,6 @@ pub(super) fn build_plan(
             ctx.merge_storeys,
             1.0,
         );
-        skip_redundant_rel_aggregates(index, &plan.shared_remap, &mut plan.skip);
     }
 
     // Reconcile GlobalIds for every model — including the first, whose two rooted

@@ -3,25 +3,128 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Cached-replay fast path for the SSE Parquet streaming endpoint: when a
-//! request's geometry + metadata are already cached, replay them as a
-//! three-event stream (Start / one Batch / Complete) without re-parsing.
+//! request's geometry + metadata are already cached, replay them without
+//! re-parsing, in the same Start / (Batch + Progress)* / Complete shape a
+//! live parse streams (issue #3895). The geometry is split back into its
+//! original stream batches via `parquet_replay_batches::split_into_batches`
+//! (recovered from the cached blob's Parquet row-group boundaries); a blob
+//! with no recoverable boundary falls back to one oversized batch, same as
+//! before.
+//!
+//! `progress` numbers come from the `stream_progress` sidecar the live parse
+//! wrote, so a hit reports the same JOB counts a miss does (issue #3897).
+//! Entries cached before that sidecar existed have no job counts to replay;
+//! those fall back to counting emitted MESHES, which is the wrong unit but
+//! still monotonic and still ends at its own stated total.
 
-use super::cache_keys::load_cached_symbolic;
+use super::cache_keys::{
+    cache_key_from_parts, has_current_data_model, has_cached_symbolic, has_parquet_metadata, is_file_digest,
+    load_cached_symbolic, not_a_file_digest, parquet_geometry_key, parquet_metadata_key,
+};
+use super::ParseQuery;
+use ifc_lite_processing::TessellationQuality;
+use crate::services::{DataModelEntities, ParquetLayout, StreamShapes};
 use super::parquet::ParquetMetadataHeader;
-use super::parquet_stream::ParquetStreamEvent;
+use super::stream_event::ParquetStreamEvent;
+use super::stream_progress::load_stream_progress;
 use crate::error::ApiError;
+use crate::services::parquet_replay_batches::{split_into_batches, split_into_stream_batches};
 use crate::AppState;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use std::convert::Infallible;
 
+/// Serve `POST /api/v1/parse/parquet-stream` from a client-supplied file hash,
+/// with no request body at all (issue #3901).
+///
+/// The upload used to be unavoidable on a hit: the cache key is the SHA-256 of
+/// the RECEIVED bytes, so `extract_file` had to finish before the cache could
+/// be consulted, and on a 40 MB model over a real connection that upload was
+/// the whole cost of the hit. A client that hashes locally can name the entry
+/// instead.
+///
+/// The hash SELECTS; it never asserts. Everything the replay needs has to be on
+/// disk under that key already, which is exactly what [`try_cached_replay`]
+/// checks (geometry body, metadata header, a data model at the current payload
+/// version, plus whatever it later adds). Delegating to it rather than
+/// re-listing those entries here is what makes "a hash-only hit replays the
+/// same events as an upload hit" true by construction instead of by two lists
+/// agreeing. A miss answers `404`, the status
+/// `GET /api/v1/cache/check/{hash}` already uses for "upload it", and the
+/// client uploads.
+///
+/// A MISS costs no admission slot. The probe answers it from two small reads
+/// (the metadata header and the data-model marker) before touching the gate,
+/// because the common miss is a file the server has never seen and charging a
+/// parse slot for a disk lookup would mean every cold-cache client wins
+/// admission twice, probe then upload, and could be shed on the probe rather
+/// than queueing for the upload that would have succeeded.
+///
+/// A HIT does take one, around the replay BUILD, dropped before the response is
+/// returned. That is what the body-carrying hit path does, and for the same
+/// reason: `try_cached_replay` reads the whole geometry blob into memory,
+/// base64-encodes every batch, and materializes the full event vector before a
+/// byte is sent, which is several times the model's geometry resident at once.
+/// Leaving that window unbounded would make the cheapest request a client can
+/// send the cheapest way to exhaust the server. Draining the finished stream
+/// needs no slot.
+pub(super) async fn replay_by_client_hash(
+    state: &AppState,
+    query: &ParseQuery,
+    quality: TessellationQuality,
+    stream_shapes: StreamShapes,
+    sha256: &str,
+) -> Result<axum::response::Response, ApiError> {
+    if !is_file_digest(sha256) {
+        return Err(not_a_file_digest(sha256));
+    }
+    let cache_key = cache_key_from_parts(sha256, query.opening_filter, quality);
+
+    let replay = if has_parquet_metadata(&state.cache, &cache_key).await
+        && has_current_data_model(&state.cache, &cache_key, query.data_model_entities).await
+        && has_cached_symbolic(&state.cache, &cache_key).await
+    {
+        let admission_guard = state
+            .admission
+            .acquire(state.config.max_file_size_mb as u64 * 1024 * 1024)
+            .await?;
+        let replay = try_cached_replay(
+            state,
+            &cache_key,
+            query.parquet_layout,
+            stream_shapes,
+            query.data_model_entities,
+        )
+        .await;
+        drop(admission_guard);
+        replay?
+    } else {
+        None
+    };
+
+    if let Some(response) = replay {
+        tracing::info!(
+            cache_key = %cache_key,
+            "Streaming cache HIT by client-supplied hash - no upload"
+        );
+        return Ok(response);
+    }
+    tracing::debug!(
+        cache_key = %cache_key,
+        "Hash-only stream request has nothing cached; asking the client to upload"
+    );
+    Err(ApiError::NotFound(format!(
+        "Nothing cached for sha256 {sha256} under this opening_filter / tessellation_quality / parquet_layout. Resend the request with the multipart file body."
+    )))
+}
+
 /// Return the geometry slice from a cached combined-Parquet blob, framed as
 /// `[geometry_len: u32-LE][geometry_data][data_model_len: u32]...`. Returns
 /// `None` (rather than panicking) when the blob is too short to hold the length
 /// header or declares a geometry length that runs past the buffer — the caller
 /// treats that as a cache miss and re-parses.
-fn cached_geometry_slice(cached: &[u8]) -> Option<&[u8]> {
+pub(super) fn cached_geometry_slice(cached: &[u8]) -> Option<&[u8]> {
     let header = cached.get(0..4)?;
     let geometry_len = u32::from_le_bytes(header.try_into().ok()?) as usize;
     let end = 4usize.checked_add(geometry_len)?;
@@ -36,9 +139,12 @@ fn cached_geometry_slice(cached: &[u8]) -> Option<&[u8]> {
 pub(super) async fn try_cached_replay(
     state: &AppState,
     cache_key: &str,
+    layout: ParquetLayout,
+    stream_shapes: StreamShapes,
+    data_model_entities: DataModelEntities,
 ) -> Result<Option<axum::response::Response>, ApiError> {
-    let parquet_cache_key = format!("{}-parquet-v5", cache_key);
-    let metadata_cache_key = format!("{}-parquet-metadata-v4", cache_key);
+    let parquet_cache_key = parquet_geometry_key(cache_key, layout);
+    let metadata_cache_key = parquet_metadata_key(cache_key);
 
     let (Some(cached_parquet), Some(cached_metadata_json)) = (
         state.cache.get_bytes(&parquet_cache_key).await?,
@@ -47,6 +153,20 @@ pub(super) async fn try_cached_replay(
         return Ok(None);
     };
 
+    // Replaying skips the parse, and the parse is what writes the data model.
+    // A geometry entry that outlived a data-model version bump must therefore
+    // re-parse rather than replay (issue #3869). The same holds for a data
+    // model of the OTHER entities variant (#6034): geometry warmed by a
+    // default request has no rooted table behind it.
+    if !has_current_data_model(&state.cache, cache_key, data_model_entities).await
+        || !has_cached_symbolic(&state.cache, cache_key).await {
+        tracing::info!(
+            cache_key = %cache_key,
+            "Geometry cached but a required sidecar predates the current payload; re-parsing"
+        );
+        return Ok(None);
+    }
+
     tracing::info!(
         cache_key = %cache_key,
         parquet_size = cached_parquet.len(),
@@ -54,33 +174,58 @@ pub(super) async fn try_cached_replay(
     );
 
     // Parse cached metadata
-    let metadata_header: ParquetMetadataHeader = serde_json::from_slice(&cached_metadata_json)
+    let mut metadata_header: ParquetMetadataHeader = serde_json::from_slice(&cached_metadata_json)
         .map_err(|e| ApiError::Internal(format!("Failed to parse cached metadata: {}", e)))?;
+    // Stored as the live parse wrote it, `from_cache: false` included (#5542).
+    metadata_header.stats.from_cache = true;
 
     // Load the cached symbolic stream so the Complete event reaches parity
     // even on the cache fast-path (issue #900).
     let symbolic_data = load_cached_symbolic(&state.cache, cache_key).await;
 
-    // Extract + base64-encode the geometry blob from the cached buffer.
-    // The blob is framed `[geometry_len: u32-LE][geometry_data]...`. Slice
-    // WITHOUT `.unwrap()` panicking on a short/corrupt cached blob, and run
-    // the copy/encode off the async worker via `block_in_place` (matching
-    // the live path in `parse_parquet_stream`) so a large replay doesn't
-    // stall other polls. (Guarded by runtime flavor: `block_in_place` panics
-    // on current_thread, which the `#[tokio::test]` harness uses.)
-    let encode_geometry = || -> Option<String> {
-        let geometry = cached_geometry_slice(&cached_parquet)?;
-        Some(STANDARD.encode(geometry))
-    };
-    let base64_data = if tokio::runtime::Handle::current().runtime_flavor()
-        == tokio::runtime::RuntimeFlavor::MultiThread
-    {
-        tokio::task::block_in_place(encode_geometry)
-    } else {
-        encode_geometry()
-    };
+    // The job-unit progress the live parse reported for this file.
+    let recorded_progress = load_stream_progress(&state.cache, cache_key).await;
 
-    let Some(base64_data) = base64_data else {
+    // Extract the geometry blob (framed `[geometry_len: u32-LE][geometry_data]
+    // ...`, sliced WITHOUT `.unwrap()` panicking on a short/corrupt cached
+    // blob) and split it back into its original stream batches, each
+    // base64-encoded. Runs off the async worker (the same helper as the live
+    // path in `parse_parquet_stream`) so a large replay doesn't stall other
+    // polls.
+    let total_meshes = metadata_header.stats.total_meshes;
+    // A cross-batch client gets each batch as written, whole-stream offsets
+    // and all (#5407); a batch-local one gets each re-based to zero,
+    // which a blob a cross-batch stream wrote cannot be, so it falls back to
+    // one batch below.
+    let cross_batch = stream_shapes == StreamShapes::CrossBatch;
+    let split = if cross_batch { split_into_stream_batches } else { split_into_batches };
+    type Replayed = (String, usize, Option<(u32, u32)>);
+    let build_batches = || -> Option<Vec<Replayed>> {
+        let geometry = cached_geometry_slice(&cached_parquet)?;
+        let Some(batches) = split(geometry) else {
+            // Not a multi-row-group blob: one batch's worth of geometry, a
+            // pre-streaming cache entry, or a layout we can't align. Log it —
+            // otherwise a replay that has silently stopped being progressive
+            // is indistinguishable from one that never needed to be.
+            tracing::debug!(
+                geometry_bytes = geometry.len(),
+                "Cached geometry has no recoverable batch boundaries; replaying as one batch"
+            );
+            // Whole-stream offsets starting at zero ARE this one batch's
+            // offsets, so a cross-batch client is told bases of zero.
+            let bases = cross_batch.then_some((0, 0));
+            return Some(vec![(STANDARD.encode(geometry), total_meshes, bases)]);
+        };
+        Some(
+            batches
+                .into_iter()
+                .map(|b| (STANDARD.encode(&b.data), b.mesh_count, b.bases))
+                .collect(),
+        )
+    };
+    let batches = super::stream_batch::off_the_async_worker(build_batches);
+
+    let Some(batches) = batches else {
         // Short/corrupt cached blob: don't panic, don't serve garbage.
         // Fall through to the normal parse path (treat as a cache miss);
         // the re-parse overwrites the bad cache entry.
@@ -92,292 +237,62 @@ pub(super) async fn try_cached_replay(
         return Ok(None);
     };
 
-    // Create fast stream with cached data
-    let cache_key_for_stream = cache_key.to_string();
+    // Same Start / (Batch, Progress)* / Complete shape the live path streams
+    // (`parquet_stream.rs`'s per-batch Progress callback), so a cache hit is
+    // progressive too (issue #3895).
+    //
+    // The checkpoints only line up if there is one per batch. A sidecar from
+    // a run whose batch count differs from what we recovered (a fallback to
+    // one whole-geometry batch, say) describes a different segmentation, so
+    // it is dropped rather than misapplied.
+    let checkpoints = recorded_progress
+        .filter(|p| p.after_batch.len() == batches.len())
+        .map(|p| (p.total_jobs, p.after_batch));
+    let (total, per_batch_processed) = match checkpoints {
+        Some((total_jobs, after_batch)) => (total_jobs, Some(after_batch)),
+        // No sidecar: pre-#3897 cache entry. Mesh units, as before.
+        None => (total_meshes, None),
+    };
+
+    let sse = |event: &ParquetStreamEvent| -> Result<Event, Infallible> {
+        Ok(Event::default().data(serde_json::to_string(event).unwrap()))
+    };
+    let mut events: Vec<Result<Event, Infallible>> = Vec::with_capacity(batches.len() * 2 + 3);
+    events.push(sse(&ParquetStreamEvent::Start {
+        total_estimate: total,
+        cache_key: cache_key.to_string(),
+    }));
+    events.push(sse(&ParquetStreamEvent::Progress { processed: 0, total }));
+
+    let mut processed = 0usize;
+    for (batch_number, (data, mesh_count, bases)) in batches.into_iter().enumerate() {
+        processed = match &per_batch_processed {
+            Some(checkpoints) => checkpoints[batch_number],
+            None => processed + mesh_count,
+        };
+        events.push(sse(&ParquetStreamEvent::Batch {
+            data,
+            mesh_count,
+            batch_number: batch_number + 1,
+            vertex_base: bases.map(|(v, _)| v),
+            index_base: bases.map(|(_, i)| i),
+        }));
+        events.push(sse(&ParquetStreamEvent::Progress { processed, total }));
+    }
+
+    events.push(sse(&ParquetStreamEvent::Complete {
+        stats: metadata_header.stats,
+        metadata: metadata_header.metadata,
+        symbolic_data,
+    }));
+
     let fast_stream: std::pin::Pin<
         Box<dyn futures::Stream<Item = Result<Event, Infallible>> + Send>,
-    > = Box::pin(futures::stream::iter(vec![
-        // Start event
-        Ok::<_, Infallible>(
-            Event::default().data(
-                serde_json::to_string(&ParquetStreamEvent::Start {
-                    total_estimate: metadata_header.stats.total_meshes,
-                    cache_key: cache_key_for_stream.clone(),
-                })
-                .unwrap(),
-            ),
-        ),
-        // Single batch with all cached geometry
-        Ok(Event::default().data(
-            serde_json::to_string(&ParquetStreamEvent::Batch {
-                data: base64_data,
-                mesh_count: metadata_header.stats.total_meshes,
-                batch_number: 1,
-            })
-            .unwrap(),
-        )),
-        // Complete event
-        Ok(Event::default().data(
-            serde_json::to_string(&ParquetStreamEvent::Complete {
-                stats: metadata_header.stats,
-                metadata: metadata_header.metadata,
-                symbolic_data,
-            })
-            .unwrap(),
-        )),
-    ]));
+    > = Box::pin(futures::stream::iter(events));
 
     Ok(Some(
         Sse::new(fast_stream)
             .keep_alive(KeepAlive::default())
             .into_response(),
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{cached_geometry_slice, try_cached_replay};
-    use crate::admission::{Admission, AdmissionCfg};
-    use crate::config::Config;
-    use crate::routes::parse::parquet::ParquetMetadataHeader;
-    use crate::services::cache::DiskCache;
-    use crate::types::{ModelMetadata, ProcessingStats};
-    use crate::AppState;
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    use std::sync::Arc;
-
-    /// Construct an `AppState` backed by a fresh temp cache directory unique to
-    /// `label`, mirroring `parity_tests::test_state`.
-    async fn test_state(label: &str) -> AppState {
-        let dir = std::env::temp_dir().join(format!(
-            "ifc-lite-server-test-cached-replay-{}-{}",
-            std::process::id(),
-            label
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        let cache = Arc::new(DiskCache::new(dir.to_str().unwrap()).await);
-        AppState {
-            cache,
-            config: Arc::new(Config::from_env()),
-            admission: Arc::new(Admission::new(AdmissionCfg {
-                max_concurrent_parses: 8,
-                mem_budget_bytes: 0,
-                queue_depth: 16,
-                queue_timeout: std::time::Duration::from_millis(100),
-                shed_pct: 85,
-            })),
-        }
-    }
-
-    /// A well-framed geometry blob: `[len=n][n geometry bytes][data_model_len=0]`.
-    fn well_framed_blob(geometry: &[u8]) -> Vec<u8> {
-        let mut blob = (geometry.len() as u32).to_le_bytes().to_vec();
-        blob.extend_from_slice(geometry);
-        blob.extend_from_slice(&0u32.to_le_bytes());
-        blob
-    }
-
-    fn sample_metadata_header(cache_key: &str, total_meshes: usize) -> ParquetMetadataHeader {
-        ParquetMetadataHeader {
-            cache_key: cache_key.to_string(),
-            metadata: ModelMetadata::default(),
-            stats: ProcessingStats {
-                total_meshes,
-                ..Default::default()
-            },
-            mesh_coordinate_space: None,
-            site_transform: None,
-            building_transform: None,
-            data_model_stats: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn miss_when_neither_key_is_cached() {
-        let state = test_state("miss-neither").await;
-        let result = try_cached_replay(&state, "no-such-key").await;
-        assert!(matches!(result, Ok(None)), "expected a plain cache miss");
-    }
-
-    #[tokio::test]
-    async fn miss_when_only_parquet_key_is_cached() {
-        // Partial state: parquet present, metadata absent — must still be a miss,
-        // not an attempt to serve with missing metadata.
-        let state = test_state("miss-only-parquet").await;
-        let cache_key = "only-parquet";
-        state
-            .cache
-            .set_bytes(&format!("{cache_key}-parquet-v5"), &well_framed_blob(&[1, 2, 3]))
-            .await
-            .unwrap();
-        let result = try_cached_replay(&state, cache_key).await;
-        assert!(matches!(result, Ok(None)), "expected a miss with only parquet cached");
-    }
-
-    #[tokio::test]
-    async fn miss_when_only_metadata_key_is_cached() {
-        // Partial state: metadata present, parquet absent — must still be a miss.
-        let state = test_state("miss-only-metadata").await;
-        let cache_key = "only-metadata";
-        let metadata_bytes = serde_json::to_vec(&sample_metadata_header(cache_key, 1)).unwrap();
-        state
-            .cache
-            .set_bytes(&format!("{cache_key}-parquet-metadata-v4"), &metadata_bytes)
-            .await
-            .unwrap();
-        let result = try_cached_replay(&state, cache_key).await;
-        assert!(matches!(result, Ok(None)), "expected a miss with only metadata cached");
-    }
-
-    #[tokio::test]
-    async fn corrupt_parquet_blob_falls_back_to_miss_not_error() {
-        // Both keys present, but the parquet blob is too short to hold even the
-        // length header: the corrupt-blob fallback must yield `Ok(None)` (a
-        // miss the caller re-parses), NOT an `Err`.
-        let state = test_state("corrupt-blob").await;
-        let cache_key = "corrupt-blob-key";
-        let metadata_bytes = serde_json::to_vec(&sample_metadata_header(cache_key, 5)).unwrap();
-        state
-            .cache
-            .set_bytes(&format!("{cache_key}-parquet-metadata-v4"), &metadata_bytes)
-            .await
-            .unwrap();
-        state
-            .cache
-            .set_bytes(&format!("{cache_key}-parquet-v5"), &[1, 2, 3]) // < 4 bytes
-            .await
-            .unwrap();
-
-        let result = try_cached_replay(&state, cache_key).await;
-        assert!(
-            matches!(result, Ok(None)),
-            "a corrupt cached blob must be treated as a miss, got {:?}",
-            result.map(|r| r.is_some())
-        );
-    }
-
-    #[tokio::test]
-    async fn corrupt_metadata_json_is_an_error_not_a_miss() {
-        // A cached-but-unparseable metadata entry is a DIFFERENT failure mode
-        // than a corrupt parquet blob: it must surface as `Err`, not silently
-        // fall through as `Ok(None)`.
-        let state = test_state("corrupt-metadata").await;
-        let cache_key = "corrupt-metadata-key";
-        state
-            .cache
-            .set_bytes(&format!("{cache_key}-parquet-metadata-v4"), b"not valid json")
-            .await
-            .unwrap();
-        state
-            .cache
-            .set_bytes(&format!("{cache_key}-parquet-v5"), &well_framed_blob(&[9, 9]))
-            .await
-            .unwrap();
-
-        let result = try_cached_replay(&state, cache_key).await;
-        assert!(result.is_err(), "unparseable cached metadata must be an error");
-    }
-
-    #[tokio::test]
-    async fn valid_cache_hit_round_trips_the_geometry_in_the_sse_body() {
-        // Control: a genuinely valid cache entry must still be served as a real
-        // hit (not swallowed into the corrupt-blob miss path), and the exact
-        // geometry bytes must reach the client base64-encoded in the Batch event.
-        let state = test_state("valid-hit").await;
-        let cache_key = "valid-hit-key";
-        let geometry = [0xDE, 0xAD, 0xBE, 0xEF, 0x42];
-        let metadata_bytes = serde_json::to_vec(&sample_metadata_header(cache_key, 7)).unwrap();
-        state
-            .cache
-            .set_bytes(&format!("{cache_key}-parquet-metadata-v4"), &metadata_bytes)
-            .await
-            .unwrap();
-        state
-            .cache
-            .set_bytes(&format!("{cache_key}-parquet-v5"), &well_framed_blob(&geometry))
-            .await
-            .unwrap();
-
-        let result = try_cached_replay(&state, cache_key).await;
-        let response = match result {
-            Ok(Some(response)) => response,
-            other => panic!("expected a cache hit response, got {:?}", other.map(|r| r.is_some())),
-        };
-        assert_eq!(response.status(), axum::http::StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let text = String::from_utf8(body.to_vec()).unwrap();
-
-        // Batch event carries the exact base64-encoded geometry bytes.
-        let expected_data = STANDARD.encode(geometry);
-        assert!(
-            text.contains(&expected_data),
-            "SSE body did not contain the expected batch payload: {text}"
-        );
-        // Start/Complete events carry the cache key and mesh count through.
-        // Checked independently (not `||`) so a wrong Start.total_estimate
-        // can't hide behind a correct Batch.mesh_count, or vice versa.
-        assert!(text.contains(cache_key));
-        assert!(
-            text.contains("\"total_estimate\":7"),
-            "Start event missing total_estimate:7: {text}"
-        );
-        assert!(
-            text.contains("\"mesh_count\":7"),
-            "Batch event missing mesh_count:7: {text}"
-        );
-    }
-
-    #[test]
-    fn decodes_a_well_framed_geometry_blob() {
-        // [len=3][A B C][trailing data-model framing]
-        let mut blob = 3u32.to_le_bytes().to_vec();
-        blob.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
-        blob.extend_from_slice(&[0, 0, 0, 0]); // data_model_len = 0
-        assert_eq!(cached_geometry_slice(&blob), Some(&[0xAA, 0xBB, 0xCC][..]));
-    }
-
-    #[test]
-    fn returns_none_for_a_blob_too_short_for_the_length_header() {
-        // Fewer than 4 bytes: previously `cached_parquet[0..4]` panicked here.
-        assert_eq!(cached_geometry_slice(&[]), None);
-        assert_eq!(cached_geometry_slice(&[1, 2, 3]), None);
-    }
-
-    #[test]
-    fn returns_none_when_declared_length_exceeds_the_buffer() {
-        // Declares 1e9 geometry bytes but only 4 header bytes are present:
-        // must not panic slicing `[4..4 + geometry_len]`.
-        let blob = 1_000_000_000u32.to_le_bytes().to_vec();
-        assert_eq!(cached_geometry_slice(&blob), None);
-        // Off-by-a-little: length one past the available body.
-        let mut blob = 3u32.to_le_bytes().to_vec();
-        blob.extend_from_slice(&[0xAA, 0xBB]); // only 2 body bytes, need 3
-        assert_eq!(cached_geometry_slice(&blob), None);
-    }
-
-    #[test]
-    fn decodes_a_blob_of_exactly_four_bytes_as_an_empty_slice() {
-        // len=0 with no body and no trailing framing: `[4..4]` is a valid
-        // (empty) slice, not a panic.
-        assert_eq!(cached_geometry_slice(&0u32.to_le_bytes()), Some(&[][..]));
-    }
-
-    #[test]
-    fn returns_none_for_a_u32_max_declared_length() {
-        // geometry_len = u32::MAX: `4 + len` must not overflow or slice past
-        // the buffer on any pointer width.
-        let mut blob = u32::MAX.to_le_bytes().to_vec();
-        blob.extend_from_slice(&[0xAA; 16]);
-        assert_eq!(cached_geometry_slice(&blob), None);
-    }
-
-    #[test]
-    fn decodes_a_length_exactly_matching_the_remaining_body() {
-        // No trailing data-model framing at all: len == body bytes available.
-        let mut blob = 5u32.to_le_bytes().to_vec();
-        blob.extend_from_slice(&[1, 2, 3, 4, 5]);
-        assert_eq!(cached_geometry_slice(&blob), Some(&[1, 2, 3, 4, 5][..]));
-    }
 }

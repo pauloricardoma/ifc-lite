@@ -10,6 +10,8 @@
  * building rotation into coordinate info.
  */
 
+import { attachCanonicalMeshMetadata } from './canonical-mesh-metadata.js';
+import { readSpecularMaterial } from './mesh-specular.js';
 import type { MeshData, CoordinateInfo } from './types.js';
 import type { DynamicBatchConfig } from './index.js';
 import {
@@ -107,6 +109,7 @@ export function convertMeshCollectionToBatch(
         const localToWorldArr = (mesh as { localToWorld?: ArrayLike<number> }).localToWorld;
         const localToWorld =
           localToWorldArr && localToWorldArr.length === 16 ? Array.from(localToWorldArr) : undefined;
+        const material = readSpecularMaterial(mesh as { metallic?: number; roughness?: number }); // #5582
         const meshData: MeshData = {
           expressId: mesh.expressId,
           ifcType: mesh.ifcType,
@@ -128,6 +131,7 @@ export function convertMeshCollectionToBatch(
           // bundles lack both getters, so both spread to nothing.
           ...(sourceGeometryItemId !== undefined ? { geometryItemId: sourceGeometryItemId } : {}),
           ...(sourceMaterialId !== undefined ? { materialId: sourceMaterialId } : {}),
+          ...(material ? { material } : {}),
         };
 
         // #961: copy the Rust-decoded surface texture + per-vertex UVs (the
@@ -155,15 +159,7 @@ export function convertMeshCollectionToBatch(
           };
         }
 
-        // #924 / #1891: attach the per-entity geometry fingerprint — hash and,
-        // when the pass produced them, the absolute world box and the proved
-        // enclosed volume (empty Map → no-op unless geometry hashing was
-        // enabled).
-        if (fingerprint) {
-          meshData.geometryHash = fingerprint.hash;
-          if (fingerprint.aabb) meshData.geometryAabb = fingerprint.aabb;
-          if (fingerprint.volume !== undefined) meshData.geometryVolume = fingerprint.volume;
-        }
+        attachCanonicalMeshMetadata(meshData, fingerprint);
 
         batch.push(meshData);
       } finally {

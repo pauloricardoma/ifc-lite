@@ -4,17 +4,19 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
+import { resolveEnglish } from '@/i18n/registry';
 import {
   WORKSPACE_PANELS,
   isBottomPanel,
   isWorkspacePanelId,
+  migratePanelId,
   workspacePanelForShortcutCode,
 } from './registry.js';
 
 // Pure routing the Alt+digit keyboard shortcut depends on (#1200/#1208). The
 // hook itself needs a DOM to test; this locks the decision it delegates to.
 describe('workspacePanelForShortcutCode (Alt+digit routing #1200/#1208)', () => {
-  it('Digit1 opens the first panel (Information)', () => {
+  it('Digit1 opens the first panel (Properties)', () => {
     assert.strictEqual(workspacePanelForShortcutCode('Digit1'), WORKSPACE_PANELS[0].id);
     assert.strictEqual(workspacePanelForShortcutCode('Digit1'), 'properties');
   });
@@ -69,17 +71,50 @@ describe('workspacePanelForShortcutCode (Alt+digit routing #1200/#1208)', () => 
   });
 });
 
+// The IDS panel was renamed/generalised to Data validation (#5138): the old
+// id must not silently vanish from a persisted sidebar order / hidden set /
+// float layout, which all key on WorkspacePanelId.
+describe('migratePanelId (#5138 registry rename)', () => {
+  it('maps the retired "ids" id to its replacement "validation"', () => {
+    assert.strictEqual(migratePanelId('ids'), 'validation');
+    assert.ok(isWorkspacePanelId('validation'));
+    assert.ok(!isWorkspacePanelId('ids'));
+  });
+
+  it('passes a current id through unchanged', () => {
+    for (const def of WORKSPACE_PANELS) {
+      assert.strictEqual(migratePanelId(def.id), def.id);
+    }
+  });
+
+  it('returns undefined for an id that is neither current nor a known legacy alias', () => {
+    assert.strictEqual(migratePanelId('not-a-real-panel'), undefined);
+  });
+});
+
+// The BCF panel's title once read "BCF issues" — Topic is the BCF-XML
+// element and Issue is only one TopicType value among several (Request,
+// Comment, Error, Warning, Info), so "issues" narrowed and contradicted the
+// spec (#4096). Pin the corrected label so it can't regress silently.
+describe('BCF panel title', () => {
+  it('says "BCF Topics", not "BCF issues" (#4096)', () => {
+    const bcf = WORKSPACE_PANELS.find((p) => p.id === 'bcf');
+    assert.ok(bcf, 'expected a bcf panel entry in the registry');
+    assert.strictEqual(resolveEnglish(bcf.titleKey), 'BCF Topics');
+  });
+});
+
 // `isBottomPanel` gates `usePanelControls`' toggle routing (script / gantt /
 // lists go through `toggleBottomPanel`, everything else through the sidebar
 // dock). The test above only exercises 'script' (Digit8) and 'lists'
 // (Digit0) via the shortcut map — 'gantt' (Digit9) was never checked here,
 // so dropping it from `isBottomPanel`'s own condition went unnoticed.
 describe('isBottomPanel', () => {
-  it('is true for exactly script, gantt and lists — the bottom-strip trio', () => {
+  it('is true for exactly script, gantt, lists, charts, document, flow, drawing and presentation — the bottom-strip panels', () => {
     for (const id of WORKSPACE_PANELS.map((p) => p.id)) {
       assert.strictEqual(
         isBottomPanel(id),
-        id === 'script' || id === 'gantt' || id === 'lists',
+        id === 'script' || id === 'gantt' || id === 'lists' || id === 'charts' || id === 'document' || id === 'flow' || id === 'drawing' || id === 'presentation',
         `isBottomPanel('${id}')`,
       );
     }

@@ -29,6 +29,8 @@
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { fenceUntrusted, resolveTokens, runReviewerWithFailover } from './run-reviewer.mjs';
+import { resolveProviderFallbacks, describeProviderFallbacks } from './provider-fallbacks.mjs';
+import { OPENROUTER_JUDGE_MODELS_DEFAULT } from './openrouter-reviewer.mjs';
 import { stripFence } from './validate-findings.mjs';
 import { isMainEntry } from '../lib/is-main-entry.mjs';
 
@@ -50,6 +52,11 @@ export function buildJudgePrompt(judgeRubric, findings) {
           ? `verified sibling: ${JSON.stringify(String(f.sibling.path))}:${f.sibling.line} ${JSON.stringify(String(f.sibling.quote ?? ''))}`
           : 'verified sibling: none',
         `class: ${JSON.stringify(String(f.class ?? 'unknown'))}`,
+        // ONLY PRESENT ON A POOLED ENSEMBLE RUN (ensemble-reviewer.mjs stamps
+        // it; a single-reviewer run never sets it). Told to the judge so it can
+        // recognise two findings from different models about the SAME line as
+        // duplicates to merge, rather than two independent defects.
+        ...(f.source ? [`source reviewer: ${JSON.stringify(String(f.source))}`] : []),
         // JSON.stringify'd like every other field. It was the ONE raw
         // interpolation, and the record delimiter above is a fixed, guessable
         // constant -- so a body containing a newline and `--- FINDING 0` wrote a
@@ -161,7 +168,13 @@ export function applyVerdicts(findings, raw) {
   const dropped = [];
   findings.forEach((f, i) => {
     const v = byIndex.get(i);
-    if (v && v.keep === false) dropped.push({ ...f, why: String(v.why ?? '').replace(/[\r\n]+/g, ' ').slice(0, 200) });
+    // A sibling reaches here only after the validator proved that its path,
+    // line and quote came from the base-tree context pack. The live judge twice
+    // inverted that evidence and called the untouched parallel site proof that
+    // the work was "already owned" (#3609, runs 33817317055/33820560852).
+    // Model prose cannot reliably protect this class from another model, so the
+    // optional precision filter is not allowed to suppress it.
+    if (v && v.keep === false && !f.sibling) dropped.push({ ...f, why: String(v.why ?? '').replace(/[\r\n]+/g, ' ').slice(0, 200) });
     else kept.push(f);
   });
   return { kept, dropped, note: null, ran: true };
@@ -175,11 +188,11 @@ export function applyVerdicts(findings, raw) {
  * would have left the reviewer working on the fallback while the judge quietly
  * stopped judging every PR.
  */
-export function judge({ judgeRubricPath, findings, tokens, model = 'haiku', spawn }) {
+export function judge({ judgeRubricPath, findings, tokens, model = 'haiku', spawn, providerFallback = null }) {
   if (findings.length === 0) return { kept: [], dropped: [], note: 'nothing to judge', ran: true };
   const rubric = readFileSync(judgeRubricPath, 'utf8');
   const prompt = buildJudgePrompt(rubric, findings);
-  const { text } = runReviewerWithFailover({ prompt, model, tokens, spawn });
+  const { text } = runReviewerWithFailover({ prompt, model, tokens, spawn, providerFallback });
   return applyVerdicts(findings, text);
 }
 
@@ -218,6 +231,19 @@ export function main(argv, {
   const doc = JSON.parse(readFile(findingsPath, 'utf8'));
   const before = Array.isArray(doc.findings) ? doc.findings : [];
 
+  const providers = resolveProviderFallbacks(env, {
+    openRouterModelsEnvVar: 'OPENROUTER_JUDGE_MODELS',
+    openRouterModelEnvVar: 'OPENROUTER_JUDGE_MODEL',
+    openRouterDefaultModels: OPENROUTER_JUDGE_MODELS_DEFAULT,
+    // SHORTER than the reviewer's 300000ms default: the judge is an optional
+    // precision filter (see `judge`'s doc comment -- it can only remove, and
+    // must fail soft), not the primary review path, so it should give up on a
+    // stalled model and fall back to "keep everything unjudged" well before
+    // burning the reviewer's own timeout budget on a filter nobody required.
+    openRouterTimeoutMsDefault: 120_000,
+  });
+  log(describeProviderFallbacks(providers));
+
   let result;
   try {
     result = judge({
@@ -226,6 +252,7 @@ export function main(argv, {
       tokens: resolveTokens(env),
       model: arg('model') ?? 'haiku',
       spawn,
+      providerFallback: providers.length > 0 ? providers : null,
     });
   } catch (err) {
     // The soft failure. Not a warning to be skimmed past: it names what did not
@@ -266,6 +293,23 @@ export function main(argv, {
     // every clean PR and made the eval print "THE JUDGE DID NOT RUN" on runs where
     // it did. A field means what it says; prose does not.
     judged: result.ran === true,
+    // THE PER-CLASS PASS FLAG (#3862), RESTATED AS A BOOLEAN rather than left to
+    // the spread above. The spread carries it when the validator wrote one; a
+    // document that predates the field, or one written by hand, carries nothing,
+    // and the spread alone would then hand the poster `undefined`. judged.json
+    // is a contract: the field is PRESENT and it is a boolean, and the poster's
+    // rule is `=== true`, which is the direction that refuses a flag nobody set.
+    //
+    // NOT claude-review.yml's crash backstop, which an earlier draft of this
+    // comment cited. That path is `cp findings.json judged.json` at the shell
+    // layer and never reaches this file at all -- and what it copies is the
+    // validator's own output, which writes the flag on every run. The gap this
+    // closes is narrower than that, and saying otherwise would have sent a
+    // reader to check a path where nothing can go wrong.
+    //
+    // This file never SETS the flag true, and could not: only the validator ran
+    // the class pass. It can only carry one forward.
+    classPass: doc?.classPass === true,
     // `kept` is RESTATED, not inherited. The validator's `kept` describes what
     // survived validation; leaving it beside a post-judge `findings` array made
     // `counts.kept !== findings.length` on any run that dropped something, and a

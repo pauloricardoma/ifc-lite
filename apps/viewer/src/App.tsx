@@ -16,8 +16,11 @@ import { ViewerLayout } from './components/viewer/ViewerLayout';
 import { BimProvider } from './sdk/BimProvider';
 import { ExtensionHostProvider } from './sdk/ExtensionHostProvider';
 import { SourceHostProvider } from './services/sources/SourceHostProvider';
+import type { FileSourceProviderFactory } from './services/sources/source-host';
 import { Toaster } from './components/ui/toast';
 import { ChunkErrorBoundary } from './components/ChunkErrorBoundary';
+import { StaleDeploymentNotice } from './components/StaleDeploymentNotice';
+import { LensRuntimeHost } from './components/viewer/LensRuntimeHost';
 import { Suspense, lazy, useEffect, useState } from 'react';
 import { Analytics } from '@vercel/analytics/react';
 
@@ -35,6 +38,9 @@ const McpLanding = lazy(() =>
 const McpPlayground = lazy(() =>
   import('./components/mcp/McpPlayground').then((m) => ({ default: m.McpPlayground })),
 );
+const RteGpuWitness = lazy(() =>
+  import('./e2e/RteGpuWitness').then((m) => ({ default: m.RteGpuWitness })),
+);
 
 // Neutral full-viewport placeholder while a lazy MCP route chunk loads. Both
 // /mcp routes render on a near-black stage (McpLanding's `NIGHT` = #0a0a0c), so
@@ -43,7 +49,12 @@ function RouteFallback() {
   return <div style={{ minHeight: '100vh', background: '#0a0a0c' }} />;
 }
 
-export function App() {
+export interface AppProps {
+  /** Host-supplied file-source providers; see `ViewerBootstrapOptions` in `bootstrap.tsx`. */
+  sourceProviders?: readonly FileSourceProviderFactory[];
+}
+
+export function App({ sourceProviders }: AppProps = {}) {
   const [pathname, setPathname] = useState(() => window.location.pathname);
 
   useEffect(() => {
@@ -64,6 +75,15 @@ export function App() {
   const normalizedPath = pathname.length > 1 && pathname.endsWith('/')
     ? pathname.slice(0, -1)
     : pathname;
+  if (normalizedPath === '/rte-gpu-witness') {
+    return (
+      <ChunkErrorBoundary key={normalizedPath} label="RTE GPU witness">
+        <Suspense fallback={<RouteFallback />}>
+          <RteGpuWitness />
+        </Suspense>
+      </ChunkErrorBoundary>
+    );
+  }
   // The two MCP branches below return the same fragment shape, so React
   // reconciles their ChunkErrorBoundary as ONE instance by type + position and
   // carries `state.error` across a route change: a failed playground chunk would
@@ -78,6 +98,7 @@ export function App() {
           </Suspense>
         </ChunkErrorBoundary>
         <Toaster />
+        <StaleDeploymentNotice />
         <Analytics />
       </>
     );
@@ -91,6 +112,7 @@ export function App() {
           </Suspense>
         </ChunkErrorBoundary>
         <Toaster />
+        <StaleDeploymentNotice />
         <Analytics />
       </>
     );
@@ -99,9 +121,13 @@ export function App() {
   return (
     <BimProvider>
       <ExtensionHostProvider>
-        <SourceHostProvider>
+        <SourceHostProvider additionalProviders={sourceProviders}>
+          <LensRuntimeHost />
+          {/* Toasts mount inside `ViewportContainer` itself (#5504, charter
+              #5478 item 22), anchored to the viewport's bottom-right above
+              the status bar, rather than the whole window's here. */}
           <ViewerLayout />
-          <Toaster />
+          <StaleDeploymentNotice />
           <Analytics />
         </SourceHostProvider>
       </ExtensionHostProvider>

@@ -53,6 +53,36 @@
         { "measure": "IfcAreaMeasure", "symbol": "m²", "siScale": 1.0 },
         { "measure": "IfcVolumetricFlowRateMeasure", "symbol": "m³/s", "siScale": 1.0 }
       ]
+    },
+    {
+      "name": "imperial_foot_dangling_unit_component_uses_the_named_factor",
+      "ifc": "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\nFILE_NAME('t.ifc','2026-01-01T00:00:00',(''),(''),'','','');\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n#1=IFCPROJECT('0001projectaaaaaaaaaaa',$,'P',$,$,$,$,$,#2);\n#2=IFCUNITASSIGNMENT((#3));\n#3=IFCCONVERSIONBASEDUNIT(#4,.LENGTHUNIT.,'FOOT',#5);\n#4=IFCDIMENSIONALEXPONENTS(1,0,0,0,0,0,0);\n#5=IFCMEASUREWITHUNIT(IFCLENGTHMEASURE(304.8),#99);\n#6=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);\nENDSEC;\nEND-ISO-10303-21;\n",
+      "measures": [
+        { "measure": "IfcLengthMeasure", "symbol": "ft", "siScale": 0.3048 },
+        { "measure": "IfcAreaMeasure", "symbol": "m²", "siScale": 1.0 }
+      ]
+    },
+    {
+      "name": "unknown_conversion_unit_dangling_component_shows_no_unit",
+      "ifc": "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\nFILE_NAME('t.ifc','2026-01-01T00:00:00',(''),(''),'','','');\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n#1=IFCPROJECT('0001projectaaaaaaaaaaa',$,'P',$,$,$,$,$,#2);\n#2=IFCUNITASSIGNMENT((#3));\n#3=IFCCONVERSIONBASEDUNIT(#4,.LENGTHUNIT.,'CUBIT',#5);\n#4=IFCDIMENSIONALEXPONENTS(1,0,0,0,0,0,0);\n#5=IFCMEASUREWITHUNIT(IFCLENGTHMEASURE(457.2),#99);\n#6=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);\nENDSEC;\nEND-ISO-10303-21;\n",
+      "measures": [
+        { "measure": "IfcLengthMeasure", "symbol": null, "siScale": null },
+        { "measure": "IfcAreaMeasure", "symbol": "m²", "siScale": 1.0 }
+      ]
+    },
+    {
+      "name": "psi_conversion_unit_with_a_derived_component",
+      "ifc": "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\nFILE_NAME('t.ifc','2026-01-01T00:00:00',(''),(''),'','','');\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n#1=IFCPROJECT('0001projectaaaaaaaaaaa',$,'P',$,$,$,$,$,#2);\n#2=IFCUNITASSIGNMENT((#3));\n#3=IFCCONVERSIONBASEDUNIT(#4,.PRESSUREUNIT.,'PSI',#5);\n#4=IFCDIMENSIONALEXPONENTS(-1,1,-2,0,0,0,0);\n#5=IFCMEASUREWITHUNIT(IFCPRESSUREMEASURE(6894.757),#6);\n#6=IFCDERIVEDUNIT((#8,#10),.PRESSUREUNIT.,$,$);\n#7=IFCSIUNIT(*,.FORCEUNIT.,$,.NEWTON.);\n#8=IFCDERIVEDUNITELEMENT(#7,1);\n#9=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);\n#10=IFCDERIVEDUNITELEMENT(#9,-2);\nENDSEC;\nEND-ISO-10303-21;\n",
+      "measures": [
+        { "measure": "IfcPressureMeasure", "symbol": "psi", "siScale": 6894.757 }
+      ]
+    },
+    {
+      "name": "non_length_unit_named_foot_dangling_component_shows_no_unit",
+      "ifc": "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\nFILE_NAME('t.ifc','2026-01-01T00:00:00',(''),(''),'','','');\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n#1=IFCPROJECT('0001projectaaaaaaaaaaa',$,'P',$,$,$,$,$,#2);\n#2=IFCUNITASSIGNMENT((#3));\n#3=IFCCONVERSIONBASEDUNIT(#4,.AREAUNIT.,'FOOT',#5);\n#4=IFCDIMENSIONALEXPONENTS(2,0,0,0,0,0,0);\n#5=IFCMEASUREWITHUNIT(IFCAREAMEASURE(0.09290304),#99);\nENDSEC;\nEND-ISO-10303-21;\n",
+      "measures": [
+        { "measure": "IfcAreaMeasure", "symbol": null, "siScale": null }
+      ]
     }
   ]
 }

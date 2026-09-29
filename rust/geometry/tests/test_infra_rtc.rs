@@ -8,8 +8,23 @@
 //! These files are gitignored (private) — tests are `#[ignore]` by default
 //! and run only when files are present.
 
-use ifc_lite_core::{build_entity_index, EntityDecoder, EntityScanner};
+use ifc_lite_core::{build_entity_index, EntityDecoder, EntityScanner, RtcVerdict};
 use ifc_lite_geometry::GeometryRouter;
+
+/// The offset the mesh pipelines actually subtract for a whole file: the live
+/// detector's verdict, read the live way (zero for `Small`). These tests used
+/// to call `detect_rtc_offset_from_first_element`, the same sampler without the
+/// verdict or the placement-bounds fallback, which had no production caller
+/// left (#4611).
+fn detected_offset(
+    router: &GeometryRouter,
+    content: &str,
+    decoder: &mut EntityDecoder,
+) -> (f64, f64, f64) {
+    router
+        .detect_rtc_offset_for_file(content.as_bytes(), decoder)
+        .map_or((0.0, 0.0, 0.0), RtcVerdict::offset)
+}
 
 const LOCAL_MODELS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/models/local");
 
@@ -42,7 +57,7 @@ fn test_real_infra_rtc_detection() {
         let mut decoder = EntityDecoder::with_index(&content, entity_index);
         let router = GeometryRouter::with_units(&content, &mut decoder);
 
-        let offset = router.detect_rtc_offset_from_first_element(&content, &mut decoder);
+        let offset = detected_offset(&router, &content, &mut decoder);
 
         println!(
             "{}: RTC offset = ({:.1}, {:.1}, {:.1})",
@@ -77,7 +92,7 @@ fn test_real_infra_rtc_application() {
     let mut decoder = EntityDecoder::with_index(&content, entity_index);
     let mut router = GeometryRouter::with_units(&content, &mut decoder);
 
-    let offset = router.detect_rtc_offset_from_first_element(&content, &mut decoder);
+    let offset = detected_offset(&router, &content, &mut decoder);
     println!("RTC offset: ({:.1}, {:.1}, {:.1})", offset.0, offset.1, offset.2);
     router.set_rtc_offset(offset);
 
@@ -148,7 +163,7 @@ fn test_real_infra_federation_alignment() {
         let entity_index = build_entity_index(&content);
         let mut decoder = EntityDecoder::with_index(&content, entity_index);
         let router = GeometryRouter::with_units(&content, &mut decoder);
-        let offset = router.detect_rtc_offset_from_first_element(&content, &mut decoder);
+        let offset = detected_offset(&router, &content, &mut decoder);
         println!("{}: RTC = ({:.1}, {:.1}, {:.1})", file_name, offset.0, offset.1, offset.2);
         offsets.push(offset);
     }

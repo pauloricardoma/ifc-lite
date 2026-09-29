@@ -21,8 +21,6 @@ const SLASH = 0x2f; // '/'
 const STAR = 0x2a; // '*'
 const NEWLINE = 0x0a; // '\n'
 const QUOTE = 0x27; // '\''
-const LPAREN = 0x28; // '('
-const RPAREN = 0x29; // ')'
 
 // Whether a comment opens at `pos`.
 export function opensComment(buf: Uint8Array, pos: number, len: number): boolean {
@@ -62,8 +60,10 @@ export function skipComment(buf: Uint8Array, pos: number, len: number): number {
   return -1;
 }
 
-// Index just past the closing quote of the literal opening at `pos`, or `len`
-// when it never closes. A doubled '' is an escaped quote and stays inside.
+// Index just past the closing quote of the literal opening at `pos`, or -1
+// when it never closes -- the same signal `skipComment` gives, not the old
+// `len` return that read as "closed at the last byte". A doubled '' is an
+// escaped quote and stays inside.
 //
 // Scanners consume a literal whole so nothing inside it can be mistaken for
 // syntax. Without this, a HEADER description reading `'rev /* pending'` opens a
@@ -83,7 +83,7 @@ export function skipStringLiteral(buf: Uint8Array, pos: number, len: number): nu
     }
     p++;
   }
-  return len;
+  return -1;
 }
 
 export interface Skip {
@@ -91,8 +91,10 @@ export interface Skip {
   next: number;
   // Newlines crossed, to add to the caller's line counter.
   lines: number;
-  // True when scanning must stop: an unterminated comment runs to EOF, so
-  // there is nothing left to find. Matches the Rust scanner returning None.
+  // True when scanning must stop: an unterminated comment or string literal
+  // runs to EOF, so there is nothing left to find. Matches the Rust scanner
+  // returning None. No per-kind field: every caller reports this with one
+  // generic message, so nothing downstream reads which construct it was.
   stop: boolean;
 }
 
@@ -102,6 +104,9 @@ export interface Skip {
 export function skipLexical(buf: Uint8Array, pos: number, len: number): Skip {
   if (buf[pos] === QUOTE) {
     const next = skipStringLiteral(buf, pos, len);
+    if (next < 0) {
+      return { next: len, lines: countNewlines(buf, pos, len), stop: true };
+    }
     return { next, lines: countNewlines(buf, pos, next), stop: false };
   }
   const next = skipComment(buf, pos, len);
@@ -116,11 +121,42 @@ export function opensLiteralOrComment(buf: Uint8Array, pos: number, len: number)
   return buf[pos] === QUOTE || opensComment(buf, pos, len);
 }
 
+// Whether an entity keyword may start with byte `b`: an ASCII letter of either
+// case. A keyword's case is not significant, so a lowercase lead byte is a
+// keyword too; the byte scanners then name the type in upper case, once, at
+// scan time (#4713). Rust's `EntityScanner` accepts the same letters
+// (rust/core/src/parser/scanner.rs). `scan-worker-lexing.ts` holds the worker's
+// copy as `isKeywordLeadByteAt`.
+export function isKeywordLeadByte(b: number): boolean {
+  return (b >= 0x41 && b <= 0x5a) || (b >= 0x61 && b <= 0x7a);
+}
+
+// The upper-case form of keyword byte `b`. Precondition: `b` is a keyword
+// byte, [A-Za-z0-9_], which every caller's token loop has already checked. Of
+// those only a-z is at or above 0x61, so one compare folds case; any other
+// byte (0x7B and up) would come back wrong. `scan-worker-lexing.ts` holds the
+// worker's copy as `upperKeywordByte`.
+export function upperKeywordByte(b: number): number {
+  return b >= 0x61 ? b - 0x20 : b;
+}
+
 // ASCII whitespace per ISO 10303-21. Not /\s/: that also matches U+00A0 and the
 // other Unicode space separators, which the byte scanners and the Rust half do
 // not treat as whitespace.
-function isSpaceByte(b: number): boolean {
-  return b === 0x20 || b === 0x09 || b === 0x0d || b === NEWLINE;
+//
+// The full six-byte set (space, tab, LF, CR, form feed 0x0c, vertical tab
+// 0x0b) matches `isAsciiSpace` below, which this file's header-string scanner
+// already used for the same six bytes -- and matches `is_step_space` in
+// `rust/export/src/source_header.rs`, which spells the set out for the same
+// reason this one now does: a stdlib "ASCII whitespace" helper is not
+// trustworthy here. Rust's `u8::is_ascii_whitespace` follows the WhatWG
+// definition and excludes vertical tab, so reaching for it on either side
+// reintroduces the exact FF/VT divergence issue #3733 reported (dropped
+// entity on a leading form feed) rather than closing it.
+export function isSpaceByte(b: number): boolean {
+  return (
+    b === 0x20 || b === 0x09 || b === 0x0d || b === NEWLINE || b === 0x0c || b === 0x0b
+  );
 }
 
 // Skip STEP trivia from `pos`: whitespace, comments, and any run of the two.
@@ -168,54 +204,6 @@ export function countNewlines(buf: Uint8Array, from: number, to: number): number
     if (buf[p] === NEWLINE) n++;
   }
   return n;
-}
-
-// Byte length of the record that starts at `startOffset` and whose argument
-// list opens at `pos`: the span up to and including the ')' balancing that '(',
-// or 0 when the input runs out first.
-//
-// A string literal is jumped over by skipStringLiteral above rather than
-// counted, so the '(' in 'Storey (Level 1)' is text and not depth, and STEP's
-// doubled-quote escape ('') stays inside the literal instead of closing it.
-// Sharing that helper is what keeps the escape rule in one place: an
-// open-coded `inString` flag here would be a second copy of it, free to drift
-// from the one every other scanner in this file uses.
-//
-// A comment is jumped over for the same reason, in the same order: the literal
-// test comes first, so a '/*' inside a value is text; the comment is then taken
-// whole, so a '(' or a quote inside it is text. Without that, the comment in
-// `#1=IFCWALL('a', /* see IFCWALL( */ $);` opened a paren depth that never
-// closed and the record came back with length 0.
-export function findEntityLength(buf: Uint8Array, pos: number, startOffset: number): number {
-  const len = buf.length;
-  let depth = 0;
-
-  while (pos < len) {
-    const char = buf[pos];
-
-    if (char === QUOTE) {
-      // Returns `len` on an unterminated literal, which ends the loop with no
-      // balancing ')' found -- the same 0 the open-coded version returned.
-      pos = skipStringLiteral(buf, pos, len);
-    } else if (opensComment(buf, pos, len)) {
-      const end = skipComment(buf, pos, len);
-      // Unterminated: the rest of the input is inside the comment, so no
-      // balancing ')' can follow. Same 0 as running off the end.
-      if (end < 0) return 0;
-      pos = end;
-    } else if (char === LPAREN) {
-      depth++;
-      pos++;
-    } else if (char === RPAREN) {
-      depth--;
-      pos++;
-      if (depth === 0) return pos - startOffset;
-    } else {
-      pos++;
-    }
-  }
-
-  return 0; // no matching ')'
 }
 
 // ---------------------------------------------------------------------------

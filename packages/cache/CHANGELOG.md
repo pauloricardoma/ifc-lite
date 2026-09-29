@@ -1,5 +1,220 @@
 # @ifc-lite/cache
 
+## 3.6.1
+
+### Patch Changes
+
+- Updated dependencies [[`ccc491e`](https://github.com/LTplus-AG/ifc-lite/commit/ccc491efac18ce496af47c91b1ef4fc04ebecca5), [`7215c2a`](https://github.com/LTplus-AG/ifc-lite/commit/7215c2a9344ede37c90680e1eb2a6c2b70c0ee3d), [`5c02af8`](https://github.com/LTplus-AG/ifc-lite/commit/5c02af8b7fda4d2fe53f79d3f00b9d192fc664d9)]:
+  - @ifc-lite/data@6.0.0
+  - @ifc-lite/geometry@7.5.2
+
+## 3.6.0
+
+### Minor Changes
+
+- [#5171](https://github.com/LTplus-AG/ifc-lite/pull/5171) [`9739441`](https://github.com/LTplus-AG/ifc-lite/commit/9739441c1d0bd36c92bd492013c141b8a8f4a990) Thanks [@louistrue](https://github.com/louistrue)! - CLI/MCP parity for `.rules.json` information-validation rule sets ([#5138](https://github.com/LTplus-AG/ifc-lite/issues/5138) PR 7b), running the same `@ifc-lite/rules` engine (`runRuleSet`) the viewer's Data Validation panel runs — no second evaluator, no parity fixture. New `ifc-lite check <model.ifc>... --rules <file.rules.json> [--format json|table] [--fail-on error|warning]`, exit `0` all pass / `1` any fail / `2` any rule error or unreadable input. `ifc-lite delivery` recipes gain an additive `rules: string[]` field (tri-state `pass`/`fail`/`error`, mirroring `ids`). New MCP tool `check_rules` wraps the same engine against every model in scope.
+  
+  `@ifc-lite/cache` gains `computeSourceFingerprint`/`computeSourceFingerprintFromBlob` plus `sourceModelIdentity(name, bytes)` — the single definition of the `${name}:${hex}` string a rule set's targets are matched against, shared by the CLI and the MCP tool so they cannot drift (moved from the viewer's `hooks/sourceFingerprint.ts`, review finding on [#5171](https://github.com/LTplus-AG/ifc-lite/issues/5171)): a rule set's `targets.modelFingerprints` is saved from the viewer's `FederatedModel.sourceFingerprint`, so a headless caller (the CLI, the MCP server) needs the SAME spread-sampled xxhash64 to resolve it — a SHA-256 of the full bytes, what `ifc-lite check`/`delivery` used before this fix, can never match it. `@ifc-lite/viewer` is a private, unpublished app and gets no changeset entry of its own — its import of this code moved from a local hook to `@ifc-lite/cache`, an internal refactor with no published-API surface of its own.
+
+### Patch Changes
+
+- Updated dependencies [[`35e54fc`](https://github.com/LTplus-AG/ifc-lite/commit/35e54fc20bc8a7632b9caec26cdb820e1ee0c0b7)]:
+  - @ifc-lite/geometry@7.5.0
+
+## 3.5.1
+
+### Patch Changes
+
+- [#5009](https://github.com/LTplus-AG/ifc-lite/pull/5009) [`d38af5a`](https://github.com/LTplus-AG/ifc-lite/commit/d38af5afd36f12329fe6f33bf905d28fca65ba43) Thanks [@louistrue](https://github.com/louistrue)! - Index every schema-resolvable `IfcRelationship` subtype as an exact typed edge, expose exact inbound/outbound relationship rows through the SDK, MCP, and viewer, and allow `related()` queries for every indexed `IfcRel*` name. Bump the cache format so graphs cached before the expanded indexing are reparsed instead of silently omitting the new edge buckets. `@ifc-lite/parser` also exports `resolveEffectiveEntityRecord`, the one place a read model folds a queued retype (name-based re-layout), named and positional edits into an entity record exactly as export writes it; the CLI, MCP and viewer read surfaces use it.
+- Updated dependencies [[`d38af5a`](https://github.com/LTplus-AG/ifc-lite/commit/d38af5afd36f12329fe6f33bf905d28fca65ba43), [`e2ca87d`](https://github.com/LTplus-AG/ifc-lite/commit/e2ca87d9b8f25be2ffeabd5843cbadc4154471c0), [`e1ace4f`](https://github.com/LTplus-AG/ifc-lite/commit/e1ace4f05a45a252d502bf72a506336185d2b157), [`ab8380e`](https://github.com/LTplus-AG/ifc-lite/commit/ab8380e6b9edf1ca1f05abf343ae6040ac8aee77), [`e211790`](https://github.com/LTplus-AG/ifc-lite/commit/e211790ff4d7070d908fb519652158089652dd9c)]:
+  - @ifc-lite/data@5.0.0
+  - @ifc-lite/geometry@7.4.0
+
+## 3.5.0
+
+### Minor Changes
+
+- [#4842](https://github.com/LTplus-AG/ifc-lite/pull/4842) [`12482c5`](https://github.com/LTplus-AG/ifc-lite/commit/12482c5f64c1298782508d536af65c4b30c342b2) Thanks [@louistrue](https://github.com/louistrue)! - Expose the mesh producer's exact RTC frame, persist it in cache format v20, and let grid, alignment, and symbolic overlay extraction use that frame instead of independently voting on coordinate shifting.
+
+### Patch Changes
+
+- Updated dependencies [[`12482c5`](https://github.com/LTplus-AG/ifc-lite/commit/12482c5f64c1298782508d536af65c4b30c342b2), [`3b10435`](https://github.com/LTplus-AG/ifc-lite/commit/3b10435ab117b1fcaf3ad7c47f7d9fdf74e0f2a4)]:
+  - @ifc-lite/geometry@7.1.0
+
+## 3.4.3
+
+### Patch Changes
+
+- [#4672](https://github.com/LTplus-AG/ifc-lite/pull/4672) [`6d8ebeb`](https://github.com/LTplus-AG/ifc-lite/commit/6d8ebebb7cd8722534ff1ad7817cf7a7d0191aaf) Thanks [@BIMvoice](https://github.com/BIMvoice)! - `extractRelFast`'s hand-written per-STEP-keyword branch ladder (`packages/parser/src/columnar-parser-relationships.ts`) is replaced by a single schema-derived algorithm: for any `IfcRelationship` subtype, the relating (single-reference) and related (reference-or-list) attribute positions are read straight from the codegen-generated schema registries, keyed by the `Relating*`/`Related*` EXPRESS naming convention, not a hand-typed table. `HIERARCHY_REL_TYPES` (the gate that decides which STEP keywords ever reach relationship extraction) is derived the same way, from every concrete `IfcRelationship` subtype across the bundled IFC2X3/IFC4/IFC4X3 registries, replacing an enumeration that [#3964](https://github.com/LTplus-AG/ifc-lite/issues/3964), [#3237](https://github.com/LTplus-AG/ifc-lite/issues/3237) and [#1075](https://github.com/LTplus-AG/ifc-lite/issues/1075) each landed because it was missing one more class.
+  
+  17 previously wholly-unindexed relationship classes (`IfcRelAssignsToActor`, `IfcRelAssignsToResource`, `IfcRelAssignsToProcess`, `IfcRelAssignsToControl`, `IfcRelAssociatesConstraint`, `IfcRelAssociatesApproval`, `IfcRelAssociatesLibrary`, `IfcRelDeclares`, `IfcRelInterferesElements`, `IfcRelCoversBldgElements`, `IfcRelCoversSpaces`, `IfcRelServicesBuildings`, `IfcRelProjectsElement`, `IfcRelFlowControlElements`, `IfcRelSequence`, and the IFC4X3-only `IfcRelPositions`/`IfcRelAdheresToElement`) each get their own `RelationshipType` enum member and edge, instead of being invisible to the relationship graph. `RelationshipType`-keyed name maps in `relationship-graph.ts`, `parquet-exporter.ts`, `cache/sections/relationships.ts` and `duckdb-integration.ts` were extended for exhaustiveness; the last of those was also converted from a non-exhaustive `Record<number, string>` to `Record<RelationshipType, string>` (it had silently been missing `ConnectsPortToElement`, `ConnectsPorts` and `AssociatesDocument` since they were added).
+  
+  A handful of concrete relationship subtypes (`IfcRelDefinesByObject`, `IfcRelDefinesByTemplate`, `IfcRelConnectsStructuralActivity`, `IfcRelConnectsStructuralMember`, `IfcRelConnectsWithEccentricity`, `IfcRelConnectsWithRealizingElements`, `IfcRelSpaceBoundary1stLevel`/`2ndLevel`, plus ten IFC2X3-legacy classes such as `IfcRelAssignsTasks`) now pass the schema-derived gate but still have no dedicated `RelationshipType`/edge — a deliberately scoped remainder, not a regression, tracked against [#4205](https://github.com/LTplus-AG/ifc-lite/issues/4205).
+- Updated dependencies [[`b4bc7df`](https://github.com/LTplus-AG/ifc-lite/commit/b4bc7df25e9cdcd6c46f4affd289c0b3da7829fa), [`5a82260`](https://github.com/LTplus-AG/ifc-lite/commit/5a82260e3e0bf686851e724b24dbfa05d11d9c7c), [`6d8ebeb`](https://github.com/LTplus-AG/ifc-lite/commit/6d8ebebb7cd8722534ff1ad7817cf7a7d0191aaf), [`9b9f2df`](https://github.com/LTplus-AG/ifc-lite/commit/9b9f2df47e0b1192fe033ca36021499af532220b), [`be2fed0`](https://github.com/LTplus-AG/ifc-lite/commit/be2fed0945e7dff83e3fb5d9ba810f0b5a6339a7)]:
+  - @ifc-lite/geometry@7.0.0
+  - @ifc-lite/data@4.4.0
+
+## 3.4.2
+
+### Patch Changes
+
+- Updated dependencies [[`5583362`](https://github.com/LTplus-AG/ifc-lite/commit/5583362ea8d7c988c84d44bf3b27c6c72fb6b798)]:
+  - @ifc-lite/geometry@6.0.0
+
+## 3.4.1
+
+### Patch Changes
+
+- [#4478](https://github.com/LTplus-AG/ifc-lite/pull/4478) [`341f41f`](https://github.com/LTplus-AG/ifc-lite/commit/341f41fd1725e8551d9bae4a3478ea3fa5b2698f) Thanks [@louistrue](https://github.com/louistrue)! - Load photogrammetry GLBs with usable base-colour textures even when they also carry auxiliary material maps, morph targets, vertex colours, alpha metadata, or alternate UV sets. Unsupported Draco compression now reports the uncompressed export workaround.
+
+- [#4496](https://github.com/LTplus-AG/ifc-lite/pull/4496) [`511e488`](https://github.com/LTplus-AG/ifc-lite/commit/511e488a8de2b90f7d5f7663911873a92b3427c7) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix two of the relationship-graph folds named in [#4205](https://github.com/LTplus-AG/ifc-lite/issues/4205) that lost information at parse time:
+  
+  - `IfcRelNests` was indexed onto the exact same `RelationshipType.Aggregates` edge as `IfcRelAggregates`, with no way to tell a nesting edge apart from a real decomposition edge once indexed. It now also lands on a distinct `RelationshipType.Nests` edge (in addition to the existing `Aggregates` edge, so every current consumer — spatial hierarchy, decomposition, the IDS `partOf`/ancestors bridge — is unaffected).
+  - `IfcRelAssignsToGroupByFactor` was indexed onto the same `RelationshipType.AssignsToGroup` edge as a plain `IfcRelAssignsToGroup`, and its `Factor` attribute was unreachable from the relationship graph. It now also lands on a distinct `RelationshipType.AssignsToGroupByFactor` edge, and `extractGroupAssignmentFactorOnDemand(store, groupId, memberId)` resolves the `Factor` value (`undefined`, not `0`, when the assignment is plain or absent).
+  
+  This is a narrow fix for the two folds the issue calls out as live defects, not the full schema-derived relationship-edge migration [#4205](https://github.com/LTplus-AG/ifc-lite/issues/4205) also scopes — the hand-written 17-value `RelationshipType` enum and the hand-written relating/related attribute slots are unchanged.
+  
+  Two follow-up fixes for consumers that don't filter by relationship type and so double-counted or mislabeled the new secondary edges:
+  
+  - `ParquetExporter`'s `Metadata.json` `statistics.relationshipCount` counted raw graph edges, so a model with `IfcRelNests`/`IfcRelAssignsToGroupByFactor` relationships reported one extra per such relationship (the new secondary edge counted alongside its broad-bucket edge). It now counts distinct `IfcRel*` records instead.
+  - The DuckDB-backed `relationships` SQL table (`@ifc-lite/query`) rendered `rel_type` as `'Unknown'` for both new types — its type→string map was missed when the other three were updated. Added, with the same display strings as those three maps.
+- Updated dependencies [[`c952d49`](https://github.com/LTplus-AG/ifc-lite/commit/c952d497c424ec15b972d87b878b41bf0573460b), [`c952d49`](https://github.com/LTplus-AG/ifc-lite/commit/c952d497c424ec15b972d87b878b41bf0573460b), [`511e488`](https://github.com/LTplus-AG/ifc-lite/commit/511e488a8de2b90f7d5f7663911873a92b3427c7)]:
+  - @ifc-lite/geometry@5.0.0
+  - @ifc-lite/data@4.2.0
+
+## 3.4.0
+
+### Minor Changes
+
+- [#4389](https://github.com/LTplus-AG/ifc-lite/pull/4389) [`33194e5`](https://github.com/LTplus-AG/ifc-lite/commit/33194e5db6a17763e8fad5f5a6d2fea130d8dc84) Thanks [@louistrue](https://github.com/louistrue)! - Retain embedded GLB base-colour image bytes and UV coordinates, including texture transforms and node rotation/scale. Expose encoded image resources for host-owned decoding; reject unsupported capture appearance instead of silently dropping it.
+
+- [#4275](https://github.com/LTplus-AG/ifc-lite/pull/4275) [`576369b`](https://github.com/LTplus-AG/ifc-lite/commit/576369b2168ee1277fab3cfbc42d54c356aec0ef) Thanks [@louistrue](https://github.com/louistrue)! - Preserve canonical appearance provenance in cache format v19, with shared source topology across chunks and validated restored index identities.
+
+### Patch Changes
+
+- [#4397](https://github.com/LTplus-AG/ifc-lite/pull/4397) [`9c7062f`](https://github.com/LTplus-AG/ifc-lite/commit/9c7062f1f28a2f9d8a46db65225b772af4666cde) Thanks [@louistrue](https://github.com/louistrue)! - Reject embedded GLB images whose PNG/JPEG signature disagrees with their declared MIME type, preventing transparent PNG data from bypassing JPEG opacity handling.
+- Updated dependencies [[`ced8bb4`](https://github.com/LTplus-AG/ifc-lite/commit/ced8bb46c368648bd54a1bab716d049143faa036), [`f33ac74`](https://github.com/LTplus-AG/ifc-lite/commit/f33ac74dd0578792327f684ba5ca59f050458c65), [`be4fdb9`](https://github.com/LTplus-AG/ifc-lite/commit/be4fdb9ffe6995c74d3629887021c98b843beadb), [`7427343`](https://github.com/LTplus-AG/ifc-lite/commit/742734300487f78df8192dc6fd4126615b63b966), [`a6976b9`](https://github.com/LTplus-AG/ifc-lite/commit/a6976b9da44d13157533372a8def23995fcfb93f)]:
+  - @ifc-lite/data@4.1.0
+  - @ifc-lite/geometry@4.4.0
+
+## 3.3.0
+
+### Minor Changes
+
+- [#4012](https://github.com/LTplus-AG/ifc-lite/pull/4012) [`a24b8cf`](https://github.com/LTplus-AG/ifc-lite/commit/a24b8cff9598e48c75c5f9fbebd036e72c09063e) Thanks [@louistrue](https://github.com/louistrue)! - Expose borrowed compact entity columns to compatible consumers and reuse them when writing binary cache indexes. Preserve the existing binary layout, normalized type order, generic iterable inputs and borrowed-buffer ownership while avoiding reference-object reconstruction for valid compact indexes.
+
+- [#4015](https://github.com/LTplus-AG/ifc-lite/pull/4015) [`ae886b4`](https://github.com/LTplus-AG/ifc-lite/commit/ae886b4d113a227826fdec535a3d66f6d963beb9) Thanks [@louistrue](https://github.com/louistrue)! - Allow browser callers to move geometry cache compression into one bounded worker while preserving cache format and the workerless default. Transfer serialized chunks without cloning model data and terminate the worker on success or failure.
+
+### Patch Changes
+
+- Updated dependencies [[`62e41d5`](https://github.com/LTplus-AG/ifc-lite/commit/62e41d57ec5a41769b91d01e35d10113de91900b), [`165ee1f`](https://github.com/LTplus-AG/ifc-lite/commit/165ee1fa486f799f59531fe332cad6bf67bd3f10)]:
+  - @ifc-lite/geometry@4.3.0
+
+## 3.2.0
+
+### Minor Changes
+
+- [#3811](https://github.com/LTplus-AG/ifc-lite/pull/3811) [`21b131d`](https://github.com/LTplus-AG/ifc-lite/commit/21b131d77e9079edc80ccf1dc1708c2d65747ae7) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Add `toCacheDataStore()`, exported from the package root, so callers stop
+  hand-rolling the `IfcDataStore` to `CacheDataStore` conversion that
+  `BinaryCacheWriter.write` requires (`schema: SchemaVersion`, a numeric enum,
+  against the parser's `schemaVersion` string union). The viewer's cache hook
+  carried its own copy of that mapping, spelled out as bare `1`/`2`/`0`
+  literals, and the package README carried a second one inline; both now go
+  through this one function, so the mapping can no longer drift between them.
+  An IFC5 source is tagged `SchemaVersion.IFC2X3` on write, since the binary
+  format predates IFC5, matching the fallback the viewer's read side already
+  uses. The store's `entityIndex` passes straight through (the parser's
+  `EntityByIdIndex` already iterates `[number, EntityRef]` and `EntityRef`
+  satisfies `CacheEntityRef`), so a cache written this way carries an
+  entity-index section and a reader that retains the source can re-attach the
+  parser's lazy accessors.
+  
+  Correct the package docstring and README, which claimed the cache
+  pre-computes "all data structures" for a 5-10x speedup. That holds for
+  entities, relationships, spatial hierarchy and geometry, but not for
+  properties or quantities: a STEP-parsed store resolves those lazily and
+  never populates its property/quantity tables, so `write()` serializes them
+  empty and a cache-restored model queries properties exactly as slow as a
+  fresh parse, unless the caller separately retains the source buffer and
+  re-attaches on-demand extraction on read (as the viewer's cache hook does).
+  `docs/guide/querying.md` already documented this correctly; the package's
+  own docs now say the same thing. Reported as issue [#3759](https://github.com/LTplus-AG/ifc-lite/issues/3759).
+
+- [#3528](https://github.com/LTplus-AG/ifc-lite/pull/3528) [`62bb58f`](https://github.com/LTplus-AG/ifc-lite/commit/62bb58fc8364c27bcf8452ab8edbde26727f527c) Thanks [@louistrue](https://github.com/louistrue)! - Carry the originating `IfcRepresentationItem` id on GPU-instanced occurrences, so a host can drill from a rendered instanced piece back to the entity in the IFC source ([#2985](https://github.com/LTplus-AG/ifc-lite/discussions/2985)).
+  
+  The instancing path has always been per representation item — `collect_submeshes_from_item_inner` emits one sub-mesh per item and tags it with that item's express id, which is why a two-solid `IfcRepresentationMap` instanced N times produces two templates rather than one. The id was computed at every step and then dropped: `RawInstanceOccurrence` had no field for it even though the colour lookup one line up already read `sub.geometry_id`, and the `InstanceMeshRef` the browser batch hands the encoder had none either, which lost it for the template as well as for its occurrences. A flat mesh reported `geometryItemId`; the same geometry, instanced, reported nothing — and "no item id" is indistinguishable from "this geometry has no item", so the loss was silent.
+  
+  The IFNS wire format goes to version 2 to carry it. Header word 7, written as a literal `0` and read by nobody in v1, becomes the instance record STRIDE IN BYTES: 88 for the base record (templateIndex, entityId, colour, transform), 92 when it also carries the trailing `itemId` u32. The stride is now DERIVED from that word in one place per language rather than repeated as a literal in four, and the encoder derives it from the DATA — a model whose producer names no representation item writes 88-byte records rather than 4 bytes of zeros per occurrence (~800 KB on a 200k-occurrence model, written, cached verbatim and re-read on every load).
+  
+  A stride rather than a flags word, because per-instance fields are APPEND-ONLY in a fixed canonical order and the stride is what tells a reader how many trailing fields are present. A decoder must REJECT a flag bit it does not know — an unknown bit changes the stride unknowably — so flags buy no forward compatibility over the version word they duplicate. A stride the decoder READS buys exactly that, and both suites prove it against bytes rather than prose: a synthesised version-3 shard at stride 96 (base + itemId + 4 bytes of a field that does not exist yet) decodes here with every known field intact and the unknown tail stepped over.
+  
+  Both decoders became PERMISSIVE on version: v1 (stride 88, no trailing fields) and any version at or above 2 whose declared stride is readable and valid. So the v1 shards already sitting in browser caches still load, reporting no item id rather than failing. The strictness moved to where it belongs — the stride: below the 88-byte base record, not a multiple of 4, or too large for the instance table it implies to fit the buffer, is refused, because a mis-strided read yields plausible garbage instead of an error. Version 0 is refused. The claim is tested against bytes rather than asserted: a real v1 shard, frozen in both the Rust and the TypeScript suite and never regenerated, is decoded by the current decoders and round-tripped through the cache section.
+  
+  The alignment rule is there because the two statements of the format have to refuse the same shards. The TypeScript decoder views the pooled data as `Float32Array` over the shard buffer, so an odd stride pushes that offset off a 4-byte multiple (stride 90 with one template and one instance lands on 170) and the view constructor throws an opaque `RangeError`; Rust reads the identical bytes through byte slices and decoded every base field happily. On a shard the permissive-version rule promises to read, one side used to succeed and the other to fail with the wrong error.
+  
+  **ONE CACHE INVALIDATION, DELIBERATELY.** `@ifc-lite/cache`'s `FORMAT_VERSION` moves 15 → 16, so the viewer's cache key (`ifc-<bytes>-<fingerprint>-v<FORMAT_VERSION>…`) moves with it and every existing entry misses once and re-meshes. That cost buys a closed deploy-skew window. The InstancedShards section stores shard bytes VERBATIM and never re-encodes, so a v2 shard this build writes into IndexedDB would otherwise sit under a key an OLDER bundle also matches — a tab opened before the deploy, an edge still serving the previous build, a rollback. That bundle's decoder is a strict `version !== 1` throw, and `useGeometryStreaming` swallows it with a `console.warn`: every instanced occurrence disappears while the flat geometry keeps drawing, so it reads as missing geometry rather than as a version error. The bump splits the keyspace instead — the old bundle looks for v15, misses, re-parses, and writes v1 shards it can read; this build looks for v16. No shared key.
+  
+  Belt and braces beside that key, because shard bytes travel by more routes than one key: the encoder writes **version 1** whenever the derived stride is the bare 88-byte base record, with header word 7 at the literal `0` v1 wrote there. Such a shard carries no trailing field, so it IS a v1 shard byte for byte and a pre-[#2985](https://github.com/LTplus-AG/ifc-lite/issues/2985) decoder reads it. Only a widened 92-byte record claims v2.
+  
+  The stride predicate is read off the occurrences the encoder actually WRITES — the collated template occurrences plus the flat singletons — not off the input mesh slice. `collate_refs` drops members (an empty non-instanceable mesh, an all-empty representation group), so a batch whose only id-bearing entry was a dropped one used to declare 92 and then write `0` into every record it emitted: the zero-filled widened record the data-derived stride exists to prevent, and a `carriesItemIds: true` that lied to the consumer.
+  
+  Two smaller gaps on the same terrain close with it, neither needing a wire change. A sub-threshold occurrence that recovers FLAT (`recover_flat` in the browser batch, `recover_orphan_occurrences` in the native finalize) never reaches the shard at all, so its id rides the recovered `MeshData` through `with_style_metadata` instead. And `Scene.getInstancedMeshDataPieces` now stamps `geometryItemId` on each materialized piece, so an exporter or a source-navigation consumer reading instanced geometry is not worse off than one reading flat geometry.
+  
+  The id stays CPU-side. It is deliberately absent from the GPU per-instance vertex buffer, whose 88-byte layout is packed identically by the instanced pipeline, the shadow pass and the picker: this is host-query data ("which entity produced this piece"), not shading data.
+  
+  New surface: `DecodedInstance.itemId?` and `DecodedInstancedShard.carriesItemIds` (`@ifc-lite/geometry`), `InstancedRenderTemplate.itemIds?` (`@ifc-lite/renderer`), `item_id` fields on `InstanceMeshRef` / `DecodedInstance` / `RawInstanceOccurrence` / `InstanceRecord` and `MeshData::style_geometry_item_id` / `recover_occurrences_flat` in the Rust crates. Minor rather than patch: the wire version moved and every one of those is an addition to a public surface. `carriesItemIds` is REQUIRED, not optional, and that is the one thing here breaking for a TypeScript consumer who constructs a `DecodedInstancedShard` by hand rather than receiving it from `decodeInstancedShard` (only tests in this repo do). It is required on purpose: it is what a consumer keys the per-occurrence id column off, so an omitted flag would read as "no ids" and drop them silently — absence looking exactly like success, which is the defect this whole change is about.
+  
+  BREAKING FOR THE RUST CRATES, and this changeset cannot express it. `ifc-lite-geometry` and `ifc-lite-processing` are published to crates.io, and four `pub` structs that callers construct literally gain a `pub` field: `InstanceMeshRef.item_id` and `DecodedInstance.item_id` in geometry, `RawInstanceOccurrence.geometry_item_id` and `InstanceRecord.geometry_item_id` in processing. None is `#[non_exhaustive]`, so any downstream exhaustive struct literal stops compiling — and both breaks are demonstrated in-repo, since the field additions broke the literals in `rust/export/src/gltf.rs`, `rust/export/src/usd/tests.rs` and three `rust/processing/tests/` files. Measured against the published 7.1.1 with `cargo +stable semver-checks check-release -p <crate> --baseline-version 7.1.1 --release-type minor`: both report `constructible_struct_adds_field` and "semver requires new major version" (196 checks, 195 pass, 1 fail). `scripts/sync-versions.js` derives the Cargo version from the highest npm package version, so a `minor` here would ship 7.1.1 → 7.2.0 and break anyone pinned to `ifc-lite-geometry = "7"` on an ordinary `cargo update`. The remedy this repo provides is `rust-major-offset.json`, and this PR APPLIES it: `majorOffset` goes from 1 to 2, in its own commit, with the re-synced Cargo manifests and `Cargo.lock` beside it — the shape [#3326](https://github.com/LTplus-AG/ifc-lite/issues/3326) established for the 0 → 1 move. `[workspace.package] version` moves 7.1.1 → 8.1.1 as a result, so the crates publish as a major while the npm packages stay on a minor. `node scripts/check-rust-major-offset.mjs` is green on the branch: "Rust crate version 8.1.1: crates run 2 major(s) ahead of npm 6.1.1. 14 internal dependency literal(s) across 8 manifest(s) agree, over 48 workspace package(s) scanned." `scripts/check-rust-semver.mjs` stays the backstop, and it now has something to compare: its "nothing to gate" line appears only when every crate is already on crates.io at the workspace version, and 8.1.1 is not published.
+
+- [#3782](https://github.com/LTplus-AG/ifc-lite/pull/3782) [`a1069f8`](https://github.com/LTplus-AG/ifc-lite/commit/a1069f8f096fcfc5771200a2748466096c3463d5) Thanks [@louistrue](https://github.com/louistrue)! - Fix `RelationshipGraphBuilder.addEdge` double-counting a relationship that a file declares twice.
+  
+  Nothing in EXPRESS forbids two `IfcRel*` instances from naming the same (relating, related) pair — two `IfcRelContainedInSpatialStructure` records can re-relate the same element to the same storey, and `IfcRelDefinesByProperties` carries only a `NoRelatedTypeObject` WHERE rule. The builder pushed both edges, so every consumer that walks the raw edge list saw the target twice: `store.spatialHierarchy.byStorey` listed the element twice, the viewer's generated schedule reported one product too many, and `SpatialHierarchy.parquet` emitted a duplicate row (which a `GROUP BY` in an external BI tool inherits).
+  
+  `addEdge` now folds a repeat of a `(source, target, type)` triple into the surviving edge instead of dropping it: the first instance's express id becomes `relationshipId`, later repeats are kept on `shadowedRelationshipIds`. Edges that differ in source, target, or type are untouched. The parser's on-demand property/quantity/classification/document maps — which a query reads in preference to the graph — now dedup the same way, so a redundant `IfcRel*` no longer duplicates a pset, qset, classification, or document either. `onDemandMaterialMap` is deliberately left as-is: `buildMaterialUsageIndex` already dedupes per (material, entity) downstream via its own `seenPerMaterial` set, a contract pinned by `material-fraction-and-associations.test.ts` (`onDemandMaterialMap.get(100)` for two redundant `IfcRelAssociatesMaterial` records is expected to equal `[300, 300, 999]`, not `[300, 999]`) — deduping upstream too would duplicate that work, not fix a gap.
+  
+  `shadowedRelationshipIds` is stored on the wire as three small, Transferable typed arrays (`shadowedEdgeIndex`/`shadowedGroupOffsets`/`shadowedRelIds`) rather than one slot per edge, because the obvious dense shape structured-clones (instead of transferring) across the parser worker boundary — measured +1.2s / +190MB on a 12M-edge model for a field that's empty on almost every edge. The fields are optional on `RelationshipEdges`/`RelationshipEdgesColumns`: absent entirely on a graph that tracks no duplicates, read via `?.`.
+  
+  Four places needed the extra ids, not just the deduped edge itself:
+  - `related()` in both the CLI and MCP backends now treats a connection as alive as long as any one of `relationshipId` or `shadowedRelationshipIds` still exists (via a shared `edgeSurvives` helper), so deleting the surviving `IfcRel*` doesn't erase a connection a sibling instance still names.
+  - `getRelationshipsBetween` reports `shadowedRelationshipIds` on each `RelationshipInfo`.
+  - `Relationships.parquet` and the DuckDB `relationships` table (via a shared `flattenRelationshipEdges` helper) and the anonymized-subset exporter's `collectRelatedEntities` all emit one row/closure entry per shadowed id too, not just the survivor — each is a real STEP record in the source file.
+  - The on-disk model cache (`@ifc-lite/cache`, FORMAT_VERSION 17 -> 18) persists the shadowed-id columns, so a model reloaded from cache gets the same delete-then-query behavior as a fresh parse. A v17 cache entry (written before this change) is read as having no shadowed ids rather than being treated as corrupt — matches the pre-fix in-memory behaviour exactly, since those graphs never tracked them either — and the cache lookup key already embeds `FORMAT_VERSION`, so an old entry simply misses and re-parses on next load.
+  
+  `Relationships.parquet` also drops a row whose own `IfcRel*` record has been deleted through the overlay, not only rows whose source or target endpoint was — an `IfcRel*` line is a row in `Entities.parquet` too, so a `RelId` for a deleted one was a dangling reference. Because each shadowed id is its own row, a deleted survivor drops while a live sibling keeps the connection, matching `edgeSurvives`.
+  
+  One consequence to note: `Relationships.parquet` is still built from the deduped graph, so a redundant second `IfcRel*` instance appears as its own row again (via `shadowedRelationshipIds`) rather than being silently dropped — every `IfcRel*` record that backs a surviving edge appears at least once, including deduplicated duplicates. (Not a 1:1 row-to-record count: a deleted endpoint still drops rows, and one `IfcRel*` with N `RelatedObjects` has always produced N rows, one per target — unchanged by this fix.)
+
+### Patch Changes
+
+- [#3603](https://github.com/LTplus-AG/ifc-lite/pull/3603) [`a1aebc8`](https://github.com/LTplus-AG/ifc-lite/commit/a1aebc822b819221258f4759edf4c82ff0d140f7) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix the cache-rehydrated `PropertyTable.getForEntity` (`readProperties`) silently merging two distinct `IfcPropertySet` instances into one when they share a literal name -- the same bug just fixed in `@ifc-lite/data`, but in a second, byte-for-byte-duplicate grouping loop that only ran on a model loaded from the binary cache. A model with two same-named pset instances (a federated merge, or an exporter emitting the same `Pset_` twice on one element) answered correctly from a fresh parse but merged them into one set, misattributing the second instance's properties to the first instance's GlobalId, once reloaded from cache. Both paths now call the same `@ifc-lite/data` grouping helper (`groupPropertySetsByInstance`, keyed on `(psetName, psetGlobalId)`), so a cache-loaded model can no longer diverge from a fresh parse.
+
+- [#3606](https://github.com/LTplus-AG/ifc-lite/pull/3606) [`f8e03d4`](https://github.com/LTplus-AG/ifc-lite/commit/f8e03d4d5bb620fc9e807d5233091d145a201165) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Persist the new `QuantityTable.qsetGlobalId` column through the binary cache format and restore the same distinct-instance grouping in `readQuantities`'s `getForEntity`, mirroring `properties.ts`'s `psetGlobalId` handling. Bumps `FORMAT_VERSION` from 16 to 17 (a wire-format-breaking column addition); `FORMAT_VERSION` is embedded in the cache key, so old-format entries simply never key a hit — no read-side migration.
+  
+  Both `getForEntity` implementations -- the columnar one in `@ifc-lite/data`'s `quantity-table.ts` and this cache-rehydrated one -- now call a single shared `groupQuantitySetsByInstance` helper (new `@ifc-lite/data` export) instead of carrying two independent copies of the `(qsetName, qsetGlobalId)` grouping loop, mirroring `groupPropertySetsByInstance` on the property side. A cache round-trip test now asserts parity: a model with two same-named `IfcElementQuantity` instances (distinct GlobalIds) reads back from the binary cache identically to a fresh parse, so the two paths can no longer re-diverge.
+
+- [#3505](https://github.com/LTplus-AG/ifc-lite/pull/3505) [`082fd0b`](https://github.com/LTplus-AG/ifc-lite/commit/082fd0bf0d8f472acdadac438bd43523826491ce) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fail loudly when a cached RelationshipGraph's per-entity edge range is corrupted, instead of silently returning edges with `undefined` fields.
+  
+  The relationships section stores each entity's edges as an `(offset, count)` pair into a shared edge-target/type/relationshipId array. Nothing validated that pair against the array's actual length: a cache file corrupted between write and read (disk bitrot, a truncated write, a hand-edited file) could carry an `offset + count` that overruns the edge arrays. `getEdges()` would then read past the end of a `Uint32Array`/`Uint16Array`, which JavaScript resolves to `undefined` rather than throwing, and return relationship edges with `undefined` target/type/relationshipId mixed in with the real ones — silent corruption reaching callers with no signal anything went wrong.
+  
+  `readRelationships`/`readEdges` now validate every entity's `(offset, count)` range against the edge array length right after parsing, and throw a descriptive "Corrupt cache RelationshipGraph" error if it doesn't fit — the same fail-fast contract already applied to this cache format's other sections (StringTable offsets, entity-index typeIndex, InstancedShards lengths).
+
+- [#3567](https://github.com/LTplus-AG/ifc-lite/pull/3567) [`ddc0221`](https://github.com/LTplus-AG/ifc-lite/commit/ddc0221a776bce15348d915a861e3fbc6cdff968) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Reject a NaN/Infinity-bombed vertex position or normal in a cached geometry section instead of silently decoding it. Every existing corruption guard in the binary cache validates declared SHAPE (section offsets, string-table offsets, row indices, chunk-directory contiguity); none constrained the numeric domain of a vertex float once its slot was in range. A byte-flip landing inside the position/normal data therefore passed every check and decoded as a syntactically valid, semantically poisoned mesh, which could reach the spatial index and renderer unfiltered. The cache reader now throws (and the viewer's cache-restore path already discards the entry and falls back to a fresh parse on any read failure).
+  
+  The per-mesh finiteness scan is checked via a raw IEEE-754 bit-pattern test (a `Uint32Array` view over the same buffer, no copy) rather than `Number.isFinite`, after measuring on a real 5,927-mesh / 473K-vertex fixture (`dental_clinic.ifc`, full write+read through `BinaryCacheWriter`/`BinaryCacheReader`, 20 iterations after 4 warmup reads): unguarded `read()` ~26-30ms (min-median across two trials), `Number.isFinite` guard ~34-42ms (+27-38%), a zero-allocation float-comparison loop ~30-34ms (+17-22%), the bitwise mask ~30-37ms (+15-22%) — the fastest of the three, though still a material cost since the guard is a genuine second linear pass over every position/normal float. Kept anyway: it is the only guard in this package that closes a mis-parse (not just bounds/shape) class of corruption, and a thrown read already falls back to a fresh parse in the viewer's cache-restore path.
+
+- [#3609](https://github.com/LTplus-AG/ifc-lite/pull/3609) [`1000dce`](https://github.com/LTplus-AG/ifc-lite/commit/1000dce72e9ec75c59848efefc1f709d01172e72) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fixed the GLB reader (`resolveMaterialColor` in `parseGLBToMeshData`) copying `pbrMetallicRoughness.baseColorFactor` straight into `MeshData.color`. `baseColorFactor` is defined in LINEAR colour space (glTF 2.0 spec), while the mesh-colour pipeline the viewer consumes is sRGB — so after the exporter fix that emits linear factors, the reader treated those linear values as sRGB on an export → re-import round-trip and rendered too dark, and any spec-conformant external GLB was mis-read the same way. The reader now applies the inverse IEC 61966-2-1 encode (linear → sRGB) to the R/G/B channels only, clamped to [0, 1]; alpha passes through untouched. This is the reader half of the writer fix in `@ifc-lite/wasm`.
+
+- [#3855](https://github.com/LTplus-AG/ifc-lite/pull/3855) [`182215a`](https://github.com/LTplus-AG/ifc-lite/commit/182215a835c4beac6a776bcb4eb1d019cab9063e) Thanks [@louistrue](https://github.com/louistrue)! - Corrected the code samples on each package's npm landing page: the README fences are now typechecked against the package's real exports, so the snippets import what they call, declare the values they read, and no longer show removed options or renamed methods. Patch-bumping every package whose README changed so the corrections actually reach npmjs.com.
+
+- [#3507](https://github.com/LTplus-AG/ifc-lite/pull/3507) [`4f5414d`](https://github.com/LTplus-AG/ifc-lite/commit/4f5414d7faf69b2ca8a624edf20f6d6b0b448cac) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `readProperties`/`readQuantities` accepting an out-of-range row index from the cached `entityIndex`/`psetIndex`/`propIndex`/`qsetIndex`/`quantityIndex` tables without validation.
+  
+  Those tables map a key (entity id, pset/qset name index, property/quantity name index) to row indices into the parallel column arrays (`entityId`, `psetName`, `propType`, `value`, ...). The column arrays are fixed-size typed arrays, so an out-of-range row index doesn't throw — `arr[idx]` on a `Uint32Array`/`Float64Array` silently answers `undefined`. A corrupt or hand-crafted cache file whose index table names a row past the column length therefore didn't fail the cache load: `getForEntity` returned a property set (or quantity set) whose set name, property/quantity name and type were all `undefined` — and, for a quantity, whose value was `undefined` too — as if they were real data, and `QuantityTable.sumByType` summed that row into `NaN`, instead of the cache being rejected and the source file re-parsed. `getPropertyValue`/`getQuantityValue` answered `null` for such a row and `findByProperty`/`findByQuantity` skipped it, so those accessors did not surface garbage. `entity-index.ts`'s `typeIndex` bounds check already covered the equivalent condition for the entity index section; this closes the same gap in the property and quantity tables.
+  
+  Reading a cache file corrupted at the property/quantity index tables now throws `Corrupt cache PropertyTable <indexName>: row index N for key K exceeds row count C` (or the `QuantityTable` equivalent) instead of silently returning garbage rows. This is only reachable via a damaged or hand-crafted cache file, never via a normal write-then-read round trip.
+- Updated dependencies [[`bcbe7b9`](https://github.com/LTplus-AG/ifc-lite/commit/bcbe7b9afa38e8dafb5900e73575c71a8fd96012), [`3efe762`](https://github.com/LTplus-AG/ifc-lite/commit/3efe762a993897fc3ddc029a8de1e5914e27df3f), [`5297514`](https://github.com/LTplus-AG/ifc-lite/commit/52975142846390bb1eb12b723d53c0e275289a90), [`1000dce`](https://github.com/LTplus-AG/ifc-lite/commit/1000dce72e9ec75c59848efefc1f709d01172e72), [`499ccf2`](https://github.com/LTplus-AG/ifc-lite/commit/499ccf2f97fe1e24728eb4eb99f895044c36f7b2), [`62bb58f`](https://github.com/LTplus-AG/ifc-lite/commit/62bb58fc8364c27bcf8452ab8edbde26727f527c), [`ea81645`](https://github.com/LTplus-AG/ifc-lite/commit/ea81645f7cd47d9e62718a6687f9e780794c2aa2), [`c6ffda4`](https://github.com/LTplus-AG/ifc-lite/commit/c6ffda4789099a45fafdb5fe237c33c6edd9884c), [`3b266b9`](https://github.com/LTplus-AG/ifc-lite/commit/3b266b99dac5e384c48a410df7074803b01ef20f), [`d2fb0e4`](https://github.com/LTplus-AG/ifc-lite/commit/d2fb0e4121ccd19f326837ea574b189ee2a5f6c8), [`89c4cf2`](https://github.com/LTplus-AG/ifc-lite/commit/89c4cf22e83d76115035f7dcbf6e34f9c06dd091), [`4475e58`](https://github.com/LTplus-AG/ifc-lite/commit/4475e583ea35def444fb6d7ba92410629bd89096), [`182215a`](https://github.com/LTplus-AG/ifc-lite/commit/182215a835c4beac6a776bcb4eb1d019cab9063e), [`f1a006a`](https://github.com/LTplus-AG/ifc-lite/commit/f1a006af952dd670c6486cdb4ef0e8e1e0e280d7), [`fdac473`](https://github.com/LTplus-AG/ifc-lite/commit/fdac4734ce04758d2cd12b365f8b6de624713de6), [`902768e`](https://github.com/LTplus-AG/ifc-lite/commit/902768e138b595b26a47389bcea536f3f9e25b6d), [`a1aebc8`](https://github.com/LTplus-AG/ifc-lite/commit/a1aebc822b819221258f4759edf4c82ff0d140f7), [`f8e03d4`](https://github.com/LTplus-AG/ifc-lite/commit/f8e03d4d5bb620fc9e807d5233091d145a201165), [`a1069f8`](https://github.com/LTplus-AG/ifc-lite/commit/a1069f8f096fcfc5771200a2748466096c3463d5), [`cb9dad2`](https://github.com/LTplus-AG/ifc-lite/commit/cb9dad2df38f1796ab8cb6eefe881ad795876cc9), [`1060a30`](https://github.com/LTplus-AG/ifc-lite/commit/1060a30187c8f6bb327f9e356056f2364568e8ff), [`a2488e8`](https://github.com/LTplus-AG/ifc-lite/commit/a2488e858bc7792cdcc818f7759c0a6e46e7d892), [`8368339`](https://github.com/LTplus-AG/ifc-lite/commit/83683393654d8c1b903f03b5c6e9e5ff111fdaf0), [`2edd144`](https://github.com/LTplus-AG/ifc-lite/commit/2edd14432999ceeed4c0bb0baf6b2000c1c5b041), [`3ccb417`](https://github.com/LTplus-AG/ifc-lite/commit/3ccb4176f3a61a227bcfc302c3e0b1fb43a6f0ec), [`7eaed2a`](https://github.com/LTplus-AG/ifc-lite/commit/7eaed2a98a8cd60bd402c0a9d79940739eabb331), [`a99ecd9`](https://github.com/LTplus-AG/ifc-lite/commit/a99ecd9998dada941dc66e8bcc85ce3864b44065)]:
+  - @ifc-lite/data@4.0.0
+  - @ifc-lite/geometry@4.2.0
+
 ## 3.1.0
 
 ### Minor Changes

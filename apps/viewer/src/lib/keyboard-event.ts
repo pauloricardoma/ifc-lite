@@ -40,18 +40,56 @@ export function eventKey(e: KeyboardEvent): string | null {
 }
 
 /**
- * True when the event targets a text-entry surface (`<input>`, `<textarea>` or
- * a `contenteditable` host), i.e. the user is typing and single-key shortcuts
- * must not fire.
+ * Keys the Walk tool's movement loop owns (see `useKeyboardControls`). While
+ * `activeTool === 'walk'`, global single-key shortcuts must not also fire on
+ * them — A would otherwise "Show all" and D toggle the presentation dock.
+ */
+export const WALK_MOVEMENT_KEYS: ReadonlySet<string> = new Set([
+  'arrowup', 'arrowdown', 'arrowleft', 'arrowright',
+  'w', 's', 'a', 'd',
+]);
+
+/** ARIA roles whose widgets consume plain keys (type-ahead, arrows, values). */
+const INPUT_ROLE_SELECTOR =
+  '[role=combobox],[role=listbox],[role=slider],[role=menu],[role=menuitem],.cm-editor';
+
+/**
+ * True when `target` is a surface that consumes plain key presses — a
+ * text-entry element (`<input>`, `<textarea>`, a `contenteditable` host), a
+ * native `<select>` (type-ahead), or an element inside an ARIA combobox,
+ * listbox, slider or menu — so single-key shortcuts must not fire.
  *
  * Returns `false` for a missing or non-HTML target rather than throwing.
  */
+export function isTextEntryElement(target: unknown): boolean {
+  const el = target as (Partial<HTMLElement> | null | undefined);
+  if (!el) return false;
+  if (
+    el.tagName === 'INPUT' ||
+    el.tagName === 'TEXTAREA' ||
+    el.tagName === 'SELECT' ||
+    el.isContentEditable === true
+  ) {
+    return true;
+  }
+  return typeof el.closest === 'function' && el.closest(INPUT_ROLE_SELECTOR) !== null;
+}
+
+/**
+ * True when `target` edits text itself (`<input>`, `<textarea>`, a native
+ * `<select>`, a `contenteditable` host, a CodeMirror editor), so Ctrl+Z there
+ * is the browser's text undo. An ARIA combobox or menu BUTTON is not one:
+ * after a pick it keeps focus, and Ctrl+Z must still undo the model edit the
+ * pick made (#6232 M2.5).
+ */
+export function isTextEditingElement(target: unknown): boolean {
+  const el = target as (Partial<HTMLElement> | null | undefined);
+  if (!el) return false;
+  if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable === true) return true;
+  return typeof el.closest === 'function' && el.closest('.cm-editor') !== null;
+}
+
+/** {@link isTextEntryElement} for a key event's target. */
 export function isTextEntryTarget(e: Event): boolean {
-  const target = e.target as (Partial<HTMLElement> | null);
-  if (!target) return false;
-  return (
-    target.tagName === 'INPUT' ||
-    target.tagName === 'TEXTAREA' ||
-    target.isContentEditable === true
-  );
+  return isTextEntryElement(e.target);
 }

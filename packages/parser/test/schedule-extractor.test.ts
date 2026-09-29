@@ -177,6 +177,23 @@ describe('extractScheduleOnDemand', () => {
     expect(b?.parentGlobalId).toBe('root-gid');
   });
 
+  it('dedupes when two IfcRelNests entities nest the same task/subtask pair', () => {
+    // Two distinct IFCRELNESTS entities (#20 and #21) both nest root (#10)
+    // over child-a (#11) — reached via two independent relation entities,
+    // not two identical iterations of the same one.
+    const lines = [
+      "#10=IFCTASK('root-gid',$,'Project',$,$,$,$,$,$,.F.,$,$,$);",
+      "#11=IFCTASK('child-a-gid',$,'Foundation',$,$,$,$,$,$,.F.,$,$,.CONSTRUCTION.);",
+      "#20=IFCRELNESTS('rel-gid',$,$,$,#10,(#11));",
+      "#21=IFCRELNESTS('rel-gid-2',$,$,$,#10,(#11));",
+    ];
+    const store = buildStoreFromStep(lines);
+    const result = extractScheduleOnDemand(store);
+    const root = result.tasks.find(t => t.globalId === 'root-gid');
+    // A duplicated relation must not duplicate the edge.
+    expect(root?.childGlobalIds).toEqual(['child-a-gid']);
+  });
+
   it('extracts IfcRelSequence dependencies with lag time', () => {
     const lines = [
       "#10=IFCTASK('pred-gid',$,'Predecessor',$,$,$,$,$,$,.F.,$,$,.CONSTRUCTION.);",
@@ -210,5 +227,193 @@ describe('extractScheduleOnDemand', () => {
     expect(result.workSchedules[0].taskGlobalIds).toEqual(['task-a-gid', 'task-b-gid']);
     const t = result.tasks.find(x => x.globalId === 'task-a-gid');
     expect(t?.controllingScheduleGlobalIds).toEqual(['sched-gid']);
+  });
+
+  it('dedupes when two IfcRelAssignsToControl entities assign the same task to the same schedule', () => {
+    // Two distinct IFCRELASSIGNSTOCONTROL entities (#40 and #41) both assign
+    // task-a (#10) to schedule (#30) — reached via two independent relation
+    // entities, not two identical iterations of the same one. The paired
+    // arrays (schedule.taskGlobalIds / task.controllingScheduleGlobalIds)
+    // must stay in lockstep: both dedupe, or neither would.
+    const lines = [
+      "#10=IFCTASK('task-a-gid',$,'Task A',$,$,$,$,$,$,.F.,$,$,.CONSTRUCTION.);",
+      "#30=IFCWORKSCHEDULE('sched-gid',$,'Main schedule','desc','Planning','S1','2024-01-01T00:00:00',$,'Construction',$,$,'2024-01-01T00:00:00','2024-06-01T00:00:00',.PLANNED.);",
+      "#40=IFCRELASSIGNSTOCONTROL('rel-gid',$,$,$,(#10),$,#30);",
+      "#41=IFCRELASSIGNSTOCONTROL('rel-gid-2',$,$,$,(#10),$,#30);",
+    ];
+    const store = buildStoreFromStep(lines);
+    const result = extractScheduleOnDemand(store);
+    expect(result.workSchedules[0].taskGlobalIds).toEqual(['task-a-gid']);
+    const t = result.tasks.find(x => x.globalId === 'task-a-gid');
+    expect(t?.controllingScheduleGlobalIds).toEqual(['sched-gid']);
+  });
+});
+
+describe('extractScheduleOnDemand — IfcWorkCalendar (#4830)', () => {
+  // IfcWorkCalendar attribute order (IFC4/IFC4X3, IfcControl supertype):
+  // [0] GlobalId [1] OwnerHistory [2] Name [3] Description [4] ObjectType
+  // [5] Identification [6] WorkingTimes [7] ExceptionTimes [8] PredefinedType
+  // IfcWorkTime (IfcSchedulingTime supertype, so no GlobalId):
+  // [0] Name [1] DataOrigin [2] UserDefinedDataOrigin
+  // [3] RecurrencePattern [4] Start [5] Finish
+  // IfcRecurrencePattern:
+  // [0] RecurrenceType [1] DayComponent [2] WeekdayComponent
+  // [3] MonthComponent [4] Position [5] Interval [6] Occurrences [7] TimePeriods
+
+  it('extracts a bare IfcWorkCalendar with a WorkingTime carrying a RecurrencePattern', () => {
+    const lines = [
+      "#60=IFCTIMEPERIOD('07:00:00','16:00:00');",
+      "#61=IFCRECURRENCEPATTERN(.WEEKLY.,$,(1,2,3,4,5),$,$,1,30,(#60));",
+      "#62=IFCWORKTIME('Weekdays',.USERDEFINED.,'hand-entered',#61,'2024-05-01','2024-12-31');",
+      "#63=IFCWORKTIME('Shutdown',$,$,$,'2024-08-01','2024-08-14');",
+      "#64=IFCWORKCALENDAR('cal-gid',$,'Site calendar','Two shifts','ObjType','CAL-1',(#62),(#63),.SECONDSHIFT.);",
+    ];
+    const result = extractScheduleOnDemand(buildStoreFromStep(lines));
+
+    // A calendar-only file still counts as 4D data worth surfacing.
+    expect(result.hasSchedule).toBe(true);
+    expect(result.workCalendars).toHaveLength(1);
+
+    const cal = result.workCalendars![0];
+    expect(cal.expressId).toBe(64);
+    expect(cal.globalId).toBe('cal-gid');
+    expect(cal.name).toBe('Site calendar');
+    expect(cal.description).toBe('Two shifts');
+    expect(cal.objectType).toBe('ObjType');
+    expect(cal.identification).toBe('CAL-1');
+    expect(cal.predefinedType).toBe('SECONDSHIFT');
+
+    expect(cal.workingTimes).toHaveLength(1);
+    const working = cal.workingTimes[0];
+    expect(working.name).toBe('Weekdays');
+    expect(working.dataOrigin).toBe('USERDEFINED');
+    expect(working.userDefinedDataOrigin).toBe('hand-entered');
+    expect(working.start).toBe('2024-05-01');
+    expect(working.finish).toBe('2024-12-31');
+
+    const pattern = working.recurrencePattern!;
+    expect(pattern.recurrenceType).toBe('WEEKLY');
+    expect(pattern.weekdayComponent).toEqual([1, 2, 3, 4, 5]);
+    // `$` aggregates read back as empty arrays, not undefined.
+    expect(pattern.dayComponent).toEqual([]);
+    expect(pattern.monthComponent).toEqual([]);
+    expect(pattern.position).toBeUndefined();
+    expect(pattern.interval).toBe(1);
+    expect(pattern.occurrences).toBe(30);
+    expect(pattern.timePeriods).toEqual([{ start: '07:00:00', end: '16:00:00' }]);
+
+    // The exception time has `$` for RecurrencePattern — absent, not empty.
+    expect(cal.exceptionTimes).toHaveLength(1);
+    expect(cal.exceptionTimes[0].name).toBe('Shutdown');
+    expect(cal.exceptionTimes[0].recurrencePattern).toBeUndefined();
+  });
+
+  it('reads a calendar whose WorkingTimes / ExceptionTimes are both absent', () => {
+    const lines = [
+      "#64=IFCWORKCALENDAR('empty-cal',$,'Empty',$,$,$,$,$,.NOTDEFINED.);",
+    ];
+    const result = extractScheduleOnDemand(buildStoreFromStep(lines));
+    expect(result.workCalendars).toHaveLength(1);
+    expect(result.workCalendars![0].workingTimes).toEqual([]);
+    expect(result.workCalendars![0].exceptionTimes).toEqual([]);
+    expect(result.workCalendars![0].predefinedType).toBe('NOTDEFINED');
+  });
+
+  it('populates both the schedule-control and the calendar field when a task has each', () => {
+    // Two SEPARATE IfcRelAssignsToControl relations on the same task: #40
+    // binds it to the work schedule, #41 to the work calendar. Neither may
+    // clobber the other's field.
+    const lines = [
+      "#10=IFCTASK('task-a-gid',$,'Task A',$,$,$,$,$,$,.F.,$,$,.CONSTRUCTION.);",
+      "#11=IFCTASK('task-b-gid',$,'Task B',$,$,$,$,$,$,.F.,$,$,.CONSTRUCTION.);",
+      "#30=IFCWORKSCHEDULE('sched-gid',$,'Main schedule',$,$,$,'2024-01-01T00:00:00',$,$,$,$,'2024-01-01T00:00:00','2024-06-01T00:00:00',.PLANNED.);",
+      "#64=IFCWORKCALENDAR('cal-gid',$,'Site calendar',$,$,$,$,$,.FIRSTSHIFT.);",
+      "#40=IFCRELASSIGNSTOCONTROL('rel-sched',$,$,$,(#10,#11),$,#30);",
+      "#41=IFCRELASSIGNSTOCONTROL('rel-cal',$,$,$,(#10,#30),$,#64);",
+    ];
+    const result = extractScheduleOnDemand(buildStoreFromStep(lines));
+
+    const taskA = result.tasks.find(t => t.globalId === 'task-a-gid')!;
+    expect(taskA.controllingScheduleGlobalIds).toEqual(['sched-gid']);
+    expect(taskA.calendarGlobalIds).toEqual(['cal-gid']);
+
+    // Task B is under the schedule but was never given a calendar.
+    const taskB = result.tasks.find(t => t.globalId === 'task-b-gid')!;
+    expect(taskB.controllingScheduleGlobalIds).toEqual(['sched-gid']);
+    expect(taskB.calendarGlobalIds ?? []).toEqual([]);
+
+    // The calendar relation also names the schedule itself.
+    const schedule = result.workSchedules[0];
+    expect(schedule.calendarGlobalIds).toEqual(['cal-gid']);
+    // …and the schedule's own task list is untouched by it.
+    expect(schedule.taskGlobalIds).toEqual(['task-a-gid', 'task-b-gid']);
+  });
+
+  it('dedupes a calendar assigned twice through two separate relations', () => {
+    const lines = [
+      "#10=IFCTASK('task-a-gid',$,'Task A',$,$,$,$,$,$,.F.,$,$,.CONSTRUCTION.);",
+      "#64=IFCWORKCALENDAR('cal-gid',$,'Site calendar',$,$,$,$,$,.FIRSTSHIFT.);",
+      "#41=IFCRELASSIGNSTOCONTROL('rel-cal',$,$,$,(#10),$,#64);",
+      "#42=IFCRELASSIGNSTOCONTROL('rel-cal-2',$,$,$,(#10),$,#64);",
+    ];
+    const result = extractScheduleOnDemand(buildStoreFromStep(lines));
+    expect(result.tasks[0].calendarGlobalIds).toEqual(['cal-gid']);
+  });
+
+  it('records two distinct calendars assigned to one task', () => {
+    const lines = [
+      "#10=IFCTASK('task-a-gid',$,'Task A',$,$,$,$,$,$,.F.,$,$,.CONSTRUCTION.);",
+      "#64=IFCWORKCALENDAR('cal-base',$,'Base',$,$,$,$,$,.FIRSTSHIFT.);",
+      "#65=IFCWORKCALENDAR('cal-site',$,'Site exceptions',$,$,$,$,$,.USERDEFINED.);",
+      "#41=IFCRELASSIGNSTOCONTROL('rel-1',$,$,$,(#10),$,#64);",
+      "#42=IFCRELASSIGNSTOCONTROL('rel-2',$,$,$,(#10),$,#65);",
+    ];
+    const result = extractScheduleOnDemand(buildStoreFromStep(lines));
+    expect(result.workCalendars!.map(c => c.globalId)).toEqual(['cal-base', 'cal-site']);
+    expect(result.tasks[0].calendarGlobalIds).toEqual(['cal-base', 'cal-site']);
+  });
+
+  it('gives calendars with missing GlobalIds stable distinct assignment identities', () => {
+    const lines = [
+      "#10=IFCTASK('task-a-gid',$,'Task A',$,$,$,$,$,$,.F.,$,$,.CONSTRUCTION.);",
+      "#64=IFCWORKCALENDAR($,$,'Same name',$,$,$,$,$,.FIRSTSHIFT.);",
+      "#65=IFCWORKCALENDAR($,$,'Same name',$,$,$,$,$,.FIRSTSHIFT.);",
+      "#41=IFCRELASSIGNSTOCONTROL('rel-1',$,$,$,(#10),$,#64);",
+      "#42=IFCRELASSIGNSTOCONTROL('rel-2',$,$,$,(#10),$,#65);",
+    ];
+    const result = extractScheduleOnDemand(buildStoreFromStep(lines));
+    const ids = result.workCalendars!.map(c => c.globalId);
+    expect(new Set(ids).size).toBe(2);
+    expect(result.tasks[0].calendarGlobalIds).toEqual(ids);
+  });
+
+  it('tolerates malformed scalar recurrence aggregates', () => {
+    const lines = [
+      '#61=IFCRECURRENCEPATTERN(.WEEKLY.,1,2,3,$,1,$,$);',
+      "#62=IFCWORKTIME('Malformed',$,$,#61,$,$);",
+      "#64=IFCWORKCALENDAR('cal-gid',$,'Calendar',$,$,$,(#62),$,.FIRSTSHIFT.);",
+    ];
+    const result = extractScheduleOnDemand(buildStoreFromStep(lines));
+    const pattern = result.workCalendars![0].workingTimes[0].recurrencePattern!;
+    expect(pattern.dayComponent).toEqual([]);
+    expect(pattern.weekdayComponent).toEqual([]);
+    expect(pattern.monthComponent).toEqual([]);
+  });
+
+  it('does not decode IFC4 calendar attributes in an IFC2X3 model', () => {
+    const lines = [
+      "#64=IFCWORKCALENDAR('cal-gid',$,'Wrong layout',$,$,$,$,$,.FIRSTSHIFT.);",
+    ];
+    const result = extractScheduleOnDemand(buildStoreFromStep(lines, { schemaVersion: 'IFC2X3' }));
+    expect(result.workCalendars).toEqual([]);
+  });
+
+  it('reports an empty workCalendars array for a schedule with no calendars', () => {
+    const lines = [
+      "#10=IFCTASK('task-a-gid',$,'Task A',$,$,$,$,$,$,.F.,$,$,.CONSTRUCTION.);",
+    ];
+    const result = extractScheduleOnDemand(buildStoreFromStep(lines));
+    expect(result.workCalendars).toEqual([]);
+    expect(result.tasks[0].calendarGlobalIds ?? []).toEqual([]);
   });
 });

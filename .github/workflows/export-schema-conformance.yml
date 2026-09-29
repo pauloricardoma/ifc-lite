@@ -1,0 +1,233 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+# Schema-conformance check for the STEP/IFC export writer, against
+# IfcOpenShell (#4043).
+#
+# THE GAP THIS CLOSES. Every fidelity test for `packages/export`'s STEP/IFC
+# writer is `parse(write(x))` through ifc-lite's own `@ifc-lite/parser` — the
+# writer and reader agreeing with each other, not with the format. The
+# `IfcOpenShell parity` workflow (ifcopenshell-parity.yml) is this repo's
+# real external anchor, but its `paths:`/internal filter covers
+# `rust/geometry|processing|core|python` and the parity tooling itself —
+# `packages/**` and `rust/export/**` are outside it — and it compares only
+# bbox/volume/dropped-element counts, never STEP/EXPRESS schema conformance
+# (mandatory attributes, WHERE/uniqueness rules, inverse relationships).
+# `packages/export/src/step-exporter.test.ts` records that gap being hit
+# once by hand as regression #1839, caught by a manual `ifcopenshell.validate`
+# run that was never wired into CI.
+#
+# WHY A SEPARATE JOB, NOT AN EXTENSION OF `ifcopenshell-parity.yml`'s
+# `quick` lane. That lane is a REQUIRED check specifically because it is
+# cheap and always reports (no reference-engine install, Rust-wheel-only,
+# gated on 4 fixed geometry fixtures). Measured on this branch,
+# `packages/export/**` changed in 22 of the last 300 upstream commits and
+# `rust/export/**` in 14 — folding this into that lane's trigger would
+# roughly double how often the REQUIRED parity check does real work, and
+# would add a Python + ifcopenshell install (a native-extension wheel, not a
+# small pure-Python package) to a lane whose whole design point is staying
+# light. This is a NEW, non-required, narrowly-path-filtered job instead —
+# same tooling directory, same requirements.lock, independent trigger — so a
+# writer-schema regression is caught without slowing or risking every other
+# PR's required check.
+#
+# WHAT IT DOES. Re-exports two real third-party fixtures (ara3d/duplex.ifc,
+# ara3d/IfcOpenHouse_IFC4.ifc) through `StepExporter`, plus an IFC4X3 set
+# (IFC4 fixtures converted to IFC4X3, IFC4X3_ADD2 fixtures round-tripped, and
+# `IfcCreator` IFC4X3 output; #5351), and runs
+# `tools/ifcopenshell_reference/validate_export.py` — `ifcopenshell.validate`
+# with `express_rules=True` — against both the re-exports and the ORIGINAL
+# fixtures (a control: a non-conformant input must not read as a writer
+# defect). See that script's own header for its vacuous-pass refusals, and
+# `test_validate_export.py` for the fault-injection proof it actually has
+# teeth.
+
+name: Export schema conformance
+
+on:
+  pull_request:
+    paths:
+      - "packages/export/**"
+      - "packages/parser/**"
+      # The rest of the workspace closure of the ONE file this job runs,
+      # src/ifcopenshell-schema-conformance.test.ts — measured, not the full
+      # alias list in packages/export/vitest.config.ts (which also carries
+      # codegen and geometry for the rest of the export suite, neither
+      # reachable from this test). Without these the lane cannot see the
+      # change that breaks it: `@ifc-lite/regex-guard` was added under
+      # `mutations`, and the resulting resolve failure surfaced only on the
+      # weekly cron, on a non-required check, detached from its own PR.
+      - "packages/data/**"
+      - "packages/encoding/**"
+      - "packages/ifcx/**"
+      - "packages/mutations/**"
+      - "packages/pointcloud/**"
+      - "packages/regex-guard/**"
+      # The LandXML→IFC4X3 converter writes STEP of its own (#4937); the step
+      # below grades it with the same validator plus the alignment checker, and
+      # grades IfcCreator's own IFC4X3 output (#5351).
+      - "packages/create/**"
+      # The rest of create's build closure (`turbo --filter='@ifc-lite/create^...'`,
+      # measured with --dry-run) — the step below builds these, so a change to
+      # any of them can break this job and must be able to trigger it.
+      - "packages/codegen/**"
+      - "packages/geometry/**"
+      - "packages/timing-ladder/**"
+      - "packages/wasm/**"
+      - "packages/wasm-lifecycle/**"
+      - "tools/ifcopenshell_reference/check_alignment.py"
+      - "tools/ifcopenshell_reference/check_vertical.py"
+      - "tools/ifcopenshell_reference/check_referents.py"
+      - "tools/ifcopenshell_reference/alignment_fixture.json"
+      - "tools/ifcopenshell_reference/make_alignment_fixture.py"
+      - "tools/ifcopenshell_reference/probe_cant_mapping.py"
+      # #5942: draped terrain imagery in the LandXML export. The texture is
+      # written by the Rust appearance planner through the wasm, and the export
+      # glue lives in the viewer, so the job below builds both.
+      - "tools/ifcopenshell_reference/check_terrain_texture.py"
+      - "rust/processing/src/appearance/**"
+      - "rust/geometry/src/router/textured.rs"
+      - "rust/geometry/src/router/processing.rs"
+      - "apps/viewer/src/lib/export/landXmlIfc*"
+      - "apps/viewer/src/lib/terrain-imagery/**"
+      - "tools/ifcopenshell_reference/validate_export.py"
+      - "tools/ifcopenshell_reference/test_validate_export.py"
+      - "tools/ifcopenshell_reference/requirements.lock"
+      - "tests/models/manifest.json"
+      - ".github/workflows/export-schema-conformance.yml"
+  schedule:
+    # Weekly, off the top of the hour — catches a pinned-engine or fixture
+    # drift even on a quiet week with no export/parser PRs.
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: StepExporter output vs ifcopenshell.validate(express_rules=True)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ifcopenshell + pytest (express_rules needs pytest's assertion rewriter)
+        run: pip install -r tools/ifcopenshell_reference/requirements.lock
+
+      - name: validate_export.py self-test (vacuity refusals + fault injection)
+        working-directory: tools/ifcopenshell_reference
+        run: python -m unittest test_validate_export -v
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      # The IFC4 pair, then the IFC4X3 set (#5351): two IFC4 fixtures the
+      # test converts to IFC4X3 and two IFC4X3_ADD2 fixtures it round-trips.
+      # Hello_Wall carries a `$` FILE_NAME author/organization (#5470).
+      - name: Fetch the fixtures this check needs
+        run: >-
+          node scripts/fixtures/fetch-fixtures.mjs
+          tests/models/ara3d/duplex.ifc
+          tests/models/ara3d/IfcOpenHouse_IFC4.ifc
+          tests/models/buildingsmart/Building-Architecture.ifc
+          tests/models/buildingsmart/tessellated-item.ifc
+          tests/models/ifc5/Georeferencing_georeferenced-bridge-deck.ifc
+          tests/models/buildingsmart/annex_e/basic-geometric-shape/triangulated-item.ifc
+          tests/models/ifc5/Hello_Wall_hello-wall.ifc
+
+      - name: Re-export the fixtures and validate against IfcOpenShell
+        run: pnpm --filter @ifc-lite/export exec vitest run src/ifcopenshell-schema-conformance.test.ts
+
+      # The LandXML→IFC4X3 converter's output. ifc-lite's own parser cannot
+      # evaluate an IFC4X3 IfcAlignment, so IfcOpenShell is the only thing in CI
+      # that can say whether a written alignment lands on its authored points.
+      # `@ifc-lite/create` resolves its workspace dependencies from `dist/`
+      # (unlike `@ifc-lite/export`, whose vitest config aliases them to
+      # `src/`). This job installs with --ignore-scripts and builds nothing,
+      # so build exactly create's declared dependency closure — ~20 s — rather
+      # than alias a subset to src and risk two instances of one package.
+      - name: Build @ifc-lite/create's workspace dependencies
+        run: pnpm exec turbo run build --filter='@ifc-lite/create^...'
+
+      - name: Grade LandXML→IFC4X3 output (schema + alignment geometry) with IfcOpenShell
+        run: pnpm --filter @ifc-lite/create exec vitest run src/landxml/ifcopenshell-conformance.test.ts
+
+      - name: Grade IfcCreator IFC4X3 output with IfcOpenShell
+        run: pnpm --filter @ifc-lite/create exec vitest run src/ifcopenshell-ifc4x3-conformance.test.ts
+
+  terrain-imagery:
+    # #5942 (mapping spec §15.5): a draped terrain exported as .ifcZIP must
+    # reopen in IfcOpenShell with its texture resolved on the TIN faces, the
+    # marked pixel landing on the marked vertex. The texture is written by the
+    # appearance planner (Rust, through the wasm), so unlike the job above this
+    # one builds the wasm from source: a prebuilt bundle would grade the
+    # planner of the last release, not of this change.
+    name: LandXML terrain imagery .ifcZIP vs IfcOpenShell
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ifcopenshell + pytest
+        run: pip install -r tools/ifcopenshell_reference/requirements.lock
+
+      - name: Setup WASM build toolchain
+        uses: ./.github/actions/setup-wasm-build
+        with:
+          cache-prefix: export-conformance
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      # The viewer's workspace closure, the wasm included (its build script
+      # runs scripts/build-wasm.sh, which needs the toolchain above).
+      - name: Build the viewer's workspace dependencies
+        run: pnpm exec turbo run build --filter='@ifc-lite/viewer^...'
+
+      - name: Export a draped terrain and grade the .ifcZIP with IfcOpenShell
+        working-directory: apps/viewer
+        env:
+          IFCOPENSHELL_PYTHON: python
+          # Here a missing wasm or ifcopenshell is a broken lane, not a skip.
+          REQUIRE_TERRAIN_IMAGERY_CHECK: "1"
+        run: >-
+          pnpm exec tsx --import ./src/test/vite-module-hooks.mjs --test
+          src/lib/export/landXmlIfcImagery.test.ts
+
+  report-scheduled-failure:
+    needs: [validate, terrain-imagery]
+    if: always() && github.event_name == 'schedule' && (needs.validate.result != 'success' || needs.terrain-imagery.result != 'success')
+    uses: ./.github/workflows/report-scheduled-failure.yml
+    with:
+      workflow_name: Export schema conformance
+      jobs: validate, terrain-imagery
+      result: validate=${{ needs.validate.result }}, terrain-imagery=${{ needs.terrain-imagery.result }}
+    permissions:
+      contents: read
+      issues: write

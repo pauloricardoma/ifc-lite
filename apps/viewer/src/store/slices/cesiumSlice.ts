@@ -24,7 +24,7 @@ import {
   type CustomBasemap,
 } from '@/lib/geo/custom-basemap';
 
-export type CesiumDataSource = 'google-photorealistic' | 'osm-buildings' | 'osm-map' | 'custom';
+export type CesiumDataSource = 'google-photorealistic' | 'osm-buildings' | 'osm-map' | 'custom' | 'custom-3dtiles';
 
 export interface CesiumPlacementDraft {
   eastings: number;
@@ -46,6 +46,12 @@ export interface CesiumSlice {
    * the picker says so rather than rendering an empty globe.
    */
   cesiumCustomBasemap: CustomBasemap | null;
+  /**
+   * User-supplied 3D Tiles tileset URL for the `'custom-3dtiles'` data
+   * source (#3607) — e.g. Dutch 3D BAG/PDOK data. Same per-browser storage
+   * reasoning as `cesiumCustomBasemap`. `null` when none is configured.
+   */
+  cesiumCustomTilesetUrl: string | null;
   /** Resolved Cesium ion access token (user override or build-time default). */
   cesiumIonToken: string;
   /** Terrain enabled (Cesium World Terrain). */
@@ -111,6 +117,8 @@ export interface CesiumSlice {
   setCesiumDataSource: (source: CesiumDataSource) => void;
   /** Save (or clear, with `null`) the custom XYZ basemap. Persists per browser. */
   setCesiumCustomBasemap: (basemap: CustomBasemap | null) => void;
+  /** Save (or clear, with `null`) the custom 3D Tiles URL. Persists per browser. */
+  setCesiumCustomTilesetUrl: (url: string | null) => void;
   setCesiumIonToken: (token: string) => void;
   setCesiumTerrainEnabled: (enabled: boolean) => void;
   setCesiumTerrainHeight: (height: number | null) => void;
@@ -148,6 +156,8 @@ const STORAGE_KEY_DATA_SOURCE = 'ifc-lite:cesium-data-source';
  * into a project document later is an addition, not a migration.
  */
 const STORAGE_KEY_CUSTOM_BASEMAP = 'ifc-lite:cesium-custom-basemap';
+/** Same per-browser reasoning as {@link STORAGE_KEY_CUSTOM_BASEMAP} (#3607). */
+const STORAGE_KEY_CUSTOM_TILESET_URL = 'ifc-lite:cesium-custom-tileset-url';
 
 /**
  * Default Cesium ion token provided at build time.
@@ -192,13 +202,18 @@ function loadCustomBasemap(): CustomBasemap | null {
   return decodeCustomBasemap(loadFromStorage(STORAGE_KEY_CUSTOM_BASEMAP, ''));
 }
 
+function loadCustomTilesetUrl(): string | null {
+  return loadFromStorage(STORAGE_KEY_CUSTOM_TILESET_URL, '') || null;
+}
+
 function loadDataSource(): CesiumDataSource {
   const stored = loadFromStorage(STORAGE_KEY_DATA_SOURCE, FALLBACK_DATA_SOURCE);
   if (stored === 'osm-buildings' || stored === 'osm-map') return stored;
-  // 'custom' only survives a reload while a valid basemap is still stored;
-  // otherwise the overlay would come up on a source with nothing behind it and
-  // render an empty globe.
+  // 'custom'/'custom-3dtiles' only survive a reload while their stored value
+  // is still present; otherwise the overlay would come up on a source with
+  // nothing behind it and render an empty globe.
   if (stored === 'custom' && loadCustomBasemap()) return 'custom';
+  if (stored === 'custom-3dtiles' && loadCustomTilesetUrl()) return 'custom-3dtiles';
   return FALLBACK_DATA_SOURCE;
 }
 
@@ -209,13 +224,13 @@ function resolveIonToken(): string {
 }
 
 /**
- * Cross-slice surface CesiumSlice writes into. `editEnabled` lives on
- * UISlice — turning on the placement editor implies global edit mode,
- * so the slice writes it directly here to keep the toolbar pill in
- * sync atomically.
+ * Cross-slice surface CesiumSlice reaches into. Turning on the placement
+ * editor implies global edit mode, which is the Model workspace (#6232):
+ * it goes through UISlice's `setEditEnabled`, never a bare flag write.
  */
 export interface CesiumCrossSliceState {
   editEnabled: boolean;
+  setEditEnabled?: (enabled: boolean) => void;
 }
 
 export const createCesiumSlice: StateCreator<CesiumSlice & CesiumCrossSliceState, [], [], CesiumSlice> = (set, get) => ({
@@ -223,6 +238,7 @@ export const createCesiumSlice: StateCreator<CesiumSlice & CesiumCrossSliceState
   cesiumEnabled: false,
   cesiumDataSource: loadDataSource(),
   cesiumCustomBasemap: loadCustomBasemap(),
+  cesiumCustomTilesetUrl: loadCustomTilesetUrl(),
   cesiumIonToken: resolveIonToken(),
   cesiumTerrainEnabled: true,
   cesiumTerrainHeight: null,
@@ -286,6 +302,19 @@ export const createCesiumSlice: StateCreator<CesiumSlice & CesiumCrossSliceState
     if (get().cesiumDataSource === 'custom') get().setCesiumDataSource(FALLBACK_DATA_SOURCE);
     set({ cesiumCustomBasemap: null });
   },
+  setCesiumCustomTilesetUrl: (url) => {
+    if (url) {
+      saveToStorage(STORAGE_KEY_CUSTOM_TILESET_URL, url);
+      set({ cesiumCustomTilesetUrl: url });
+      return;
+    }
+    removeFromStorage(STORAGE_KEY_CUSTOM_TILESET_URL);
+    // Same delegation as `setCesiumCustomBasemap`: leave the `'custom-3dtiles'`
+    // source when its URL is cleared, or the picker stays on a source with
+    // nothing to load.
+    if (get().cesiumDataSource === 'custom-3dtiles') get().setCesiumDataSource(FALLBACK_DATA_SOURCE);
+    set({ cesiumCustomTilesetUrl: null });
+  },
   setCesiumIonToken: (token) => {
     clearTerrainElevationCache();
     saveToStorage(STORAGE_KEY_ION_TOKEN, token);
@@ -322,31 +351,23 @@ export const createCesiumSlice: StateCreator<CesiumSlice & CesiumCrossSliceState
   toggleShowModelBasepoints: () => set((s) => ({ showModelBasepoints: !s.showModelBasepoints })),
   setCesiumTerrainClipY: (y) => set({ cesiumTerrainClipY: y }),
   setCesiumGlbLoaded: (loaded) => set({ cesiumGlbLoaded: loaded }),
-  setCesiumPlacementEditMode: (enabled) => set(
-    // Turning the placement editor on implies global edit mode — keeps
-    // the toolbar pill in sync so the user can't end up "moving the
-    // georef" while the rest of the UI claims it's read-only. Turning
-    // it off does *not* exit global edit; other sub-tools (properties,
-    // geometry) may still be in use — but we DO clear the placement
-    // draft so callers exiting via the setter don't leave stale draft
-    // state behind (matches the toggle's disable branch).
-    enabled
-      ? { cesiumPlacementEditMode: true, editEnabled: true }
-      : {
-          cesiumPlacementEditMode: false,
-          cesiumPlacementDraftModelId: null,
-          cesiumPlacementDraft: null,
-        },
-  ),
-  toggleCesiumPlacementEditMode: () => set((s) => (
-    s.cesiumPlacementEditMode
-      ? {
-          cesiumPlacementEditMode: false,
-          cesiumPlacementDraftModelId: null,
-          cesiumPlacementDraft: null,
-        }
-      : { cesiumPlacementEditMode: true, editEnabled: true }
-  )),
+  setCesiumPlacementEditMode: (enabled) => {
+    // Turning the placement editor on implies global edit mode — the user
+    // can't end up "moving the georef" while the rest of the UI claims it's
+    // read-only; if edit mode is refused (collab role, no editable model),
+    // the editor stays off. Turning it off does *not* exit global edit;
+    // other sub-tools may still be in use — but the placement draft is
+    // cleared so callers exiting via the setter leave no stale draft.
+    if (!enabled) {
+      set({ cesiumPlacementEditMode: false, cesiumPlacementDraftModelId: null, cesiumPlacementDraft: null });
+      return;
+    }
+    const s = get();
+    if (!s.editEnabled && s.setEditEnabled) s.setEditEnabled(true);
+    else if (!s.editEnabled) set({ editEnabled: true });
+    if (get().editEnabled) set({ cesiumPlacementEditMode: true });
+  },
+  toggleCesiumPlacementEditMode: () => get().setCesiumPlacementEditMode(!get().cesiumPlacementEditMode),
   beginCesiumPlacementDraft: (modelId, conversion) => set({
     cesiumPlacementDraftModelId: modelId,
     cesiumPlacementDraft: {

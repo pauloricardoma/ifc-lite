@@ -36,7 +36,9 @@ import {
   metaMap,
 } from '../doc/schema.js';
 import { inflateStructuredAttributes } from './structured-attrs.js';
-import { clearOverlayTombstones, readOverlayTombstones, resolveTombstoneOpinion, resurrectionBlocked, writeOverlayTombstones } from './overlay-tombstones.js';
+import type { ModelSlotRef } from '../doc/model-slot.js';
+import { clearOverlayTombstones, readOverlayTombstones, resurrectionBlocked, writeOverlayTombstone } from './overlay-tombstones.js';
+import { qualifyNode, writeIfcxFileMeta } from './slot-ifcx.js';
 import { setClassifications, setMaterials, readIfcClass } from './overlay-entity-attrs.js';
 
 export interface SeedOptions {
@@ -44,6 +46,14 @@ export interface SeedOptions {
   origin?: unknown;
   /** If true, clear any existing top-level state before seeding. */
   reset?: boolean;
+  /**
+   * The model slot the file's nodes belong to (#4444). Every node path, and
+   * every `children` / `inherits` reference, is qualified with the slot's
+   * prefix, and the file's header / imports / schemas are recorded for that
+   * slot (see slot-ifcx.ts). Omitted: the implicit legacy slot (paths and
+   * room-wide metadata untouched).
+   */
+  slot?: ModelSlotRef;
 }
 
 export type IfcxInput = ArrayBuffer | Uint8Array | string | IfcxFile;
@@ -84,16 +94,15 @@ export function seedFromIfcx(doc: Y.Doc, input: IfcxInput, opts: SeedOptions = {
       // Overlay tombstones describe deletions in the discarded entity
       // universe; retaining them would block a same-path entity in this
       // freshly seeded snapshot.
-      clearOverlayTombstones(meta);
+      clearOverlayTombstones(doc);
     }
 
-    // Stash file-level metadata so we can re-emit it during snapshotting.
-    if (file.header) meta.set('header', file.header);
-    if (file.imports) meta.set('imports', file.imports);
-    if (file.schemas) meta.set('schemas', file.schemas);
+    // Stash file-level metadata so we can re-emit it during snapshotting —
+    // per slot, so a second IFC5 model does not overwrite the first's.
+    writeIfcxFileMeta(meta, opts.slot, file);
 
     for (const node of file.data ?? []) {
-      const decoded = decodeNode(node, false);
+      const decoded = decodeNode(opts.slot ? qualifyNode(opts.slot, node) : node, false);
       if (!decoded) continue;
       restoreGeometryCarriers(doc, decoded, createGeometry);
       createNodeEntity(doc, decoded);
@@ -286,7 +295,7 @@ export function applyIfcxOverlay(
     if (file.imports) meta.set('imports', file.imports);
     if (file.schemas) meta.set('schemas', file.schemas);
 
-    const tombstonesFromEarlierCalls = readOverlayTombstones(meta);
+    const tombstonesFromEarlierCalls = readOverlayTombstones(doc);
 
     // Composition resolves `ifclite::deleted` after every node in the
     // layer has been applied — the strongest (last) opinion wins — so a
@@ -308,9 +317,11 @@ export function applyIfcxOverlay(
     }
     for (const [path, deleted] of tombstoned) {
       if (deleted) deleteEntity(doc, path);
-      resolveTombstoneOpinion(tombstonesFromEarlierCalls, path, deleted);
+      // Per-path write: two concurrent calls tombstoning different paths
+      // now touch different registry keys and both survive the merge
+      // (see overlay-tombstones.ts module doc).
+      writeOverlayTombstone(doc, path, deleted);
     }
-    writeOverlayTombstones(meta, tombstonesFromEarlierCalls);
   }, opts.origin ?? SEED_ORIGIN);
 
   return file;

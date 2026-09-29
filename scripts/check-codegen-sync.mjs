@@ -33,14 +33,27 @@
  *
  *   1. `packages/codegen/generated/ifc4`    <- IFC4_ADD2_TC1.exp
  *   2. `packages/codegen/generated/ifc4x3`  <- IFC4X3.exp
- *   3. `packages/parser/src/generated`      <- IFC4_ADD2_TC1.exp (the same
+ *   3. `packages/codegen/generated/ifc2x3`  <- IFC2X3_TC1.exp (#4202)
+ *   4. `packages/parser/src/generated`      <- IFC4_ADD2_TC1.exp (the same
  *      generation as (1); parser's copy is compared against it a second
  *      time because it is maintained as a separate committed artifact, not
  *      a symlink — see INTEGRATION.md "Copy Generated Files to Parser")
- *   4. `packages/data/src/ifc-schema/generated` <- `packages/data/scripts/
+ *   5. `packages/parser/src/generated/ifc4x3` and `.../ifc2x3` (#4202) <-
+ *      the same (2) and (3) generations, compared one file at a time
+ *      (`schema-registry.ts` only — the runtime metadata a per-schemaVersion
+ *      lookup needs) rather than the whole directory: these two mirrors
+ *      deliberately do NOT carry entities.ts/types.ts/enums.ts/selects.ts,
+ *      since three copies of those compile-time interfaces under one flat
+ *      `packages/parser/src/generated` would redeclare the same TypeScript
+ *      type names for every class shared across schemas
+ *   6. `packages/data/src/ifc-schema/generated` <- `packages/data/scripts/
  *      upstream/SchemaInfo.*.g.cs`, via `generate-ifc-schema.ts` then
  *      `emit-entity-names.ts` (the second script reads the first's output,
  *      so both run against the same temp tree in sequence)
+ *   7. `rust/core/src/generated/{schema,type_ids}.rs` <- IFC4X3 plus the
+ *      production IFC4 and IFC2X3 supplements (#4203/#5054). These two files
+ *      sit beside, rather than inside, the crate-private registries in (1),
+ *      so they need their own comparison.
  *
  * (1)-(3) need `packages/codegen`'s `dist/cli.js` built (plain `tsc`, no
  * runtime dependency on `@ifc-lite/data` — the package imports it only
@@ -104,6 +117,7 @@ import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { checkCanonicalRustCodegen } from './lib/check-canonical-rust-codegen.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
@@ -164,16 +178,40 @@ export function buildCodegen(root) {
 }
 
 /** Run the built codegen CLI against `schemaPath`, writing into `outDir`. */
-export function runCodegenCli(root, schemaPath, outDir) {
+export function runCodegenCli(root, schemaPath, outDir, rustDir, options = {}) {
   const cliPath = join(root, 'packages/codegen/dist/cli.js');
   if (!existsSync(cliPath)) {
     throw new Error(`packages/codegen/dist/cli.js not found after build — cannot regenerate ${schemaPath}`);
   }
-  execFileSync(process.execPath, [cliPath, schemaPath, '-o', outDir], {
+  const args = [cliPath, schemaPath, '-o', outDir];
+  if (rustDir) {
+    args.push('--rust', '--rust-dir', rustDir);
+    if (options.cratePrivate) args.push('--rust-crate-private');
+    if (options.supplementalSchemas?.length) {
+      args.push('--rust-supplemental-schema', ...options.supplementalSchemas);
+    }
+  }
+  execFileSync(process.execPath, args, {
     cwd: root,
     stdio: 'pipe',
     encoding: 'utf8',
   });
+  if (rustDir && !options.cratePrivate) {
+    // Canonical core artifacts are committed after rustfmt. Apply that same
+    // deterministic final generation step before byte comparison; comparing
+    // pre-format text would report formatting noise, while normalising either
+    // side would let a hand edit through (#5054).
+    const generatedFiles = ['schema.rs', 'type_ids.rs']
+      .map((file) => join(rustDir, file))
+      .filter(existsSync);
+    if (generatedFiles.length > 0) {
+      execFileSync('rustfmt', ['+stable', ...generatedFiles], {
+        cwd: root,
+        stdio: 'pipe',
+        encoding: 'utf8',
+      });
+    }
+  }
 }
 
 /**
@@ -219,8 +257,29 @@ export function runAllTargets(root) {
 
     const ifc4Out = join(tmp, 'ifc4');
     const ifc4x3Out = join(tmp, 'ifc4x3');
+    const ifc2x3Out = join(tmp, 'ifc2x3');
     runCodegenCli(root, join(root, 'packages/codegen/schemas/IFC4_ADD2_TC1.exp'), ifc4Out);
     runCodegenCli(root, join(root, 'packages/codegen/schemas/IFC4X3.exp'), ifc4x3Out);
+    runCodegenCli(root, join(root, 'packages/codegen/schemas/IFC2X3_TC1.exp'), ifc2x3Out);
+
+    const rustRegistryOut = join(tmp, 'rust-schema-registry');
+    const rustSchemaInputs = [
+      ['IFC2X3_TC1.exp', 'ifc2x3'],
+      ['IFC4_ADD2_TC1.exp', 'ifc4'],
+      ['IFC4X1.exp', 'ifc4x1'],
+      ['IFC4X2.exp', 'ifc4x2'],
+    ];
+    for (const [schemaFile, registry] of rustSchemaInputs) {
+      const out = join(tmp, `rust-${registry}`);
+      const rustOut = join(rustRegistryOut, registry);
+      runCodegenCli(root, join(root, 'packages/codegen/schemas', schemaFile), out, rustOut, { cratePrivate: true });
+      results.push({
+        name: `rust/core/src/generated/${registry} (generated from ${schemaFile})`,
+        ...diffDirs(rustOut, join(root, 'rust/core/src/generated', registry)),
+      });
+    }
+
+    results.push(...checkCanonicalRustCodegen({ root, tmp, runCodegenCli }));
 
     results.push({
       name: 'packages/codegen/generated/ifc4',
@@ -231,9 +290,54 @@ export function runAllTargets(root) {
       ...diffDirs(ifc4x3Out, join(root, 'packages/codegen/generated/ifc4x3')),
     });
     results.push({
-      name: 'packages/parser/src/generated (mirrors codegen ifc4)',
-      ...diffDirs(ifc4Out, join(root, 'packages/parser/src/generated')),
+      name: 'packages/codegen/generated/ifc2x3',
+      ...diffDirs(ifc2x3Out, join(root, 'packages/codegen/generated/ifc2x3')),
     });
+    // packages/parser/src/generated is no longer JUST the flat IFC4 mirror
+    // (#4202 added ifc4x3/ and ifc2x3/ subdirectories plus a hand-written
+    // schema-registry-by-version.ts + its test) — diffDirs's whole-directory
+    // recursive comparison would report every one of those as a spurious
+    // "extra" file the IFC4 generation doesn't produce. Compare only the
+    // flat top-level files ifc4Out itself contains (the historical mirror
+    // set); the subdirectories get their own targeted comparisons below and
+    // the hand-written files are not generated output at all.
+    const ifc4MirrorFiles = listFilesRecursive(ifc4Out);
+    const ifc4MirrorSubset = join(tmp, 'parser-mirror-subset-ifc4');
+    mkdirSync(ifc4MirrorSubset, { recursive: true });
+    const parserGeneratedDir = join(root, 'packages/parser/src/generated');
+    for (const f of ifc4MirrorFiles) {
+      const committedPath = join(parserGeneratedDir, f);
+      if (existsSync(committedPath)) {
+        writeFileSync(join(ifc4MirrorSubset, f), readFileSync(committedPath));
+      }
+    }
+    results.push({
+      name: 'packages/parser/src/generated (mirrors codegen ifc4)',
+      ...diffDirs(ifc4Out, ifc4MirrorSubset),
+    });
+
+    // The IFC4X3 and IFC2X3 mirrors under packages/parser/src/generated
+    // carry only schema-registry.ts (#4202) — the runtime metadata a
+    // per-schemaVersion lookup needs — not the full entities.ts/types.ts/
+    // enums.ts/selects.ts compile-time interface set the IFC4 mirror above
+    // carries, since three copies of those under one flat directory would
+    // redeclare the same TypeScript type names for classes shared across
+    // schemas. So each gets its own single-file subset comparison rather
+    // than reusing diffDirs's whole-directory comparison against ifc4x3Out
+    // / ifc2x3Out, which would report every OTHER generated file as
+    // spuriously "missing".
+    for (const [schemaOut, mirrorDir] of [
+      [ifc4x3Out, 'ifc4x3'],
+      [ifc2x3Out, 'ifc2x3'],
+    ]) {
+      const subset = join(tmp, `parser-mirror-subset-${mirrorDir}`);
+      mkdirSync(subset, { recursive: true });
+      writeFileSync(join(subset, 'schema-registry.ts'), readFileSync(join(schemaOut, 'schema-registry.ts')));
+      results.push({
+        name: `packages/parser/src/generated/${mirrorDir} (mirrors codegen ${mirrorDir} schema-registry.ts only)`,
+        ...diffDirs(subset, join(root, 'packages/parser/src/generated', mirrorDir)),
+      });
+    }
 
     const dataOut = runDataGenerator(root, join(tmp, 'data'));
     results.push({
@@ -279,7 +383,10 @@ if (isMain) {
         '   pnpm --filter @ifc-lite/codegen... build\n' +
         '   pnpm --filter @ifc-lite/codegen run generate:ifc4\n' +
         '   pnpm --filter @ifc-lite/codegen run generate:ifc4x3\n' +
+        '   pnpm --filter @ifc-lite/codegen run generate:ifc2x3\n' +
         '   (copy packages/codegen/generated/ifc4/* over packages/parser/src/generated/*)\n' +
+        '   (copy packages/codegen/generated/ifc4x3/schema-registry.ts over packages/parser/src/generated/ifc4x3/schema-registry.ts)\n' +
+        '   (copy packages/codegen/generated/ifc2x3/schema-registry.ts over packages/parser/src/generated/ifc2x3/schema-registry.ts)\n' +
         '   pnpm --filter @ifc-lite/data run generate:ifc-schema\n',
     );
     process.exit(1);

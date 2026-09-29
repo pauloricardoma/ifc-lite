@@ -5,7 +5,6 @@
 /**
  * Shared types for the viewer store
  */
-
 // ============================================================================
 // Measurement Types
 // ============================================================================
@@ -207,10 +206,8 @@ export interface EdgeLockState {
 // ============================================================================
 // Section Plane Types
 // ============================================================================
-
 /** Semantic axis names: down (Y), front (Z), side (X) for intuitive user experience */
 export type SectionPlaneAxis = 'down' | 'front' | 'side';
-
 // Re-export the renderer's canonical cap-styling types so the viewer store and
 // the WebGPU renderer share a single source of truth. Adding a new hatch
 // pattern only requires editing `packages/renderer/src/section-cap-style.ts`.
@@ -220,12 +217,15 @@ import type { SectionCapStyle } from '@ifc-lite/renderer';
 // at the renderer's `Camera`, so the store shares the renderer's own type.
 export type { InteractionMode as ControlsMode } from '@ifc-lite/renderer';
 import type { InteractionMode as ControlsMode } from '@ifc-lite/renderer';
-
+import type { LandXmlSchema, LandXmlTinDocument } from '../hooks/ingest/landXmlSemantics.js';
 /**
  * Custom (face-picked) plane override. When present, the renderer uses
- * `normal` + `distance` directly and ignores `axis` / `position`. The
- * cardinal `axis` / `position` / `flipped` fields are still kept in sync
- * (nearest-cardinal for axis, percentage along it for position) so any
+ * `normal` + `distance` directly and ignores `axis` / `position`, and
+ * `SectionPlane.flipped` is relative to `normal`, not to the cardinal axis
+ * (#5644): the shader's `side` multiplies `dot(p, normal) - distance`. The
+ * cardinal `axis` / `position` fields are still kept in sync
+ * (nearest-cardinal for axis, percentage along it for position; read the
+ * matching flip through `cardinalSectionFlipped`) so any
  * downstream reader that pre-dates custom planes (drawings export, BCF
  * snapshots, view controls) still gets a sensible projection rather than
  * crashing or emitting empty data.
@@ -248,13 +248,21 @@ export interface CustomSectionPlane {
   bitangent: [number, number, number];
 }
 
+/** An axis-aligned world-space section box (#5513): the renderer's `ClipBox` without its flag. */
+export interface SectionBox {
+  min: [number, number, number];
+  max: [number, number, number];
+}
+/** One of the six faces of a `SectionBox`, named by corner and axis. */
+export type SectionBoxFace = 'minX' | 'maxX' | 'minY' | 'maxY' | 'minZ' | 'maxZ';
+
 export interface SectionPlane {
   axis: SectionPlaneAxis;
   /** 0-100 percentage of model bounds */
   position: number;
-  enabled: boolean;
-  /** If true, show the opposite side of the cut */
-  flipped: boolean;
+  enabled: boolean; // the cut is defined and turned on; ON SCREEN also requires `sceneState.section.visible` (#5893)
+  parked?: boolean; // enabled, but hidden by the visibility toggle (`sceneState.section.visible === false`, #5893)
+  flipped: boolean; // show the opposite side of the cut
   /** Whether to render the filled, hatched cap surface at the plane. Defaults to true. */
   showCap: boolean;
   /**
@@ -273,6 +281,8 @@ export interface SectionPlane {
    * `CustomSectionPlane`).
    */
   custom?: CustomSectionPlane;
+  /** Box mode (#5513): the cut is this box, not a plane; exclusive with `custom`. */
+  box?: SectionBox;
 }
 
 // ============================================================================
@@ -284,13 +294,13 @@ export interface HoverState {
   screenX: number;
   screenY: number;
   /**
-   * World-space hit position from the GPU pick (depth readback +
-   * inverse view-projection). Unset when the picker couldn't recover
-   * one (e.g. `pointCount === 0` clear, or the pick fell on the
-   * background). Useful for point-cloud hover tooltips where the
-   * synthetic entity has no surface property to display.
+   * World-space hit position from the GPU pick (depth readback + inverse view-projection).
+   * Unset when the picker couldn't recover one (e.g. `pointCount === 0` clear, or the pick
+   * fell on the background). Useful for point-cloud hover tooltips where the synthetic
+   * entity has no surface property to display.
    */
   worldXYZ?: { x: number; y: number; z: number };
+  modelIndex?: number; // model of the picked entity (federation), for the hover outline (#5390)
 }
 
 export interface ContextMenuState {
@@ -382,7 +392,9 @@ export interface CameraCallbacks {
   rotateLeft?: () => void;
   /** Rotate the camera exactly 90° around the vertical axis. */
   rotateRight?: () => void;
-  frameSelection?: () => void;
+  frameSelection?: (durationMs?: number) => void;
+  /** The world AABB `frameSelection` would frame (same id resolution), or `null` with nothing framable. */
+  selectionBounds?: () => { min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } } | null;
   /**
    * Resolve ids to what the 3D renderer can actually highlight, expanding a
    * geometry-less `IfcRelAggregates` assembly (own id has no mesh) to its
@@ -409,14 +421,13 @@ export interface CameraCallbacks {
    */
   frameBuildingExtent?: () => void;
   /**
-   * Replace the Space Sketch draft "ghost" overlay meshes in the 3D scene. These
-   * go straight to the renderer scene (NOT through geometryResult), so frequent
-   * per-edit updates can't trip the streaming reclassifier (which would reset the
-   * camera / un-pick newly created spaces). Pass [] (or use clear) to remove all.
+   * Replace one authoring channel's ghost meshes (Space Sketch rooms, a command
+   * preview; `useAuthoringOverlay.ts`). They bypass geometryResult so per-edit
+   * updates can't trip the streaming reclassifier. [] (or clear) removes them.
    */
-  setSpaceOverlayMeshes?: (meshes: MeshData[]) => void;
-  /** Remove all Space Sketch overlay ghost meshes from the scene. */
-  clearSpaceOverlayMeshes?: () => void;
+  setAuthoringOverlayMeshes?: (channel: AuthoringOverlayChannel, meshes: MeshData[]) => void;
+  /** Remove one authoring channel's overlay ghost meshes from the scene. */
+  clearAuthoringOverlayMeshes?: (channel: AuthoringOverlayChannel) => void;
   /**
    * Frame an explicit world-space box (min/max corners) from the canonical
    * isometric view, animating there. Used to frame a focused clash's contact
@@ -462,8 +473,9 @@ export interface CameraCallbacks {
 // ============================================================================
 
 import type { IfcDataStore } from '@ifc-lite/parser';
-import type { CoordinateInfo, EntityWorldAabb, GeometryResult, MeshData } from '@ifc-lite/geometry';
-
+import type { CoordinateInfo, EntityWorldAabb, GeometryResult, MeshData, ModelSpatialReference } from '@ifc-lite/geometry';
+import type { ModelLoadReportFields } from '../lib/loadReport'; // #3927 load report
+export type AuthoringOverlayChannel = 'spaceSketch' | 'command'; // authoring ghost-mesh channels (#6232)
 /**
  * Compound identifier for entities across multiple models.
  *
@@ -502,15 +514,14 @@ export type MetadataLoadState =
   | 'error';
 
 export type ModelSourceFile = File;
-
 /** Complete model container for federation */
 /**
  * A federated model's geometry as it stood before alignment re-baked it.
- *
  * The whole set of channels `federationAlign.ts` overwrites — anything it
- * writes has to be in here or the restore is incomplete. Captured and restored
- * by the one pair of functions in `hooks/ingest/federationRealign.ts`.
- */
+ * writes has to be in here or the restore is incomplete. Captured/restored
+ * by the pair in `hooks/ingest/federationRealign.ts`. Invariant (#4970):
+ * every array below is INDEX-ALIGNED with `geometryResult.meshes`; only
+ * `growPreAlignment`/`prunePreAlignment` may change its length. */
 export interface PreAlignmentSnapshot {
   /** One Float32Array per mesh, in `geometryResult.meshes` order. */
   positions: Float32Array[];
@@ -553,16 +564,22 @@ export interface PreAlignmentSnapshot {
    */
   instancedGeometryAabbs: Map<number, EntityWorldAabb> | undefined;
 }
-
-export interface FederatedModel {
-  /** Unique identifier (UUID generated on load) */
-  id: string;
+export interface FederatedModel extends ModelLoadReportFields {
+  id: string; // UUID generated on load.
   /** Display name (filename by default, user can rename) */
   name: string;
+  sourceFingerprint?: string; // Durable identity for persisted model filters.
+  sourceContentHash?: string; // Full-content identity for workspace placements.
   /** Parsed IFC data model */
   ifcDataStore: IfcDataStore | null;
+  /** Non-IFC source semantics, kept outside the IFC data store by design; `terrainImagery` is imagery draped on it (#5942), provenance only. */
+  landXmlDocument?: LandXmlTinDocument; terrainImagery?: import('../lib/terrain-imagery/drape-state.js').TerrainImageryDrape;
+  /** Truthful source schema; `schemaVersion` remains the compatibility store schema. */
+  sourceSchema?: LandXmlSchema;
   /** Pre-tessellated geometry (with globalIds, not original expressIds) */
   geometryResult: GeometryResult | null;
+  /** Format-neutral declared source frame for non-IFC geometry (LandXML/scans). */
+  spatialReference?: ModelSpatialReference;
   /** Model-level visibility toggle */
   visible: boolean;
   /** UI collapse state in hierarchy panel */
@@ -655,32 +672,7 @@ export interface FederatedModel {
  * a published API is free to fail loudly at the corruption site. Keep the
  * two in step on *bugs*, not on contract.
  */
-export function entityRefToString(ref: EntityRef): string {
-  return `${ref.modelId}:${ref.expressId}`;
-}
-
-/** Parse string back to EntityRef */
-export function stringToEntityRef(str: string): EntityRef {
-  const colonIndex = str.indexOf(':');
-  if (colonIndex === -1) {
-    // Invalid format - return a sentinel value
-    return { modelId: '', expressId: -1 };
-  }
-  const modelId = str.substring(0, colonIndex);
-  const expressId = parseInt(str.substring(colonIndex + 1), 10);
-  // Handle NaN case (malformed expressId)
-  if (Number.isNaN(expressId)) {
-    return { modelId, expressId: -1 };
-  }
-  return { modelId, expressId };
-}
-
-/** Check if two EntityRefs are equal */
-export function entityRefEquals(a: EntityRef | null, b: EntityRef | null): boolean {
-  if (a === null && b === null) return true;
-  if (a === null || b === null) return false;
-  return a.modelId === b.modelId && a.expressId === b.expressId;
-}
+export { entityRefEquals, entityRefToString, stringToEntityRef } from './entity-ref.js';
 
 /**
  * Type guard to check if a data store has IFC5 schema version.

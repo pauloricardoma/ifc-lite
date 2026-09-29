@@ -1,6 +1,187 @@
 /* tslint:disable */
 /* eslint-disable */
 
+/** Exact browser mesh RTC frame, in IFC Z-up metres. */
+export interface RtcFrame {
+    x: number;
+    y: number;
+    z: number;
+    needsShift: boolean;
+}
+
+
+
+export interface LandXmlTinDocumentJs {
+    format: "landxml";
+    schema: "LandXML-1.0" | "LandXML-1.1" | "LandXML-1.2";
+    capabilities: { renderable_tin: boolean; preserved_only_surfaces: number; unknown_extensions: number };
+    version: string;
+    /** serde_wasm_bindgen omits an absent Rust Option field rather than serializing null. `assumed` is true only when these units came from `LandXmlParseOptionsJs.assumedLinearUnit`, never from a declared LandXML/Units element (#5175). */
+    units?: { linear_unit: string; elevation_unit: string; linear_scale_to_meters: number; elevation_scale_to_meters: number; assumed: boolean };
+    surfaces: LandXmlSurfaceJs[];
+    pipe_networks?: LandXmlPipeNetworkDocumentJs;
+    extensions: LandXmlExtensionJs[];
+    warnings: string[];
+    alignments: LandXmlAlignmentSummaryJs[]; profiles: LandXmlProfileJs[];
+    cross_sections: LandXmlCrossSectionJs[]; cross_section_surfaces: LandXmlCrossSectionSurfaceJs[];
+    roadways: LandXmlRoadwayJs[]; capability_diagnostics: LandXmlCapabilityDiagnosticJs[];
+    preserved_only_extensions: LandXmlPreservedOnlyExtensionJs[];
+    /** COGO, parcel and plan-feature records from the same source bytes. */
+    plan: LandXmlPlanDocumentJs;
+}
+export interface LandXmlPlanDocumentJs {
+    schema: "LandXML-1.0" | "LandXML-1.1" | "LandXML-1.2"; version: string;
+    capability_diagnostics: LandXmlCapabilityDiagnosticJs[];
+    area_unit?: string; area_scale_to_square_meters?: number;
+    cogo_points: LandXmlCgPointJs[]; monuments: LandXmlMonumentJs[];
+    plan_features: LandXmlPlanFeatureJs[]; parcels: LandXmlParcelJs[]; warnings: string[];
+    source_batches: LandXmlPlanSourceBatchJs[]; parcel_probes: LandXmlParcelProbeJs[];
+    resolved_monuments: LandXmlResolvedMonumentJs[]; resolved_geometry: LandXmlResolvedGeometryJs[];
+}
+export interface LandXmlPlanSourceBatchJs { source_ids: string[]; }
+export interface LandXmlParcelProbeJs { source_id: string; state: { kind: "analytic" } | { kind: "preserved_only"; reason: string }; perimeter_in_declared_linear_units?: number; area_in_declared_square_units?: number; declared_area?: number; declared_perimeter?: number; perimeter_in_meters?: number; area_in_square_meters?: number; }
+export interface LandXmlResolvedMonumentJs { source_id: string; point?: LandXmlPlanPointJs; }
+export interface LandXmlResolvedGeometryJs { source_id: string; start?: LandXmlPlanPointJs; end?: LandXmlPlanPointJs; center?: LandXmlPlanPointJs; pi?: LandXmlPlanPointJs; }
+export interface LandXmlPlanPointJs { northing: number; easting: number; elevation?: number; }
+export interface LandXmlCgPointJs { source_id: string; scope_id: string; ordinal: number; name?: string; code?: string; description?: string; point?: LandXmlPlanPointJs; pnt_ref?: string; properties: Record<string, string>; }
+export interface LandXmlMonumentJs { source_id: string; point_scope_id?: string; ordinal: number; name?: string; code?: string; description?: string; pnt_ref?: string; point?: LandXmlPlanPointJs; properties: Record<string, string>; }
+export interface LandXmlPlanFeatureJs { source_id: string; ordinal: number; name?: string; code?: string; description?: string; properties: Record<string, string>; locations: LandXmlPlanPointLocationJs[]; geometry: LandXmlPlanGeometryJs[]; }
+export interface LandXmlParcelJs { source_id: string; ordinal: number; name?: string; code?: string; description?: string; title?: string; declared_area?: number; declared_perimeter?: number; declared_area_unit?: string; properties: Record<string, string>; loops: LandXmlPlanGeometryJs[][]; preservation_reason?: string; }
+export interface LandXmlPlanGeometryJs { source_id: string; ordinal: number; kind: "line" | "curve" | "irregular_line"; point_scope_id?: string; start: LandXmlPlanPointLocationJs; end: LandXmlPlanPointLocationJs; center?: LandXmlPlanPointLocationJs; pi?: LandXmlPlanPointLocationJs; intermediate_points: LandXmlPlanPointJs[]; rotation?: string; radius?: number; declared_length?: number; properties: Record<string, string>; }
+export type LandXmlPlanPointLocationJs = { kind: "coordinates"; point: LandXmlPlanPointJs; pnt_ref?: string } | { kind: "point_reference"; pnt_ref: string };
+export interface LandXmlSurfaceJs {
+    source_id: string; ordinal: number; source_path: string;
+    properties: Record<string, string>; definition_properties: Record<string, string>;
+    name: string; kind: "tin" | "grid" | "volume" | "other";
+    render_state: "rendered" | "preserved_only" | "unsupported";
+    topology_origin: "authored_faces" | "constrained_triangulation" | "preserved_only";
+    terrain_diagnostic?: { code: "missing_outer_boundary" | "unsupported_boundary_semantics" | "unsupported_breakline_semantics" | "missing_elevation" | "conflicting_elevation" | "intersecting_constraints" | "degenerate_constraints" | "work_limit_exceeded" | "cancelled"; message: string };
+    points: LandXmlPointJs[]; canonical_vertices: LandXmlCanonicalVertexJs[]; source_data_points: LandXmlSourcePointJs[];
+    faces: [string, string, string][]; face_source_ids: string[]; face_visibility: boolean[];
+    hidden_face_count: number; boundaries: LandXmlPolylineJs[]; breaklines: LandXmlPolylineJs[]; contours: LandXmlPolylineJs[];
+}
+export interface LandXmlPointJs { source_id: string; id: string; northing: number; easting: number; elevation: number; }
+export interface LandXmlCanonicalVertexJs { id: string; northing: number; easting: number; elevation: number; contributor_source_ids: string[]; }
+export interface LandXmlSourcePointJs { source_id: string; ordinal: number; source_path: string; coordinate_dimension: 2 | 3; coordinates: number[]; }
+/** serde_wasm_bindgen omits absent Rust Option fields rather than serializing null. */
+export interface LandXmlPolylineJs { source_id: string; ordinal: number; name?: string; kind?: string; source_path: string; properties: Record<string, string>; coordinate_dimension: 2 | 3; points: number[][]; point_source_ids: string[]; }
+export interface LandXmlExtensionJs { namespace: string; local_name: string; path: string; }
+export interface LandXmlSourceDocumentJs { tin: LandXmlTinDocumentJs; alignments: LandXmlAlignmentDocumentJs; alignment_render_spans: LandXmlAlignmentRenderSpanJs[]; alignment_render_refusals: LandXmlAlignmentRenderRefusalJs[]; alignment_render_truncated: boolean; }
+export interface LandXmlAlignmentRenderSpanJs { source_id: string; points: LandXmlPlanPointJs[]; }
+export interface LandXmlAlignmentRenderRefusalJs { source_id: string; message: string; }
+export interface LandXmlAlignmentDocumentJs {
+    schema: "LandXML-1.0" | "LandXML-1.1" | "LandXML-1.2"; version: string;
+    capability_diagnostics: LandXmlCapabilityDiagnosticJs[];
+    units?: LandXmlUnitsJs; alignments: LandXmlAlignmentJs[]; warnings: string[];
+}
+/** `assumed` is true only when these units came from `LandXmlParseOptionsJs.assumedLinearUnit`, never from a declared LandXML/Units element (#5175). */
+export interface LandXmlUnitsJs { linear_unit: string; elevation_unit: string; linear_scale_to_meters: number; elevation_scale_to_meters: number; assumed: boolean; }
+/** Terrain-parser alignment linkage; use LandXmlAlignmentDocumentJs for complete alignment semantics. */
+export interface LandXmlAlignmentSummaryJs { source_id: string; ordinal: number; name: string; length: number; sta_start: number; profile_source_ids: string[]; cross_section_source_ids: string[]; }
+export interface LandXmlAlignmentJs { source_id: string; ordinal: number; name: string; length: number; sta_start: number; start?: LandXmlPointLocationJs; align_pis: LandXmlAlignmentPiJs[]; segments: LandXmlAlignmentSegmentJs[]; station_equations: LandXmlStationEquationJs[]; cant?: LandXmlCantJs; superelevations: LandXmlSuperelevationJs[]; unsupported_transitions: LandXmlUnsupportedTransitionJs[]; }
+export type LandXmlPointLocationJs = { kind: "coordinates"; point: LandXmlPlanPointJs } | { kind: "point_reference"; pnt_ref: string };
+export interface LandXmlAlignmentPiJs { source_id: string; location: LandXmlPointLocationJs; }
+export type LandXmlAlignmentSegmentJs = { source_id: string; ordinal: number; primitive: LandXmlAlignmentPrimitiveJs };
+export interface LandXmlSpiralJs { start: LandXmlPointLocationJs; pi: LandXmlPointLocationJs; end: LandXmlPointLocationJs; spi_type: string; radius_start: LandXmlRadiusJs; radius_end: LandXmlRadiusJs; rotation: "clockwise" | "counter_clockwise"; declared_length: number; }
+export type LandXmlAlignmentPrimitiveJs = { kind: "line"; start: LandXmlPointLocationJs; end: LandXmlPointLocationJs; declared_length?: number } | { kind: "irregular_line"; start: LandXmlPointLocationJs; end: LandXmlPointLocationJs; points: LandXmlPlanPointJs[]; declared_length?: number } | { kind: "curve"; start: LandXmlPointLocationJs; center: LandXmlPointLocationJs; end: LandXmlPointLocationJs; pi?: LandXmlPointLocationJs; rotation: "clockwise" | "counter_clockwise"; radius?: number; declared_length?: number } | ({ kind: "spiral" } & LandXmlSpiralJs) | ({ kind: "unsupported_spiral" } & LandXmlSpiralJs);
+export type LandXmlRadiusJs = { finite: number } | "infinite";
+export interface LandXmlStationEquationJs { source_id: string; sta_internal: number; sta_ahead: number; sta_back?: number; sta_increment?: string; }
+export interface LandXmlCantJs { source_id: string; name: string; gauge: number; rotation_point?: string; equilibrium_constant?: number; applied_cant_constant?: number; stations: LandXmlCantStationJs[]; speed_stations: LandXmlSpeedStationJs[]; }
+export interface LandXmlCantStationJs { source_id: string; station: number; applied_cant: number; equilibrium_cant?: number; curvature: "clockwise" | "counter_clockwise"; cant_deficiency?: number; cant_excess?: number; rate_of_change_of_applied_cant_over_time?: number; rate_of_change_of_applied_cant_over_length?: number; rate_of_change_of_cant_deficiency_over_time?: number; cant_gradient?: number; speed?: number; transition_type?: string; adverse?: boolean; }
+export interface LandXmlSpeedStationJs { source_id: string; station: number; speed: number; }
+export interface LandXmlSuperelevationJs { source_id: string; sta_start?: number; sta_end?: number; events: LandXmlSuperelevationEventJs[]; }
+export interface LandXmlSuperelevationEventJs { source_id: string; kind: string; value?: string; }
+/** `spiral` is the Rust LandXmlSpiral payload, not a tagged primitive enum. */
+export interface LandXmlUnsupportedTransitionJs { source_id: string; spi_type: string; spiral: LandXmlSpiralJs; reason: string; }
+export interface LandXmlAlignmentProbeJs { alignment_source_id: string; segment_source_id: string; geometric_distance: number; station: { geometric_distance: number; displayed_back: number; displayed_ahead: number; is_equation_boundary: boolean }; northing: number; easting: number; tangent_northing: number; tangent_easting: number; }
+export type LandXmlAlignmentProbesJs = LandXmlAlignmentProbeJs[];
+/** Neighbouring authored CantStation records; values are never interpolated. */
+export interface LandXmlAlignmentInspectionJs { cant?: { internal_station: number; station: { geometric_distance: number; displayed_back: number; displayed_ahead: number; is_equation_boundary: boolean }; previous?: LandXmlCantStationJs; next?: LandXmlCantStationJs }; superelevations: LandXmlSuperelevationJs[]; superelevation_block_count: number; superelevation_event_count: number; superelevation_truncated: boolean; }
+/** `assumedLinearUnit`: see #5175. Accepts the same tokens a declared `<Units linearUnit="...">` accepts (e.g. `"meter"`, `"foot"`, `"USSurveyFoot"`); an unknown token refuses rather than defaulting to meters. Ignored, with a warning, when the source declares its own `<Units>`. */
+export interface LandXmlParseOptionsJs { maxBytes?: number; maxDepth?: number; maxTextBytes?: number; maxPoints?: number; maxFaces?: number; maxWork?: number; maxAlignments?: number; maxAlignmentSegments?: number; maxAlignmentPoints?: number; maxStationEquations?: number; maxCantStations?: number; maxSuperelevationEvents?: number; assumedLinearUnit?: string; cancelled?: boolean; }
+export interface LandXmlProfilePointJs { source_id: string; station: number; elevation?: number; }
+export interface LandXmlGradeLineJs { source_id: string; parent_profile_source_id: string; ordinal: number; points: LandXmlProfilePointJs[]; }
+export interface LandXmlVerticalCurveJs { source_id: string; parent_profile_source_id: string; kind: "parabolic" | "unsymmetrical_parabolic" | "circular"; station: number; elevation?: number; length?: number; length_in?: number; length_out?: number; radius?: number; }
+export interface LandXmlProfileJs { source_id: string; parent_alignment_source_id: string; ordinal: number; name: string; kind: "design" | "sampled"; pvis: LandXmlProfilePointJs[]; vertical_curves: LandXmlVerticalCurveJs[]; grade_lines: LandXmlGradeLineJs[]; }
+export interface LandXmlCrossSectionJs { source_id: string; parent_alignment_source_id: string; ordinal: number; station: number; surface_source_ids: string[]; }
+export interface LandXmlCrossSectionPointJs { source_id: string; data_format: "offset_elevation" | "slope_distance"; offset?: number; elevation?: number; slope?: number; distance?: number; pnt_ref?: string; alignment_ref?: string; align_ref_station?: number; alignment_source_id?: string; plan_feature_ref?: string; plan_feature_ref_station?: number; parcel_ref?: string; parcel_ref_station?: number; }
+export interface LandXmlCrossSectionSegmentJs { source_id: string; parent_surface_source_id: string; ordinal: number; points: LandXmlCrossSectionPointJs[]; }
+export interface LandXmlCrossSectionSurfaceJs { source_id: string; parent_cross_section_source_id: string; kind: "sampled" | "design"; name?: string; segments: LandXmlCrossSectionSegmentJs[]; points: LandXmlCrossSectionPointJs[]; }
+export interface LandXmlRoadwayJs { source_id: string; ordinal: number; name: string; alignment_refs: string[]; alignment_source_ids: string[]; surface_refs: string[]; surface_source_ids: string[]; grade_model_refs: string[]; }
+export interface LandXmlCapabilityDiagnosticJs { code: string; source_id?: string; source_path: string; message: string; }
+export interface LandXmlPreservedOnlyExtensionJs { source_id: string; parent_source_id?: string; local_name: string; source_path: string; kind: "corridor" | "string_line"; }
+export interface LandXmlPipeUnitsJs { linear_unit: string; elevation_unit: string; diameter_unit: string; width_unit: string; height_unit: string; flow_unit?: string; linear_scale_to_meters: number; elevation_scale_to_meters: number; diameter_scale_to_meters: number; width_scale_to_meters: number; height_scale_to_meters: number; }
+export interface LandXmlPipeNetworkDocumentJs {
+    schema: "LandXML-1.0" | "LandXML-1.1" | "LandXML-1.2"; version: string;
+    capability_diagnostics: LandXmlCapabilityDiagnosticJs[];
+    root_units?: LandXmlPipeUnitsJs; collections: LandXmlPipeCollectionJs[];
+    features: LandXmlPipeFeatureJs[]; networks: LandXmlPipeNetworkJs[]; refusals: LandXmlPipeRefusalJs[];
+}
+export interface LandXmlPipeCollectionJs { source_id: string; source_path: string; properties: Record<string, string>; }
+export interface LandXmlPipeFeatureJs { source_id: string; source_path: string; owner_source_id: string; properties: Record<string, string>; }
+export interface LandXmlPipeRefusalJs { source_id: string; source_path: string; code: string; message: string; }
+export interface LandXmlPipeMeasureJs { value: number; unit: string; meters: number; }
+export interface LandXmlPipePositionJs { northing: number; easting: number; northing_meters: number; easting_meters: number; elevation?: LandXmlPipeMeasureJs; }
+export interface LandXmlPipeFlowJs { source_id: string; source_path: string; unit?: string; flow_in?: number; loss_in?: number; loss_out?: number; properties: Record<string, string>; }
+export interface LandXmlPipeInvertJs { source_id: string; source_path: string; pipe_source_id: string; flow_direction: string; elevation: LandXmlPipeMeasureJs; properties: Record<string, string>; }
+export interface LandXmlPipePartJs { kind: "circular" | "elliptical" | "egg" | "rectangular"; properties: Record<string, string>; diameter?: LandXmlPipeMeasureJs; span?: LandXmlPipeMeasureJs; width?: LandXmlPipeMeasureJs; height?: LandXmlPipeMeasureJs; thickness?: LandXmlPipeMeasureJs; material?: string; }
+export interface LandXmlStructurePartJs { kind: "circular" | "rectangular" | "inlet" | "outlet" | "connection"; properties: Record<string, string>; diameter?: LandXmlPipeMeasureJs; length?: LandXmlPipeMeasureJs; width?: LandXmlPipeMeasureJs; thickness?: LandXmlPipeMeasureJs; material?: string; }
+export interface LandXmlPipeNetworkJs { source_id: string; source_path: string; name: string; pipe_network_type: string; properties: Record<string, string>; features: LandXmlPipeFeatureJs[]; structure_units?: LandXmlPipeUnitsJs; pipe_units?: LandXmlPipeUnitsJs; structures: LandXmlPipeStructureJs[]; pipes: LandXmlPipeJs[]; }
+export interface LandXmlPipeStructureJs { source_id: string; source_path: string; name: string; properties: Record<string, string>; units: LandXmlPipeUnitsJs; center: LandXmlPipePositionJs; part: LandXmlStructurePartJs; rim_elevation?: LandXmlPipeMeasureJs; sump_elevation?: LandXmlPipeMeasureJs; inverts: LandXmlPipeInvertJs[]; flow?: LandXmlPipeFlowJs; }
+export interface LandXmlPipeJs { source_id: string; source_path: string; name: string; properties: Record<string, string>; units: LandXmlPipeUnitsJs; connectivity: { start_structure_source_id: string; end_structure_source_id: string }; part: LandXmlPipePartJs; geometry: { kind: "straight" | "pass_through"; point?: LandXmlPipePositionJs }; length?: LandXmlPipeMeasureJs; flow?: LandXmlPipeFlowJs; }
+
+
+
+export type AnalyticStatusJs = { type: "complete" } | { type: "unsupported"; reason: string };
+export type AnalyticSourceContextJs =
+| { kind: "direct"; representation_id: number }
+| { kind: "mapped"; representation_map_path: number[] };
+export interface AnalyticSourceKeyJs {
+    model_sha256: string; schema: string | null; length_unit_scale_bits: string;
+    context: AnalyticSourceContextJs; solid_id: number;
+}
+export type AnalyticCurveSegmentJs =
+| { type: "line"; start: number[]; end: number[] }
+| { type: "arc"; center: number[]; normal: number[]; x_axis: number[];
+radius: number; start_angle: number; sweep_angle: number };
+export interface AnalyticProfileLoopJs {
+    kind: "outer" | "inner"; segments: AnalyticCurveSegmentJs[];
+    signed_area: number; perimeter: number;
+}
+export interface AnalyticProfileJs {
+    profile_id: number; ifc_type_name: string; ProfileType: string | null;
+    Position: number | null; profile_position: number[] | null;
+    loops: AnalyticProfileLoopJs[]; status: AnalyticStatusJs;
+}
+export interface AnalyticExtrusionJs {
+    solid_id: number; SweptArea: number | null; profile: AnalyticProfileJs | null;
+    Position: number | null; position_matrix: number[] | null;
+    ExtrudedDirection: number | null; DirectionRatios: number[] | null;
+    axis_unit_vector: number[] | null; Depth: number | null; status: AnalyticStatusJs;
+}
+export interface ExtrusionNominalQuantitiesJs {
+    profile_area: number; projected_height: number; nominal_volume: number;
+}
+export interface ExtrusionDefinitionJs {
+    key: AnalyticSourceKeyJs; source: AnalyticExtrusionJs;
+    /** Squared/cubed IFC file-length units; null for unsupported or invalid sources. */
+    nominal_quantities: ExtrusionNominalQuantitiesJs | null;
+}
+export interface ExtrusionInstanceJs {
+    ordinal: number; source: AnalyticSourceKeyJs; product_id: number;
+    solid_id: number; mapping_path: number[]; source_modified: boolean;
+    world_from_source: number[] | null; status: AnalyticStatusJs;
+}
+export interface ExtrusionDefinitionsJs {
+    up_axis: "Z"; source_units: "ifc_file_length_units"; world_units: "m";
+    coordinate_space: "absolute_ifc_world"; model_sha256: string;
+    schema: string | null; length_unit_scale: number;
+    sources: ExtrusionDefinitionJs[];
+    instances: Record<number, ExtrusionInstanceJs[]>; diagnostics: string[];
+}
+
+
+
 /**
  * The overlap solid of one clashing pair, or the reason there is none.
  */
@@ -90,6 +271,7 @@ export class ClashRunResult {
     readonly a: Uint32Array;
     readonly b: Uint32Array;
     readonly bounds: Float64Array;
+    readonly depthFloor: Float64Array;
     readonly distance: Float64Array;
     readonly distanceKind: Uint8Array;
     readonly points: Float64Array;
@@ -114,11 +296,15 @@ export class ClashSession {
     ingest(positions: Float32Array, pos_ranges: Uint32Array, indices: Uint32Array, idx_ranges: Uint32Array, aabbs: Float32Array): void;
     constructor();
     /**
-     * Run one rule. `group_a`/`group_b` are GLOBAL element indices; an empty
-     * `group_b` means a self-clash within `group_a`. `mode`: 0 = hard,
-     * 1 = clearance. Records carry GLOBAL element indices.
+     * Run one rule. `group_a`/`group_b` are GLOBAL element indices.
+     * OMIT `group_b` (pass `undefined`/`null`) for a self-clash within
+     * `group_a`; pass an array -- INCLUDING an empty one -- for a two-sided
+     * rule. An empty array is a B side that matched nothing and yields no
+     * clashes, which is why this is nullable rather than "empty means
+     * self" (#5354). `mode`: 0 = hard, 1 = clearance. Records carry GLOBAL
+     * element indices.
      */
-    runRule(group_a: Uint32Array, group_b: Uint32Array, mode: number, tolerance: number, clearance: number, report_touch: boolean): ClashRunResult;
+    runRule(group_a: Uint32Array, group_b: Uint32Array | null | undefined, mode: number, tolerance: number, clearance: number, report_touch: boolean): ClashRunResult;
 }
 
 /**
@@ -306,6 +492,26 @@ export class IfcAPI {
      */
     buildPrePassStreamingSharded(data: Uint8Array, on_event: Function, chunk_size: number, disabled_type_names: string[] | null | undefined, skip_type_geometry: boolean, index_ids: Uint32Array, index_starts: Uint32Array, index_lengths: Uint32Array, index_classes: Uint8Array): any;
     /**
+     * Existing sharded prepass plus an exact full-source key in complete.
+     */
+    buildPrePassStreamingShardedWithSourceFingerprint(data: Uint8Array, on_event: Function, chunk_size: number, disabled_type_names: string[] | null | undefined, skip_type_geometry: boolean, index_ids: Uint32Array, index_starts: Uint32Array, index_lengths: Uint32Array, index_classes: Uint8Array): any;
+    /**
+     * Existing streaming prepass plus an exact full-source key in complete.
+     */
+    buildPrePassStreamingWithSourceFingerprint(data: Uint8Array, on_event: Function, chunk_size: number, disabled_type_names: string[] | null | undefined, skip_type_geometry: boolean): any;
+    /**
+     * Calibrate one raster plane from native-source landmarks and a measured
+     * world span. Returns UTF-8 CalibratedPlane JSON. Constant bounded work;
+     * does not read IFC, decode image pixels or mutate a model.
+     */
+    calibrateAppearancePlane(request_json: string): Uint8Array;
+    /**
+     * Catalog effective IfcProduct classes and IfcRelDefinesByType membership.
+     * JSON input is AppearanceCatalogRequest; output is AppearanceCatalog JSON.
+     * Run in a worker and validate sourceRevision before using the selectors.
+     */
+    catalogAppearance(content: Uint8Array, request_json: string): Uint8Array;
+    /**
      * Clear the cached entity index (call between loads when reusing
      * the same `IfcAPI` instance — e.g. the parser worker keeps one
      * `IfcAPI` alive across multiple `parse` requests).
@@ -313,6 +519,17 @@ export class IfcAPI {
      * Recovers a poisoned cache Mutex instead of panicking; see `mod_tests.rs`.
      */
     clearPrePassCache(): void;
+    /**
+     * Starts one owned raw-byte LandXML session. The caller must free or abort
+     * the session on every cancellation path.
+     *
+     * `options` is the same shape `parseLandXmlSourceBytesWithOptions`
+     * accepts (see `LandXmlParseOptionsJs`) and is optional so every
+     * existing single-argument call site keeps working unchanged. A bad
+     * `assumedLinearUnit` token (or any other invalid option) refuses here,
+     * at session construction, never partway through a stream (#5175).
+     */
+    createLandXmlTinStreamSession(max_bytes: number, options?: LandXmlParseOptionsJs | null): LandXmlTinStreamSession;
     /**
      * Run geometry extraction on `content` and return its typed CSG / opening
      * diagnostics (the `GeometryDiagnostics` contract) as a JS object, or
@@ -345,8 +562,17 @@ export class IfcAPI {
      *
      * `hidden` / `isolated` are express-id visibility filters; `hidden_types_csv` is a
      * comma-separated list of IFC type names whose class toggle is off (e.g.
-     * `"IfcOpeningElement,IfcSpace"`). `include_metadata` attaches counts + per-node
-     * `expressId`. Per-mesh RTC origin rides the node translation (precision-safe).
+     * `"IfcOpeningElement,IfcSpace"`). `isolated` carries the isolation allowlist's
+     * null-vs-empty distinction across the wasm boundary: omit it (`undefined`) for
+     * "no isolation filter" (every mesh is a candidate); pass an empty `Uint32Array`
+     * for "isolation is ACTIVE and currently matches nothing" (every mesh is
+     * excluded). Collapsing the two — as a bare `Uint32Array` parameter would force a
+     * caller to do — silently exports the whole model when a filter matches nothing
+     * (#4328 follow-up: reachable by filtering the Class tab to a type present only
+     * in a federated model's secondary member, then exporting "Visible Only"). A
+     * non-empty `Uint32Array` is the ordinary allowlist. `include_metadata` attaches
+     * counts + per-node `expressId`. Per-mesh RTC origin rides the node translation
+     * (precision-safe).
      * `lit` emits standard PBR materials that shade from normals; omitted or
      * `true` ⇒ lit (the default), `false` ⇒ flat `KHR_materials_unlit` (the
      * historical look — #1321). Optional at the boundary so older 5-arg callers
@@ -361,7 +587,7 @@ export class IfcAPI {
      * CLI/MCP wrappers; making the boundary itself refuse means SDK/viewer/
      * direct callers inherit it too (the TS guards stay as defense-in-depth).
      */
-    exportGlb(content: Uint8Array, include_metadata: boolean, hidden: Uint32Array, isolated: Uint32Array, hidden_types_csv: string, lit?: boolean | null, emissive?: boolean | null): Uint8Array;
+    exportGlb(content: Uint8Array, include_metadata: boolean, hidden: Uint32Array, isolated: Uint32Array | null | undefined, hidden_types_csv: string, lit?: boolean | null, emissive?: boolean | null): Uint8Array;
     /**
      * Assemble a **GLB** from already-produced meshes (the viewer's `MeshData`, flattened)
      * — no re-meshing. Per mesh `i`: `vertex_counts[i]` verts + `index_counts[i]` indices
@@ -370,11 +596,15 @@ export class IfcAPI {
      * per-mesh local). The caller passes exactly the meshes it wants emitted.
      *
      * Fails CLOSED: if the declared vertex/index counts run past the flattened
-     * `positions` / `indices`, there are fewer `index_counts` than meshes, or `normals`
-     * is empty or too short to cover every vertex, this throws an `Error` whose message
-     * starts with `MALFORMED_MESH_INPUT` — instead of silently emitting a GLB with those
-     * meshes dropped. (The viewer always passes fully-backed, normal-covered arrays, so
-     * this only fires on a caller bug.)
+     * `positions` / `indices`, there are fewer `index_counts` than meshes, `normals`
+     * is empty or too short to cover every vertex, a mesh's index block is not a
+     * whole number of triangles, or an index names a vertex its own mesh does not
+     * have (glTF 2.0 3.7.2.1), this throws an `Error` whose message starts with
+     * `MALFORMED_MESH_INPUT` — instead of silently emitting a GLB with those meshes
+     * dropped, a TRIANGLES primitive whose count is not a multiple of 3, or the
+     * out-of-range index copied into the BIN chunk. (The viewer always passes
+     * fully-backed, normal-covered, whole-triangle, in-range arrays, so this only
+     * fires on a caller bug.)
      */
     exportGlbFromMeshes(positions: Float32Array, normals: Float32Array, indices: Uint32Array, vertex_counts: Uint32Array, index_counts: Uint32Array, colors: Float32Array, origins: Float64Array, express_ids: Uint32Array, include_metadata: boolean, lit?: boolean | null, emissive?: boolean | null): Uint8Array;
     /**
@@ -395,6 +625,24 @@ export class IfcAPI {
      */
     exportHbjson(content: Uint8Array, name: string): Uint8Array;
     /**
+     * Like [`Self::export_hbjson`], but also returns the export's coverage stats
+     * (`HbjsonStats`: spaces seen, rooms emitted, spaces skipped as degenerate, plus
+     * apertures / doors / shades / constructions / interior adjacencies) so a caller
+     * can tell whether the "success" result silently dropped input.
+     *
+     * Returns a plain JS object `{ content: Uint8Array, stats: HbjsonStats }`; `content`
+     * is UTF-8 HBJSON bytes (same encoding rationale as [`Self::export_hbjson`] — not
+     * capped by the V8 max-string ceiling). Runs the export once — `content` and `stats`
+     * come from the same pass, not two separate exports.
+     *
+     * ```javascript
+     * const api = new IfcAPI();
+     * const { content, stats } = api.exportHbjsonWithStats(ifcContent, "my_model");
+     * if (stats.skipped > 0) console.warn(`${stats.skipped} spaces skipped as degenerate`);
+     * ```
+     */
+    exportHbjsonWithStats(content: Uint8Array, name: string): any;
+    /**
      * Export **IFC5 / IFCX** (the USD-style node graph). `only_known_properties` keeps
      * only properties with an official IFC5 schema.
      */
@@ -405,25 +653,18 @@ export class IfcAPI {
     exportJson(content: Uint8Array, pretty: boolean, include_properties: boolean, include_quantities: boolean): Uint8Array;
     /**
      * Export **JSON-LD** (`@graph` of `ifc:` nodes). Empty `context` ⇒ buildingSMART
-     * IFC4 OWL default. `included` is an express-id isolation filter mirroring the
-     * OBJ/glTF/STEP exporters (empty ⇒ all entities).
-     */
-    exportJsonld(content: Uint8Array, context: string, include_properties: boolean, include_quantities: boolean, pretty: boolean, included: Uint32Array): Uint8Array;
-    /**
-     * Package an already-produced **GLB** + georeference into a **KMZ** (`Uint8Array`)
-     * for Google Earth: a ZIP of `doc.kml` (a `<Model>` placed at `latitude`/`longitude`/
-     * `altitude`) + `model.glb`. `x_axis_abscissa`/`x_axis_ordinate` are the
-     * `IfcMapConversion` grid-north components; pass both as `undefined` for heading 0.
+     * IFC4 OWL default.
      *
-     * `altitude_mode` selects the KML vertical placement: `"clampToGround"`
-     * (the default when omitted) rests the model on the terrain, ignoring
-     * `altitude`; `"absolute"` places the origin at `altitude` metres MSL.
-     * Google Earth's terrain already encodes the site elevation, so clamping
-     * keeps a wrong/zero/double-counted OrthogonalHeight from floating the
-     * model into the sky (#1427); absolute is offered for models whose
-     * OrthogonalHeight is a true MSL elevation the user wants honoured.
+     * `included` is an express-id isolation filter mirroring `exportObj` /
+     * `exportGlb`, and carries the same null-vs-empty distinction across the wasm
+     * boundary: omit it (`undefined`) for "no isolation filter" (every entity is
+     * emitted); pass an empty `Uint32Array` for "isolation is ACTIVE and currently
+     * matches nothing", which emits an empty `@graph`. Collapsing the two — as a
+     * bare `Uint32Array` parameter would force a caller to do — silently exported
+     * the whole model when a filter matched nothing (#4659, the JSON-LD twin of
+     * #4483/#4484). A non-empty `Uint32Array` is the ordinary allowlist.
      */
-    exportKmz(glb: Uint8Array, latitude: number, longitude: number, altitude: number, x_axis_abscissa: number | null | undefined, x_axis_ordinate: number | null | undefined, name: string, altitude_mode?: string | null): Uint8Array;
+    exportJsonld(content: Uint8Array, context: string, include_properties: boolean, include_quantities: boolean, pretty: boolean, included?: Uint32Array | null): Uint8Array;
     /**
      * Build a Google-Earth-ready **KMZ** (`Uint8Array`) straight from the viewer's
      * already-produced meshes — the working path (#1427). The model is embedded as
@@ -435,6 +676,15 @@ export class IfcAPI {
      * `altitude_mode` (`"clampToGround"` default ⇒ rest on terrain, ignoring
      * `altitude`; `"absolute"` ⇒ place at `altitude` metres MSL) selects the
      * KML vertical placement (#1427).
+     *
+     * Fails CLOSED: when no triangle survives (an empty visible set, or meshes
+     * whose only triangles are degenerate and collapse in the vertex dedup)
+     * this throws an `Error` whose message starts with `NO_RENDER_GEOMETRY`;
+     * a declared vertex/index count running past its buffer, an index block
+     * that is not whole triangles, or an index outside its mesh throws
+     * `MALFORMED_MESH_INPUT`, exactly as `exportGlbFromMeshes` does. These used
+     * to ship as a "successful" archive: an empty one around a COLLADA
+     * document the 1.4.1 schema rejects, or one with meshes or faces missing.
      */
     exportKmzFromMeshes(positions: Float32Array, normals: Float32Array, indices: Uint32Array, vertex_counts: Uint32Array, index_counts: Uint32Array, colors: Float32Array, origins: Float64Array, latitude: number, longitude: number, altitude: number, x_axis_abscissa: number | null | undefined, x_axis_ordinate: number | null | undefined, name: string, altitude_mode?: string | null): Uint8Array;
     /**
@@ -451,14 +701,21 @@ export class IfcAPI {
      * V8 max-string ceiling (~512 MB); decode with `TextDecoder` when a string
      * is genuinely needed.
      *
-     * `hidden` / `isolated` are express-id filters mirroring the viewer's visibility
-     * state (empty `isolated` ⇒ all visible). Instanced type-library shapes are skipped.
+     * `hidden` is an express-id filter mirroring the viewer's visibility state.
+     * `isolated` carries the isolation allowlist's null-vs-empty distinction across
+     * the wasm boundary: omit it (`undefined`) for "no isolation filter" (every mesh
+     * is a candidate); pass an empty `Uint32Array` for "isolation is ACTIVE and
+     * currently matches nothing" (every mesh is excluded). Collapsing the two — as a
+     * bare `Uint32Array` parameter would force a caller to do — silently exports the
+     * whole model when a filter matches nothing (the OBJ twin of #4328/#4364, fixed
+     * for GLB in `export_glb`). A non-empty `Uint32Array` is the ordinary allowlist.
+     * Instanced type-library shapes are skipped regardless of the filter.
      *
      * ```javascript
-     * const obj = api.exportObj(ifcContent, true, new Uint32Array(), new Uint32Array());
+     * const obj = api.exportObj(ifcContent, true, new Uint32Array(), undefined);
      * ```
      */
-    exportObj(content: Uint8Array, include_normals: boolean, hidden: Uint32Array, isolated: Uint32Array): Uint8Array;
+    exportObj(content: Uint8Array, include_normals: boolean, hidden: Uint32Array, isolated?: Uint32Array | null): Uint8Array;
     /**
      * Re-serialize the model in `content` to STEP/IFC UTF-8 bytes.
      *
@@ -467,15 +724,28 @@ export class IfcAPI {
      * is genuinely needed.
      *
      * `schema` is the FILE_SCHEMA label to write (empty ⇒ preserve the source schema).
-     * `included` is an express-id allowlist (empty ⇒ whole model); when set, the forward
-     * `#`-reference closure is added so the subset never dangles a reference.
-     * `mutations_json` carries `MutablePropertyView` edits (attribute updates +
-     * property-set synthesis); empty ⇒ none. See `export_step_json` for the shape.
+     *
+     * `included` is an express-id allowlist carrying the same null-vs-empty
+     * distinction as `exportObj` / `exportGlb`: omit it (`undefined`) for "no
+     * isolation filter" (whole model); pass an empty `Uint32Array` for "isolation
+     * is ACTIVE and currently matches nothing", which writes a header-only file
+     * with an empty `DATA;` section. Collapsing the two — as a bare `Uint32Array`
+     * parameter would force a caller to do — silently exported the whole model
+     * when a filter matched nothing (#4659, the STEP twin of #4483/#4484). When
+     * set, the forward `#`-reference closure is added so the subset never dangles
+     * a reference.
+     * `mutations_json` carries `MutablePropertyView` edits; empty ⇒ none. It is
+     * either the mutation log `MutablePropertyView.exportMutations()` returns
+     * (an object with a `mutations` array, optionally `newEntities` and
+     * `georefMutations`), written with byte parity to the TypeScript
+     * `StepExporter` (#5941), or the older pre-serialized
+     * `{ attributeUpdates, propertyMutations }` shape. A log does not combine
+     * with `included`. See `export_step_json` for both shapes.
      * A non-empty but malformed `mutations_json` throws rather than silently
      * exporting the model with none of the caller's edits applied — mirrors
      * `exportGlb`'s and `exportMerged`'s fail-closed contract on this same API.
      */
-    exportStep(content: Uint8Array, schema: string, included: Uint32Array, mutations_json: string): Uint8Array;
+    exportStep(content: Uint8Array, schema: string, included: Uint32Array | null | undefined, mutations_json: string): Uint8Array;
     /**
      * Export **OpenUSD** (`.usda` ASCII): a real Z-up USD stage — spatial hierarchy of
      * `Xform` prims, `UsdGeomMesh` geometry, `UsdPreviewSurface` materials, IFC
@@ -506,14 +776,38 @@ export class IfcAPI {
      */
     extractProfiles(content: string, model_index: number): ProfileCollection;
     /**
+     * Return authored swept-disk occurrences, including exact line/arc
+     * directrices and derived measurements, in absolute IFC Z-up metres.
+     * `ids` contains product STEP IDs; omit it for all products or pass an
+     * empty `Uint32Array` for none. Unsupported records keep their status and
+     * a null `directrix_metrics`; malformed representation walks report a
+     * diagnostic and omit that product atomically.
+     */
+    extractSweptDiskDescriptions(content: Uint8Array, ids?: Uint32Array | null): any;
+    /**
+     * `ids` is an optional product STEP-ID filter; `None` selects all and
+     * `Some([])` selects no products, matching the Rust and Python APIs.
+     * Matrices are column-major f64; profile_position and position_matrix are
+     * applied before world_from_source. No mesh is decoded on this path.
+     */
+    extrusionDefinitions(content: Uint8Array, ids?: Uint32Array | null): ExtrusionDefinitionsJs;
+    /**
      * Sharded pre-pass: merge the shard-resolved styled-item columns with the
      * SUPPORT spans (extracted host-side from the shard classes) and run the
      * CANONICAL styles flatten. Returns the exact `styles` event payload the
      * serial path emits. Runs on any worker with `setEntityIndex` installed.
      * Span arguments are `[id, start, len]` triples; `plane_angle_to_radians`
-     * comes from the meta event.
+     * comes from the meta event. `orphanColors` / `geomColors` carry exactly
+     * four floats per id in `orphanIds` / `geomIds`; any other length throws
+     * before either column is read. The payload's `styleFinishes` come from
+     * the geometry finishes a preceding `setPrepassGeometryFinishes` stashed
+     * (consumed here); without that call they are all NaN.
      */
     finalizePrepassStyles(data: Uint8Array, orphan_ids: Uint32Array, orphan_colors: Float32Array, geom_ids: Uint32Array, geom_colors: Float32Array, colour_map_spans: Uint32Array, material_def_spans: Uint32Array, rel_material_spans: Uint32Array, void_spans: Uint32Array, fills_spans: Uint32Array, aggregate_spans: Uint32Array, plane_angle_to_radians: number): any;
+    /**
+     * Finalize prepass styles against the installed source and entity index.
+     */
+    finalizePrepassStylesFromSource(orphan_ids: Uint32Array, orphan_colors: Float32Array, geom_ids: Uint32Array, geom_colors: Float32Array, colour_map_spans: Uint32Array, material_def_spans: Uint32Array, rel_material_spans: Uint32Array, void_spans: Uint32Array, fills_spans: Uint32Array, aggregate_spans: Uint32Array, plane_angle_to_radians: number): any;
     /**
      * Get WASM memory for zero-copy access
      */
@@ -527,6 +821,12 @@ export class IfcAPI {
      * the degenerate-backstop drop count, and the CSG failure aggregates.
      */
     getPipelineDiagnostics(): any;
+    /**
+     * Inspect authored cant and superelevation records at a physical distance.
+     * Cant exposes bracketing source records only; no transition value is
+     * fabricated. Superelevation blocks preserve their authored bounds.
+     */
+    inspectLandXmlAlignmentAtDistance(data: Uint8Array, alignment_source_id: string, distance: number): LandXmlAlignmentInspectionJs;
     /**
      * Create and initialize the IFC API
      */
@@ -543,11 +843,19 @@ export class IfcAPI {
      */
     parseAlignmentLines(content: string): Float32Array;
     /**
+     * Parse alignments in the exact RTC frame selected by the mesh pre-pass.
+     */
+    parseAlignmentLinesInFrame(content: string, frame: RtcFrame): Float32Array;
+    /**
      * Parse the file and return structured per-axis data (tag + endpoints) in
      * the renderer's Y-up world space (RTC-subtracted, metres). Use this when
      * you also need the axis tags (to render grid bubbles / labels).
      */
     parseGridAxes(content: string): GridAxisCollection;
+    /**
+     * Parse structured grid axes in the exact frame selected by the mesh pre-pass.
+     */
+    parseGridAxesInFrame(content: string, frame: RtcFrame): GridAxisCollection;
     /**
      * Parse the file and return every `IfcGridAxis` as a flat `Float32Array`
      * of 3D line-list vertices `[x0,y0,z0, x1,y1,z1, …]` (one segment per
@@ -559,9 +867,38 @@ export class IfcAPI {
      */
     parseGridLines(content: string): Float32Array;
     /**
+     * Parse grid line vertices in the exact frame selected by the mesh pre-pass.
+     */
+    parseGridLinesInFrame(content: string, frame: RtcFrame): Float32Array;
+    /**
+     * Parse all currently supported LandXML source families from the original
+     * bytes. Terrain-only and alignment-only sources both return an honest
+     * empty sibling collection, allowing the viewer's single load path to
+     * handle either form and mixed documents uniformly.
+     */
+    parseLandXmlSourceBytes(data: Uint8Array): LandXmlSourceDocumentJs;
+    /**
+     * Parse a source with explicit hostile-input bounds. Passing
+     * `cancelled: true` refuses before entering WASM; in-flight browser
+     * cancellation is performed by terminating the worker that owns this
+     * synchronous operation.
+     */
+    parseLandXmlSourceBytesWithOptions(data: Uint8Array, options: any): LandXmlSourceDocumentJs;
+    /**
+     * Parse a supported LandXML TIN document from its original bytes.
+     *
+     * The object is an owned serialization of the semantic document. Errors
+     * deliberately use `LandXmlError::Display`, including its stable LXML code.
+     */
+    parseLandXmlTinBytes(data: Uint8Array): LandXmlTinDocumentJs;
+    /**
      * Parse IFC file and extract symbolic representations (Plan,
      * Annotation, FootPrint, Axis). These are 2D curves used for
      * architectural drawings instead of sectioning 3D geometry.
+     *
+     * This standalone entry point detects an RTC frame from the whole source.
+     * Use `parseSymbolicRepresentationsInFrame` when the symbols accompany
+     * meshes produced by a streaming pre-pass or federation override.
      *
      * Example:
      * ```javascript
@@ -576,11 +913,83 @@ export class IfcAPI {
      */
     parseSymbolicRepresentations(content: string): SymbolicRepresentationCollection;
     /**
+     * Parse symbolic representations in the exact RTC frame selected by the
+     * browser mesh pre-pass rather than detecting a second frame from the
+     * whole source.
+     */
+    parseSymbolicRepresentationsInFrame(content: string, frame: RtcFrame): SymbolicRepresentationCollection;
+    /**
+     * Create a calibrated image annotation through canonical native geometry.
+     * Input is AnnotationPlaneRequest; output UTF-8 AnnotationPlanePlan JSON.
+     * Does not mutate the IFC snapshot or decode the host-owned image.
+     */
+    planAnnotationPlane(content: Uint8Array, request_json: string): Uint8Array;
+    /**
+     * Plan image/UV edits against an effective IFC snapshot without mutating it.
+     * JSON input uses AppearanceRequest; output is UTF-8 AppearancePlan JSON.
+     * Call from a worker, then validate sourceRevision and allocator before an
+     * atomic host commit. Preview UVs describe an unsplit canonical mesh item.
+     */
+    planAppearance(content: Uint8Array, request_json: string): Uint8Array;
+    /**
+     * Create a captured textured surface through canonical native geometry.
+     * Input is CapturedMeshRequest; output UTF-8 CapturedMeshPlan JSON.
+     * Does not mutate the IFC snapshot or decode the host-owned image.
+     */
+    planCapturedMesh(content: Uint8Array, request_json: string): Uint8Array;
+    /**
+     * Registered mesh observations over canonical target albedo. Host verifies
+     * original GLB identity against decoded source mesh/image and freezes frames.
+     * Run in an owned cancellable worker. IFPA output adds `transfer` coverage;
+     * `plan` is null when no sample is observed. Never infer accuracy approval.
+     */
+    planMeshTransfer(content: Uint8Array, request_json: string, rgba: Uint8Array): Uint8Array;
+    /**
+     * Finite-page composition over original canonical albedo. RGBA is supplied
+     * separately from the bounded JSON request. Result: IFPA magic, little-endian
+     * u32 JSON byte length, metadata JSON, then PNG bytes addressed by metadata.
+     * Run in a cancellable worker; atomically adopt every item asset and IFC edit.
+     */
+    planPageAppearance(content: Uint8Array, request_json: string, rgba: Uint8Array): Uint8Array;
+    /**
+     * Plan an opaque polygonal PDF fill page as canonical IfcAnnotation
+     * geometry with a provenance property set. An exact page plans directly; a
+     * page with visible omissions needs the accepted fidelity report digest.
+     */
+    planPdfFillAnnotation(source: Uint8Array, request_json: string): Uint8Array;
+    /**
+     * Registered RGB point-cloud observations (#4381). `request_json.source`
+     * is `{kind:'points', …}`; `positions` (3n f64, source-frame metres) and
+     * `colors` (3n RGB8) are the payload, `normals` (3n f32, oriented) and
+     * `stations` (n indices into `source.viewpoints`) are empty when absent.
+     * `rgba` carries only the target's existing rasters. Same output as
+     * `planMeshTransfer`; `transfer.source` records the orientation used.
+     */
+    planPointTransfer(content: Uint8Array, request_json: string, rgba: Uint8Array, positions: Float64Array, colors: Uint8Array, normals: Float32Array, stations: Uint32Array): Uint8Array;
+    /**
+     * Prepare bounded ordered PDF vector graphics states and the page fidelity
+     * report (convertible paths, omissions with extent, exact/raster-only).
+     */
+    preparePdfVectorPage(request_json: string): Uint8Array;
+    /**
+     * Evaluate one supported horizontal-alignment source span at an exact
+     * f64 distance. The binding reuses the native validator, so malformed
+     * deserialized records, discontinuities, unresolved references, and
+     * unsupported transition domains are rejected rather than approximated.
+     */
+    probeLandXmlAlignmentAtDistance(data: Uint8Array, alignment_source_id: string, distance: number, offset_right: number): LandXmlAlignmentProbeJs;
+    /**
+     * Evaluate a bounded set of physical locations carrying a displayed
+     * station label. A duplicate label is real, never collapsed; an
+     * excessive number is refused rather than allocated synchronously.
+     */
+    probeLandXmlAlignmentAtStation(data: Uint8Array, alignment_source_id: string, station: number, offset_right: number): LandXmlAlignmentProbesJs;
+    /**
      * Process geometry for a subset of pre-scanned entities → flat
      * MeshCollection. Takes raw bytes + pre-pass data from buildPrePassOnce.
      * Thin wrapper over [`IfcAPI::produce_batch`]; converts each produced mesh
-     * to MeshDataJs (the IFC Z-up→WebGL Y-up swap + winding reversal happen
-     * there). Output is byte-for-byte what the pre-refactor method produced.
+     * to MeshDataJs (the IFC Z-up→WebGL Y-up rotation with preserved winding happens
+     * there). Flat indices preserve source order through this proper rotation.
      */
     processGeometryBatch(data: Uint8Array, jobs_flat: Uint32Array, unit_scale: number, rtc_x: number, rtc_y: number, rtc_z: number, needs_shift: boolean, void_keys: Uint32Array, void_counts: Uint32Array, void_values: Uint32Array, style_ids: Uint32Array, style_colors: Uint8Array, plane_angle_to_radians?: number | null, material_element_ids?: Uint32Array | null, material_color_counts?: Uint32Array | null, material_colors_rgba?: Uint8Array | null): MeshCollection;
     /**
@@ -626,16 +1035,28 @@ export class IfcAPI {
      */
     processGeometryBatchPartitionedFromSource(jobs_flat: Uint32Array, unit_scale: number, rtc_x: number, rtc_y: number, rtc_z: number, needs_shift: boolean, void_keys: Uint32Array, void_counts: Uint32Array, void_values: Uint32Array, style_ids: Uint32Array, style_colors: Uint8Array, plane_angle_to_radians?: number | null, material_element_ids?: Uint32Array | null, material_color_counts?: Uint32Array | null, material_colors_rgba?: Uint8Array | null): PartitionedBatch;
     /**
+     * Fit bounded manual correspondences in source metres -> IFC world Z-up
+     * metres, reporting held-out errors separately. Does not load or move models.
+     */
+    registerScanCorrespondences(request_json: string): Uint8Array;
+    /**
      * Sharded pre-pass: resolve ONE contiguous (file-ordered) slice of the
      * styled-item span list on this worker, against the entity index installed
      * by `setEntityIndex`. Returns raw resolved maps as flat columns:
-     * `{ orphanIds, orphanColors (f32 rgba per id), geomIds, geomColors }`.
+     * `{ orphanIds, orphanColors (f32 rgba per id), geomIds, geomColors,
+     * geomFinishes }`, where `geomFinishes` is the #5582 `[metallic,
+     * roughness]` pair per `geomIds` entry (NaN when unauthored), from
+     * `resolve_geometry_finishes` over this slice.
      * The host merges shard results IN SHARD ORDER with first-wins per
      * geometry id, reproducing the serial resolver's file-order precedence,
      * then hands the merged columns to `finalizePrepassStyles`.
      * `spans` is `[id, start, len]` triples.
      */
     resolveStyledItemsShard(data: Uint8Array, spans: Uint32Array): any;
+    /**
+     * Resolve styled-item spans against the installed source and entity index.
+     */
+    resolveStyledItemsShardFromSource(spans: Uint32Array): any;
     /**
      * Fast entity scanning using SIMD-accelerated Rust scanner
      * Returns array of entity references for data model parsing
@@ -688,6 +1109,10 @@ export class IfcAPI {
      */
     scanEntityIndexShard(data: Uint8Array, range_start: number, range_end: number): any;
     /**
+     * Scan a shard of the source installed by `setSourceBytes`.
+     */
+    scanEntityIndexShardFromSource(start: number, end: number): any;
+    /**
      * Fast geometry-only entity scanning
      * Scans only entities that have geometry, skipping 99% of non-geometry entities
      * Returns array of geometry entity references for parallel processing
@@ -717,10 +1142,10 @@ export class IfcAPI {
      * even though the pre-pass worker built the same index minutes
      * earlier.
      *
-     * Builds a compact [`ColumnarEntityIndex`] from the three input slices
+     * Adopts the three binding-owned columns into a compact [`ColumnarEntityIndex`]
      * (sorted `u32` columns + binary search) instead of a per-worker
      * `FxHashMap` — ~229 MB vs ~436 MB on a 19.1 M-entity model (#1682).
-     * [`ColumnarEntityIndex::from_columns`] verifies the id ordering once
+     * [`ColumnarEntityIndex::from_owned_columns`] verifies the id ordering once
      * (O(n)) and only argsorts if the producer did not emit sorted columns.
      *
      * `lengths[i]` is the byte length of entity `ids[i]`, so lookup returns
@@ -729,6 +1154,12 @@ export class IfcAPI {
      * Idempotent in the sense that repeated calls REPLACE the cache —
      * supports the parser-worker pattern of reusing one IfcAPI across
      * multiple loads with different files.
+     *
+     * Throws when the three columns disagree in length. Every call is a
+     * content swap, a rejected one included: the previous file's index,
+     * content-scoped caches and pipeline diagnostics are dropped before the
+     * error is raised, and a rejected or empty index leaves no index, so the
+     * next batch scans the bytes it is given.
      */
     setEntityIndex(ids: Uint32Array, starts: Uint32Array, lengths: Uint32Array): void;
     /**
@@ -783,6 +1214,15 @@ export class IfcAPI {
      * Default is `false`. Pass `true` before calling `processGeometryBatch`.
      */
     setMergeLayers(enabled: boolean): void;
+    /**
+     * Sharded pre-pass (#5582): stash the shard-merged geometry finishes —
+     * the `geomFinishes` columns `resolveStyledItemsShard` returns, merged
+     * first-wins like `geomColors` — for the next `finalizePrepassStyles` /
+     * `finalizePrepassStylesFromSource` call on this instance, which consumes
+     * them and emits the aligned `styleFinishes`. Without this call that
+     * finalize emits NaN finishes, as it always emitted colours only.
+     */
+    setPrepassGeometryFinishes(geom_ids: Uint32Array, geom_finishes: Float32Array): void;
     /**
      * Enable or disable the PARAMETRIC rectangular-opening fast path (the
      * placement-frame, ground-truth-exact analytic cut) for `processGeometryBatch`.
@@ -839,6 +1279,22 @@ export class IfcAPI {
      */
     setSourceBytes(data: Uint8Array): void;
     /**
+     * Install the prepass's authored metallic/roughness per style (#5582):
+     * `styleFinishes` carries two floats per `styleIds` entry,
+     * `[metallic, roughness]`, NaN for an unauthored field — the
+     * `styleFinishes` array every prepass result carries beside `styleColors`.
+     * Call it with the same `styleIds` later passed to `processGeometryBatch*`;
+     * finishes set for a different style wire are ignored. Empty arrays clear
+     * them. Malformed lengths never throw: a style without a complete pair
+     * simply gets no finish.
+     *
+     * The batch stamps each returned `MeshDataJs` (`metallic` / `roughness`)
+     * from these, taking each mesh's finish from the style its colour came
+     * from (#5984). Occurrences that ride the instanced (IFNS) shard carry
+     * theirs in the shard's per-instance finish field (v3).
+     */
+    setStyleFinishes(style_ids: Uint32Array, style_finishes: Float32Array): void;
+    /**
      * Select the tessellation detail level applied by every subsequent
      * `processGeometryBatch` call (issue #976, step 4).
      *
@@ -882,6 +1338,37 @@ export class IfcAPI {
     readonly version: string;
 }
 
+export class LandXmlTinStreamSession {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    abort(): void;
+    advanceChunk(data: Uint8Array): void;
+    /**
+     * Drain only after the renderer has credited this many transport bytes.
+     */
+    drain(max_bytes: number): any;
+    finish(): any;
+    /**
+     * Start the resumable metadata cursor. Consumers must continue draining
+     * until [`Self::output_pending`] is false, then abort/free the session.
+     */
+    finishCursor(): void;
+    header(): any;
+    /**
+     * Whether the host must grant more credited output drain capacity.
+     */
+    outputPending(): boolean;
+    /**
+     * Exact serialized transport bytes currently retained by the Rust queue.
+     */
+    queuedBytes(): number;
+    /**
+     * Complete credited transport records currently retained by the Rust queue.
+     */
+    queuedEvents(): number;
+}
+
 /**
  * Collection of mesh data for returning multiple meshes
  */
@@ -895,7 +1382,9 @@ export class MeshCollection {
      */
     get(index: number): MeshDataJs | undefined;
     /**
-     * Check if RTC offset is significant (>10km)
+     * Check if an RTC offset was applied to these meshes (any non-zero
+     * component). It can be inside 10 km: the placement-bounds fallback
+     * re-bases on the bbox centre when a corner is past 10 km (#4643).
      */
     hasRtcOffset(): boolean;
     /**
@@ -1105,6 +1594,10 @@ export class MeshDataJs {
      */
     readonly materialId: number | undefined;
     /**
+     * IFC-authored metallic/roughness (#5582). `undefined` when unauthored.
+     */
+    readonly metallic: number | undefined;
+    /**
      * Get normals as Float32Array (copy to JS)
      */
     readonly normals: Float32Array;
@@ -1118,6 +1611,7 @@ export class MeshDataJs {
      * Get positions as Float32Array (copy to JS)
      */
     readonly positions: Float32Array;
+    readonly roughness: number | undefined;
     /**
      * Optional SurfaceColour for the "Shading" GLB-export choice — only
      * present when the file authored a distinct DiffuseColour. JS sees
@@ -1526,6 +2020,7 @@ export class SymbolicFillArea {
     readonly fillB: number;
     readonly fillG: number;
     readonly fillR: number;
+    readonly geometryItemId: number | undefined;
     readonly hasHatching: boolean;
     readonly hatchAngle: number;
     readonly hatchAngleSecondary: number;
@@ -1806,7 +2301,12 @@ export function intersection2d(a: Contours2D, b: Contours2D): Contours2D;
  *
  * `positions` is flat XYZ; `indices` is flat triangle indices. `axis` is
  * 0/1/2 = x/y/z (the cut axis, WebGL Y-up). Returns `undefined` when the mesh
- * has no triangles or projects to nothing.
+ * has no triangles or projects to nothing: the element has no footprint.
+ *
+ * THROWS when the outline was not computed: an `axis` outside 0..=2, or a
+ * mesh with more valid projected triangles than the overlay budget (50 000).
+ * The viewer's outline provider catches the throw and draws its TypeScript
+ * silhouette for that mesh.
  *
  * ```javascript
  * const outline = meshOutline2d(positions, indices, 1, false); // axis 1 = y
@@ -1857,10 +2357,17 @@ export function resolve2d(a: Contours2D): Contours2D;
  * meaningless volumes with a plausible `sumErrorRel`, so the closure proof
  * above is the caller's responsibility and not a formality.
  *
+ * Returns `undefined` when the mesh encloses no volume (no triangles survive
+ * the filter above, or the shell is degenerate): there is nothing to split,
+ * and a result for it would report `pieceCount` 1, `sumErrorRel` 0 and
+ * `remainderFailed` false, a perfect split of nothing. A caller that gates
+ * on those numbers must treat `undefined` as "no split", not as "no error".
+ *
  * ```javascript
  * const split = splitMeshByZones(positions, indices, new Float64Array([
  *   0, 0, 0, 10, 10, 10, 0,
  * ]));
+ * if (!split) return; // the mesh encloses no volume
  * for (let i = 0; i < split.pieceCount; i++) {
  *   const piece = split.piece(i);
  *   // piece.zoneIndex, piece.positions, piece.indices, piece.volume
@@ -1869,7 +2376,7 @@ export function resolve2d(a: Contours2D): Contours2D;
  * split.free();
  * ```
  */
-export function splitMeshByZones(positions: Float64Array, indices: Uint32Array, zones: Float64Array, footprints?: Float64Array | null, footprint_counts?: Uint32Array | null): ZoneSplitJs;
+export function splitMeshByZones(positions: Float64Array, indices: Uint32Array, zones: Float64Array, footprints?: Float64Array | null, footprint_counts?: Uint32Array | null): ZoneSplitJs | undefined;
 
 /**
  * `a ∪ b`.
@@ -1902,6 +2409,7 @@ export interface InitOutput {
     readonly __wbg_gridaxiscollection_free: (a: number, b: number) => void;
     readonly __wbg_gridaxisjs_free: (a: number, b: number) => void;
     readonly __wbg_ifcapi_free: (a: number, b: number) => void;
+    readonly __wbg_landxmltinstreamsession_free: (a: number, b: number) => void;
     readonly __wbg_meshcollection_free: (a: number, b: number) => void;
     readonly __wbg_meshdatajs_free: (a: number, b: number) => void;
     readonly __wbg_meshoutlinejs_free: (a: number, b: number) => void;
@@ -1929,6 +2437,7 @@ export interface InitOutput {
     readonly clashrunresult_a: (a: number, b: number) => void;
     readonly clashrunresult_b: (a: number, b: number) => void;
     readonly clashrunresult_bounds: (a: number, b: number) => void;
+    readonly clashrunresult_depthFloor: (a: number, b: number) => void;
     readonly clashrunresult_distance: (a: number, b: number) => void;
     readonly clashrunresult_distanceKind: (a: number, b: number) => void;
     readonly clashrunresult_points: (a: number, b: number) => void;
@@ -1958,57 +2467,97 @@ export interface InitOutput {
     readonly ifcapi_buildPrePassOnce: (a: number, b: number, c: number) => number;
     readonly ifcapi_buildPrePassStreaming: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
     readonly ifcapi_buildPrePassStreamingSharded: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number) => void;
+    readonly ifcapi_buildPrePassStreamingShardedWithSourceFingerprint: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number) => void;
+    readonly ifcapi_buildPrePassStreamingWithSourceFingerprint: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
+    readonly ifcapi_calibrateAppearancePlane: (a: number, b: number, c: number, d: number) => void;
+    readonly ifcapi_catalogAppearance: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly ifcapi_clearPrePassCache: (a: number) => void;
+    readonly ifcapi_createLandXmlTinStreamSession: (a: number, b: number, c: number, d: number) => void;
     readonly ifcapi_diagnoseGeometry: (a: number, b: number, c: number) => number;
     readonly ifcapi_exportCsv: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
     readonly ifcapi_exportDfjson: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly ifcapi_exportGlb: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number) => void;
     readonly ifcapi_exportGlbFromMeshes: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number) => void;
     readonly ifcapi_exportHbjson: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly ifcapi_exportHbjsonWithStats: (a: number, b: number, c: number, d: number, e: number) => number;
     readonly ifcapi_exportIfcx: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly ifcapi_exportJson: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly ifcapi_exportJsonld: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => void;
-    readonly ifcapi_exportKmz: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number) => void;
     readonly ifcapi_exportKmzFromMeshes: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number, v: number, w: number, x: number, y: number, z: number, a1: number) => void;
     readonly ifcapi_exportMerged: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly ifcapi_exportObj: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
     readonly ifcapi_exportStep: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => void;
     readonly ifcapi_exportUsd: (a: number, b: number, c: number, d: number) => void;
     readonly ifcapi_extractProfiles: (a: number, b: number, c: number, d: number) => number;
+    readonly ifcapi_extractSweptDiskDescriptions: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly ifcapi_extrusionDefinitions: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly ifcapi_finalizePrepassStyles: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number, v: number, w: number, x: number, y: number) => void;
+    readonly ifcapi_finalizePrepassStylesFromSource: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number, v: number, w: number) => void;
     readonly ifcapi_getMemory: (a: number) => number;
     readonly ifcapi_getPipelineDiagnostics: (a: number) => number;
+    readonly ifcapi_inspectLandXmlAlignmentAtDistance: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly ifcapi_is_ready: (a: number) => number;
     readonly ifcapi_new: () => number;
     readonly ifcapi_parseAlignmentLines: (a: number, b: number, c: number) => number;
+    readonly ifcapi_parseAlignmentLinesInFrame: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly ifcapi_parseGridAxes: (a: number, b: number, c: number) => number;
+    readonly ifcapi_parseGridAxesInFrame: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly ifcapi_parseGridLines: (a: number, b: number, c: number) => number;
+    readonly ifcapi_parseGridLinesInFrame: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly ifcapi_parseLandXmlSourceBytes: (a: number, b: number, c: number, d: number) => void;
+    readonly ifcapi_parseLandXmlSourceBytesWithOptions: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly ifcapi_parseLandXmlTinBytes: (a: number, b: number, c: number, d: number) => void;
     readonly ifcapi_parseSymbolicRepresentations: (a: number, b: number, c: number) => number;
+    readonly ifcapi_parseSymbolicRepresentationsInFrame: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly ifcapi_planAnnotationPlane: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly ifcapi_planAppearance: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly ifcapi_planCapturedMesh: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly ifcapi_planMeshTransfer: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
+    readonly ifcapi_planPageAppearance: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
+    readonly ifcapi_planPdfFillAnnotation: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly ifcapi_planPointTransfer: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number) => void;
+    readonly ifcapi_preparePdfVectorPage: (a: number, b: number, c: number, d: number) => void;
+    readonly ifcapi_probeLandXmlAlignmentAtDistance: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
+    readonly ifcapi_probeLandXmlAlignmentAtStation: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly ifcapi_processGeometryBatch: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number, v: number, w: number, x: number, y: number, z: number, a1: number, b1: number) => number;
     readonly ifcapi_processGeometryBatchFromSource: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number, v: number, w: number, x: number, y: number, z: number) => number;
     readonly ifcapi_processGeometryBatchInstanced: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number, v: number, w: number, x: number, y: number, z: number, a1: number, b1: number, c1: number) => void;
     readonly ifcapi_processGeometryBatchPartitioned: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number, v: number, w: number, x: number, y: number, z: number, a1: number, b1: number) => number;
     readonly ifcapi_processGeometryBatchPartitionedFromSource: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number, v: number, w: number, x: number, y: number, z: number) => number;
+    readonly ifcapi_registerScanCorrespondences: (a: number, b: number, c: number, d: number) => void;
     readonly ifcapi_resolveStyledItemsShard: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly ifcapi_resolveStyledItemsShardFromSource: (a: number, b: number, c: number, d: number) => void;
     readonly ifcapi_scanEntitiesFast: (a: number, b: number, c: number) => number;
     readonly ifcapi_scanEntitiesFastBytes: (a: number, b: number, c: number) => number;
     readonly ifcapi_scanEntityIndexShard: (a: number, b: number, c: number, d: number, e: number) => number;
+    readonly ifcapi_scanEntityIndexShardFromSource: (a: number, b: number, c: number) => number;
     readonly ifcapi_scanGeometryEntitiesFast: (a: number, b: number, c: number) => number;
     readonly ifcapi_setComputeGeometryHashes: (a: number, b: number, c: number) => void;
-    readonly ifcapi_setEntityIndex: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+    readonly ifcapi_setEntityIndex: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly ifcapi_setInstantiatedTypeIds: (a: number, b: number, c: number) => void;
     readonly ifcapi_setMappedInstancePlan: (a: number, b: number, c: number) => void;
     readonly ifcapi_setMaterialLayerIndex: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number) => void;
     readonly ifcapi_setMergeLayers: (a: number, b: number) => void;
+    readonly ifcapi_setPrepassGeometryFinishes: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly ifcapi_setRectParamFastPath: (a: number, b: number) => void;
     readonly ifcapi_setReferencedRepmaps: (a: number, b: number, c: number) => void;
     readonly ifcapi_setSkipSmallCuts: (a: number, b: number) => void;
     readonly ifcapi_setSourceBytes: (a: number, b: number, c: number) => void;
+    readonly ifcapi_setStyleFinishes: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly ifcapi_setTessellationQuality: (a: number, b: number, c: number, d: number) => void;
     readonly ifcapi_simplifyMeshes: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number, v: number, w: number, x: number, y: number, z: number, a1: number) => void;
     readonly ifcapi_version: (a: number, b: number) => void;
     readonly intersection2d: (a: number, b: number) => number;
-    readonly meshOutline2d: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
+    readonly landxmltinstreamsession_abort: (a: number) => void;
+    readonly landxmltinstreamsession_advanceChunk: (a: number, b: number, c: number, d: number) => void;
+    readonly landxmltinstreamsession_drain: (a: number, b: number, c: number) => void;
+    readonly landxmltinstreamsession_finish: (a: number, b: number) => void;
+    readonly landxmltinstreamsession_finishCursor: (a: number, b: number) => void;
+    readonly landxmltinstreamsession_header: (a: number, b: number) => void;
+    readonly landxmltinstreamsession_outputPending: (a: number) => number;
+    readonly landxmltinstreamsession_queuedBytes: (a: number) => number;
+    readonly landxmltinstreamsession_queuedEvents: (a: number) => number;
+    readonly meshOutline2d: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly meshcollection_buildingRotation: (a: number, b: number) => void;
     readonly meshcollection_diagnostics: (a: number) => number;
     readonly meshcollection_geometryAabbValues: (a: number) => number;
@@ -2036,9 +2585,11 @@ export interface InitOutput {
     readonly meshdatajs_localBounds: (a: number, b: number) => void;
     readonly meshdatajs_localToWorld: (a: number, b: number) => void;
     readonly meshdatajs_materialId: (a: number) => number;
+    readonly meshdatajs_metallic: (a: number) => number;
     readonly meshdatajs_normals: (a: number) => number;
     readonly meshdatajs_origin: (a: number) => number;
     readonly meshdatajs_positions: (a: number) => number;
+    readonly meshdatajs_roughness: (a: number) => number;
     readonly meshdatajs_shadingColor: (a: number, b: number) => void;
     readonly meshdatajs_textureHeight: (a: number) => number;
     readonly meshdatajs_textureId: (a: number) => number;
@@ -2117,10 +2668,12 @@ export interface InitOutput {
     readonly symboliccircle_repIdentifier: (a: number, b: number) => void;
     readonly symboliccircle_startAngle: (a: number) => number;
     readonly symboliccircle_worldY: (a: number) => number;
+    readonly symbolicfillarea_expressId: (a: number) => number;
     readonly symbolicfillarea_fillA: (a: number) => number;
     readonly symbolicfillarea_fillB: (a: number) => number;
     readonly symbolicfillarea_fillG: (a: number) => number;
     readonly symbolicfillarea_fillR: (a: number) => number;
+    readonly symbolicfillarea_geometryItemId: (a: number) => number;
     readonly symbolicfillarea_hasHatching: (a: number) => number;
     readonly symbolicfillarea_hatchAngle: (a: number) => number;
     readonly symbolicfillarea_hatchAngleSecondary: (a: number) => number;
@@ -2136,6 +2689,7 @@ export interface InitOutput {
     readonly symbolicpolyline_expressId: (a: number) => number;
     readonly symbolicpolyline_ifcType: (a: number, b: number) => void;
     readonly symbolicpolyline_isClosed: (a: number) => number;
+    readonly symbolicpolyline_pointCount: (a: number) => number;
     readonly symbolicpolyline_points: (a: number) => number;
     readonly symbolicpolyline_repIdentifier: (a: number, b: number) => void;
     readonly symbolicrepresentationcollection_circleCount: (a: number) => number;
@@ -2153,11 +2707,11 @@ export interface InitOutput {
     readonly symbolicrepresentationcollection_truncatedLimit: (a: number) => number;
     readonly symbolicrepresentationcollection_truncatedReason: (a: number, b: number) => void;
     readonly symbolictext_alignment: (a: number, b: number) => void;
-    readonly symbolictext_colorA: (a: number) => number;
     readonly symbolictext_content: (a: number, b: number) => void;
     readonly symbolictext_ifcType: (a: number, b: number) => void;
     readonly symbolictext_repIdentifier: (a: number, b: number) => void;
-    readonly symbolictext_targetPx: (a: number) => number;
+    readonly symbolictext_x: (a: number) => number;
+    readonly symbolictext_y: (a: number) => number;
     readonly union2d: (a: number, b: number) => number;
     readonly version: (a: number) => void;
     readonly zonepiecejs_indices: (a: number) => number;
@@ -2167,10 +2721,9 @@ export interface InitOutput {
     readonly zonesplitjs_pieceCount: (a: number) => number;
     readonly zonesplitjs_remainderFailed: (a: number) => number;
     readonly meshoutlinejs_contourCount: (a: number) => number;
-    readonly symbolicpolyline_pointCount: (a: number) => number;
     readonly get_memory: () => number;
-    readonly symbolicfillarea_expressId: (a: number) => number;
     readonly symbolicpolyline_worldY: (a: number) => number;
+    readonly symbolictext_colorA: (a: number) => number;
     readonly symbolictext_colorB: (a: number) => number;
     readonly symbolictext_colorG: (a: number) => number;
     readonly symbolictext_colorR: (a: number) => number;
@@ -2178,9 +2731,8 @@ export interface InitOutput {
     readonly symbolictext_dirY: (a: number) => number;
     readonly symbolictext_expressId: (a: number) => number;
     readonly symbolictext_height: (a: number) => number;
+    readonly symbolictext_targetPx: (a: number) => number;
     readonly symbolictext_worldY: (a: number) => number;
-    readonly symbolictext_x: (a: number) => number;
-    readonly symbolictext_y: (a: number) => number;
     readonly zonepiecejs_volume: (a: number) => number;
     readonly zonesplitjs_sumErrorRel: (a: number) => number;
     readonly zonesplitjs_wholeVolume: (a: number) => number;

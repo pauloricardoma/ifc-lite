@@ -149,6 +149,28 @@ fn only_ordinary_occurrence_geometry_is_a_candidate() {
     assert!(is_instancing_candidate(&occurrence));
 }
 
+/// #5409: an opaque, repeated `IfcOpeningElement` rode the shard, which carries
+/// no class, so the Openings toggle never reached it. Every class-toggled class
+/// must stay flat; a physical class with the same shape must still instance,
+/// or the gate would be refusing everything rather than reading the class.
+#[test]
+fn class_toggled_classes_stay_flat_and_physical_classes_still_instance() {
+    for class in CLASS_TOGGLED_TYPES {
+        let mut mesh = plain_mesh();
+        mesh.ifc_type = (*class).to_string();
+        assert!(
+            !is_instancing_candidate(&mesh),
+            "{class} is gated by a whole-class viewer toggle; on the shard it \
+             would ignore that toggle"
+        );
+    }
+    for class in ["IfcWall", "IfcDoor", "IfcMember", "IfcOpeningElementType"] {
+        let mut mesh = plain_mesh();
+        mesh.ifc_type = class.to_string();
+        assert!(is_instancing_candidate(&mesh), "{class} is not class-toggled");
+    }
+}
+
 /// The candidate gate is about the mesh's own properties. Instance metadata
 /// decides repetition, not eligibility — so a candidate with no metadata is
 /// still a candidate (it just tallies nothing and lands on the flat path).
@@ -380,4 +402,161 @@ fn an_empty_wire_decodes_to_an_empty_map() {
         style_colors_from_wire(&[1, 2], &[]).is_empty(),
         "ids with no colour bytes at all yield nothing, not black"
     );
+}
+
+/// The occurrence count handed to the viewer must equal the instances actually
+/// in the shard.
+///
+/// Three things leave `refs` on the way to the shard, and the count has to
+/// follow all three. Members the collator refuses are taken back for the flat
+/// collection (`rejected`), and that was subtracted. But a pose-only #1623
+/// placeholder whose group has no invertible template placement reaches NEITHER
+/// side: there is no `rel` to place it with and no geometry of its own to draw.
+/// That one was not subtracted, so a batch containing such a group reported more
+/// occurrences than it drew, and this partition is the only caller that feeds
+/// pose-only refs at all.
+#[test]
+fn the_reported_occurrence_count_equals_what_reaches_the_shard() {
+    use ifc_lite_geometry::{InstanceMeshRef, InstanceMeta};
+
+    // A shareable group at exactly the gate: same geometry, same placement, so
+    // every pairing reconstructs exactly and the group is instanced. The shared
+    // `meta` helper's transform is all zeros, which is SINGULAR and would be
+    // refused for that reason instead -- the placement has to be a real one.
+    let identity = InstanceMeta {
+        transform: {
+            let mut m = [0.0f64; 16];
+            for k in 0..4 {
+                m[k * 4 + k] = 1.0;
+            }
+            m
+        },
+        ..meta(1, true)
+    };
+    let good: Vec<MeshData> = (0..INSTANCE_MIN_OCCURRENCES)
+        .map(|_| plain_mesh().with_instance(Some(identity.clone())))
+        .collect();
+    // A group whose template placement is SINGULAR (a rank-deficient linear
+    // part), so nothing in it can be placed, plus one pose-only placeholder.
+    let singular = InstanceMeta {
+        transform: {
+            let mut m = [0.0f64; 16];
+            m[15] = 1.0;
+            m
+        },
+        ..meta(2, true)
+    };
+    let broken = plain_mesh().with_instance(Some(singular));
+    let placeholder_meta = meta(2, true);
+
+    let mut refs: Vec<InstanceMeshRef> = good
+        .iter()
+        .chain(std::iter::once(&broken))
+        .map(|m: &MeshData| InstanceMeshRef {
+            positions: &m.positions,
+            normals: &m.normals,
+            indices: &m.indices,
+            origin: m.origin,
+            instance_meta: m.instance.as_ref(),
+            entity_id: m.express_id,
+            color: m.color,
+            item_id: m.geometry_item_id,
+        })
+        .collect();
+    let materialized = refs.len();
+    refs.push(InstanceMeshRef {
+        positions: &[],
+        normals: &[],
+        indices: &[],
+        origin: [0.0; 3],
+        instance_meta: Some(&placeholder_meta),
+        entity_id: 99,
+        color: [0.0; 4],
+        item_id: None,
+    });
+
+    let (shard, rejected, dropped) =
+        encode_shard_routing_refusals_back(&refs, &[], materialized, [0.0; 3]);
+    assert_eq!(rejected, vec![materialized - 1], "the unplaceable member draws flat");
+    assert_eq!(dropped, 1, "its placeholder reaches neither side");
+
+    let shipped = ifc_lite_geometry::decode_instanced(&shard).expect("decodes").instances.len();
+    assert_eq!(
+        shipped, INSTANCE_MIN_OCCURRENCES as usize,
+        "only the shareable group rides the shard"
+    );
+    assert_eq!(
+        refs.len() - dropped - rejected.len(),
+        shipped,
+        "the reported occurrence count must equal the shard's instances"
+    );
+    // The arithmetic that omitted `dropped` overreports on exactly this fixture,
+    // which is what makes the subtraction load-bearing rather than defensive.
+    assert_ne!(refs.len() - rejected.len(), shipped);
+}
+
+#[test]
+fn take_back_rejected_counts_pushes_not_the_length_of_its_input() {
+    // The caller subtracts the return from the occurrence count it reports, so
+    // it has to be what happened, not what was asked for. Index 5 is past the
+    // end of `instanced`: the loop never reaches it, so it is not a push, and
+    // returning `rejected.len()` would say three meshes left the shard when
+    // only two did — undercounting the shard's instances while the mesh stayed
+    // in it.
+    let instanced = vec![(plain_mesh(), None), (plain_mesh(), None)];
+    let rejected = [0usize, 1, 5];
+    let mut collection = MeshCollection::new();
+    let taken = take_back_rejected(instanced, &rejected, &mut collection);
+    assert_eq!(taken, 2, "only the two in-range entries were pushed");
+    assert_eq!(collection.length(), 2, "and the collection holds exactly those");
+    assert_ne!(
+        taken,
+        rejected.len(),
+        "the return must not be a restatement of the input's length"
+    );
+}
+
+/// #5984: the partition hands each shard occurrence's finish to the encoder,
+/// so an instanced occurrence keeps its authored finish instead of the
+/// renderer's default (FZK-Haus's 42 instanced 'Kiefer' members, roughness
+/// 0.9). Every member here shares one finish, so instance order is moot.
+#[test]
+fn instanced_occurrences_carry_their_finish_in_the_shard() {
+    use ifc_lite_geometry::InstanceMeshRef;
+    let identity = InstanceMeta {
+        transform: {
+            let mut m = [0.0f64; 16];
+            for k in 0..4 {
+                m[k * 4 + k] = 1.0;
+            }
+            m
+        },
+        ..meta(1, true)
+    };
+    let group: Vec<MeshData> = (0..INSTANCE_MIN_OCCURRENCES)
+        .map(|_| plain_mesh().with_instance(Some(identity.clone())))
+        .collect();
+    let refs: Vec<InstanceMeshRef> = group
+        .iter()
+        .map(|m| InstanceMeshRef {
+            positions: &m.positions,
+            normals: &m.normals,
+            indices: &m.indices,
+            origin: m.origin,
+            instance_meta: m.instance.as_ref(),
+            entity_id: m.express_id,
+            color: m.color,
+            item_id: m.geometry_item_id,
+        })
+        .collect();
+    let kiefer = vec![[f32::NAN, 0.9]; refs.len()];
+    let (shard, rejected, _) = encode_shard_routing_refusals_back(&refs, &kiefer, refs.len(), [0.0; 3]);
+    assert!(rejected.is_empty(), "the group instances");
+    let finishes = ifc_lite_geometry::decode_instance_finishes(&shard).expect("decodes");
+    assert_eq!(finishes.len(), refs.len());
+    assert!(finishes.iter().all(|f| f[0].is_nan() && (f[1] - 0.9).abs() < 1e-6), "{finishes:?}");
+
+    let (plain, _, _) = encode_shard_routing_refusals_back(&refs, &[], refs.len(), [0.0; 3]);
+    let unfinished = ifc_lite_geometry::decode_instance_finishes(&plain).expect("decodes");
+    assert!(unfinished.iter().flatten().all(|v| v.is_nan()), "no finish, no field");
 }

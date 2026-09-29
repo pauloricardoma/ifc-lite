@@ -21,6 +21,8 @@ import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useViewerStore } from '@/store';
+import { useTranslation } from '@/i18n';
+import type { TranslationKey } from '@/i18n';
 import type { LayerAuthorKind, LayerStackEntry } from '@/store/slices/layerStackSlice';
 import { computeLayerContribution, shortContentId } from '@/lib/layers/stack';
 import { LayerDiffView } from './LayerDiffView';
@@ -37,19 +39,19 @@ interface LayersPanelProps {
 }
 
 /** Author kind → badge tint + icon. Mirrors the RoomPanel role-badge system. */
-const AUTHOR_META: Record<LayerAuthorKind, { label: string; cls: string; Icon: typeof User }> = {
+const AUTHOR_META: Record<LayerAuthorKind, { labelKey: TranslationKey; cls: string; Icon: typeof User }> = {
   human: {
-    label: 'Human',
+    labelKey: 'layersPanel.panel.authorHuman',
     cls: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-300',
     Icon: User,
   },
   agent: {
-    label: 'Agent',
+    labelKey: 'layersPanel.panel.authorAgent',
     cls: 'border-violet-500/30 bg-violet-500/10 text-violet-600 dark:text-violet-300',
     Icon: Bot,
   },
   hybrid: {
-    label: 'Hybrid',
+    labelKey: 'layersPanel.panel.authorHybrid',
     cls: 'border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-300',
     Icon: Users2,
   },
@@ -66,10 +68,11 @@ function accentClass(kind: LayerAuthorKind | undefined): string {
 }
 
 function AuthorBadge({ kind, principal }: { kind?: LayerAuthorKind; principal?: string }) {
+  const { t } = useTranslation();
   if (!kind) {
     return (
-      <span className="shrink-0 rounded-full border border-dashed px-1.5 py-px text-[10px] leading-none text-muted-foreground">
-        unsigned
+      <span className="shrink-0 rounded-full border border-dashed px-1.5 py-px text-2xs leading-none text-muted-foreground">
+        {t('layersPanel.panel.unsigned')}
       </span>
     );
   }
@@ -78,10 +81,10 @@ function AuthorBadge({ kind, principal }: { kind?: LayerAuthorKind; principal?: 
     <Tooltip>
       <TooltipTrigger asChild>
         <span
-          className={`inline-flex shrink-0 items-center gap-1 rounded-full border px-1.5 py-px text-[10px] font-medium leading-none ${m.cls}`}
+          className={`inline-flex shrink-0 items-center gap-1 rounded-full border px-1.5 py-px text-2xs font-medium leading-none ${m.cls}`}
         >
           <m.Icon className="size-2.5" aria-hidden />
-          {m.label}
+          {t(m.labelKey)}
         </span>
       </TooltipTrigger>
       {principal && <TooltipContent side="top">{principal}</TooltipContent>}
@@ -109,11 +112,12 @@ function LayerStratum({
   onInspect: () => void;
   onToggleDetail: () => void;
 }) {
+  const { t } = useTranslation();
   const created = entry.created ? entry.created.slice(0, 10) : undefined;
   const subParts: string[] = [];
   if (entry.authorPrincipal) subParts.push(entry.authorPrincipal);
   if (created) subParts.push(created);
-  subParts.push(`${entry.nodeCount} ${entry.nodeCount === 1 ? 'node' : 'nodes'}`);
+  subParts.push(t('layersPanel.panel.nodeCount', { count: entry.nodeCount, countDisplay: String(entry.nodeCount) }));
 
   return (
     <div
@@ -129,10 +133,10 @@ function LayerStratum({
         className="min-w-0 flex-1 text-left"
         onClick={onToggleDetail}
         aria-expanded={expanded}
-        aria-label={`Provenance of ${entry.name}`}
+        aria-label={t('layersPanel.panel.provenanceAriaLabel', { name: entry.name })}
       >
         <div className="flex items-center gap-1.5">
-          <span className="shrink-0 rounded bg-muted px-1 font-mono text-[10px] leading-4 text-muted-foreground">
+          <span className="shrink-0 rounded bg-muted px-1 font-mono text-2xs leading-4 text-muted-foreground">
             {total - position + 1}
           </span>
           <span className="truncate text-xs font-medium" title={entry.name}>
@@ -141,19 +145,22 @@ function LayerStratum({
           {entry.isMerge && (
             <Tooltip>
               <TooltipTrigger asChild>
-                <GitMerge className="size-3 shrink-0 text-muted-foreground" aria-label="Merge layer" />
+                <GitMerge
+                  className="size-3 shrink-0 text-muted-foreground"
+                  aria-label={t('layersPanel.panel.mergeLayerLabel')}
+                />
               </TooltipTrigger>
-              <TooltipContent side="top">Merge layer</TooltipContent>
+              <TooltipContent side="top">{t('layersPanel.panel.mergeLayerLabel')}</TooltipContent>
             </Tooltip>
           )}
           <AuthorBadge kind={entry.authorKind} principal={entry.authorPrincipal} />
         </div>
         {entry.intent && (
-          <div className="truncate text-[11px] italic text-muted-foreground" title={entry.intent}>
+          <div className="truncate text-2xs italic text-muted-foreground" title={entry.intent}>
             {entry.intent}
           </div>
         )}
-        <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
+        <div className="flex items-center gap-1.5 text-2xs text-muted-foreground">
           <span className="truncate">{subParts.join(' · ')}</span>
           {entry.checksTotal !== undefined && (
             <span
@@ -163,7 +170,7 @@ function LayerStratum({
                   : 'border-amber-500/30 text-amber-600 dark:text-amber-300'
               }`}
             >
-              {entry.checksPassed}/{entry.checksTotal} checks
+              {t('layersPanel.panel.checksBadge', { passed: entry.checksPassed ?? 0, total: entry.checksTotal })}
             </span>
           )}
           {entry.contentId && (
@@ -173,7 +180,7 @@ function LayerStratum({
                   {shortContentId(entry.contentId)}
                 </span>
               </TooltipTrigger>
-              <TooltipContent side="top" className="font-mono text-[10px]">
+              <TooltipContent side="top" className="font-mono text-2xs">
                 {entry.contentId}
               </TooltipContent>
             </Tooltip>
@@ -183,17 +190,18 @@ function LayerStratum({
       <Button
         variant="ghost"
         size="sm"
-        className="h-6 shrink-0 self-center px-1.5 text-[11px] opacity-0 transition-opacity focus-visible:opacity-100 group-hover:opacity-100"
+        className="h-6 shrink-0 self-center px-1.5 text-2xs opacity-0 transition-opacity focus-visible:opacity-100 group-hover:opacity-100"
         disabled={busy}
         onClick={onInspect}
       >
-        {active ? 'Hide' : 'Changes'}
+        {t(active ? 'layersPanel.panel.hideButton' : 'layersPanel.panel.changesButton')}
       </Button>
     </div>
   );
 }
 
 export function LayersPanel(_props: LayersPanelProps) {
+  const { t } = useTranslation();
   const layerStack = useViewerStore((s) => s.layerStack);
   const layerStackDiff = useViewerStore((s) => s.layerStackDiff);
   const layerDiffBusy = useViewerStore((s) => s.layerDiffBusy);
@@ -236,31 +244,29 @@ export function LayersPanel(_props: LayersPanelProps) {
       <ScrollArea className="h-full">
         <div className="flex flex-col items-center gap-2 p-6 pt-10 text-center">
           <Layers className="size-8 text-muted-foreground/50" aria-hidden />
-          <p className="text-xs font-medium">Layers: version your model like code</p>
-          <p className="max-w-[30ch] text-[11px] text-muted-foreground">
-            An IFC5 model composes from immutable layers. Inspect who changed
-            what, publish your edits as new layers, and merge them with
-            reviews, checks, and conflict resolution.
+          <p className="text-xs font-medium">{t('layersPanel.panel.heroTitle')}</p>
+          <p className="max-w-[30ch] text-2xs text-muted-foreground">
+            {t('layersPanel.panel.heroDescription')}
           </p>
           <div className="flex flex-col gap-1.5 pt-2">
             <Button
               size="sm"
-              className="h-7 gap-1.5 px-3 text-[11px]"
+              className="h-7 gap-1.5 px-3 text-2xs"
               onClick={() => void loadDemo()}
               disabled={demoBusy}
               {...tourAnchor(TOUR_ANCHORS.layersDemo)}
             >
               <Sparkles className="size-3.5" aria-hidden />
-              {demoBusy ? 'Loading…' : 'Load demo stack'}
+              {t(demoBusy ? 'layersPanel.panel.loadingDemo' : 'layersPanel.panel.loadDemoStack')}
             </Button>
             <Button
               size="sm"
               variant="outline"
-              className="h-7 gap-1.5 px-3 text-[11px]"
+              className="h-7 gap-1.5 px-3 text-2xs"
               onClick={() => stackInputRef.current?.click()}
             >
               <FolderOpen className="size-3.5" aria-hidden />
-              Open .ifcx files
+              {t('layersPanel.panel.openFilesButton')}
             </Button>
             <input
               ref={stackInputRef}
@@ -275,8 +281,8 @@ export function LayersPanel(_props: LayersPanelProps) {
               }}
             />
           </div>
-          <p className="max-w-[30ch] pt-1 text-[10px] text-muted-foreground/70">
-            You can also drop several .ifcx files anywhere in the viewer.
+          <p className="max-w-[30ch] pt-1 text-2xs text-muted-foreground">
+            {t('layersPanel.panel.dropHint')}
           </p>
           {/* Local candidates from earlier sessions stay actionable even
               before a stack is loaded (self-hides when the store is empty). */}
@@ -297,10 +303,13 @@ export function LayersPanel(_props: LayersPanelProps) {
 
   return (
     <div className="flex h-full flex-col">
-      <div className="flex items-center gap-1.5 px-3 pb-1 pt-2 text-[11px] text-muted-foreground">
+      <div className="flex items-center gap-1.5 px-3 pb-1 pt-2 text-2xs text-muted-foreground">
         <Layers className="size-3.5" aria-hidden />
         <span>
-          {layerStack.length} {layerStack.length === 1 ? 'layer' : 'layers'}, strongest on top
+          {t('layersPanel.panel.layerCountHeader', {
+            count: layerStack.length,
+            countDisplay: String(layerStack.length),
+          })}
         </span>
       </div>
       <ScrollArea className="min-h-0 flex-1">
@@ -329,7 +338,9 @@ export function LayersPanel(_props: LayersPanelProps) {
           ))}
           </div>
           {layerDiffBusy && (
-            <p className="px-1 py-2 text-center text-[11px] text-muted-foreground">Computing changes…</p>
+            <p className="px-1 py-2 text-center text-2xs text-muted-foreground">
+              {t('layersPanel.panel.computingChanges')}
+            </p>
           )}
           {layerStackDiff && activeEntry && !layerDiffBusy && (
             <LayerDiffView entry={activeEntry} diff={layerStackDiff.diff} />

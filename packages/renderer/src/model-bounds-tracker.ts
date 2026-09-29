@@ -121,7 +121,7 @@ export class ModelBoundsTracker {
     }
 
     /** Fold newly loaded mesh geometry into the tracked AABB. */
-    updateFromMeshes(meshes: import('@ifc-lite/geometry').MeshData[]): void {
+    updateFromMeshes(meshes: import('@ifc-lite/geometry').MeshData[], translationForModel?: (modelIndex: number) => readonly [number, number, number]): void {
         if (!this.bounds) {
             this.bounds = {
                 min: { x: Infinity, y: Infinity, z: Infinity },
@@ -135,7 +135,8 @@ export class ModelBoundsTracker {
             // Model bounds are world-space, so fold the per-mesh origin. No-op when
             // origin is absent/[0,0,0]. Mirrors coordinate-handler.ts.
             const o = mesh.origin;
-            const ox = o ? o[0] : 0, oy = o ? o[1] : 0, oz = o ? o[2] : 0;
+            const delta = translationForModel?.(mesh.modelIndex ?? 0);
+            const ox = (o?.[0] ?? 0) + (delta?.[0] ?? 0), oy = (o?.[1] ?? 0) + (delta?.[1] ?? 0), oz = (o?.[2] ?? 0) + (delta?.[2] ?? 0);
             for (let i = 0; i < positions.length; i += 3) {
                 const x = positions[i] + ox;
                 const y = positions[i + 1] + oy;
@@ -163,7 +164,28 @@ export class ModelBoundsTracker {
      *  "expand" would no-op. We detect the placeholder by its exact symmetric
      *  signature and replace it with the actual annotation AABB instead. */
     expandWithFlatVertices(positions: Float32Array, stride: number): void {
-        if (positions.length === 0) return;
+        this.expandWithVertices(positions.length, stride, (index, axis) => positions[index + axis]);
+    }
+
+    /**
+     * Fold one f32-local drawable through its f64 source anchor. Overlay
+     * vertices must never be widened to absolute f32 just to update the scene
+     * bounds: that would make camera framing disagree with the RTE draw.
+     */
+    expandWithAnchoredVertices(
+        positions: Float32Array,
+        origin: readonly [number, number, number],
+        stride: number,
+    ): void {
+        this.expandWithVertices(positions.length, stride, (index, axis) => positions[index + axis] + origin[axis]);
+    }
+
+    private expandWithVertices(
+        length: number,
+        stride: number,
+        coordinateAt: (index: number, axis: 0 | 1 | 2) => number,
+    ): void {
+        if (length === 0) return;
         const isPlaceholderCube = (b: ModelBoundsBox): boolean =>
             b.min.x === -100 && b.min.y === -100 && b.min.z === -100
                 && b.max.x === 100 && b.max.y === 100 && b.max.z === 100;
@@ -174,10 +196,10 @@ export class ModelBoundsTracker {
             };
         }
         let expanded = false;
-        for (let i = 0; i + 2 < positions.length; i += stride) {
-            const x = positions[i];
-            const y = positions[i + 1];
-            const z = positions[i + 2];
+        for (let i = 0; i + 2 < length; i += stride) {
+            const x = coordinateAt(i, 0);
+            const y = coordinateAt(i, 1);
+            const z = coordinateAt(i, 2);
             if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
             if (x < this.bounds.min.x) this.bounds.min.x = x;
             if (y < this.bounds.min.y) this.bounds.min.y = y;

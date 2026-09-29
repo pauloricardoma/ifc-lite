@@ -30,15 +30,9 @@
 //!
 //! ## Geometry-faithful (over-weld guard)
 //!
-//! Two independent guards keep the weld from flattening a real feature:
-//!
-//! 1. **Normal bucket** (`NORMAL_QUANT`): facets only cluster if their normals
-//!    quantise to the same direction (~0.06° resolution) — a real roof pitch /
-//!    dormer has a distinct normal bucket and never clusters with the slope.
-//! 2. **Offset jitter tolerance** (`MAX_OFFSET_JITTER`): within a normal
-//!    bucket, facets only cluster if their plane offsets are within this tight
-//!    band. Two genuinely-distinct parallel planes (e.g. the 0.4 m-apart slopes
-//!    on #1112) stay in separate clusters.
+//! Two guards keep the weld from flattening a real feature: facets must share a
+//! quantised normal (~0.06° resolution) and offsets within `MAX_OFFSET_JITTER`.
+//! Thus real pitches and #1112's distinct parallel slopes remain separated.
 //!
 //! On top of that the per-vertex MOVE is hard-capped (`MAX_VERTEX_MOVE`): a
 //! vertex is only projected if it lands within that cap of the fitted plane, so
@@ -46,6 +40,8 @@
 //! by at most the jitter (sub-100 µm) and never dragged onto a far plane. The
 //! correction is sub-millimetre at building scale; cut volume is preserved
 //! within the kernel's snap grid.
+//!
+//! Facet passes assume the router's index-only source cleanup (#4797); they neither replace it nor promise hygienic output. New candidates need local handling.
 //!
 //! ## Determinism (native == wasm)
 //!
@@ -63,12 +59,13 @@
 //!
 //! ## Watertightness
 //!
-//! Welding moves SHARED canonical vertices (deduped by snapped position), so
+//! Welding moves SHARED canonical vertices (deduped on a 100 µm cell), so
 //! every facet incident to a moved vertex moves WITH it — no gaps and no
 //! T-junctions. When a vertex is eligible for more than one plane cluster, the
 //! candidate projected positions are averaged (deterministic order) and the
 //! result is still bounded by `MAX_VERTEX_MOVE`, so a single final position is
-//! used by all incident facets.
+//! used by all incident facets. Only cells that weld are written back; every
+//! other vertex keeps its input position bit-for-bit (#4698).
 
 use crate::mesh::Mesh;
 use std::collections::BTreeMap;
@@ -146,8 +143,10 @@ fn tri_normal(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> Option<([f64; 3], f64)> 
 /// already-planar extrusion hosts and for meshes whose facets are genuinely
 /// distinct planes (the offset / move guards keep real features apart).
 ///
-/// The returned mesh keeps the SAME topology (same indices); only positions of
-/// welded shared vertices move, snapped to the kernel grid.
+/// The returned mesh keeps the SAME topology (same indices); only vertices in
+/// welded dedup cells move, snapped to the kernel grid.
+///
+/// Preserve the router's source cleanup; this is no hygiene guarantee (#4797).
 pub fn weld_near_coplanar_facets(mesh: &Mesh) -> Mesh {
     let vertex_count = mesh.positions.len() / 3;
     let tri_count = mesh.indices.len() / 3;
@@ -438,12 +437,11 @@ pub fn weld_near_coplanar_facets(mesh: &Mesh) -> Mesh {
         process_cluster(&keyed[cluster_start..]);
     }
 
-    // ── Step 5: resolve each canonical vertex's final position. A vertex with
-    // candidate projections (from one or more clusters) gets their average
-    // (deterministic — they were pushed in cluster-iteration order), snapped to
-    // the kernel grid; a vertex with none stays put.
-    let mut new_canon_pos = canon_pos.clone();
-    let mut any_moved = false;
+    // ── Step 5: each canonical vertex's welded position, if any: the average of
+    // its candidate projections (deterministic — pushed in cluster-iteration
+    // order), snapped to the kernel grid; `None` when it has no candidates or the
+    // average breaks `MAX_VERTEX_MOVE`.
+    let mut welded: Vec<Option<[f32; 3]>> = vec![None; n_canon];
     for cv in 0..n_canon {
         let cands = &vertex_moves[cv];
         if cands.is_empty() {
@@ -464,22 +462,20 @@ pub fn weld_near_coplanar_facets(mesh: &Mesh) -> Mesh {
         if d2 > MAX_VERTEX_MOVE * MAX_VERTEX_MOVE {
             continue;
         }
-        new_canon_pos[cv] = [snap_grid(avg[0]), snap_grid(avg[1]), snap_grid(avg[2])];
-        any_moved = true;
+        welded[cv] = Some([
+            snap_grid(avg[0]) as f32,
+            snap_grid(avg[1]) as f32,
+            snap_grid(avg[2]) as f32,
+        ]);
     }
 
-    if !any_moved {
-        return mesh.clone();
-    }
-
-    // ── Step 6: rebuild with the SAME indices/normals, replacing each ORIGINAL
-    // vertex position with its (possibly welded) canonical position.
+    // ── Step 6: same indices/normals; only welded cells are written back (see
+    // the module's Watertightness section). With nothing welded this is `mesh`.
     let mut out = mesh.clone();
-    for i in 0..vertex_count {
-        let np = new_canon_pos[canon_of[i]];
-        out.positions[i * 3] = np[0] as f32;
-        out.positions[i * 3 + 1] = np[1] as f32;
-        out.positions[i * 3 + 2] = np[2] as f32;
+    for (dst, &cv) in out.positions.chunks_exact_mut(3).zip(&canon_of) {
+        if let Some(p) = welded[cv] {
+            dst.copy_from_slice(&p);
+        }
     }
     out
 }
@@ -522,7 +518,23 @@ fn aspect(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> f64 {
 /// fanned to two new rim vertices a few cm apart) that lands ALONE in its plane
 /// bucket and bypasses the coplanar CDT. Bisecting its long edge breaks the
 /// sliver without touching the opening hole (the hole boundary is framed by its
-/// non-degenerate neighbours) or the cut volume.
+/// non-degenerate neighbours) or the volume of what it bisects. The PASS is not
+/// volume-exact: see the cell dedup below, which also drops collapsed triangles.
+///
+/// ## The 100 µm cell dedup is whole-mesh (#4698)
+///
+/// The pass deduplicates vertices by [`POSITION_DEDUP_GRID`] cell — every vertex
+/// in a 100 µm cell takes the FIRST raw position seen in it, itself unsnapped;
+/// only the bisection midpoints go on the kernel grid ([`SNAP_GRID`], 1/65536 of
+/// a unit) — and rebuilds EVERY triangle from those, so it closes
+/// near-duplicate cracks and drops a triangle two of whose corners land in one
+/// cell. Both are intended: measured over 117 local fixtures at f4e69c67d (before
+/// #4745 changed what the weld upstream writes back, so read them as the order of
+/// magnitude, not today's exact counts), 552 of 2227 rebuilds moved 48085
+/// vertices and dropped 4097 triangles; #4640 recorded that writing back only the
+/// bisected vertices moved `various/rvt01.ifc` #13797 from 88 to 92 open edges. The rebuild also de-shares vertices and re-derives flat per-face
+/// normals. A caller that needs the input's sub-100 µm vertex spread, its shared
+/// vertices or its authored normals must not run this pass.
 ///
 /// ## Determinism (native == wasm)
 ///
@@ -532,13 +544,17 @@ fn aspect(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> f64 {
 ///
 /// Returns the input unchanged when no triangle exceeds the threshold (the
 /// common case for clean cuts).
+///
+/// Not source cleanup: its fresh candidates need local handling (#4797).
 pub fn refine_high_aspect_slivers(mesh: &Mesh) -> Mesh {
     refine_high_aspect_slivers_impl(mesh, None)
 }
 
 /// Region-scoped [`refine_high_aspect_slivers`]: only triangles whose AABB
-/// intersects one of `boxes` are sliver candidates; everything outside is left
-/// exactly as authored.
+/// intersects one of `boxes`, grown by the canonicalization slack below, are
+/// sliver CANDIDATES.
+/// The rebuild is still whole-mesh, so once any sliver fires, the cell dedup
+/// documented on [`refine_high_aspect_slivers`] applies to the rest of the host.
 ///
 /// Motivation (Holter-class steel models): the sliver pass exists to repair
 /// high-aspect corner slivers a CUT emits at an opening rim (#1007). Scanning

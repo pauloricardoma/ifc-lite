@@ -18,6 +18,8 @@ import {
   type ShadowOccluderSources,
 } from './shadow-occluders.js';
 import { ShadowPass } from './shadow-pass.js';
+import { INSTANCED_VERTEX_BUFFERS } from './instanced-vertex-layout.js';
+import { INSTANCE_FLAGS_OFFSET } from './instanced-render.js';
 import type { BatchedMesh, Mesh } from './types.js';
 import type { InstancedTemplateGPU, TexturedMesh } from './scene.js';
 
@@ -55,6 +57,8 @@ function instancedTemplate(): InstancedTemplateGPU {
     indexCount: 24,
     instanceBuffer: buf('inst-inst'),
     instanceCount: 5,
+    canonicalAnchors: new Float64Array(15),
+    rteDeltas: { buffer: buf('inst-rte'), scratch: new Float32Array(40), camera: null, runs: [] },
     bounds: null,
     maxOccRadius: 1,
     selectedCount: 0,
@@ -104,6 +108,16 @@ describe('collectShadowOccluders', () => {
     const inst = draws.find((d) => d.kind === 'instanced');
     assert.ok(inst?.instanceBuffer, 'instance buffer missing');
     assert.equal(inst?.instanceCount, 5);
+    assert.equal((inst?.rteDeltas?.buffer as unknown as { label: string }).label, 'inst-rte', 'the template\'s own delta stream (#6393)');
+  });
+
+  it('skips an instanced occluder with no delta stream instead of drawing stale deltas (#6393)', () => {
+    const rec = emptyRecord();
+    const pass = new ShadowPass(mockShadowDevice(), 1024);
+    const draws = collectShadowOccluders({ batches: [], instanced: [instancedTemplate()], textured: [] });
+    delete draws[0]!.rteDeltas;
+    pass.render(mockEncoder(rec), { m: new Float32Array(16) }, draws);
+    assert.deepEqual(rec.drawPipelines, []);
   });
 
   it('skips an evicted (non-resident) batch', () => {
@@ -117,6 +131,51 @@ describe('collectShadowOccluders', () => {
     // flat id 101 and quant id 102 hidden, textured 900 hidden; instanced always casts.
     const kinds = draws.map((d) => d.kind).sort();
     assert.deepEqual(kinds, ['instanced']);
+  });
+
+  // Three-state check on `isolatedIds`, matching `entity-visibility.ts`'s documented
+  // rule ("an EMPTY set means isolate nothing... do not collapse the two"):
+  //   1. no isolation (undefined)        → everything casts.
+  //   2. non-empty isolation             → only the matched subset casts.
+  //   3. active-but-empty isolation      → NOTHING casts (the bug: `anyVisible`'s
+  //      `hasIsolate = isolatedIds != null && isolatedIds.size > 0` collapsed this
+  //      to "no isolation active" and let the whole batch cast a phantom shadow).
+  it('casts nothing (not everything) for a textured/individual mesh under an active-but-empty isolate set', () => {
+    const mesh: Mesh = {
+      expressId: 900,
+      vertexBuffer: buf('mesh-v'),
+      indexBuffer: buf('mesh-i'),
+      indexCount: 6,
+      color: [1, 1, 1, 1],
+      transform: { m: originModelMatrix(undefined) },
+      hydrated: false,
+    } as unknown as Mesh;
+    const draws = collectShadowOccluders(
+      { batches: [], instanced: [], textured: [texturedMesh()], meshes: [mesh] },
+      { isolatedIds: new Set<number>() },
+    );
+    assert.deepEqual(draws, [], 'isolate-to-nothing must cast nothing, not the whole scene');
+  });
+
+  it('casts everything when isolatedIds is absent (no isolation active)', () => {
+    const draws = collectShadowOccluders(
+      { batches: [], instanced: [], textured: [texturedMesh()] },
+      { isolatedIds: undefined },
+    );
+    assert.equal(draws.length, 1, 'no isolation active → the textured mesh still casts');
+  });
+
+  it('casts only the matched subset for a non-empty isolate set', () => {
+    const draws = collectShadowOccluders(
+      { batches: [], instanced: [], textured: [texturedMesh()] },
+      { isolatedIds: new Set([900]) },
+    );
+    assert.equal(draws.length, 1, 'the isolated textured mesh still casts');
+    const drawsExcluded = collectShadowOccluders(
+      { batches: [], instanced: [], textured: [texturedMesh()] },
+      { isolatedIds: new Set([12345]) },
+    );
+    assert.deepEqual(drawsExcluded, [], 'a non-matching isolate set excludes the textured mesh');
   });
 
   it('lets a transparent (glass) batch pass light — it does not cast', () => {
@@ -220,6 +279,10 @@ interface DeviceRecord {
   pipelines: { label: string; hasFragment: boolean; buffers?: readonly GPUVertexBufferLayout[] }[];
   /** Last data written to the buffer labelled 'shadow-clip-uniform'. */
   clipWrite: Float32Array | null;
+  /** Last packed per-draw RTE payload (the real dynamic uniform write). */
+  drawWrite: Float32Array | null;
+  /** Light matrix + instanced camera high/low payload. */
+  lightWrite: Float32Array | null;
 }
 
 function mockShadowDevice(rec?: DeviceRecord): GPUDevice {
@@ -229,6 +292,12 @@ function mockShadowDevice(rec?: DeviceRecord): GPUDevice {
         rec.clipWrite = new Float32Array(
           (data as Float32Array).slice() as unknown as ArrayLike<number>,
         );
+      }
+      if (rec && buffer?.label === 'shadow-per-draw-uniform') {
+        rec.drawWrite = new Float32Array((data as Float32Array).slice() as unknown as ArrayLike<number>);
+      }
+      if (rec && buffer?.label === 'shadow-light-uniform') {
+        rec.lightWrite = new Float32Array((data as Float32Array).slice() as unknown as ArrayLike<number>);
       }
     },
   };
@@ -321,6 +390,48 @@ describe('ShadowPass.render', () => {
     // Each draw binds a distinct 256-aligned dynamic offset.
     assert.deepEqual(rec.dynamicOffsets, [0, 256, 512, 768]);
   });
+
+  it('packs a 5,000-km origin as a centimetre eye-relative residual (#5049)', () => {
+    const dev: DeviceRecord = { pipelines: [], clipWrite: null, drawWrite: null, lightWrite: null };
+    const pass = new ShadowPass(mockShadowDevice(dev), 1024);
+    const draw = collectShadowOccluders({ batches: [flatBatch(1)], instanced: [], textured: [] })[0];
+    draw.origin = [5_000_000.015625, 0, 0];
+    pass.render(
+      mockEncoder(emptyRecord()),
+      { m: new Float32Array(16) },
+      [draw],
+      null,
+      { cameraWorld: [5_000_000, 0, 0] },
+    );
+
+    assert.ok(dev.drawWrite, 'the depth pass must upload its per-draw RTE uniform');
+    // originHigh starts at float 20 and originLow at 24. This is the exact
+    // CPU->GPU payload the shadow vertex shader evaluates, not a helper-only
+    // approximation. 15.625 mm survives at a national-grid coordinate.
+    const residual = dev.drawWrite![20] + dev.drawWrite![24];
+    assert.ok(Math.abs(residual - 0.015625) < 1e-8, `shadow origin residual became ${residual}`);
+    assert.equal(dev.drawWrite![12], 0, 'absolute model translation must not leak into the f32 matrix');
+    assert.ok(dev.lightWrite, 'instanced shadow anchors need the same camera split');
+    assert.equal(dev.lightWrite![16] + dev.lightWrite![20], 5_000_000);
+  });
+
+  it('submits collector-produced instanced anchors at 5,000 km without a fictitious draw origin (#5049)', () => {
+    const dev: DeviceRecord = { pipelines: [], clipWrite: null, drawWrite: null, lightWrite: null };
+    const pass = new ShadowPass(mockShadowDevice(dev), 1024);
+    const draw = collectShadowOccluders({ batches: [], instanced: [instancedTemplate()], textured: [] });
+    assert.equal(draw[0].origin, undefined, 'occurrences, not the batch, own the canonical anchors');
+    draw[0]!.canonicalAnchors = Float64Array.from(
+      { length: 15 },
+      (_, index) => index % 3 === 0 ? 5_000_000 : 0,
+    );
+    assert.doesNotThrow(() => pass.render(
+      mockEncoder(emptyRecord()), { m: new Float32Array(16) }, draw, null,
+      { cameraWorld: [5_000_000, 0, 0] },
+    ));
+    assert.ok(dev.drawWrite, 'the instanced depth draw still uploads its layout');
+    assert.equal(dev.drawWrite![20], 0, 'per-draw origin lanes stay unused for per-occurrence anchors');
+    assert.equal(dev.lightWrite![16] + dev.lightWrite![20], 5_000_000);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -335,7 +446,7 @@ describe('ShadowPass clipping', () => {
   const box = { min: [-1, -2, -3] as const, max: [4, 5, 6] as const };
 
   it('stays fragment-less (depth-only) when nothing is clipped', () => {
-    const dev: DeviceRecord = { pipelines: [], clipWrite: null };
+    const dev: DeviceRecord = { pipelines: [], clipWrite: null, drawWrite: null, lightWrite: null };
     const rec = emptyRecord();
     const pass = new ShadowPass(mockShadowDevice(dev), 1024);
     pass.render(mockEncoder(rec), { m: new Float32Array(16) }, draws(), null);
@@ -347,7 +458,7 @@ describe('ShadowPass clipping', () => {
   });
 
   it('routes every path through a clipping pipeline when a section plane is on', () => {
-    const dev: DeviceRecord = { pipelines: [], clipWrite: null };
+    const dev: DeviceRecord = { pipelines: [], clipWrite: null, drawWrite: null, lightWrite: null };
     const rec = emptyRecord();
     const pass = new ShadowPass(mockShadowDevice(dev), 1024);
     pass.render(mockEncoder(rec), { m: new Float32Array(16) }, draws(), { section });
@@ -365,7 +476,7 @@ describe('ShadowPass clipping', () => {
   });
 
   it('packs the section plane and its flipped bit like the colour pass', () => {
-    const dev: DeviceRecord = { pipelines: [], clipWrite: null };
+    const dev: DeviceRecord = { pipelines: [], clipWrite: null, drawWrite: null, lightWrite: null };
     const pass = new ShadowPass(mockShadowDevice(dev), 1024);
     pass.render(mockEncoder(emptyRecord()), { m: new Float32Array(16) }, draws(), { section });
 
@@ -380,7 +491,7 @@ describe('ShadowPass clipping', () => {
   });
 
   it('packs the clip box bounds and enable bit', () => {
-    const dev: DeviceRecord = { pipelines: [], clipWrite: null };
+    const dev: DeviceRecord = { pipelines: [], clipWrite: null, drawWrite: null, lightWrite: null };
     const pass = new ShadowPass(mockShadowDevice(dev), 1024);
     pass.render(mockEncoder(emptyRecord()), { m: new Float32Array(16) }, draws(), { box });
 
@@ -391,7 +502,7 @@ describe('ShadowPass clipping', () => {
   });
 
   it('builds the clipping pipelines once, on the first clipped frame', () => {
-    const dev: DeviceRecord = { pipelines: [], clipWrite: null };
+    const dev: DeviceRecord = { pipelines: [], clipWrite: null, drawWrite: null, lightWrite: null };
     const pass = new ShadowPass(mockShadowDevice(dev), 1024);
     assert.equal(dev.pipelines.length, 4, 'construction builds only the depth-only set');
 
@@ -450,20 +561,19 @@ describe('classifyBatchVisibility', () => {
 
 describe('ShadowPass instanced pipeline', () => {
   it('binds the per-occurrence flags lane so a hidden instance can be culled in-shader', () => {
-    const dev: DeviceRecord = { pipelines: [], clipWrite: null };
+    const dev: DeviceRecord = { pipelines: [], clipWrite: null, drawWrite: null, lightWrite: null };
     new ShadowPass(mockShadowDevice(dev), 1024);
 
     const inst = dev.pipelines.find((p) => p.label === 'shadow-pipeline-vs_shadow_instanced');
     assert.ok(inst, 'instanced shadow pipeline built');
-    const instanceLayout = inst!.buffers?.find((b) => b.stepMode === 'instance');
-    assert.ok(instanceLayout, 'slot-1 instance-step layout present');
+    // #6393: the depth pass reads the colour pass's layout, not its own copy.
+    assert.equal(inst!.buffers, INSTANCED_VERTEX_BUFFERS);
+    const instanceLayout = inst!.buffers?.[1];
+    assert.equal(instanceLayout?.stepMode, 'instance', 'slot-1 instance-step layout present');
     const flags = [...instanceLayout!.attributes].find((a) => a.shaderLocation === 9);
     assert.ok(flags, 'flags lane (shaderLocation 9) bound');
-    // Offset 84 within the 88-byte INSTANCE_STRIDE_BYTES layout (mat4 + id + rgba + flags).
-    assert.equal(flags!.offset, 84);
+    // Offset 84 within the record (mat4 + id + rgba + flags).
+    assert.equal(flags!.offset, INSTANCE_FLAGS_OFFSET);
     assert.equal(flags!.format, 'uint32');
-    // The mat4 columns (3..6) stay bound so the transform still arrives.
-    const locs = [...instanceLayout!.attributes].map((a) => a.shaderLocation).sort((x, y) => x - y);
-    assert.deepEqual(locs, [3, 4, 5, 6, 9]);
   });
 });

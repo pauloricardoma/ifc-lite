@@ -38,6 +38,7 @@ import {
   calculateViewportBounds,
   calculateOptimalScaleBarLength,
 } from '@ifc-lite/drawing-2d';
+import { nextSheetTemplateId } from './sheetSlice.persistence';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // STATE TYPES
@@ -107,7 +108,7 @@ export interface SheetSlice extends SheetState {
 // HELPER FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════════════
 
-function createDefaultSheet(options?: SheetCreationOptions): DrawingSheet {
+export function createDefaultSheet(options?: SheetCreationOptions): DrawingSheet {
   const paper = PAPER_SIZE_REGISTRY[options?.paperId || 'A3_LANDSCAPE'];
   const frameStyle = (options?.frameStyle || 'professional') as FrameStyle;
   const framePreset = FRAME_PRESETS[frameStyle];
@@ -492,10 +493,9 @@ export const createSheetSlice: StateCreator<SheetSlice, [], [], SheetSlice> = (
   saveAsTemplate: (name) => {
     const current = get().activeSheet;
     if (!current) return;
-
     const template: DrawingSheet = {
       ...current,
-      id: `template-${Date.now()}`,
+      id: nextSheetTemplateId(get().savedSheetTemplates),
       name,
     };
     set((s) => ({

@@ -452,6 +452,26 @@ describe('buildCompareReport content matches (#1891)', () => {
       'NEW_GUID_BBBBBBBBBBBB,,IfcWall,Renamed,,B,renamed,OLD_GUID_AAAAAAAAAAAA',
     );
   });
+
+  it('adds a Key column only when a row was compared on an authored key, and keeps it out of GlobalId (#4955)', () => {
+    const report = buildCompareReport(
+      resultWith([
+        {
+          kind: 'renamed',
+          dataHash: 'd',
+          base: [fingerprint('a', 'prop:AST-0042', 1)],
+          head: [fingerprint('b', 'prop:AST-0042', 2)],
+        },
+      ]),
+      new Map(),
+    );
+    const lines = reportToCsv(report).split('\r\n');
+    assert.strictEqual(
+      lines[0],
+      'GlobalId,Name,IfcType,Change,MovedDistance_m,Model,Match,MatchedGlobalId,Key',
+    );
+    assert.strictEqual(lines[1], ',,IfcWall,Renamed,,B,renamed,,AST-0042');
+  });
 });
 
 describe('buildCompareReport - a geometry-less product that moved', () => {
@@ -770,5 +790,26 @@ describe('buildCompareReport products vs type objects (headline split)', () => {
     assert.strictEqual(report.counts.modified, 1, 'aggregate must match the filtered entries');
     const lines = reportToCsv(report).split('\r\n');
     assert.strictEqual(lines[0], 'GlobalId,Name,IfcType,Change,MovedDistance_m,Model,Match,MatchedGlobalId');
+  });
+});
+
+describe('buildCompareReport - spatial re-parenting (#5309)', () => {
+  it('names a container-only change instead of the generic label', () => {
+    const fp = (modelId: string) => ({
+      key: 'MOVED_GUID_AAAAAAAAAAA',
+      ifcType: 'IfcWall',
+      dataHash: 'd',
+      ref: { modelId, localId: 1, globalId: 1, meshed: false },
+    });
+    const result = {
+      baseModelId: 'a', headModelId: 'b', baseName: 'A', headName: 'B',
+      scope: 'both', geometryUnavailable: true, excludedHiddenIds: new Set<number>(),
+      diff: {
+        scope: 'both', excludedTypes: [], byKey: new Map(),
+        counts: { added: 0, modified: 1, deleted: 0, unchanged: 0 },
+        entries: [{ key: 'MOVED_GUID_AAAAAAAAAAA', state: 'modified', changeKinds: ['container'], base: fp('a'), head: fp('b') }],
+      },
+    } as unknown as CompareResult;
+    assert.strictEqual(buildCompareReport(result, new Map()).rows[0].change, 'Container changed');
   });
 });

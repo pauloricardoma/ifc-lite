@@ -4,7 +4,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { previewSetPattern, formatMatchHint } from './pattern-preview';
+import { previewSetPattern, matchHintFacts } from './pattern-preview';
 
 const SETS = [
   'Qto_WallBaseQuantities',
@@ -65,19 +65,32 @@ describe('previewSetPattern', () => {
     assert.deepEqual(previewSetPattern('', SETS), { isPattern: false, isInvalid: false, matches: [] });
     assert.deepEqual(previewSetPattern('   ', SETS), { isPattern: false, isInvalid: false, matches: [] });
   });
+
+  it('flags a catastrophic-backtracking-shaped pattern as invalid instead of throwing', () => {
+    // `compileNameMatcher` THROWS for this shape (see @ifc-lite/lists, via
+    // @ifc-lite/regex-guard). This function runs on every keystroke via the
+    // caller's `useMemo` with no surrounding try/catch, so if this call
+    // site stopped catching that throw, typing `/(a+)+$/` into the column
+    // builder would crash the whole panel mid-keystroke rather than
+    // showing the existing "Invalid pattern" warning. Asserting
+    // `doesNotThrow` — not just the return value — is what catches that
+    // regression.
+    assert.doesNotThrow(() => previewSetPattern('/(a+)+$/', SETS));
+    const p = previewSetPattern('/(a+)+$/', SETS);
+    assert.equal(p.isPattern, false);
+    assert.equal(p.isInvalid, true);
+    assert.deepEqual(p.matches, []);
+  });
 });
 
-describe('formatMatchHint', () => {
-  it('reads "matches 0 sets in loaded models" for no matches', () => {
-    assert.equal(formatMatchHint([]), 'matches 0 sets in loaded models');
-  });
-
-  it('singularises one match', () => {
-    assert.equal(formatMatchHint(['Qto_WallBaseQuantities']), 'matches 1 set: Qto_WallBaseQuantities');
-  });
-
-  it('lists up to the cap then " +N more"', () => {
-    assert.equal(formatMatchHint(['A', 'B']), 'matches 2 sets: A, B');
-    assert.equal(formatMatchHint(['A', 'B', 'C', 'D', 'E']), 'matches 5 sets: A, B, C +2 more');
+describe('matchHintFacts', () => {
+  it('returns locale-neutral facts for translated match hints', () => {
+    assert.deepEqual(matchHintFacts([]), { count: 0, shown: [], extra: 0 });
+    assert.deepEqual(matchHintFacts(['A']), { count: 1, shown: ['A'], extra: 0 });
+    assert.deepEqual(matchHintFacts(['A', 'B', 'C', 'D', 'E']), {
+      count: 5,
+      shown: ['A', 'B', 'C'],
+      extra: 2,
+    });
   });
 });

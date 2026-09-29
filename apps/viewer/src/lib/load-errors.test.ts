@@ -4,7 +4,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { classifyLoadError, errorCaptureProps } from './load-errors.js';
+import { bundleAgeHours, classifyLoadError, errorCaptureProps } from './load-errors.js';
 import { formatLoadError } from './load-error-message.js';
 
 describe('classifyLoadError', () => {
@@ -112,15 +112,37 @@ describe('classifyLoadError', () => {
     );
   });
 
-  it('classifies a WebGPU buffer-allocation failure as out_of_memory', () => {
+  it('classifies a WebGPU buffer-allocation failure as gpu_alloc_failed, not out_of_memory (#4885)', () => {
     // Chromium's wording is misleading — 193 KB is not "too large" for any
-    // device; what failed is mapping host memory. Same user guidance as OOM.
+    // device; what actually failed is mapping host memory, which is as often
+    // device-loss fallout as real memory pressure. Its own bucket lets
+    // `device_lost_at_time` tell the two apart instead of folding both into
+    // out_of_memory, which used to mislabel the common (loss) case.
     assert.equal(
       classifyLoadError(new RangeError(
         "Failed to execute 'createBuffer' on 'GPUDevice': createBuffer failed, size (193836) is too large for the implementation when mappedAtCreation == true",
       )),
-      'out_of_memory',
+      'gpu_alloc_failed',
     );
+  });
+
+  it('still classifies tiny post-loss createBuffer sizes as gpu_alloc_failed (#4885)', () => {
+    // The production sizes from the issue's Edge-user report: 672, 5544 and
+    // 15176 bytes — nowhere near any device limit, and exactly the fallout a
+    // lost device produces on every subsequent allocation.
+    for (const size of [672, 5544, 15176]) {
+      assert.equal(
+        classifyLoadError(new RangeError(
+          `Failed to execute 'createBuffer' on 'GPUDevice': createBuffer failed, size (${size}) is too large for the implementation when mappedAtCreation == true`,
+        )),
+        'gpu_alloc_failed',
+      );
+    }
+  });
+
+  it('keeps a genuinely large allocation out of gpu_alloc_failed only when it is not the mappedAtCreation wording', () => {
+    // out_of_memory still owns every other memory-exhaustion signal.
+    assert.equal(classifyLoadError(new RangeError('Array buffer allocation failed')), 'out_of_memory');
   });
 
   it('classifies an unreadable picked file, not as a memory or model failure', () => {
@@ -135,6 +157,89 @@ describe('classifyLoadError', () => {
     assert.equal(
       classifyLoadError(new Error('The requested file could not be read due to permission problems')),
       'file_unreadable',
+    );
+  });
+
+  it('classifies the file-moved NotFoundError as file_unreadable, not as unknown (#3731)', () => {
+    // The SIBLING of NotReadableError, and the one the field reports actually
+    // carry. Chromium throws NotReadableError when the file is still there but
+    // unreadable (permissions), and NotFoundError when the bytes are gone --
+    // the file was moved, renamed, deleted, or rewritten in place by the
+    // authoring tool between `getFile()` and the read. Four PostHog issues
+    // (#2546, #2860, #3324, #3731) carried this wording and every one of them
+    // classified as `unknown`, so the user was shown the raw DOM sentence and
+    // each occurrence spawned its own GitHub issue.
+    assert.equal(
+      classifyLoadError(new Error(
+        'A requested file or directory could not be found at the time an operation was processed.',
+      )),
+      'file_unreadable',
+    );
+    // Stringified name-first, the shape `String(err)` produces.
+    assert.equal(
+      classifyLoadError(new Error(
+        'NotFoundError: A requested file or directory could not be found at the time an operation was processed.',
+      )),
+      'file_unreadable',
+    );
+    // WebKit's wording for the same DOMException (#2860) needs the load
+    // context to be safe - see the Safari test below.
+    assert.equal(
+      classifyLoadError(new Error('The object can not be found here.'), 'ifc_model_load'),
+      'file_unreadable',
+    );
+  });
+
+  it('only trusts the WebKit NotFoundError wording inside a load context', () => {
+    // "The object can not be found here." is WebKit's GENERIC description for
+    // the NotFoundError name, and WebKit - unlike Blink - gives removeChild and
+    // insertBefore no message of their own, so a Safari reconciler crash
+    // (#1229/#1230/#1232) carries this EXACT string. Message-only, the two are
+    // indistinguishable, and claiming it unconditionally shows a user whose
+    // React tree just died a note about re-picking their file.
+    const webkit = new Error('The object can not be found here.');
+
+    assert.equal(
+      classifyLoadError(webkit),
+      'unknown',
+      'no context: the honest answer, because on this engine the string does not say which failure it was',
+    );
+    assert.equal(
+      classifyLoadError(webkit, 'export_glb'),
+      'unknown',
+      'a context that is not a load is as disqualifying as none',
+    );
+    assert.equal(classifyLoadError(webkit, 'ifc_model_load'), 'file_unreadable');
+    assert.equal(classifyLoadError(webkit, 'geometry_processing'), 'file_unreadable');
+
+    // The Chromium wording needs no context: Blink words its DOM failures
+    // "Failed to execute '...' on '...'", so they never reach this text.
+    assert.equal(
+      classifyLoadError(new Error(
+        'A requested file or directory could not be found at the time an operation was processed.',
+      )),
+      'file_unreadable',
+    );
+  });
+
+  it('leaves the DOM-mutation NotFoundError alone - it is not a file failure', () => {
+    // `harden-dom-mutations.ts` exists because a translation extension makes
+    // React's reconciler call removeChild/insertBefore against a parent that no
+    // longer holds the node. Those are NotFoundErrors too, and telling that
+    // user their file was moved would be a lie. The two families are separated
+    // by wording, which is why the matcher above is anchored on the whole
+    // message instead of searching for "could not be found".
+    assert.equal(
+      classifyLoadError(new Error(
+        "Failed to execute 'removeChild' on 'Node': The node to be removed is not a child of this node.",
+      )),
+      'unknown',
+    );
+    assert.equal(
+      classifyLoadError(new Error(
+        "Failed to execute 'insertBefore' on 'Node': The node before which the new node is to be inserted is not a child of this node.",
+      )),
+      'unknown',
     );
   });
 
@@ -282,7 +387,7 @@ describe('classifyLoadError', () => {
   // unanchored `network_unavailable` claims it — which both fingerprints it
   // together with genuine offline blips AND hands it to the benign-severity
   // downgrade in analytics-scrub.ts, silencing a real deploy failure that
-  // survived main.tsx's one-shot chunk-reload budget. #2410 removed the explicit
+  // survived bootstrap.tsx's one-shot chunk-reload budget. #2410 removed the explicit
   // exclusion that used to say so, because the whole-message anchor subsumes it
   // (the message names the module, so it is not the whole wording) — leaving
   // this test as the live gate on that anchor rather than an unreachable branch.
@@ -614,6 +719,17 @@ describe('formatLoadError', () => {
     assert.doesNotMatch(msg, /memory|too large|smaller/i);
   });
 
+  it('tells the user to re-pick a file that moved out from under the browser (#3731)', () => {
+    const msg = formatLoadError(
+      new Error('A requested file or directory could not be found at the time an operation was processed.'),
+      'tower.ifc',
+    );
+    assert.match(msg, /"tower\.ifc"/);
+    assert.match(msg, /select the file again/i);
+    // The raw DOM sentence is what four field reports put in front of a user.
+    assert.doesNotMatch(msg, /at the time an operation was processed/i);
+  });
+
   it('preserves the raw message for unknown failures', () => {
     const msg = formatLoadError(new Error('Unexpected token in IFC header'), 'tower.ifc');
     assert.match(msg, /"tower\.ifc"/);
@@ -718,5 +834,20 @@ describe('wasm runtime traps (#1898)', () => {
     assert.match(msg, /geometry engine crashed/i);
     assert.match(msg, /memory/i);
     assert.doesNotMatch(msg, /unreachable/);
+  });
+});
+
+describe('bundleAgeHours (#4886)', () => {
+  const built = '2026-09-14T06:36:09.000Z';
+
+  it('reports whole hours since the build', () => {
+    assert.equal(bundleAgeHours(built, Date.parse('2026-09-15T06:52:10.208Z')), 24);
+    assert.equal(bundleAgeHours(built, Date.parse(built)), 0);
+  });
+
+  it('reports nothing when the build date is unknown, invalid, or in the future', () => {
+    assert.equal(bundleAgeHours(undefined, Date.now()), undefined);
+    assert.equal(bundleAgeHours('dev', Date.now()), undefined);
+    assert.equal(bundleAgeHours(built, Date.parse('2026-09-13T00:00:00Z')), undefined);
   });
 });

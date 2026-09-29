@@ -200,40 +200,10 @@ export enum QuantityType {
   Number = 6,
 }
 
-export enum RelationshipType {
-  ContainsElements = 1,
-  Aggregates = 2,
-  DefinesByProperties = 10,
-  DefinesByType = 11,
-  AssociatesMaterial = 20,
-  AssociatesClassification = 30,
-  AssociatesDocument = 31,
-  ConnectsPathElements = 40,
-  FillsElement = 41,
-  VoidsElement = 42,
-  ConnectsElements = 43,
-  /**
-   * `IfcRelConnectsPortToElement` — a port belongs to the element it sits on.
-   * Forward runs port → element, matching the EXPRESS attribute order
-   * (RelatingPort, RelatedElement).
-   */
-  ConnectsPortToElement = 44,
-  /**
-   * `IfcRelConnectsPorts` — one port joined to another. Together with
-   * {@link ConnectsPortToElement} this is what makes plant topology
-   * traversable: element → its ports → the ports they connect to → those
-   * ports' elements. Without both, a distribution system in a model is a set
-   * of unrelated parts.
-   */
-  ConnectsPorts = 45,
-  SpaceBoundary = 50,
-  AssignsToGroup = 60,
-  AssignsToProduct = 61,
-  ReferencedInSpatialStructure = 70,
-}
+export { RelationshipType } from './relationship-type.js';
 
 export enum EntityFlags {
-  HAS_GEOMETRY = 0b00000001,
+  /** Own `Representation` set (not `$`) — not a class guess, not aggregated children (#4666). */ HAS_GEOMETRY = 0b00000001,
   HAS_PROPERTIES = 0b00000010,
   HAS_QUANTITIES = 0b00000100,
   IS_TYPE = 0b00001000,
@@ -277,6 +247,13 @@ export interface SpatialHierarchy {
    * predate it fall back to `elementToStorey`.
    */
   elementToContainer?: Map<number, number>;
+  ambiguousStorey?: Set<number>;  // elementIds with >1 storey declared via direct ContainsElements in source (elementToStorey's answer was a tie-break, #4311); optional, older hierarchies omit it
+  /** Spatial nodes reachable from `IfcProject` via canonical-parent edges — the set
+   * `SpatialHierarchyBuilder` resolved `elementToStorey`'s tie-break against, read by
+   * `EntityNode.containedIn()` so it cannot decide reachability for itself and answer a
+   * different storey (#4314). Absent on legacy / non-parser hierarchies, and absence
+   * means "no reachability information", never "nothing is reachable". */
+  reachableSpatialNodes?: Set<number>;
 
   // Helper methods
   getStoreyElements(storeyId: number): number[];

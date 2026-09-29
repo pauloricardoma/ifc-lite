@@ -111,6 +111,67 @@ export function runGuards(sourceText, headText, base, head, key) {
   let presentHeads = 0;
   for (const ref of keyedHeads) if (headRefs.has(ref)) presentHeads++;
 
+  // The successor stage's `position` profile pairs only inside one container
+  // NAME path, resolved by the same adapter on both sides, so every keyed
+  // counterpart must carry the same path as its base — the re-GUID must not
+  // have touched a storey or space name. One exception is REPORTED rather
+  // than failed: a path containing `#` names an UNNAMED spatial node by its
+  // express id, which no re-export preserves (finding F4 in SPEC.md, Duplex's
+  // building has no Name). That is the engine's own documented weakness, not
+  // the fixture's, and the `position` recall it costs is the measurement.
+  const containerOf = new Map();
+  for (const fingerprint of base.fingerprints) {
+    containerOf.set(`b${fingerprint.ref}`, fingerprint.container);
+  }
+  for (const fingerprint of head.fingerprints) {
+    containerOf.set(`h${fingerprint.ref}`, fingerprint.container);
+  }
+  let containersCompared = 0;
+  let containersAgree = 0;
+  let containersUnstable = 0;
+  for (const element of key.elements) {
+    const basePath = containerOf.get(`b${element.base}`);
+    if (!basePath) continue;
+    for (const headRef of element.head) {
+      const headPath = containerOf.get(`h${headRef}`);
+      containersCompared++;
+      if (headPath === basePath) containersAgree++;
+      else if (unnamedNodesNormalised(basePath) === unnamedNodesNormalised(headPath ?? '')) {
+        // Only a difference CONFINED to the `#<id>` segments is the documented
+        // instability; a renamed storey next to an unnamed building is still
+        // a leak.
+        containersUnstable++;
+      }
+    }
+  }
+
+  // The `insertedNearby` control is only a control if the planted element
+  // really sits INSIDE the deleted element's box — a construction that put it
+  // next door would pass vacuously. Checked against the geometry pass's own
+  // boxes, with the hash grid as slack.
+  const boxOf = new Map();
+  for (const fingerprint of base.fingerprints) {
+    if (fingerprint.aabb) boxOf.set(`b${fingerprint.ref}`, fingerprint.aabb);
+  }
+  for (const fingerprint of head.fingerprints) {
+    if (fingerprint.aabb) boxOf.set(`h${fingerprint.ref}`, fingerprint.aabb);
+  }
+  let nearbyInside = 0;
+  let nearbyExpected = 0;
+  for (const element of key.elements) {
+    const planted = element.detail?.insertedNearby;
+    if (planted === undefined) continue;
+    nearbyExpected++;
+    const outer = boxOf.get(`b${element.base}`);
+    const inner = boxOf.get(`h${planted}`);
+    if (!outer || !inner) continue;
+    const slack = 1e-3;
+    const inside = [0, 1, 2].every(
+      (axis) => inner.min[axis] >= outer.min[axis] - slack && inner.max[axis] <= outer.max[axis] + slack,
+    );
+    if (inside) nearbyInside++;
+  }
+
   // Keys must not survive: if any GlobalId were shared the key-based pass would
   // match those entities directly and the content pass would never see them.
   const baseKeys = new Set(base.fingerprints.map((fingerprint) => fingerprint.key));
@@ -141,16 +202,55 @@ export function runGuards(sourceText, headText, base, head, key) {
     // claimed by two bases lets one wrong pair score as right, and a repeated
     // fingerprint ref makes the adapter's population disagree with the key's.
     duplicateKeyBaseIds: duplicates(key.elements.map((element) => element.base)).length,
+    // A `merged` head id is legitimately claimed by TWO base rows — the
+    // primary and its donor (issue #4989), the one place in the key where
+    // that is the honest answer rather than a corruption — so it is excluded
+    // here and checked on its own terms by `mergedHeadFanInWrong` below
+    // (every merged head id must have EXACTLY two, never more, never one).
     duplicateKeyHeadIds: duplicates([
-      ...key.elements.flatMap((element) => element.head),
+      ...key.elements.filter((element) => element.kind !== 'merged').flatMap((element) => element.head),
       ...key.insertedHeadIds,
+      ...(key.insertedNearbyHeadIds ?? []),
     ]).length,
+    mergedHeadFanInWrong: mergedHeadFanInWrong(key),
+    containersCompared,
+    containersAgree,
+    containersUnstable,
+    insertedNearbyExpected: nearbyExpected,
+    insertedNearbyInside: nearbyInside,
     duplicateBaseRefs: duplicates(base.fingerprints.map((f) => f.ref)).length,
     duplicateHeadRefs: duplicates(head.fingerprints.map((f) => f.ref)).length,
     keyedHeadsExpected: keyedHeads.size,
     baseHasGeometryHashes: base.fingerprints.some((f) => f.geometryHash !== undefined),
     headHasGeometryHashes: head.fingerprints.some((f) => f.geometryHash !== undefined),
   };
+}
+
+/** A container path with every `#<expressId>` segment replaced by `#`, so
+ *  two spellings of one unnamed node compare equal and nothing else does. */
+export function unnamedNodesNormalised(path) {
+  return path
+    .split('/')
+    .map((segment) => (/^#\d+$/.test(segment) ? '#' : segment))
+    .join('/');
+}
+
+/** Every `merged` head id must be claimed by EXACTLY two base rows — a
+ *  primary and its one donor (issue #4989). Zero is impossible (a `merged`
+ *  row always carries one), so this only ever catches more than two, which
+ *  would mean a donor got reused across pairs and its base-side row lies
+ *  about the pair it names. Returns the count of head ids that fail this. */
+export function mergedHeadFanInWrong(key) {
+  const counts = new Map();
+  for (const element of key.elements) {
+    for (const ref of element.head) {
+      const count = counts.get(ref) ?? { total: 0, merged: 0 };
+      count.total++;
+      if (element.kind === 'merged') count.merged++;
+      counts.set(ref, count);
+    }
+  }
+  return [...counts.values()].filter(({ total, merged }) => merged > 0 && (total !== 2 || merged !== 2)).length;
 }
 
 /** Values appearing more than once. */
@@ -218,9 +318,23 @@ export function guardFailures(guards) {
   ]) {
     if (count > 0) failures.push(`${count} duplicate ${what}: the key does not describe this pair`);
   }
+  if (guards.mergedHeadFanInWrong > 0) {
+    failures.push(`${guards.mergedHeadFanInWrong} merged head id(s) not claimed by exactly two merged base rows`);
+  }
   if (!guards.baseHasGeometryHashes || !guards.headHasGeometryHashes) {
     failures.push('a revision carries no geometry hashes: the geometry tiers would abstain');
   }
+  if (guards.containersAgree + guards.containersUnstable !== guards.containersCompared) {
+    failures.push(
+      `${guards.containersCompared - guards.containersAgree - guards.containersUnstable} keyed ` +
+        'counterparts carry a different NAMED spatial container path from their base',
+    );
+  }
+  if (guards.insertedNearbyInside !== guards.insertedNearbyExpected) {
+    failures.push(
+      `${guards.insertedNearbyExpected - guards.insertedNearbyInside} of ${guards.insertedNearbyExpected} ` +
+        'insertedNearby elements were not planted inside the deleted element\'s box',
+    );
+  }
   return failures;
 }
-

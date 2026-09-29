@@ -60,14 +60,6 @@ import {
 } from '@ifc-lite/drawing-2d';
 import useDrawingExport from './useDrawingExport.js';
 
-// happy-dom has no `window.alert`; the production failure path calls it from
-// inside a fire-and-forget async IIFE, where a ReferenceError would hang the
-// completion promise below with no visible cause.
-(globalThis as unknown as { alert: (msg?: string) => void }).alert = (msg) => {
-  // eslint-disable-next-line no-console -- test-only diagnostic for a swallowed export error
-  console.error('[handleExportPDF alert]', msg);
-};
-
 /** A valid 1x1 PNG so jsPDF's own decoder accepts the stubbed raster. */
 const TINY_PNG_B64 =
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
@@ -185,7 +177,7 @@ function stubRasterization(): () => void {
   // @ts-expect-error -- test stub, narrower signature than the DOM lib's overloaded getContext
   HTMLCanvasElement.prototype.getContext = function (type: string) {
     if (type === '2d') return { fillStyle: '', fillRect() {}, drawImage() {} };
-    return originalGetContext.call(this, type as '2d');
+    return (originalGetContext as (contextId: string) => RenderingContext | null).call(this, type);
   };
   const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
   HTMLCanvasElement.prototype.toDataURL = function () {

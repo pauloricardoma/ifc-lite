@@ -41,8 +41,9 @@ import { act } from 'react';
 import type { MapConversion, ProjectedCRS } from '@ifc-lite/parser';
 import { useViewerStore } from '@/store';
 import { BROWSER_ACCESS_BLOCKED, type CustomBasemap } from '@/lib/geo/custom-basemap';
-import { pendingTerrain, resetCesiumStub, stubProviders } from '@/test/cesium-stub.js';
+import { pendingTerrain, resetCesiumStub, stubProviders, stubViewers } from '@/test/cesium-stub.js';
 import { cleanup, render } from '@/test/render.js';
+import { ViewportHud } from '../viewport-ui/hud/ViewportHud.js';
 import { CesiumOverlay } from './CesiumOverlay.js';
 
 const BASEMAP_A: CustomBasemap = {
@@ -113,9 +114,18 @@ function seedStore(basemap: CustomBasemap): void {
   } as never);
 }
 
+/**
+ * `CesiumOverlay`'s status chips are now `HudItem`s (#5504), portaled into
+ * `ViewportHud`'s top-left region — mounting the HUD host alongside the
+ * overlay, in the same container, is what makes `container.querySelector`
+ * see them (a `HudItem` renders nothing until its target region exists).
+ */
 function mount(): HTMLElement {
   return render(
-    <CesiumOverlay mapConversion={MAP_CONVERSION} projectedCRS={PROJECTED_CRS} />,
+    <>
+      <ViewportHud />
+      <CesiumOverlay mapConversion={MAP_CONVERSION} projectedCRS={PROJECTED_CRS} />
+    </>,
   );
 }
 
@@ -250,5 +260,20 @@ describe('CesiumOverlay — state writes after the init effect is torn down (#26
         `the ${name} banner must not position itself — that is what put them on top of each other; got "${banner.className}"`,
       );
     }
+  });
+
+  it('does not install terrain after the Viewer that requested it retires (#4807)', async () => {
+    seedStore(BASEMAP_A);
+    mount();
+    await waitFor(() => pendingTerrain.length === 1 && stubViewers.length === 1, 'the first terrain request');
+    const retiredViewer = stubViewers[0];
+    const delayedTerrain = pendingTerrain[0];
+
+    act(() => { useViewerStore.setState({ cesiumDataSource: 'osm-map' } as never); });
+    assert.equal(retiredViewer.destroyed, true, 'source switch tears down the viewer synchronously');
+    delayedTerrain.resolve({ id: 'late-terrain' });
+    await settle();
+
+    assert.equal(retiredViewer.terrainProvider, null, 'late terrain belongs to no replacement Viewer');
   });
 });

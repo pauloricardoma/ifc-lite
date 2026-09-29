@@ -1,5 +1,210 @@
 # @ifc-lite/bcf
 
+## 5.0.0
+
+### Major Changes
+
+- [#5970](https://github.com/LTplus-AG/ifc-lite/pull/5970) [`f64353f`](https://github.com/LTplus-AG/ifc-lite/commit/f64353f10fb643a664a9f3f485ef009b1d2622f8) Thanks [@louistrue](https://github.com/louistrue)! - Removed `BCFOverlayRenderer` and `BCFOverlayRendererOptions` ([#5511](https://github.com/LTplus-AG/ifc-lite/issues/5511), charter [#5478](https://github.com/LTplus-AG/ifc-lite/issues/5478)). The framework-agnostic DOM overlay class — and the injected `<style>` stylesheet it carried — is gone; the viewer's `BCFOverlay` was its only consumer and now renders markers, connector lines and hover tooltips as `Pin` / `AnchoredCard` primitives on the viewport's shared scene-overlay projector instead of running its own `requestAnimationFrame` polling loop against this class. `computeMarkerPositions` and every other export of `@ifc-lite/bcf` are unchanged — marker *position* computation stays a pure, viewer-agnostic function; only the DOM rendering class is removed. A consumer still wanting a plain-DOM BCF overlay (no React) needs to render markers itself from `computeMarkerPositions`' output.
+
+## 4.2.1
+
+### Patch Changes
+
+- [#5804](https://github.com/LTplus-AG/ifc-lite/pull/5804) [`7fae2b8`](https://github.com/LTplus-AG/ifc-lite/commit/7fae2b8b2d6264a90af3235d95e0a4f6c257b9d7) Thanks [@louistrue](https://github.com/louistrue)! - `BCFOverlayRenderer` now takes its colours from the host page's CSS custom properties instead of a hard-coded dark palette, so the marker tooltip is legible on light pages as well as dark ones ([#5491](https://github.com/LTplus-AG/ifc-lite/issues/5491)). The tooltip reads `--color-popover`, `--color-popover-foreground`, `--color-muted-foreground` and `--color-border`; pins read `--overlay-status-danger` / `-warn` / `-ok` (open / in progress / resolved), `--overlay-ink-muted` (closed), `--overlay-ink` (any other status) and `--overlay-halo` (outline and index); the active marker is ringed in `--overlay-accent`. Every property has a light fallback, so a page that defines none of them still gets a readable dark-on-white tooltip.
+
+- [#5906](https://github.com/LTplus-AG/ifc-lite/pull/5906) [`e6ebbef`](https://github.com/LTplus-AG/ifc-lite/commit/e6ebbefde52670adbdb0c35bc19baed0453ca42f) Thanks [@louistrue](https://github.com/louistrue)! - Write ZIP archives with "version needed to extract" 2.0 on DEFLATE entries, as the ZIP APPNOTE requires. JSZip hardcodes 1.0 on every entry, so `writeBCF` (.bcfzip) and `ParquetExporter.exportBOS` (.bos) now pack with fflate, which writes 2.0 itself. Found while investigating [#3612](https://github.com/LTplus-AG/ifc-lite/issues/3612); this is not shown to be the cause of the Solibri import failure reported there.
+
+## 4.2.0
+
+### Minor Changes
+
+- [#5247](https://github.com/LTplus-AG/ifc-lite/pull/5247) [`becc9dc`](https://github.com/LTplus-AG/ifc-lite/commit/becc9dc4bd33267dbe8522f788fb8936dd349b70) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `readBCF` silently dropping topics nested below the archive root (e.g. `MyProject/<guid>/markup.bcf`, the shape produced by zipping a folder rather than its contents) and dropping viewpoints named with an uppercase `.BCFV` extension. Both previously vanished with no warning and no error. Topic-folder matching now works at any depth while explicitly excluding `__MACOSX` resource-fork shadow paths, so this is a behaviour change consumers may observe as more topics/viewpoints being read from archives that used to import as empty or incomplete.
+
+### Patch Changes
+
+- [#5293](https://github.com/LTplus-AG/ifc-lite/pull/5293) [`77f5e16`](https://github.com/LTplus-AG/ifc-lite/commit/77f5e16e939aac5d28301c56a29c04472aa90792) Thanks [@louistrue](https://github.com/louistrue)! - Fix `readBCF` silently returning an empty project for a `.bcfzip` whose entries use backslash path separators (a real historical Windows-zip-writer output). Entry names are normalised to `/` once when the archive loads, so the archive root, topic folders, viewpoints and snapshots all resolve, including in a zipped-folder archive. A `markup.bcf` that no topic folder can claim is now reported through `onWarning` (and the console) instead of reading as a successful empty result.
+
+- [#5278](https://github.com/LTplus-AG/ifc-lite/pull/5278) [`610c3a1`](https://github.com/LTplus-AG/ifc-lite/commit/610c3a1d60c76850c2d2cc839e176f97ec0e2ca6) Thanks [@louistrue](https://github.com/louistrue)! - `readBCF` now reads `bcf.version` and `project.bcfp` when their names differ only in case (for example `MyProject/BCF.VERSION`), at the archive root and inside a wrapped project folder. Previously the wrapped root was matched case-insensitively and then read under a lowercase name that did not exist, so the import failed with `missing bcf.version`.
+
+## 4.1.0
+
+### Minor Changes
+
+- [#4872](https://github.com/LTplus-AG/ifc-lite/pull/4872) [`1cc533f`](https://github.com/LTplus-AG/ifc-lite/commit/1cc533f5ca326a8d574ca5e870dfdafec7df32d0) Thanks [@louistrue](https://github.com/louistrue)! - BCF viewpoints are now written and read in IFC world coordinates ([#4806](https://github.com/LTplus-AG/ifc-lite/issues/4806)). The viewer captured the camera, section plane and clash/IDS framing cameras in its origin-shifted render frame, so for a georeferenced model BIMcollab, usBIM and other BCF tools put the camera kilometres from the building, and imported cameras landed off-model the same way. `@ifc-lite/bcf` adds `translateViewpoint`, and `createBCFFromClashResult` accepts a `worldOffset`. Viewpoints written by earlier ifc-lite versions still open in place. Topics and viewpoints captured from the BCF panel while a clash is focused now carry the clashing pair as found objects and colouring, and the Clash panel's topic records its source-file header.
+
+- [#4880](https://github.com/LTplus-AG/ifc-lite/pull/4880) [`35c0517`](https://github.com/LTplus-AG/ifc-lite/commit/35c0517d9779297704979131f451a4ae704bf744) Thanks [@louistrue](https://github.com/louistrue)! - BCF viewpoints are written in IFC world coordinates outside the viewer too ([#4879](https://github.com/LTplus-AG/ifc-lite/issues/4879)). `ifc-lite clash --bcf`, the MCP playground's `clash_bcf_export` and `bim.bcf.createViewpoint({ camera: bim.viewer.getCamera() })` wrote render-frame (origin-shifted, RTC-local) cameras, so other BCF tools put the camera hundreds of kilometres from a georeferenced building. A new `@ifc-lite/geometry/world-frame` entry point holds the one render frame <-> world conversion (`renderFrameWorldOffset`, `totalYupOffset`, `ifcToViewerAxes`, `viewerToIfcAxes`, `federationFrameInfo`), which the viewer, CLI, playground and SDK all use. `@ifc-lite/bcf` adds `viewpointFromWorld`, the inverse of `translateViewpoint` that keeps viewpoints written by ifc-lite before [#4806](https://github.com/LTplus-AG/ifc-lite/issues/4806) in place. In the SDK, `ViewerBackendMethods` gains an optional `getRenderFrameOffset()`; when a backend provides it (the viewer does), `bim.bcf.createViewpoint()` adds it and `bim.bcf.extractViewpointState()` subtracts it, so viewpoints are world coordinates and extracted cameras are ready for `bim.viewer.setCamera()`. Backends without it, and `new BCFNamespace()` with no backend, behave as before.
+
+## 4.0.0
+
+### Major Changes
+
+- [#4509](https://github.com/LTplus-AG/ifc-lite/pull/4509) [`9a271dc`](https://github.com/LTplus-AG/ifc-lite/commit/9a271dcb19dff2f9bca72fc3505ce5a71b3e800b) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `createViewpoint`/`extractViewpointState` reading an active-but-empty isolation (the viewer isolated to a set that currently matches nothing — an empty viewport) the same as no isolation at all.
+  
+  - `createViewpoint({ visibleGuids: [] })` (isolation active, zero entities) previously wrote no `components.visibility` at all, so the resulting BCF viewpoint claimed the whole model was visible. It now correctly writes `defaultVisibility: false` with no exceptions. This was reachable via `@ifc-lite/sdk`'s `bim.bcf.createViewpoint()`, which already produced `visibleGuids: []` for `{ defaultVisibility: false, exceptions: [] }` input — a real caller shape, not a hypothetical.
+  - `extractViewpointState()`'s `visibleGuids` field is now `string[] | null` (was `string[]`): `null` means the read viewpoint carried no isolation channel, while a non-null array — empty included — means isolation was active in the captured viewpoint, down to "matched nothing". A BCF viewpoint from any conformant tool with `<Visibility DefaultVisibility="false"/>` and no `<Exceptions>` is spec-valid and previously round-tripped back as "no isolation" instead of "isolated to nothing". `@ifc-lite/sdk`'s `ExtractedViewpointState.visibleGuids` carries the same type change.
+  
+  - `bim.bcf.createViewpoint()`'s `components.visibility.defaultVisibility` is now **optional**, and an absent value is read as `true`, per BCF's schema default ("everything is visible, the exceptions are HIDDEN"). It was previously truthy-tested, which mapped an absent value onto the isolation arm — inverting the spec's default, and, with no exceptions to isolate, turning a caller who said nothing about visibility into a viewpoint asserting a blank viewport. Pass `defaultVisibility: false` explicitly to isolate.
+  
+  `hiddenGuids` is unaffected: it is a blocklist, where an absent and an empty set both correctly mean "hide nothing" (matching `packages/renderer/src/entity-visibility.ts`'s `isEntityVisible` convention), so it keeps its `.length > 0` check.
+  
+  When both `visibleGuids` and `hiddenGuids` are supplied, the isolation allowlist wins and the blocklist is not written. That is deliberate and lossless rather than a dropped input: BCF's `<Visibility>` carries a single `DefaultVisibility` flag, so only one of the two modes is expressible at all, and an allowlist already hides everything outside itself.
+
+## 3.0.1
+
+### Patch Changes
+
+- [#3970](https://github.com/LTplus-AG/ifc-lite/pull/3970) [`8eb1c25`](https://github.com/LTplus-AG/ifc-lite/commit/8eb1c258fafc73bd9c83c7af95ba2feebf00fb34) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix three cases in `@ifc-lite/bcf` where a failure or absence produced a result indistinguishable from success:
+  
+  - Reading a `.bcfzip` where two topic folders declare the same `Topic/@Guid` no longer silently overwrites one topic in the resulting map; the first one read is kept and a `console.warn` reports the collision.
+  - Reading a `Topic/Index` value that is not a valid number now yields `undefined`, matching the treatment of every other numeric field in the reader, instead of a `NaN` stored as a plain `number`.
+  - Writing a viewpoint's snapshot now resolves the snapshot bytes once, before deciding whether to emit the markup `<Snapshot>` reference, so a `data:` URL that fails to decode can no longer produce an archive whose markup references a snapshot file that was never written.
+  
+  Also split `reader.ts`'s BCFV viewpoint-content parsing (camera shapes, point/direction, lines, clipping planes, bitmaps) into `reader-viewpoint-content.ts`, and `writer.ts`'s markup-element writers (header/file, BIM snippet, document reference, line, clipping plane, bitmap) into `writer-markup-elements.ts`, to bring both files back under the repo's module-size budget. Pure internal refactor: no behaviour change, and `@ifc-lite/bcf`'s public API is unchanged.
+
+- [#4029](https://github.com/LTplus-AG/ifc-lite/pull/4029) [`49edb1e`](https://github.com/LTplus-AG/ifc-lite/commit/49edb1e62451fe48f799652b2ef95d0c980298d1) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Extend `schema-validation.test.ts` to validate two genuine third-party BCF archives already in the repo (`test-data/PerspectiveCamera.bcf`, `test-data/OrthogonalCamera.bcf`) against the vendored buildingSMART v2.1 XSDs, closing a gap where every schema-validation test checked only fixtures this codebase built by hand from its own understanding of the schema. Test-only, no source change.
+
+- [#4039](https://github.com/LTplus-AG/ifc-lite/pull/4039) [`ad193bd`](https://github.com/LTplus-AG/ifc-lite/commit/ad193bd23fc97b2e7167d740c447ca87680c7c07) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Add a second, independently-produced third-party BCF archive (`test-data/AC20-FZK-Haus_BIMcollabZoom.bcf`, produced by BIMcollab Zoom) alongside the existing buildingSMART/iabi.BCF pair, and validate its `bcf.version`/`project.bcfp`/`markup.bcf`/`.bcfv` entries against the vendored BCF 2.1 XSDs. It also exercises shapes neither our writer nor either existing fixture produces: a `<Comment>` element, a zero-length directory entry, `TopicStatus="Active"`, and generic `viewpoint.bcfv`/`snapshot.png` filenames instead of our own `Viewpoint_<guid>`/`Snapshot_<guid>` convention. New reader assertions pin that the viewpoint declared by its top-level `<Viewpoints Guid="...">` entry is recovered and that `comment.viewpointGuid` (copied from the Comment's own nested `<Viewpoint Guid="..."/>`) resolves to it. A second fixture, `AC20-FZK-Haus_BIMcollabZoom-CommentOnly.bcf`, is the same archive with only that top-level `<Viewpoints>` element removed (schema-valid, since markup.xsd declares it `minOccurs="0"`); it pins that the reader's topic-folder `.bcfv` glob still recovers the viewpoint when markup.bcf makes no top-level declaration at all -- not through any comment-driven lookup, since none exists. No source change.
+
+- [#4097](https://github.com/LTplus-AG/ifc-lite/pull/4097) [`f48b803`](https://github.com/LTplus-AG/ifc-lite/commit/f48b803ee82824710b315cb768f8b02b658fa101) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Finish renaming the BCF "issues" language to "topics" across the app, docs, and package-facing text. Per the BCF-XML specification, `Topic` is the container element and `Issue` is only one `TopicType` value among several (Request, Comment, Error, Warning, Info); the previous patch fixed the BCF panel's own title, heading, empty-state copy, and topic-title placeholder, and left the rest of the product inconsistent.
+  
+  Remaining app-visible surfaces now fixed: the Analyze ribbon's "BCF issues" toggle button (a fourth site, alongside the command palette, main toolbar, and workspace-panel controls fixed previously), the compare panel's "Create BCF issue" affordance and "Issue for" header, the auto-created BCF project's default name (`<model>_Issues` → `<model>_Topics`, matching the BCF panel's own default), the landing-page hero animation's "Issue" step label, the MCP playground's BCF category blurb and example export path, and BCF-related copy across three in-app tours (`bcf`, `compare`, `clash`) — tour titles/descriptions plus five step titles/bodies.
+  
+  Docs updated to match: `docs/index.md`, `README.md`, `docs/guide/quickstart.md`, `docs/guide/bcf.md`, `docs/api/typescript.md`, and the CLI guide/reference's `bcf` examples (`--out topic.bcf`, `bcf list topics.bcf`), which also renamed the example filenames for consistency — they are illustrative only; the CLI has no default BCF filename.
+  
+  Also reworded now-inconsistent internal comments and JSDoc in the touched files, `@ifc-lite/bcf`'s package README and `createTopic` doc comment, `@ifc-lite/bcf-api`'s README, `@ifc-lite/sdk`'s `bim.bcf` namespace docs, `@ifc-lite/mcp`'s `bcf` tool docblock and fire-rating prompt template, and `@ifc-lite/sandbox`'s clash-to-BCF tool description — all comment/doc-only, no behavior change beyond the CLI's `bcf create` usage-message example (`--title "Issue"` → `--title "Missing door"`, matching the `--help` listing).
+  
+  Left deliberately unchanged: `bcfHelpers.tsx`'s `TOPIC_TYPES` list and every other real `TopicType` spec value (including the MCP `bcf` tool's `type` default and the sandbox playground's `topicType` default, both `'Issue'`), `ClashPanel`'s unrelated clash-detection "issues", GitHub issue-number references, and `registry.ts`'s `id: 'bcf'` panel key.
+
+- [#4151](https://github.com/LTplus-AG/ifc-lite/pull/4151) [`c6e4713`](https://github.com/LTplus-AG/ifc-lite/commit/c6e471329c1685e52277a8927da06c452756a4fd) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Name a topic's first (or only) viewpoint `viewpoint.bcfv`/`snapshot.<ext>` instead of a GUID-prefixed `Viewpoint_<guid>.bcfv`/`Snapshot_<guid>.<ext>`; additional viewpoints in the same topic keep a GUID-qualified name, now as a suffix (`<guid>_viewpoint.bcfv`) rather than a prefix, matching the convention BIMcollab uses. Investigation on [#3612](https://github.com/LTplus-AG/ifc-lite/issues/3612) (a BCF export rejected by Solibri while the same topic re-exported by BIMcollab was accepted) narrowed the difference between the two archives to this filename convention -- both forms are schema-legal, since `markup.bcf` names the file explicitly, but a reader that assumes the conventional name rather than following the reference fails on the old prefix form. The markup `<Viewpoint>`/`<Snapshot>` reference and the archive entry are computed from one shared name so the two can never disagree.
+
+## 3.0.0
+
+### Major Changes
+
+- [#3574](https://github.com/LTplus-AG/ifc-lite/pull/3574) [`1d51937`](https://github.com/LTplus-AG/ifc-lite/commit/1d519376392e405645166761cc537bfbed9083cf) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Stop the BCF reader from fabricating a `CreationAuthor`/`Author` when a `markup.bcf` omits the required element, and stop the writer from emitting an archive that omission makes schema-invalid.
+  
+  `markup.xsd` declares `Topic/CreationAuthor` and `Comment/Author` as required `UserIdType` (string) elements with no schema default — the same shape as `Topic/CreationDate`/`Comment/Date`, which a prior release already stopped fabricating. When a non-conformant source file omitted one, the reader substituted the literal string `'Unknown'`, which is indistinguishable downstream from a genuinely-declared author name.
+  
+  Two breaking changes, both on the read/write round trip for such a file:
+  
+  - `BCFTopic.creationAuthor` and `BCFComment.author` are now `string | undefined`. The reader passes through what the file declared and substitutes nothing. Code that assumed a `string` — `topic.creationAuthor.split('@')[0]`, string-templating `comment.author` — has to handle the missing case.
+  - `writeBCF` now rejects a topic or comment with no author (and a topic with `ModifiedDate` but no `ModifiedAuthor`/`CreationAuthor` to fall back to) instead of silently emitting an author-less element, whose absence makes the `markup.bcf` fail `markup.xsd` in both BCF 2.1 and 3.0. This is the same rule the writer already applies to `CreationDate`/`Date` and to a BCF 3.0 topic with no `TopicType`: it will neither invent a value the source never stated nor hand back an archive it knows is invalid. The error names the element and the topic/comment guid, so a caller that does know the author can supply it and write again.
+
+- [#3530](https://github.com/LTplus-AG/ifc-lite/pull/3530) [`18e4de8`](https://github.com/LTplus-AG/ifc-lite/commit/18e4de865884d3126f478a9081cf56178fefcd00) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Stop the BCF reader from fabricating a `CreationDate`/`Date` when a `markup.bcf` omits the required element, and stop the writer from emitting an archive that omission makes schema-invalid.
+  
+  `markup.xsd` declares `Topic/CreationDate` and `Comment/Date` as required `xs:dateTime` elements with no schema default. When a non-conformant source file omitted one, the reader substituted `new Date().toISOString()` — the wall-clock time *at read time*. That value is indistinguishable downstream from a genuinely-declared timestamp (it drives topic/comment chronological sort and the "Created on" label), and it isn't even stable across repeated reads of the same untouched archive: reading the file twice produced two different "creation" dates.
+  
+  Two breaking changes, both on the read/write round trip for such a file:
+  
+  - `BCFTopic.creationDate` and `BCFComment.date` are now `string | undefined`. The reader passes through what the file declared and substitutes nothing. Code that assumed a `string` — `formatDate(topic.creationDate)`, `new Date(comment.date)` — has to handle the missing case.
+  - `writeBCF` now rejects a topic or comment with no date instead of silently dropping the element, whose absence makes the `markup.bcf` fail `markup.xsd` in both BCF 2.1 and 3.0. This is the same rule the writer already applies to a BCF 3.0 topic with no `TopicType`: it will neither invent a value the source never stated nor hand back an archive it knows is invalid. The error names the element and the topic/comment guid, so a caller that does know the date can supply it and write again.
+
+### Patch Changes
+
+- [#3856](https://github.com/LTplus-AG/ifc-lite/pull/3856) [`142b84c`](https://github.com/LTplus-AG/ifc-lite/commit/142b84c41036b749e7b64418a882424b9c386edb) Thanks [@louistrue](https://github.com/louistrue)! - Let a caller supply the viewport aspect ratio a BCF 3.0 camera requires.
+  
+  `v3_0/visinfo.xsd` makes `<AspectRatio>` a required child of both camera types
+  and the writer refuses to invent one, but `ViewerCameraState` had no field for
+  it. Every viewpoint `createViewpoint` produced was therefore unwritable as BCF
+  3.0, and `writeBCF` throws for the whole archive on the first such camera, so a
+  single captured viewpoint meant no export at all. `ViewerCameraState` now
+  carries an optional `aspectRatio` that `cameraToPerspective`/`cameraToOrthogonal`
+  pass through and `perspectiveToCamera`/`orthogonalToCamera` return. A caller
+  that supplies nothing still gets no `AspectRatio`, as BCF 2.1 requires.
+  
+  `@ifc-lite/renderer` gains `Camera.getAspect()`, which reports the ratio the
+  projection is built from. That is the drawing buffer's ratio, not the CSS box's
+  (the render loop floors canvas width to a multiple of 64 for WebGPU texture row
+  alignment), and it is the one BCF wants: a viewpoint's snapshot PNG comes from
+  the same buffer, so the written ratio describes the image actually in the
+  archive.
+
+- [#3856](https://github.com/LTplus-AG/ifc-lite/pull/3856) [`142b84c`](https://github.com/LTplus-AG/ifc-lite/commit/142b84c41036b749e7b64418a882424b9c386edb) Thanks [@louistrue](https://github.com/louistrue)! - Write the `DocumentReference/@Guid` that BCF 3.0 requires.
+  
+  2.1's markup.xsd leaves the attribute optional and 3.0's
+  `DocumentReferenceAttributes` marks it `use="required"`, so a 3.0 topic
+  carrying a document reference without one produced a `markup.bcf` that fails
+  validation, and a viewer that rejects markup.bcf drops the topic entirely. A
+  guid is now derived when the caller supplied none, and written back onto the
+  reference so the in-memory project matches the file. A caller-supplied guid is
+  kept, and BCF 2.1 output is unchanged.
+  
+  The guid is a pure function of the topic, the document and the position, so two
+  exports of one unchanged project are byte-identical. `uuidFromSeed` moved from
+  `@ifc-lite/clash` to `@ifc-lite/encoding` to make that sharing possible without
+  a package cycle (`@ifc-lite/clash` depends on `@ifc-lite/bcf`); it is now
+  exported from `@ifc-lite/encoding`, and `@ifc-lite/clash` re-exports it from its
+  existing path, so no clash caller changes.
+
+- [#3893](https://github.com/LTplus-AG/ifc-lite/pull/3893) [`3284390`](https://github.com/LTplus-AG/ifc-lite/commit/328439014322dafaecb1bc930cd66ce5192c3c74) Thanks [@louistrue](https://github.com/louistrue)! - Frame IDS report cameras from the box corners, not the largest side
+  
+  `computeCameraFromBounds` derived its standoff from the longest side of the
+  entity bounds times a fixed factor. A side length is not what the projection
+  sees: down the southeast-isometric axis the camera uses, a box projects wider
+  than any of its sides, so the worst corner of a unit cube sat outside the
+  frustum at 16/9 (vertical slope 0.837 against the tan(30 deg) = 0.577 limit)
+  and outside it horizontally at 9/16 (0.344 against 0.325).
+  
+  The distance is now the smallest standoff that puts all eight corners inside
+  both half-angles for the given field of view and aspect ratio, with the same
+  1.5x padding on top. The view direction and up vector are unchanged. Cameras
+  for boxes that were already cropped move further out; a landscape export of a
+  cube frames exactly as a square one does.
+
+- [#3669](https://github.com/LTplus-AG/ifc-lite/pull/3669) [`bbcb476`](https://github.com/LTplus-AG/ifc-lite/commit/bbcb476209a96b3c8a97f11751f4540cdaf41919) Thanks [@BIMvoice](https://github.com/BIMvoice)! - `readBCF` silently dropped every `Topic` label from a BCF 3.0 archive. BCF 2.1's markup.xsd repeats the label element itself (`<Labels>Structural</Labels><Labels>Urgent</Labels>`), while 3.0 wraps one `<Labels>` container around repeated `<Label>` children (`<Labels><Label>Structural</Label><Label>Urgent</Label></Labels>`). The reader's label regex only matched the 2.1 shape's direct text content, so a conformant 3.0 archive's `<Labels>` — immediately followed by a nested `<Label>` tag rather than text — matched nothing and the topic came back with no labels at all, with no warning. The reader now recognizes both shapes.
+  
+  A CDATA-wrapped label (`<Label><![CDATA[Urgent & Important]]></Label>`) was dropped by the same regex, in both shapes, for the same reason: a CDATA section's content starts with `<`. Label text is now read CDATA-tolerantly — CDATA content stays literal per the XML spec, surrounding text is still entity-decoded, and real child markup still reads as not-a-text-value.
+
+- [#3669](https://github.com/LTplus-AG/ifc-lite/pull/3669) [`bbcb476`](https://github.com/LTplus-AG/ifc-lite/commit/bbcb476209a96b3c8a97f11751f4540cdaf41919) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Three more `readBCF` import-side gaps, filed as follow-ups to the label/CDATA and `DefaultVisibility` reader fixes shipping in this same release (each has its own entry):
+  
+  - A CDATA-wrapped `<Title>` or `<Comment>` fell back to `'Untitled'` / `''` instead of being read: `extractElement`'s content regex rejected CDATA the same way `parseLabels`'s did before it was fixed, but only `parseLabels` had been given the CDATA-aware extractor. `extractElement` (and every field that goes through it — Title, Comment, and the rest) now shares the same CDATA-tolerant decoding.
+  - `<DocumentReference isExternal="1">` read back as `isExternal: false`. markup.xsd types `isExternal` as `xs:boolean`, whose lexical space is `{true, false, 1, 0}`; the reader's other two `isExternal` sites already accepted the numeral form, this one compared only against the literal `'true'`.
+  - A whitespace-only `DefaultVisibility` (e.g. `DefaultVisibility="   "`) read as `true` instead of falling back to the archive version's schema-declared default. Trimming produces the empty string, which is not a member of `xs:boolean`'s lexical space — the same as the attribute being absent — but the reader treated an empty trimmed value as an explicit, truthy one.
+  
+  Also unifies the four hand-rolled `xs:boolean` parses this package had (`DefaultVisibility`, `ViewSetupHints`'s per-attribute flags, and the header `<File>` and `<BimSnippet>` `isExternal` reads) behind one shared `parseXsBoolean(raw, { ifUnrecognized })`, each call site keeping its own absent-case default. As part of that, a whitespace-only `<File isExternal="   ">` and `<ViewSetupHints SpacesVisible="   ">` now read the same as an absent attribute (`isExternal`/`spacesVisible`: `undefined`) instead of `false` — consistent with the whitespace-only `DefaultVisibility` fix in the third bullet above, and with the same reasoning: a blank value is not a member of `xs:boolean`'s lexical space, so it should not be read as an explicit `false`. In the other direction, `xs:boolean` carries `whiteSpace=collapse`, so a padded but otherwise valid `" true "` / `" 1 "` is lexically valid; every one of these sites previously compared the untrimmed value against the literal `'true'`/`'1'` and read a padded value as `false`. All five now trim before comparing.
+
+- [#3669](https://github.com/LTplus-AG/ifc-lite/pull/3669) [`bbcb476`](https://github.com/LTplus-AG/ifc-lite/commit/bbcb476209a96b3c8a97f11751f4540cdaf41919) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Two `readBCF` defects in the same `DefaultVisibility` read, both of which inverted a third-party BCF 3.0 viewpoint's visibility on import. (This release also carries separate `@ifc-lite/bcf` reader fixes for dropped BCF 3.0 topic labels and for CDATA/`xs:boolean` handling; each has its own entry.)
+  
+  - An omitted `<Visibility>`/`DefaultVisibility` attribute was treated as `true` for every BCF archive, but visinfo.xsd only leaves that undefined for 2.1 — 3.0 declares `default="false"`. A spec-legal 3.0 viewpoint that omits the attribute (meaning "show only the listed exceptions") was silently read as "show everything." The reader now resolves the omitted-attribute default per the archive's own `bcf.version`; a 2.1 archive with the same omission is unaffected.
+  - An explicit `DefaultVisibility="0"` read back as `true`. `xs:boolean`'s lexical space is `{true, false, 1, 0}`, but the reader compared only against the literal `'false'`, so the numeral form of false read as its opposite — for 2.1 and 3.0 alike.
+  
+  ifc-lite's own writer always emits the attribute explicitly, and always in the `true`/`false` form, so neither could surface from a self-round-trip — only from a third-party BCF file.
+
+- [#3667](https://github.com/LTplus-AG/ifc-lite/pull/3667) [`80398a9`](https://github.com/LTplus-AG/ifc-lite/commit/80398a944093e3607944c70803b82d64fc372cba) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Emit the schema-required `<ExtensionSchema>` in BCF 2.1 `project.bcfp`.
+  
+  BCF 2.1's `project.xsd` declares `<ProjectExtension>` as the sequence `Project?`, `ExtensionSchema` — and `ExtensionSchema` carries no `minOccurs`, so it is required. `writeProjectFile` never emitted it, so every BCF 2.1 archive this package produces shipped a `project.bcfp` that fails validation against the official schema with `Element 'ProjectExtension': Missing child element(s). Expected is ( ExtensionSchema )`. That is every archive in practice: 2.1 is `createBCFProject`'s default and every caller in this repository takes it, and `createBCFProject` always sets a project id, so `project.bcfp` is always written. It is now emitted as an empty `<ExtensionSchema/>`, which is a valid `xs:anyURI` and the honest value — this writer ships no `extensions.xsd`, so there is no extension schema to name. BCF 3.0 is unaffected: its `project.xsd` has no `ExtensionSchema` element at all, and none is written there.
+  
+  A new `interop-conformance.test.ts` validates every entry of an archive assembled only through the public helpers — `createBCFProject`, `createBCFTopic`, `createBCFComment`, `createViewpoint`, the sequence the viewer's BCF panel, `@ifc-lite/cli` and `@ifc-lite/mcp` all follow — against the vendored buildingSMART XSDs, and fails if any entry fails. The existing schema tests only validated a hand-built maximal fixture, and the `project.bcfp` violation had been pinned there as an accepted gap rather than fixed.
+  
+  The same reporter's archive also failed validation a second, more severe way: `markup.bcf`'s `<DueDate>` was a bare `YYYY-MM-DD` (exactly what an HTML `<input type="date">` yields, and exactly what `createBCFTopic`'s `dueDate` option accepted verbatim), and `markup.xsd` types `DueDate` `xs:dateTime` — a bare date is not a valid `xs:dateTime`. Because `markup.bcf` carries the topic itself, this is the one that made third-party tools show the issue as empty rather than merely warn on it. The writer now normalizes every `xs:dateTime` element it emits — `Topic/CreationDate`, `Topic/ModifiedDate`, `Topic/DueDate`, `Comment/Date`, `Comment/ModifiedDate` and `Header/File/Date` — through one shared helper: a bare date becomes midnight UTC on that date, an already-valid `xs:dateTime` passes through unchanged, and a value that is neither is omitted (for the optional fields, since `minOccurs="0"` makes omission schema-valid and an invalid element would poison the whole file) or refused with an error (for the two required fields, `CreationDate` and `Comment/Date`, where there is no valid element to omit). `interop-conformance.test.ts`'s fixture now sets a bare-date `dueDate`, which the previous fixture never did.
+
+- [#3615](https://github.com/LTplus-AG/ifc-lite/pull/3615) [`9e45546`](https://github.com/LTplus-AG/ifc-lite/commit/9e455460f81f4bd463ef65116cbd89000e5539f7) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Refuse to write a BCF 3.0 `PerspectiveCamera/FieldOfView` outside `visinfo.xsd`'s `(0, 180)` exclusive facet, instead of emitting a finite-but-invalid archive.
+  
+  `FieldOfView` is `xs:double` with `minExclusive="0"` and `maxExclusive="180"` in BCF 3.0's `visinfo.xsd`. The writer's only guard on write-side numbers, `xsdDouble`, checks finiteness — it says nothing about a value that is out of range but perfectly finite, so `0`, a negative number, or `180` and above walked straight through it and were written as-is. Every existing test that touched this field validated the *schema's* rejection of a hand-mutated string, never the writer's own behavior on an out-of-range `fieldOfView` in the input `BCFProject`; `AspectRatio`, the sibling 3.0-only facet-bearing field, already had this guard and `FieldOfView` did not.
+  
+  `writeBCF` now throws for a 3.0 camera whose `fieldOfView` is `<= 0` or `>= 180`, naming the viewpoint, the same policy `requireAspectRatioElement` and the `Topic/@TopicType`/`Topic/@TopicStatus` checks already apply: no safe value to invent, and no invalid archive handed back silently. BCF 2.1's own `FieldOfView` facet (`[45, 60]`) is deliberately left unenforced — its schema annotation says that limitation will be dropped and viewers should expect values outside it.
+
+- [#3599](https://github.com/LTplus-AG/ifc-lite/pull/3599) [`06f81fe`](https://github.com/LTplus-AG/ifc-lite/commit/06f81fe10ba35a5b8edc7848017017f1f4d045ea) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Escape `BCFProject.projectId` when writing `project.bcfp`.
+  
+  `writeProjectFile` interpolated `projectId` directly into the `<Project ProjectId="...">` attribute without XML-escaping, unlike every other free-text field the writer emits (Title, Description, Comment, Author, AssignedTo, Labels, Stage, DocumentReference names, and `project.bcfp`'s own `<Name>`). A `projectId` containing `"` broke the attribute's own quoting; a bare `&` or `<` made the whole `.bcfzip` non-well-formed XML, which a strict external reader (Solibri, BIMcollab, usBIM) rejects outright rather than opening the file.
+  
+  `readBCF` now also unescapes `ProjectId` on the way back in, matching the write-side fix — otherwise a read-modify-write round trip on an escaped value would double-escape it (`&` -> `&amp;` -> `&amp;amp;`) on the next write.
+
+- [#3891](https://github.com/LTplus-AG/ifc-lite/pull/3891) [`3e117c2`](https://github.com/LTplus-AG/ifc-lite/commit/3e117c249e792362ee5ec7eb722cf400ee18940a) Thanks [@louistrue](https://github.com/louistrue)! - `writeBCF` no longer adds explicit directory entries (`<topic guid>/`) to the archive. That entry was the one structural difference between an export Solibri refused and the same topic re-exported by BIMcollab, which Solibri opened ([#3612](https://github.com/LTplus-AG/ifc-lite/issues/3612)); every file path already carries its folder, and the BCF spec never asks for directory entries.
+
+- [#3864](https://github.com/LTplus-AG/ifc-lite/pull/3864) [`2329b20`](https://github.com/LTplus-AG/ifc-lite/commit/2329b20506160171da97af7d4dd0cd76ab85f13f) Thanks [@louistrue](https://github.com/louistrue)! - `createBCFFromIDSReport({ version: '3.0' })` now produces a writable archive.
+  Computed cameras carry an `AspectRatio` (required by BCF 3.0's `visinfo.xsd`),
+  taken from a new `aspectRatio` export option that defaults to 16/9, the
+  convention when no viewport exists. Per-specification grouping frames the union
+  of the failing entities' bounds instead of getting no camera at all. Without
+  `entityBounds` there is nothing to compute a camera from, so the export is
+  refused up front, naming the topic and the option that fixes it, rather than
+  failing later inside `writeBCF` with only a generated viewpoint GUID to go on.
+
+- [#3855](https://github.com/LTplus-AG/ifc-lite/pull/3855) [`182215a`](https://github.com/LTplus-AG/ifc-lite/commit/182215a835c4beac6a776bcb4eb1d019cab9063e) Thanks [@louistrue](https://github.com/louistrue)! - Corrected the code samples on each package's npm landing page: the README fences are now typechecked against the package's real exports, so the snippets import what they call, declare the values they read, and no longer show removed options or renamed methods. Patch-bumping every package whose README changed so the corrections actually reach npmjs.com.
+- Updated dependencies [[`142b84c`](https://github.com/LTplus-AG/ifc-lite/commit/142b84c41036b749e7b64418a882424b9c386edb), [`82343f7`](https://github.com/LTplus-AG/ifc-lite/commit/82343f75dd2e6029946cbcd0990d3f8fd38a26ad), [`80a0cd9`](https://github.com/LTplus-AG/ifc-lite/commit/80a0cd9b946a5ff1aa6ca214ddb427a5d1f5303c)]:
+  - @ifc-lite/encoding@2.2.0
+
 ## 2.0.1
 
 ### Patch Changes

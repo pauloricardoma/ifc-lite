@@ -15,13 +15,15 @@
 
 import { useCallback, useMemo } from 'react';
 import { useViewerStore } from '@/store';
+import type { UiSurface } from '@/lib/analytics-ui-events';
 import {
   isAnalysisPanel,
-  isBottomPanel,
   isLeftPanel,
   type WorkspacePanelId,
   type AnalysisPanelId,
 } from '@/lib/panels/registry';
+import { BOTTOM_PANEL_SETTER, isBottomPanel, isBottomPanelOpen } from '@/lib/panels/bottom-panels';
+import { useBottomPanelFlags } from './useBottomPanelFlags';
 import { openPanelWindow, closePanelWindow } from '@/services/panel-windows';
 
 export type PanelLocation = 'docked' | 'floating' | 'popped' | 'closed';
@@ -34,9 +36,9 @@ export interface PanelControls {
   isOpen: (id: WorkspacePanelId) => boolean;
   panelLocation: (id: WorkspacePanelId) => PanelLocation;
   /** Open a panel in its home region (right pane or bottom strip). */
-  openInHome: (id: WorkspacePanelId) => void;
+  openInHome: (id: WorkspacePanelId, source?: UiSurface) => void;
   /** Toggle a panel in its home region (second activation closes it). */
-  toggle: (id: WorkspacePanelId) => void;
+  toggle: (id: WorkspacePanelId, source?: UiSurface) => void;
   /** Pop the panel into an in-app floating window. */
   floatPanel: (id: WorkspacePanelId) => void;
   /** Tear the panel off into an OS / PiP window (another screen). */
@@ -52,14 +54,13 @@ function setDockedVisible(id: AnalysisPanelId, visible: boolean): void {
   switch (id) {
     case 'compare': s.setComparePanelVisible(visible); break;
     case 'bcf': s.setBcfPanelVisible(visible); break;
-    case 'ids': s.setIdsPanelVisible(visible); break;
+    case 'validation': s.setIdsPanelVisible(visible); break;
     case 'lens': s.setLensPanelVisible(visible); break;
     case 'clash': s.setClashPanelVisible(visible); break;
     case 'extensions': s.setExtensionsPanelVisible(visible); break;
     case 'sources': s.setSourcesPanelVisible(visible); break;
-    case 'script': s.setScriptPanelVisible(visible); break;
-    case 'gantt': s.setGanttPanelVisible(visible); break;
-    case 'lists': s.setListPanelVisible(visible); break;
+    // Bottom-strip panels: one row of the table each (`BOTTOM_PANEL_SETTER`).
+    case 'script': case 'gantt': case 'lists': case 'charts': case 'document': case 'flow': case 'drawing': case 'presentation': s[BOTTOM_PANEL_SETTER[id]](visible); break;
     case 'layers': s.setLayersPanelVisible(visible); break;
   }
 }
@@ -68,10 +69,8 @@ export function usePanelControls(): PanelControls {
   const floatingPanels = useViewerStore((s) => s.floatingPanels);
   const poppedOutIds = useViewerStore((s) => s.poppedOutIds);
   const activePanel = useViewerStore((s) => s.sidebarActivePanel);
-  // Bottom-strip visibility flags (their "docked" state).
-  const scriptVisible = useViewerStore((s) => s.scriptPanelVisible);
-  const ganttVisible = useViewerStore((s) => s.ganttPanelVisible);
-  const listVisible = useViewerStore((s) => s.listPanelVisible);
+  // Bottom-strip visibility flags (their "docked" state), shallow-compared.
+  const bottomFlags = useBottomPanelFlags();
   // The Hierarchy panel (left region, #1267) is "docked" while its slot is open.
   const leftPanelCollapsed = useViewerStore((s) => s.leftPanelCollapsed);
   // The lower half of a docked split (#1266), also docked/visible.
@@ -104,13 +103,11 @@ export function usePanelControls(): PanelControls {
   const isDockedInHome = useCallback(
     (id: WorkspacePanelId): boolean => {
       if (id === 'hierarchy') return !leftPanelCollapsed; // left slot open
-      if (id === 'script') return scriptVisible;
-      if (id === 'gantt') return ganttVisible;
-      if (id === 'lists') return listVisible;
+      if (isBottomPanel(id)) return isBottomPanelOpen(bottomFlags, id);
       // A side panel is docked as the right-pane primary OR the split secondary.
       return id === sideDocked || id === secondaryDocked;
     },
-    [sideDocked, secondaryDocked, scriptVisible, ganttVisible, listVisible, leftPanelCollapsed],
+    [sideDocked, secondaryDocked, bottomFlags, leftPanelCollapsed],
   );
 
   const panelLocation = useCallback(
@@ -127,17 +124,17 @@ export function usePanelControls(): PanelControls {
     [floatingIds, poppedIds, isDockedInHome],
   );
 
-  const openInHome = useCallback((id: WorkspacePanelId) => {
+  const openInHome = useCallback((id: WorkspacePanelId, source: UiSurface = 'rail') => {
     // Hierarchy's home is the left slot, so reveal it instead of routing through
     // the right-pane / bottom-strip flags (#1267).
     if (isLeftPanel(id)) {
       useViewerStore.getState().setLeftPanelCollapsed(false);
       return;
     }
-    useViewerStore.getState().openPanelInHome(id);
+    useViewerStore.getState().openPanelInHome(id, source);
   }, []);
 
-  const toggle = useCallback((id: WorkspacePanelId) => {
+  const toggle = useCallback((id: WorkspacePanelId, source: UiSurface = 'rail') => {
     if (isLeftPanel(id)) {
       const s = useViewerStore.getState();
       s.setLeftPanelCollapsed(!s.leftPanelCollapsed);
@@ -150,8 +147,8 @@ export function usePanelControls(): PanelControls {
       useViewerStore.getState().setSidebarSecondaryPanel(null);
       return;
     }
-    if (isBottomPanel(id)) useViewerStore.getState().toggleBottomPanel(id);
-    else useViewerStore.getState().toggleWorkspacePanel(id);
+    if (isBottomPanel(id)) useViewerStore.getState().toggleBottomPanel(id, source);
+    else useViewerStore.getState().toggleWorkspacePanel(id, source);
   }, []);
 
   const floatPanel = useCallback((id: WorkspacePanelId) => {

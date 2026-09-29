@@ -19,12 +19,29 @@ npm install @ifc-lite/pointcloud
 ```ts
 import { decodeIfcxPointAttribute } from '@ifc-lite/pointcloud';
 
+// One IFCX node's attribute map, e.g. from a parsed .ifcx document
+declare const node: { attributes: ReadonlyMap<string, unknown> };
+
 const chunk = decodeIfcxPointAttribute(node.attributes);
 if (chunk) {
   console.log(`${chunk.pointCount} points`, chunk.bbox);
   // chunk.positions, chunk.colors are ready for GPU upload
 }
 ```
+
+`DecodedPointChunk.normals` carries source-supplied oriented normals as
+row-aligned `nx, ny, nz` float triples when a decoder provides them. PLY
+supports complete `nx`/`ny`/`nz` properties in ASCII and binary files and
+preserves their values and vertex order exactly. Partial, duplicate, list-valued,
+non-finite, and zero normal declarations leave XYZ loadable but set
+`normalState: 'invalid'`; consumers decide whether valid normals are required
+for their operation.
+
+The canonical PLY streaming source scans headers and bounds in bounded byte
+windows, then decodes directly into host-sized, stride-filtered chunks. A
+memory-cap probe therefore does not allocate full-file point channels before
+downsampling. Streaming PLY headers are limited to 65,536 bytes and files that
+exceed that bound are refused with an explicit error.
 
 The renderer (`@ifc-lite/renderer`) uploads decoded chunks (wrapped as
 `PointCloudAsset` values) via `Renderer.setPointClouds()` /
@@ -46,6 +63,12 @@ const info = await source.open();
 // drive source.next(maxPoints) → DecodedPointChunk until it returns null
 ```
 
+PLY chunks retain complete scalar `nx`/`ny`/`nz` channels as raw, row-aligned
+`Float32Array` values. `normalState` explicitly distinguishes `supplied`,
+`absent`, and `invalid` declarations; consumers must not silently treat an
+invalid declaration as an un-oriented scan. Stride sampling and worker
+transfer keep each normal with the same position and colour row.
+
 Notes:
 
 - The inlined worker bundle is lazy-loaded — consumers that only call
@@ -65,3 +88,18 @@ See the [docs site](https://ifclite.dev/docs/) for guides and the full API refer
 ## License
 
 [MPL-2.0](../../LICENSE)
+
+
+## Local origins for large-coordinate scans
+
+`streamPointCloud({ ..., autoOrigin: true })` chooses a nearby origin before
+emitting chunks when `originOffset` is absent. Header bounds choose the centre;
+formats without usable bounds probe one point and reopen the original bytes.
+The decoder subtracts that origin in float64 before writing float32 positions.
+`onOpen(info)` receives the chosen `info.originOffset` in native X/Y/Z source
+units, before the first `onChunk`. Compose that offset with your alignment and
+manual translation in double precision before sending a final matrix to the
+GPU. Explicit `originOffset` takes precedence; the default remains unchanged.
+Opening may perform an extra decode pass for formats without header bounds.
+A local origin preserves nearby detail but cannot repair a source whose
+coordinates were already quantized or an extremely large spatial extent.

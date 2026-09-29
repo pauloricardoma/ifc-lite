@@ -158,12 +158,13 @@ fn geom_color_key_length_frame_prevents_split_aliasing() {
 fn with_index_glb_is_byte_identical() {
     // The shared-index path must emit byte-for-byte the same GLB as the
     // self-indexing path — it only injects an index equal to the one
-    // `export_glb_with_stats` builds internally. Guards the two from drifting.
+    // `try_export_glb_with_stats` builds internally. Guards the two from drifting.
     let bytes = fixture_or_skip!("ara3d/duplex.ifc");
     let opts = GltfOptions::default();
-    let (plain, _) = export_glb_with_stats(&bytes, &opts);
+    let (plain, _) = try_export_glb_with_stats(&bytes, &opts).expect("has geometry");
     let idx = Arc::new(crate::build_entity_index(&bytes));
-    let (shared, _) = export_glb_with_stats_with_index(&bytes, &opts, idx);
+    let (shared, _) =
+        try_export_glb_with_stats_with_index(&bytes, &opts, idx).expect("has geometry");
     assert_eq!(plain, shared, "shared-index GLB must equal self-indexed GLB");
 }
 
@@ -187,11 +188,13 @@ fn tessellation_quality_reaches_the_exporter_and_changes_the_mesh() {
         return;
     };
 
-    let (medium, medium_stats) = export_glb_with_stats(&bytes, &GltfOptions::default());
-    let (coarse, coarse_stats) = export_glb_with_stats(
+    let (medium, medium_stats) =
+        try_export_glb_with_stats(&bytes, &GltfOptions::default()).expect("has geometry");
+    let (coarse, coarse_stats) = try_export_glb_with_stats(
         &bytes,
         &GltfOptions { tessellation_quality: TessellationQuality::Low, ..Default::default() },
-    );
+    )
+    .expect("has geometry");
 
     assert_ne!(
         medium, coarse,
@@ -219,11 +222,13 @@ fn default_tessellation_quality_is_the_golden_medium() {
         eprintln!("skipping default_tessellation_quality_is_the_golden_medium: corpus not fetched");
         return;
     };
-    let (implicit, _) = export_glb_with_stats(&bytes, &GltfOptions::default());
-    let (explicit, _) = export_glb_with_stats(
+    let (implicit, _) =
+        try_export_glb_with_stats(&bytes, &GltfOptions::default()).expect("has geometry");
+    let (explicit, _) = try_export_glb_with_stats(
         &bytes,
         &GltfOptions { tessellation_quality: TessellationQuality::Medium, ..Default::default() },
-    );
+    )
+    .expect("has geometry");
     assert_eq!(implicit, explicit, "default must be byte-identical to explicit Medium");
 }
 
@@ -252,9 +257,10 @@ fn bounded_glb_with_index_is_byte_identical() {
     let bytes = fixture_or_skip!("ara3d/duplex.ifc");
     for quantize in [false, true] {
         let opts = GltfOptions { quantize, ..GltfOptions::default() };
-        let (plain, ps) = export_glb_streaming_bounded(&bytes, &opts);
+        let (plain, ps) = try_export_glb_streaming_bounded(&bytes, &opts).expect("has geometry");
         let idx = Arc::new(crate::build_entity_index(&bytes));
-        let (shared, ss) = export_glb_streaming_bounded_with_index(&bytes, &opts, idx);
+        let (shared, ss) =
+            try_export_glb_streaming_bounded_with_index(&bytes, &opts, idx).expect("has geometry");
         assert_eq!(plain, shared, "shared-index bounded GLB must match (quantize={quantize})");
         assert_eq!(ps, ss, "stats must match");
     }
@@ -290,7 +296,7 @@ fn project_glb_size_matches_bounded_output() {
     for quantize in [false, true] {
         let opts = GltfOptions { quantize, ..GltfOptions::default() };
         let proj = project_glb_size(&bytes, &opts);
-        let (glb, stats) = export_glb_streaming_bounded(&bytes, &opts);
+        let (glb, stats) = try_export_glb_streaming_bounded(&bytes, &opts).expect("has geometry");
         assert_eq!(
             proj.total_bytes as usize,
             glb.len(),
@@ -304,26 +310,6 @@ fn project_glb_size_matches_bounded_output() {
         assert_eq!(proj_idx.total_bytes, proj.total_bytes);
         assert_eq!(proj_idx.bin_bytes, proj.bin_bytes);
     }
-}
-
-/// The checked bounded export returns the SAME bytes as the panicking one for
-/// a model that fits (the common case), so `try_*` is a drop-in that only
-/// changes the oversize behaviour (typed error vs panic).
-#[test]
-fn try_export_bounded_matches_export_for_fitting_model() {
-    let bytes = fixture_or_skip!("ara3d/duplex.ifc");
-    let opts = GltfOptions::default();
-    let (want, wstats) = export_glb_streaming_bounded(&bytes, &opts);
-    let (got, gstats) = try_export_glb_streaming_bounded(&bytes, &opts)
-        .expect("duplex fits — must not be TooLarge");
-    assert_eq!(want, got, "checked bounded GLB must equal the panicking one");
-    assert_eq!(wstats, gstats);
-
-    // The top-level fail-closed API agrees with the in-memory export for a
-    // small model and still guards the empty case.
-    let (glb, _) = try_export_glb_with_stats(&bytes, &opts).expect("has geometry");
-    let (want2, _) = export_glb_with_stats(&bytes, &opts);
-    assert_eq!(glb, want2, "try_export_glb_with_stats must match export_glb_with_stats");
 }
 
 // ── KHR_mesh_quantization ────────────────────────────────────────────
@@ -443,11 +429,13 @@ fn quantized_glb_matches_f32_world_bounds() {
     // per-mesh dequant + placement (incl. the nested instanced dequant nodes)
     // compose correctly. Compared via world-space AABB within a few mm.
     let bytes = fixture_or_skip!("ara3d/duplex.ifc");
-    let (f32_glb, _) = export_glb_with_stats(&bytes, &GltfOptions::default());
-    let (q_glb, _) = export_glb_with_stats(
+    let (f32_glb, _) =
+        try_export_glb_with_stats(&bytes, &GltfOptions::default()).expect("has geometry");
+    let (q_glb, _) = try_export_glb_with_stats(
         &bytes,
         &GltfOptions { quantize: true, ..Default::default() },
-    );
+    )
+    .expect("has geometry");
     let (j0, b0) = parse_glb(&f32_glb);
     let (j1, b1) = parse_glb(&q_glb);
     let (lo0, hi0) = world_aabb(&j0, &[&b0]);
@@ -481,7 +469,7 @@ fn multibuffer_splits_and_matches_single_glb() {
     // split). Proves the chunked bufferView/accessor reindexing is correct.
     let bytes = fixture_or_skip!("ara3d/duplex.ifc");
     let opts = GltfOptions::default();
-    let (glb, _) = export_glb_with_stats(&bytes, &opts);
+    let (glb, _) = try_export_glb_with_stats(&bytes, &opts).expect("has geometry");
     let (gj, gb) = parse_glb(&glb);
     let (lo0, hi0) = world_aabb(&gj, &[&gb]);
 
@@ -516,7 +504,8 @@ fn multibuffer_quantized_roundtrips() {
     // Quantization + multi-buffer compose: quantized geometry split across chunks
     // still reconstructs the f32 world bounds (within mm) and stays < cap.
     let bytes = fixture_or_skip!("ara3d/duplex.ifc");
-    let (glb, _) = export_glb_with_stats(&bytes, &GltfOptions::default());
+    let (glb, _) =
+        try_export_glb_with_stats(&bytes, &GltfOptions::default()).expect("has geometry");
     let (gj, gb) = parse_glb(&glb);
     let (lo0, hi0) = world_aabb(&gj, &[&gb]);
 
@@ -576,10 +565,11 @@ fn multibuffer_is_deterministic() {
 #[test]
 fn quantized_glb_is_structurally_valid() {
     let bytes = fixture_or_skip!("ara3d/duplex.ifc");
-    let (glb, stats) = export_glb_with_stats(
+    let (glb, stats) = try_export_glb_with_stats(
         &bytes,
         &GltfOptions { quantize: true, ..Default::default() },
-    );
+    )
+    .expect("has geometry");
     let (json, bin) = parse_glb(&glb);
     assert!(stats.meshes > 0);
     // Extension declared and required.
@@ -627,8 +617,8 @@ fn quantized_glb_is_structurally_valid() {
 fn quantized_glb_is_byte_deterministic() {
     let bytes = fixture_or_skip!("ara3d/duplex.ifc");
     let opts = GltfOptions { quantize: true, ..Default::default() };
-    let (a, _) = export_glb_with_stats(&bytes, &opts);
-    let (b, _) = export_glb_with_stats(&bytes, &opts);
+    let (a, _) = try_export_glb_with_stats(&bytes, &opts).expect("has geometry");
+    let (b, _) = try_export_glb_with_stats(&bytes, &opts).expect("has geometry");
     assert_eq!(a, b, "quantized GLB must be byte-deterministic");
 }
 
@@ -665,7 +655,8 @@ fn quantization_roundtrip_precision() {
 #[test]
 fn duplex_exports_valid_glb() {
     let (glb, stats) =
-        export_glb_with_stats(&fixture_or_skip!("ara3d/duplex.ifc"), &GltfOptions::default());
+        try_export_glb_with_stats(&fixture_or_skip!("ara3d/duplex.ifc"), &GltfOptions::default())
+            .expect("has geometry");
     assert!(stats.meshes > 0 && stats.triangles > 0);
 
     let (json, bin) = parse_glb(&glb);
@@ -1012,6 +1003,55 @@ fn try_from_meshes_rejects_index_counts_past_buffer() {
 }
 
 #[test]
+fn try_from_meshes_rejects_an_index_past_its_own_mesh() {
+    // Every check the fail-closed gate had was about a COUNT running past a
+    // buffer. An index whose VALUE is out of range passes all of them — the
+    // sums here are exact — and the assembler then copies the index buffer
+    // into the BIN chunk verbatim (`bytemuck::cast_slice`), so it reached the
+    // file. glTF 2.0 3.7.2.1: "index values MUST be less than the number of
+    // vertices". `try_export_collada_from_meshes` refuses the same arrays through
+    // the same predicate (#4684); `mesh_input`'s tests pin the two together.
+    let positions: Vec<f32> =
+        vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0];
+    let normals: Vec<f32> = std::iter::repeat_n([0.0f32, 0.0, 1.0], 6).flatten().collect();
+    // Mesh 1's last index names vertex 7; mesh 1 has three vertices.
+    let indices: Vec<u32> = vec![0, 1, 2, 0, 1, 7];
+    let (vc, ic) = (vec![3u32, 3u32], vec![3u32, 3u32]);
+    let color = vec![0.5, 0.5, 0.5, 1.0, 0.5, 0.5, 0.5, 1.0];
+    let origin = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let ids = vec![1u32, 2u32];
+
+    // The gate refuses, naming the mesh and the index.
+    let err = try_export_glb_from_meshes(
+        &positions, &normals, &indices, &vc, &ic, &color, &origin, &ids, false, true, false,
+    )
+    .expect_err("an index past its mesh's vertex count must be MalformedMeshInput");
+    assert!(matches!(err, ExportError::MalformedMeshInput { .. }), "got {err:?}");
+    assert_eq!(err.code(), "MALFORMED_MESH_INPUT");
+    assert!(err.to_string().contains("mesh 1"), "names the offending mesh: {err}");
+    assert!(err.to_string().contains('7'), "names the offending index: {err}");
+
+    // The boundary, both ways round. An index EQUAL to the vertex count is out
+    // of range (indices are zero-based), and `vertex_count - 1` is the last
+    // legal one, so a `>` where the rule wants `>=` is caught here rather than
+    // by the 7-against-3 case above, which both spellings reject.
+    let at_count: Vec<u32> = vec![0, 1, 2, 0, 1, 3];
+    assert!(
+        try_export_glb_from_meshes(
+            &positions, &normals, &at_count, &vc, &ic, &color, &origin, &ids, false, true, false,
+        )
+        .is_err(),
+        "index == vertex_count is out of range"
+    );
+
+    let ok_indices: Vec<u32> = vec![0, 1, 2, 0, 1, 2];
+    try_export_glb_from_meshes(
+        &positions, &normals, &ok_indices, &vc, &ic, &color, &origin, &ids, false, true, false,
+    )
+    .expect("in-range indices must still export");
+}
+
+#[test]
 fn try_from_meshes_rejects_empty_input() {
     // Zero meshes (e.g. a viewer selection whose visible set filtered to
     // nothing) passes every per-count-consistency check trivially — vsum=0,
@@ -1037,8 +1077,10 @@ fn export_is_byte_deterministic() {
     // Instancing groups by HashMap keys (rep colour buckets, material dedup);
     // emission order must be fixed so repeated exports are byte-identical.
     let content = fixture_or_skip!("ara3d/C20-Institute-Var-2.ifc");
-    let a = export_glb(&content, &GltfOptions { include_metadata: true, ..Default::default() });
-    let b = export_glb(&content, &GltfOptions { include_metadata: true, ..Default::default() });
+    let a = try_export_glb(&content, &GltfOptions { include_metadata: true, ..Default::default() })
+        .expect("has geometry");
+    let b = try_export_glb(&content, &GltfOptions { include_metadata: true, ..Default::default() })
+        .expect("has geometry");
     assert_eq!(a, b, "repeated GLB exports must be byte-identical");
 }
 
@@ -1052,7 +1094,7 @@ fn nodes_carry_global_id_and_model_id() {
         model_id: Some("model-42".to_string()),
         ..GltfOptions::default()
     };
-    let (glb, _stats) = export_glb_with_stats(&content, &opts);
+    let (glb, _stats) = try_export_glb_with_stats(&content, &opts).expect("has geometry");
     let (json, _bin) = parse_glb(&glb);
     let nodes = json["nodes"].as_array().unwrap();
 
@@ -1079,7 +1121,7 @@ fn nodes_carry_global_id_and_model_id() {
 
     // Without a model id, no `modelId` key is emitted.
     let plain = GltfOptions { include_metadata: true, ..GltfOptions::default() };
-    let (glb2, _) = export_glb_with_stats(&content, &plain);
+    let (glb2, _) = try_export_glb_with_stats(&content, &plain).expect("has geometry");
     let (json2, _) = parse_glb(&glb2);
     for n in json2["nodes"].as_array().unwrap() {
         if let Some(extras) = n.get("extras") {
@@ -1113,7 +1155,7 @@ fn glb_nodes_have_export_rows_for_legacy_products() {
             include_metadata: true,
             ..GltfOptions::default()
         };
-        let (glb, _stats) = export_glb_with_stats(&content, &opts);
+        let (glb, _stats) = try_export_glb_with_stats(&content, &opts).expect("has geometry");
         let (json, _bin) = parse_glb(&glb);
         let rows: std::collections::HashSet<u32> = crate::model::build_export_model(&content)
             .entities
@@ -1158,7 +1200,7 @@ fn instanced_occurrences_reconstruct_world_positions() {
     // genuinely rotated, placed occurrences, so any frame/RTC error surfaces.
     let content = fixture_or_skip!("ara3d/C20-Institute-Var-2.ifc");
     let opts = GltfOptions { include_metadata: true, ..GltfOptions::default() };
-    let (glb, _stats) = export_glb_with_stats(&content, &opts);
+    let (glb, _stats) = try_export_glb_with_stats(&content, &opts).expect("has geometry");
     let (json, bin) = parse_glb(&glb);
 
     // Truth: express id -> the occurrence's baked Y-up world vertices.
@@ -1472,29 +1514,79 @@ fn opaque_material_omits_alpha_mode() {
 
 #[test]
 fn metadata_and_isolation() {
-    let with_meta = export_glb_with_stats(
+    let with_meta = try_export_glb_with_stats(
         &fixture_or_skip!("ara3d/duplex.ifc"),
         &GltfOptions { include_metadata: true, ..GltfOptions::default() },
     )
+    .expect("has geometry")
     .0;
     let (json, _) = parse_glb(&with_meta);
     assert!(json["asset"]["extras"]["meshCount"].as_u64().unwrap() >= 1);
     assert!(json["nodes"][0]["extras"]["expressId"].is_number());
 
     // Isolate one id ⇒ fewer or equal meshes than the full export.
-    let full = export_glb_with_stats(&fixture_or_skip!("ara3d/duplex.ifc"), &GltfOptions::default()).1;
+    let full =
+        try_export_glb_with_stats(&fixture_or_skip!("ara3d/duplex.ifc"), &GltfOptions::default())
+            .expect("has geometry")
+            .1;
     let some_id = process_geometry(&fixture_or_skip!("ara3d/duplex.ifc")[..])
         .meshes
         .iter()
         .find(|m| super::mesh_visible(m, &GltfOptions::default()))
         .map(|m| m.express_id)
         .unwrap();
-    let iso = export_glb_with_stats(
+    let iso = try_export_glb_with_stats(
         &fixture_or_skip!("ara3d/duplex.ifc"),
-        &GltfOptions { isolated: vec![some_id], ..GltfOptions::default() },
+        &GltfOptions { isolated: Some(vec![some_id]), ..GltfOptions::default() },
     )
+    .expect("has geometry")
     .1;
     assert!(iso.meshes >= 1 && iso.meshes <= full.meshes);
+}
+
+/// #4328 follow-up, three states over a real fixture: `None` (no filter) keeps
+/// the full model, an active filter matching zero express ids exports NOTHING
+/// (not the whole model), and an active filter matching one id exports exactly
+/// that id's mesh(es) — the middle case is the one a careless fix breaks in
+/// either direction (over-hiding a normal allowlist, or falling back to
+/// "export everything" on an empty one).
+#[test]
+fn isolation_three_states_over_a_real_fixture() {
+    let bytes = fixture_or_skip!("ara3d/duplex.ifc");
+
+    let no_filter =
+        try_export_glb_with_stats(&bytes, &GltfOptions::default()).expect("has geometry").1;
+    assert!(no_filter.meshes > 1, "fixture must have more than one visible mesh to discriminate");
+
+    // Zero meshes is refused rather than shipped as an empty GLB (#4685).
+    let empty_active = try_export_glb_with_stats(
+        &bytes,
+        &GltfOptions { isolated: Some(vec![]), ..GltfOptions::default() },
+    )
+    .map(|(_, stats)| stats.meshes);
+    assert_eq!(
+        empty_active,
+        Err(ExportError::NoRenderGeometry),
+        "an ACTIVE isolation filter matching zero express ids must be refused as empty, \
+         not silently fall back to the whole model"
+    );
+
+    let some_id = process_geometry(&bytes[..])
+        .meshes
+        .iter()
+        .find(|m| super::mesh_visible(m, &GltfOptions::default()))
+        .map(|m| m.express_id)
+        .unwrap();
+    let one_match = try_export_glb_with_stats(
+        &bytes,
+        &GltfOptions { isolated: Some(vec![some_id]), ..GltfOptions::default() },
+    )
+    .expect("has geometry")
+    .1;
+    assert!(
+        one_match.meshes >= 1 && one_match.meshes < no_filter.meshes,
+        "a non-empty allowlist must still export exactly its matches, not everything and not nothing"
+    );
 }
 
 /// A minimal but valid triangulated mesh (one triangle, matching normals),
@@ -1558,17 +1650,38 @@ DATA;\n\
 ENDSEC;\n\
 END-ISO-10303-21;\n";
 
+/// Every from-bytes GLB entry point refuses an empty model (#4685). The zero-mesh
+/// GLB they used to return is not valid glTF: `accessors`, `bufferViews`,
+/// `meshes` and `nodes` came out as empty arrays where the schema requires at
+/// least one item, and `buffers[0].byteLength` as 0 where it requires >= 1.
+/// Both assemblers are covered: this input is under the streaming threshold, so
+/// `try_export_glb*` take the in-memory one and `try_export_glb_streaming_bounded*`
+/// the two-pass one.
 #[test]
-fn try_export_glb_fails_closed_on_geometryless_model() {
-    let err = try_export_glb(GEOMETRYLESS_IFC.as_bytes(), &GltfOptions::default())
+fn every_glb_entry_point_fails_closed_on_geometryless_model() {
+    let content = GEOMETRYLESS_IFC.as_bytes();
+    let opts = GltfOptions::default();
+    let index = || Arc::new(crate::build_entity_index(content));
+    let refused = Err(ExportError::NoRenderGeometry);
+
+    let err = try_export_glb(content, &opts)
         .expect_err("a zero-mesh export must be an error, not a valid empty GLB");
     assert_eq!(err, ExportError::NoRenderGeometry);
     assert_eq!(err.code(), "NO_RENDER_GEOMETRY");
-    // The fail-open path still exists for callers that explicitly want it.
-    let (glb, stats) = export_glb_with_stats(GEOMETRYLESS_IFC.as_bytes(), &GltfOptions::default());
-    assert_eq!(stats.meshes, 0);
-    let (json, _) = parse_glb(&glb);
-    assert!(json["meshes"].as_array().is_none_or(|m| m.is_empty()));
+
+    let meshes = |r: Result<(Vec<u8>, GltfStats), ExportError>| r.map(|(_, s)| s.meshes);
+    assert_eq!(meshes(try_export_glb_with_stats(content, &opts)), refused, "with_stats");
+    assert_eq!(
+        meshes(try_export_glb_with_stats_with_index(content, &opts, index())),
+        refused,
+        "with_stats_with_index"
+    );
+    assert_eq!(meshes(try_export_glb_streaming_bounded(content, &opts)), refused, "bounded");
+    assert_eq!(
+        meshes(try_export_glb_streaming_bounded_with_index(content, &opts, index())),
+        refused,
+        "bounded_with_index"
+    );
 }
 
 /// The #1516 TooLarge variant carries the projected size and a stable code the
@@ -1579,16 +1692,6 @@ fn too_large_error_code_and_message() {
     assert_eq!(err.code(), "TOO_LARGE");
     assert!(err.to_string().contains("5000000000"), "message carries the byte size");
     assert!(err.to_string().starts_with("TOO_LARGE"), "code prefixes the message");
-}
-
-#[test]
-fn try_export_glb_matches_fail_open_path_when_nonempty() {
-    let Some(content) = crate::test_support::fixture_opt("ifcopenshell/1019-column.ifc") else { return };
-    let (glb, stats) =
-        try_export_glb_with_stats(&content, &GltfOptions::default()).expect("has geometry");
-    assert!(stats.meshes >= 1);
-    let (baseline, _) = export_glb_with_stats(&content, &GltfOptions::default());
-    assert_eq!(glb, baseline, "try_ path must be byte-identical to export_glb");
 }
 
 /// Sum of world triangles: every node instance of a mesh counts its index
@@ -1614,8 +1717,10 @@ fn streaming_bounded_is_byte_identical_on_flat_models() {
     for rel in ["ifcopenshell/1019-column.ifc", "ifcopenshell/1030-sphere.ifc"] {
         let Some(content) = crate::test_support::fixture_opt(rel) else { continue };
         let opts = GltfOptions { include_metadata: true, ..GltfOptions::default() };
-        let (in_memory, mem_stats) = export_glb_from_result(process_geometry(&content), &opts);
-        let (streamed, stream_stats) = export_glb_streaming_bounded(&content, &opts);
+        let (in_memory, mem_stats) =
+            try_export_glb_from_result(process_geometry(&content), &opts).expect("has geometry");
+        let (streamed, stream_stats) =
+            try_export_glb_streaming_bounded(&content, &opts).expect("has geometry");
         assert_eq!(mem_stats.meshes, stream_stats.meshes, "{rel}: mesh stats");
         assert_eq!(in_memory, streamed, "{rel}: bounded assembler must be byte-identical");
     }
@@ -1629,8 +1734,10 @@ fn streaming_bounded_preserves_world_geometry_on_instanced_model() {
     // `streaming_bounded_shares_a_repeated_shape` pins.
     let Some(content) = crate::test_support::fixture_opt("ara3d/duplex.ifc") else { return };
     let opts = GltfOptions::default();
-    let (in_memory, _) = export_glb_from_result(process_geometry(&content), &opts);
-    let (streamed, stream_stats) = export_glb_streaming_bounded(&content, &opts);
+    let (in_memory, _) =
+        try_export_glb_from_result(process_geometry(&content), &opts).expect("has geometry");
+    let (streamed, stream_stats) =
+        try_export_glb_streaming_bounded(&content, &opts).expect("has geometry");
     assert!(stream_stats.meshes > 0);
     let (mem_json, _) = parse_glb(&in_memory);
     let (str_json, str_bin) = parse_glb(&streamed);
@@ -1803,7 +1910,8 @@ fn world_totals(json: &Value, bufs: &[&[u8]]) -> WorldTotals {
 fn streaming_bounded_shares_a_repeated_shape() {
     let Some(content) = crate::test_support::fixture_opt("ara3d/duplex.ifc") else { return };
     let opts = GltfOptions::default();
-    let (streamed, stats) = export_glb_streaming_bounded(&content, &opts);
+    let (streamed, stats) =
+        try_export_glb_streaming_bounded(&content, &opts).expect("has geometry");
     let (json, _) = parse_glb(&streamed);
     let nodes = json["nodes"].as_array().unwrap().len();
     assert!(stats.meshes > 0, "the fixture has geometry");
@@ -1832,24 +1940,32 @@ fn streaming_bounded_shares_a_repeated_shape() {
 /// has no instance side-channel, and this one drops that occurrence and keeps
 /// the rest. The world geometry either path produces is pinned by
 /// `streaming_bounded_preserves_world_geometry_on_instanced_model`.
+///
+/// Under `quantize` too (export review finding H4): the bounded path used to
+/// skip instancing there, so every repeated shape went out once per
+/// occurrence and the BIN was about twice the in-memory path's.
 #[test]
 fn the_bounded_path_shares_at_least_as_much() {
     let Some(content) = crate::test_support::fixture_opt("ara3d/duplex.ifc") else { return };
-    let opts = GltfOptions::default();
-    let (_, mem) = export_glb_from_result(process_geometry(&content), &opts);
-    let (_, streamed) = export_glb_streaming_bounded(&content, &opts);
-    assert!(
-        streamed.meshes <= mem.meshes,
-        "in-memory emitted {} meshes, bounded {} — bounded found less sharing",
-        mem.meshes,
-        streamed.meshes,
-    );
-    assert!(
-        streamed.vertices <= mem.vertices,
-        "vertices follow meshes: in-memory {}, bounded {}",
-        mem.vertices,
-        streamed.vertices,
-    );
+    for quantize in [false, true] {
+        let opts = GltfOptions { quantize, ..GltfOptions::default() };
+        let (_, mem) =
+            try_export_glb_from_result(process_geometry(&content), &opts).expect("has geometry");
+        let (_, streamed) =
+            try_export_glb_streaming_bounded(&content, &opts).expect("has geometry");
+        assert!(
+            streamed.meshes <= mem.meshes,
+            "quantize={quantize}: in-memory emitted {} meshes, bounded {} — bounded found less sharing",
+            mem.meshes,
+            streamed.meshes,
+        );
+        assert!(
+            streamed.vertices <= mem.vertices,
+            "quantize={quantize}: vertices follow meshes: in-memory {}, bounded {}",
+            mem.vertices,
+            streamed.vertices,
+        );
+    }
 }
 
 #[test]
@@ -1861,8 +1977,10 @@ fn streaming_bounded_quantized_is_byte_identical_on_flat_models() {
             include_metadata: true,
             ..GltfOptions::default()
         };
-        let (in_memory, mem_stats) = export_glb_from_result(process_geometry(&content), &opts);
-        let (streamed, stream_stats) = export_glb_streaming_bounded(&content, &opts);
+        let (in_memory, mem_stats) =
+            try_export_glb_from_result(process_geometry(&content), &opts).expect("has geometry");
+        let (streamed, stream_stats) =
+            try_export_glb_streaming_bounded(&content, &opts).expect("has geometry");
         assert_eq!(mem_stats.meshes, stream_stats.meshes, "{rel}: mesh stats");
         assert_eq!(in_memory, streamed, "{rel}: quantized bounded must be byte-identical");
     }
@@ -1872,14 +1990,16 @@ fn streaming_bounded_quantized_is_byte_identical_on_flat_models() {
 fn streaming_bounded_quantized_preserves_world_geometry_on_instanced_model() {
     let Some(content) = crate::test_support::fixture_opt("ara3d/duplex.ifc") else { return };
     let opts = GltfOptions { quantize: true, ..GltfOptions::default() };
-    let (in_memory, _) = export_glb_from_result(process_geometry(&content), &opts);
-    let (streamed, stream_stats) = export_glb_streaming_bounded(&content, &opts);
+    let (in_memory, _) =
+        try_export_glb_from_result(process_geometry(&content), &opts).expect("has geometry");
+    let (streamed, stream_stats) =
+        try_export_glb_streaming_bounded(&content, &opts).expect("has geometry");
     assert!(stream_stats.meshes > 0);
-    let (mem_json, _) = parse_glb(&in_memory);
-    let (str_json, _) = parse_glb(&streamed);
-    // Node counts legitimately differ (the in-memory instanced quantized path
-    // nests a dequant child under a placement parent), but each occurrence
-    // carries exactly one mesh node on both paths, so placed triangles agree.
+    let (mem_json, mem_bin) = parse_glb(&in_memory);
+    let (str_json, str_bin) = parse_glb(&streamed);
+    // Each occurrence carries exactly one mesh node on both paths (an
+    // instanced one nests its dequant child under a placement parent on both),
+    // so placed triangles agree.
     assert_eq!(
         world_triangles(&mem_json),
         world_triangles(&str_json),
@@ -1889,16 +2009,22 @@ fn streaming_bounded_quantized_preserves_world_geometry_on_instanced_model() {
         str_json["extensionsRequired"][0].as_str(),
         Some("KHR_mesh_quantization"),
     );
-}
-
-#[test]
-fn streaming_bounded_matches_in_memory_on_empty_model() {
-    let empty = GEOMETRYLESS_IFC.as_bytes();
-    let opts = GltfOptions::default();
-    let (in_memory, _) = export_glb_from_result(process_geometry(empty), &opts);
-    let (streamed, stats) = export_glb_streaming_bounded(empty, &opts);
-    assert_eq!(stats.meshes, 0);
-    assert_eq!(in_memory, streamed, "empty-model GLB must be byte-identical");
+    // Where the triangles are. The bounded path now shares shapes under
+    // `quantize` (H4), so a wrong dequant (an occurrence's own bbox instead of
+    // its template's) or a flattened matrix/dequant nesting moves triangles
+    // without moving any count above.
+    let mem_w = world_totals(&mem_json, &[&mem_bin]);
+    let str_w = world_totals(&str_json, &[&str_bin]);
+    // Measured on duplex: the two agree to ~1.5e-8 on the centroid sums and
+    // exactly on the bounds. 1e-6 is the tolerance the f32 twin above uses.
+    assert_eq!(mem_w.triangles, str_w.triangles, "placed triangle count");
+    for k in 0..3 {
+        let axis = ["x", "y", "z"][k];
+        let centroid = (mem_w.centroid_sum[k] - str_w.centroid_sum[k]).abs();
+        let bounds = (mem_w.min[k] - str_w.min[k]).abs().max((mem_w.max[k] - str_w.max[k]).abs());
+        assert!(centroid < 1e-6, "centroid sum {axis} differs by {centroid:e}: shared shapes are placed differently");
+        assert!(bounds < 1e-6, "world bounds {axis} differ by {bounds:e}");
+    }
 }
 
 // ── glTF quantized index componentType: u16 / u32 threshold (issue #2802) ──
@@ -2039,7 +2165,8 @@ fn index_acc_and_nverts(json: &Value) -> (usize, u64) {
 fn index_u16_boundary_in_memory() {
     let content = faceted_brep_fixture(65536);
     let opts = GltfOptions { quantize: true, ..GltfOptions::default() };
-    let (glb, _) = export_glb_from_result(process_geometry(content.as_bytes()), &opts);
+    let (glb, _) = try_export_glb_from_result(process_geometry(content.as_bytes()), &opts)
+        .expect("has geometry");
     let (json, bin) = parse_glb(&glb);
     let (idx_acc, nverts) = index_acc_and_nverts(&json);
     assert_eq!(nverts, 65536, "fixture must actually reach the boundary vertex count");
@@ -2060,7 +2187,8 @@ fn index_u16_boundary_in_memory() {
 fn index_u32_promote_in_memory() {
     let content = faceted_brep_fixture(65537);
     let opts = GltfOptions { quantize: true, ..GltfOptions::default() };
-    let (glb, _) = export_glb_from_result(process_geometry(content.as_bytes()), &opts);
+    let (glb, _) = try_export_glb_from_result(process_geometry(content.as_bytes()), &opts)
+        .expect("has geometry");
     let (json, bin) = parse_glb(&glb);
     let (idx_acc, nverts) = index_acc_and_nverts(&json);
     assert_eq!(nverts, 65537, "fixture must actually reach one past the boundary");
@@ -2086,7 +2214,8 @@ fn index_u32_promote_in_memory() {
 fn index_u16_boundary_streaming_bounded() {
     let content = faceted_brep_fixture(65536);
     let opts = GltfOptions { quantize: true, ..GltfOptions::default() };
-    let (glb, _) = export_glb_streaming_bounded(content.as_bytes(), &opts);
+    let (glb, _) =
+        try_export_glb_streaming_bounded(content.as_bytes(), &opts).expect("has geometry");
     let (json, bin) = parse_glb(&glb);
     let (idx_acc, nverts) = index_acc_and_nverts(&json);
     assert_eq!(nverts, 65536);
@@ -2101,7 +2230,8 @@ fn index_u16_boundary_streaming_bounded() {
 fn index_u32_promote_streaming_bounded() {
     let content = faceted_brep_fixture(65537);
     let opts = GltfOptions { quantize: true, ..GltfOptions::default() };
-    let (glb, _) = export_glb_streaming_bounded(content.as_bytes(), &opts);
+    let (glb, _) =
+        try_export_glb_streaming_bounded(content.as_bytes(), &opts).expect("has geometry");
     let (json, bin) = parse_glb(&glb);
     let (idx_acc, nverts) = index_acc_and_nverts(&json);
     assert_eq!(nverts, 65537);
@@ -2129,4 +2259,587 @@ fn the_streamed_mesh_plan_stays_small() {
         240,
         "the per-mesh plan grew; see the rep side table in plan_bounded_glb"
     );
+}
+
+/// Two occurrences of one representation on a GEOREFERENCED model, the second
+/// rotated 90 degrees about Z relative to the first.
+///
+/// `build_gltf` passes `rtc = [0,0,0]` to the collator, so the `rel` the #3666
+/// reconstruction check sees is PRE-RTC, while the baked positions it compares
+/// against are POST-RTC (and Y-up). The residual left by that mismatch is
+/// `(R_rel - I) * rtc` — zero for a translated-only sibling, but hundreds of
+/// kilometres for a rotated one at national-grid magnitude. A `baked_basis` of
+/// `S_YUP` alone does not account for it, so the check rejected every rotated
+/// group on a georeferenced model and the geometry fell back to flat (no
+/// instancing at all). The basis has to be `S_YUP · T(-rtc_zup)`, which is
+/// exactly the conjugation the shipped node matrix applies.
+#[test]
+fn a_georeferenced_rotated_sibling_still_instances() {
+    use ifc_lite_geometry::Vector3;
+
+    let rtc = [2_600_000.0f64, 1_200_000.0, 400.0];
+    // Canonical tetra in source coords (>= 3 vertices, so `view_ok` passes).
+    const CANON: [f64; 12] = [0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 1.5];
+    let indices: Vec<u32> = vec![0, 1, 2, 0, 1, 3, 0, 2, 3, 1, 2, 3];
+
+    // Two PRE-RTC world placements at georeferenced magnitude; B is rotated 90
+    // degrees about Z, which is what makes `(R_rel - I) * rtc` non-zero.
+    let place = |offset: [f64; 3], rot: f64| {
+        Matrix4::new_translation(&Vector3::new(
+            rtc[0] + offset[0],
+            rtc[1] + offset[1],
+            rtc[2] + offset[2],
+        )) * Matrix4::from_euler_angles(0.0, 0.0, rot)
+    };
+    let m_a = place([10.0, 5.0, 1.0], 0.0);
+    let m_b = place([-6.0, 4.0, 2.0], std::f64::consts::FRAC_PI_2);
+
+    let row_major = |m: &Matrix4<f64>| {
+        let mut out = [0.0f64; 16];
+        for r in 0..4 {
+            for c in 0..4 {
+                out[r * 4 + c] = m[(r, c)];
+            }
+        }
+        out
+    };
+    // Bake exactly like the pipeline: world = M * canon, minus the RTC offset,
+    // then Z-up -> Y-up (`(x, y, z) -> (x, z, -y)`, what `frame::to_yup_in_place`
+    // applies to every visible mesh BEFORE `build_gltf` sees it).
+    let bake_yup = |m: &Matrix4<f64>| {
+        let mut out = Vec::with_capacity(CANON.len());
+        for v in CANON.chunks_exact(3) {
+            let w = [
+                m[(0, 0)] * v[0] + m[(0, 1)] * v[1] + m[(0, 2)] * v[2] + m[(0, 3)],
+                m[(1, 0)] * v[0] + m[(1, 1)] * v[1] + m[(1, 2)] * v[2] + m[(1, 3)],
+                m[(2, 0)] * v[0] + m[(2, 1)] * v[1] + m[(2, 2)] * v[2] + m[(2, 3)],
+            ];
+            let (x, y, z) = (w[0] - rtc[0], w[1] - rtc[1], w[2] - rtc[2]);
+            out.push(x as f32);
+            out.push(z as f32);
+            out.push(-y as f32);
+        }
+        out
+    };
+    let pos_a = bake_yup(&m_a);
+    let pos_b = bake_yup(&m_b);
+    let normals = vec![0.0f32; CANON.len()];
+
+    let meta = |m: &Matrix4<f64>| InstanceMeta {
+        transform: row_major(m),
+        local_transform: None,
+        canonical_transform: None,
+        rep_identity: 90_909,
+        instanceable: true,
+    };
+    let (meta_a, meta_b) = (meta(&m_a), meta(&m_b));
+    fn view<'a>(
+        id: u32,
+        positions: &'a [f32],
+        normals: &'a [f32],
+        indices: &'a [u32],
+        im: &'a InstanceMeta,
+    ) -> MeshView<'a> {
+        MeshView {
+            express_id: id,
+            ifc_type: "IfcWall",
+            global_id: None,
+            positions,
+            normals,
+            indices,
+            color: [0.5, 0.5, 0.5, 1.0],
+            origin: [0.0, 0.0, 0.0],
+            instance: Some(im),
+        }
+    }
+    let views = vec![
+        view(1, &pos_a, &normals, &indices, &meta_a),
+        view(2, &pos_b, &normals, &indices, &meta_b),
+    ];
+
+    let mut ch = Chunker::new(12, usize::MAX, None);
+    let (gltf, _stats) =
+        build_gltf(&views, false, None, true, false, MeshCoordinateSpace::ModelRtc, rtc, None, false, &mut ch);
+
+    assert_eq!(
+        gltf.meshes.len(),
+        1,
+        "a rotated sibling on a georeferenced model must still share ONE template mesh"
+    );
+    let placed: Vec<[f32; 16]> = gltf.nodes.iter().filter_map(|n| n.matrix).collect();
+    assert_eq!(placed.len(), 2, "both occurrences placed by a node matrix");
+
+    // Placement check that does not need `scene_center`: the DIFFERENCE between
+    // the two occurrence nodes applied to the shared template geometry must equal
+    // the difference between the two occurrences' own baked Y-up vertices.
+    let apply = |m: &[f32; 16], p: [f64; 3]| {
+        // glTF node matrices are column-major.
+        [
+            m[0] as f64 * p[0] + m[4] as f64 * p[1] + m[8] as f64 * p[2] + m[12] as f64,
+            m[1] as f64 * p[0] + m[5] as f64 * p[1] + m[9] as f64 * p[2] + m[13] as f64,
+            m[2] as f64 * p[0] + m[6] as f64 * p[1] + m[10] as f64 * p[2] + m[14] as f64,
+        ]
+    };
+    for v in 0..pos_a.len() / 3 {
+        let p = [pos_a[v * 3] as f64, pos_a[v * 3 + 1] as f64, pos_a[v * 3 + 2] as f64];
+        let d0 = apply(&placed[0], p);
+        let d1 = apply(&placed[1], p);
+        for k in 0..3 {
+            let expected = (pos_b[v * 3 + k] - pos_a[v * 3 + k]) as f64;
+            let got = d1[k] - d0[k];
+            assert!(
+                (got - expected).abs() < 1e-3,
+                "occurrence node placement off by {} on axis {k}",
+                got - expected
+            );
+        }
+    }
+}
+
+/// A rep group holding two exact-tier occurrences and one RIGID-tier member.
+///
+/// The collator decides the rigid-tier exemption per member, so it hands back
+/// one template whose occurrences are mixed. The exporter decided it per GROUP
+/// (`.any()`), so a single rigid member sent the whole group to the flat path
+/// and the two exact occurrences lost their shared mesh. The two now agree:
+/// the exact members instance, the rigid one is flattened on its own.
+#[test]
+fn a_mixed_group_instances_its_exact_members_and_flattens_the_rigid_one() {
+    use ifc_lite_geometry::Vector3;
+
+    const CANON: [f64; 12] = [0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 1.5];
+    let indices: Vec<u32> = vec![0, 1, 2, 0, 1, 3, 0, 2, 3, 1, 2, 3];
+    let row_major = |m: &Matrix4<f64>| {
+        let mut out = [0.0f64; 16];
+        for r in 0..4 {
+            for c in 0..4 {
+                out[r * 4 + c] = m[(r, c)];
+            }
+        }
+        out
+    };
+    // Baked Y-up positions, exactly as `to_yup_in_place` leaves them.
+    let bake_yup = |m: &Matrix4<f64>, canon: &[f64]| {
+        let mut out = Vec::with_capacity(canon.len());
+        for v in canon.chunks_exact(3) {
+            let w = [
+                m[(0, 0)] * v[0] + m[(0, 1)] * v[1] + m[(0, 2)] * v[2] + m[(0, 3)],
+                m[(1, 0)] * v[0] + m[(1, 1)] * v[1] + m[(1, 2)] * v[2] + m[(1, 3)],
+                m[(2, 0)] * v[0] + m[(2, 1)] * v[1] + m[(2, 2)] * v[2] + m[(2, 3)],
+            ];
+            out.push(w[0] as f32);
+            out.push(w[2] as f32);
+            out.push(-w[1] as f32);
+        }
+        out
+    };
+    let m_a = Matrix4::new_translation(&Vector3::new(10.0, 5.0, 1.0));
+    let m_b = Matrix4::new_translation(&Vector3::new(-6.0, 4.0, 2.0));
+    let m_r = Matrix4::new_translation(&Vector3::new(20.0, -8.0, 3.0));
+    let exact_meta = |m: &Matrix4<f64>| InstanceMeta {
+        transform: row_major(m),
+        local_transform: None,
+        canonical_transform: None,
+        rep_identity: 71_717,
+        instanceable: true,
+    };
+    // The rigid member: congruent, NOT bit-identical, so it carries a
+    // `canonical_transform` and a different raw vertex count (5, not 4).
+    let rigid_canon: [f64; 15] =
+        [0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 1.5, 1.0, 1.0, 1.0];
+    let rigid_meta = InstanceMeta {
+        transform: row_major(&m_r),
+        local_transform: None,
+        canonical_transform: Some(row_major(&Matrix4::identity())),
+        rep_identity: 71_717,
+        instanceable: true,
+    };
+    let (pos_a, pos_b) = (bake_yup(&m_a, &CANON), bake_yup(&m_b, &CANON));
+    let pos_r = bake_yup(&m_r, &rigid_canon);
+    let (norm4, norm5) = (vec![0.0f32; 12], vec![0.0f32; 15]);
+    let rigid_indices: Vec<u32> = vec![0, 1, 2, 0, 1, 3, 0, 2, 4, 1, 2, 4];
+    let (meta_a, meta_b) = (exact_meta(&m_a), exact_meta(&m_b));
+    fn view<'a>(
+        id: u32,
+        p: &'a [f32],
+        n: &'a [f32],
+        i: &'a [u32],
+        im: &'a InstanceMeta,
+    ) -> MeshView<'a> {
+        MeshView {
+            express_id: id,
+            ifc_type: "IfcWall",
+            global_id: None,
+            positions: p,
+            normals: n,
+            indices: i,
+            color: [0.5, 0.5, 0.5, 1.0],
+            origin: [0.0, 0.0, 0.0],
+            instance: Some(im),
+        }
+    }
+    let views = vec![
+        view(1, &pos_a, &norm4, &indices, &meta_a),
+        view(2, &pos_b, &norm4, &indices, &meta_b),
+        view(3, &pos_r, &norm5, &rigid_indices, &rigid_meta),
+    ];
+
+    let mut ch = Chunker::new(12, usize::MAX, None);
+    let (gltf, _stats) =
+        build_gltf(&views, false, None, true, false, MeshCoordinateSpace::RawIfc, [0.0, 0.0, 0.0], None, false, &mut ch);
+
+    assert_eq!(
+        gltf.meshes.len(),
+        2,
+        "one shared template mesh for the exact pair, one flat mesh for the rigid member"
+    );
+    assert_eq!(
+        gltf.nodes.iter().filter(|n| n.matrix.is_some()).count(),
+        2,
+        "both exact occurrences are placed by a node matrix"
+    );
+    assert_eq!(
+        gltf.nodes.iter().filter(|n| n.mesh.is_some()).count(),
+        3,
+        "all three occurrences are still drawn"
+    );
+}
+
+/// The #3666 gap between the two GLB assemblers is reported at the seam, not
+/// only in a comment inside the bounded one.
+///
+/// The in-memory path verifies every exact-tier pairing by reconstruction, so a
+/// `rep_identity` collision falls back to flat. The bounded path holds a plan
+/// and no geometry, so it cannot run that check and ships every group it shares
+/// on the vertex/index-count guard alone - which a same-shaped colliding pair
+/// passes. A caller choosing between the two paths can now read that off
+/// `GltfStats` instead of the source.
+#[test]
+fn the_bounded_path_reports_the_groups_it_could_not_verify() {
+    let Some(content) = crate::test_support::fixture_opt("ara3d/duplex.ifc") else { return };
+    let opts = GltfOptions::default();
+    let (_, mem_stats) =
+        try_export_glb_from_result(process_geometry(&content), &opts).expect("has geometry");
+    // Catches a fixture that is PRESENT but yields no geometry, which would make
+    // both counts trivially 0 and the assertions below vacuous. It does not close
+    // the skip above -- that `return` has already happened -- and it is not meant
+    // to: the house convention for a missing fixture is the skip, closed in CI by
+    // `IFC_LITE_REQUIRE_FIXTURES=1`, which makes `fixture_opt` panic instead (see
+    // `test_support`). Every other duplex test here relies on the same thing.
+    assert!(mem_stats.meshes > 0, "fixture present but produced no geometry");
+    let (_, stream_stats) =
+        try_export_glb_streaming_bounded(&content, &opts).expect("has geometry");
+    assert_eq!(
+        mem_stats.unverified_instance_groups, 0,
+        "the in-memory path verifies every group it instances"
+    );
+    assert!(
+        stream_stats.unverified_instance_groups > 0,
+        "duplex has shared rep groups, and the bounded path instances them unverified"
+    );
+    // The assertion is on the direction, not the number: duplex's group count
+    // moves with the model and the collator. The exact figure is pinned on the
+    // synthetic fixture below, where it is a property of the fixture instead.
+}
+
+/// Four occurrences of ONE `IfcRepresentationMap` in TWO colours: the shape the
+/// bounded path's bucket key (identity, colour) splits and its `GltfStats`
+/// field does not. Colour comes from the material chain, which is per PRODUCT,
+/// so the four proxies share a representation while two of them are red and two
+/// blue.
+const ONE_IDENTITY_TWO_COLOURS: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('one rep map, two colours'),'2;1');
+FILE_NAME('two-colour.ifc','2026-09-04T00:00:00',(''),(''),'','','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0TwoColourProject0001',$,'P',$,$,$,$,(#2),#3);
+#2=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#5,$);
+#3=IFCUNITASSIGNMENT((#6));
+#4=IFCCARTESIANPOINT((0.,0.,0.));
+#5=IFCAXIS2PLACEMENT3D(#4,$,$);
+#6=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#20=IFCREPRESENTATIONMAP(#5,#21);
+#21=IFCSHAPEREPRESENTATION(#2,'Body','Tessellation',(#22));
+#22=IFCTRIANGULATEDFACESET(#23,$,.T.,((1,2,3),(1,2,4),(1,4,3),(2,3,4)),$);
+#23=IFCCARTESIANPOINTLIST3D(((0.,0.,0.),(1.,0.,0.),(0.,1.,0.),(0.,0.,1.)));
+#30=IFCCARTESIANTRANSFORMATIONOPERATOR3D($,$,#4,$,$);
+#110=IFCCARTESIANPOINT((0.,0.,0.));
+#111=IFCAXIS2PLACEMENT3D(#110,$,$);
+#112=IFCLOCALPLACEMENT($,#111);
+#113=IFCMAPPEDITEM(#20,#30);
+#114=IFCSHAPEREPRESENTATION(#2,'Body','MappedRepresentation',(#113));
+#115=IFCPRODUCTDEFINITIONSHAPE($,$,(#114));
+#116=IFCBUILDINGELEMENTPROXY('0TwoColourProxy0001A',$,'E',$,$,#112,#115,$,$);
+#120=IFCCARTESIANPOINT((5.,0.,0.));
+#121=IFCAXIS2PLACEMENT3D(#120,$,$);
+#122=IFCLOCALPLACEMENT($,#121);
+#123=IFCMAPPEDITEM(#20,#30);
+#124=IFCSHAPEREPRESENTATION(#2,'Body','MappedRepresentation',(#123));
+#125=IFCPRODUCTDEFINITIONSHAPE($,$,(#124));
+#126=IFCBUILDINGELEMENTPROXY('0TwoColourProxy0002A',$,'E',$,$,#122,#125,$,$);
+#130=IFCCARTESIANPOINT((10.,0.,0.));
+#131=IFCAXIS2PLACEMENT3D(#130,$,$);
+#132=IFCLOCALPLACEMENT($,#131);
+#133=IFCMAPPEDITEM(#20,#30);
+#134=IFCSHAPEREPRESENTATION(#2,'Body','MappedRepresentation',(#133));
+#135=IFCPRODUCTDEFINITIONSHAPE($,$,(#134));
+#136=IFCBUILDINGELEMENTPROXY('0TwoColourProxy0003B',$,'E',$,$,#132,#135,$,$);
+#140=IFCCARTESIANPOINT((15.,0.,0.));
+#141=IFCAXIS2PLACEMENT3D(#140,$,$);
+#142=IFCLOCALPLACEMENT($,#141);
+#143=IFCMAPPEDITEM(#20,#30);
+#144=IFCSHAPEREPRESENTATION(#2,'Body','MappedRepresentation',(#143));
+#145=IFCPRODUCTDEFINITIONSHAPE($,$,(#144));
+#146=IFCBUILDINGELEMENTPROXY('0TwoColourProxy0004B',$,'E',$,$,#142,#145,$,$);
+#80=IFCMATERIAL('Red',$,$);
+#81=IFCMATERIALDEFINITIONREPRESENTATION($,$,(#82),#80);
+#82=IFCSTYLEDREPRESENTATION(#2,'Style','Material',(#83));
+#83=IFCSTYLEDITEM($,(#84),$);
+#84=IFCSURFACESTYLE('Red',.BOTH.,(#85));
+#85=IFCSURFACESTYLERENDERING(#86,$,$,$,$,$,$,$,.FLAT.);
+#86=IFCCOLOURRGB($,1.,0.,0.);
+#90=IFCMATERIAL('Blue',$,$);
+#91=IFCMATERIALDEFINITIONREPRESENTATION($,$,(#92),#90);
+#92=IFCSTYLEDREPRESENTATION(#2,'Style','Material',(#93));
+#93=IFCSTYLEDITEM($,(#94),$);
+#94=IFCSURFACESTYLE('Blue',.BOTH.,(#95));
+#95=IFCSURFACESTYLERENDERING(#96,$,$,$,$,$,$,$,.FLAT.);
+#96=IFCCOLOURRGB($,0.,0.,1.);
+#98=IFCRELASSOCIATESMATERIAL('0TwoColourRelRed00001',$,$,$,(#116,#126),#80);
+#99=IFCRELASSOCIATESMATERIAL('0TwoColourRelBlue0001',$,$,$,(#136,#146),#90);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+
+/// `unverified_instance_groups` counts REP IDENTITIES, not the bucket key the
+/// bounded path groups on.
+///
+/// That key is `(rep_identity, colour)`, because a glTF material rides the mesh
+/// primitive rather than the node — so this fixture's ONE representation map in
+/// TWO colours is two buckets. Reporting 2 would name the same unverified hash
+/// twice and contradict the field's own doc comment. Only a fixture that splits
+/// a single identity across colours can tell the two counts apart; duplex, the
+/// other side of this pair, happens to hold one colour per identity and reports
+/// the same number either way.
+#[test]
+fn the_bounded_path_counts_identities_not_colour_buckets() {
+    let opts = GltfOptions::default();
+    let content = ONE_IDENTITY_TWO_COLOURS.as_bytes();
+    // The fixture only discriminates if it really is one shape in two colours.
+    let mut colors: Vec<[u32; 4]> = process_geometry(content)
+        .meshes
+        .iter()
+        .map(|m| m.color.map(|c| c.to_bits()))
+        .collect();
+    colors.sort_unstable();
+    colors.dedup();
+    assert_eq!(colors.len(), 2, "fixture must hold two distinct colours");
+
+    let (_, stats) = try_export_glb_streaming_bounded(content, &opts).expect("has geometry");
+    assert_eq!(
+        stats.unverified_instance_groups, 1,
+        "four occurrences of one representation map are ONE unverified identity, \
+         whatever the colours split them into"
+    );
+}
+
+#[test]
+fn mesh_visible_empty_isolated_set_is_indistinguishable_from_no_filter_bug_repro() {
+    // #4328 follow-up: an ACTIVE isolation filter that matches nothing must hide
+    // every mesh, not export the whole model. `GltfOptions::isolated` today is a
+    // bare `Vec<u32>`, so "no filter" and "filter active, zero matches" both
+    // arrive as an empty vec and collapse to the same `isolated_active = false`.
+    // This test pins that collapse; it must go RED before the fix (isolated_active
+    // becomes `Option<Vec<u32>>`-driven) and GREEN after.
+    let mesh = synthetic_mesh(99, "IfcWall");
+
+    let no_filter = GltfOptions::default();
+    let empty_active_filter = GltfOptions { isolated: Some(vec![]), ..GltfOptions::default() };
+
+    assert!(mesh_visible(&mesh, &no_filter), "no isolation filter: mesh stays visible");
+    assert!(
+        !mesh_visible(&mesh, &empty_active_filter),
+        "an isolation filter active with zero matches must hide every mesh, not export everything \
+         (currently BOTH read as `isolated_active = false` because `Vec::is_empty()` can't tell \
+         'no filter' from 'filter matched nothing')"
+    );
+}
+
+/// #4118 part B: two occurrences of one representation on a `site_local` model
+/// whose `IfcSite` placement carries a 34 degree yaw — the reporter's own case.
+///
+/// The baker applies `Rᵀ` to every position AFTER `InstanceMeta` was captured
+/// (`convert_mesh_to_site_local`), so a `rel` built from `InstanceMeta` alone
+/// reconstructs `rel · Rᵀp` where the baked vertices are `Rᵀ · rel · p`. For the
+/// two siblings here that residual is `(I − Rᵀ)·d` with `|d| = 6 m`, about 3.5 m
+/// — thousands of times over the collator's tolerance — so the group was
+/// rejected and the shape shipped twice. The fix is a basis, not a looser
+/// bound: `baked_basis_yup` folds `Rᵀ` in alongside the RTC and Y-up terms.
+///
+/// Ground truth is each occurrence's OWN baked vertices, which the instanced
+/// path never reads, so this cannot pass by sharing the fix's blind spot.
+#[test]
+fn a_yawed_site_still_instances_its_repeated_shape() {
+    use ifc_lite_geometry::Vector3;
+
+    // 34 degree yaw about Z plus a site translation; in the site_local tier the
+    // RTC offset IS that translation (`processor/mod.rs`'s tier selection).
+    let yaw = 34f64.to_radians();
+    let (c, s) = (yaw.cos(), yaw.sin());
+    let rtc = [2_600_000.0f64, 1_200_000.0, 400.0];
+    #[rustfmt::skip]
+    let site_zup: Vec<f64> = vec![
+        c,      s,      0.0,    0.0,
+        -s,     c,      0.0,    0.0,
+        0.0,    0.0,    1.0,    0.0,
+        rtc[0], rtc[1], rtc[2], 1.0,
+    ];
+
+    const CANON: [f64; 12] = [0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 1.5];
+    let indices: Vec<u32> = vec![0, 1, 2, 0, 1, 3, 0, 2, 3, 1, 2, 3];
+
+    // Two PRE-RTC world placements six metres apart, differing by a PURE
+    // translation. That is the case the old code was most wrong about: with no
+    // relative rotation the RTC conjugation alone leaves zero residual, so the
+    // 3.5 m this test exercises is entirely the missing `Rᵀ`.
+    let place = |offset: [f64; 3]| {
+        Matrix4::new_translation(&Vector3::new(
+            rtc[0] + offset[0],
+            rtc[1] + offset[1],
+            rtc[2] + offset[2],
+        ))
+    };
+    let m_a = place([10.0, 5.0, 1.0]);
+    let m_b = place([16.0, 5.0, 1.0]);
+
+    let row_major = |m: &Matrix4<f64>| {
+        let mut out = [0.0f64; 16];
+        for r in 0..4 {
+            for col in 0..4 {
+                out[r * 4 + col] = m[(r, col)];
+            }
+        }
+        out
+    };
+    // Bake exactly like the site_local pipeline: world = M * canon, minus the
+    // RTC offset (the router), then the site placement's INVERSE rotation
+    // (`convert_mesh_to_site_local`), then Z-up -> Y-up (`frame::to_yup_in_place`,
+    // which runs before `build_gltf` sees a view).
+    let bake_yup = |m: &Matrix4<f64>| {
+        let mut out = Vec::with_capacity(CANON.len());
+        for v in CANON.chunks_exact(3) {
+            let w = [
+                m[(0, 0)] * v[0] + m[(0, 1)] * v[1] + m[(0, 2)] * v[2] + m[(0, 3)] - rtc[0],
+                m[(1, 0)] * v[0] + m[(1, 1)] * v[1] + m[(1, 2)] * v[2] + m[(1, 3)] - rtc[1],
+                m[(2, 0)] * v[0] + m[(2, 1)] * v[1] + m[(2, 2)] * v[2] + m[(2, 3)] - rtc[2],
+            ];
+            // Rᵀ, the same product `apply_inverse_rotation_in_place` forms from
+            // the COLUMNS of the column-major site matrix.
+            let (x, y, z) = (c * w[0] + s * w[1], -s * w[0] + c * w[1], w[2]);
+            out.push(x as f32);
+            out.push(z as f32);
+            out.push(-y as f32);
+        }
+        out
+    };
+    let pos_a = bake_yup(&m_a);
+    let pos_b = bake_yup(&m_b);
+    let normals = vec![0.0f32; CANON.len()];
+
+    let meta = |m: &Matrix4<f64>| InstanceMeta {
+        transform: row_major(m),
+        local_transform: None,
+        canonical_transform: None,
+        rep_identity: 41_180,
+        instanceable: true,
+    };
+    let (meta_a, meta_b) = (meta(&m_a), meta(&m_b));
+
+    fn mesh_view<'a>(
+        id: u32,
+        positions: &'a [f32],
+        normals: &'a [f32],
+        indices: &'a [u32],
+        im: Option<&'a InstanceMeta>,
+    ) -> MeshView<'a> {
+        MeshView {
+            express_id: id,
+            ifc_type: "IfcBeam",
+            global_id: None,
+            positions,
+            normals,
+            indices,
+            color: [0.5, 0.5, 0.5, 1.0],
+            origin: [0.0, 0.0, 0.0],
+            instance: im,
+        }
+    }
+
+    // Ground truth: the SAME fixture exported with instancing off. `instance:
+    // None` is exactly what the pipeline handed the exporter for a yawed site
+    // before this fix, so this is also the pre-#4118 output.
+    let flat_views = vec![
+        mesh_view(1, &pos_a, &normals, &indices, None),
+        mesh_view(2, &pos_b, &normals, &indices, None),
+    ];
+    let mut flat_ch = Chunker::new(12, usize::MAX, None);
+    let (flat_gltf, _) = build_gltf(
+        &flat_views, false, None, true, false, MeshCoordinateSpace::SiteLocal, rtc, Some(&site_zup), false,
+        &mut flat_ch,
+    );
+    assert_eq!(
+        flat_gltf.meshes.len(),
+        2,
+        "the instancing-off reference must keep one mesh per occurrence"
+    );
+
+    let views = vec![
+        mesh_view(1, &pos_a, &normals, &indices, Some(&meta_a)),
+        mesh_view(2, &pos_b, &normals, &indices, Some(&meta_b)),
+    ];
+    let mut ch = Chunker::new(12, usize::MAX, None);
+    let (gltf, _stats) = build_gltf(
+        &views, false, None, true, false, MeshCoordinateSpace::SiteLocal, rtc, Some(&site_zup), false,
+        &mut ch,
+    );
+
+    assert_eq!(
+        gltf.meshes.len(),
+        1,
+        "a repeated shape under a YAWED site must share ONE template mesh; got {} \
+         meshes, i.e. the group was rejected and nothing collated",
+        gltf.meshes.len()
+    );
+    let placed: Vec<[f32; 16]> = gltf.nodes.iter().filter_map(|n| n.matrix).collect();
+    assert_eq!(placed.len(), 2, "both occurrences placed by a node matrix");
+
+    // Reconstruct each occurrence from (template geometry, node matrix) and
+    // compare against its own baked vertices. `scene_center` cancels out of the
+    // DIFFERENCE between the two nodes, which is what makes this independent of
+    // the centring the exporter chose.
+    let apply = |m: &[f32; 16], p: [f64; 3]| {
+        // glTF node matrices are column-major.
+        [
+            m[0] as f64 * p[0] + m[4] as f64 * p[1] + m[8] as f64 * p[2] + m[12] as f64,
+            m[1] as f64 * p[0] + m[5] as f64 * p[1] + m[9] as f64 * p[2] + m[13] as f64,
+            m[2] as f64 * p[0] + m[6] as f64 * p[1] + m[10] as f64 * p[2] + m[14] as f64,
+        ]
+    };
+    for v in 0..pos_a.len() / 3 {
+        let p = [pos_a[v * 3] as f64, pos_a[v * 3 + 1] as f64, pos_a[v * 3 + 2] as f64];
+        let d0 = apply(&placed[0], p);
+        let d1 = apply(&placed[1], p);
+        for k in 0..3 {
+            let expected = (pos_b[v * 3 + k] - pos_a[v * 3 + k]) as f64;
+            let got = d1[k] - d0[k];
+            assert!(
+                (got - expected).abs() < 1e-3,
+                "occurrence node placement off by {} m on axis {k} (vertex {v}) \
+                 under a 34 degree site yaw",
+                got - expected
+            );
+        }
+    }
 }

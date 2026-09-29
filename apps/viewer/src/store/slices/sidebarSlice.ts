@@ -23,7 +23,8 @@
 import type { StateCreator } from 'zustand';
 import {
   WORKSPACE_PANELS,
-  isWorkspacePanelId,
+  PANEL_GROUPS,
+  migratePanelId,
   getPanelDef,
   SIDEBAR_DEFAULT_WIDTH_PCT,
   type WorkspacePanelId,
@@ -60,15 +61,22 @@ const STORAGE_KEY = 'ifc-lite:sidebar-layout-v1';
 const MIN_WIDTH_PCT = 14;
 const MAX_WIDTH_PCT = 60;
 
-// Display order in the rail. Hierarchy (#1267) is appended to WORKSPACE_PANELS
-// to keep the frozen Alt+1..0 mapping intact, but its natural home is the TOP
-// of the rail (it's the primary navigation surface), so float it to the front
-// here. The registry order still drives Alt+N; this only drives display.
-const DEFAULT_ORDER: WorkspacePanelId[] = (() => {
-  const ids = WORKSPACE_PANELS.map((p) => p.id);
-  const rest = ids.filter((id) => id !== 'hierarchy');
-  return ids.includes('hierarchy') ? ['hierarchy', ...rest] : rest;
-})();
+// Fresh layouts cluster the registry's task groups; persisted custom order is
+// preserved by normalizeOrder. Hierarchy leads Coordinate without changing the
+// registry's frozen first-ten Alt+digit shortcut order (#1200, #5873).
+const DEFAULT_ORDER: WorkspacePanelId[] = PANEL_GROUPS.flatMap((group) => {
+  const ids = WORKSPACE_PANELS.filter((panel) => panel.group === group.id).map((panel) => panel.id);
+  return group.id === 'coordinate'
+    ? [...ids.filter((id) => id === 'hierarchy'), ...ids.filter((id) => id !== 'hierarchy')]
+    : ids;
+});
+
+// An unchanged saved order from before task groups should receive the new
+// grouping on upgrade. A reordered list remains the user's own layout.
+const PRE_GROUP_DEFAULT_ORDER: WorkspacePanelId[] = [
+  'hierarchy',
+  ...WORKSPACE_PANELS.map((panel) => panel.id).filter((id) => id !== 'hierarchy'),
+];
 
 function clampWidth(pct: number): number {
   if (!Number.isFinite(pct)) return SIDEBAR_DEFAULT_WIDTH_PCT;
@@ -85,12 +93,19 @@ function normalizeOrder(order: unknown): WorkspacePanelId[] {
   const seen = new Set<WorkspacePanelId>();
   const out: WorkspacePanelId[] = [];
   if (Array.isArray(order)) {
-    for (const id of order) {
-      if (typeof id === 'string' && isWorkspacePanelId(id) && !seen.has(id)) {
+    for (const raw of order) {
+      // A retired panel id (e.g. pre-#5138 'ids') migrates to its
+      // replacement rather than silently vanishing from a persisted order.
+      const id = typeof raw === 'string' ? migratePanelId(raw) : undefined;
+      if (id !== undefined && !seen.has(id)) {
         seen.add(id);
         out.push(id);
       }
     }
+  }
+  if (out.length >= 10) {
+    const priorOrder = PRE_GROUP_DEFAULT_ORDER.filter((id) => seen.has(id));
+    if (out.every((id, index) => id === priorOrder[index])) return [...DEFAULT_ORDER];
   }
   // Surface registry panels the persisted list never knew about, in
   // DEFAULT_ORDER order. Hierarchy (#1267) is special: its documented home is
@@ -108,8 +123,9 @@ function normalizeOrder(order: unknown): WorkspacePanelId[] {
 function normalizeHidden(hidden: unknown): WorkspacePanelId[] {
   if (!Array.isArray(hidden)) return [];
   const out = new Set<WorkspacePanelId>();
-  for (const id of hidden) {
-    if (typeof id === 'string' && isWorkspacePanelId(id) && id !== 'properties') out.add(id);
+  for (const raw of hidden) {
+    const id = typeof raw === 'string' ? migratePanelId(raw) : undefined;
+    if (id !== undefined && id !== 'properties') out.add(id);
   }
   return [...out];
 }

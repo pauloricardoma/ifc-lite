@@ -2,43 +2,36 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Post-cut hygiene for void subtraction (#1788): real-change detection and
-//! the stray-shard sweep against the original (pre-cut) host.
+//! Post-cut hygiene for void subtraction (#1788): which subtract result the
+//! host continues as, and the stray-shard sweep against the original (pre-cut)
+//! host.
 
-use super::geom::{mesh_is_closed_exact, mesh_point, mesh_signed_volume, point_inside_mesh};
+use super::geom::{mesh_is_closed_exact, mesh_point, point_inside_mesh};
+use crate::csg::GroupCut;
 use crate::{Mesh, Point3};
 
-/// Whether a boolean produced a REAL change against the pre-cut host: the
-/// triangle count moved, or the enclosed volume moved beyond noise.
+/// The mesh the host continues as after a subtract, or `None` when it stays as
+/// it is and the caller's fallbacks decide.
 ///
-/// Triangle count alone misreads two opposite cases (#1788):
-///  * an end/miter cut can replace a 12-tri box host with another 12-tri box —
-///    same count, 8.5% volume moved (ISSUE_129 `IGC_MUR` wedge); count-only
-///    detection threw the perfect cut away and the #635 AABB fallback then
-///    carved the cutter's axis-aligned world box instead;
-///  * a kernel short-circuit returns the host byte-identical — count AND
-///    volume are equal, which this test still (correctly) reads as unchanged.
+/// Whether a cut happened comes from the kernel (#4692): a `Cut` is kept
+/// however little it removed. That used to be guessed from the triangle count
+/// and a 0.1 % volume change, which read a real same-count cut under 0.1 % of
+/// the host as no cut.
 ///
-/// Volumes are compared by MAGNITUDE: the kernel's `orient_outward`
-/// normalization can hand back a no-op subtraction of an inward-wound host
-/// with its winding flipped, and comparing raw signed values would read that
-/// as a ~2x volume change — accepting an UNCUT mesh and skipping the #635
-/// fallback (codex P1 on #1802).
-///
-/// The volume tolerance is deliberately COARSE (0.1% relative): a rejected /
-/// short-circuited subtract may return the host re-snapped rather than
-/// byte-identical, and reading that noise as "changed" would silently skip
-/// the #635 fallback machinery. A same-count REAL cut moves volume by orders
-/// of magnitude more (8.5% on the ISSUE_129 wedge); a real cut smaller than
-/// 0.1% of the host that ALSO keeps the triangle count identical stays on
-/// the (pre-existing) fallback path, no worse than before.
-pub(super) fn cut_changed_mesh(result: &Mesh, tris_before: usize, vol_before: f64) -> bool {
-    if result.triangle_count() != tris_before {
-        return true;
+/// A `Retessellated` host (the cutter never reached the solid) is kept only
+/// when the arrangement changed its triangle count. That is not a verdict on
+/// the cut; it keeps the tessellation the router has always continued with.
+/// The old guess took exactly these re-tessellations as "changed", which also
+/// skipped the #635 fallback for them. The watertightness census depends on
+/// it: later cuts run on the consolidated host, and a miss sent to the
+/// fallback can box-cut. Changing either is a census decision, not part of
+/// telling a cut from a miss.
+pub(super) fn mesh_to_keep(outcome: GroupCut, host: &Mesh) -> Option<Mesh> {
+    match outcome {
+        GroupCut::Cut(cut) => Some(cut),
+        GroupCut::Retessellated(m) if m.triangle_count() != host.triangle_count() => Some(m),
+        GroupCut::Retessellated(_) | GroupCut::Rejected(_) => None,
     }
-    let vol_after = mesh_signed_volume(result).abs();
-    let vol_before = vol_before.abs();
-    (vol_after - vol_before).abs() > vol_before.max(1.0e-9) * 1.0e-3
 }
 
 /// Cap on `result_triangles x host_triangles` for the shard sweep. Every swept
@@ -267,9 +260,20 @@ pub(super) fn drop_faces_outside_host(result: Mesh, original_host: &Mesh) -> Mes
         // its centroid inside while a far vertex hangs ~1 m out, so (a) alone
         // misses it. The 1 mm clearance keeps host-surface vertices (distance
         // ~0) and corner-grazing parity noise safe.
+        //
+        // (a) carries the SAME clearance (#5127). A flush cap grazing the host
+        // by a few µm leaves a sub-0.1 mm sliver strip along the host's edge,
+        // with both ±50 µm probes outside the reference solid — and that strip
+        // is a connected part of a closed skin, not a shard: dropping it tore
+        // ISSUE_068 #1401204 (0 -> 6 open edges) on a host whose result was
+        // exactly watertight before the sweep. A shard is far from the host
+        // by construction (the #1788 cap fragments sit ~1 m off the wall
+        // plane), so a centroid within 1 mm of the reference surface is never
+        // one. Parity noise at a corner is bounded the same way (b) bounds it.
         const VERTEX_CLEARANCE: f64 = 1.0e-3;
         let centroid_out = !point_inside_mesh(reference_host, centroid + off)
-            && !point_inside_mesh(reference_host, centroid - off);
+            && !point_inside_mesh(reference_host, centroid - off)
+            && point_mesh_distance_exceeds(reference_host, &centroid, VERTEX_CLEARANCE);
         let vertex_out = [a, b, c].iter().any(|&v| {
             !point_inside_mesh(reference_host, v)
                 && point_mesh_distance_exceeds(reference_host, &v, VERTEX_CLEARANCE)

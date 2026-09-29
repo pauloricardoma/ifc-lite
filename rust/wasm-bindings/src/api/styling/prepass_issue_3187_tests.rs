@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! #3187 — geometry jobs must be labelled legacy-aware.
 //!
 //! Split into its own file rather than grown inline: `prepass.rs` is on the
@@ -7,23 +11,20 @@
 //! move. `prepass_orphan_type_tests.rs` is the same pattern.
 use super::combined_pre_pass;
 
-use ifc_lite_core::{legacy_aware_ifc_type, EntityDecoder, IfcType};
+use ifc_lite_core::{ifc_type_from_keyword, EntityDecoder, IfcType};
 
 // #3187. The scan loop resolved a job's type with a BARE
-// `IfcType::from_str`, which knows only the current schema. A legacy
-// keyword therefore came back `IfcType::Unknown(crc32)` — and `Unknown`
-// carries a CRC32 of the name, NOT the name, so nothing downstream can
-// recover what it was (#3179). The element still rendered, which is why
-// this survived: the geometry is right and only the label is wrong, so
-// there is no blank screen to notice.
+// `IfcType::from_str`, which once knew only IFC4X3. The supported-schema
+// universe now preserves the exact legacy variant, while this path keeps the
+// existing modern processing mapping.
 //
 // #3190 fixed the four gates that DROPPED geometry. These six job-label
 // sites were left, and they are reachable: every keyword below answers
 // `has_geometry_by_name` = true, so it reaches the branch at first hand.
 const LEGACY_WITH_GEOMETRY: &[(&str, IfcType)] = &[
-    ("IFCBEAMSTANDARDCASE", IfcType::IfcBeam),
-    ("IFCDOORSTANDARDCASE", IfcType::IfcDoor),
-    ("IFCPROXY", IfcType::IfcBuildingElementProxy),
+    ("IFCBEAMSTANDARDCASE", IfcType::IfcBeamStandardCase),
+    ("IFCDOORSTANDARDCASE", IfcType::IfcDoorStandardCase),
+    ("IFCPROXY", IfcType::IfcProxy),
 ];
 
 fn job_type_for(keyword: &str) -> Option<IfcType> {
@@ -42,37 +43,42 @@ fn job_type_for(keyword: &str) -> Option<IfcType> {
         .simple_jobs
         .iter()
         .chain(pre_pass.complex_jobs.iter())
-        .map(|&(_, _, _, ty)| ty)
+        .map(|(_, _, _, ty)| ty.clone())
         .next()
 }
 
 #[test]
 fn legacy_keywords_are_not_scheduled_as_unknown() {
-    for &(keyword, expected) in LEGACY_WITH_GEOMETRY {
+    for &(keyword, ref expected) in LEGACY_WITH_GEOMETRY {
         // These two do DIFFERENT jobs, and only the second is anti-vacuity.
         // The first pins WHICH branch is under test: were the keyword to move
         // to the spatial-container exception branch, that branch is also
         // legacy-aware now, so this would pass while silently testing a
         // different site. It could not go quietly vacuous -- an unscheduled
         // keyword panics at the unwrap below. The second IS the guard: if the
-        // generated enum ever learns the keyword, the bare resolver returns
-        // the right type and this test passes with the fix reverted.
+        // generated enum must preserve the exact name while the legacy-aware
+        // classifier deliberately chooses the established processing base.
         assert!(
             ifc_lite_core::has_geometry_by_name(keyword),
             "{keyword} must reach the has_geometry branch; if it moves, this test would \
              silently exercise the spatial-container branch instead"
         );
-        assert!(
-            matches!(IfcType::from_str(keyword), IfcType::Unknown(_)),
-            "{keyword} must be one the BARE resolver gets wrong, else this test \
-             passes with the fix reverted"
+        let exact = IfcType::from_str(keyword);
+        assert_eq!(
+            exact.as_str(),
+            keyword,
+            "{keyword} must retain its exact name"
         );
-        assert_eq!(legacy_aware_ifc_type(keyword), expected, "table sanity: {keyword}");
+        assert_eq!(
+            ifc_type_from_keyword(keyword),
+            expected.clone(),
+            "exact generated type: {keyword}"
+        );
 
         let scheduled = job_type_for(keyword)
             .unwrap_or_else(|| panic!("{keyword} must be scheduled as a geometry job"));
         assert_eq!(
-            scheduled, expected,
+            scheduled, expected.clone(),
             "{keyword} was scheduled as {scheduled:?}; a job labelled Unknown(crc32) \
              cannot be recovered downstream because Unknown stores the hash, not the name"
         );
@@ -84,15 +90,13 @@ fn legacy_keywords_are_not_scheduled_as_unknown() {
 /// not a fact about the tests, so it is asserted here rather than assumed.
 ///
 /// EXACTLY WHAT THIS ASSERTS, because the raw counts invite a wrong reading:
-/// the bare resolver returns `Unknown` for all **26** names in
-/// `LEGACY_ENTITY_NAMES`. Of those, 22 reach the `has_geometry_by_name` arm,
+/// the generated resolver now retains supported legacy names exactly. The
+/// three synthetic stratum extensions remain `Unknown`; all three reach the
+/// `has_geometry_by_name` arm,
 /// **0** reach the `IFCSITE` arm, and **0** reach the representationless-
-/// spatial-container arm. The remaining 4 reach NONE of the three and are
-/// never scheduled as geometry jobs at all; three of them
-/// (`IFCDOORSTYLE`, `IFCWINDOWSTYLE`, `IFCBUILDINGELEMENTTYPE`) are picked up
-/// by a fourth arm, `type_product_ifc_type`, which already resolves
-/// legacy-aware. So this test deliberately does NOT compare the geometry count
-/// to the Unknown total: 22 against 26 is correct, not a discrepancy.
+/// spatial-container arm. The remaining four reach none of those three arms,
+/// while supported legacy type products are picked up by
+/// `type_product_ifc_type`, which resolves legacy-aware.
 ///
 /// The two zeroes are the load-bearing claim. They are what makes
 /// `styling/prepass.rs:68`/`:94` and `gpu_meshes/prepass.rs:349`/`:416`
@@ -110,7 +114,7 @@ fn legacy_keywords_are_not_scheduled_as_unknown() {
 fn every_legacy_keyword_reaches_the_geometry_arm_and_no_other() {
     let mut geometry = 0;
     let mut other = Vec::new();
-    for name in ifc_lite_core::LEGACY_ENTITY_NAMES.iter() {
+    for name in ifc_lite_core::EXPORTER_STRATUM_ALIASES.iter() {
         let name: &str = name;
         if !matches!(IfcType::from_str(name), IfcType::Unknown(_)) {
             continue;

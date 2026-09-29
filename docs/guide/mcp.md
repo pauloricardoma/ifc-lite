@@ -4,6 +4,12 @@ The `@ifc-lite/mcp` package turns any IFC model into a set of tools an LLM agent
 
 The server bundles the same headless kernel the [CLI](cli.md) and [server](server.md) use, and can optionally drive the WebGL viewer so an agent paints results into a live 3D scene.
 
+For 5D workflows, `cost_data` returns the canonical IFC cost graph and
+`cost_evaluate` evaluates an `item` or `value` by local `express_id`. Pass
+`model_id` whenever multiple models are loaded. Amounts are decimal strings,
+diagnostics retain model-qualified references, and results describe the loaded
+source snapshot rather than pending mutation overlays.
+
 ## Quickstart
 
 ### stdio (local agents)
@@ -92,7 +98,7 @@ Tools are grouped by capability. Everything below is registered in the default t
 | Category | Tools |
 |----------|-------|
 | Discovery | `model_info`, `model_list`, `model_load`, `model_unload`, `schema_describe` |
-| Query | `query_entities`, `count_entities`, `get_entity`, `get_entities_bulk`, `spatial_hierarchy`, `containment_chain`, `relationships`, `properties_unique`, `materials_list`, `classifications_list`, `georeferencing`, `units` |
+| Query | `query_entities`, `count_entities`, `get_entity`, `get_entities_bulk`, `spatial_hierarchy`, `containment_chain`, `relationships`, `properties_unique`, `materials_list`, `classifications_list`, `georeferencing`, `units`, `cost_data`, `cost_evaluate` |
 | Geometry | `geometry_bbox`, `geometry_volume`, `geometry_area`, `geometry_get` *(planned)*, `raycast` *(planned)* |
 | Clash | `clash_check`, `clash_matrix` |
 | Validation | `ids_validate`, `ids_explain`, `model_audit`, `gherkin_check` *(planned)* |
@@ -101,7 +107,21 @@ Tools are grouped by capability. Everything below is registered in the default t
 | bSDD | `bsdd_search`, `bsdd_class`, `bsdd_property_sets`, `bsdd_match` |
 | Diff | `model_diff`, `quantity_diff` |
 | Export | `export_ifc`, `export_csv`, `export_json`, `export_glb`, `export_obj`, `export_ifcx`, `export_usd`, `export_pdf_report` *(planned)* |
+| Flow | `describe_flow`, `run_flow` |
 | Viewer | `viewer_ask`, `viewer_open`, `viewer_close`, `viewer_status`, `viewer_colorize`, `viewer_isolate`, `viewer_hide`, `viewer_show`, `viewer_reset`, `viewer_fly_to`, `viewer_set_section`, `viewer_clear_section`, `viewer_color_by_storey`, `viewer_color_by_property`, `viewer_get_selection`, `viewer_wait_for_selection`, `viewer_describe_selection` |
+| Draft layers & review | `create_draft_layer`, `draft_apply_ops`, `publish_layer`, `diff_layer`, `dry_run_merge`, `list_conflicts`, `request_review`, `add_review_feedback`, `get_review_feedback`, `add_review_topic`, `respond_to_review` |
+
+!!! tip "Pinning the GlobalId of a created entity"
+    `entity_create` takes an optional `global_id`: the GlobalId of the new
+    entity, the MCP counterpart of the `GlobalId` parameter the in-store
+    builders and `bim.store.add*` accept. It must be a valid 22-character IFC
+    GUID (the `isValidIfcGuid` rule from `@ifc-lite/encoding`), the class must
+    derive from `IfcRoot` (the value is written to attribute 0), and it must not
+    already be carried by an entity in the model, parsed or created this
+    session. Each violation is refused with `INVALID_INPUT` and nothing is
+    queued; a GlobalId given both as `global_id` and as a different
+    `attributes[0]` is refused too. Without `global_id` the tool behaves as
+    before.
 
 !!! tip "`model_diff` and re-exported models"
     `model_diff` compares by GlobalId, so two files that describe the same
@@ -111,8 +131,10 @@ Tools are grouped by capability. Everything below is registered in the default t
     entities by content. It is opt-in and stays off by default: an ambiguous
     group has no honest scalar form, so turning it on would change what the
     existing numbers mean. Either way the diff reflects any edits the session
-    has queued but not yet saved, and says how many. See [Content diffing over
-    MCP](model-diff.md#mcp-usage).
+    has queued but not yet saved, and says how many. `key_from` (`"Tag"` or
+    `"Pset.Prop"`) keys the comparison on an authored identifier instead of
+    GlobalId, exactly as the CLI's `--key-from` does. See [Content diffing over
+    MCP](model-diff.md#mcp-usage) and [Stable Element Identity](stable-identity.md).
 
 !!! tip "Reading back an edit you just made"
     A `model_id` names a *session*, not a file. `entity_set_property`,
@@ -138,6 +160,9 @@ Tools are grouped by capability. Everything below is registered in the default t
     parsed graph, so an `IfcRelVoidsElement` this session created or deleted
     shows up there only after a save and reload.
 
+    `model_audit` scores identity and naming from effective classes, GlobalIds
+    and Names, including queued retypes and edits.
+
     **One GlobalId, one entity, whichever tool asks.** A GlobalId is supposed to
     be unique and in practice is not — a session can create an entity under an id
     the file already uses. `get_entity`, `get_entities_bulk`, `entity_set_*`,
@@ -154,6 +179,14 @@ Tools are grouped by capability. Everything below is registered in the default t
     first two used to emit the raw uppercase STEP key. `count_entities` also
     honours `type` on the `group_by: 'type'` branch now (it was ignored), and
     expands subtypes the way `query_entities` does.
+
+    **`count_entities` counts BIM products on every `group_by`.** It is the
+    aggregate form of `query_entities` and answers over the same set. The
+    ungrouped total and `group_by: 'type'` used to fold raw STEP records
+    instead — geometry and property-value lines included — so the same tool
+    answered 44,249 by type and 128 by storey for one model. For the raw STEP
+    record count, which is a file statistic rather than a query, use
+    `model_info` (the MCP analogue of `ifc-lite info`).
 
     **`pendingMutations` is a number wherever it appears, never an object.**
     `model_diff` used to publish a `{ base, head }` object under that name
@@ -200,6 +233,34 @@ Tools are grouped by capability. Everything below is registered in the default t
     `IFC4_ADD2_TC1` when the pinned registry answered (attributes with their
     EXPRESS types) and `bundled-schema-union` when it did not (attribute names
     in positional order, no types).
+
+!!! tip "Flow graphs: describe_flow / run_flow"
+    A `.flow.json` graph — the same document the viewer's Flow editor authors
+    and `ifc-lite flow run` executes from the CLI — can be discovered and run
+    headlessly by an agent. `describe_flow` takes `flow` (the parsed document
+    inline) or `flow_path` (subject to `--allow`), and returns the graph's
+    declared inputs (name, kind, default) and outputs (node/port, value kind,
+    access) plus registry-aware wiring diagnostics. It never throws on an
+    invalid graph — a declared output naming a port no node has comes back as
+    `ok: false` with `diagnostics`, not an opaque error, because that
+    defect is exactly what an agent calls this tool to find.
+
+    `run_flow` takes the same `flow`/`flow_path`, an optional `model_id`, and
+    `inputs` (Player parameter overrides keyed `"nodeId.param"`). An `inputs`
+    key naming no declared parameter is rejected by name rather than dropped
+    silently — the graph never runs on defaults while reporting success. The
+    result carries `ok`, per-node status counts, a `tracking` summary
+    (created/updated/kept/removed elements for tracked write nodes), and the
+    declared `outputs`' values; a table output's rows are capped with a
+    `truncated` flag. A failed node marks the whole run `ok: false`, and any
+    output downstream of it comes back with no data rather than reporting the
+    half-applied model as a success.
+
+    Element-creation node types (`element.column`, `model.addElement`, …) are
+    not yet runnable through `run_flow`: the MCP server's in-session store
+    adapter does not implement `addColumn`/`addWall`/`addSlab`/`addBeam` (use
+    `entity_create` for those today). A property-writing graph, like the
+    shipped fire-rating-audit example, runs normally.
 
 !!! note "Planned tools return a clean error"
     `geometry_get`, `raycast`, `gherkin_check`, and `export_pdf_report` are

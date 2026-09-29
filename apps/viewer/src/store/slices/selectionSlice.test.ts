@@ -144,6 +144,19 @@ describe('SelectionSlice', () => {
       assert.ok(state.selectedEntitiesSet.has('model-1:123'));
     });
 
+    it('increments provenance when a non-final entity is removed (#4832)', () => {
+      const first: EntityRef = { modelId: 'model-1', expressId: 123 };
+      const second: EntityRef = { modelId: 'model-2', expressId: 456 };
+      state.addEntityToSelection(first);
+      state.addEntityToSelection(second);
+      const before = state.selectionRevision;
+
+      state.removeEntityFromSelection(first);
+
+      assert.equal(state.selectionRevision, before + 1);
+      assert.deepEqual([...state.selectedEntitiesSet], ['model-2:456']);
+    });
+
     it('should clear primary when removing last entity', () => {
       const ref: EntityRef = { modelId: 'model-1', expressId: 123 };
       state.addEntityToSelection(ref);
@@ -379,6 +392,12 @@ describe('SelectionSlice', () => {
       assert.strictEqual(state.selectedModelId, 'model-1');
     });
 
+    it('setSelectedEntityId(null) clears a stale LandXML source selection (#5042)', () => {
+      state.setSelectedLandXmlSource({ modelId: 'terrain', sourceId: 'landxml:surface:1' });
+      state.setSelectedEntityId(null);
+      assert.strictEqual(state.selectedLandXmlSource, null);
+    });
+
     it('setSelectedModelId clears the multi-model entity channels and the primary id', () => {
       state.setSelectedEntity({ modelId: 'model-1', expressId: 7 });
       state.setSelectedEntities([
@@ -400,8 +419,8 @@ describe('SelectionSlice', () => {
       // `selectedEntities` and `selectedEntityId`, and must also clear the
       // legacy global-id set, matching its own comment: "Clear other
       // selection when selecting a model". Otherwise the set survives and
-      // MainToolbar.tsx:352 and ElementsTab.tsx:44 keep reporting the stale
-      // count, and useAnimationLoop.ts:244 keeps painting the stale
+      // the Elements ribbon selection group keeps reporting the stale count,
+      // and useAnimationLoop.ts:244 keeps painting the stale
       // highlight, while the properties panel has already switched to the
       // model.
       state.setSelectedEntityIds([7, 8]);

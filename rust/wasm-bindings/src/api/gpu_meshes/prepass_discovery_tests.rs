@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Tests for `prepass_discovery`, split out of it for the module-size ratchet.
 //!
 //! The rule there is shrink or split by default -- a raise is possible on both
@@ -131,6 +135,79 @@ fn sharded_column_discovery_schedules_storey_geometry_job() {
     );
 }
 
+/// Record starts past the content (columns stitched against a longer buffer
+/// than this worker holds) must not panic the walk, which runs under wasm
+/// `panic=abort` (#4614). `keyword_at` used to clamp only `end`, so
+/// `start > content.len()` panicked. Mutation that fails this test: restore
+/// `&content[start..end.min(content.len())]` in `keyword_at`.
+#[test]
+fn a_span_past_the_content_is_an_unnamed_record_not_a_panic() {
+    let bytes = LEGACY_JOB_FIXTURE.as_bytes();
+    let (records, classes, _) =
+        ifc_lite_processing::scan_shard_classified(bytes, 0, bytes.len());
+    let ids: Vec<u32> = records.iter().map(|&(id, _, _)| id).collect();
+    let lengths: Vec<u32> = records.iter().map(|&(_, s, e)| (e - s) as u32).collect();
+    // Every record start shifted past the end of the buffer.
+    let beam_idx = records
+        .iter()
+        .position(|&(_, s, e)| keyword_at(bytes, s, e) == "IFCBEAMSTANDARDCASE")
+        .expect("fixture must contain the IFCBEAMSTANDARDCASE");
+    assert!(
+        classes[beam_idx] & ifc_lite_processing::PREPASS_CLASS_FLAG_GEOMETRY_JOB != 0,
+        "sanity: the walk must reach keyword_at for this record"
+    );
+    let starts: Vec<u32> = records.iter().map(|&(_, s, _)| (s + bytes.len()) as u32).collect();
+
+    assert_eq!(keyword_at(bytes, bytes.len() + 10, bytes.len() + 20), "");
+
+    let disabled = rustc_hash::FxHashSet::default();
+    let discovery = discover_from_columns(bytes, &ids, &starts, &lengths, &classes, &disabled);
+    // The record is still scheduled (the decoder's own bounds check drops it
+    // later, and counts it), but with no keyword to name it.
+    let beam_id = records[beam_idx].0;
+    let labelled: Vec<_> = discovery
+        .buffered_jobs
+        .iter()
+        .filter(|&&(id, _, _, _)| id == beam_id)
+        .map(|(_, _, _, ty)| ty.clone())
+        .collect();
+    assert_eq!(
+        labelled,
+        vec![ifc_lite_core::ifc_type_from_keyword("")],
+        "a job whose span lies outside the content carries the empty keyword's type"
+    );
+}
+
+/// A class column shorter than the id column used to index `classes[i]` past
+/// its end inside the walk (#4614). The sharded entry refuses unequal columns;
+/// the walk also stops at the shortest column, so no caller can trap the
+/// worker through it. Mutation that fails this test: restore the
+/// `for i in 0..ids.len()` loop indexing each column by `i`.
+#[test]
+fn a_short_column_ends_the_walk_instead_of_panicking() {
+    let bytes = LEGACY_JOB_FIXTURE.as_bytes();
+    let (records, classes, _) =
+        ifc_lite_processing::scan_shard_classified(bytes, 0, bytes.len());
+    let ids: Vec<u32> = records.iter().map(|&(id, _, _)| id).collect();
+    let starts: Vec<u32> = records.iter().map(|&(_, s, _)| s as u32).collect();
+    let lengths: Vec<u32> = records.iter().map(|&(_, s, e)| (e - s) as u32).collect();
+    let disabled = rustc_hash::FxHashSet::default();
+
+    let full = discover_from_columns(bytes, &ids, &starts, &lengths, &classes, &disabled);
+    let last_id = *ids.last().expect("fixture has records");
+    assert!(
+        full.buffered_jobs.iter().any(|&(id, _, _, _)| id == last_id),
+        "sanity: the last record (the beam) is a geometry job when every column is whole"
+    );
+
+    let short = &classes[..classes.len() - 1];
+    let truncated = discover_from_columns(bytes, &ids, &starts, &lengths, short, &disabled);
+    assert!(
+        truncated.buffered_jobs.iter().all(|&(id, _, _, _)| id != last_id),
+        "the record past the short column is not walked"
+    );
+}
+
     // The geometry-JOB fixture. `IFCBEAMSTANDARDCASE` is an IFC4 entity that
     // IFC4X3 removed, and `has_geometry_by_name` admits it, so it reaches the
     // geometry-job branch directly. Declared IFC4 because that is the schema
@@ -155,11 +232,9 @@ END-ISO-10303-21;
 "#;
 
 // #3187: an IFC2X3 `IfcDoorStyle` whose RepresentationMap no IfcMappedItem
-// references. `IfcType::from_str("IFCDOORSTYLE")` is `Unknown` -- the
-// keyword is one IFC4X3 dropped -- so the flag-setting classifier and the
-// label this walk attaches must BOTH go through the legacy-aware
-// resolver, or the span is either never flagged or flagged and then
-// labelled `Unknown`.
+// references. The exact generated variant and the modern processing mapping
+// are deliberately distinct: the former preserves identity, while the latter
+// keeps geometry behaviour stable.
 const LEGACY_TYPE_FIXTURE: &str = r#"ISO-10303-21;
 HEADER;
 FILE_DESCRIPTION((''),'2;1');
@@ -185,18 +260,14 @@ END-ISO-10303-21;
 /// The sharded browser path's own pin for #3187. The serial scan is not
 /// reachable from a host test (it lives inside a `#[wasm_bindgen]` method
 /// driven by JS callbacks), but this walk is, and it is the path that
-/// re-attaches an `IfcType` to a span someone else flagged -- the exact
-/// place a bare `IfcType::from_str` would put `Unknown` on the wire.
+/// re-attaches a processing `IfcType` to a span someone else flagged. It must
+/// retain the exact schema-local type even after legacy tables are removed.
 #[test]
 fn sharded_column_discovery_labels_a_legacy_type_candidate_with_its_base_type() {
     let bytes = LEGACY_TYPE_FIXTURE.as_bytes();
-    assert!(
-        matches!(
-            ifc_lite_core::IfcType::from_str("IFCDOORSTYLE"),
-            ifc_lite_core::IfcType::Unknown(_)
-        ),
-        "sanity: the BARE resolver must not know IFCDOORSTYLE, or this test \
-         cannot tell the legacy-aware label from the literal one"
+    assert_eq!(
+        ifc_lite_core::IfcType::from_str("IFCDOORSTYLE"),
+        ifc_lite_core::IfcType::IfcDoorStyle
     );
 
     let (records, classes, handoff) =
@@ -222,36 +293,29 @@ fn sharded_column_discovery_labels_a_legacy_type_candidate_with_its_base_type() 
         .type_candidate_spans
         .iter()
         .filter(|&&(id, _, _, _)| id == style_id)
-        .map(|&(_, _, _, ty)| ty)
+        .map(|(_, _, _, ty)| ty.clone())
         .collect();
     assert_eq!(
         labelled,
-        vec![ifc_lite_core::IfcType::IfcDoorType],
-        "the sharded walk must carry the legacy IfcDoorStyle forward as its base \
-         type IfcDoorType, not as Unknown and not dropped; type_candidate_spans = {:?}",
+        vec![ifc_lite_core::IfcType::IfcDoorStyle],
+        "the sharded walk must preserve the exact IfcDoorStyle variant; \
+         type_candidate_spans = {:?}",
         discovery.type_candidate_spans
     );
 }
 
 /// The geometry-JOB half of the same walk, and the sibling of the test
-/// above. The type-candidate branch was made legacy-aware and this one was
-/// not, so a keyword the gate admitted through the legacy-aware
-/// `has_geometry_by_name` was then labelled by a bare `IfcType::from_str`
-/// and reached the wire as `Unknown(crc32)`. `Unknown` carries a hash of
-/// the keyword rather than the keyword, so no consumer can recover it
-/// (#3179). This is the sharded path, which is the one large models take.
+/// above. Before #4203, a keyword admitted through `has_geometry_by_name` was
+/// labelled by a separate bare lookup and could reach the wire as
+/// `Unknown(crc32)`. Exact generated variants remove that information loss,
+/// and the sharded path must preserve the same schema-local type as every
+/// other path (#3179, #4203).
 #[test]
 fn sharded_column_discovery_labels_a_legacy_geometry_job_with_its_base_type() {
     let bytes = LEGACY_JOB_FIXTURE.as_bytes();
-    // Anti-vacuity: if the generated enum ever learns this keyword, the
-    // bare resolver returns the right type and this test passes with the
-    // fix reverted.
-    assert!(
-        matches!(
-            ifc_lite_core::IfcType::from_str("IFCBEAMSTANDARDCASE"),
-            ifc_lite_core::IfcType::Unknown(_)
-        ),
-        "sanity: the BARE resolver must not know IFCBEAMSTANDARDCASE"
+    assert_eq!(
+        ifc_lite_core::IfcType::from_str("IFCBEAMSTANDARDCASE"),
+        ifc_lite_core::IfcType::IfcBeamStandardCase
     );
 
     let (records, classes, handoff) =
@@ -278,15 +342,28 @@ fn sharded_column_discovery_labels_a_legacy_geometry_job_with_its_base_type() {
         .buffered_jobs
         .iter()
         .filter(|&&(id, _, _, _)| id == beam_id)
-        .map(|&(_, _, _, ty)| ty)
+        .map(|(_, _, _, ty)| ty.clone())
         .collect();
     assert_eq!(
         labelled,
-        vec![ifc_lite_core::IfcType::IfcBeam],
-        "the sharded walk must label the legacy IFCBEAMSTANDARDCASE job as IfcBeam, \
-         agreeing with the gate that admitted it; Unknown stores a hash of the \
-         keyword rather than the keyword, so the label cannot be repaired later \
-         from itself; buffered_jobs = {:?}",
+        vec![ifc_lite_core::IfcType::IfcBeamStandardCase],
+        "the sharded walk must preserve the exact IFCBEAMSTANDARDCASE type; buffered_jobs = {:?}",
         discovery.buffered_jobs
     );
+}
+
+/// The skip set holds uppercase names and the keyword is whatever case the
+/// file wrote: an uppercase keyword is one hash lookup, a recased one falls
+/// to the case-folded scan, and neither spelling escapes the filter.
+#[test]
+fn a_disabled_type_is_skipped_in_any_keyword_case() {
+    let disabled: rustc_hash::FxHashSet<String> =
+        ["IFCSPACE".to_string(), "IFCOPENINGELEMENT".to_string()].into_iter().collect();
+    for kw in ["IFCSPACE", "ifcspace", "IfcSpace", "IfcOpeningElement"] {
+        assert!(is_disabled(&disabled, kw), "{kw} is in the skip set");
+    }
+    for kw in ["IFCWALL", "ifcwall", "IFCSPACETYPE"] {
+        assert!(!is_disabled(&disabled, kw), "{kw} is not in the skip set");
+    }
+    assert!(!is_disabled(&rustc_hash::FxHashSet::default(), "ifcspace"), "empty set skips nothing");
 }

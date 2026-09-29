@@ -7,6 +7,27 @@ repo_name: LTplus-AG/ifc-lite
 edit_uri: edit/main/docs/
 use_directory_urls: true
 
+validation:
+  nav:
+    omitted_files: warn
+
+# architecture/evidence/** are the supporting artifacts (fixtures, screenshots,
+# method notes) behind the design docs above them, not pages in their own right.
+# They are absent from `nav` but reached from their parent design doc.
+#
+# research/** holds decision records: the measurements behind an experiment,
+# kept so nobody re-runs it. Same reason for skipping `nav` -- a dropped
+# experiment does not belong beside the user guides -- but NOT the same
+# reachability. These are built and search-indexed like any page, and today
+# nothing links to them, so they are findable only by search or a direct URL.
+# If you add one, link it from the design doc it informs; "kept" and "kept where
+# the next person finds it" are not the same thing.
+#
+# Declaring them here keeps `omitted_files: warn` meaningful for everything else.
+not_in_nav: |
+  architecture/evidence/**
+  research/**
+
 theme:
   name: material
   custom_dir: docs/overrides
@@ -119,6 +140,7 @@ nav:
   - Getting Started:
     - Installation: guide/installation.md
     - Quick Start: guide/quickstart.md
+    - Web Viewer Controls: guide/web-viewer-controls.md
     - CLI Toolkit: guide/cli.md
     - MCP for AI Agents: guide/mcp.md
     - 3D Viewer & Analysis: guide/viewer-api.md
@@ -130,8 +152,11 @@ nav:
     - Geometry Processing: guide/geometry.md
     - Rendering: guide/rendering.md
     - Querying Data: guide/querying.md
+    - Selector Syntax: guide/selector-syntax.md
+    - Images and PDF Appearance: guide/appearance.md
     - Exporting Data: guide/exporting.md
     - Multi-Model Federation: guide/federation.md
+    - LandXML: guide/landxml.md
     - BCF Collaboration: guide/bcf.md
     - IDS Validation: guide/ids.md
     - 2D Drawings: guide/drawing-2d.md
@@ -140,15 +165,19 @@ nav:
     - Error Handling & Integration: guide/error-handling.md
     - Clash Detection: guide/clash-detection.md
     - Model Diff: guide/model-diff.md
+    - Stable Element Identity: guide/stable-identity.md
     - Real-Time Collaboration: guide/collaboration.md
-    - Collab Engine (API): guide/collab.md
+    - Collab Engine (API): guide/collaboration-api.md
     - Collaboration Server: guide/collab-server.md
-    - Testing Collaboration: guide/collab-testing.md
     - Lens Visualization: guide/lens.md
     - Lists & Schedules: guide/lists.md
     - Schedule Import: guide/schedule-import.md
+    - Cost Panel: guide/cost-panel.md
+    - Charts: guide/charts.md
+    - Documents: guide/documents.md
     - Solar Analysis: guide/solar.md
     - Scripting SDK: guide/scripting-sdk.md
+    - Flow Graphs: guide/flow.md
   - Customization:
     - Extensions: guide/extensions.md
     - Authoring Extensions: guide/extension-authoring.md
@@ -159,9 +188,42 @@ nav:
     - Data Flow: architecture/data-flow.md
     - Parsing Pipeline: architecture/parsing-pipeline.md
     - Geometry Pipeline: architecture/geometry-pipeline.md
+    - Coverage Ledger: architecture/coverage-ledger.md
+    - Schema Enum Reconciliation: architecture/schema-enum-reconciliation.md
+    - LandXML Interoperability: architecture/landxml-coverage-ledger.md
+    - LandXML → IFC Mapping: architecture/landxml-to-ifc-mapping.md
+    - Speckle → IFC Mapping: architecture/speckle-mapping.md
     - Rendering Pipeline: architecture/rendering-pipeline.md
+    - Relative-to-Eye Rendering: architecture/renderer-relative-to-eye.md
     - Coordinate Handling: architecture/coordinate-handling.md
     - Federation: architecture/federation.md
+    - Collaboration: architecture/collaboration.md
+    - Clash Detection: architecture/clash-detection.md
+    - Element Splitting: architecture/element-splitting.md
+    - Spatial Zone Emission: architecture/spatial-zone-emission.md
+    - Mesh Determinism: architecture/mesh-determinism.md
+    - CSG Threading: architecture/csg-threading-design.md
+    - N-ary Union Repair: architecture/nary-union-repair.md
+    - WASM Wide Arithmetic: architecture/wasm-wide-arithmetic.md
+    - Plato Code Generation: architecture/plato-codegen.md
+    - Appearance:
+        - Roadmap: architecture/appearance-roadmap.md
+        - Coordinated Assignments: architecture/appearance-assignments.md
+        - Cooperative Apply: architecture/appearance-cooperative-apply.md
+        - Evaluated Occurrences: architecture/appearance-evaluated-occurrences.md
+        - Registered Drawing References: architecture/appearance-references.md
+        - Workspace Integration: architecture/appearance-workspace.md
+    - Captured Mesh Authoring: architecture/captured-mesh-authoring.md
+    - PDF Vector Annotations: architecture/pdf-vector-annotations.md
+    - Scan Alignment Workbench: architecture/scan-alignment-workbench.md
+    - Extension System:
+        - Extension Model: architecture/ai-customization/01-extension-model.md
+        - Security Model: architecture/ai-customization/02-security.md
+        - UI Surface: architecture/ai-customization/03-ui-surface.md
+        - AI Authoring: architecture/ai-customization/04-ai-authoring.md
+        - Flavors and Sharing: architecture/ai-customization/05-flavors-and-sharing.md
+        - Self-Improvement Loops: architecture/ai-customization/06-self-improvement.md
+        - Registry and Signing: architecture/ai-customization/10-registry-and-signing.md
     - Layer PRs:
         - Overview: architecture/layer-prs/index.md
         - Concepts: architecture/layer-prs/01-concepts.md
@@ -174,8 +236,6 @@ nav:
         - Review Workflow: architecture/layer-prs/08-review.md
         - CLI & CI: architecture/layer-prs/09-cli.md
         - Registry: architecture/layer-prs/10-registry.md
-        - Standards & Ecosystem: architecture/layer-prs/11-standards-ecosystem.md
-        - Roadmap: architecture/layer-prs/12-roadmap.md
   - API Reference:
     - TypeScript API: api/typescript.md
     - Rust API: api/rust.md
@@ -190,5 +250,5 @@ nav:
   - Contributing:
     - Development Setup: contributing/setup.md
     - Testing: contributing/testing.md
+    - Collaboration Testing: contributing/collaboration-testing.md
     - Release Process: contributing/release.md
-

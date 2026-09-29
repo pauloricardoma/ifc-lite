@@ -23,10 +23,13 @@ mod alignment;
 mod boolean;
 mod brep;
 mod csg_primitive;
+mod sphere;
 pub(crate) mod extrusion;
 mod extrusion_tapered;
 mod helpers;
 mod sectioned;
+mod structural_edge;
+mod structural_face;
 mod surface;
 mod swept;
 mod tessellated;
@@ -37,22 +40,28 @@ mod tests;
 
 // Re-export all processor types
 pub use advanced::{AdvancedBrepProcessor, BSplineSurfaceProcessor};
+// Drained by the router once per representation item to report a capped
+// B-spline curve edge (#4901); see `advanced_face::bspline_budget`.
+pub(crate) use advanced_face::take_curve_capped;
 pub use alignment::IfcAlignmentProcessor;
 pub use boolean::BooleanClippingProcessor;
 pub use brep::{
     FaceBasedSurfaceModelProcessor, FacetedBrepProcessor, ShellBasedSurfaceModelProcessor,
 };
-pub use csg_primitive::{BlockProcessor, CsgSolidProcessor, SphereProcessor};
+pub use csg_primitive::{BlockProcessor, CsgSolidProcessor};
+pub use sphere::SphereProcessor;
 pub use extrusion::ExtrudedAreaSolidProcessor;
 pub use extrusion_tapered::ExtrudedAreaSolidTaperedProcessor;
 pub use sectioned::SectionedSolidHorizontalProcessor;
+pub use structural_edge::IfcEdgeProcessor;
+pub use structural_face::IfcFaceSurfaceProcessor;
 pub use surface::SurfaceOfLinearExtrusionProcessor;
 pub use swept::{
     RevolvedAreaSolidProcessor, SurfaceCurveSweptAreaSolidProcessor, SweptDiskSolidProcessor,
 };
 pub use tessellated::{PolygonalFaceSetProcessor, TriangulatedFaceSetProcessor};
 pub use texture::{
-    build_texture_index, ImageTextureRef, MeshTexture, ResolvedTextureMap, TextureAttachment,
+    build_texture_index, embedded_raster_dimensions, MAX_TEXTURE_DIMENSION, ImageTextureRef, MeshTexture, ResolvedTextureMap, TextureAttachment,
     TextureSource,
 };
 

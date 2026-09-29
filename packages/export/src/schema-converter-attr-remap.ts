@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import { splitTopLevelStepArguments } from './step-argument-parser.js';
+
 /**
  * Attribute-list reconciliation for a genuine cross-schema entity RENAME
  * whose lists fail `schema-converter.ts`'s strict-prefix test (neither list
@@ -9,46 +11,24 @@
  * `schema-converter.ts`'s line budget (`scripts/module-size-allowlist.txt`).
  */
 
-/** Split a raw STEP attribute list into its top-level (comma-separated)
- *  value strings, respecting nested parentheses and single-quoted strings.
- *  Mirrors `schema-converter.ts`'s `trimAttributes` scanner but returns
- *  every value instead of stopping at a budget. Empty list → []. */
-export function splitTopLevelAttributes(attrsRaw: string): string[] {
-  if (!attrsRaw.trim()) return [];
-  const attrs: string[] = [];
-  let depth = 0;
-  let inString = false;
-  let current = '';
-  for (let i = 0; i < attrsRaw.length; i++) {
-    const ch = attrsRaw[i];
-    if (ch === "'" && !inString) {
-      inString = true;
-      current += ch;
-    } else if (ch === "'" && inString) {
-      if (i + 1 < attrsRaw.length && attrsRaw[i + 1] === "'") {
-        current += "''";
-        i++;
-        continue;
-      }
-      inString = false;
-      current += ch;
-    } else if (inString) {
-      current += ch;
-    } else if (ch === '(') {
-      depth++;
-      current += ch;
-    } else if (ch === ')') {
-      depth--;
-      current += ch;
-    } else if (ch === ',' && depth === 0) {
-      attrs.push(current);
-      current = '';
-    } else {
-      current += ch;
-    }
-  }
-  attrs.push(current);
-  return attrs;
+/**
+ * Split a raw STEP attribute list into its top-level (comma-separated)
+ * value strings, respecting nested parentheses and single-quoted strings.
+ * Empty list → [].
+ *
+ * A thin wrapper over `step-argument-parser.ts`'s validated
+ * `splitTopLevelStepArguments`. This module used to carry its own permissive
+ * scan; keeping the wrapper gives remapping an explicit refusal boundary
+ * without retaining a fourth parser (LTplus-AG/ifc-lite#4125/#4200).
+ *
+ * The validated splitter preserves an empty trailing slot so malformed
+ * fixed-arity records cannot shift positional meaning. It does NOT trim
+ * whitespace around a token, whatever this comment used to say: measured,
+ * `splitTopLevelStepArguments("'a' ,  $  , #3 ")` returns
+ * `["'a' ", "  $  ", " #3 "]`, and no test pinned the trimming half.
+ */
+export function splitTopLevelAttributes(attrsRaw: string): string[] | null {
+  return splitTopLevelStepArguments(attrsRaw);
 }
 
 /**
@@ -72,8 +52,21 @@ export function splitTopLevelAttributes(attrsRaw: string): string[] {
  * freshly minted GlobalId — losing the door/window's own identity, Name
  * and property-set associations even though IFC2X3 has a real (if
  * differently shaped) representation for it.
+ *
+ * `IFCSTRUCTURALCURVEACTION`/`IFCSTRUCTURALSURFACEACTION` are added for the
+ * same reason (#4206): each shares `GlobalId` through `DestabilizingLoad`
+ * with its IFC2X3 `IfcStructuralLinearAction`/`PlanarAction` target, but
+ * IFC2X3 inserts an optional `CausedBy` before `ProjectedOrTrue` where IFC4
+ * instead appends `PredefinedType`, so neither list is a positional prefix
+ * of the other verified case by case (see the entries in `IFC4_TO_IFC2X3`
+ * in `schema-converter.ts`).
  */
-export const BY_NAME_ATTR_REMAP_TYPES = new Set(['IFCDOORTYPE', 'IFCWINDOWTYPE']);
+export const BY_NAME_ATTR_REMAP_TYPES = new Set([
+  'IFCDOORTYPE',
+  'IFCWINDOWTYPE',
+  'IFCSTRUCTURALCURVEACTION',
+  'IFCSTRUCTURALSURFACEACTION',
+]);
 
 /**
  * Reconcile a renamed entity's attribute list by matching attribute NAMES
@@ -87,17 +80,26 @@ export const BY_NAME_ATTR_REMAP_TYPES = new Set(['IFCDOORTYPE', 'IFCWINDOWTYPE']
  * prefix of the other.
  *
  * A target attribute with no same-named source attribute becomes `$`
- * (unknown) rather than a guess; a source attribute with no same-named
- * target slot is dropped. Both are honest data loss for attributes the
- * target schema's OWN shape does not carry under that name — never a
- * misplaced value.
+ * (unknown) rather than a guess; a source attribute with no same-named target
+ * slot is dropped. Both are honest data loss for attributes the target
+ * schema's OWN shape does not carry under that name — never a misplaced value.
+ *
+ * That `$` is not the last word on a slot IFC2X3 requires a value in.
+ * `IfcDoorStyle`/`IfcWindowStyle` declare `OperationType`, `ConstructionType`,
+ * `ParameterTakesPrecedence` and `Sizeable` mandatory, and
+ * `IfcDoorType`/`IfcWindowType` have no `ConstructionType` or `Sizeable` at
+ * all; `Ifc2x3SlotFill` settles all four from the generated required-slot
+ * table straight after this runs — on every conversion to IFC2X3, fill
+ * argument or not — because this output carries exactly the target's
+ * attribute count. Same policy and shape as the Rust `remap_attrs_by_name`.
  */
 export function remapRenamedAttributesByName(
   attrsRaw: string,
   srcNames: readonly string[],
   tgtNames: readonly string[],
-): string {
+): string | null {
   const values = splitTopLevelAttributes(attrsRaw);
+  if (values === null) return null;
   const byName = new Map<string, string>();
   for (let i = 0; i < srcNames.length && i < values.length; i++) {
     byName.set(srcNames[i], values[i]);

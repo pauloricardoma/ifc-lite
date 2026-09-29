@@ -60,8 +60,9 @@ import {
 import { loadBundleFromDirectory } from '@ifc-lite/extensions/node';
 
 // Validate a manifest
+const manifestJson: unknown = await fetch('/my-extension/manifest.json').then((r) => r.json());
 const result = validateManifest(manifestJson);
-if (result.ok) {
+if (result.ok === true) {
   console.log(result.value.id);
 } else {
   for (const err of result.errors) {
@@ -69,6 +70,16 @@ if (result.ok) {
   }
 }
 ```
+
+## Stable diagnostic identifiers
+
+Risk and SDK compatibility results expose machine-readable identifiers alongside
+their English diagnostics. `CapabilityRisk.capabilityId` identifies the
+capability catalogue entry, while `CapabilityRisk.reasonCode` explains why its
+risk tier was selected. `CompatibilityResult.reasonCode` identifies the SDK
+range outcome. Consumers should branch, localize, and aggregate on these codes,
+not on `description` or `reason`, whose English wording is intended for logs and
+non-localized output. The public TypeScript unions define the supported values.
 
 ## Docs
 

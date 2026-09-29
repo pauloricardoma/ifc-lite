@@ -11,12 +11,15 @@
  */
 
 import { useCallback, useEffect, useRef } from 'react';
+import { isTextEntryElement } from '@/lib/keyboard-event';
+import { registerKeyboardCommand, registerKeyboardKeyUp } from '@/lib/commands/dispatcher';
 import type { Drawing2D } from '@ifc-lite/drawing-2d';
 import type {
   Annotation2DTool, Point2D, TextAnnotation2D,
   SelectedAnnotation2D, Measure2DResult, PolygonArea2DResult, CloudAnnotation2D,
 } from '@/store/slices/drawing2DSlice';
-import { computePolygonArea, computePolygonPerimeter, computePolygonCentroid } from '@/components/viewer/tools/computePolygonArea';
+import { computePolygonArea, computePolygonPerimeter } from '@/components/viewer/tools/computePolygonArea';
+import { nearestPointOnSegment, hitTestAnnotations as hitTestAnnotationsPure } from '@/hooks/annotation2DHitTest';
 
 // ─── Public interfaces ──────────────────────────────────────────────────────
 
@@ -216,70 +219,12 @@ export function useAnnotation2D({
   // ── Hit-testing for annotation selection ──────────────────────────────
 
   const hitTestAnnotations = useCallback((screenX: number, screenY: number): SelectedAnnotation2D | null => {
-    const threshold = HIT_TEST_RADIUS_PX;
     const { textAnnotations2D: texts, cloudAnnotations2D: clouds,
       polygonArea2DResults: polys, measure2DResults: measures } = storeRef.current;
-
-    // Text annotations (highest priority — small precise targets)
-    for (const annotation of texts) {
-      if (!annotation.text.trim()) continue;
-      const sp = drawingToScreen(annotation.position);
-      const fontSize = annotation.fontSize;
-      const lines = annotation.text.split('\n');
-      const lineHeight = fontSize * 1.3;
-      const padding = 6;
-      const approxCharWidth = fontSize * 0.6;
-      const maxLineLen = Math.max(...lines.map((l) => l.length));
-      const w = maxLineLen * approxCharWidth + padding * 2;
-      const h = lines.length * lineHeight + padding * 2;
-      if (screenX >= sp.x - 2 && screenX <= sp.x + w + 2 &&
-          screenY >= sp.y - 2 && screenY <= sp.y + h + 2) {
-        return { type: 'text', id: annotation.id };
-      }
-    }
-
-    // Cloud annotations
-    for (const cloud of clouds) {
-      if (cloud.points.length < 2) continue;
-      const sp1 = drawingToScreen(cloud.points[0]);
-      const sp2 = drawingToScreen(cloud.points[1]);
-      const minX = Math.min(sp1.x, sp2.x);
-      const maxX = Math.max(sp1.x, sp2.x);
-      const minY = Math.min(sp1.y, sp2.y);
-      const maxY = Math.max(sp1.y, sp2.y);
-      if (screenX >= minX - threshold && screenX <= maxX + threshold &&
-          screenY >= minY - threshold && screenY <= maxY + threshold) {
-        return { type: 'cloud', id: cloud.id };
-      }
-    }
-
-    // Polygon area results (edge proximity + centroid label)
-    for (const result of polys) {
-      if (result.points.length < 3) continue;
-      for (let i = 0; i < result.points.length; i++) {
-        const a = drawingToScreen(result.points[i]);
-        const b = drawingToScreen(result.points[(i + 1) % result.points.length]);
-        if (nearestPointOnScreenSegment({ x: screenX, y: screenY }, a, b).dist < threshold) {
-          return { type: 'polygon', id: result.id };
-        }
-      }
-      const centroid = computePolygonCentroid(result.points);
-      const sc = drawingToScreen(centroid);
-      if (Math.abs(screenX - sc.x) < 40 && Math.abs(screenY - sc.y) < 20) {
-        return { type: 'polygon', id: result.id };
-      }
-    }
-
-    // Measure results (line proximity)
-    for (const result of measures) {
-      const sa = drawingToScreen(result.start);
-      const sb = drawingToScreen(result.end);
-      if (nearestPointOnScreenSegment({ x: screenX, y: screenY }, sa, sb).dist < threshold) {
-        return { type: 'measure', id: result.id };
-      }
-    }
-
-    return null;
+    return hitTestAnnotationsPure({
+      screenX, screenY, threshold: HIT_TEST_RADIUS_PX, drawingToScreen,
+      texts, clouds, polys, measures,
+    });
   }, [drawingToScreen]); // stable — reads annotation data from storeRef
 
   // ── Get annotation origin (reads latest data from refs) ───────────────
@@ -316,39 +261,27 @@ export function useAnnotation2D({
   // ── Keyboard shortcuts ────────────────────────────────────────────────
 
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Shift') {
-        shiftHeldRef.current = true;
-      }
-      if (e.key === 'Escape') {
-        // 1. Cancel in-progress work
-        if (activeTool === 'polygon-area') cancelPolygonArea2D();
-        else if (activeTool === 'cloud') cancelCloudAnnotation2D();
-        else if (activeTool === 'text') setTextAnnotation2DEditing(null);
-        // 2. Exit any creation tool back to select/pan
-        if (activeTool !== 'none') {
-          setActiveTool('none');
-        }
-        // 3. Deselect
-        if (storeRef.current.selectedAnnotation2D) setSelectedAnnotation2D(null);
-      }
-      if ((e.key === 'Delete' || e.key === 'Backspace') && storeRef.current.selectedAnnotation2D) {
-        const activeEl = document.activeElement;
-        if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA')) return;
-        e.preventDefault();
-        deleteSelectedAnnotation2D();
-      }
-    };
-
-    const handleKeyUp = (e: KeyboardEvent) => {
-      if (e.key === 'Shift') shiftHeldRef.current = false;
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('keyup', handleKeyUp);
+    const removeShift = registerKeyboardCommand('drawing2d.orthogonal', () => {
+      shiftHeldRef.current = true;
+      return false; // Measurement observes the same modifier.
+    }, { ignoreModifiers: true, allowInTextEntry: true });
+    const removeCancel = registerKeyboardCommand('drawing2d.cancel', () => {
+      if (activeTool === 'polygon-area') cancelPolygonArea2D();
+      else if (activeTool === 'cloud') cancelCloudAnnotation2D();
+      else if (activeTool === 'text') setTextAnnotation2DEditing(null);
+      if (activeTool !== 'none') setActiveTool('none');
+      if (storeRef.current.selectedAnnotation2D) setSelectedAnnotation2D(null);
+    }, { active: () => activeTool !== 'none' || Boolean(storeRef.current.selectedAnnotation2D),
+      allowInTextEntry: true, ignoreModifiers: true });
+    const removeDelete = registerKeyboardCommand('drawing2d.delete', () => {
+      if (!storeRef.current.selectedAnnotation2D || isTextEntryElement(document.activeElement)) return false;
+      deleteSelectedAnnotation2D();
+    }, { active: () => Boolean(storeRef.current.selectedAnnotation2D) });
+    const removeKeyUp = registerKeyboardKeyUp((event) => {
+      if (event.key === 'Shift') shiftHeldRef.current = false;
+    });
     return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-      window.removeEventListener('keyup', handleKeyUp);
+      removeShift(); removeCancel(); removeDelete(); removeKeyUp();
     };
   }, [activeTool, setActiveTool, cancelPolygonArea2D, cancelCloudAnnotation2D,
     setTextAnnotation2DEditing, setSelectedAnnotation2D, deleteSelectedAnnotation2D]);
@@ -513,39 +446,6 @@ export function useAnnotation2D({
     handleDoubleClick,
     isDraggingRef,
   };
-}
-
-// ─── Helpers (module-level, zero allocation) ────────────────────────────────
-
-function nearestPointOnSegment(
-  p: Point2D, a: Point2D, b: Point2D
-): { point: Point2D; dist: number } {
-  const dx = b.x - a.x;
-  const dy = b.y - a.y;
-  const lenSq = dx * dx + dy * dy;
-  if (lenSq < 0.0001) {
-    return { point: a, dist: Math.sqrt((p.x - a.x) ** 2 + (p.y - a.y) ** 2) };
-  }
-  const t = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq));
-  const nearest = { x: a.x + t * dx, y: a.y + t * dy };
-  return { point: nearest, dist: Math.sqrt((p.x - nearest.x) ** 2 + (p.y - nearest.y) ** 2) };
-}
-
-function nearestPointOnScreenSegment(
-  p: { x: number; y: number },
-  a: { x: number; y: number },
-  b: { x: number; y: number }
-): { dist: number } {
-  const dx = b.x - a.x;
-  const dy = b.y - a.y;
-  const lenSq = dx * dx + dy * dy;
-  if (lenSq < 0.01) {
-    return { dist: Math.sqrt((p.x - a.x) ** 2 + (p.y - a.y) ** 2) };
-  }
-  const t = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq));
-  const nx = a.x + t * dx;
-  const ny = a.y + t * dy;
-  return { dist: Math.sqrt((p.x - nx) ** 2 + (p.y - ny) ** 2) };
 }
 
 export default useAnnotation2D;

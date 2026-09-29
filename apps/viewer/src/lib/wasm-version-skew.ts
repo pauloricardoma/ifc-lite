@@ -26,6 +26,7 @@ import {
   isWorkerScriptSkewMessage,
   WASM_ASSET_UNAVAILABLE_EVENT,
 } from '@ifc-lite/geometry';
+import { reportStaleDeployment } from './stale-deployment.js';
 
 /** sessionStorage key holding the epoch-ms of the last skew-triggered reload. */
 const RELOAD_TS_KEY = 'ifclite:wasm-skew-reload-ts';
@@ -64,7 +65,7 @@ function markReloaded(now: number): boolean {
     // allow-same-origin / "block all cookies"). If we cannot RECORD a reload
     // we must not PERFORM one: a permanent failure (CSP-blocked worker, proxy
     // rewriting assets) would otherwise reload on every occurrence with no
-    // debounce at all. Mirrors the vite:preloadError policy in main.tsx.
+    // debounce at all. Mirrors the vite:preloadError policy in bootstrap.tsx.
     return false;
   }
 }
@@ -134,11 +135,14 @@ export function installWasmVersionSkewRecovery(): void {
   // letting it bubble to the global handlers below.
   window.addEventListener(WASM_ASSET_UNAVAILABLE_EVENT, (event) => {
     const detail = (event as CustomEvent<{ message?: string; kind?: string }>).detail;
+    // Reload refused (already spent in this window, or storage blocked): the
+    // user reloads instead, prompted by the stale-deployment notice (#5609).
     if (detail?.kind === 'worker-script') {
-      recoverFromWorkerScriptSkew();
+      if (!recoverFromWorkerScriptSkew()) reportStaleDeployment();
       return;
     }
-    recoverFromWasmVersionSkew(detail?.message ?? '');
+    const message = detail?.message ?? '';
+    if (!recoverFromWasmVersionSkew(message) && isWasmAssetUnavailableError(message)) reportStaleDeployment();
   });
 
   // Backstop for any wasm asset error that bubbles unhandled — parser wasm,

@@ -29,8 +29,9 @@ import {
   GripVertical,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useTranslation } from '@/i18n';
 import type { FloatingPanelState, SnapZone } from '@/store';
-import { computeFloatingPanelStyle, type SnapBounds } from './floating-panel-geometry';
+import { computeFloatingPanelStyle, type FloatingArea, type SnapBounds } from './floating-panel-geometry';
 
 export type { SnapBounds };
 
@@ -47,6 +48,8 @@ interface FloatingPanelProps {
   zIndex: number;
   /** The viewport region edge snaps confine to; null until measured. */
   bounds: SnapBounds | null;
+  /** The window size free-floating panels are clamped into; null until measured. */
+  area: FloatingArea | null;
   children: ReactNode;
   onRect: (rect: Partial<Pick<FloatingPanelState, 'x' | 'y' | 'w' | 'h'>>) => void;
   onSnap: (snap: SnapZone) => void;
@@ -61,6 +64,7 @@ export function FloatingPanel({
   title,
   zIndex,
   bounds,
+  area,
   children,
   onRect,
   onSnap,
@@ -68,6 +72,7 @@ export function FloatingPanel({
   onDock,
   onClose,
 }: FloatingPanelProps) {
+  const { t } = useTranslation();
   const ref = useRef<HTMLDivElement>(null);
   // Tear down any in-flight drag / resize listeners if the panel unmounts mid-
   // gesture (closed / docked while dragging) so stale window listeners don't
@@ -91,7 +96,10 @@ export function FloatingPanel({
     const w = rect.width;
     const h = rect.height;
     const maxX = Math.max(0, (el.offsetParent as HTMLElement | null ? (el.offsetParent as HTMLElement).clientWidth : window.innerWidth) - w);
-    const maxY = Math.max(0, (el.offsetParent as HTMLElement | null ? (el.offsetParent as HTMLElement).clientHeight : window.innerHeight) - h);
+    // Never above the toolbar bottom: a header dropped under the z-50 toolbar
+    // could not be grabbed again (#5957).
+    const minY = area?.top ?? 0;
+    const maxY = Math.max(minY, (el.offsetParent as HTMLElement | null ? (el.offsetParent as HTMLElement).clientHeight : window.innerHeight) - h);
     const px = e.clientX;
     const py = e.clientY;
     if (panel.snap !== 'free') onSnap('free');
@@ -99,7 +107,7 @@ export function FloatingPanel({
 
     const move = (ev: MouseEvent) => {
       const x = Math.max(0, Math.min(maxX, startX + ev.clientX - px));
-      const y = Math.max(0, Math.min(maxY, startY + ev.clientY - py));
+      const y = Math.max(minY, Math.min(maxY, startY + ev.clientY - py));
       onRect({ x, y });
     };
     const up = () => {
@@ -177,7 +185,7 @@ export function FloatingPanel({
   return (
     <div
       ref={ref}
-      style={{ ...computeFloatingPanelStyle(panel, bounds), zIndex }}
+      style={{ ...computeFloatingPanelStyle(panel, bounds, area), zIndex }}
       onMouseDown={onFocus}
       className="absolute pointer-events-auto flex flex-col rounded-lg border border-border bg-background shadow-2xl overflow-hidden"
     >
@@ -190,17 +198,17 @@ export function FloatingPanel({
         <span className="text-xs font-medium truncate min-w-0 flex-1">{title}</span>
         <div className="flex items-center gap-0.5 shrink-0">
           {/* Float positioning (overlay); the model stays full size behind it. */}
-          {snapBtn('left', PanelLeft, 'Snap left (overlay)')}
-          {snapBtn('bottom', PanelBottom, 'Snap bottom (overlay)')}
-          {snapBtn('right', PanelRight, 'Snap right (overlay)')}
-          {snapBtn('free', Square, 'Free float')}
+          {snapBtn('left', PanelLeft, t('shellChrome.floatingPanel.snapLeft'))}
+          {snapBtn('bottom', PanelBottom, t('shellChrome.floatingPanel.snapBottom'))}
+          {snapBtn('right', PanelRight, t('shellChrome.floatingPanel.snapRight'))}
+          {snapBtn('free', Square, t('shellChrome.floatingPanel.freeFloat'))}
           <span className="mx-0.5 h-4 w-px bg-border" aria-hidden />
           {/* Dock reserves space (panel + model side by side). */}
           <button
             type="button"
             data-no-drag
-            title="Dock into sidebar (reserves space)"
-            aria-label="Dock into sidebar (reserves space beside the model)"
+            title={t('shellChrome.floatingPanel.dockTitle')}
+            aria-label={t('shellChrome.floatingPanel.dockAriaLabel')}
             onClick={onDock}
             className="h-6 w-6 inline-flex items-center justify-center rounded hover:bg-muted transition-colors"
           >
@@ -209,7 +217,7 @@ export function FloatingPanel({
           <button
             type="button"
             data-no-drag
-            title="Close"
+            title={t('viewerShell.dialog.close')}
             onClick={onClose}
             className="h-6 w-6 inline-flex items-center justify-center rounded hover:bg-muted transition-colors"
           >

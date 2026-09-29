@@ -76,10 +76,13 @@ describe('Scene.getEntityLocalBounds', () => {
     // side), mirroring scene-remove.test.ts's approach for boundingBoxes.
     scene['instancedTemplateCpu'] = [
       {
+        modelIndex: 0,
         positions: new Float32Array(),
         normals: new Float32Array(),
         indices: new Uint32Array(),
         instanceData: new ArrayBuffer(0),
+        canonicalAnchors: new Float64Array(),
+        canonicalMatrixTranslations: new Float32Array(),
         localMin: [0, 0, 0],
         localMax: [2, 2, 2],
       },
@@ -109,12 +112,14 @@ describe('Scene.getEntityLocalBounds', () => {
     const scene = new Scene();
     scene['instancedTemplateCpu'] = [
       {
+        modelIndex: 0,
         positions: new Float32Array(), normals: new Float32Array(), indices: new Uint32Array(),
-        instanceData: new ArrayBuffer(0), localMin: [0, 0, 0], localMax: [1, 1, 1],
+        instanceData: new ArrayBuffer(0), canonicalAnchors: new Float64Array(), canonicalMatrixTranslations: new Float32Array(), localMin: [0, 0, 0], localMax: [1, 1, 1],
       },
       {
+        modelIndex: 0,
         positions: new Float32Array(), normals: new Float32Array(), indices: new Uint32Array(),
-        instanceData: new ArrayBuffer(0), localMin: [-1, 0.5, 0], localMax: [0.5, 2, 1],
+        instanceData: new ArrayBuffer(0), canonicalAnchors: new Float64Array(), canonicalMatrixTranslations: new Float32Array(), localMin: [-1, 0.5, 0], localMax: [0.5, 2, 1],
       },
     ];
     scene['instancedEntityMap'] = new Map([
@@ -184,10 +189,13 @@ describe('Scene.getEntityTransform', () => {
 
     scene['instancedTemplateCpu'] = [
       {
+        modelIndex: 0,
         positions: new Float32Array(),
         normals: new Float32Array(),
         indices: new Uint32Array(),
         instanceData,
+        canonicalAnchors: new Float64Array(),
+        canonicalMatrixTranslations: new Float32Array(),
         localMin: [0, 0, 0],
         localMax: [1, 1, 1],
       },

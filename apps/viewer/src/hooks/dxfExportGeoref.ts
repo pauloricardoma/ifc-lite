@@ -91,7 +91,7 @@ import type { Point2D } from '@ifc-lite/drawing-2d';
 import type { GeometryResult } from '@ifc-lite/geometry';
 import type { MapConversion, ProjectedCRS } from '@ifc-lite/parser';
 import { dxfWorldShift } from './dxfUnderlayMath';
-import { getEffectiveHorizontalScale, resolveMapUnitToMetreScale } from '@/lib/geo/geo-scale';
+import { getEffectiveAxisScales, resolveMapUnitToMetreScale } from '@/lib/geo/geo-scale';
 import { effectiveMapConversionForGeometry } from '@/lib/geo/map-absolute';
 import {
   selectAnchorGeoref,
@@ -167,13 +167,13 @@ export function buildDxfExportTransform(params: DxfExportTransformParams): (p: P
 
   if (!georeference) return toWorld;
 
-  const { mapConversion, mapUnitScale, scale, abscissa, ordinate } = resolveGeorefLinearParams(georeference);
+  const { mapConversion, mapUnitScale, scaleX, scaleY, abscissa, ordinate } = resolveGeorefLinearParams(georeference);
 
   return (p) => {
     const world = toWorld(p);
     return {
-      x: mapConversion.eastings * mapUnitScale + scale * (abscissa * world.x - ordinate * world.y),
-      y: mapConversion.northings * mapUnitScale + scale * (ordinate * world.x + abscissa * world.y),
+      x: mapConversion.eastings * mapUnitScale + abscissa * scaleX * world.x - ordinate * scaleY * world.y,
+      y: mapConversion.northings * mapUnitScale + ordinate * scaleX * world.x + abscissa * scaleY * world.y,
     };
   };
 }
@@ -200,7 +200,8 @@ function finiteOr(value: number, fallback: number): number {
 function resolveGeorefLinearParams(georeference: DxfExportGeoreference): {
   mapConversion: MapConversion;
   mapUnitScale: number;
-  scale: number;
+  scaleX: number;
+  scaleY: number;
   abscissa: number;
   ordinate: number;
 } {
@@ -217,37 +218,28 @@ function resolveGeorefLinearParams(georeference: DxfExportGeoreference): {
     georeference.coordinateInfo,
   );
   // Guard the pathological IfcMapConversion.Scale = 0 (or negative/NaN):
-  // getEffectiveHorizontalScale passes an explicit 0 through, which would
+  // getEffectiveAxisScales passes an explicit 0 through, which would
   // collapse every exported point onto the eastings/northings origin (or,
   // inverted, make every map point resolve to the same world point).
   // Falling back to unscaled (1) keeps the geometry intact, which is
   // strictly less wrong than a single-point result.
-  const rawEffectiveScale = getEffectiveHorizontalScale(mapConversion.scale, mapUnitScale, lengthUnitScale);
-  const scale = Number.isFinite(rawEffectiveScale) && rawEffectiveScale > 0 ? rawEffectiveScale : 1;
+  const { x: rawScaleX, y: rawScaleY } = getEffectiveAxisScales(mapConversion, mapUnitScale, lengthUnitScale);
+  const scaleX = Number.isFinite(rawScaleX) && rawScaleX > 0 ? rawScaleX : 1;
+  const scaleY = Number.isFinite(rawScaleY) && rawScaleY > 0 ? rawScaleY : 1;
   // IfcMapConversion.XAxisAbscissa/XAxisOrdinate form a direction vector, not
   // necessarily unit length — the IFC spec allows an authoring tool to write
   // any non-zero (cos, sin)-proportional pair. Used raw, a non-unit vector
   // scales the whole transform by its magnitude. Normalize like the Rust
-  // source of truth (rust/core/src/georef.rs normalize_axis) for the
-  // general and near-zero cases: a near-zero vector (both components ~0)
-  // falls back to the no-rotation default (1, 0), matching that function's
-  // guard. NOT exact parity for non-finite input, though -- see below.
+  // source of truth (rust/core/src/georef.rs sanitize_transform): a
+  // near-zero or non-finite vector falls back to the no-rotation default
+  // (1, 0), matching that function's guard.
   //
   // PR #1965 review: `axisLen < 1e-9` alone only catches the near-zero
   // MAGNITUDE case — `NaN < 1e-9` and `Infinity < 1e-9` are both `false`, so
   // a non-finite component used to fall through to the divide branch and
-  // manufacture a NaN axis.
-  //
-  // This is a DELIBERATE divergence from `normalize_axis`, not an oversight
-  // left over from the "exactly like Rust" framing above: `normalize_axis`
-  // tests `len > f64::EPSILON` (also false for NaN) but then *skips*
-  // normalization on the degenerate branch, leaving the raw (possibly NaN)
-  // value in place -- `local_to_map` would still consume that NaN as
-  // cos_r/sin_r. The TS side instead substitutes the no-rotation default
-  // BEFORE computing `axisLen`, so a non-finite component here produces a
-  // finite (1, 0) fallback rather than propagating NaN, consistent with
-  // every other guard in this function (Scale, eastings, northings) always
-  // preferring a finite fallback over an exact-parity NaN.
+  // manufacture a NaN axis. Rust had the same hole (it left a NaN axis in
+  // place) until sanitize_transform reset any axis whose length is not
+  // finite and above epsilon; the two now agree on non-finite input too.
   //
   // PR #1965 review, round 2: a MIXED pair (one finite, one not -- e.g.
   // XAxisAbscissa: NaN, XAxisOrdinate: 0.6) needs the SAME fallback as the
@@ -283,7 +275,7 @@ function resolveGeorefLinearParams(georeference: DxfExportGeoreference): {
   const safeMapConversion: MapConversion = (eastings === mapConversion.eastings && northings === mapConversion.northings)
     ? mapConversion
     : { ...mapConversion, eastings, northings };
-  return { mapConversion: safeMapConversion, mapUnitScale, scale, abscissa, ordinate };
+  return { mapConversion: safeMapConversion, mapUnitScale, scaleX, scaleY, abscissa, ordinate };
 }
 
 /**
@@ -308,14 +300,14 @@ export function buildDxfMapToWorldTransform(
 ): (p: Point2D) => Point2D {
   if (!georeference) return (p) => p;
 
-  const { mapConversion, mapUnitScale, scale, abscissa, ordinate } = resolveGeorefLinearParams(georeference);
+  const { mapConversion, mapUnitScale, scaleX, scaleY, abscissa, ordinate } = resolveGeorefLinearParams(georeference);
 
   return (p) => {
     const dE = p.x - mapConversion.eastings * mapUnitScale;
     const dN = p.y - mapConversion.northings * mapUnitScale;
     return {
-      x: (abscissa * dE + ordinate * dN) / scale,
-      y: (-ordinate * dE + abscissa * dN) / scale,
+      x: (abscissa * dE + ordinate * dN) / scaleX,
+      y: (-ordinate * dE + abscissa * dN) / scaleY,
     };
   };
 }

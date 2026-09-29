@@ -106,8 +106,7 @@ const SDK_STRUCTURED_KEYS = new Set<string>([
   '$exception_list', '$exception_values', '$exception_types',
 ]);
 
-// Guard against pathological/cyclic payloads: bounded depth, and a seen-set so
-// a self-referencing object can't spin forever.
+// Bound depth and remember objects so pathological/cyclic payloads terminate.
 const MAX_SCRUB_DEPTH = 5;
 
 const scrubProperties = (
@@ -128,6 +127,7 @@ const scrubProperties = (
       if (typeof v === 'string') props[k] = stripQueryAndHash(v);
       continue;
     }
+    if (k === 'model_count' && typeof v === 'number' && Number.isSafeInteger(v) && v >= 0) continue; // aggregate only
     if (SENSITIVE_KEY.test(k)) {
       delete props[k];
       continue;
@@ -411,7 +411,7 @@ const tagErrorKind = (
   if (typeof event.properties.error_kind === 'string') return;
   const message = exceptionMessage(event.properties);
   if (message === undefined) return;
-  const kind = classifyLoadError(message);
+  const kind = classifyLoadError(message, event.properties.context);
   // Only tag recognised families — never stamp `unknown` onto an unrelated
   // exception (that would mislabel it as a triaged load error).
   if (kind === 'unknown') return;
@@ -553,8 +553,12 @@ const stampFingerprint = (
 // `isThreeContextRefusal` in ./webgl-unavailable.ts) and they inherit this severity
 // with it. If a WebGLRenderer is ever constructed outside that guard again, the
 // throw would arrive here benign; the guard is the thing keeping this honest.
+//
+// `file_unreadable` meets the same bar and joins them, and is safe here ONLY
+// because the ambiguous WebKit wording is context-gated -- the argument, and
+// what breaks without it, are in ./file-not-found-errors.ts.
 const BENIGN_ERROR_KINDS = new Set<string>([
-  'network_unavailable', 'cancelled', 'webgl_unavailable',
+  'network_unavailable', 'cancelled', 'webgl_unavailable', 'file_unreadable',
 ]);
 
 const downgradeBenignExceptions = (

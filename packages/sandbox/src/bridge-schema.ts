@@ -16,10 +16,13 @@
  */
 
 import type { QuickJSContext, QuickJSHandle } from 'quickjs-emscripten';
-import type { BimContext, EntityRef } from '@ifc-lite/sdk';
+import type { BimContext } from '@ifc-lite/sdk';
+import type { Capability } from '@ifc-lite/extensions';
 import type { SandboxPermissions } from './types.js';
+import type { ArgType } from './bridge-unmarshal.js';
 
 import { HostWorkQueue, isThenable } from './bridge-async.js';
+import { unmarshalArgs } from './bridge-unmarshal.js';
 import { creatorRegistry } from './creator-registry.js';
 import { buildModelNamespace } from './bridge-model.js';
 import { buildQueryNamespace } from './bridge-query.js';
@@ -30,20 +33,11 @@ import { buildCreateMethods } from './bridge-create.js';
 import { buildFilesNamespace } from './bridge-files.js';
 import { buildExportNamespace } from './bridge-export.js';
 import { buildScheduleNamespace } from './bridge-schedule.js';
+import { buildStructuralNamespace } from './bridge-structural.js';
 import { buildClashNamespace } from './bridge-clash.js';
-
-// ============================================================================
-// Schema Types
-// ============================================================================
-
-/** How to unmarshal a single argument from QuickJS */
-type ArgType =
-  | 'string'       // vm.getString(handle)
-  | 'number'       // vm.getNumber(handle)
-  | 'dump'         // vm.dump(handle) — generic JSON-like value
-  | 'entityRefs'   // vm.dump(handle) — array of entities, map to .ref
-  | '...strings'   // rest: collect all remaining args as strings
-
+import { buildCostNamespace } from './bridge-cost.js';
+import { buildNetworkNamespace } from './bridge-network.js';
+import type { FetchTransport } from './network-request.js';
 /** How to marshal the return value back to QuickJS */
 type ReturnType =
   | 'void'       // No return value
@@ -118,9 +112,9 @@ export interface NamespaceSchema {
   name: string;
   /** Human-readable description for editor completions */
   doc: string;
+  ambientDeclarations?: string[];
   /** Permission key — if false, this namespace is skipped */
   permission: keyof SandboxPermissions;
-  /** Methods in this namespace */
   methods: MethodSchema[];
 }
 
@@ -195,11 +189,26 @@ export const NAMESPACE_SCHEMAS: NamespaceSchema[] = [
   // ── bim.schedule ───────────────────────────────────────────
   buildScheduleNamespace(),
 
+  // ── bim.structural ─────────────────────────────────────────
+  buildStructuralNamespace(),
+
+  // ── bim.cost ───────────────────────────────────────────────
+  buildCostNamespace(),
+
   // ── bim.clash ──────────────────────────────────────────────
   buildClashNamespace(),
 
   // ── bim.export ─────────────────────────────────────────────
   buildExportNamespace(),
+
+  // ── bim.network ────────────────────────────────────────────
+  // The empty grant list here is a placeholder for typegen/introspection
+  // consumers of this static table (`scripts/generate-bim-globals.mjs`,
+  // `bridge-schema.test.ts`) — it carries no real host allow-list.
+  // `buildSchemaNamespaces` below rebuilds this entry per sandbox with the
+  // graph's ACTUAL `network.fetch:<host>` grants; never used for runtime
+  // permission decisions as-is.
+  buildNetworkNamespace([]),
 ];
 
 // ============================================================================
@@ -209,6 +218,13 @@ export const NAMESPACE_SCHEMAS: NamespaceSchema[] = [
 /**
  * Build all schema-defined namespaces on the `bim` handle.
  * Skips namespaces whose permission is disabled.
+ *
+ * `networkGrants` builds `bim.network`'s schema fresh per sandbox (unlike
+ * every other namespace, which is a static entry in `NAMESPACE_SCHEMAS`):
+ * the allow-list it closes over is the actual `network.fetch:<host>`
+ * grants for the running graph, not something a static table can hold.
+ * Passing none is the same as passing an empty grant list — every host is
+ * refused, which matches the `network` permission defaulting to `false`.
  */
 export function buildSchemaNamespaces(
   vm: QuickJSContext,
@@ -217,8 +233,16 @@ export function buildSchemaNamespaces(
   permissions: Required<SandboxPermissions>,
   context: BridgeCallContext,
   hostWork: HostWorkQueue,
+  networkGrants: readonly Capability[] = [],
+  networkTransport?: FetchTransport,
 ): void {
-  for (const schema of NAMESPACE_SCHEMAS) {
+  // `NAMESPACE_SCHEMAS` carries a placeholder (empty-grant) `network` entry
+  // for typegen; swap in the real, grants-aware one built fresh for this
+  // sandbox — never build both (that would let a script see two `bim.network`
+  // registrations, the second silently winning via `vm.setProp`).
+  const realNetwork = buildNetworkNamespace(networkGrants, networkTransport);
+  const schemas = NAMESPACE_SCHEMAS.map((s) => (s.name === 'network' ? realNetwork : s));
+  for (const schema of schemas) {
     if (!permissions[schema.permission]) continue;
     buildNamespace(vm, bimHandle, sdk, schema, context, hostWork);
   }
@@ -299,47 +323,6 @@ function buildNamespace(
 
 export function disposeSchemaNamespaceSession(context: BridgeCallContext): void {
   creatorRegistry.removeSession(context.sandboxSessionId);
-}
-
-/** Unmarshal QuickJS handles to native JS values based on arg schema */
-function unmarshalArgs(vm: QuickJSContext, handles: QuickJSHandle[], argTypes: ArgType[]): unknown[] {
-  const result: unknown[] = [];
-  for (let i = 0; i < argTypes.length; i++) {
-    switch (argTypes[i]) {
-      case 'string': {
-        const handle = handles[i];
-        result.push(handle ? vm.getString(handle) : undefined);
-        break;
-      }
-      case 'number': {
-        const handle = handles[i];
-        result.push(handle ? vm.getNumber(handle) : undefined);
-        break;
-      }
-      case 'dump': {
-        const handle = handles[i];
-        result.push(handle ? vm.dump(handle) : undefined);
-        break;
-      }
-      case 'entityRefs': {
-        const handle = handles[i];
-        if (!handle) { result.push([]); break; }
-        const raw = vm.dump(handle) as Array<{ ref?: EntityRef } & EntityRef>;
-        result.push(raw.map(r => r.ref ?? r));
-        break;
-      }
-      case '...strings': {
-        // Collect all remaining handles as strings
-        const rest: string[] = [];
-        for (let j = i; j < handles.length; j++) {
-          if (handles[j]) rest.push(vm.getString(handles[j]));
-        }
-        result.push(rest);
-        return result; // No more args after rest
-      }
-    }
-  }
-  return result;
 }
 
 /** Marshal a native JS value back to a QuickJS handle */

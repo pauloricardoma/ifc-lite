@@ -12,15 +12,45 @@
  * a re-export preserves the existing import path for callers that
  * pass through `_modelId` (currently unused but preserved for API
  * stability — the validator already takes a `modelInfo` separately).
+ *
+ * `mutationView`, when passed, layers any pending property edits (e.g. an
+ * IDS correction applied through `MutablePropertyView.setProperty`, #3929)
+ * on top of the store's own data — so a re-run of validation against THIS
+ * accessor actually sees the correction instead of the pre-edit value.
+ * Every other read (attributes, classifications, materials, partOf) is
+ * untouched except entity membership: enumeration and `getEntityType` also
+ * consult `mutationView` directly (it satisfies `EntityVisibilityView`
+ * structurally, so no adapter is needed, unlike the property overlay). A
+ * tombstoned entity is excluded, and an overlay-created or retyped one is
+ * validated under its effective class (#5184).
+ *
+ * The view -> `PropertyOverride[]` projection itself lives in
+ * `@/lib/ids/property-overlay-snapshot`, not here, because the IDS worker
+ * needs the same projection and cannot import a `MutablePropertyView`
+ * (#3946). This accessor and the worker's accessor are handed resolvers
+ * built by the same function from the same snapshot, so they cannot drift.
  */
 
 import type { IFCDataAccessor } from '@ifc-lite/ids';
 import { createDataAccessor as createBridgeAccessor } from '@ifc-lite/ids/bridge';
 import type { IfcDataStore } from '@ifc-lite/parser';
+import type { MutablePropertyView } from '@ifc-lite/mutations';
+
+import {
+  snapshotPropertyOverlay,
+  overlayResolverFromSnapshot,
+} from '@/lib/ids/property-overlay-snapshot';
 
 export function createDataAccessor(
   dataStore: IfcDataStore,
-  _modelId: string
+  _modelId: string,
+  mutationView?: MutablePropertyView | null
 ): IFCDataAccessor {
-  return createBridgeAccessor(dataStore);
+  return createBridgeAccessor(
+    dataStore,
+    mutationView
+      ? overlayResolverFromSnapshot(snapshotPropertyOverlay(mutationView))
+      : undefined,
+    mutationView ?? undefined
+  );
 }

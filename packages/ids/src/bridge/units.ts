@@ -2,7 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-import { extractProjectUnits, type IfcDataStore } from '@ifc-lite/parser';
+import {
+  extractLengthUnitScale,
+  extractProjectUnits,
+  resolveOwningIfcProjectId,
+  type IfcDataStore,
+} from '@ifc-lite/parser';
 
 /**
  * Per IDS spec, IDS literal values for IFC measure types are always in
@@ -61,6 +66,177 @@ export function resolveMeasureScales(store: IfcDataStore): MeasureScales {
   };
 }
 
+/** Per-entity resolved scales: `length` mirrors `store.lengthUnitScale`'s
+ *  meaning (metres-per-raw-unit), `area`/`volume` mirror {@link MeasureScales}. */
+export interface EntityMeasureScales extends MeasureScales {
+  length: number | undefined;
+}
+
+const entityProjectScaleCache = new WeakMap<object, Map<number, EntityMeasureScales>>();
+
+/**
+ * Resolve length/area/volume scales for `expressId`'s OWN `IFCPROJECT`,
+ * not necessarily the file's first one.
+ *
+ * An ordinary IFC file has exactly one `IFCPROJECT` (EXPRESS invariant), so
+ * `store.lengthUnitScale` / {@link resolveMeasureScales} — both resolved
+ * once from the file's first `IFCPROJECT` at parse time — are correct for
+ * every entity and this is a zero-cost fast path back to them.
+ *
+ * A multi-project file (the shape `MergedExporter`'s documented `auto`
+ * unit-reconciliation mode produces for a federated merge of
+ * differently-unit'd models, see issue #1332) can contain a SECOND
+ * `IFCPROJECT` with its own, different declared units. An entity belonging
+ * to that later project was previously scaled by the FIRST project's units
+ * regardless — silently wrong, not absent, and compliance-critical for IDS
+ * (a `Width >= 100mm` requirement evaluates against the wrongly-scaled raw
+ * value). This resolves the entity's OWN owning project via the shared
+ * `resolveOwningIfcProjectId` (`@ifc-lite/parser`'s `owning-project.ts`,
+ * also used by `resolveEntityLengthUnitScale` for #3554's material-layer
+ * fix — one containment walk, not a per-caller copy) and reads THAT
+ * project's units, falling back to the store-wide default when the walk
+ * can't place the entity (matches prior behaviour).
+ */
+export function resolveEntityMeasureScales(
+  store: IfcDataStore,
+  expressId: number
+): EntityMeasureScales {
+  const fallback = (): EntityMeasureScales => ({
+    length: store.lengthUnitScale,
+    ...resolveMeasureScales(store),
+  });
+
+  if (!store.source?.length || !store.entityIndex) return fallback();
+  // @raw-entity-enumeration-ok enumerate source IfcProject ids to choose the parsed model's unit-resolution path; project units and owning-project relationships are source-snapshot inputs, not live candidate membership
+  const projectIds = store.entityIndex.byType.get('IFCPROJECT') ?? [];
+  if (projectIds.length <= 1) return fallback();
+
+  const ownerId = resolveOwningIfcProjectId(store.entityIndex, store.relationships, expressId);
+  if (ownerId === undefined) return fallback();
+
+  let byProject = entityProjectScaleCache.get(store);
+  if (!byProject) {
+    byProject = new Map();
+    entityProjectScaleCache.set(store, byProject);
+  }
+  let scales = byProject.get(ownerId);
+  if (!scales) {
+    const units = extractProjectUnits(store.source, store.entityIndex, ownerId);
+    // `extractLengthUnitScale` answers an unconfirmed 1.0 both for "this
+    // project declares metres" and "this project declares no LENGTHUNIT at
+    // all" - absence reading as success. `UnitsInContext` is OPTIONAL on
+    // `IfcContext`, so a federated model CAN arrive with none, and taking the
+    // 1.0 would silently rescale a millimetre value by 1000x. `ProjectUnits`
+    // tells the two apart, so only a DECLARED length unit overrides the
+    // store-wide scale; an undeclared one keeps the file-wide answer, which is
+    // the same safe-miss direction the walk-failed fallback already takes.
+    const declaresLengthUnit = units.resolvedForUnitType('LENGTHUNIT') !== undefined;
+    if (!declaresLengthUnit) {
+      // The owner's UnitsInContext is missing or declares no LENGTHUNIT at
+      // all, so it has no AREAUNIT/VOLUMEUNIT either (both are read off that
+      // same, absent-or-empty assignment). Falling back to
+      // store.lengthUnitScale for length ALONE while leaving area/volume
+      // undefined would make callers derive area/volume from THIS scale
+      // squared/cubed - the file-wide length scale, not the file-wide
+      // area/volume scale, which IFC does not require to be related by that
+      // exponent (see the module doc above). Take the file-wide answer for
+      // all three together, matching the walk-failed fallback exactly.
+      scales = fallback();
+      byProject.set(ownerId, scales);
+      return scales;
+    }
+    // Deliberately re-derives the scale via extractLengthUnitScale rather
+    // than reading units.resolvedForUnitType('LENGTHUNIT').siScale: for an
+    // IfcConversionBasedUnit the two resolvers can disagree - this one
+    // prefers a name-keyed table (e.g. 'FOOT' -> 0.3048) over a non-standard
+    // declared ConversionFactor, while ProjectUnits always computes the
+    // declared factor (proven, with the disagreeing case, in
+    // length-unit-resolvers-agreement.test.ts).
+    scales = {
+      length: extractLengthUnitScale(store.source, store.entityIndex, ownerId),
+      area: units.resolvedForUnitType('AREAUNIT')?.siScale,
+      volume: units.resolvedForUnitType('VOLUMEUNIT')?.siScale,
+    };
+    byProject.set(ownerId, scales);
+  }
+  return scales;
+}
+
+/**
+ * Which scalable IFC measure dimension `dataType` names, or `undefined`
+ * for anything this module doesn't scale (labels, identifiers, booleans,
+ * an untyped table column). The single classification both
+ * `applyUnitConversion` and the raw/base-SI helpers below key off, so
+ * "which measure types get scaled" can't drift between the base
+ * projection and an overlay correction.
+ */
+function measureKind(dataType: string | undefined): 'length' | 'area' | 'volume' | undefined {
+  const upper = dataType ? dataType.toUpperCase() : '';
+  if (upper === 'IFCLENGTHMEASURE' || upper === 'IFCPOSITIVELENGTHMEASURE') return 'length';
+  if (upper === 'IFCAREAMEASURE') return 'area';
+  if (upper === 'IFCVOLUMEMEASURE') return 'volume';
+  return undefined;
+}
+
+/**
+ * The raw-to-base-SI multiplier for a scalar measure of `dataType`, given
+ * the entity's resolved {@link EntityMeasureScales}. Area scales by the
+ * SQUARE of the length factor and volume by the CUBE (a millimetre-authored
+ * 1 m² is stored as 1e6 mm², not 1e3) — NOT the raw length scale — unless
+ * the file declares an explicit AREAUNIT/VOLUMEUNIT, which takes
+ * precedence (IFC does not require it to relate to LENGTHUNIT by that
+ * exponent; see `resolveMeasureScales` above). `undefined` for a
+ * non-measure `dataType` or when the entity has no resolved length scale.
+ */
+export function measureScaleFor(
+  dataType: string | undefined,
+  scales: EntityMeasureScales
+): number | undefined {
+  const kind = measureKind(dataType);
+  if (!kind) return undefined;
+  if (kind === 'length') return scales.length;
+  if (kind === 'area') {
+    return scales.area ?? (scales.length != null ? scales.length ** 2 : undefined);
+  }
+  return scales.volume ?? (scales.length != null ? scales.length ** 3 : undefined);
+}
+
+/**
+ * Convert a raw-frame scalar value — the frame every stored IFC property,
+ * and every `MutablePropertyView` property mutation, is written in — into
+ * the base-SI frame `applyUnitConversion`/`projectProperty` already put
+ * every OTHER property of the same pset into. Only numeric measure values
+ * move; strings, booleans and non-measure dataTypes pass through
+ * unchanged, and a value that is already `1` scale (e.g. a metre project)
+ * is returned as-is rather than re-boxed.
+ */
+export function toBaseSI(
+  rawValue: string | number | boolean | null,
+  dataType: string | undefined,
+  scales: EntityMeasureScales
+): string | number | boolean | null {
+  if (typeof rawValue !== 'number') return rawValue;
+  const scale = measureScaleFor(dataType, scales);
+  if (!scale || scale === 1) return rawValue;
+  return rawValue * scale;
+}
+
+/**
+ * The inverse of {@link toBaseSI}: convert a base-SI scalar — an IDS
+ * literal, or a user-typed correction meant to satisfy one — into the raw
+ * frame the model actually stores. Only numeric measure values move.
+ */
+export function toRaw(
+  baseSIValue: string | number | boolean | null,
+  dataType: string | undefined,
+  scales: EntityMeasureScales
+): string | number | boolean | null {
+  if (typeof baseSIValue !== 'number') return baseSIValue;
+  const scale = measureScaleFor(dataType, scales);
+  if (!scale || scale === 1) return baseSIValue;
+  return baseSIValue / scale;
+}
+
 export function applyUnitConversion(
   rawValue: string | number | boolean | null,
   rawValues: string[] | undefined,
@@ -68,15 +244,11 @@ export function applyUnitConversion(
   scale: number | undefined,
   measureScales?: MeasureScales
 ): { value: string | number | boolean | null; values: string[] | undefined } {
-  const upper = dataType ? dataType.toUpperCase() : '';
-  const isLength =
-    upper === 'IFCLENGTHMEASURE' || upper === 'IFCPOSITIVELENGTHMEASURE';
-  const isArea = upper === 'IFCAREAMEASURE';
-  const isVolume = upper === 'IFCVOLUMEMEASURE';
+  const kind = measureKind(dataType);
   const isUntypedTable =
     !dataType && Array.isArray(rawValues) && rawValues.length > 0;
 
-  if (!isLength && !isArea && !isVolume && !isUntypedTable) {
+  if (!kind && !isUntypedTable) {
     return { value: rawValue, values: rawValues };
   }
 
@@ -99,16 +271,14 @@ export function applyUnitConversion(
     return { value: rawValue, values: expanded };
   }
 
-  // Area scales by the SQUARE of the length factor and volume by the
-  // CUBE (a millimetre-authored 1 m² is stored as 1e6 mm², not 1e3) —
-  // NOT the raw length scale. Prefer the file's explicitly declared
-  // AREAUNIT/VOLUMEUNIT when present; only derive from the length scale
-  // when the file declares none (see `resolveMeasureScales` above).
-  const effectiveScale = isLength
-    ? scale
-    : isArea
-      ? (measureScales?.area ?? (scale != null ? scale ** 2 : undefined))
-      : (measureScales?.volume ?? (scale != null ? scale ** 3 : undefined));
+  // Dimension handling (length vs. area-squared vs. volume-cubed) lives in
+  // `measureScaleFor` — see its doc for why area/volume don't just reuse
+  // the raw length scale.
+  const effectiveScale = measureScaleFor(dataType, {
+    length: scale,
+    area: measureScales?.area,
+    volume: measureScales?.volume,
+  });
 
   if (!effectiveScale || effectiveScale === 1) {
     return { value: rawValue, values: rawValues };

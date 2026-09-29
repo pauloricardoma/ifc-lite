@@ -21,16 +21,16 @@ pub(super) struct ColumnsDiscovery {
     pub site_position: Option<(u32, usize, usize)>,
     pub prepass_spans: ifc_lite_processing::prepass::PrepassSpans,
     pub mapped_item_spans: Vec<(u32, usize, usize)>,
-    pub rel_defines_by_type_spans: Vec<(u32, usize, usize)>,
     pub type_candidate_spans: Vec<(u32, usize, usize, ifc_lite_core::IfcType)>,
     pub has_layer_set: bool,
 }
 
 /// Parse the raw STEP keyword at a record start (`#id=KEYWORD(...`). Only
 /// called for the few records that need it (geometry jobs + type candidates),
-/// never for the 19M-entity bulk.
+/// never for the 19M-entity bulk. A span outside `content` (columns stitched
+/// against a different buffer) yields `""`, like a record with no keyword.
 fn keyword_at(content: &[u8], start: usize, end: usize) -> &str {
-    let span = &content[start..end.min(content.len())];
+    let span = content.get(start..end.min(content.len())).unwrap_or_default();
     let eq = span.iter().position(|&b| b == b'=').map(|p| p + 1).unwrap_or(0);
     let kw_end = span[eq..]
         .iter()
@@ -38,6 +38,21 @@ fn keyword_at(content: &[u8], start: usize, end: usize) -> &str {
         .map(|p| eq + p)
         .unwrap_or(span.len());
     std::str::from_utf8(&span[eq..kw_end]).unwrap_or("").trim()
+}
+
+/// Is the raw keyword `kw` in the caller's load-time skip set? The set holds
+/// uppercase names, so an uppercase `kw` (every mainstream exporter) is one
+/// hash lookup; only a keyword the file wrote in another case falls to the
+/// folded linear scan. The set is empty in the common case.
+pub(super) fn is_disabled(disabled_types: &rustc_hash::FxHashSet<String>, kw: &str) -> bool {
+    if disabled_types.is_empty() {
+        return false;
+    }
+    if disabled_types.contains(kw) {
+        return true;
+    }
+    kw.bytes().any(|b| b.is_ascii_lowercase())
+        && disabled_types.iter().any(|d| ifc_lite_core::keyword_eq(kw, d))
 }
 
 /// Walk the stitched (file-ordered) class columns and reproduce the serial
@@ -59,18 +74,17 @@ pub(super) fn discover_from_columns(
         site_position: None,
         prepass_spans: p::prepass::PrepassSpans::default(),
         mapped_item_spans: Vec::new(),
-        rel_defines_by_type_spans: Vec::new(),
         type_candidate_spans: Vec::new(),
         has_layer_set: false,
     };
-    for i in 0..ids.len() {
-        let class = classes[i];
+    // Zipped, so a short column ends the walk rather than trapping the worker.
+    for (((&id, &start), &length), &class) in ids.iter().zip(starts).zip(lengths).zip(classes) {
         if class == p::PREPASS_CLASS_NONE {
             continue;
         }
-        let id = ids[i];
-        let start = starts[i] as usize;
-        let end = start + lengths[i] as usize;
+        let start = start as usize;
+        // Saturating: `+` wraps on wasm32 release builds (no overflow checks).
+        let end = start.saturating_add(length as usize);
         match class & p::PREPASS_CLASS_CODE_MASK {
             c if c == p::PREPASS_CLASS_PROJECT => {
                 if d.project_id.is_none() {
@@ -123,10 +137,10 @@ pub(super) fn discover_from_columns(
                 continue;
             }
             c if c == p::PREPASS_CLASS_REL_DEFINES_BY_TYPE => {
-                d.rel_defines_by_type_spans.push((id, start, end));
-                // Also feed the shared resolver's material type-fallback
-                // (an occurrence with no material of its own inherits its
-                // type's IfcRelAssociatesMaterial).
+                // Feeds both the instantiated-type-id build and the shared
+                // resolver's material type-fallback (an occurrence with no
+                // material of its own inherits its type's
+                // IfcRelAssociatesMaterial).
                 d.prepass_spans.defines_by_type.push((id, start, end));
                 continue;
             }
@@ -143,16 +157,14 @@ pub(super) fn discover_from_columns(
         }
         if class & p::PREPASS_CLASS_FLAG_GEOMETRY_JOB != 0 {
             let kw = keyword_at(content, start, end);
-            if disabled_types.is_empty() || !disabled_types.contains(kw) {
-                // Legacy-aware, for the same reason the type-candidate branch
-                // above is: `classify_type_name` sets this flag through the
-                // legacy-aware `has_geometry_by_name`, so a bare `from_str`
-                // here labels a job the gate admitted with `Unknown(crc32)` —
-                // the label disagreeing with the gate that let it in. `Unknown`
-                // carries a hash of the keyword rather than the keyword, so
-                // nothing downstream can recover it (#3179).
+            if !is_disabled(disabled_types, kw) {
+                // Schema-resolved, for the same reason as the type-candidate
+                // branch: `classify_type_name` and this label must both use the
+                // generated schema universe. Exact variants are retained, while
+                // the bounded exporter aliases remain owned unknown keywords
+                // (#3179, #4203).
                 d.buffered_jobs
-                    .push((id, start, end, ifc_lite_core::legacy_aware_ifc_type(kw)));
+                    .push((id, start, end, ifc_lite_core::ifc_type_from_keyword(kw)));
                 d.total_jobs += 1;
             }
         }

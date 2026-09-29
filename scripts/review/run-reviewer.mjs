@@ -53,6 +53,8 @@
  *                    CLAUDE_CODE_OAUTH_TOKEN with `claude setup-token`.
  *   MODEL_ERROR      Any other non-zero exit or `is_error`. REMEDY: read the
  *                    captured stderr, which is printed verbatim.
+ *   CLI_SILENT_EXIT  Non-zero with no diagnostic stderr. The live session-limit
+ *                    shape may still leave an opaque JSON envelope on stdout.
  *   EMPTY_RESPONSE   The CLI succeeded and produced nothing. Treated as failure
  *                    rather than as an empty review.
  *   BAD_ENVELOPE     The CLI's own JSON wrapper did not parse.
@@ -73,13 +75,16 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { isMainEntry } from '../lib/is-main-entry.mjs';
+import { renderSiblingRow } from './sibling-row.mjs';
+import { buildRetrySection } from './retry-prompt.mjs';
+import { resolveProviderFallbacks, describeProviderFallbacks } from './provider-fallbacks.mjs';
+import { applicableClassesFromRaw, renderApplicableForPrompt } from './lib/class-applicability.mjs';
+import { RunReviewerError } from './lib/run-reviewer-error.mjs';
+import { checkToken, resolveTokens } from './lib/credentials.mjs';
+import { maybeRunEnsemble } from './ensemble-reviewer.mjs';
+import { redactSecrets } from './lib/redact-secrets.mjs';
 
-export class RunReviewerError extends Error {
-  constructor(reason, message) {
-    super(message);
-    this.reason = reason;
-  }
-}
+export { RunReviewerError, checkToken, resolveTokens };
 
 /**
  * A DENY-LIST, and it cannot promise completeness -- an earlier comment here
@@ -141,10 +146,61 @@ export function promptSafePath(path) {
   return JSON.stringify(String(path)).replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
 }
 
+/**
+ * THE THREE PER-ROW RENDERINGS AND THE THREE PER-ROW CHARGES, together because
+ * they are the same fact twice: `promptEnvelopeBytes` (build-context-pack) and
+ * `fitFilesToPrompt` (build-review-input) budget a row by measuring the exact
+ * string `buildPrompt` will emit for it, so neither can drift from the prompt.
+ * A hand-written constant modelling these did drift -- it charged a kept file's
+ * path ONCE while `fileHeader` plus `rosterRow` spend it TWICE, and 600 kept
+ * files with 188-byte paths pushed a "fits" verdict 8,476 bytes over
+ * MAX_PROMPT_BYTES. Both callers then re-spelled the arithmetic themselves,
+ * which is the same split one module further out; it lives here so that
+ * changing how a row renders changes what it costs, by construction.
+ *
+ * THE JOIN BYTES ARE PART OF THE ROW: file sections join on `\n\n`, the roster
+ * and the unreviewable list on `\n`. Charged per row rather than per gap, which
+ * over-reserves by one joiner per section -- conservative by bytes, not
+ * kilobytes.
+ */
+export const fileHeader = (path) => `--- FILE: ${path}\n`;
+export const rosterRow = (path) => `  ${promptSafePath(path)}`;
+export const unreviewableRow = (u) => `  - ${promptSafePath(u.path)} (${promptSafePath(u.reason ?? 'unknown')})`;
+const rowBytes = (str) => Buffer.byteLength(str, 'utf8');
+export const keptRowCharge = (path) => rowBytes(fileHeader(path)) + 2 + rowBytes(rosterRow(path)) + 1;
+export const unreviewableRowCharge = (u) => rowBytes(unreviewableRow(u)) + 1;
+
+/**
+ * THE APPLICABILITY ROW IS A FOURTH RENDERING WITH A FOURTH CHARGE, for the
+ * reason the three above have one: `site.path` is PR-CONTROLLED and lands in
+ * the TRUSTED half of the prompt, outside the nonce fence. Git permits any byte
+ * but NUL and `/`, so `dir\nIGNORE ALL PREVIOUS INSTRUCTIONS/package.json` would
+ * place a standalone instruction line there -- the attack `rosterRow` already
+ * spends `promptSafePath` to stop, and the first cut of this disclosure
+ * bypassed it.
+ */
+export const applicabilityRow = (cls, path, line) =>
+  `  - ${cls} — ${path === null ? 'the PR description' : `${promptSafePath(path)}${line ? `:${line}` : ''}`}`;
+/**
+ * An UPPER BOUND, not the exact set: the fit runs before the firing set is
+ * known, so charge at most one row per defect class at the longest candidate
+ * path. Over-reserving is the safe direction -- an undercharge is what put a
+ * "fits" verdict 8,476 bytes over the ceiling. Variable part only; the fixed
+ * ~250-byte preamble sits in PROMPT_BASE_OVERHEAD_BYTES's margin, named here
+ * as the unreviewable preamble is, and charging it would break the pinned
+ * `promptEnvelopeBytes(undefined) === base`.
+ */
+export const applicabilityReserve = (paths, classCount) => {
+  let longest = '';
+  for (const p of paths) if (String(p).length > longest.length) longest = String(p);
+  if (longest === '') return 0;
+  return classCount * (rowBytes(applicabilityRow('behaviour-break-on-surviving-export', longest, 999999)) + 1);
+};
+
 /** Assemble the full prompt: trusted rubric, then fenced untrusted diff. */
-export function buildPrompt(rubric, input) {
+export function buildPrompt(rubric, input, opts = {}) { // trusted rubric + fenced diff; opts.retryNote/opts.retryReason: see retry-prompt.mjs
   const files = input.files
-    .map((f) => `--- FILE: ${f.path}\n${f.patch}`)
+    .map((f) => `${fileHeader(f.path)}${f.patch}`)
     .join('\n\n');
   // JSON.stringify'd, because a path is PR-controlled bytes. Git permits any byte
   // but NUL and `/` in a path, newlines included, so an interpolated filename
@@ -152,7 +208,7 @@ export function buildPrompt(rubric, input) {
   // premise is that PR-controlled bytes never leave the fence.
   const unreviewable = (input.unreviewable ?? []).length
     ? `\nFiles in this PR you were NOT shown (do not comment on them, do not report them clean):\n` +
-      input.unreviewable.map((u) => `  - ${promptSafePath(u.path)} (${promptSafePath(u.reason ?? 'unknown')})`).join('\n')
+      input.unreviewable.map(unreviewableRow).join('\n')
     : '';
 
   // THE CANONICAL `files_reviewed` LIST, handed over verbatim. Asking the model
@@ -166,12 +222,12 @@ export function buildPrompt(rubric, input) {
   // as the unreviewable list: a path is PR-controlled bytes in the trusted
   // region.
   const roster =
+    `\n${renderApplicableForPrompt(applicableClassesFromRaw(input))}\n` +
     `\nYour \`files_reviewed\` array must contain EXACTLY these ${input.files.length} path(s), ` +
     'verbatim -- nothing added, nothing dropped:\n' +
-    input.files.map((f) => `  ${promptSafePath(f.path)}`).join('\n');
+    input.files.map((f) => rosterRow(f.path)).join('\n');
 
   // THE CONTEXT PACK, fenced with the diff because it is the same trust class.
-  //
   // Base-tree excerpts are merged, reviewed text and lower risk than the head,
   // but they are fenced identically: the fence costs nothing and a carve-out is
   // a thing to get wrong later. Nothing here was fetched by the model -- the
@@ -190,7 +246,7 @@ export function buildPrompt(rubric, input) {
       '',
       fenceUntrusted(
         pack.siblings
-          .map((s2) => `--- SIBLING: ${s2.path}:${s2.line} (key ${JSON.stringify(s2.key)})\n${s2.text}`)
+          .map((s2) => renderSiblingRow(s2))
           .join('\n\n'),
       ),
     );
@@ -234,7 +290,7 @@ export function buildPrompt(rubric, input) {
     fenceUntrusted(files),
     unreviewable,
     roster,
-    ...sections,
+    ...sections, ...buildRetrySection(opts.retryNote, fenceUntrusted, opts.retryReason), // #3652/#3777 retry, sibling-extracted
     '',
     'Emit the JSON described above and nothing else.',
   ].join('\n');
@@ -246,51 +302,7 @@ export function buildPrompt(rubric, input) {
  *   Injected so every branch is reachable in tests without a model, a token, or
  *   a network. The shipped caller passes a real spawnSync wrapper.
  */
-/**
- * Check the credential's SHAPE without ever printing it, and hand back a trimmed
- * copy.
- *
- * A repository secret cannot be read back through the API, by design, so a
- * malformed one is invisible until it fails at run time -- and the most common
- * way to malform it is invisible in a terminal too: `echo token | gh secret set`
- * stores a TRAILING NEWLINE. That produces an auth rejection whose message says
- * nothing about whitespace, which is a long debugging session for a one-character
- * problem.
- *
- * So: trim first, so the whole whitespace class simply cannot bite, and then
- * report the shape so a genuinely wrong value says so on the first run instead of
- * looking like a quota problem. Nothing here logs the value, and the reported
- * length is a property of the credential, not the credential.
- *
- * @returns {{ token: string, note: string }}
- */
-export function checkToken(raw) {
-  if (raw === undefined || raw === null || String(raw) === '') {
-    throw new RunReviewerError(
-      'AUTH_MISSING',
-      'CLAUDE_CODE_OAUTH_TOKEN is unset or empty. REMEDY: `claude setup-token`, then ' +
-        '`gh secret set CLAUDE_CODE_OAUTH_TOKEN`. The lane cannot run without it, and it fails ' +
-        'here rather than posting a clean verdict it never earned.',
-    );
-  }
-  const token = String(raw).trim();
-  if (token === '') {
-    throw new RunReviewerError('AUTH_MALFORMED', 'CLAUDE_CODE_OAUTH_TOKEN is only whitespace.');
-  }
-  if (/\s/.test(token)) {
-    throw new RunReviewerError(
-      'AUTH_MALFORMED',
-      `CLAUDE_CODE_OAUTH_TOKEN contains whitespace INSIDE it (length ${token.length}). A trailing ` +
-        'newline is trimmed automatically; whitespace in the middle means the value was pasted ' +
-        'wrapped or truncated. REMEDY: re-set it with `printf %s "$TOKEN" | gh secret set ...`.',
-    );
-  }
-  const wrapped = String(raw) !== token;
-  return {
-    token,
-    note: `credential present, ${token.length} chars${wrapped ? ' (surrounding whitespace trimmed)' : ''}`,
-  };
-}
+/** `checkToken`/`resolveTokens` moved to ./lib/credentials.mjs (module-size budget); re-exported above. */
 
 /**
  * How this lane actually invokes the CLI. It lived as an anonymous lambda inside
@@ -333,10 +345,30 @@ export function runReviewer({ prompt, model, spawn = realSpawn, token = null }) 
   }
   const stderr = String(r.stderr ?? '');
   if (r.status !== 0) {
-    const reason = classify(`${stderr}\n${r.stdout ?? ''}`);
+    const output = `${stderr}\n${r.stdout ?? ''}`;
+    const classified = classify(output);
+    // Run 33802488121 measured the second early-exit shape: exit 1 and empty
+    // stderr, but an opaque stdout envelope that contains no recognised
+    // diagnostic. It is still an exit before a usable review, and treating the
+    // envelope's mere bytes as MODEL_ERROR prevents the independent provider
+    // from taking over. Preserve specific auth/quota text wherever the CLI
+    // writes it; only the otherwise-unclassified, stderr-empty shape is silent.
+    const reason = classified !== 'MODEL_ERROR'
+      ? classified
+      : stderr.trim() === ''
+        ? 'CLI_SILENT_EXIT'
+        : 'MODEL_ERROR';
+    // CLI_SILENT_EXIT carries the CLI's own stdout excerpt on top of the
+    // remedy: with stderr empty there is otherwise nothing to diagnose from,
+    // and run 33802488121's opaque envelope is exactly the shape this is for.
+    // Capped at 1500 chars, read from `r.stdout` alone, and `redactSecrets`-ed
+    // as a backstop should a future CLI version echo its own env into stdout.
+    const rawStdout = redactSecrets(String(r.stdout ?? '').slice(0, 1500).trim());
+    const stdoutNote = reason === 'CLI_SILENT_EXIT' ? `\n--- stdout ---\n${rawStdout || '(empty)'}` : '';
     throw new RunReviewerError(
       reason,
-      `The reviewer CLI exited ${r.status}. ${remedyFor(reason)}\n--- stderr ---\n${stderr.trim() || '(empty)'}`,
+      `The reviewer CLI exited ${r.status}. ${remedyFor(reason)}\n--- stderr ---\n${stderr.trim() || '(empty)'}${stdoutNote}`,
+      { stdoutExcerpt: reason === 'CLI_SILENT_EXIT' ? rawStdout : null },
     );
   }
 
@@ -380,43 +412,35 @@ function remedyFor(reason) {
   if (reason === 'AUTH_FAILED') {
     return 'AUTH_FAILED. REMEDY: refresh the token with `claude setup-token` and update the CLAUDE_CODE_OAUTH_TOKEN secret.';
   }
+  if (reason === 'CLI_SILENT_EXIT') {
+    return 'CLI_SILENT_EXIT: the CLI exited before producing a usable review. REMEDY: use an independent provider or inspect the captured process output.';
+  }
   return 'MODEL_ERROR. REMEDY: read the captured stderr below.';
 }
 
 /**
- * Run the reviewer, falling back to a SECOND credential when the first is the
- * thing that failed.
+ * Retry only credential-specific failures: first across independent Claude
+ * accounts, then across providers. Request/model/output failures stay failed.
  *
- * WHY THIS EXISTS. The lane rests on one manually-refreshed subscription token.
- * It expired once already, and the day it did the lane was dark while every
- * per-PR check looked like an ordinary transient red. CodeRabbit covers about a
- * third of this repository's volume, so a single dead credential means most PRs
- * get no review at all.
- *
- * ONLY TWO REASONS RETRY, and the list is deliberately short:
- *
- *   AUTH_FAILED    - this credential is dead. A different one may not be.
- *   QUOTA_DRAINED  - this POOL is empty. A different account has its own pool.
- *
- * Everything else -- MODEL_ERROR, EMPTY_RESPONSE, BAD_ENVELOPE -- is a property
- * of the request or the model, not of the credential, and retrying it on a
- * second account would burn a second pool to get the same answer. Worse, it
- * would turn a deterministic failure into an intermittent one, which is harder
- * to diagnose than the failure itself.
- *
- * THE FALLBACK IS OPTIONAL. With no second token configured this behaves exactly
- * as before, and says so, because a silent single-credential setup that looks
- * like a redundant one is the failure this whole function is about.
- *
- * @param {{ prompt: string, model: string, tokens: {token: string, label: string}[], spawn: Function }} o
+ * `providerFallback` accepts EITHER shape, for backward compatibility with
+ * every existing caller and test that passes a single function:
+ *   - a plain `(prompt) => text` function, treated as one provider labelled
+ *     `'openai-fallback'` (the label existing tests and logs already assert);
+ *   - an array of `{ label, run }`, tried IN ORDER. The first to succeed wins;
+ *     if every one throws, the final error names all of their messages so a
+ *     misconfigured second provider is never hidden behind a first failure.
  */
-export function runReviewerWithFailover({ prompt, model, tokens, spawn }) {
-  if (!Array.isArray(tokens) || tokens.length === 0) {
-    throw new RunReviewerError('AUTH_MISSING', 'No usable credential was resolved.');
-  }
-  const RETRYABLE = new Set(['AUTH_FAILED', 'QUOTA_DRAINED']);
-  let last;
-  for (const [i, t] of tokens.entries()) {
+export function runReviewerWithFailover({ prompt, model, tokens, spawn, providerFallback = null }) {
+  const hasTokens = Array.isArray(tokens) && tokens.length > 0;
+  const noCredential = new RunReviewerError('AUTH_MISSING', 'No usable credential was resolved.');
+  // A CLAUDE-FREE, PROVIDER-ONLY RUN IS VALID: only "nothing at all configured"
+  // is immediate. `last` starts as this same error so a token-less run falls
+  // straight through to `providerFallback` below with a truthful `last.reason`,
+  // instead of the old unconditional throw that made the chain unreachable.
+  if (!hasTokens && !providerFallback) throw noCredential;
+  const RETRYABLE = new Set(['AUTH_FAILED', 'QUOTA_DRAINED', 'CLI_SILENT_EXIT']);
+  let last = noCredential;
+  for (const [i, t] of hasTokens ? tokens.entries() : []) {
     try {
       const r = runReviewer({ prompt, model, token: t.token, spawn });
       if (i > 0) console.log(`auth: succeeded on ${t.label} after ${tokens[0].label} failed.`);
@@ -424,49 +448,52 @@ export function runReviewerWithFailover({ prompt, model, tokens, spawn }) {
     } catch (err) {
       last = err;
       const more = i + 1 < tokens.length;
-      if (!(err instanceof RunReviewerError) || !RETRYABLE.has(err.reason) || !more) throw err;
+      if (!(err instanceof RunReviewerError) || !RETRYABLE.has(err.reason)) throw err;
+      // PRINTED HERE, before the next slot is tried: `last` is never re-thrown
+      // (and never logged) once a later credential or provider succeeds, so
+      // this diagnosis would otherwise vanish the moment the fallback answers.
+      if (err.reason === 'CLI_SILENT_EXIT' && err.stdoutExcerpt !== null) {
+        console.log(`auth: ${t.label} CLI_SILENT_EXIT stdout (first 800 chars): ${err.stdoutExcerpt.slice(0, 800) || '(empty)'}`);
+      }
+      if (!more) break;
       console.log(`auth: ${t.label} failed with ${err.reason}; trying ${tokens[i + 1].label}.`);
+    }
+  }
+  if (providerFallback) {
+    const providers = Array.isArray(providerFallback)
+      ? providerFallback
+      : [{ label: 'openai-fallback', run: providerFallback }];
+    const failures = [];
+    for (const provider of providers) {
+      console.log(`auth: Claude failed with ${last.reason}; trying ${provider.label}.`);
+      try {
+        // A provider may answer with a bare string (openai-fallback, one
+        // fixed model) or `{ text, model }` when it tried more than one model
+        // (openrouter-fallback) -- the envelope names which model actually
+        // answered only when the provider reports one.
+        const outcome = provider.run(prompt);
+        const text = typeof outcome === 'string' ? outcome : outcome.text;
+        const model = typeof outcome === 'string' ? undefined : outcome.model;
+        console.log(`auth: ${provider.label} succeeded${model ? ` (model=${model})` : ''}.`);
+        return { text, envelope: { provider: provider.label, ...(model ? { model } : {}) } };
+      } catch (error) {
+        console.log(`auth: ${provider.label} failed: ${error.message}`);
+        failures.push(`${provider.label}: ${error.message}`);
+      }
+    }
+    if (failures.length > 0) {
+      throw new RunReviewerError(
+        'FALLBACK_ERROR',
+        `Claude failed with ${last.reason}, and every independent provider failed:\n${failures.join('\n')}`,
+      );
     }
   }
   throw last;
 }
 
-/**
- * Every credential this run may use, in order, with a LABEL that is safe to
- * print. The value is never logged -- only which slot it came from -- because a
- * secret in a log is a leaked secret and this repository is public.
- */
-export function resolveTokens(env) {
-  const out = [];
-  const seen = new Set();
-  for (const [name, label] of [
-    ['CLAUDE_CODE_OAUTH_TOKEN', 'the primary credential'],
-    ['CLAUDE_CODE_OAUTH_TOKEN_2', 'the fallback credential'],
-  ]) {
-    const raw = env[name];
-    if (raw === undefined || String(raw).trim() === '') continue;
-    const { token, note } = checkToken(raw);
-    // THE SAME SECRET IN BOTH SLOTS IS NOT REDUNDANCY, and it is an easy mistake
-    // to make while wiring the second one up. Refused rather than retried,
-    // because a fallback that shares the primary's pool fails at exactly the
-    // moment it is needed while looking like insurance.
-    if (seen.has(token)) {
-      throw new RunReviewerError(
-        'DUPLICATE_CREDENTIAL',
-        `\`${name}\` holds the same value as an earlier slot. Two copies of one credential share ` +
-          'one quota pool and one expiry, so this is not a fallback. REMEDY: set a token from a ' +
-          'different account, or unset it.',
-      );
-    }
-    seen.add(token);
-    out.push({ token, label, note, name });
-  }
-  return out;
-}
-
-function main() {
-  const args = { rubric: null, input: null, out: null, model: 'sonnet' };
-  const FLAGS = new Map([['--rubric', 'rubric'], ['--input', 'input'], ['--out', 'out'], ['--model', 'model']]);
+async function main() {
+  const args = { rubric: null, input: null, out: null, model: 'sonnet', retryNote: null, retryReason: null };
+  const FLAGS = new Map([['--rubric', 'rubric'], ['--input', 'input'], ['--out', 'out'], ['--model', 'model'], ['--retry-note', 'retryNote'], ['--retry-reason', 'retryReason']]); // optional: retry-prompt.mjs
   const argv = process.argv.slice(2);
   for (let i = 0; i < argv.length; i += 1) {
     const key = FLAGS.get(argv[i]);
@@ -481,26 +508,32 @@ function main() {
 
   const rubric = readFileSync(args.rubric, 'utf8');
   const input = JSON.parse(readFileSync(args.input, 'utf8'));
-  const prompt = buildPrompt(rubric, input);
+  const prompt = buildPrompt(rubric, input, { retryNote: args.retryNote ? readFileSync(args.retryNote, 'utf8') : null, retryReason: args.retryReason ?? 'PROOF_OF_WORK_FAILED' }); // default: #3652 wording for an older caller with no --retry-reason
+
+  // THE PARALLEL CHEAP ENSEMBLE RUNS FIRST, before the Claude CLI -- see
+  // ensemble-reviewer.mjs, which owns the design and this feature's module-size
+  // budget. Unset/empty `REVIEW_ENSEMBLE_MODELS` is the unchanged path: `false`
+  // means every line below behaves exactly as it did before this existed.
+  if (await maybeRunEnsemble({ env: process.env, input, prompt, outPath: args.out })) return;
 
   const tokens = resolveTokens(process.env);
-  if (tokens.length === 0) {
-    // Unchanged message: `checkToken` owns this diagnosis, and it is the one a
-    // reader has already seen in the logs.
-    checkToken(process.env.CLAUDE_CODE_OAUTH_TOKEN);
-  }
-  console.log(
-    `auth: ${tokens[0].note}` +
-      (tokens.length > 1
-        ? `, plus ${tokens.length - 1} fallback credential(s)`
-        : ', NO fallback configured (set CLAUDE_CODE_OAUTH_TOKEN_2 from a second account)'),
-  );
+  const providers = resolveProviderFallbacks(process.env);
+  // Only reached with NEITHER a Claude credential NOR a provider configured --
+  // a provider-only run must reach the failover below instead of failing here.
+  if (tokens.length === 0 && providers.length === 0) checkToken(process.env.CLAUDE_CODE_OAUTH_TOKEN);
+  console.log(tokens.length === 0
+    ? 'auth: no Claude credential configured; relying on the provider chain.'
+    : `auth: ${tokens[0].note}` + (tokens.length > 1
+      ? `, plus ${tokens.length - 1} fallback credential(s)`
+      : ', NO fallback configured (set CLAUDE_CODE_OAUTH_TOKEN_2 from a second account)'));
+  console.log(describeProviderFallbacks(providers));
 
   const { text, envelope } = runReviewerWithFailover({
     prompt,
     model: args.model,
     tokens,
     spawn: realSpawn,
+    providerFallback: providers.length > 0 ? providers : null,
   });
 
   writeFileSync(args.out, text);
@@ -512,7 +545,7 @@ function main() {
 
 if (isMainEntry(import.meta.url)) {
   try {
-    main();
+    await main();
   } catch (err) {
     if (err instanceof RunReviewerError) {
       console.error(`❌ ${err.reason}: ${err.message}`);

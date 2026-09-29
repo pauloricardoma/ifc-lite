@@ -21,8 +21,10 @@
 //! filter (`gpu_meshes.rs:307`, `MAX_REASONABLE_OFFSET = 50 km`) plus
 //! the JS-side bound check, expressed in pure Rust.
 
-use ifc_lite_core::{has_geometry_by_name, EntityDecoder, EntityScanner};
+use ifc_lite_core::{has_geometry_by_name, EntityDecoder, EntityScanner, RtcVerdict};
 use ifc_lite_geometry::GeometryRouter;
+
+mod support;
 
 const FIXTURE: &str = "../../tests/models/issues/859_linear_placement_of_signal.ifc";
 
@@ -37,9 +39,21 @@ const MAX_REASONABLE_OFFSET: f32 = 50_000.0;
 
 fn read_fixture() -> Option<String> {
     match std::fs::read_to_string(FIXTURE) {
-        Ok(s) if s.starts_with("version https://git-lfs.github.com/spec/") => None,
+        Ok(s) if s.starts_with("version https://git-lfs.github.com/spec/") => {
+            assert!(
+                !support::require_fixtures(),
+                "fixture is an LFS pointer and IFC_LITE_REQUIRE_FIXTURES=1 -- \
+                 run `pnpm fixtures` to download real bytes"
+            );
+            None
+        }
         Ok(s) => Some(s),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            assert!(
+                !support::require_fixtures(),
+                "fixture missing and IFC_LITE_REQUIRE_FIXTURES=1 -- \
+                 run `pnpm fixtures` to download (sha256 in tests/models/manifest.json)"
+            );
             eprintln!("issue-859 fixture missing — skipping (run `pnpm fixtures`)");
             None
         }
@@ -58,12 +72,14 @@ fn railway_meshes_land_within_renderer_valid_coord_band() {
     let mut router = GeometryRouter::with_units(&content, &mut decoder);
 
     // 2. Detect RTC offset from first geometry-bearing elements.
-    let rtc_offset = router.detect_rtc_offset_from_first_element(&content, &mut decoder);
-    let needs_shift = rtc_offset.0.abs() > 10_000.0
-        || rtc_offset.1.abs() > 10_000.0
-        || rtc_offset.2.abs() > 10_000.0;
+    // `detect_rtc_offset_for_file` is the live whole-file detector, and its
+    // verdict IS the needs-shift decision - the pipelines do not re-derive one
+    // from the offset's magnitude, and neither does this test (#4611).
+    let verdict = router.detect_rtc_offset_for_file(content.as_bytes(), &mut decoder);
+    let needs_shift = matches!(verdict, Some(RtcVerdict::Large { .. }));
+    let rtc_offset = verdict.map_or((0.0, 0.0, 0.0), RtcVerdict::offset);
     eprintln!(
-        "detect_rtc_offset_from_first_element → ({:.2}, {:.2}, {:.2}); needs_shift={needs_shift}",
+        "detect_rtc_offset_for_file → ({:.2}, {:.2}, {:.2}); needs_shift={needs_shift}",
         rtc_offset.0, rtc_offset.1, rtc_offset.2,
     );
 

@@ -30,7 +30,7 @@
 //! on: at the meta cut the partial index MISSES the offset *even though the
 //! IfcSite entity is present*, while the full index recovers it.
 
-use ifc_lite_core::{build_entity_index, EntityDecoder, EntityScanner, IfcType};
+use ifc_lite_core::{build_entity_index, EntityDecoder};
 use ifc_lite_geometry::GeometryRouter;
 
 /// A minimal, self-contained IFC where the IfcSite entity precedes the
@@ -69,21 +69,9 @@ ENDSEC;
 END-ISO-10303-21;
 ";
 
-fn wall_jobs(content: &str) -> Vec<(u32, usize, usize, IfcType)> {
-    let mut jobs = Vec::new();
-    let mut sc = EntityScanner::new(content);
-    while let Some((id, ty, s, e)) = sc.next_entity() {
-        if ty == "IFCWALL" {
-            jobs.push((id, s, e, IfcType::IfcWall));
-        }
-    }
-    jobs
-}
-
 #[test]
 fn partial_index_misses_offset_even_with_early_site_full_index_recovers_it() {
-    let jobs = wall_jobs(IFC);
-    assert_eq!(jobs.len(), 1, "fixture must yield exactly one wall job");
+    assert_eq!(IFC.matches("=IFCWALL(").count(), 1, "fixture must yield exactly one wall job");
 
     // The streaming meta is emitted right after the sample threshold of geometry
     // jobs is buffered, against the partial index built up to that scan point.
@@ -110,9 +98,13 @@ fn partial_index_misses_offset_even_with_early_site_full_index_recovers_it() {
     // Partial index at the meta cut: the forward-referenced site placement is
     // unreachable, so the element placement chain cannot resolve and detection
     // returns None (NOT a small "no shift" — the chain genuinely failed).
+    // The decoder reads the FULL content with the PARTIAL index, and the sample
+    // window is the scanned head, which is what `resolve_partial_rtc` hands the
+    // detector mid-scan: the whole buffer is resident, only the index and the
+    // window stop at the scan point.
     let partial_index = build_entity_index(partial);
-    let mut partial_decoder = EntityDecoder::with_index(partial, partial_index);
-    let partial_rtc = router.detect_rtc_offset_from_jobs(&jobs, &mut partial_decoder);
+    let mut partial_decoder = EntityDecoder::with_index(IFC, partial_index);
+    let partial_rtc = router.detect_rtc_anchor_for_file(partial.as_bytes(), &mut partial_decoder);
     assert!(
         partial_rtc.is_none() || !is_large(partial_rtc.unwrap()),
         "partial index must MISS the late offset (the bug); got {partial_rtc:?}"
@@ -123,7 +115,7 @@ fn partial_index_misses_offset_even_with_early_site_full_index_recovers_it() {
     let full_index = build_entity_index(IFC);
     let mut full_decoder = EntityDecoder::with_index(IFC, full_index);
     let full_rtc = router
-        .detect_rtc_offset_from_jobs(&jobs, &mut full_decoder)
+        .detect_rtc_anchor_for_file(IFC.as_bytes(), &mut full_decoder)
         .expect("full-index detection returns an offset");
     assert!(
         is_large(full_rtc),

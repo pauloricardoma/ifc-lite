@@ -57,7 +57,8 @@ export function createStreamingViewerAdapter(port: number): ViewerBackendMethods
     },
 
     resetColors(refs?: EntityRef[]): void {
-      if (refs && refs.length > 0) {
+      if (refs?.length === 0) return;
+      if (refs) {
         sendCommand(port, {
           action: 'resetColorEntities',
           ids: refsToIds(refs),

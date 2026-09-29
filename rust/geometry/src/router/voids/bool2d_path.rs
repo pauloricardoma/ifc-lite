@@ -3,7 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! 2D opening-subtraction fast path (IfcOpenShell's `boolean-attempt-2d`).
-//!
 //! For the common case — an extruded host whose openings penetrate straight
 //! through the extrusion depth — the exact 3D mesh-boolean is replaced by a much
 //! cheaper operation: subtract the openings' footprints from the host's 2D
@@ -11,32 +10,27 @@
 //! the holed profile. On CSG-heavy models the void-cut is ~80% of geometry time
 //! and the exact kernel is at its single-threaded, bandwidth-bound floor; this
 //! path collapses each qualifying host to a couple of profile triangulations.
-//!
-//! HYBRID per-opening eligibility. A host's openings are split at capture:
-//!   * ELIGIBLE — an extruded opening swept PARALLEL to the host axis that
-//!     penetrates the FULL host depth (a through-cut). These are subtracted from
-//!     the profile in 2D and re-extruded.
-//!   * RESIDUAL — everything else (perpendicular sleeves, partial-depth recesses,
-//!     non-extruded voids). These are cut by the exact kernel on the re-extruded
-//!     host, so one ineligible opening no longer forfeits its host's cheap ones.
-//!
-//! CORRECTNESS is paramount — every gate defers to the exact kernel on the
-//! faintest doubt, and the emitted mesh is reconciled by bounds + volume against
-//! the real host mesh and self-checked watertight:
+//! HYBRID eligibility subtracts parallel through-cuts in 2D. Perpendicular,
+//! partial-depth, and non-extruded openings remain residual 3D cuts on the
+//! re-extruded host, so one ineligible opening does not forfeit the cheap ones.
+//! Pure 2D cuts union overlapping footprints. Mixed cuts stage a stable precursor,
+//! residual cuts, and mandatory overlap corrections; only their complete union
+//! difference may be returned. This avoids changing the residual cutter's input
+//! tessellation when overlapping footprints merge (#4617).
+//! Safety gates validate the 2D PREFIX before residual routing:
 //!   1. Host body = ONE `IfcExtrudedAreaSolid` swept along local ±Z (arbitrary
 //!      profile OK; mapped items unwrapped; a clipped / multi-item body defers).
 //!   2. Each eligible footprint lands STRICTLY INTERIOR to the host profile
-//!      (gated at capture), so the 2D difference turns it into a clean hole —
-//!      adjacent footprints legitimately MERGE (still the exact cut). A footprint
-//!      that touches / breaches the boundary is routed to the residual instead.
+//!      (gated at capture). A footprint touching or breaching the boundary is
+//!      routed to the residual instead.
 //!   3. The difference must yield ONE connected shape (a void that splits the
 //!      profile is rejected — the largest-shape keep would drop geometry) with at
 //!      least one hole formed.
 //!   4. The no-hole re-extrude reconciles with the host mesh (bounds + volume),
-//!      and the holed re-extrude (watertight CDT caps) self-checks watertight.
+//!      and the holed re-extrude self-checks watertight. The later residual result
+//!      is not certified by this gate; #4610 pins its established census reading.
 //!
-//! When ANY of these fail the host falls through to the exact kernel with its
-//! FULL opening set unchanged, so correctness can never regress.
+//! A prefix-gate failure falls through with the full opening set unchanged.
 //!
 //! Gate: `IFC_LITE_VOID_2D=0` forces every host back through the exact kernel
 //! (A/B measurement / bisection). Default ON. wasm has no env, so the default
@@ -48,12 +42,15 @@ use std::sync::OnceLock;
 
 use super::geom::{mesh_signed_volume, param_cut_watertight};
 use super::{world_host_bounds, GeometryRouter, VoidContext};
-use crate::bool2d::{compute_signed_area, subtract_multiple_2d_counted};
+use crate::bool2d::{subtract_multiple_2d_counted, subtract_staged_2d_counted};
 use crate::extrusion::{apply_transform, extrude_profile, extrude_profile_watertight};
 use crate::mesh::Mesh;
 use crate::profile::Profile2D;
 use ifc_lite_core::{DecodedEntity, EntityDecoder, IfcType};
-use nalgebra::{Matrix4, Point2, Point3, Vector3};
+use nalgebra::{Matrix4, Point2, Vector3};
+
+mod footprint;
+use footprint::{footprint_interior, opening_solid_footprint};
 
 /// `IFC_LITE_VOID_2D=0` disables the 2D opening-subtraction path (exact kernel
 /// for every host). Default ON; read once.
@@ -97,28 +94,6 @@ pub(super) struct Bool2dCut {
     residual: Option<Box<VoidContext>>,
 }
 
-/// Shoelace area magnitude of a 2D contour.
-#[inline]
-fn area_abs(poly: &[Point2<f64>]) -> f64 {
-    compute_signed_area(poly).abs()
-}
-
-/// True iff `fp` lies strictly interior to `profile`: every vertex is inside the
-/// outer boundary and outside every existing hole. A conservative interiority
-/// test — a footprint that touches or crosses a boundary edge (a boundary notch)
-/// fails and is routed to the exact kernel rather than approximated. Interior
-/// footprints subtract to clean holes (adjacent ones merge, still exact), so the
-/// re-extrude reproduces the boolean without dropping any profile piece.
-fn footprint_interior(fp: &[Point2<f64>], profile: &Profile2D) -> bool {
-    fp.iter().all(|v| {
-        crate::bool2d::point_in_contour(v, &profile.outer)
-            && profile
-                .holes
-                .iter()
-                .all(|h| !crate::bool2d::point_in_contour(v, h))
-    })
-}
-
 impl GeometryRouter {
     /// Build the 2D-subtraction data for a host + its openings. Splits the
     /// openings into eligible (parallel through-cut → 2D) and residual
@@ -160,11 +135,10 @@ impl GeometryRouter {
             };
             // An opening is eligible only when EVERY constituent solid is a
             // parallel through-cut whose hole-free footprint lands STRICTLY
-            // INTERIOR to the host profile. Interior footprints subtract to clean
-            // holes (touching ones legitimately MERGE — that is still the exact
-            // cut); a footprint that touches / breaches the boundary, or lands in
-            // an existing profile hole, is routed to the residual so it never
-            // silently no-ops. Collect tentatively; any ineligible solid sends the
+            // INTERIOR to the host profile. A footprint that touches / breaches
+            // the boundary, or lands in an existing profile hole, is routed to
+            // the residual so it never silently no-ops. Collect tentatively; any
+            // ineligible solid sends the
             // whole opening (all its solids) to the residual so nothing is
             // double-cut.
             let mut opening_footprints: Vec<Vec<Point2<f64>>> = Vec::new();
@@ -239,12 +213,12 @@ impl GeometryRouter {
         })
     }
 
-    /// Emit the 2D-subtracted, re-extruded cut mesh for a captured host (eligible
-    /// openings subtracted in 2D; residual openings NOT yet cut — the caller runs
-    /// the exact kernel on the result), or `None` (→ full exact kernel) if
+    /// Emit the staged re-extruded precursor and mandatory correction cutters.
+    /// The caller must cut residual openings, then remove all corrections before
+    /// returning a mixed result. Returns `None` (→ full exact kernel) if
     /// reconciliation or the watertight self-check fails. Deterministic f64 →
     /// byte-identical native==wasm.
-    pub(super) fn try_bool2d_cut(&self, mesh: &Mesh, cut: &Bool2dCut) -> Option<Mesh> {
+    pub(super) fn try_bool2d_cut(&self, mesh: &Mesh, cut: &Bool2dCut) -> Option<(Mesh, Vec<Mesh>)> {
         // A -Z sweep places the profile plane at the TOP; shift the [0, depth]
         // extrude down so the solid occupies [-depth, 0] in the profile frame,
         // matching the extruded-solid processor's downward-extrusion handling.
@@ -265,17 +239,19 @@ impl GeometryRouter {
             return None;
         }
 
-        // (2) 2D difference. Footprints were gated INTERIOR at capture, so the
-        // subtract keeps the outer boundary and turns them into holes (adjacent
-        // footprints legitimately merge — still the exact cut). The one pathology
-        // interiority can't rule out is a void that SPLITS the profile into
+        // (2) 2D difference. The one pathology interiority can't rule out is a
+        // void that SPLITS the profile into
         // disconnected pieces (an interior slot bridging the outer to an existing
         // hole): the difference then yields multiple shapes and only the largest
         // is kept, silently dropping geometry. Reject any multi-shape result and
         // require at least one hole to have formed (a zero-hole result would signal
         // a projection error rather than a real cut).
-        let (holed, n_shapes) =
-            subtract_multiple_2d_counted(&cut.host_profile, &cut.footprints).ok()?;
+        let (holed, n_shapes, corrections) = if cut.residual.is_some() {
+            subtract_staged_2d_counted(&cut.host_profile, &cut.footprints).ok()?
+        } else {
+            let (profile, count) = subtract_multiple_2d_counted(&cut.host_profile, &cut.footprints).ok()?;
+            (profile, count, Vec::new())
+        };
         if n_shapes != 1 {
             return None;
         }
@@ -304,9 +280,24 @@ impl GeometryRouter {
             return None;
         }
 
-        FIRES.fetch_add(1, Ordering::Relaxed);
-        FOOTPRINTS.fetch_add(cut.footprints.len() as u64, Ordering::Relaxed);
-        Some(out)
+        let corrections = corrections
+            .iter()
+            .map(|profile| {
+                if !profile.holes.is_empty() {
+                    return None;
+                }
+                let mut correction = extrude_profile_watertight(profile, cut.depth, transform).ok()?;
+                apply_transform(&mut correction, &wt);
+                correction.origin = origin;
+                Some(correction)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let footprints = cut.footprints.len() as u64;
+        crate::telemetry_transaction::record(move || {
+            FIRES.fetch_add(1, Ordering::Relaxed);
+            FOOTPRINTS.fetch_add(footprints, Ordering::Relaxed);
+        });
+        Some((out, corrections))
     }
 
     /// The captured residual (ineligible-opening) exact-kernel context, if any.
@@ -314,59 +305,6 @@ impl GeometryRouter {
         cut.residual.as_deref()
     }
 }
-
-/// Project one opening solid's outer profile into the host profile plane, and
-/// keep it only if the solid sweeps PARALLEL to the host axis and penetrates the
-/// full host depth [`hz_min`, `hz_max`]. `None` (ineligible → exact kernel) for a
-/// perpendicular sweep, a partial-depth (recess) opening, an annular opening
-/// (its own profile holes), or a degenerate footprint.
-fn opening_solid_footprint(
-    op: &ExtrudedSolidLike,
-    hm_inv: &Matrix4<f64>,
-    host_axis: &Vector3<f64>,
-    hz_min: f64,
-    hz_max: f64,
-    z_tol: f64,
-) -> Option<Vec<Point2<f64>>> {
-    if !op.profile.holes.is_empty() {
-        return None;
-    }
-    let op_rot = op.m.fixed_view::<3, 3>(0, 0).into_owned();
-    let op_axis = (op_rot * Vector3::new(0.0, 0.0, op.dir_sign)).try_normalize(1e-9)?;
-    if host_axis.dot(&op_axis).abs() < 1.0 - 1.0e-6 {
-        return None; // near-exact host-parallelism only (~0.08°); a tilt skews the cut
-    }
-    let to_host = hm_inv * op.m;
-    let mut fp: Vec<Point2<f64>> = Vec::with_capacity(op.profile.outer.len());
-    let mut zmin = f64::INFINITY;
-    let mut zmax = f64::NEG_INFINITY;
-    // Zero lateral sweep: base/far images must share host-XY (no oblique drift).
-    let lat_tol = 1.0e-4 * (hz_max - hz_min).abs() + 1.0e-6;
-    for p in &op.profile.outer {
-        let base = to_host.transform_point(&Point3::new(p.x, p.y, 0.0));
-        let far = to_host.transform_point(&Point3::new(p.x, p.y, op.dir_sign * op.depth));
-        if (far.x - base.x).abs() > lat_tol || (far.y - base.y).abs() > lat_tol {
-            return None;
-        }
-        fp.push(Point2::new(base.x, base.y));
-        zmin = zmin.min(base.z.min(far.z));
-        zmax = zmax.max(base.z.max(far.z));
-    }
-    // Through-cut: the opening must span the ENTIRE host depth. A partial-depth
-    // void (recess / blind pocket) would leave material the flat re-extrude can't
-    // represent — defer it to the exact kernel.
-    if zmin > hz_min + z_tol || zmax < hz_max - z_tol {
-        return None;
-    }
-    if area_abs(&fp) <= 0.0 {
-        return None;
-    }
-    Some(fp)
-}
-
-/// The subset of [`super::probe::ExtrudedSolidInfo`] this module reads. Aliased so
-/// the free function above stays decoupled from the probe struct's full shape.
-use super::probe::ExtrudedSolidInfo as ExtrudedSolidLike;
 
 /// Reconcile the no-hole re-extruded `solid` against the real host `mesh` by
 /// world AABB (per axis) and signed volume. Validates that the recovered profile
@@ -398,3 +336,7 @@ fn reconcile_solid(host: &Mesh, solid: &Mesh) -> bool {
 #[cfg(test)]
 #[path = "bool2d_path_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "bool2d_transaction_tests.rs"]
+mod transaction_tests;

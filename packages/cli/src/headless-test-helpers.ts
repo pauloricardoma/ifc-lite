@@ -69,7 +69,9 @@ export type HeadlessBim = Awaited<ReturnType<typeof loadInlineModel>>;
  * reaches the file, which is exactly the bug these suites were written for.
  */
 export function exportStep(bim: HeadlessBim, schema: 'IFC2X3' | 'IFC4' | 'IFC4X3' = 'IFC4'): string {
-  const content = bim.export.ifc([], { schema });
+  // No ref list at all: the whole model. An empty array is an isolation filter
+  // that matched nothing and is refused (#4738).
+  const content = bim.export.ifc(undefined, { schema });
   return typeof content === 'string' ? content : new TextDecoder().decode(content);
 }
 

@@ -6,6 +6,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert';
 
 import { PickingManager, type PointPickProvider } from './picking-manager.js';
+import { isEntityVisible } from './entity-visibility.js';
 import type { PointPickNode } from './point-picker.js';
 
 describe('PickingManager', () => {
@@ -51,6 +52,7 @@ describe('PickingManager', () => {
       canvas as HTMLCanvasElement,
       () => {
         meshCreations += 1;
+        return { ok: true as const, value: undefined };
       },
     );
 
@@ -86,6 +88,7 @@ describe('PickingManager', () => {
       // Authoritative pickable-id set DOES include the fused door (Scene.addMeshData
       // registers a merged mesh under every per-vertex entityId).
       getAllMeshDataExpressIds: () => [WALL, DOOR],
+      visibleMeshDataEntitiesExceed: (limit: number) => 2 > limit,
       getMeshDataPieces: (expressId: number) =>
         expressId === DOOR ? [{ expressId: DOOR }]
         : expressId === WALL ? [{ expressId: WALL }]
@@ -120,6 +123,7 @@ describe('PickingManager', () => {
       canvas as HTMLCanvasElement,
       (piece) => {
         createdMeshes.push({ expressId: piece.expressId, modelIndex: piece.modelIndex });
+        return { ok: true as const, value: undefined };
       },
     );
 
@@ -135,6 +139,68 @@ describe('PickingManager', () => {
       pickerMeshes.every((m) => m.expressId === DOOR),
       'expected only the isolated door to survive the isolation filter',
     );
+  });
+
+  // Review on #4978 (#4885): a hydration failure during prepareBatchedPick —
+  // a lost device, or a mapped-createBuffer allocation failure — must not
+  // report 'gpu' with an INCOMPLETE hydrated set. Before this, the loop
+  // ignored createMeshFromDataFn's return value entirely, so a pick after the
+  // device died still tried the GPU route and silently missed the
+  // un-hydrated piece instead of falling back to the CPU raycast, which needs
+  // no GPU resources at all.
+  it('falls back to the CPU raycast when hydration fails partway (losable-device stub)', async () => {
+    const WALL = 300;
+    const DOOR = 301; // hydration for this piece "loses the device" mid-pick
+
+    const camera = {
+      unprojectToRay: () => ({ origin: { x: 0, y: 0, z: 0 }, direction: { x: 0, y: 0, z: -1 } }),
+      getViewProjMatrix: () => ({ m: new Float32Array(16) }),
+    };
+
+    let raycastCalls = 0;
+    let pickerCalls = 0;
+    const createdMeshes: Array<{ expressId: number }> = [];
+
+    const scene = {
+      getMeshes: () => createdMeshes,
+      getBatchedMeshes: () => [{ expressIds: [WALL] }],
+      isGeometryDataReleased: () => false,
+      getAllMeshDataExpressIds: () => [WALL, DOOR],
+      visibleMeshDataEntitiesExceed: (limit: number) => 2 > limit,
+      getMeshDataPieces: (expressId: number) =>
+        expressId === DOOR ? [{ expressId: DOOR }]
+        : expressId === WALL ? [{ expressId: WALL }]
+        : undefined,
+      getInstancedTemplates: () => undefined,
+      raycast: () => { raycastCalls++; return { expressId: DOOR, modelIndex: 0 }; },
+    };
+
+    const picker = { pick: async () => { pickerCalls++; return null; } };
+    const canvas = { width: 100, height: 100, getBoundingClientRect: () => ({ width: 100, height: 100 }) };
+
+    // Stands in for a losable device (same shape as `renderer.isDeviceLost()`
+    // latching mid-frame): the WALL piece hydrates fine, then the device dies
+    // and DOOR's hydration reports it, exactly what `Renderer.createMeshFromData`
+    // now returns instead of throwing (#4885).
+    let deviceLost = false;
+    const manager = new PickingManager(
+      camera as never,
+      scene as never,
+      picker as never,
+      canvas as HTMLCanvasElement,
+      (piece) => {
+        if (deviceLost) return { ok: false as const, reason: 'device-lost' as const };
+        createdMeshes.push({ expressId: piece.expressId });
+        if (piece.expressId === WALL) deviceLost = true; // "loses the device" before DOOR hydrates
+        return { ok: true as const, value: undefined };
+      },
+    );
+
+    const result = await manager.pick(50, 50);
+
+    assert.deepStrictEqual(result, { expressId: DOOR, modelIndex: 0 }, 'the CPU raycast still answers the pick');
+    assert.equal(raycastCalls, 1, 'a failed hydration must route through the CPU fallback');
+    assert.equal(pickerCalls, 0, 'the GPU picker must not run against an incompletely hydrated mesh set');
   });
 
   // Regression for #1904. pickRect used to pass scene.getMeshes() straight to
@@ -155,6 +221,7 @@ describe('PickingManager', () => {
 
     function harness(overrides: {
       released?: boolean;
+      texturedOnly?: boolean;
       existingMeshes?: Array<{ expressId: number }>;
       pieces?: (id: number) => Array<{ expressId: number }> | undefined;
       pointNodes?: PointPickNode[] | null;
@@ -171,14 +238,22 @@ describe('PickingManager', () => {
 
       const camera = {
         getViewProjMatrix: () => ({ m: new Float32Array(16) }),
+        getRelativeToEyeFrame: () => ({
+          getViewProjection: () => ({ m: new Float32Array(16) }),
+          getCameraWorld: () => [0, 0, 0] as [number, number, number],
+          getRenderEpoch: () => 1,
+          snapshot: () => ({ renderEpoch: 1 }),
+        }),
         unprojectToRay: () => ({ origin: { x: 0, y: 0, z: 0 }, direction: { x: 0, y: 0, z: -1 } }),
       };
 
       const scene = {
         getMeshes: () => createdMeshes,
-        getBatchedMeshes: () => [{ expressIds: [WALL] }],
+        getBatchedMeshes: () => overrides.texturedOnly ? [] : [{ expressIds: [WALL] }],
+        getTexturedMeshes: () => overrides.texturedOnly ? [{ expressId: WALL }, { expressId: SLAB }] : [],
         isGeometryDataReleased: () => overrides.released ?? false,
         getAllMeshDataExpressIds: () => [WALL, SLAB],
+        visibleMeshDataEntitiesExceed: (limit: number) => 2 > limit,
         getMeshDataPieces:
           overrides.pieces ?? ((id: number) => [{ expressId: id }]),
         getInstancedTemplates: () => INSTANCED_TEMPLATES,
@@ -221,7 +296,7 @@ describe('PickingManager', () => {
         scene as never,
         picker as never,
         canvas as HTMLCanvasElement,
-        (piece) => { createdMeshes.push({ expressId: piece.expressId }); },
+        (piece) => { createdMeshes.push({ expressId: piece.expressId }); return { ok: true as const, value: undefined }; },
       );
 
       if (overrides.pointNodes !== undefined) {
@@ -241,6 +316,18 @@ describe('PickingManager', () => {
         get selectRectCalls() { return selectRectCalls; },
       };
     }
+
+    it('hydrates textured-only captured objects without a colour batch (#4228)', async () => {
+      const h = harness({ texturedOnly: true, pieces: id => [{ expressId: id }, { expressId: id }] });
+      const hits = await h.manager.pickRect(0, 0, 100, 100);
+      assert.deepStrictEqual(h.createdMeshes.map(mesh => mesh.expressId), [WALL, WALL, SLAB, SLAB]);
+      assert.deepStrictEqual(h.pickerRectMeshes, h.createdMeshes, 'all hydrated pieces must reach the GPU picker');
+      assert.equal(h.selectRectCalls, 0, 'textured-only small models must avoid the CPU fallback');
+      assert.deepStrictEqual(hits, new Set([WALL, SLAB]));
+      // A second pick must reuse the hydrated pieces rather than duplicating them.
+      await h.manager.pickRect(0, 0, 100, 100);
+      assert.equal(h.createdMeshes.length, 4);
+    });
 
     it('hydrates batched pieces so the rect pass can see them', async () => {
       const h = harness();
@@ -450,6 +537,122 @@ describe('PickingManager', () => {
         'a failed point pass must not discard the bounding-box hits already computed',
       );
       assert.equal(warnings.length, 1, 'the failure must be logged, not swallowed');
+    });
+  });
+
+  // #5383: the drawing buffer is now the element's device-pixel size. The pick
+  // pass must stay at CSS resolution: pointer input only resolves CSS pixels,
+  // the single-pixel pick copies the whole depth image back, and the splat
+  // picker's CSS-px point sizes must match the point draw's.
+  describe('pick target on a HiDPI drawing buffer (#5383)', () => {
+    function hidpiHarness() {
+      const calls: Array<{ x: number; y: number; width: number; height: number }> = [];
+      const rectCalls: Array<{ x0: number; y0: number; x1: number; y1: number; width: number; height: number }> = [];
+      const picker = {
+        pick: async (x: number, y: number, width: number, height: number) => {
+          calls.push({ x, y, width, height });
+          return null;
+        },
+        pickRect: async (x0: number, y0: number, x1: number, y1: number, width: number, height: number) => {
+          rectCalls.push({ x0, y0, x1, y1, width, height });
+          return new Set<number>();
+        },
+      };
+      const scene = {
+        getMeshes: () => [{ expressId: 1 }],
+        getBatchedMeshes: () => [],
+        getTexturedMeshes: () => [],
+        getInstancedTemplates: () => undefined,
+      };
+      const camera = { getViewProjMatrix: () => ({ m: new Float32Array(16) }) };
+      // DPR 2: an 800 x 600 CSS box with a 1600 x 1200 drawing buffer.
+      const canvas = { width: 1600, height: 1200, getBoundingClientRect: () => ({ width: 800, height: 600 }) };
+      const manager = new PickingManager(
+        camera as never,
+        scene as never,
+        picker as never,
+        canvas as HTMLCanvasElement,
+        () => ({ ok: true as const, value: undefined }),
+      );
+      return { manager, calls, rectCalls };
+    }
+
+    it('picks at CSS resolution with CSS coordinates, not the device-pixel buffer', async () => {
+      const h = hidpiHarness();
+      await h.manager.pick(600, 150);
+      assert.deepStrictEqual(h.calls, [{ x: 600, y: 150, width: 800, height: 600 }]);
+    });
+
+    it('rect-picks in the same CSS-resolution target', async () => {
+      const h = hidpiHarness();
+      await h.manager.pickRect(100, 50, 700, 550);
+      assert.deepStrictEqual(h.rectCalls, [{ x0: 100, y0: 50, x1: 700, y1: 550, width: 800, height: 600 }]);
+    });
+  });
+
+  // #5390 made hover pick up to 20x a second by default. On a large model every
+  // pick walked each entity's pieces (and extracted colour-merged ones) only to
+  // conclude 'cpu'; the verdict must now come from counting alone.
+  describe('over-budget verdict without the per-entity walk', () => {
+    function budgetHarness(flatIds: number[]) {
+      const calls = { pieces: 0, raycast: 0, picker: 0 };
+      const meshData = new Set(flatIds);
+      const scene = {
+        getMeshes: () => [],
+        getBatchedMeshes: () => [{ expressIds: flatIds.slice(0, 1) }],
+        isGeometryDataReleased: () => false,
+        getAllMeshDataExpressIds: () => flatIds,
+        visibleMeshDataEntitiesExceed: (
+          limit: number,
+          hiddenIds?: ReadonlySet<number> | null,
+          isolatedIds?: ReadonlySet<number> | null,
+        ) => flatIds.filter((id) => isEntityVisible(id, hiddenIds, isolatedIds)).length > limit,
+        getMeshDataPieces: (id: number) => {
+          calls.pieces += 1;
+          return meshData.has(id) ? [{ expressId: id }] : undefined;
+        },
+        getInstancedTemplates: () => undefined,
+        raycast: () => {
+          calls.raycast += 1;
+          return { expressId: flatIds[0], modelIndex: 0 };
+        },
+      };
+      const picker = { pick: async () => { calls.picker += 1; return null; } };
+      const camera = {
+        unprojectToRay: () => ({ origin: { x: 0, y: 0, z: 0 }, direction: { x: 0, y: 0, z: -1 } }),
+        getViewProjMatrix: () => ({ m: new Float32Array(16) }),
+      };
+      const canvas = { width: 100, height: 100, getBoundingClientRect: () => ({ width: 100, height: 100 }) };
+      const manager = new PickingManager(
+        camera as never,
+        scene as never,
+        picker as never,
+        canvas as HTMLCanvasElement,
+        () => ({ ok: true as const, value: undefined }),
+      );
+      return { manager, calls };
+    }
+    const ids = (n: number) => Array.from({ length: n }, (_, i) => 1 + i);
+
+    it('takes the CPU route over budget without reading a single piece', async () => {
+      const h = budgetHarness(ids(501));
+      await h.manager.pick(50, 50);
+      assert.equal(h.calls.raycast, 1);
+      assert.equal(h.calls.pieces, 0, 'the verdict must not walk entity pieces');
+    });
+
+    it('stays on the exact path at the budget (500 entities)', async () => {
+      const h = budgetHarness(ids(500));
+      await h.manager.pick(50, 50);
+      assert.equal(h.calls.raycast, 0, '500 pieces are affordable and hydrate for the GPU pick');
+      assert.equal(h.calls.picker, 1);
+    });
+
+    it('counts only what isolation leaves visible', async () => {
+      const h = budgetHarness(ids(900));
+      await h.manager.pick(50, 50, { isolatedIds: new Set(ids(10)) });
+      assert.equal(h.calls.raycast, 0, 'ten isolated entities fit the budget');
+      assert.equal(h.calls.picker, 1);
     });
   });
 });

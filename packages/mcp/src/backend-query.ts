@@ -25,10 +25,8 @@
  * `bim.decomposes`. A queued `IfcRelContainedInSpatialStructure` is how an agent
  * places something over MCP, so ignoring it was ignoring a write.
  *
- * What is deliberately not folded: `relationships`, whose voids / fills / groups
- * / connections come from a parser-side extractor with no overlay seam, and the
- * geometry the clash and viewer tools read. Those are rebuilt on the next
- * `model_load` after a save.
+ * Exact `relationships().relations` rows are folded through the same overlay.
+ * Legacy projections and geometry rebuild on `model_load` after a save.
  */
 
 import type {
@@ -52,17 +50,19 @@ import {
   extractDocumentsOnDemand,
   extractMaterialsOnDemand,
   extractRelationshipsOnDemand,
+  extractExactRelatedIds,
   expandTypes,
   QUERY_REL_TYPE_MAP,
   extractTypePropertiesOnDemand,
   isQueryableObjectType,
 } from '@ifc-lite/parser';
 import { attributeNamesForSchema } from './schema-tables.js';
-import { EntityNode } from '@ifc-lite/query';
-import { matchesPropertyFilter } from './property-filter-match.js';
+import { EntityNode, matchesPropertyFilter } from '@ifc-lite/query';
+import { iterateEffectiveEntityIds, type MutablePropertyView } from '@ifc-lite/mutations';
 
-import { stepText, type CreatedEntity, type PendingOverlay } from './overlay.js';
-
+import type { CreatedEntity, PendingOverlay } from './overlay.js';
+import { authoredValue } from './authored-attribute-value.js';
+import { foldRelationshipRows } from './backend-query-relationships.js';
 // `expandTypes` used to be defined here; it now comes from `@ifc-lite/parser`,
 // shared with the other query backends (see `query-backend-maps.ts`). Re-exported
 // so this module's consumers are unaffected by where it lives.
@@ -77,65 +77,17 @@ export { expandTypes };
  */
 export const isProductType = isQueryableObjectType;
 
-/** The overlay's answer for an entity it created, in `EntityData` shape. */
-function createdEntityData(created: CreatedEntity, ref: EntityRef): EntityData {
+function createdEntityData(created: CreatedEntity, ref: EntityRef, store: IfcDataStore): EntityData {
+  const names = attributeNamesForSchema(created.ifcType, store.schemaVersion);
+  const objectType = authoredValue(created.attributes[names.indexOf('ObjectType')]);
   return {
     ref,
     globalId: created.globalId,
     name: created.name ?? '',
     type: created.ifcType,
     description: created.description ?? '',
-    // Slot 4 is `ObjectType` on an IfcObject but `ApplicableOccurrence` on an
-    // IfcTypeObject, so it is not read positionally. An `entity_set_attribute`
-    // override still lands, applied by the caller.
-    objectType: '',
+    objectType: typeof objectType === 'string' ? objectType : '',
   };
-}
-
-/**
- * One authored STEP attribute as a plain scalar, for `bim.attributes` on a
- * created entity.
- *
- * **Not `stepText`.** That helper answers "is this text?", and deliberately says
- * no to `#42` because its caller reads an entity's *Name* and must not mistake a
- * reference for one. Reusing it here dropped every structural attribute an agent
- * authored — `ObjectPlacement: '#40'` vanished from the readback (#2014). The
- * fix belongs on this side of the line, not in `stepText`: a reference *is* the
- * value of a structural attribute, and it is what will be serialised.
- *
- * Coercion mirrors the parsed path (`coerceRaw` in `@ifc-lite/query`) so a
- * created entity and a parsed one report the same shapes: `$`/`*`/`.U.`/`.X.`
- * are absent, `.T.`/`.F.` are booleans, other dotted tokens are bare enum names,
- * quoted text is unquoted.
- *
- * Lists are skipped — and so are they on the parsed path, where `coerceRaw`
- * answers null for an array. `EntityAttributeData.value` has no array form to
- * put one in, and reporting a created entity's `RelatedElements` while a parsed
- * entity's stays hidden would trade one inconsistency for another. The queued
- * relationships those lists express are read back through `related()` instead,
- * where they have somewhere to go.
- */
-function authoredValue(value: unknown): string | number | boolean | undefined {
-  if (typeof value === 'number' || typeof value === 'boolean') return value;
-  // The authoring API's wrapper forms (`StoreEditor.addEntity`).
-  if (value && typeof value === 'object' && !Array.isArray(value)) {
-    const wrapper = value as { real?: number; typed?: { value?: string | number | boolean } };
-    if (typeof wrapper.real === 'number') return wrapper.real;
-    if (wrapper.typed && wrapper.typed.value !== undefined) return wrapper.typed.value;
-    return undefined;
-  }
-  if (typeof value !== 'string') return undefined;
-  const trimmed = value.trim();
-  if (trimmed === '' || trimmed === '$' || trimmed === '*') return undefined;
-  if (trimmed === '.T.') return true;
-  if (trimmed === '.F.') return false;
-  if (trimmed === '.U.' || trimmed === '.X.') return undefined;
-  if (trimmed.startsWith('#')) return trimmed;
-  if (trimmed.length >= 2 && trimmed.startsWith("'") && trimmed.endsWith("'")) {
-    return trimmed.slice(1, -1).replace(/''/g, "'");
-  }
-  if (trimmed.length >= 2 && trimmed.startsWith('.') && trimmed.endsWith('.')) return trimmed.slice(1, -1);
-  return trimmed;
 }
 
 /**
@@ -148,12 +100,17 @@ export function createQueryAdapter(
   store: IfcDataStore,
   modelId: string,
   overlay: () => PendingOverlay | null,
+  mutationView: () => MutablePropertyView | null,
 ): QueryBackendMethods {
   function entityData(ref: EntityRef): EntityData | null {
     const pending = overlay();
     if (pending?.deleted.has(ref.expressId)) return null;
     const created = pending?.createdEntity(ref.expressId);
-    if (created) return withOverrides(createdEntityData(created, ref), pending, ref.expressId);
+    if (created) {
+      const data = createdEntityData(created, ref, store);
+      return { ...data, type: pending?.effectiveType(ref.expressId) ?? data.type };
+    }
+    // @raw-entity-enumeration-ok tombstones and overlay-created ids returned above; this point probe only checks the remaining parsed source
     if (!store.entityIndex.byId.has(ref.expressId)) return null;
     const node = new EntityNode(store, ref.expressId);
     const type = node.type;
@@ -162,7 +119,7 @@ export function createQueryAdapter(
       ref,
       globalId: node.globalId,
       name: node.name,
-      type,
+      type: pending?.effectiveType(ref.expressId) ?? type,
       description: node.description,
       objectType: node.objectType,
     }, pending, ref.expressId);
@@ -171,18 +128,31 @@ export function createQueryAdapter(
   function withOverrides(data: EntityData, pending: PendingOverlay | null, expressId: number): EntityData {
     if (!pending) return data;
     const overrides = pending.attributes(expressId);
-    if (overrides.size === 0) return data;
-    // `EntityData` has a slot for exactly these three; anything else the session
-    // wrote (`Tag`) reaches the caller through `attributes()` below, which
-    // carries the whole map.
-    return {
+    const positional = pending.positionalAttributes(expressId);
+    if (overrides.size === 0 && positional.size === 0 && !pending.effectiveType(expressId)) return data;
+    const next = {
       ...data,
+      type: pending.effectiveType(expressId) ?? data.type,
       name: overrides.get('Name') ?? data.name,
       description: overrides.get('Description') ?? data.description,
       objectType: overrides.get('ObjectType') ?? data.objectType,
     };
+    // Positional slots are named by the effective class (a queued retype wins).
+    const effectiveType = pending.effectiveType(expressId);
+    const exactType = effectiveType ?? (store.entities.getTypeName(expressId) || data.type);
+    const names = attributeNamesForSchema(exactType, store.schemaVersion);
+    if (effectiveType && names.length > 0 && !names.includes('ObjectType')) next.objectType = '';
+    for (const [index, value] of positional) {
+      const authored = authoredValue(value);
+      const isUnset = value == null || (typeof value === 'string' && ['', '$', '*'].includes(value.trim()));
+      const text = typeof authored === 'string' ? authored : isUnset ? '' : null;
+      if (text === null) continue;
+      if (names[index] === 'Name') next.name = text;
+      else if (names[index] === 'Description') next.description = text;
+      else if (names[index] === 'ObjectType') next.objectType = text;
+    }
+    return next;
   }
-
   function properties(ref: EntityRef, captured?: PendingOverlay | null): PropertySetData[] {
     // `captured` lets a caller that already has the overlay pass it in rather
     // than have it rebuilt per entity — the filter loop in `entities()` runs
@@ -227,22 +197,28 @@ export function createQueryAdapter(
       : extractAllEntityAttributes(store, ref.expressId);
     if (!pending) return base;
     const overrides = pending.attributes(ref.expressId);
-    if (overrides.size === 0) return base;
+    const positional = pending.positionalAttributes(ref.expressId);
+    if (overrides.size === 0 && positional.size === 0) return base;
     // Overwrite what the base carries, then append what it does not. The append
     // is the half that was missing (#2014): `extractAllEntityAttributes` omits
     // an attribute whose stored value is `$`, so setting a previously-unset
     // `Description` changed the top-level field while this list still denied it
     // — one payload contradicting itself. Appended names go last; the list is
     // name-keyed and its order is not positional (the base already drops nulls).
-    const merged = base.map((attr) => {
-      const written = overrides.get(attr.name);
-      return written === undefined ? attr : { ...attr, value: written };
-    });
-    const present = new Set(merged.map((attr) => attr.name));
-    for (const [name, value] of overrides) {
-      if (!present.has(name)) merged.push({ name, value });
+    const merged = new Map(base.map((attribute) => [attribute.name, attribute.value]));
+    const writes = new Map<string, unknown>(overrides);
+    const exactType = created?.ifcType ?? store.entities.getTypeName(ref.expressId);
+    const names = attributeNamesForSchema(exactType, store.schemaVersion);
+    for (const [index, value] of positional) {
+      const name = names[index];
+      if (name) writes.set(name, value);
     }
-    return merged;
+    for (const [name, value] of writes) {
+      const authored = authoredValue(value);
+      if (authored === undefined) merged.delete(name);
+      else merged.set(name, authored);
+    }
+    return [...merged].map(([name, value]) => ({ name, value }));
   }
 
   function namedAuthoredAttributes(created: CreatedEntity): EntityAttributeData[] {
@@ -269,30 +245,22 @@ export function createQueryAdapter(
     entities(descriptor: QueryDescriptor): EntityData[] {
       const pending = overlay();
       const requested = descriptor.types && descriptor.types.length > 0
-        ? expandTypes(descriptor.types)
+        ? expandTypes(descriptor.types, store.schemaVersion)
         : null;
 
-      const entityIds: number[] = [];
-      if (requested) {
-        for (const type of requested) {
-          const typeIds = store.entityIndex.byType.get(type) ?? [];
-          for (const eid of typeIds) entityIds.push(eid);
-        }
-      } else {
-        for (const [typeName, ids] of store.entityIndex.byType) {
-          if (isProductType(typeName)) {
-            for (const eid of ids) entityIds.push(eid);
-          }
-        }
-      }
-
       const results: EntityData[] = [];
-      for (const expressId of entityIds) {
-        if (expressId === 0) continue;
-        if (pending?.deleted.has(expressId)) continue;
+      for (const { expressId, type, overlayCreated } of iterateEffectiveEntityIds(store, mutationView(), requested ?? undefined)) {
+        if (!requested && !isProductType(type)) continue;
+        const ref = { modelId, expressId };
+        if (overlayCreated) {
+          const created = pending?.createdEntity(expressId);
+          if (!created) throw new Error(`Missing pending entity #${expressId} during enumeration`);
+          results.push(withOverrides(createdEntityData(created, ref, store), pending, expressId));
+          continue;
+        }
         const node = new EntityNode(store, expressId);
         results.push(withOverrides({
-          ref: { modelId, expressId },
+          ref,
           globalId: node.globalId,
           name: node.name,
           type: node.type,
@@ -300,24 +268,6 @@ export function createQueryAdapter(
           objectType: node.objectType,
         }, pending, expressId));
       }
-      // Queued entities join the same result set under the same type rules, so
-      // an agent that creates a wall and then queries for walls finds it.
-      // `createdAll`, not `created`: `model_info` and `count_entities` count
-      // every queued entity, so a typed query over the same class has to list
-      // every one of them or the two contradict each other about what exists
-      // (#2014). A queued entity with no GlobalId is still an entity; callers
-      // address it by the `expressId` every row carries.
-      const wanted = requested ? new Set(requested) : null;
-      for (const created of pending?.createdAll ?? []) {
-        const key = created.ifcType.toUpperCase();
-        if (wanted ? !wanted.has(key) : !isProductType(key)) continue;
-        results.push(withOverrides(
-          createdEntityData(created, { modelId, expressId: created.expressId }),
-          pending,
-          created.expressId,
-        ));
-      }
-
       let filtered = results;
       if (descriptor.filters && descriptor.filters.length > 0) {
         const propsCache = new Map<number, PropertySetData[]>();
@@ -329,8 +279,25 @@ export function createQueryAdapter(
           }
           return cached;
         };
+        // A `Qto_` filter (or any psetName with no matching property set)
+        // falls back to quantity sets — see `matchesPropertyFilter` in
+        // `@ifc-lite/query`'s `property-filter-match.ts`. Without this, a
+        // `Qto_WallBaseQuantities.NetVolume>1` filter (e.g. from the `#4094`
+        // selector adapter's `.select()`/`selector` param) silently matched
+        // zero entities even when the quantity was present.
+        const qsetsCache = new Map<number, QuantitySetData[]>();
+        const cachedQuantities = (ref: EntityRef): QuantitySetData[] => {
+          let cached = qsetsCache.get(ref.expressId);
+          if (!cached) {
+            cached = quantities(ref);
+            qsetsCache.set(ref.expressId, cached);
+          }
+          return cached;
+        };
         for (const filter of descriptor.filters) {
-          filtered = filtered.filter((entity) => matchesPropertyFilter(cachedProps(entity.ref), filter));
+          filtered = filtered.filter((entity) =>
+            matchesPropertyFilter(cachedProps(entity.ref), filter, cachedQuantities(entity.ref))
+          );
         }
       }
       // `&&` alone lets a NaN offset/limit through silently: every NaN
@@ -400,7 +367,10 @@ export function createQueryAdapter(
       return extractDocumentsOnDemand(store, ref.expressId);
     },
     relationships(ref: EntityRef): EntityRelationshipsData {
-      return extractRelationshipsOnDemand(store, ref.expressId);
+      const result = extractRelationshipsOnDemand(store, ref.expressId);
+      const pending = overlay();
+      if (!pending) return result;
+      return foldRelationshipRows(result, pending, ref, entityData);
     },
     /**
      * Containment, aggregation and typing, with the session's queued edits
@@ -432,10 +402,8 @@ export function createQueryAdapter(
       const relEnum = QUERY_REL_TYPE_MAP[relType];
       if (relEnum === undefined) return [];
       const pending = overlay();
-      // A deleted entity relates to nothing. Filtering only the far end left it
-      // answering questions about itself (#2014 review).
+      // A deleted entity relates to nothing (#2014 review).
       if (pending?.deleted.has(ref.expressId)) return [];
-      const half = direction === 'forward' ? store.relationships.forward : store.relationships.inverse;
       const out: number[] = [];
       const seen = new Set<number>();
       const take = (expressId: number): void => {
@@ -443,17 +411,12 @@ export function createQueryAdapter(
         seen.add(expressId);
         out.push(expressId);
       };
-      for (const edge of half.getEdges(ref.expressId, relEnum)) {
-        if (pending?.deleted.has(edge.relationshipId)) continue;
-        take(edge.target);
-      }
-      for (const relation of pending?.queuedRelations(relType) ?? []) {
-        if (direction === 'forward') {
-          if (relation.relating !== ref.expressId) continue;
-          for (const target of relation.related) take(target);
-        } else if (relation.related.includes(ref.expressId)) {
-          take(relation.relating);
-        }
+      const isDeleted = pending
+        ? (id: number) => pending.deleted.has(id) || pending.supersededRelationshipIds.has(id)
+        : () => false;
+      for (const id of extractExactRelatedIds(store, ref.expressId, relType, direction, isDeleted)) take(id);
+      for (const edge of pending?.relationshipEdges(ref.expressId, relType) ?? []) {
+        if (edge.direction === direction) take(edge.targetId);
       }
       return out.map((expressId: number) => ({ modelId: ref.modelId, expressId }));
     },

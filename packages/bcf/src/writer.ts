@@ -8,7 +8,6 @@
  * Creates .bcfzip files from BCFProject structure
  */
 
-import JSZip from 'jszip';
 import type {
   BCFProject,
   BCFTopic,
@@ -19,21 +18,21 @@ import type {
   BCFVisibility,
   BCFViewSetupHints,
   BCFColoring,
-  BCFLine,
-  BCFClippingPlane,
-  BCFBitmap,
-  BCFPoint,
-  BCFDirection,
-  BCFBimSnippet,
-  BCFDocumentReference,
-  BCFHeaderFile,
 } from './types.js';
 import {
   requireCameraChoice,
   writeOrthogonalCamera,
   writePerspectiveCamera,
 } from './writer-camera.js';
-import { xsdDouble, xsdInt, xsdPointElement } from './numeric.js';
+import {
+  writeLine,
+  writeClippingPlane,
+  writeBitmap,
+  writeHeader,
+  writeBimSnippet,
+  writeDocumentReference,
+} from './writer-markup-elements.js';
+import { xsdInt } from './numeric.js';
 import { escapeXml } from './xml-text.js';
 import {
   XML_WHITESPACE_ONLY,
@@ -42,6 +41,8 @@ import {
   xsdRequiredString,
 } from './xsd-required-string.js';
 import { generateUuid } from '@ifc-lite/encoding';
+import { viewpointFileName, type ViewpointFileName } from './writer-viewpoint-filename.js';
+import { BcfArchive } from './writer-archive.js';
 
 /**
  * Write a BCFProject to a .bcfzip file
@@ -50,7 +51,7 @@ import { generateUuid } from '@ifc-lite/encoding';
  * @returns Blob containing the .bcfzip file
  */
 export async function writeBCF(project: BCFProject): Promise<Blob> {
-  const zip = new JSZip();
+  const zip = new BcfArchive();
 
   // Write version file
   writeVersionFile(zip, project.version);
@@ -66,12 +67,7 @@ export async function writeBCF(project: BCFProject): Promise<Blob> {
     await writeTopicFolder(zip, topic, project.version, usedFolderNames);
   }
 
-  // Generate zip file
-  return zip.generateAsync({
-    type: 'blob',
-    compression: 'DEFLATE',
-    compressionOptions: { level: 6 },
-  });
+  return zip.toBlob();
 }
 
 /**
@@ -88,7 +84,7 @@ export async function writeBCF(project: BCFProject): Promise<Blob> {
  * content against an empty content model). So for 3.0 the element must be
  * self-closing with no child content at all, not merely omit DetailedVersion.
  */
-function writeVersionFile(zip: JSZip, version: '2.1' | '3.0'): void {
+function writeVersionFile(zip: BcfArchive, version: '2.1' | '3.0'): void {
   const content =
     version === '3.0'
       ? `<?xml version="1.0" encoding="UTF-8"?>
@@ -125,7 +121,7 @@ function writeVersionFile(zip: JSZip, version: '2.1' | '3.0'): void {
  * the schema error for a dangling reference; omitting the element keeps the
  * schema error. Empty does neither.
  */
-function writeProjectFile(zip: JSZip, project: BCFProject, version: '2.1' | '3.0'): void {
+function writeProjectFile(zip: BcfArchive, project: BCFProject, version: '2.1' | '3.0'): void {
   const projectId = project.projectId || generateUuid();
   const nameElement = project.name ? `\n    <Name>${escapeXml(project.name)}</Name>` : '';
   const rootElement = version === '3.0' ? 'ProjectInfo' : 'ProjectExtension';
@@ -187,13 +183,12 @@ function sanitizeZipComponent(raw: string, usedNames: Set<string>, fallback: str
 
 /** Write a topic folder with all its contents. */
 async function writeTopicFolder(
-  zip: JSZip,
+  zip: BcfArchive,
   topic: BCFTopic,
   version: '2.1' | '3.0',
   usedFolderNames: Set<string>,
 ): Promise<void> {
-  const folder = zip.folder(sanitizeZipComponent(topic.guid, usedFolderNames, 'topic'));
-  if (!folder) return;
+  const folderName = sanitizeZipComponent(topic.guid, usedFolderNames, 'topic');
 
   // Sanitize each viewpoint GUID once, up front, so the markup <Viewpoint>
   // reference (written below) and the zip entry (written in
@@ -205,12 +200,24 @@ async function writeTopicFolder(
     sanitizeZipComponent(vp.guid, usedViewpointNames, 'viewpoint'),
   );
 
+  // Derive the actual archive file names ONCE, so viewpointXml (markup) and
+  // writeViewpointFiles (archive entry) can never disagree (#3612).
+  const viewpointFileNames = viewpointBaseNames.map((baseName, i) => viewpointFileName(baseName, i));
+
+  // Resolve each viewpoint's snapshot ONCE, before markup.bcf is written, so
+  // the `<Snapshot>` reference and the archive entry it names are driven off
+  // the SAME decode attempt and can never disagree (#3962): previously the
+  // reference was written based on `viewpoint.snapshot`/`snapshotData`'s mere
+  // presence, and the actual file write -- which could fail decoding a
+  // malformed `data:` URL -- happened later, independently.
+  const snapshotBytes = topic.viewpoints.map((vp) => resolveSnapshotBytes(vp));
+
   // Write markup.bcf
-  writeMarkupFile(folder, topic, version, viewpointBaseNames);
+  writeMarkupFile(zip, folderName, topic, version, viewpointFileNames, snapshotBytes);
 
   // Write viewpoints
   for (let i = 0; i < topic.viewpoints.length; i++) {
-    await writeViewpointFiles(folder, topic.viewpoints[i], viewpointBaseNames[i], version);
+    await writeViewpointFiles(zip, folderName, topic.viewpoints[i], viewpointFileNames[i], version, snapshotBytes[i]);
   }
 }
 
@@ -228,12 +235,51 @@ function snapshotExt(viewpoint: BCFViewpoint): 'png' | 'jpg' {
   return 'png';
 }
 
+/**
+ * Resolve a viewpoint's snapshot to the exact bytes/string that will be
+ * written to the archive, or `undefined` when there is nothing writable --
+ * computed once, up front, so both the markup `<Snapshot>` reference and the
+ * zip entry are driven off this single result and can never disagree (#3962).
+ *
+ * A malformed `data:` URL still only drops that one viewpoint's snapshot
+ * rather than aborting the whole export, matching this file's existing
+ * "skip the one bad piece, keep going" policy -- but unlike before, the
+ * warning below now corresponds to an omitted markup reference too, not just
+ * an omitted file.
+ */
+function resolveSnapshotBytes(viewpoint: BCFViewpoint): Uint8Array | undefined {
+  if (viewpoint.snapshotData) {
+    return viewpoint.snapshotData;
+  }
+  if (viewpoint.snapshot && viewpoint.snapshot.startsWith('data:')) {
+    const base64Data = viewpoint.snapshot.split(',')[1];
+    if (!base64Data) return undefined;
+    try {
+      const binaryString = atob(base64Data);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      return bytes;
+    } catch (e) {
+      console.warn(
+        `[BCF] Skipping malformed snapshot data URL for viewpoint "${viewpoint.guid}": ` +
+          `omitting both its <Snapshot> markup reference and its archive entry`,
+        e,
+      );
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
 /** Write markup.bcf -- buildingSMART standard format. */
 function writeMarkupFile(
-  folder: JSZip,
+  zip: BcfArchive, folderName: string,
   topic: BCFTopic,
   version: '2.1' | '3.0',
-  viewpointBaseNames: string[],
+  viewpointFileNames: ViewpointFileName[],
+  snapshotBytes: (Uint8Array | undefined)[],
 ): void {
   // BCF 3.0's markup.xsd tightens `Topic/@TopicType` and `Topic/@TopicStatus`
   // from optional (2.1) to `use="required"`. Omitting the attribute -
@@ -353,8 +399,8 @@ function writeMarkupFile(
     // <DocumentReferences> element, while 2.1 repeats <DocumentReference>
     // directly under <Topic> (buildingSMART/BCF-XML markup.xsd, Topic).
     if (version === '3.0') content += `\n    <DocumentReferences>`;
-    for (const docRef of topic.documentReferences) {
-      content += writeDocumentReference(docRef, version);
+    for (let i = 0; i < topic.documentReferences.length; i++) {
+      content += writeDocumentReference(topic.documentReferences[i], version, topic.guid, i);
     }
     if (version === '3.0') content += `\n    </DocumentReferences>`;
   }
@@ -407,18 +453,19 @@ function writeMarkupFile(
   const viewpointXml = (indent: string) =>
     topic.viewpoints
       .map((viewpoint, i) => {
-        // Use standard buildingSMART naming convention: Viewpoint_<guid>.bcfv,
-        // but the file name component is the sanitized base name (zip-slip
-        // guard) -- the SAME one writeViewpointFiles uses for the actual entry,
-        // so the markup reference and the archive agree. The real GUID is still
-        // written verbatim as the Guid attribute below.
-        const baseName = viewpointBaseNames[i];
-        const filename = `Viewpoint_${baseName}.bcfv`;
-        const snapshotName = `Snapshot_${baseName}.${snapshotExt(viewpoint)}`;
+        // Shared viewpointFileName() result (#3612) -- the SAME one
+        // writeViewpointFiles uses, so the two can never disagree. The real
+        // GUID is still written verbatim as the Guid attribute below.
+        const filename = viewpointFileNames[i].viewpointFile;
+        const snapshotName = `${viewpointFileNames[i].snapshotBase}.${snapshotExt(viewpoint)}`;
 
         let v = `\n${indent}<${viewpointEntryTag} Guid="${escapeXml(viewpoint.guid)}">`;
         v += `\n${indent}  <Viewpoint>${filename}</Viewpoint>`;
-        if (viewpoint.snapshot || viewpoint.snapshotData) {
+        // Driven off the ALREADY-resolved snapshot bytes (see
+        // writeTopicFolder), not off `viewpoint.snapshot`/`snapshotData`'s
+        // mere presence -- so this reference is only emitted when the entry
+        // it names is actually going into the archive (#3962).
+        if (snapshotBytes[i] !== undefined) {
           v += `\n${indent}  <Snapshot>${snapshotName}</Snapshot>`;
         }
         v += `\n${indent}</${viewpointEntryTag}>`;
@@ -451,24 +498,23 @@ function writeMarkupFile(
 
   content += `\n</Markup>`;
 
-  folder.file('markup.bcf', content);
+  zip.file(`${folderName}/markup.bcf`, content);
 }
 
 /**
  * Write viewpoint files (bcfv and snapshot)
  */
 async function writeViewpointFiles(
-  folder: JSZip,
+  zip: BcfArchive, folderName: string,
   viewpoint: BCFViewpoint,
-  baseName: string,
+  fileNames: ViewpointFileName,
   version: '2.1' | '3.0',
+  snapshot: Uint8Array | undefined,
 ): Promise<void> {
-  // Use standard buildingSMART naming convention: Viewpoint_<guid>.bcfv, but
-  // the file name component is the sanitized base name (zip-slip guard) --
-  // the SAME one the caller wrote into the markup <Viewpoint> reference, so
-  // the archive entry and the markup agree. See sanitizeZipComponent.
-  const filename = `Viewpoint_${baseName}.bcfv`;
-  const snapshotName = `Snapshot_${baseName}.${snapshotExt(viewpoint)}`;
+  // Shared viewpointFileName() result (#3612) -- the SAME one the caller
+  // wrote into the markup reference, so the two can never disagree.
+  const filename = fileNames.viewpointFile;
+  const snapshotName = `${fileNames.snapshotBase}.${snapshotExt(viewpoint)}`;
 
   // Write viewpoint XML - use buildingSMART standard format
   let content = `<?xml version="1.0" encoding="UTF-8"?>
@@ -538,27 +584,14 @@ async function writeViewpointFiles(
 
   content += `\n</VisualizationInfo>`;
 
-  folder.file(filename, content);
+  zip.file(`${folderName}/${filename}`, content);
 
-  // Write snapshot
-  if (viewpoint.snapshotData) {
-    folder.file(snapshotName, viewpoint.snapshotData);
-  } else if (viewpoint.snapshot && viewpoint.snapshot.startsWith('data:')) {
-    // Convert data URL to binary
-    const base64Data = viewpoint.snapshot.split(',')[1];
-    if (base64Data) {
-      try {
-        const binaryString = atob(base64Data);
-        const bytes = new Uint8Array(binaryString.length);
-        for (let i = 0; i < binaryString.length; i++) {
-          bytes[i] = binaryString.charCodeAt(i);
-        }
-        folder.file(snapshotName, bytes);
-      } catch (e) {
-        // Skip a single malformed snapshot data URL rather than aborting the export
-        console.warn('[BCF] Skipping malformed snapshot data URL:', e);
-      }
-    }
+  // Write the snapshot the caller already resolved (see writeTopicFolder /
+  // resolveSnapshotBytes) -- this function no longer decodes the `data:` URL
+  // itself, so it can never write a file that the markup reference (written
+  // earlier, off the same resolution) disagrees with (#3962).
+  if (snapshot !== undefined) {
+    zip.file(`${folderName}/${snapshotName}`, snapshot);
   }
 }
 
@@ -712,151 +745,3 @@ function writeColoringEntry(coloring: BCFColoring, version: '2.1' | '3.0'): stri
   return content;
 }
 
-/**
- * Write line XML
- */
-function writeLine(line: BCFLine, where: string): string {
-  return `\n    <Line>${xsdPointElement('StartPoint', line.startPoint, '      ', where)}${xsdPointElement('EndPoint', line.endPoint, '      ', where)}
-    </Line>`;
-}
-
-/**
- * Write clipping plane XML
- */
-function writeClippingPlane(plane: BCFClippingPlane, where: string): string {
-  return `\n    <ClippingPlane>${xsdPointElement('Location', plane.location, '      ', where)}${xsdPointElement('Direction', plane.direction, '      ', where)}
-    </ClippingPlane>`;
-}
-
-/**
- * Write bitmap XML
- *
- * Two more shape differences beyond the `<Bitmaps>` wrapper (see the call
- * site in {@link writeViewpointFiles}), both against v2_1/visinfo.xsd vs
- * v3_0/visinfo.xsd:
- * - The format element's name changes: 2.1 nests it as `<Bitmap>` (same tag
- *   name as the outer per-entry element -- `<Bitmap><Bitmap>PNG</Bitmap>...`);
- *   3.0 renamed it `<Format>`.
- * - The `BitmapFormat` enum's case changes: 2.1 is uppercase (`PNG`, `JPG`);
- *   3.0's simpleType only accepts lowercase (`png`, `jpg`) -- validation
- *   fails with "The value 'PNG' is not an element of the set {'png','jpg'}"
- *   otherwise. `BCFBitmap.format` stays typed `'PNG' | 'JPG'`; we only
- *   lowercase it on the wire for 3.0.
- */
-function writeBitmap(bitmap: BCFBitmap, version: '2.1' | '3.0', where: string): string {
-  const formatTag = version === '3.0' ? 'Format' : 'Bitmap';
-  const formatValue = version === '3.0' ? bitmap.format.toLowerCase() : bitmap.format;
-  return `\n    <Bitmap>
-      <${formatTag}>${formatValue}</${formatTag}>
-      <Reference>${escapeXml(bitmap.reference)}</Reference>${xsdPointElement('Location', bitmap.location, '      ', where)}${xsdPointElement('Normal', bitmap.normal, '      ', where)}${xsdPointElement('Up', bitmap.up, '      ', where)}
-      <Height>${xsdDouble(bitmap.height, 'Bitmap/Height', where)}</Height>
-    </Bitmap>`;
-}
-
-/**
- * Write the markup `<Header>` block (source IFC files).
- *
- * The container differs by BCF version: 2.1 nests `<File>` directly under
- * `<Header>`, while 3.0 wraps them in a `<Files>` element. The `<File>` shape
- * (IfcProject / IfcSpatialStructureElement / isExternal attributes; Filename,
- * Date, Reference children) is identical across both.
- */
-function writeHeader(files: BCFHeaderFile[], version: '2.1' | '3.0'): string {
-  const fileIndent = version === '3.0' ? '      ' : '    ';
-  const fileXml = files.map((f) => writeHeaderFile(f, fileIndent, version)).join('');
-
-  if (version === '3.0') {
-    return `\n  <Header>\n    <Files>${fileXml}\n    </Files>\n  </Header>`;
-  }
-  return `\n  <Header>${fileXml}\n  </Header>`;
-}
-
-/** Write a single `<File>` entry inside the markup `<Header>`. */
-function writeHeaderFile(file: BCFHeaderFile, indent: string, version: '2.1' | '3.0'): string {
-  // isExternal defaults to true (an unresolved reference is treated as external).
-  const isExternal = file.isExternal ?? true;
-  // BCF 2.1 spells the attribute `isExternal`; 3.0 renamed it `IsExternal`.
-  const isExternalAttr = version === '3.0' ? 'IsExternal' : 'isExternal';
-
-  let attrs = '';
-  if (file.ifcProject) {
-    attrs += ` IfcProject="${escapeXml(file.ifcProject)}"`;
-  }
-  if (file.ifcSpatialStructureElement) {
-    attrs += ` IfcSpatialStructureElement="${escapeXml(file.ifcSpatialStructureElement)}"`;
-  }
-  attrs += ` ${isExternalAttr}="${isExternal}"`;
-
-  let content = `\n${indent}<File${attrs}>`;
-  if (file.filename) {
-    content += `\n${indent}  <Filename>${escapeXml(file.filename)}</Filename>`;
-  }
-  const fileDate = xsdOptionalDateTime(file.date);
-  if (fileDate) {
-    content += `\n${indent}  <Date>${fileDate}</Date>`;
-  }
-  if (file.reference) {
-    content += `\n${indent}  <Reference>${escapeXml(file.reference)}</Reference>`;
-  }
-  content += `\n${indent}</File>`;
-  return content;
-}
-
-/**
- * Write BimSnippet XML
- *
- * BCF 2.1 spells the attribute `isExternal`; 3.0 renamed it `IsExternal`
- * (buildingSMART/BCF-XML markup.xsd, BimSnippet's IsExternal attribute) —
- * same rename as the Header `<File>` attribute in {@link writeHeaderFile}.
- */
-function writeBimSnippet(snippet: BCFBimSnippet, version: '2.1' | '3.0'): string {
-  // Caller guarantees referenceSchema is present (see writeMarkupFile); both
-  // Reference and ReferenceSchema are required by the BCF schema.
-  const isExternalAttr = version === '3.0' ? 'IsExternal' : 'isExternal';
-  let content = `\n    <BimSnippet SnippetType="${escapeXml(snippet.snippetType)}" ${isExternalAttr}="${snippet.isExternal}">`;
-  content += `\n      <Reference>${escapeXml(snippet.reference)}</Reference>`;
-  content += `\n      <ReferenceSchema>${escapeXml(snippet.referenceSchema ?? '')}</ReferenceSchema>`;
-  content += `\n    </BimSnippet>`;
-  return content;
-}
-
-/**
- * Write DocumentReference XML
- *
- * BCF 2.1 and 3.0 diverge structurally here, not just by attribute casing:
- * 2.1 has `<ReferencedDocument>` (a string, plus an `isExternal` flag on
- * whether it's a URL); 3.0 replaced both with `<DocumentGuid>` (a reference
- * into project.bcfp's Documents) or `<Url>`, and dropped `isExternal`
- * entirely (buildingSMART/BCF-XML markup.xsd, release_3_0 DocumentReference).
- * `documentGuid`/`url` are preferred when present; `referencedDocument` is
- * the 2.1-shaped fallback so 2.1-authored data written as 3.0 still emits
- * something.
- */
-function writeDocumentReference(docRef: BCFDocumentReference, version: '2.1' | '3.0'): string {
-  const guidAttr = docRef.guid ? ` Guid="${escapeXml(docRef.guid)}"` : '';
-
-  if (version === '3.0') {
-    let content = `\n    <DocumentReference${guidAttr}>`;
-    if (docRef.documentGuid) {
-      content += `\n      <DocumentGuid>${escapeXml(docRef.documentGuid)}</DocumentGuid>`;
-    } else {
-      const url = docRef.url ?? docRef.referencedDocument;
-      if (url) {
-        content += `\n      <Url>${escapeXml(url)}</Url>`;
-      }
-    }
-    if (docRef.description) {
-      content += `\n      <Description>${escapeXml(docRef.description)}</Description>`;
-    }
-    content += `\n    </DocumentReference>`;
-    return content;
-  }
-
-  let content = `\n    <DocumentReference${guidAttr} isExternal="${docRef.isExternal ?? false}">`;
-  content += `\n      <ReferencedDocument>${escapeXml(docRef.referencedDocument ?? docRef.url ?? '')}</ReferencedDocument>`;
-  if (docRef.description) {
-    content += `\n      <Description>${escapeXml(docRef.description)}</Description>`;
-  }
-  content += `\n    </DocumentReference>`;
-  return content;
-}

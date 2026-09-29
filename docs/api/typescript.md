@@ -46,12 +46,20 @@ ifc-lite ships its public npm packages under the `@ifc-lite/*` scope, plus the `
 | [`@ifc-lite/codegen`](#ifc-litecodegen) | TypeScript code generator from IFC EXPRESS schemas |
 | [`create-ifc-lite`](#create-ifc-lite) | Create IFC-Lite projects with one command |
 | [`@ifc-lite/bcf-api`](https://www.npmjs.com/package/@ifc-lite/bcf-api) | BCF API (OpenCDE) REST client for connecting to BCF servers |
+| [`@ifc-lite/charts`](https://www.npmjs.com/package/@ifc-lite/charts) | Headless chart data binding for IFC-Lite: aggregate model rows into buckets that keep their element ids, build ECharts options, render SVG |
+| [`@ifc-lite/documents-api`](https://www.npmjs.com/package/@ifc-lite/documents-api) | OpenCDE Documents API 1.0 client: select, download, query and upload documents against a buildingSMART Documents API server |
+| [`@ifc-lite/flow`](https://www.npmjs.com/package/@ifc-lite/flow) | Keyed-data graph runtime for BIM workflows: typed ports, item/list/group lifting, memoised evaluation, and element tracking for re-runnable graphs |
+| [`@ifc-lite/flow-nodes`](https://www.npmjs.com/package/@ifc-lite/flow-nodes) | Standard node library for @ifc-lite/flow over the ifc-lite SDK: model reads and writes, tables, viewer, and a sandboxed Script node |
 | [`@ifc-lite/merge`](https://www.npmjs.com/package/@ifc-lite/merge) | Three-way merge engine for IFCX layers — MergePlan with auto-merged ops and explicit conflict records, merge-layer emission, rebase, and revert. |
 | [`@ifc-lite/oauth-pkce`](https://www.npmjs.com/package/@ifc-lite/oauth-pkce) | Browser OAuth 2.0 Authorization Code + PKCE flow, shared by ifc-lite's file-source providers |
+| [`@ifc-lite/opencde-foundation`](https://www.npmjs.com/package/@ifc-lite/opencde-foundation) | buildingSMART OpenCDE Foundation API client: version discovery, auth discovery, OAuth2 flows and the shared HTTP client used by every OpenCDE service client |
 | [`@ifc-lite/plugin-api`](https://www.npmjs.com/package/@ifc-lite/plugin-api) | Dependency-free type surface for ifc-lite file-source plugins |
+| [`@ifc-lite/regex-guard`](https://www.npmjs.com/package/@ifc-lite/regex-guard) | A shared, dependency-free guard against catastrophic-backtracking (ReDoS) regex patterns compiled from untrusted input |
+| [`@ifc-lite/rules`](https://www.npmjs.com/package/@ifc-lite/rules) | Filter-rule vocabulary, evaluator and .rules.json information-validation engine for IFC-Lite |
 | [`@ifc-lite/source-dalux`](https://www.npmjs.com/package/@ifc-lite/source-dalux) | Dalux Build (Box) file-source provider for ifc-lite |
 | [`@ifc-lite/source-dropbox`](https://www.npmjs.com/package/@ifc-lite/source-dropbox) | Dropbox file-source provider for ifc-lite |
 | [`@ifc-lite/source-msgraph`](https://www.npmjs.com/package/@ifc-lite/source-msgraph) | Microsoft Graph (OneDrive/SharePoint) file-source provider for ifc-lite |
+| [`@ifc-lite/wasm-lifecycle`](https://www.npmjs.com/package/@ifc-lite/wasm-lifecycle) | Shared WASM engine load-retry classification and cross-realm panic-forwarding, used by @ifc-lite/geometry and @ifc-lite/parser |
 <!-- END GENERATED: package-index -->
 
 ---
@@ -186,20 +194,44 @@ class GeometryProcessor {
   // Stream geometry for large files (async generator of streaming events)
   processStreaming(/* buffer + streaming options; see the .d.ts */): AsyncGenerator<StreamingGeometryEvent>;
 
+  // Authored IfcSweptDiskSolid curves and derived centreline measurements
+  extractSweptDiskDescriptions(buffer: Uint8Array, ids?: Uint32Array): SweptDiskDescriptions | null;
+
   // Rust-side exporters surfaced on the processor
   exportGlb(buffer, includeMetadata?, hidden?, isolated?, hiddenTypesCsv?, lit?): Uint8Array | null;
   exportGlbFromMeshes(meshes: MeshData[], includeMetadata?, lit?): Uint8Array | null;
   exportObj(/* ... */): Uint8Array | null;
+  exportKmzFromMeshes(
+    meshes: MeshData[],
+    latitude: number,
+    longitude: number,
+    altitude: number,
+    xAxisAbscissa?: number,
+    xAxisOrdinate?: number,
+    name?: string,
+    altitudeMode?: 'clampToGround' | 'absolute',
+  ): Uint8Array | null;
   exportCsv(/* buffer, mode: 'entities'|'properties'|'quantities'|'spatial', ... */): Uint8Array | null;
   exportJson(/* ... */): Uint8Array | null;
   exportJsonld(/* ... */): Uint8Array | null;
   exportStep(/* ... */): Uint8Array | null;
   exportIfcx(buffer, onlyKnownProperties?, pretty?): Uint8Array | null;
   exportMerged(buffers: Uint8Array[], schema?): Uint8Array | null;
-  exportKmz(/* ... */): Uint8Array | null;
   exportHbjson(buffer, name): Uint8Array | null;
 }
 ```
+
+`extractSweptDiskDescriptions` returns `null` until `init()` completes. Omit
+`ids` to inspect every product, or pass an empty `Uint32Array` to select none.
+The result is keyed by product STEP ID and contains ordered exact line and arc
+segments, the disk `Radius` and `InnerRadius`, and per-segment and total
+centreline lengths in metres. Arc `bend_angle` is an unsigned radian measure;
+the directrix's signed `sweep_angle` keeps its travel direction. Coordinates
+are double-precision, absolute IFC Z-up world metres. `source_modified` marks
+a CSG operand whose final visible shape may differ. Unsupported records have
+an empty directrix and `directrix_metrics: null`. `diagnostics` reports
+malformed representation walks. The returned data is an analytic description,
+not a render overlay or a mesh.
 
 ### GeometryResult and MeshData
 
@@ -248,6 +280,11 @@ class RelationshipGraphBuilder { /* build(): RelationshipGraph */ }
 ```
 
 Each table type also has `fromColumns` / `toColumns` helpers for structured-clone transfer across workers (`entityTableFromColumns`, `propertyTableToColumns`, ...). Shared enums and types live here too: `IfcTypeEnum`, `PropertyValueType`, `QuantityType`, `RelationshipType`, `SpatialHierarchy`, `IfcStoreBase`, the generated entity-name lists (`ENTITIES_IFC2X3` / `IFC4` / `IFC4X3`), plus utilities like `safeUtf8Decode` and `createLogger`.
+
+`countEffectiveEntityTypes(store, overlay, sourceIds?)` returns uppercase IFC
+class counts after queued creates, deletes, and retypes. Pass the same store and
+overlay used by `iterateEffectiveEntities`; supply `sourceIds` for a columnar
+source without STEP type buckets, such as IFCX.
 
 `IFC_DATA_TYPES` sits alongside those entity lists: the raw, read-only table of EXPRESS **defined types** (`IfcLengthMeasure`, `IfcBoolean`, `IfcTextAlignment`, ...) across all three schemas. The upstream data the `ENTITIES_*` lists come from carries defined types as entity rows, so any synchronous consumer deciding "is this name a real class?" has to subtract this table — that is what `@ifc-lite/parser`'s `isKnownType` does. Prefer the async `findDataType(version, name)` when you only need a single lookup and are not inside a synchronous guard.
 
@@ -426,11 +463,18 @@ class Renderer {
   // Initialize WebGPU
   init(): Promise<void>;
 
-  // Load geometry (main entry point for IFC geometry)
-  loadGeometry(geometry: GeometryResult | MeshData[]): void;
+  // Rebuild a lost GPU device and reconstructable scene resources in place.
+  // Transient GPU-only layers that were cleared are named in `omissions`.
+  recoverDevice(): Promise<DeviceRecoveryResult>;
 
-  // Add meshes incrementally (for streaming)
-  addMeshes(meshes: MeshData[], isStreaming?: boolean): void;
+  // Load geometry (main entry point for IFC geometry). Returns a typed
+  // outcome instead of throwing when the GPU device is lost (#4885) — check
+  // `.ok` before assuming the geometry was uploaded.
+  loadGeometry(geometry: GeometryResult | MeshData[]): GpuUploadOutcome<void>;
+
+  // Add meshes incrementally (for streaming). Same lost-device contract as
+  // loadGeometry.
+  addMeshes(meshes: MeshData[], isStreaming?: boolean): GpuUploadOutcome<void>;
 
   // Rendering
   render(options?: RenderOptions): void;
@@ -457,9 +501,20 @@ class Renderer {
 
 Visibility is passed via `render()` options (`hiddenIds`, `isolatedIds`); frustum culling via `enableFrustumCulling` plus a `spatialIndex` from `@ifc-lite/spatial`.
 
+`DeviceRecoveryResult` is a discriminated union. Success carries an `omissions`
+array (`point-clouds`, `reference-images`, or transient overlay kinds); failure
+carries a stable `reason`, including `cpu-geometry-released`,
+`scene-not-settled`, `cold-restore-failed`, `device-init-failed`, and
+`scene-restore-failed`. Recovery preserves the renderer and camera rather than
+remounting the viewport.
+
 `PickResult` carries `expressId` (the product) plus the optional `modelIndex`, `worldXYZ` and `geometryItemId`. The last is the `IfcRepresentationItem` the clicked surface was built from, and the key is absent, never `0`, where the renderer has no item identity for that hit. See [Which representation item was picked](../guide/rendering.md#which-representation-item-was-picked).
 
 Other exports: `Camera`, `Picker`, `Raycaster`, `SnapDetector`, `BVH`, `RaycastEngine`, `SectionPlaneRenderer`, `PointCloudRenderer`, `FederationRegistry` (multi-model id ranges), and the section-cap / plane-basis helpers.
+
+`Renderer.hasActiveClipping()` reports section, terrain or box clipping from the last rendered frame. `raycastScene()` applies the same clip state and its `Intersection` includes `modelIndex`, plus `geometryItemId` and `sourceTriangleIndex` when the hit has unambiguous representation-item and canonical evaluated-surface provenance. `appearanceSourceTriangle(mesh, triangleIndex)` performs that strict provenance lookup directly and returns `undefined` for absent, stale or mixed-corner identity.
+
+An appearance preview may carry an `AppearancePartition` whose `sourceGeometryItemId` and `triangleCount` name one canonical evaluated surface. Its `before` and `after` parts use side-local `partId` values and canonical triangle ordinals, allowing repeated representation-item ids across streaming fragments. `validateAppearancePartition(partition, before, after)` verifies bounded, disjoint and complete provenance plus exact ownership, placement and corner geometry; `invertAppearancePartition(partition)` describes the reverse transition for Undo.
 
 `Scene` and `Section2DOverlayRenderer` are package-internal from 2.0: reach the scene through `getScene(): SceneContents`, and the 3D line overlays through `Renderer.setLineOverlay`. `PickingManager` is package-internal from 2.0 as well: its constructor takes the now-internal `Scene`, so an exported class nobody could construct would have been worse than no export. Pick through `Renderer.pick` / `Renderer.pickRect`.
 
@@ -528,7 +583,7 @@ Creates a `.bos` archive (ZIP of Parquet files) from a parsed store, optionally 
 
 ```typescript
 class ParquetExporter {
-  constructor(store: IfcDataStore, geometryResult?: GeometryResult);
+  constructor(store: IfcDataStore, geometryResult?: GeometryResult, mutationView?: MutablePropertyView);
 
   exportBOS(options?: ParquetExportOptions): Promise<Uint8Array>;
   exportTable(tableName: string): Promise<Uint8Array>;
@@ -571,6 +626,12 @@ The standalone `GltfExporter` and `CsvExporter` classes were removed. glTF/GLB a
 ## @ifc-lite/mutations
 
 Property editing with bidirectional change tracking. Nothing mutates the parsed buffer; edits accumulate in an overlay and materialise during `StepExporter.export({ applyMutations: true })`.
+
+`iterateEffectiveEntityIds(dataStore, view, types?)` enumerates the live entity
+set for a model: parsed entities minus tombstones, plus overlay creations, with
+queued class changes applied. `types` is an optional list of schema-expanded
+UPPERCASE IFC names. Results carry `expressId`, effective `type`, and
+`overlayCreated`; pass each model's own store and view together.
 
 ### MutablePropertyView
 
@@ -789,12 +850,16 @@ For editing an **already-parsed** `IfcDataStore`, the package exposes anchored b
 
 `addColumnToStore`, `addWallToStore`, `addSlabToStore`, `addBeamToStore`, `addDoorToStore`, `addWindowToStore`, `addSpaceToStore`, `addRoofToStore`, `addPlateToStore`, `addMemberToStore`.
 
+Hosted builders take a `HostAnchor` from `resolveHostAnchor(dataStore, hostExpressId, mutationView)` instead: `addOpeningToStore` (IfcOpeningElement + IfcRelVoidsElement in an IfcWall or IfcSlab), `addHostedDoorToStore` and `addHostedWindowToStore` (the opening plus an IfcDoor / IfcWindow filling it through IfcRelFillsElement).
+
+Type objects and materials take the storey-free anchor from `resolveAuthoringAnchor(dataStore, mutationView)`: `addElementTypeToStore` and `assignTypeInStore` (IfcRelDefinesByType), and `addMaterialToStore`, `addMaterialLayerSetToStore`, `addMaterialLayerSetUsageToStore` and `assignMaterialInStore` (IfcRelAssociatesMaterial). The `assign*` builders take the model's existing relationships from `readRelatedLists`.
+
 ```typescript
 import { StoreEditor } from '@ifc-lite/mutations';
 import { addColumnToStore, resolveSpatialAnchor } from '@ifc-lite/create';
 
 const editor = new StoreEditor(dataStore, mutationView);
-const anchor = resolveSpatialAnchor(dataStore, storeyExpressId);
+const anchor = resolveSpatialAnchor(dataStore, storeyExpressId, mutationView);
 
 const result = addColumnToStore(editor, anchor, {
   Position: [1, 1, 0],
@@ -805,13 +870,14 @@ const result = addColumnToStore(editor, anchor, {
 
 #### resolveSpatialAnchor
 
-Walks a parsed `IfcDataStore` for the references every in-store builder needs. Throws if `IfcOwnerHistory`, the 'Body' representation context, or the storey's `IfcLocalPlacement` cannot be resolved.
+Reads the parsed `IfcDataStore` and, when supplied, a live mutation view for the references every in-store builder needs. Deleted or retyped-away anchors are excluded; created storeys and placements are accepted. `IfcOwnerHistory` is optional in IFC4 and required in IFC2X3. Throws if a required context or the storey's `IfcLocalPlacement` cannot be resolved.
 
 ```typescript
-function resolveSpatialAnchor(store: IfcDataStore, storeyExpressId: number): SpatialAnchor;
+import type { MutablePropertyView } from '@ifc-lite/mutations';
+function resolveSpatialAnchor(store: IfcDataStore, storeyExpressId: number, view?: MutablePropertyView | null): SpatialAnchor;
 
 interface SpatialAnchor {
-  ownerHistoryId: number;    // referenced by every IfcRoot
+  ownerHistoryId: number | null; // optional from IFC4 onward
   bodyContextId: number;     // 'Body' subcontext (or parent context fallback)
   storeyId: number;
   storeyPlacementId: number; // the storey's own IfcLocalPlacement
@@ -829,7 +895,7 @@ For byte-reproducible **exported files**, seed the exporter too: builders that a
 
 ## @ifc-lite/bcf
 
-BCF (BIM Collaboration Format) support for issue tracking. Implements BCF 2.1 and 3.0.
+BCF (BIM Collaboration Format) support for topic tracking. Implements BCF 2.1 and 3.0.
 
 ### readBCF / writeBCF
 
@@ -873,7 +939,7 @@ function extractViewpointState(viewpoint: BCFViewpoint): {
 
 ### Utilities
 
-GUID conversion (`uuidToIfcGuid`, `ifcGuidToUuid`, `generateIfcGuid`, `isValidIfcGuid`), ARGB colour helpers (`parseARGBColor`, `toARGBColor`), 3D marker overlay (`computeMarkerPositions`, `BCFOverlayRenderer`), and `createBCFFromIDSReport` to turn an IDS validation report into BCF topics.
+GUID conversion (`uuidToIfcGuid`, `ifcGuidToUuid`, `generateIfcGuid`, `isValidIfcGuid`), ARGB colour helpers (`parseARGBColor`, `toARGBColor`), 3D marker positioning (`computeMarkerPositions`), and `createBCFFromIDSReport` to turn an IDS validation report into BCF topics.
 
 ---
 
@@ -968,7 +1034,7 @@ Headless model-diff engine: classifies entities as added / modified / deleted / 
 
 ## @ifc-lite/lens
 
-Rule-based 3D filtering and colorization for IFC models: `evaluateLens`, `evaluateAutoColorLens`, `matchesCriteria`, class/data-source discovery (`discoverClasses`, `discoverDataSources`), and `BUILTIN_LENSES` presets.
+Rule-based 3D filtering and colorization for IFC models: `evaluateLens` applies shared rule selections, `evaluateAutoColorLens` groups by data values, and class/data-source discovery (`discoverClasses`, `discoverDataSources`) supports the `BUILTIN_LENSES` presets.
 
 ## @ifc-lite/lists
 

@@ -4,7 +4,7 @@
 
 /**
  * Single source of truth for "which loaded models have pending changes, and
- * how many". Both the toolbar Export Changes badge and its multi-model export
+ * how many". Both the toolbar Export modified IFC… badge and its multi-model export
  * loop read from here, so the count the user sees and the set of files they get
  * can never disagree (issue #1534: the badge + export used to look at only the
  * first federated model).
@@ -30,7 +30,9 @@ import type { ExportScheduleState } from '@/sdk/adapters/export-schedule-splice'
 // Import from the pure helpers module (not the slice) so this stays free of the
 // slice's runtime graph — keeps the module and its tests hermetic.
 import { countGeneratedTasks } from '@/store/slices/schedule-edit-helpers';
-import { sanitizeFilename } from './download.js';
+import { sanitizeFilename, stripExtension } from './download.js';
+import { mapStepSchema, uniqueArtifactBase } from './artifact-naming.js';
+import { roomExportPathPrefix, type RoomExportPathState } from '@/lib/collab/room-export-paths';
 
 /** Synthetic id for the legacy single-model store (no federation map). */
 export const LEGACY_MODEL_ID = '__legacy__';
@@ -39,9 +41,11 @@ export const LEGACY_MODEL_ID = '__legacy__';
  * The subset of the viewer store `collectChangedModels` /
  * `buildChangedArtifacts` read. Declared structurally (not as the full
  * `ViewerState`) so tests can build a minimal snapshot, and so the real store
- * — whose Maps are mutable — is assignable via `ReadonlyMap`.
+ * — whose Maps are mutable — is assignable via `ReadonlyMap`. The room fields
+ * (`collabRoomId`, `collabRoomModels`) tell the IFCX route which models are a
+ * recipient's room models, whose node paths carry the room slot (#4444).
  */
-export interface ChangesExportState {
+export interface ChangesExportState extends RoomExportPathState {
   /** Federated models keyed by id. Empty in legacy single-model mode. */
   models: ReadonlyMap<string, FederatedModel>;
   /** Legacy single-model data store (used only when `models` is empty). */
@@ -230,8 +234,10 @@ export function totalChangeCount(result: ChangedModelsResult): number {
 /** A produced export payload for one model, before final naming. */
 export interface ChangesExportArtifact {
   content: string | Uint8Array;
-  ext: 'ifc' | 'ifcx';
+  ext: 'ifc' | 'ifczip' | 'ifcx';
   mime: string;
+  /** Edits the format could not represent and left out, e.g. an empty pset in IFCX (#5201). */
+  skippedCount?: number;
 }
 
 /** STEP export request handed to the injected `exportStep` dep. */
@@ -256,6 +262,8 @@ export interface IfcxExportInvocation {
    * loaded — nothing else to wrongly include.
    */
   maxExpressId?: number;
+  /** Room slot prefix a recipient's room model must drop from its node paths (#4444). */
+  stripPathPrefix?: string;
 }
 
 export interface BuildArtifactsDeps {
@@ -278,11 +286,13 @@ export interface BuildArtifactsDeps {
 /** A produced file (base name is deduped so `base.ext` is unique in the set). */
 export interface ArtifactFile {
   base: string;
-  ext: 'ifc' | 'ifcx';
+  ext: 'ifc' | 'ifczip' | 'ifcx';
   mime: string;
   content: string | Uint8Array;
   modelId: string;
   changeCount: number;
+  /** See {@link ChangesExportArtifact.skippedCount}. */
+  skippedCount: number;
 }
 
 export interface SkippedModel {
@@ -296,37 +306,6 @@ export interface BuildArtifactsResult {
   scheduleTargetModelId: string | null;
   /** True if the pending schedule was actually spliced into a produced STEP file. */
   scheduleSpliced: boolean;
-}
-
-/** Map any schema string to the STEP schema token (matches the legacy button). */
-export function mapStepSchema(schemaVersion: string): 'IFC2X3' | 'IFC4' | 'IFC4X3' {
-  return schemaVersion.includes('2X3')
-    ? 'IFC2X3'
-    : schemaVersion.includes('4X3')
-      ? 'IFC4X3'
-      : 'IFC4';
-}
-
-function stripExtension(name: string): string {
-  return name.replace(/\.[^.]+$/, '');
-}
-
-/**
- * Reserve a collision-free base for `base.ext`. fflate keys zip entries by
- * name and silently clobbers duplicates, and federated models frequently share
- * a name (and `sanitizeFilename` truncates to 60 chars), so two `model.ifc`
- * inputs must become `model.ifc` + `model-2.ifc`. Same base, different ext
- * (`model.ifc` + `model.ifcx`) do NOT collide.
- */
-export function uniqueArtifactBase(base: string, ext: string, used: Set<string>): string {
-  if (!used.has(`${base}.${ext}`)) {
-    used.add(`${base}.${ext}`);
-    return base;
-  }
-  let i = 2;
-  while (used.has(`${base}-${i}.${ext}`)) i++;
-  used.add(`${base}-${i}.${ext}`);
-  return `${base}-${i}`;
 }
 
 /**
@@ -379,6 +358,7 @@ export async function buildChangedArtifacts(
           geometryResult,
           idOffset: model?.idOffset ?? 0,
           maxExpressId: model?.maxExpressId,
+          stripPathPrefix: roomExportPathPrefix(state, entry.id),
         });
       } else {
         const dataStore = await deps.resolveStepDataStore(entry.id);
@@ -407,6 +387,7 @@ export async function buildChangedArtifacts(
         content: artifact.content,
         modelId: entry.id,
         changeCount: entry.changeCount,
+        skippedCount: artifact.skippedCount ?? 0,
       });
     } catch (err) {
       skipped.push({ name: entry.name, reason: err instanceof Error ? err.message : 'Export failed' });

@@ -483,3 +483,54 @@ fn feature_off_is_a_noop_and_deterministic() {
     assert_eq!(n1, host.normals, "feature-off leaves normals byte-identical");
     assert_eq!((p1, i1, n1), (p2, i2, n2), "deterministic across runs");
 }
+
+/// Offset `d` from a site 9 km out (native positions are absolute).
+fn far(d: [f64; 3]) -> [f64; 3] {
+    const F: [f64; 3] = [9000.375, 5000.25, 300.125];
+    [F[0] + d[0], F[1] + d[1], F[2] + d[2]]
+}
+
+/// One mesh holding every part's triangles, indices rebased.
+fn joined(parts: &[&Mesh]) -> Mesh {
+    let mut mesh = Mesh::new();
+    for part in parts {
+        let offset = (mesh.positions.len() / 3) as u32;
+        mesh.positions.extend_from_slice(&part.positions);
+        mesh.indices.extend(part.indices.iter().map(|i| offset + i));
+    }
+    mesh
+}
+
+/// A single unpaired triangle: the crack that leaves a host open.
+fn crack_triangle(corners: [[f64; 3]; 3]) -> Mesh {
+    let mut mesh = Mesh::new();
+    for p in corners {
+        mesh.positions.extend(p.map(|x| x as f32));
+    }
+    mesh.indices = vec![0, 1, 2];
+    mesh
+}
+
+/// `accept_cut`'s removed volume over an OPEN host 9 km out (native positions
+/// are absolute). One unpaired triangle inside the wall stands in for a crack
+/// (normal -X); the cut removes a 1 m rod from the wall's -X face, moving the
+/// mesh's bounding-box centre by 0.5 m. `vol_before` and the after reading
+/// must share one reference point, or the untouched crack leaves
+/// `(o_after - o_before)·N/6` (-0.17 m³ here) in the removed volume and a
+/// bound tighter than the rod still accepts the cut (#4632).
+#[test]
+fn accept_cut_reads_before_and_after_about_one_point_on_an_open_far_host_4632() {
+    let rod = box_mesh(far([-1.0, 0.0, 0.0]), far([0.0, 0.125, 0.125]));
+    let wall = box_mesh(far([0.0, 0.0, 0.0]), far([3.0, 1.0, 3.0]));
+    let crack = crack_triangle([far([1.5, 0.0, 0.5]), far([1.5, 0.0, 2.5]), far([1.5, 1.0, 0.5])]);
+    let host = joined(&[&rod, &wall, &crack]);
+    let cut = joined(&[&wall, &crack]);
+    let rod_volume = 1.0 * 0.125 * 0.125;
+
+    let run = |max_removed: f64| {
+        let mut result = host.clone();
+        accept_cut(&mut result, cut.clone(), max_removed)
+    };
+    assert!(run(rod_volume * (1.0 + 1e-6)), "a bound just above the rod's volume admits the cut");
+    assert!(!run(rod_volume * (1.0 - 1e-3)), "a bound just below the rod's volume refuses it");
+}

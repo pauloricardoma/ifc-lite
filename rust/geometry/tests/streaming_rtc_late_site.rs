@@ -5,7 +5,7 @@
 //! Regression for georeferenced jitter (ISSUE_129). The world offset lives in
 //! spatial-structure placements emitted LATE in the file (IfcSite at line
 //! 202 339 of a 202 691 line model). `buildPrePassStreaming` emits its RTC meta
-//! as soon as `RTC_SAMPLE_THRESHOLD` (50) geometry jobs are buffered — near the
+//! as soon as `META_EMIT_JOBS` (50) geometry jobs are buffered — near the
 //! TOP of the file — using the partial entity index built so far. At that point
 //! the element -> storey -> building -> site placement chain can't resolve, so
 //! detection returns (0,0,0), `needsShift=false`, and the ~8e6 m coordinates are
@@ -17,30 +17,31 @@
 //! *full* index recovers it (the fallback `gpu_meshes.rs` now performs when no
 //! offset is found and the IfcSite hasn't been scanned yet).
 
-use ifc_lite_core::{build_entity_index, EntityDecoder, EntityScanner, IfcType};
+use ifc_lite_core::{build_entity_index, EntityDecoder, EntityScanner};
 use ifc_lite_geometry::GeometryRouter;
 
 const FIXTURE: &str =
     "../../tests/models/ara3d/ISSUE_129_N1540_17_EXE_MOD_448200_02_09_11SMC_IGC_V17.ifc";
-const RTC_SAMPLE_THRESHOLD: usize = 50; // mirrors gpu_meshes.rs
+const META_EMIT_JOBS: usize = 50; // mirrors META_EMIT_JOB_THRESHOLD in gpu_meshes/prepass.rs
 
-/// First `n` geometry-bearing jobs, in file order. Byte spans are valid in any
-/// prefix of `content` that contains them.
-fn geometry_jobs(content: &str, n: usize) -> Vec<(u32, usize, usize, IfcType)> {
-    let mut jobs = Vec::new();
+/// Record-end offsets of the first `n` geometry-bearing entities, in file order.
+/// The last of them is where the streaming pre-pass emits its meta, so it is
+/// the byte the partial index reaches.
+fn geometry_job_ends(content: &str, n: usize) -> Vec<usize> {
+    let mut ends = Vec::new();
     let mut sc = EntityScanner::new(content);
-    while let Some((id, ty, s, e)) = sc.next_entity() {
+    while let Some((_, ty, _, e)) = sc.next_entity() {
         if matches!(
             ty,
             "IFCWALL" | "IFCWALLSTANDARDCASE" | "IFCSLAB" | "IFCCOLUMN" | "IFCBEAM" | "IFCSTAIRFLIGHT"
         ) {
-            jobs.push((id, s, e, IfcType::IfcWall));
-            if jobs.len() >= n {
+            ends.push(e);
+            if ends.len() >= n {
                 break;
             }
         }
     }
-    jobs
+    ends
 }
 
 #[test]
@@ -54,13 +55,13 @@ fn streaming_partial_index_misses_late_site_offset_but_full_index_recovers_it() 
         return;
     }
 
-    let jobs = geometry_jobs(&full, RTC_SAMPLE_THRESHOLD);
-    assert_eq!(jobs.len(), RTC_SAMPLE_THRESHOLD, "need the first 50 geometry jobs");
+    let job_ends = geometry_job_ends(&full, META_EMIT_JOBS);
+    assert_eq!(job_ends.len(), META_EMIT_JOBS, "need the first 50 geometry jobs");
 
     // The streaming meta is emitted right after the 50th geometry job is
     // buffered, against the partial index built up to that scan point. Model
     // that exactly: content truncated at the end of the 50th geometry job.
-    let cut = jobs.last().unwrap().2;
+    let cut = *job_ends.last().unwrap();
     let partial = &full[..cut];
     assert!(
         !partial.contains("IFCSITE"),
@@ -73,10 +74,14 @@ fn streaming_partial_index_misses_late_site_offset_but_full_index_recovers_it() 
 
     // Partial index (reproduces the browser's rtc=[0,0,0]): the late spatial
     // placements are unreachable, so the offset is missed.
+    // The decoder reads the FULL content with the PARTIAL index, and the sample
+    // window is the scanned head, which is what `resolve_partial_rtc` hands the
+    // detector mid-scan: the whole buffer is resident, only the index and the
+    // window stop at the scan point.
     let partial_index = build_entity_index(partial);
-    let mut partial_decoder = EntityDecoder::with_index(partial, partial_index);
+    let mut partial_decoder = EntityDecoder::with_index(&full, partial_index);
     let partial_rtc = router
-        .detect_rtc_offset_from_jobs(&jobs, &mut partial_decoder)
+        .detect_rtc_anchor_for_file(partial.as_bytes(), &mut partial_decoder)
         .unwrap_or((0.0, 0.0, 0.0));
     assert!(
         !is_large(partial_rtc),
@@ -88,7 +93,7 @@ fn streaming_partial_index_misses_late_site_offset_but_full_index_recovers_it() 
     let full_index = build_entity_index(&full);
     let mut full_decoder = EntityDecoder::with_index(&full, full_index);
     let full_rtc = router
-        .detect_rtc_offset_from_jobs(&jobs, &mut full_decoder)
+        .detect_rtc_anchor_for_file(full.as_bytes(), &mut full_decoder)
         .expect("full-index detection returns an offset");
     assert!(
         is_large(full_rtc) && full_rtc.0.abs() > 1.0e6 && full_rtc.1.abs() > 1.0e6,
