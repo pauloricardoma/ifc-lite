@@ -1,4 +1,4 @@
-import { ViewerEngine, LoadPhase } from './engine.js';
+import { ViewerEngine, LoadPhase, ProjectionMode } from './engine.js';
 import type { BCFOrthogonalCamera, BCFPerspectiveCamera } from '@ifc-lite/bcf';
 import type { BimEntityProperties, BimTreeNode } from './data-model.js';
 import type { Measurement, MeasureMode } from './measure.js';
@@ -54,7 +54,8 @@ export function initCoordly3DViewer(config: BimConfig): BimInstance {
     onDataModel: (detail) => emit('bim-datamodel-ready', detail),
     onDataModelProgress: (detail) => emit('bim-datamodel-progress', detail),
     onMeasure: (detail) => emit('bim-measure-changed', detail),
-    onViewReset: () => emit('bim-view-reset', {})
+    onViewReset: () => emit('bim-view-reset', {}),
+    onProjection: (mode) => emit('bim-projection-changed', { mode })
   });
 
   window.bimExec = (cmd: string) => {
@@ -84,6 +85,8 @@ export function initCoordly3DViewer(config: BimConfig): BimInstance {
       camera: BCFPerspectiveCamera | BCFOrthogonalCamera,
       targetDistance?: number,
     ) => engine.setBcfCamera(camera, targetDistance),
+    getProjection: () => engine.getProjection(),
+    setProjection: (mode: ProjectionMode) => engine.setProjection(mode),
     captureSnapshot: () => engine.captureSnapshot(),
     getGlobalIds: (expressIds: number[], modelIndex?: number) =>
       engine.getGlobalIds(expressIds, modelIndex),
@@ -187,6 +190,8 @@ declare global {
         camera: BCFPerspectiveCamera | BCFOrthogonalCamera,
         targetDistance?: number,
       ): void;
+      getProjection(): ProjectionMode;
+      setProjection(mode: ProjectionMode): void;
       captureSnapshot(): Promise<string | null>;
       getGlobalIds(
         expressIds: number[],

@@ -96,7 +96,14 @@ interface EngineEvents {
   onMeasure(detail: { mode: MeasureMode; measurements: Measurement[] }): void;
   /** A cena voltou ao padrão (Esc): o app espelha ocultos/isolamento e precisa zerar. */
   onViewReset(): void;
+  /**
+   * A projeção mudou — pelo botão ou por um viewpoint restaurado, que traz a
+   * dele. Sem isto a toolbar mostraria a projeção de antes do restore.
+   */
+  onProjection?(mode: ProjectionMode): void;
 }
+
+export type ProjectionMode = 'perspective' | 'orthographic';
 
 // Clique = pointerdown→up sem passar deste deslocamento acumulado (CSS px).
 // Acima disso é orbit/pan, não seleção.
@@ -1389,6 +1396,22 @@ export class ViewerEngine {
       : cameraToPerspective(state);
   }
 
+  getProjection(): ProjectionMode {
+    return this.camera?.getProjectionMode?.() ?? 'perspective';
+  }
+
+  /** Troca a projeção e enquadra o modelo nela, como o botão de enquadrar. */
+  setProjection(mode: ProjectionMode): void {
+    if (!this.camera) { return; }
+    this.applyProjection(mode);
+    this.fitToView();
+  }
+
+  private applyProjection(mode: ProjectionMode): void {
+    this.camera.setProjectionMode?.(mode);
+    this.events.onProjection?.(mode);
+  }
+
   /** Aplica uma câmera do BCF. `targetDistance` só posiciona o alvo/pivô. */
   setBcfCamera(
     camera: BCFPerspectiveCamera | BCFOrthogonalCamera,
@@ -1402,7 +1425,7 @@ export class ViewerEngine {
       ? orthogonalToCamera(camera as BCFOrthogonalCamera, distance)
       : perspectiveToCamera(camera as BCFPerspectiveCamera, distance);
 
-    this.camera.setProjectionMode?.(isOrthographic ? 'orthographic' : 'perspective');
+    this.applyProjection(isOrthographic ? 'orthographic' : 'perspective');
     this.camera.setPosition(state.position.x, state.position.y, state.position.z);
     this.camera.setTarget(state.target.x, state.target.y, state.target.z);
     this.camera.setUp(state.up.x, state.up.y, state.up.z);
