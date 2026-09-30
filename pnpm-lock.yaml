@@ -141,6 +141,9 @@ importers:
       '@ifc-lite/bcf':
         specifier: workspace:*
         version: link:../../packages/bcf
+      '@ifc-lite/clash':
+        specifier: workspace:*
+        version: link:../../packages/clash
       '@ifc-lite/geometry':
         specifier: workspace:*
         version: link:../../packages/geometry

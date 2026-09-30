@@ -18,6 +18,48 @@ import {
 } from '@ifc-lite/bcf';
 import type { BCFClippingPlane, BCFOrthogonalCamera, BCFPerspectiveCamera } from '@ifc-lite/bcf';
 import { bcfPlaneToSection, sectionToBcfPlane, withBoundsRange } from './section-bcf.js';
+import { createClashEngine, groupClashes, type ClashProgress, type ClashRuleCoverage } from '@ifc-lite/clash';
+import {
+  buildClashElements,
+  countClashTypes,
+  dedupePairs,
+  dropExcluded,
+  dropWithinTolerance,
+  indexClashLinks,
+  scopeRules,
+  toClashItems,
+  toEngineRules,
+  userRuleOf,
+  wantedByRules,
+  type ClashItem,
+  type ClashItemRef,
+  type ClashLinkIndex,
+  type ClashMeshPiece,
+  type ClashRuleCoverageItem,
+  type ClashRuleInput,
+  type ClashRunOptions,
+  type ClashRunResult,
+} from './clash.js';
+
+export type ClashFocusMode = 'highlight' | 'isolate' | 'ghost';
+
+/** Cobertura por regra do app: soma as regras de cada par de modelos. */
+function sumCoverage(coverage: ClashRuleCoverage[]): ClashRuleCoverageItem[] {
+  const byRule = new Map<string, ClashRuleCoverageItem>();
+  for (const c of coverage) {
+    const rule = userRuleOf(c.rule);
+    const sum = byRule.get(rule) ?? { rule, matchedA: 0, matchedB: 0 };
+    sum.matchedA += c.matchedA;
+    sum.matchedB = (sum.matchedB ?? 0) + (c.matchedB ?? c.matchedA);
+    byRule.set(rule, sum);
+  }
+  return Array.from(byRule.values());
+}
+
+const byModelIndex = (models: Map<string, { index: number }>, index: number): boolean => {
+  for (const model of models.values()) { if (model.index === index) { return true; } }
+  return false;
+};
 
 // O data model é escrito no cache DEPOIS da geometria (o server responde o
 // parquet e grava o resto em background), então um 202 logo após o load é
@@ -129,6 +171,9 @@ const CLICK_DRAG_PX = 5;
  * só a remoção. Os dois convivem.
  */
 const MODEL_ID_STEP = 50_000_000;
+
+/** Elemento em conflito, pintado na cena depois da verificação. */
+const CLASH_COLOR: [number, number, number, number] = [0.9, 0.12, 0.12, 1];
 
 /** Desfaz o offset: o mundo fora do engine só conhece o expressId do arquivo. */
 const localExpressId = (expressId: number): number => expressId % MODEL_ID_STEP;
@@ -320,6 +365,12 @@ export class ViewerEngine {
   private section: SectionPlane | null = null;
   // Criada no init(), quando já existe câmera para projetar o overlay.
   private measure: MeasureTool | null = null;
+  private clashAborter: AbortController | null = null;
+  /** Ids da cena em conflito na última verificação — o que o "destacar todos" pinta. */
+  private clashIds: number[] = [];
+  private clashHighlight = false;
+  /** O isolamento atual foi posto pelo foco num conflito (e sai no próximo). */
+  private clashIsolated = false;
 
   constructor(private canvas: HTMLCanvasElement, private events: EngineEvents) {}
 
@@ -1077,6 +1128,8 @@ export class ViewerEngine {
   removeModel(modelId: string): void {
     const model = this.models.get(modelId);
     if (!model || !this.renderer) { return; }
+    // Um clash em curso guarda ids deste modelo: o resultado apontaria para o nada.
+    this.cancelClash();
 
     const scene = this.renderer.getScene();
     // A remoção só marca os buckets; sem device/pipeline ela não chega à GPU e
@@ -1344,6 +1397,8 @@ export class ViewerEngine {
 
   // Reset da sessão federada (esvazia a cena e volta a poder escolher o motor).
   clearModels(): void {
+    this.cancelClash();
+    this.clearClash();
     this.renderer?.getScene().clear();
     this.releaseDataStores();
     this.models.clear();
@@ -1705,6 +1760,186 @@ export class ViewerEngine {
     this.renderer?.requestRender();
   }
 
+  // ---------------------------------------------------------------------------
+  // Clash — as regras vêm do app em tipos IFC; o escopo é o que está na cena
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Roda as regras sobre os modelos na cena. Uma execução por vez: começar
+   * outra cancela a anterior (a promise dela rejeita com `AbortError`).
+   */
+  async runClash(
+    rules: ClashRuleInput[],
+    options: ClashRunOptions,
+    onProgress?: (p: ClashProgress) => void,
+  ): Promise<ClashRunResult> {
+    this.cancelClash();
+    const aborter = new AbortController();
+    this.clashAborter = aborter;
+    const started = performance.now();
+    const aborted = () => {
+      if (aborter.signal.aborted) { throw new DOMException('Clash cancelado', 'AbortError'); }
+    };
+
+    try {
+      const models = Array.from(this.models.values());
+      const byIndex = new Map(models.map((model) => [model.index, model]));
+      const modelOf = (sceneId: number) => byIndex.get(modelIndexOf(sceneId))?.id;
+
+      // GlobalId (chave durável) e relações de exclusão, uma ida ao worker por
+      // modelo. As relações vêm na passada das propriedades: num modelo grande
+      // recém-aberto isto espera ela terminar.
+      const globalIds = new Map<number, string>();
+      const links = new Map<string, ClashLinkIndex>();
+      for (const model of models) {
+        if (!model.dataStore) { continue; }
+        const ids = Array.from(model.ids, localExpressId);
+        const [found, modelLinks] = await Promise.all([
+          model.dataStore.getGlobalIds(ids),
+          model.dataStore.getClashLinks(),
+        ]);
+        for (const { expressId, globalId } of found) { globalIds.set(expressId + model.idOffset, globalId); }
+        links.set(model.id, indexClashLinks(modelLinks));
+      }
+      aborted();
+
+      const scoped = scopeRules(rules, models.map((model) => model.id), options.crossModelOnly);
+      const pieces: ClashMeshPiece[] = [];
+      this.renderer.getScene().forEachMeshData((md) => pieces.push(md as ClashMeshPiece));
+      const { elements, frame } = buildClashElements(pieces, {
+        modelOf,
+        wanted: wantedByRules(scoped),
+        keyOf: (sceneId) => globalIds.get(sceneId),
+      });
+
+      const result = await createClashEngine({ backend: 'ts' }).run(
+        elements,
+        toEngineRules(scoped, elements, options),
+        { signal: aborter.signal, onProgress },
+      );
+      const kept = dedupePairs(
+        dropExcluded(dropWithinTolerance(result.clashes, options), links, localExpressId),
+        rules.map((rule) => rule.id),
+      );
+
+      const issues = groupClashes({ ...result, clashes: kept }, { by: 'cluster' });
+      const issueOf = new Map<string, number>();
+      issues.forEach((group, i) => group.members.forEach((c) => issueOf.set(c.id, i)));
+
+      this.clashIds = kept.flatMap((c) => [c.a.ref, c.b.ref]);
+      this.paintClashes();
+      const clashes = toClashItems(kept, issueOf, frame, localExpressId)
+        .sort((x, y) => x.issue - y.issue);
+      await this.labelClashes(clashes);
+
+      return {
+        clashes,
+        issueCount: issues.length,
+        coverage: sumCoverage(result.ruleCoverage ?? []),
+        ...(result.truncated ? { truncated: result.truncated } : {}),
+        elementCount: elements.length,
+        elapsedMs: Math.round(performance.now() - started),
+      };
+    } finally {
+      if (this.clashAborter === aborter) { this.clashAborter = null; }
+    }
+  }
+
+  cancelClash(): void {
+    this.clashAborter?.abort();
+    this.clashAborter = null;
+  }
+
+  /** "Destacar todos": pinta os elementos em conflito da última verificação. */
+  setClashHighlight(enabled: boolean): void {
+    this.clashHighlight = enabled;
+    this.paintClashes();
+  }
+
+  /** Esquece o resultado: tira a pintura e o isolamento que o foco pôs. */
+  clearClash(): void {
+    this.clashIds = [];
+    this.paintClashes();
+    if (this.clashIsolated) { this.isolatedIds = null; this.clashIsolated = false; }
+    this.renderer?.requestRender();
+  }
+
+  /** Tipos com geometria na cena e quantos elementos de cada. */
+  getClashTypes(): { ifcType: string; count: number }[] {
+    if (!this.renderer) { return []; }
+    const pieces: ClashMeshPiece[] = [];
+    this.renderer.getScene().forEachMeshData((md) => pieces.push(md as ClashMeshPiece));
+    return countClashTypes(pieces, (sceneId) => byModelIndex(this.models, modelIndexOf(sceneId)));
+  }
+
+  private paintClashes(): void {
+    if (!this.renderer) { return; }
+    const scene = this.renderer.getScene();
+    const device = this.renderer.getGPUDevice();
+    const pipeline = this.renderer.getPipeline();
+    if (!this.clashHighlight || this.clashIds.length === 0 || !device || !pipeline) {
+      scene.clearColorOverrides();
+    } else {
+      scene.setColorOverrides(new Map(this.clashIds.map((id) => [id, CLASH_COLOR])), device, pipeline);
+    }
+    this.renderer.requestRender();
+  }
+
+  /** Nome de cada lado, em uma ida ao data model por modelo. */
+  private async labelClashes(clashes: ClashItem[]): Promise<void> {
+    const byModel = new Map<string, ClashItemRef[]>();
+    for (const c of clashes) {
+      for (const ref of [c.a, c.b]) {
+        const refs = byModel.get(ref.modelId);
+        if (refs) { refs.push(ref); } else { byModel.set(ref.modelId, [ref]); }
+      }
+    }
+    for (const [modelId, refs] of byModel) {
+      const store = this.models.get(modelId)?.dataStore;
+      if (!store) { continue; }
+      const names = new Map(
+        (await store.getEntityLabels([...new Set(refs.map((r) => r.expressId))])).map((l) => [l.expressId, l.name]),
+      );
+      for (const ref of refs) {
+        const name = names.get(ref.expressId);
+        if (name) { ref.name = name; }
+      }
+    }
+  }
+
+  /**
+   * Foco num conflito, com os dois lados selecionados e enquadrados. O modo diz
+   * o que acontece com o resto: `highlight` deixa como está, `isolate` esconde,
+   * `ghost` deixa translúcido (o mesmo do duplo clique).
+   */
+  focusClash(
+    a: Pick<ClashItemRef, 'modelId' | 'expressId'>,
+    b: Pick<ClashItemRef, 'modelId' | 'expressId'>,
+    mode: ClashFocusMode = 'ghost',
+  ): void {
+    if (this.disposed || !this.renderer) { return; }
+    const sides = [a, b]
+      .map((ref) => ({ ref, model: this.models.get(ref.modelId) }))
+      .filter((s): s is { ref: typeof a; model: FederatedModel } =>
+        !!s.model && s.model.ids.has(s.ref.expressId + s.model.idOffset));
+    if (sides.length === 0) { return; }
+
+    const sceneIds = sides.map((s) => s.ref.expressId + s.model.idOffset);
+    this.selectedIds = new Set(sceneIds);
+    this.selectedId = sceneIds[0];
+    const indices = new Set(sides.map((s) => s.model.index));
+    this.selectedModelIndex = indices.size === 1 ? sides[0].model.index : undefined;
+
+    // O isolamento de um foco anterior não sobrevive ao próximo.
+    if (mode === 'isolate') { this.isolatedIds = new Set(sceneIds); this.clashIsolated = true; }
+    else if (this.clashIsolated) { this.isolatedIds = null; this.clashIsolated = false; }
+    this.ghost = mode === 'ghost' || this.ghostPinned;
+
+    this.frameEntities(sceneIds);
+    this.renderer.requestRender();
+    this.emitSelection();
+  }
+
   private emitSelection(): void {
     const sceneIds = Array.from(this.selectedIds);
     this.events.onSelect({
@@ -1922,6 +2157,7 @@ export class ViewerEngine {
   dispose(): void {
     this.disposed = true;
     this.aborter.abort();
+    this.cancelClash();
     this.releaseDataStores();
     window.removeEventListener('keydown', this.onKeyDown);
     window.removeEventListener('resize', this.onWindowResize);

@@ -42,6 +42,11 @@ async function run(req: DataModelRequest): Promise<unknown> {
     }
     case 'globalIds':
       return storeOf(req.storeId).getGlobalIds(req.expressIds);
+    case 'clashLinks': {
+      const store = storeOf(req.storeId);
+      await store.propertiesReady;
+      return store.getClashLinks();
+    }
     case 'expressIds':
       return storeOf(req.storeId).getExpressIds(req.globalIds);
     case 'release':

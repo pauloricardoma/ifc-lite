@@ -2,7 +2,7 @@
 // `RemoteDataStore` por modelo apontando para o store que mora lá. A árvore fica
 // em cache aqui (a UI a lê de forma síncrona e ela não muda); o resto é
 // consulta assíncrona.
-import type { BimEntityProperties, BimTreeNode } from './data-model.js';
+import type { BimEntityProperties, BimTreeNode, ClashLinks } from './data-model.js';
 
 type DataModelOp =
   | { op: 'init' }
@@ -11,6 +11,7 @@ type DataModelOp =
   | { op: 'properties'; storeId: number; expressIds: number[] }
   | { op: 'globalIds'; storeId: number; expressIds: number[] }
   | { op: 'expressIds'; storeId: number; globalIds: string[] }
+  | { op: 'clashLinks'; storeId: number }
   | { op: 'release'; storeId: number };
 
 export type DataModelRequest = DataModelOp & { id: number };
@@ -120,6 +121,11 @@ export class RemoteDataStore {
 
   getGlobalIds(expressIds: number[]): Promise<{ expressId: number; globalId: string }[]> {
     return call({ op: 'globalIds', storeId: this.storeId, expressIds });
+  }
+
+  /** Espera as relações (vêm na passada das propriedades, depois da árvore). */
+  getClashLinks(): Promise<ClashLinks> {
+    return call({ op: 'clashLinks', storeId: this.storeId });
   }
 
   getExpressIds(globalIds: string[]): Promise<{ globalId: string; expressId: number }[]> {

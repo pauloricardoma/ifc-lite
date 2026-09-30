@@ -1,9 +1,14 @@
 import { ViewerEngine, LoadPhase, ProjectionMode } from './engine.js';
+import type { ClashFocusMode } from './engine.js';
 import type { BCFClippingPlane, BCFOrthogonalCamera, BCFPerspectiveCamera } from '@ifc-lite/bcf';
 import type { BimEntityProperties, BimTreeNode } from './data-model.js';
 import type { Measurement, MeasureMode } from './measure.js';
 import type { IfcArtifacts } from './types.js';
 import type { SectionPlane } from '@ifc-lite/renderer';
+import type { ClashProgress } from '@ifc-lite/clash';
+import type { ClashItemRef, ClashRuleInput, ClashRunOptions, ClashRunResult } from './clash.js';
+
+type ClashFocusRef = Pick<ClashItemRef, 'modelId' | 'expressId'>;
 
 // Carregado por <script src> (não textContent): assim os imports dinâmicos
 // relativos do bundle resolvem contra a URL do script, e o arquivo fica
@@ -124,6 +129,16 @@ export function initCoordly3DViewer(config: BimConfig): BimInstance {
     setMeasureMode: (mode: MeasureMode) => engine.setMeasureMode(mode),
     clearMeasurements: () => engine.clearMeasurements(),
     deleteMeasurement: (id: string) => engine.deleteMeasurement(id),
+    // Clash: regras por tipo IFC sobre os modelos na cena; o motor testa a
+    // geometria. Rodar de novo cancela a execução anterior.
+    runClash: (rules: ClashRuleInput[], options: ClashRunOptions, onProgress?: (p: ClashProgress) => void) =>
+      engine.runClash(rules, options, onProgress),
+    cancelClash: () => engine.cancelClash(),
+    focusClash: (a: ClashFocusRef, b: ClashFocusRef, mode?: ClashFocusMode) => engine.focusClash(a, b, mode),
+    // "Destacar todos": pinta de vermelho os elementos da última verificação.
+    setClashHighlight: (enabled: boolean) => engine.setClashHighlight(enabled),
+    clearClash: () => engine.clearClash(),
+    getClashTypes: () => engine.getClashTypes(),
     // Artefatos do backend são o caminho de produção. A string (`.ifc`) segue a
     // regra antiga — server se configurado, senão cliente — pro harness e pra
     // bundles do web anteriores ao backend.
@@ -225,6 +240,16 @@ declare global {
       setMeasureMode(mode: MeasureMode): void;
       clearMeasurements(): void;
       deleteMeasurement(id: string): void;
+      runClash(
+        rules: ClashRuleInput[],
+        options: ClashRunOptions,
+        onProgress?: (p: ClashProgress) => void,
+      ): Promise<ClashRunResult>;
+      cancelClash(): void;
+      focusClash(a: ClashFocusRef, b: ClashFocusRef, mode?: ClashFocusMode): void;
+      setClashHighlight(enabled: boolean): void;
+      clearClash(): void;
+      getClashTypes(): { ifcType: string; count: number }[];
       addModel(source: string | IfcArtifacts, modelId: string): Promise<void>;
       removeModel(modelId: string): void;
       hasModel(modelId: string): boolean;

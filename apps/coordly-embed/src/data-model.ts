@@ -116,6 +116,19 @@ const cleanPropertyValue = (raw: string): string => {
 /** Progresso do processamento, de 0 a 100. */
 export type DataModelProgress = (percent: number) => void;
 
+/**
+ * Pares que o clash não conta, como o adapter STEP do `@ifc-lite/clash` faz:
+ * hospedeiro × preenchimento (parede × porta, pela abertura) e peça × montagem
+ * (degrau × escada, painel × cortina). Planos (`[a0, b0, a1, b1, …]`) para
+ * atravessar o worker sem uma alocação por par.
+ */
+export interface ClashLinks {
+  /** `[hospedeiro, preenchimento, …]` via IfcRelVoidsElement + IfcRelFillsElement. */
+  hostFiller: Uint32Array;
+  /** `[peça, montagem, …]` via IfcRelAggregates. */
+  partOf: Uint32Array;
+}
+
 /** Ponto do progresso em que a árvore fica pronta; o resto é Psets/Qtos. */
 export const TREE_READY_AT = 40;
 
@@ -210,6 +223,7 @@ export class ModelDataStore {
   private sets = new Map<number, BimPropertySet>();
   /** elemento → ids de Pset/Qto (via IfcRelDefinesByProperties). */
   private setsOf = new Map<number, number[]>();
+  private clashLinks: ClashLinks = { hostFiller: new Uint32Array(0), partOf: new Uint32Array(0) };
 
   /**
    * Resolve quando Psets/Qtos estiverem prontos. É a parte pesada do data model
@@ -267,6 +281,7 @@ export class ModelDataStore {
           store.setsOf = ModelDataStore.readSetLinks(
             relationships, store.sets, rangeReporter(onProgress, 93, 100),
           );
+          store.clashLinks = ModelDataStore.readClashLinks(relationships);
           onProgress?.(100);
           console.log(
             `[coordly-embed] data model: árvore em ${treeMs}ms (${entities.count} entidades), `
@@ -379,6 +394,31 @@ export class ModelDataStore {
       if (current) { current.push(setId); } else { links.set(element, [setId]); }
     }
     return links;
+  }
+
+  private static readClashLinks(t: arrow.Table): ClashLinks {
+    const relTypes = (col<string[]>(t, 'rel_type') ?? []) as string[];
+    const relating = col<Uint32Array>(t, 'relating_id') ?? new Uint32Array(0);
+    const related = col<Uint32Array>(t, 'related_id') ?? new Uint32Array(0);
+
+    const hostOfOpening = new Map<number, number>();
+    const fills: [number, number][] = [];
+    const partOf: number[] = [];
+    for (let i = 0; i < relating.length; i++) {
+      const type = (relTypes[i] ?? '').toUpperCase();
+      if (type === 'IFCRELVOIDSELEMENT') { hostOfOpening.set(related[i], relating[i]); }
+      else if (type === 'IFCRELFILLSELEMENT') { fills.push([relating[i], related[i]]); }
+      else if (type === 'IFCRELAGGREGATES') { partOf.push(related[i], relating[i]); }
+    }
+
+    // A abertura não está na cena: o par que importa é o hospedeiro dela com o
+    // que a preenche.
+    const hostFiller: number[] = [];
+    for (const [opening, filler] of fills) {
+      const host = hostOfOpening.get(opening);
+      if (host !== undefined) { hostFiller.push(host, filler); }
+    }
+    return { hostFiller: Uint32Array.from(hostFiller), partOf: Uint32Array.from(partOf) };
   }
 
   /**
@@ -528,6 +568,10 @@ export class ModelDataStore {
    * Elemento sem GlobalId no data model sai de fora, em vez de virar entrada com
    * id vazio que o consumidor teria de filtrar.
    */
+  getClashLinks(): ClashLinks {
+    return this.clashLinks;
+  }
+
   getGlobalIds(expressIds: number[]): { expressId: number; globalId: string }[] {
     const out: { expressId: number; globalId: string }[] = [];
 

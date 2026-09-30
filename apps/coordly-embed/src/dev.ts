@@ -75,6 +75,13 @@ engine.init().then((ok) => {
     })();
     (window as any).tree = () => engine.getSpatialTree();
     (window as any).props = (id: number) => engine.getEntityProperties(id);
+    // `clash(0.01)`: todos × todos entre as pastas carregadas.
+    (window as any).clash = async (tolerance?: number, crossModelOnly = true) => {
+      const r = await engine.runClash([{ id: 'all', name: 'Todos' }], { mode: 'hard', tolerance, crossModelOnly });
+      console.log(`[dev] clash: ${r.clashes.length} em ${r.elementCount} elementos, ${r.elapsedMs}ms`, r);
+      (window as any).focusClash = (i: number) => engine.focusClash(r.clashes[i].a, r.clashes[i].b);
+      return r;
+    };
     return;
   }
 
