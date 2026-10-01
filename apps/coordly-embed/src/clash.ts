@@ -34,6 +34,8 @@ export interface ClashRunOptions {
   clearance?: number;
   /** Só pares de elementos de modelos diferentes. */
   crossModelOnly: boolean;
+  /** Modelos da verificação (o id do `addModel`). Sem a lista, todos os da cena. */
+  models?: string[];
 }
 
 /** Lado de uma regra já com escopo: quais modelos e quais tipos. */

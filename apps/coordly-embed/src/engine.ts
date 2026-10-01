@@ -56,11 +56,6 @@ function sumCoverage(coverage: ClashRuleCoverage[]): ClashRuleCoverageItem[] {
   return Array.from(byRule.values());
 }
 
-const byModelIndex = (models: Map<string, { index: number }>, index: number): boolean => {
-  for (const model of models.values()) { if (model.index === index) { return true; } }
-  return false;
-};
-
 // O data model é escrito no cache DEPOIS da geometria (o server responde o
 // parquet e grava o resto em background), então um 202 logo após o load é
 // normal — não é erro, é "ainda não".
@@ -1782,7 +1777,8 @@ export class ViewerEngine {
     };
 
     try {
-      const models = Array.from(this.models.values());
+      const models = Array.from(this.models.values())
+        .filter((model) => !options.models || options.models.includes(model.id));
       const byIndex = new Map(models.map((model) => [model.index, model]));
       const modelOf = (sceneId: number) => byIndex.get(modelIndexOf(sceneId))?.id;
 
@@ -1864,12 +1860,15 @@ export class ViewerEngine {
     this.renderer?.requestRender();
   }
 
-  /** Tipos com geometria na cena e quantos elementos de cada. */
-  getClashTypes(): { ifcType: string; count: number }[] {
+  /** Tipos com geometria nos modelos pedidos (sem lista, todos) e quantos elementos de cada. */
+  getClashTypes(modelIds?: string[]): { ifcType: string; count: number }[] {
     if (!this.renderer) { return []; }
+    const indices = new Set(Array.from(this.models.values())
+      .filter((model) => !modelIds || modelIds.includes(model.id))
+      .map((model) => model.index));
     const pieces: ClashMeshPiece[] = [];
     this.renderer.getScene().forEachMeshData((md) => pieces.push(md as ClashMeshPiece));
-    return countClashTypes(pieces, (sceneId) => byModelIndex(this.models, modelIndexOf(sceneId)));
+    return countClashTypes(pieces, (sceneId) => indices.has(modelIndexOf(sceneId)));
   }
 
   private paintClashes(): void {

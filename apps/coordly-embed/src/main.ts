@@ -138,7 +138,7 @@ export function initCoordly3DViewer(config: BimConfig): BimInstance {
     // "Destacar todos": pinta de vermelho os elementos da última verificação.
     setClashHighlight: (enabled: boolean) => engine.setClashHighlight(enabled),
     clearClash: () => engine.clearClash(),
-    getClashTypes: () => engine.getClashTypes(),
+    getClashTypes: (modelIds?: string[]) => engine.getClashTypes(modelIds),
     // Artefatos do backend são o caminho de produção. A string (`.ifc`) segue a
     // regra antiga — server se configurado, senão cliente — pro harness e pra
     // bundles do web anteriores ao backend.
@@ -249,7 +249,7 @@ declare global {
       focusClash(a: ClashFocusRef, b: ClashFocusRef, mode?: ClashFocusMode): void;
       setClashHighlight(enabled: boolean): void;
       clearClash(): void;
-      getClashTypes(): { ifcType: string; count: number }[];
+      getClashTypes(modelIds?: string[]): { ifcType: string; count: number }[];
       addModel(source: string | IfcArtifacts, modelId: string): Promise<void>;
       removeModel(modelId: string): void;
       hasModel(modelId: string): boolean;
