@@ -171,9 +171,13 @@ for (const unit of ['metre', 'millimetre'] as const) {
       // The 3 m far piece is the longer one, so it IS the source wall, moved
       // to start at the cut: the opening keeps its host, shifted 2 m back.
       assert.equal(split.right.expressId, wall);
-      assert.deepEqual(split.openings, { toLeft: 0, toRight: 0, skipped: 0 });
+      assert.deepEqual(split.openings, { toLeft: 0, toRight: 0, skipped: 0, skipReasons: new Map() });
       assert.equal(asExpressIdRef(readAttributes(dataStore, view, editor, rel)?.[4]), wall);
-      near(asCoordinateTriple(readAttributes(dataStore, view, editor, point)?.[0]) ?? [], [1 * native, 0, 0],
+      near(asCoordinateTriple(readAttributes(dataStore, view, editor, point)?.[0]) ?? [], [3 * native, 0, 0],
+        'the original point remains unchanged for other consumers');
+      const moved = resolvePlacementChain(dataStore, view, editor, opening);
+      assert.ok(moved && moved.cartesianPointId !== point);
+      near(moved.coordinates, [1 * native, 0, 0],
         'the opening keeps its place: 1 m into the far piece');
     });
 

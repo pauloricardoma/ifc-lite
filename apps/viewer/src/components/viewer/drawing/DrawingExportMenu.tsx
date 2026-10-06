@@ -14,7 +14,7 @@ import { Button } from '@/components/ui/button';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useTranslation } from '@/i18n';
-import { confirmDialog } from '@/components/ui/confirm-dialog';
+import { useDialogs } from '@/components/ui/confirm-dialog';
 import { drawingExportOmissions, DRAWING_OMISSION_LABEL_KEYS, type DrawingExportContent } from '@/lib/export/drawing-export-omissions';
 import { SaveMarkupToModelMenuItem } from '../SaveMarkupToModelButton';
 import { DrawingPdfExportDialog } from './DrawingPdfExportDialog';
@@ -34,18 +34,21 @@ export interface DrawingExportMenuProps {
   activeSheet: DrawingSheet | null;
   markupCounts: DrawingExportContent['markupCounts'];
   visibleUnderlayCount: number;
+  visibleRasterReferenceCount?: number;
 }
 
 export function DrawingExportMenu({
   hasDrawing, compact, onExportSvg, onExportDxf, onExportPdf, onPrint,
-  displayedScale, sheetEnabled, activeSheet, markupCounts, visibleUnderlayCount,
+  displayedScale, sheetEnabled, activeSheet, markupCounts, visibleUnderlayCount, visibleRasterReferenceCount = 0,
 }: DrawingExportMenuProps) {
   const { t } = useTranslation();
+  const { confirmDialog } = useDialogs();
   const label = t('section2d.export.menu');
   const [pdfDialogOpen, setPdfDialogOpen] = useState(false);
   const content: DrawingExportContent = {
     markupCounts,
     visibleUnderlayCount,
+    visibleRasterReferenceCount,
     sheetScale: sheetEnabled && activeSheet ? activeSheet.scale.factor : null,
   };
   const pdfOmissions = drawingExportOmissions(content, 'pdf');

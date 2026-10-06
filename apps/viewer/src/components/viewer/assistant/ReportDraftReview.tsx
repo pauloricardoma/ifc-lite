@@ -1,0 +1,84 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+import { useState } from 'react';
+import { FileText } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { useTranslation } from '@/i18n';
+import { usePanelControls } from '@/hooks/usePanelControls';
+import { useViewerStore } from '@/store';
+import { useAssistant } from '@/lib/assistant/conversation';
+import { prepareReportDraft, isReportDraftCurrent, saveReportDraft, type ReportDraft } from '@/lib/assistant/report-draft';
+import { exportDocument } from '@/lib/document/persistence';
+import { ContentStorageNotice } from '../ContentStorageNotice';
+import { EvidenceView } from '../analysis/EvidenceView';
+
+export function ReportDraftReview() {
+  const { t } = useTranslation();
+  const panels = usePanelControls();
+  const assistant = useAssistant();
+  const store = useViewerStore();
+  const [name, setName] = useState('');
+  const [draft, setDraft] = useState<ReportDraft | null>(null);
+  const [approved, setApproved] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const evidence = assistant.snapshot ?? assistant.archived?.evidence;
+  if ((!evidence || evidence.source === 'flow') && !draft) return null;
+  const eligible = !!evidence && evidence.source !== 'flow' && assistant.status === 'idle' && !assistant.error
+    && assistant.messages.at(-1)?.role === 'assistant';
+  const current = draft && isReportDraftCurrent(draft);
+  const save = async () => {
+    if (!draft || !approved || busy) return;
+    setBusy(true); setError(null);
+    try { setSaved(await saveReportDraft(draft, draft.documentJson)); }
+    catch (error) { setError(error instanceof Error ? error.message : String(error)); }
+    finally { setBusy(false); }
+  };
+  if (!eligible && !draft) return null;
+  return <details className="mx-3 my-2 rounded border border-border text-xs">
+    <summary className="flex cursor-pointer items-center gap-1.5 px-2 py-1.5 font-semibold">
+      <FileText className="h-3.5 w-3.5 text-primary" aria-hidden="true" />{t('assistant.reportReview')}
+    </summary>
+    <div className="border-t border-border p-2 space-y-2">
+      <p className="text-muted-foreground">{t('assistant.reportHint')}</p>
+      <label className="sr-only" htmlFor="assistant-report-name">{t('assistant.reportName')}</label>
+      <div className="flex items-center gap-1">
+        <input id="assistant-report-name" className="min-w-0 flex-1 h-7 border border-input rounded bg-background px-2" value={name}
+          maxLength={200} disabled={busy} placeholder={t('assistant.reportName')} onChange={event => { setName(event.target.value); setApproved(false); }} />
+      <Button variant="outline" size="sm" className="h-7 shrink-0" disabled={!eligible || busy} onClick={() => {
+        try { setDraft(prepareReportDraft(name)); setApproved(false); setSaved(false); setError(null); }
+        catch (error) { setError(error instanceof Error ? error.message : String(error)); }
+      }}>{t('assistant.prepareReport')}</Button>
+      </div>
+      {draft && <>
+        <div>
+          <p className="font-semibold break-words">{draft.document.name}</p>
+          <p className="text-2xs text-muted-foreground">{draft.source.messages.at(-1)?.model}</p>
+        </div>
+        <blockquote className="whitespace-pre-wrap break-words border-l-2 border-border pl-2">{draft.source.messages.at(-1)?.content}</blockquote>
+        <details><summary className="cursor-pointer text-muted-foreground hover:text-foreground">{t('assistant.evidenceDetails')}</summary>
+          <div className="mt-2"><EvidenceView evidence={draft.source.evidence} state="historical" /></div>
+        </details>
+        <details><summary className="cursor-pointer text-muted-foreground hover:text-foreground">{t('assistant.reportContents')}</summary><pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-2xs">{draft.documentJson}</pre></details>
+        {!current && !saved && <p role="alert" className="rounded border border-amber-500/40 bg-amber-500/10 p-2">{t('assistant.reportStale')}</p>}
+        <label className="flex items-start gap-2"><input type="checkbox" checked={approved} disabled={!current || busy || saved}
+          onChange={event => setApproved(event.target.checked)} />{t('assistant.reportApproved')}</label>
+        <div className="flex flex-wrap gap-1">
+          <Button size="sm" className="h-7" disabled={!approved || !current || busy || saved} onClick={() => void save()}>{t('assistant.saveReport')}</Button>
+          <Button variant="outline" size="sm" className="h-7" disabled={!approved || busy} onClick={() => exportDocument(draft.document)}>{t('assistant.exportReport')}</Button>
+        </div>
+        {saved && <div aria-live="polite" className="rounded border border-emerald-500/40 bg-emerald-500/10 p-2 space-y-2">
+          <p>{t('assistant.reportSaved')}</p>
+          <Button variant="outline" size="sm" className="h-7" onClick={() => {
+            store.setActiveDocumentId(draft.document.id); panels.openInHome('document');
+          }}>{t('assistant.openReport')}</Button>
+        </div>}
+      </>}
+      {error && <p role="alert" className="rounded border border-destructive/40 bg-destructive/10 p-2 text-destructive">{error}</p>}
+    </div>
+    <ContentStorageNotice status={store.documentsStorage} retry={store.retryDocumentsSave} restore={store.restoreDocuments} />
+  </details>;
+}

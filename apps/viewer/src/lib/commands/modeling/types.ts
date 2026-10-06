@@ -13,8 +13,10 @@
  */
 
 import type { ComponentType } from 'react';
+import type { StoreApi } from 'zustand';
 import type { MeshData } from '@ifc-lite/geometry';
 import type { TranslationKey } from '@/i18n';
+import type { RemeshCause } from '@/lib/remesh/affected-set';
 import type { KeyCommandId } from '@/lib/commands/keyboard-commands';
 import type { SnapProfile, SnapQuery, SnapResult, Vec2 } from '@/lib/snap/types';
 import type { ViewerState } from '@/store';
@@ -76,8 +78,8 @@ export interface CommandField<G> {
   readonly unit: 'm' | 'deg' | 'count';
   /** Fields with different groups get a divider between them in the bar. */
   readonly group?: string;
-  /** Not shown (and skipped by Tab) for this gesture, e.g. Width in polygon mode. */
-  hidden?(g: G): boolean;
+  /** Not shown (and skipped by Tab) for this gesture, e.g. Width in polygon mode, or a rectangle's Width once a section is picked. */
+  hidden?(g: G, ctx: CommandContext): boolean;
   read(g: G, ctx: CommandContext): number | null;
   write(g: G, v: number, ctx: CommandContext): G;
 }
@@ -93,6 +95,12 @@ export interface CommitResult {
   deleted: number[];
   /** Express ids whose mesh must be rebuilt (WP1 `requestRemesh`). */
   remesh: number[];
+  /**
+   * Why they are rebuilt. Default: `created` when the commit created elements,
+   * else `shape` (the elements' own bodies). `hostsChanged` also rebuilds what
+   * they host: a wall that moved carries its openings, doors and windows.
+   */
+  remeshCause?: RemeshCause;
   /** Express ids to select after the commit. */
   select?: number[];
   /**
@@ -107,6 +115,16 @@ export interface CommitResult {
 export interface CommandHudProps<G> {
   gesture: G;
   ctx: CommandContext;
+  /**
+   * The offscreen copy the bar only measures (`useHudBarTier`): draw what takes
+   * room, open nothing (a popover would open twice), register nothing.
+   */
+  measuring?: boolean;
+}
+
+/** A command's layer in the 2D plan: `toScreen` maps workplane-local metres to plan pixels. */
+export interface CommandPlanProps<G> extends CommandHudProps<G> {
+  toScreen: (p: Vec2) => readonly [number, number];
 }
 
 export interface ModelingCommand<G = unknown> {
@@ -115,6 +133,8 @@ export interface ModelingCommand<G = unknown> {
   readonly hud: {
     Bar?: ComponentType<CommandHudProps<G>>;
     Scene?: ComponentType<CommandHudProps<G>>;
+    /** Drawn inside the plan's SVG, above the footprint of the `ghost` meshes the plan draws for every command. */
+    Plan?: ComponentType<CommandPlanProps<G>>;
     hint?: (g: G) => TranslationKey;
   };
   readonly fields?: readonly CommandField<G>[];
@@ -122,10 +142,26 @@ export interface ModelingCommand<G = unknown> {
   /** Per-command keys: rows in the `command.<id>` context of `KEY_COMMANDS`. */
   readonly keys?: readonly { commandKey: KeyCommandId; run(g: G, ctx: CommandContext): G | CommandSignal }[];
   init(ctx: CommandContext): G;
+  /** Command-specific editing plane; null gives a visible refusal in its HUD. */
+  workplane?(ctx: CommandContext): Workplane | null;
+  /** Editable bodies excluded from picking (e.g. a space covering the roof target). */
+  pickExclusions?(g: G): readonly { modelId: string; expressId: number }[];
   /** What the snap solver constrains against: the anchor, the chain so far, typed locks. */
   snapQuery?(g: G): Pick<SnapQuery, 'anchor' | 'chain' | 'locks'>;
   pointerMove(g: G, s: SnapResult, ctx: CommandContext): G;
   pointerDown(g: G, s: SnapResult, ctx: CommandContext): G | CommandSignal;
+  /** Handle this gesture on the actual press/release instead of a browser click. */
+  pointerDownOnPress?(g: G): boolean;
+  /**
+   * The button's release, where the pointer source reports one (plan or 3D):
+   * e.g. drop a dragged corner. Absent = releases are ignored.
+   */
+  pointerUp?(g: G, s: SnapResult, ctx: CommandContext): G | CommandSignal;
+  /**
+   * The press was lost without a release (`pointercancel`, or the pointer
+   * capture was taken away): drop whatever the press started, writing nothing.
+   */
+  pointerCancel?(g: G, ctx: CommandContext): G;
   /**
    * The second click of a double-click (`event.detail >= 2`), instead of
    * `pointerDown`: e.g. close a polygon. Absent = a plain `pointerDown`.
@@ -158,4 +194,6 @@ export interface AuthoringTransaction {
   readonly batchId: string;
   /** Live store state; re-read after each action, it changes as you write. */
   readonly store: ViewerState;
+  /** The store itself, for writers that record their own undo history (`recordModellingEdit`). */
+  readonly api: Pick<StoreApi<ViewerState>, 'getState' | 'setState' | 'subscribe'>;
 }

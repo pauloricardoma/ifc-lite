@@ -8,24 +8,28 @@
  * selected element's attributes and properties — and the bindings resolve
  * live in the preview. Image, chart and topic blocks pick their source.
  */
-import { useMemo, useRef, useState } from 'react';
-import { ArrowDown, ArrowUp, X } from 'lucide-react';
+import { BlockTitleEditor } from './BlockTitleEditor';
+import { isSavedComparisonChart } from '@/lib/charts/comparison-source';
+import { SavedReportSource } from './SavedReportSource';
+import { useId, useLayoutEffect, useRef, useState, type KeyboardEvent } from 'react';
+import { ArrowDown, ArrowUp, Copy, X } from 'lucide-react';
 import type { ChartSpec } from '@ifc-lite/charts';
 import type { BCFTopic } from '@ifc-lite/bcf';
 import type { ValidationReport } from '@ifc-lite/ids';
 import { Button } from '@/components/ui/button';
 import { toast } from '@/components/ui/toast';
 import { useTranslation, type TranslationKey } from '@/i18n';
-import { resolveGlobalId, useViewerStore } from '@/store';
+import { CHART_FONT_SIZE } from '@ifc-lite/charts';
 import { readImageFile } from '@/lib/document/persistence';
-import { FIELD_SUGGESTIONS } from '@/lib/document/presets';
-import { elementPropertyPaths, type BindingContext } from '@/lib/document/bindings';
-import { effectiveAttribute } from '@/lib/document/effective-binding-fields';
-import { spatialBindingNodes } from '@/lib/document/spatial-binding-nodes';
-import { idsReportBlockFromReport } from '@/lib/document/ids-report';
-import { CHART_BLOCK_HEIGHT_MAX, CHART_BLOCK_HEIGHT_MIN, TEXT_SIZE_MAX, TEXT_SIZE_MIN, type DocumentBlock, type TextBlock, type TextFont } from '@/lib/document/types';
-import { ClampedNumberInput, WidthEditor, field } from './BlockEditor.parts';
+import type { BindingContext } from '@/lib/document/bindings';
+import { idsReportBlockFromReport, replaceIdsReportSnapshot } from '@/lib/document/ids-report';
+import { TAB_SIZE, tabEdit } from '@/lib/document/text-tabs';
+import { CHART_BLOCK_HEIGHT_MAX, CHART_BLOCK_HEIGHT_MIN, TEXT_SIZE_MAX, TEXT_SIZE_MIN, reportBlockSourceKind, type DocumentBlock, type IdsReportBlock, type IdsReportVariant, type TextBlock, type TextFont } from '@/lib/document/types';
+import { BlockScaleEditor, ClampedNumberInput, WidthEditor, field } from './BlockEditor.parts';
 import { TableBlockEditor } from './TableBlockEditor';
+import { ManualReportBlockEditor, ManualReportPresentation } from './ManualReportBlockEditor';
+import { TextColorEditor } from './TextColorEditor';
+import { FieldPicker } from './FieldPicker';
 
 export interface BlockEditorProps {
   block: DocumentBlock;
@@ -39,6 +43,7 @@ export interface BlockEditorProps {
   idsValidationReport: ValidationReport | null;
   onChange: (block: DocumentBlock) => void;
   onMove: (delta: -1 | 1) => void;
+  onCopy: () => void;
   onRemove: () => void;
 }
 
@@ -48,36 +53,85 @@ const KIND_LABEL_KEY = {
   chart: 'document.block.kindChart',
   topic: 'document.block.kindTopic',
   spacer: 'document.block.kindSpacer',
+  'page-break': 'document.block.kindPageBreak',
   table: 'document.block.kindTable',
   'ids-report': 'document.block.kindIdsReport',
+  'manual-report': 'manualValidation.report.kind',
 } as const satisfies Record<DocumentBlock['kind'], TranslationKey>;
-/** The fields offered for insertion: the fixed suggestions, the model's storeys, and the selected element. */
-function useFieldOptions(bindings: BindingContext): Array<{ path: string; label: string }> {
-  const selected = useViewerStore((s) => s.selectedEntityIds);
-  return useMemo(() => {
-    const options = [...FIELD_SUGGESTIONS];
-    const active = bindings.models.find((m) => m.id === bindings.activeModelId) ?? bindings.models[0];
-    const storeys = active ? spatialBindingNodes(active, 'IfcBuildingStorey') : [];
-    for (const { expressId: id } of storeys.slice(0, 12)) {
-      const name = active.view ? effectiveAttribute(active, id, 'Name') : active.store.entities.getName(id);
-      if (name) options.push({ path: `IfcBuildingStorey["${name}"].Elevation`, label: `Storey "${name}" elevation` });
-    }
-    const first = selected.size > 0 ? [...selected][0] : null;
-    // The store's own renderer-id → GlobalId path, so an element added by an edit resolves too.
-    const guid = first === null ? null : resolveGlobalId(first);
-    if (guid) {
-      for (const attr of ['Name', 'Type', 'Description', 'ObjectType', 'Tag', 'Storey']) options.push({ path: `Element[${guid}].${attr}`, label: `Selected element · ${attr}` });
-      // The selected element's property and quantity sets, so a Pset value is one pick away.
-      for (const p of elementPropertyPaths(guid, bindings)) options.push({ path: p.path, label: `Selected element · ${p.label}` });
-    }
-    return options;
-  }, [bindings, selected]);
+
+/**
+ * A report block's source line and refresh button (#5125). IDS and information
+ * validation share one report slot in the store, so refresh only takes a report
+ * of the kind the block already holds (#6372): an IDS block never silently
+ * turns into a rule-set block, or back.
+ */
+function ReportBlockSource({ block, report, onChange }: { block: IdsReportBlock; report: ValidationReport | null; onChange: (block: DocumentBlock) => void }) {
+  const { t } = useTranslation();
+  const kind = reportBlockSourceKind(block);
+  const refreshable = report !== null && report.source.kind === kind;
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center gap-1 text-muted-foreground">{t('document.block.idsReportSourceLabel')}
+        <span className="min-w-0 truncate font-medium text-foreground" title={block.sourceName}>{block.sourceName}</span>
+      </div>
+      <Button
+        variant="outline"
+        size="sm"
+        className="h-6 w-fit px-2 text-xs"
+        disabled={!refreshable}
+        title={refreshable ? undefined : t(kind === 'rules' ? 'document.block.rulesReportRefreshDisabledTitle' : 'document.block.idsReportRefreshDisabledTitle')}
+        onClick={() => {
+          if (!report || report.source.kind !== kind) return;
+          onChange(replaceIdsReportSnapshot(block, idsReportBlockFromReport(report, block.id, block.variant)));
+          toast.success(t('document.block.idsReportRefreshed'));
+        }}
+      >
+        {t('document.block.idsReportRefresh')}
+      </Button>
+    </div>
+  );
 }
+
+/** Presentation belongs to the embedded result, independently of live refresh (#6500). */
+function ReportBlockPresentation({ block, onChange }: { block: IdsReportBlock; onChange: (block: DocumentBlock) => void }) {
+  const { t } = useTranslation();
+  return (
+    <>
+      <label className="inline-flex items-center gap-1 text-muted-foreground">{t('document.block.idsReportVariantLabel')}
+        <select
+          className={field}
+          value={block.variant ?? ''}
+          onChange={(e) => onChange({ ...block, variant: (e.target.value || undefined) as IdsReportVariant | undefined })}
+          aria-label={t('document.block.idsReportVariantAriaLabel')}
+        >
+          {block.variant === undefined && <option value="">{t('document.block.idsReportVariantClassic')}</option>}
+          <option value="compact">{t('document.block.idsReportVariantCompact')}</option>
+          <option value="long">{t('document.block.idsReportVariantLong')}</option>
+        </select>
+      </label>
+      {block.variant === 'compact' && (
+        <label className="inline-flex items-center gap-1 text-muted-foreground">
+          <input type="checkbox" checked={block.specificationsOnly === true} onChange={(event) => onChange({ ...block, specificationsOnly: event.target.checked || undefined })} />
+          {t('document.block.idsReportSpecificationsOnly')}
+        </label>
+      )}
+      <label className="inline-flex items-center gap-1 text-muted-foreground">
+        <input type="checkbox" checked={block.benchmarks === true} onChange={(event) => onChange({ ...block, benchmarks: event.target.checked })} />
+        {t('manualValidation.report.benchmarks')}
+      </label>
+      <label className="inline-flex items-center gap-1 text-muted-foreground">
+        <input type="checkbox" checked={block.showStamp !== false} onChange={(event) => onChange({ ...block, showStamp: event.target.checked })} />
+        {t('manualValidation.report.showStamp')}
+      </label>
+    </>
+  );
+}
+
+const MODIFIER_KEYS = new Set(['Shift', 'Control', 'Alt', 'Meta', 'AltGraph', 'CapsLock']);
 
 function TextEditor({ block, bindings, onChange }: { block: TextBlock; bindings: BindingContext; onChange: (b: TextBlock) => void }) {
   const { t } = useTranslation();
   const textarea = useRef<HTMLTextAreaElement | null>(null);
-  const options = useFieldOptions(bindings);
   const insert = (path: string): void => {
     const el = textarea.current;
     const start = el?.selectionStart ?? block.text.length;
@@ -85,6 +139,31 @@ function TextEditor({ block, bindings, onChange }: { block: TextBlock; bindings:
     const text = `${block.text.slice(0, start)}{${path}}${block.text.slice(end)}`;
     onChange({ ...block, text });
     requestAnimationFrame(() => { el?.focus(); el?.setSelectionRange(start + path.length + 2, start + path.length + 2); });
+  };
+  // Tab indents like a word processor (#6370). So the keyboard is never trapped in the box,
+  // Escape arms an exit: the next Tab (or Shift+Tab) moves focus as usual. The hint under the
+  // box says so, and any other key disarms it.
+  const hintId = useId();
+  const tabExitArmed = useRef(false);
+  const pendingSelection = useRef<[number, number] | null>(null);
+  useLayoutEffect(() => {
+    const selection = pendingSelection.current;
+    pendingSelection.current = null;
+    if (selection) textarea.current?.setSelectionRange(selection[0], selection[1]);
+  }, [block.text]);
+  const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>): void => {
+    // A modifier on its own (the Shift of Esc, Shift+Tab) neither arms nor disarms the exit.
+    if (MODIFIER_KEYS.has(event.key)) return;
+    const armed = tabExitArmed.current;
+    tabExitArmed.current = event.key === 'Escape';
+    if (event.key !== 'Tab' || armed || event.ctrlKey || event.altKey || event.metaKey || event.nativeEvent.isComposing) return;
+    const el = event.currentTarget;
+    const edit = tabEdit(el.value, el.selectionStart, el.selectionEnd, event.shiftKey);
+    // Shift+Tab with nothing left to outdent still stays in the box: one key, one meaning.
+    event.preventDefault();
+    if (!edit) return;
+    pendingSelection.current = [edit.selectionStart, edit.selectionEnd];
+    onChange({ ...block, text: edit.text });
   };
   return (
     <>
@@ -104,27 +183,28 @@ function TextEditor({ block, bindings, onChange }: { block: TextBlock; bindings:
           <ClampedNumberInput value={block.fontSize} min={TEXT_SIZE_MIN} max={TEXT_SIZE_MAX} allowUndefined placeholder={t('document.block.fontSizeDefault')} ariaLabel={t('document.block.fontSizeAriaLabel')} onCommit={(fontSize) => onChange({ ...block, fontSize })} />
         </label>
         <WidthEditor width={block.width} onChange={(width) => onChange({ ...block, width })} />
-        <label className="inline-flex min-w-0 items-center gap-1 whitespace-nowrap text-muted-foreground">{t('document.block.insertFieldLabel')}
-          <select className={`${field} max-w-[190px]`} value="" onChange={(e) => { if (e.target.value) insert(e.target.value); }} aria-label={t('document.block.insertFieldLabel')} title={t('document.block.insertFieldTitle')}>
-            <option value="">…</option>
-            {options.map((o) => <option key={o.path} value={o.path}>{o.label}</option>)}
-          </select>
-        </label>
+        <FieldPicker bindings={bindings} onInsert={insert} />
       </div>
+      <TextColorEditor block={block} onChange={onChange} />
       <textarea
         ref={textarea}
         className={`${field} min-h-[56px] w-full font-mono`}
+        style={{ tabSize: TAB_SIZE }}
         value={block.text}
         rows={block.style === 'body' ? 4 : 2}
         onChange={(e) => onChange({ ...block, text: e.target.value })}
+        onKeyDown={onKeyDown}
+        onBlur={() => { tabExitArmed.current = false; }}
         aria-label={t('document.block.textAriaLabel')}
+        aria-describedby={hintId}
         placeholder={t('document.block.textPlaceholder')}
       />
+      <p id={hintId} className="text-2xs text-muted-foreground">{t('document.block.textKeysHint')}</p>
     </>
   );
 }
 
-export function BlockEditor({ block, index, count, bindings, topics, charts, idsValidationReport, onChange, onMove, onRemove }: BlockEditorProps) {
+export function BlockEditor({ block, index, count, bindings, topics, charts, idsValidationReport, onChange, onMove, onCopy, onRemove }: BlockEditorProps) {
   const { t } = useTranslation();
   const [busy, setBusy] = useState(false);
   const pickImage = async (file: File | undefined): Promise<void> => {
@@ -142,13 +222,18 @@ export function BlockEditor({ block, index, count, bindings, topics, charts, ids
   return (
     <div className="flex flex-col gap-1.5 rounded-md border border-border bg-card p-2 text-xs" data-block-editor={block.id} data-block-kind={block.kind}>
       <div className="flex items-center gap-1">
-        <span className="font-medium">{t(KIND_LABEL_KEY[block.kind])}</span>
+        <span className="font-medium">{t(block.kind === 'ids-report' && reportBlockSourceKind(block) === 'rules' ? 'document.block.kindRulesReport' : KIND_LABEL_KEY[block.kind])}</span>
         <span className="text-muted-foreground">#{index + 1}</span>
         <span className="flex-1" />
         <Button variant="ghost" size="sm" className="h-6 w-6 p-0" disabled={index === 0} onClick={() => onMove(-1)} aria-label={t('document.block.moveUpAriaLabel')}><ArrowUp className="h-3.5 w-3.5" /></Button>
         <Button variant="ghost" size="sm" className="h-6 w-6 p-0" disabled={index === count - 1} onClick={() => onMove(1)} aria-label={t('document.block.moveDownAriaLabel')}><ArrowDown className="h-3.5 w-3.5" /></Button>
+        <Button variant="ghost" size="sm" className="h-6 w-6 p-0" onClick={onCopy} aria-label={t('document.block.copyAriaLabel')} title={t('document.block.copyAriaLabel')}><Copy className="h-3.5 w-3.5" /></Button>
         <Button variant="ghost" size="sm" className="h-6 w-6 p-0" onClick={onRemove} aria-label={t('document.block.removeAriaLabel')}><X className="h-3.5 w-3.5" /></Button>
       </div>
+
+      {block.kind !== 'table' && block.kind !== 'spacer' && block.kind !== 'page-break' && <BlockTitleEditor block={block} onChange={onChange} />}
+
+      {block.kind !== 'spacer' && block.kind !== 'page-break' && <BlockScaleEditor scale={block.scale} onChange={(scale) => onChange({ ...block, scale })} />}
 
       {block.kind === 'text' && <TextEditor block={block} bindings={bindings} onChange={onChange} />}
 
@@ -178,7 +263,9 @@ export function BlockEditor({ block, index, count, bindings, topics, charts, ids
 
       {block.kind === 'chart' && (
         <div className="flex flex-wrap items-center gap-2">
-          <label className="inline-flex min-w-0 flex-1 items-center gap-1 text-muted-foreground">{t('document.block.kindChart')}
+          {/* `basis-48` (12rem) is the label's own floor: with `flex-1` alone its basis is 0, so in this wrapping row it never
+              wraps to a new line and the picker gets only what the sibling controls leave over, which can be ~0 (#6629). */}
+          <label className="inline-flex min-w-0 basis-48 grow items-center gap-1 text-muted-foreground">{t('document.block.kindChart')}
             <select
               className={`${field} min-w-0 flex-1`}
               value=""
@@ -194,7 +281,7 @@ export function BlockEditor({ block, index, count, bindings, topics, charts, ids
             </select>
           </label>
           <label className="inline-flex items-center gap-1 text-muted-foreground">
-            <input type="checkbox" checked={block.snapshot} onChange={(e) => onChange({ ...block, snapshot: e.target.checked })} className="accent-[#7aa2f7]" /> {t('document.block.chartSnapshotLabel')}
+            <input type="checkbox" checked={block.snapshot && !isSavedComparisonChart(block.chart)} disabled={isSavedComparisonChart(block.chart)} onChange={(e) => onChange({ ...block, snapshot: e.target.checked })} className="accent-[#7aa2f7]" /> {t('document.block.chartSnapshotLabel')}
           </label>
           <label className="inline-flex items-center gap-1 text-muted-foreground">{t('document.block.heightPtLabel')}
             <ClampedNumberInput
@@ -207,6 +294,14 @@ export function BlockEditor({ block, index, count, bindings, topics, charts, ids
               onCommit={(height) => onChange({ ...block, height })}
             />
           </label>
+          <label className="inline-flex items-center gap-1 text-muted-foreground">{t('document.block.chartFontSizeLabel')}
+            <ClampedNumberInput value={block.fontSize} min={CHART_FONT_SIZE.min} max={CHART_FONT_SIZE.max}
+              placeholder={String(CHART_FONT_SIZE.default)} allowUndefined ariaLabel={t('document.block.chartFontSizeAriaLabel')}
+              onCommit={(fontSize) => onChange({ ...block, fontSize })} />
+          </label>
+          <Button size="sm" variant="ghost" disabled={block.fontSize === undefined} onClick={() => onChange({ ...block, fontSize: undefined })}>
+            {t('document.block.chartFontSizeReset')}
+          </Button>
           <WidthEditor width={block.width} onChange={(width) => onChange({ ...block, width })} />
         </div>
       )}
@@ -219,27 +314,12 @@ export function BlockEditor({ block, index, count, bindings, topics, charts, ids
 
       {block.kind === 'table' && <TableBlockEditor block={block} onChange={onChange} />}
 
-      {block.kind === 'ids-report' && (
-        <div className="flex flex-col gap-1">
-          <div className="flex items-center gap-1 text-muted-foreground">{t('document.block.idsReportSourceLabel')}
-            <span className="min-w-0 truncate font-medium text-foreground" title={block.sourceName}>{block.sourceName}</span>
-          </div>
-          <Button
-            variant="outline"
-            size="sm"
-            className="h-6 w-fit px-2 text-xs"
-            disabled={!idsValidationReport}
-            title={idsValidationReport ? undefined : t('document.block.idsReportRefreshDisabledTitle')}
-            onClick={() => {
-              if (!idsValidationReport) return;
-              onChange(idsReportBlockFromReport(idsValidationReport, block.id));
-              toast.success(t('document.block.idsReportRefreshed'));
-            }}
-          >
-            {t('document.block.idsReportRefresh')}
-          </Button>
-        </div>
-      )}
+      {(block.kind === 'ids-report' || block.kind === 'manual-report') && <SavedReportSource block={block} onChange={onChange} />}
+      {block.kind === 'ids-report' && <ReportBlockPresentation block={block} onChange={onChange} />}
+      {block.kind === 'ids-report' && !block.savedReportId && <ReportBlockSource block={block} report={idsValidationReport} onChange={onChange} />}
+
+      {block.kind === 'manual-report' && <ManualReportPresentation block={block} onChange={onChange} />}
+      {block.kind === 'manual-report' && !block.savedReportId && <ManualReportBlockEditor block={block} onChange={onChange} />}
 
       {block.kind === 'topic' && (
         <div className="flex flex-wrap items-center gap-2">

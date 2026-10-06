@@ -54,7 +54,7 @@
  * THE COROLLARY FOR AUTHORING: a mesh appended to a rotated model must be in
  * the model's own UNROTATED frame, exactly like a streamed batch, because it
  * will be turned once on arrival. A mesh built from IFC parameters already is
- * (add-element, and the wall / slab split, which rebuild their halves through
+ * (a new authored element, and the wall / slab split, which rebuild their halves through
  * `addWall` / `addSlab`). A mesh DERIVED from live vertices is not: those are
  * baked. Such a path reads its source through {@link ModelRotationBaker.inModelFrame}
  * rather than the live mesh — a copy of the live bytes would be turned twice.
@@ -64,7 +64,7 @@
  * rotation returns to zero.
  */
 
-import type { GeometryResult, MeshData, Vec3 } from '@ifc-lite/geometry';
+import type { EntityWorldAabb, GeometryResult, MeshData, Vec3 } from '@ifc-lite/geometry';
 import { applyModelRotation } from './rotation-geometry.js';
 import {
   baselineIsForeign, captureAppendedMeshBaselines, captureRotationBaseline, dropReleasedVertexBaselines,
@@ -170,6 +170,18 @@ export class ModelRotationBaker {
     }
     return { ...mesh, positions: new Float32Array(mesh.positions),
       normals: mesh.normals ? new Float32Array(mesh.normals) : mesh.normals };
+  }
+
+  /** Instanced-only authoring bounds in the same pristine frame as inModelFrame.
+   * A replacement map installed by streaming is still pristine until reconciled;
+   * only the exact map produced by a bake may read that bake's baseline. */
+  instancedBoundsInModelFrame(geometry: Geometry, globalId: number): EntityWorldAabb | undefined {
+    const live = geometry.instancedGeometryAabbs;
+    if (!live) return undefined;
+    for (const entry of this.entries.values()) {
+      if (entry.baseline.bakedInstanced === live) return entry.baseline.instancedGeometryAabbs?.get(globalId);
+    }
+    return live.get(globalId);
   }
 
   /**

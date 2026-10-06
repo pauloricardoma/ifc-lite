@@ -122,24 +122,65 @@ a small floating input panel near the cursor accepts:
 Enter commits, Esc cancels. Same panel position as the existing
 measure-tool readout.
 
-### Multi-element split (Phase 2)
+### Multi-element split (`split.multi`, #6232 C5)
+
+Shipped as the Model workspace's "Split by line" command (Shift+K, the rail's
+scissors, the palette). Decision D6: it composes the per-element actions of
+this document in one transaction; there is no clip_mesh binding.
 
 ```text
-1. Draw a line tool (Shift-K?) places a free-floating "cutting
-   plane" represented in 2D as a yellow line + extruded plane
-   visualisation in 3D.
-2. The plane snaps to vertical / horizontal axes by default, to
-   any wall axis with Shift held.
-3. Every wall / slab / beam / column that intersects the plane is
-   highlighted blue.
-4. User clicks "Apply" in the floating prompt → all highlighted
-   elements split at the plane intersection in one mutation
-   (single undo).
-5. Esc cancels.
+1. Click two points (snapped, in the plan or in 3D): the cut is the vertical
+   plane through them. Like a slab cut it is a line that runs on, not a
+   segment.
+2. The targets are the selection; with nothing selected, every wall, beam
+   and slab of the active storey.
+3. The plane's ghost is drawn, the elements it will split are outlined in
+   the accent colour with a marker where it meets each axis, and the ones
+   it crosses but the split predicate refuses are outlined dashed in red
+   with the reason beside them. The bar counts both ("5 will split",
+   "3 refused"; the tooltip lists the reasons).
+4. The second click (or Enter) splits every crossed target through
+   `splitWallAtDistance`, `splitLinearElementAtDistance` and
+   `splitSlabByLine`, inside one `runTransaction`: one undo step, one
+   re-mesh request. The larger piece keeps each element's identity, the new
+   piece gets the derived GlobalId; hosted openings and fills follow the wall
+   piece they stand in. A refused target is left untouched. If a planned
+   split fails while committing, the whole commit is reverted.
+5. Esc starts over; Backspace drops the first point.
 ```
 
-This is the killer feature for building-wide cuts (e.g. "split
-everything along this gridline").
+### Trim / Extend (`element.trimExtend`, #6232 C1)
+
+The sibling of the split commands for changing an element's length rather than
+cutting it: the Model workspace's "Trim / Extend" (Shift+E, the rail's arrow to
+a line, the palette).
+
+```text
+1. Click the boundary: a wall or beam (its axis), a slab edge, or a guide
+   line the snap solver holds (a grid axis, an edge of anything else).
+2. Click walls and beams. Trim cuts the element back to the boundary and
+   removes the side you click; Extend lengthens the end nearest the click to
+   the boundary. The bar switches the mode, Shift flips it for one click.
+3. A wall meeting a boundary WALL is joined to it by the join core
+   (`computeWallJoin` / `joinWallsInStore`): a T where it ends on the wall's
+   path, an L at a corner, with the `IfcRelConnectsPathElements` and the
+   ending wall cut at the other's face. The wall's own end goes through the
+   ONE wall resize (`resizeWallMetres`). Against any other boundary the axis
+   end is put on the line and no join is written.
+4. Beams and members change their extrusion depth; a moved start moves the
+   placement point.
+```
+
+Refusals are shown before the click (the target is outlined red, the reason
+beside it) and said by a click on it: a boundary that stops before the
+element's line meets it, an element that already crosses it (Extend) or stops
+short of it (Trim), a trim that would leave under 5 cm, a trim that would cut
+through an opening, door or window hosted in the wall (the count is named; a
+wall's hosted elements are never moved to a piece, as a trim leaves none), and
+a wall or beam the readers cannot take, with the same reason the Split button
+gives for it. Extending a wall's start moves its placement, so the openings
+hosted in it are written back where they stood. One commit is one
+`runTransaction`: one undo step, one re-mesh request.
 
 ## Visual design
 
@@ -351,8 +392,8 @@ interface SplitToolSlice {
 }
 ```
 
-Goes in a new `splitToolSlice.ts`, same shape as the existing
-`addElementSlice` (mode + anchor + hover + parameters).
+Goes in a new `splitToolSlice.ts`, same shape as the other tool slices
+(mode + anchor + hover + parameters).
 
 ## Store actions
 
@@ -418,7 +459,7 @@ Module limits respected: each stays under 400 LOC.
 ## Visual feedback layer
 
 New overlay `SplitOverlay.tsx` in `tools/`, sibling to
-`AddElementOverlay` / `GizmoOverlay` / `WallEndpointOverlay`.
+`GizmoOverlay` / `WallEndpointOverlay`.
 Mounted by `ToolOverlays` when `activeTool === 'split'`. Renders:
 
 - Cursor knife glyph (CSS cursor on the canvas)
@@ -426,7 +467,7 @@ Mounted by `ToolOverlays` when `activeTool === 'split'`. Renders:
   override pipeline — set a transient `pendingColorUpdates` entry,
   clear on hover-out)
 - Guide line — SVG anchored to projected world positions
-- Snap markers — reused from `AddElementOverlay`'s snap glyphs
+- Snap markers — reused from the snap engine's glyphs
 - Distance / percent readout — HTML over canvas, positioned at
   the cut point
 - Numeric input panel — same shape as the existing measure-tool

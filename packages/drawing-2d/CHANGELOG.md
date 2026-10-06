@@ -1,5 +1,24 @@
 # @ifc-lite/drawing-2d
 
+## 4.1.0
+
+### Minor Changes
+
+- [#6627](https://github.com/LTplus-AG/ifc-lite/pull/6627) [`89e5950`](https://github.com/LTplus-AG/ifc-lite/commit/89e5950673dda22483396628f6cf46041c15e979) Thanks [@louistrue](https://github.com/louistrue)! - Add the optional `SectionConfig.clipProjectionBands` setting to clip mesh projections and hidden-line occluders to the configured visible and overhead depth bands before outlining them. This keeps geometry crossing a finite depth boundary from projecting its out-of-band footprint. Existing callers retain their current behavior when the setting is omitted.
+
+### Patch Changes
+
+- Updated dependencies [[`1051a74`](https://github.com/LTplus-AG/ifc-lite/commit/1051a74edca83eb3e6104562a7a65e0e645ac45b), [`6dace7b`](https://github.com/LTplus-AG/ifc-lite/commit/6dace7b05927505e9a9529674c635a505ce0c887), [`4c0ebf2`](https://github.com/LTplus-AG/ifc-lite/commit/4c0ebf24c8c7b8470602300d56f0b1bd7c2a01e0)]:
+  - @ifc-lite/geometry@7.7.0
+
+## 4.0.4
+
+### Patch Changes
+
+- [#6062](https://github.com/LTplus-AG/ifc-lite/pull/6062) [`9dec151`](https://github.com/LTplus-AG/ifc-lite/commit/9dec1513c91a5db36f35fcbc77b2932103e1574e) Thanks [@louistrue](https://github.com/louistrue)! - Preserve distinct submillimetre cut faces when merging drawing lines.
+- Updated dependencies [[`cd11f20`](https://github.com/LTplus-AG/ifc-lite/commit/cd11f203e11701ce8a9d0364baa4255b71a2fd0e), [`888a9a7`](https://github.com/LTplus-AG/ifc-lite/commit/888a9a72e1b1f59a0692942b15612a62c87033cb), [`c1bff6c`](https://github.com/LTplus-AG/ifc-lite/commit/c1bff6c774cc6fbc51d0600d337ad516f3e60a21), [`72b6b77`](https://github.com/LTplus-AG/ifc-lite/commit/72b6b77e3ef810c5ea9d22b9e9df178e749094c3), [`3f38367`](https://github.com/LTplus-AG/ifc-lite/commit/3f383676a094ad28724b4fd789e240740a865d64), [`10b3a44`](https://github.com/LTplus-AG/ifc-lite/commit/10b3a44ea325740562be7cafab14e28beebd3180)]:
+  - @ifc-lite/geometry@7.6.0
+
 ## 4.0.3
 
 ### Patch Changes

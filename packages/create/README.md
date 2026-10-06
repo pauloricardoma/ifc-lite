@@ -26,9 +26,22 @@ const { content } = creator.toIfc(); // IFC STEP text
 
 - Element builders: walls, slabs, columns, beams, stairs, roofs, doors, windows, ramps, railings, plates, members, footings, piles, spaces, curtain walls, furnishing, proxies, and parametric profile shapes (I, L, T, U, C, hollow sections)
 - Openings: `addIfcWallDoor` and `addIfcWallWindow` cut hosted doors and windows into walls
+- Loaded-model hosted placement: `addHostedElementInStore(store, editor, hostId, spec)`
+  is the shared atomic operation behind viewer tools, SDK methods and MCP
+  `place_opening` / `place_door` / `place_window`. Wall cuts must fit and avoid
+  existing openings; unreadable bounds or placements are refused. Omitted
+  optional axes use IFC defaults; explicit missing, zero or parallel axes and
+  incomplete body/profile references are refused.
+- Loaded-model wall joins: `joinWallsInStore` atomically rewrites wall bodies,
+  axes and `IfcRelConnectsPathElements`. Hosted openings must remain inside
+  both joined end faces; unreadable cuts refuse the join.
 - Property sets, element quantities, materials, and colors
 - 4D scheduling entities: IfcWorkSchedule, IfcTask, IfcRelSequence
 - In-store builders (`addWallToStore`, `addSlabToStore`, ...) that emit elements into an existing parsed model
+- `addOrdinaryElementInStore(editor, anchor, element)` commits the eight ordinary
+  builders atomically. Its anchor can be resolved or supplied by a synchronous
+  draft-editor callback so existing host preparation shares that transaction.
+  Failed creation leaves no helpers, journal entries or consumed IDs.
 - `resolveSpatialAnchor(store, storeyId, view)` reads the live mutation view when
   authoring into an edited model. Pass the same view as the `StoreEditor` so a
   created storey or placement, and deletions or retypes of source anchors, are

@@ -12,20 +12,12 @@ import type { MutablePropertyView, NewEntity, IfcAttributeValue } from '@ifc-lit
 import { StoreEditor } from '@ifc-lite/mutations';
 import type { Mutation, ChangeSet, PropertyValue } from '@ifc-lite/mutations';
 import { PropertyValueType, QuantityType } from '@ifc-lite/data';
+import { validatePropertyDataType } from '@ifc-lite/export';
 import {
-  addBeamToStore,
-  addColumnToStore,
   addDoorToStore,
-  addMemberToStore,
-  addPlateToStore,
-  addRoofToStore,
-  addSlabToStore,
-  addSpaceToStore,
-  addWallToStore,
+  addOrdinaryElementInStore,
   addWindowToStore,
   resolveSpatialAnchor,
-  duplicateInStore,
-  resolveDuplicateSource,
   generateSpacesFromWalls,
   type BeamInStoreParams,
   type ColumnInStoreParams,
@@ -35,6 +27,9 @@ import {
   type GenerateSpacesResult,
   type MemberInStoreParams,
   type PlateInStoreParams,
+  type ProfiledBeamInStoreParams,
+  type ProfiledColumnInStoreParams,
+  type ProfiledMemberInStoreParams,
   type RoofInStoreParams,
   type SlabInStoreParams,
   type SpaceInStoreParams,
@@ -43,23 +38,26 @@ import {
 } from '@ifc-lite/create';
 import type { MapConversion, ProjectedCRS } from '@ifc-lite/parser';
 import type { MeshData } from '@ifc-lite/geometry';
-import { getEntityBounds, getEntityCenter } from '@/utils/viewportUtils';
+import { getEntityCenter, unionEntityBounds } from '@/utils/viewportUtils';
 import { toGlobalIdFromModels } from '../globalId.js';
-import { meshesForOwningModel } from '../owningModelMeshes.js';
+import { geometryForOwningModel, meshesForOwningModel } from '../owningModelMeshes.js';
 import { modelRotationBaker } from '../../lib/model-placement/rotation-bake.js';
 import type { AuthoredElement } from './authoredElement.js';
-import { remeshAuthoredElement, rememberAuthoredElement } from './authoredFallbackMesh.js';
-import { authoredDataStore, syncAuthoredTreeEntry } from './authoredTreeEntry.js';
+import { completeAuthoredGeometry, revealAddedGeometryInModelView } from './authoredGeometryCompletion.js';
+import { authoredDataStore } from './authoredTreeEntry.js';
 import { ensureStoreyPlacement } from './storeyPlacement.js';
 import { effectiveStoreyId } from '@/lib/effective-storey';
+import { copyElements, copySources, withHostedFillings } from '@/lib/commands/modeling/copy-elements';
+import { newMutationBatchId } from './mutation-batch-tags.js';
+import { remeshAfterCommit } from '@/lib/remesh/remesh-registry';
+import { remeshGridPlacementAfterCommit } from './mutation-grid-remesh';
 
 export type { AuthoredElement };
 import { createCostUndoMutations, type CostUndoMethods } from './mutation-cost-undo.js';
-import { stashAndPruneEntityMesh, pruneStashByModel, type RemovedMeshStash } from './mutation-mesh-stash.js';
+import { completeEntityRemoval, pruneStashByModel, type RemovedMeshStash } from './mutation-mesh-stash.js';
 import { applyDuplicatePreAlignmentBaseline } from './mutation-duplicate-prealign.js';
 import { pruneMutationHistory } from './mutation-history-prune.js';
 import { invalidateHistoryPatch } from './mutation-redo-remote-guard.js';
-import type { TypeViewMode } from '../constants.js';
 import {
   resolvePlacementChain,
   resolveRotationState,
@@ -84,7 +82,9 @@ import { withMutationBatchTags } from './mutation-batch-tags.js';
 import { canMutate, mutationDenial, mutationDenialKey, mutationPermission } from '../mutation-permission.js';
 import { syncTypeOverride } from './mutation-history-apply.js';
 import { recordMutationBatch, replayHistory } from './mutation-history-replay.js';
+import { dropFromChangeSets, newChangeSet, parseChangeSetFile, recordHistory } from './mutation-history-record.js';
 import { positionalMutations } from './mutation-positional-batch.js';
+import { addHostedFillIn, type HostedFillOutcome, type HostedFillSpec } from './mutation-hosted-fill.js';
 
 /**
  * IFC-space directions for {@link MutationSlice.duplicateEntity}.
@@ -105,23 +105,6 @@ export const DUPLICATE_DEFAULT_DIRECTION: DuplicateDirection = '+X';
 
 /** Fallback step in metres when the source has no mesh in geometry. */
 const DUPLICATE_FALLBACK_STEP = 1;
-
-/**
- * New occurrence geometry from an authoring action (add element, duplicate,
- * split) is a class-0 mesh, which the 3D "Types" view deliberately hides. If
- * the user is in Types view when they commit such an action, flip back to
- * Model so the element they just created actually renders — otherwise the
- * toast says "added" but nothing appears. No-op when already in Model view
- * (so it never needlessly overwrites the persisted preference). Reads the
- * live store via the cross-slice `get()`.
- */
-function revealAddedGeometryInModelView(get: () => unknown): void {
-  const cross = get() as {
-    typeViewMode?: TypeViewMode;
-    setTypeViewMode?: (mode: TypeViewMode) => void;
-  };
-  if (cross.typeViewMode === 'types') cross.setTypeViewMode?.('model');
-}
 
 interface ViewerBox {
   /** Per-axis sizes in viewer scene coordinates. */
@@ -419,7 +402,7 @@ export interface MutationSlice extends CostUndoMethods {
    * flag and `mutationVersion` — everything `addColumn` & co. do after their
    * builder runs, minus collab mirroring, which that writer owns.
    */
-  recordAuthoredElement: (modelId: string, storeyExpressId: number, entityId: number, element: AuthoredElement) => void;
+  recordAuthoredElement: (modelId: string, storeyExpressId: number, entityId: number, element: AuthoredElement, options?: { historyRecorded?: boolean }) => void;
   /**
    * Book a removal another writer (the SDK `bim.store.removeEntity` adapter)
    * already applied: prune the mesh, stash the overlay record for undo, push
@@ -630,7 +613,7 @@ export interface MutationSlice extends CostUndoMethods {
   addColumn: (
     modelId: string,
     storeyExpressId: number,
-    params: ColumnInStoreParams
+    params: ColumnInStoreParams | ProfiledColumnInStoreParams
   ) => { expressId: number } | { error: string };
   /** Add an IfcWall anchored to a storey. */
   addWall: (
@@ -644,11 +627,11 @@ export interface MutationSlice extends CostUndoMethods {
     storeyExpressId: number,
     params: SlabInStoreParams
   ) => { expressId: number } | { error: string };
-  /** Add an IfcBeam anchored to a storey. */
+  /** Add an IfcBeam anchored to a storey: a rectangle (`Width` x `Height`) or a parametric `Profile`. */
   addBeam: (
     modelId: string,
     storeyExpressId: number,
-    params: BeamInStoreParams
+    params: BeamInStoreParams | ProfiledBeamInStoreParams
   ) => { expressId: number } | { error: string };
   /** Add a free-standing IfcDoor anchored to a storey. */
   addDoor: (
@@ -662,6 +645,19 @@ export interface MutationSlice extends CostUndoMethods {
     storeyExpressId: number,
     params: WindowInStoreParams
   ) => { expressId: number } | { error: string };
+  /**
+   * Cut an opening into a host wall (or slab), or place a door or window in
+   * one: the whole graph as one undo batch, the host re-meshed with its void
+   * (`mutation-hosted-fill.ts`). The one write path of the placing commands
+   * and of `bim.store.addOpening` / `addHostedDoor` / `addHostedWindow`.
+   * `batchId`: the running modeling transaction, which then re-meshes.
+   */
+  addHostedFill: (
+    modelId: string,
+    hostExpressId: number,
+    spec: HostedFillSpec,
+    batchId?: string,
+  ) => HostedFillOutcome;
   /** Add an IfcSpace (room) — rectangle or polygon footprint. */
   addSpace: (
     modelId: string,
@@ -684,7 +680,7 @@ export interface MutationSlice extends CostUndoMethods {
   addMember: (
     modelId: string,
     storeyExpressId: number,
-    params: MemberInStoreParams
+    params: MemberInStoreParams | ProfiledMemberInStoreParams
   ) => { expressId: number } | { error: string };
   /** Auto-generate IfcSpace volumes for every enclosed area formed by the storey's walls
    *  (existing + overlay). `dryRun: true` detects without emitting — for live UI previews. */
@@ -697,11 +693,11 @@ export interface MutationSlice extends CostUndoMethods {
    * Duplicate an existing IfcRoot product in a chosen direction.
    * Offset magnitude is one source-bbox dimension along the picked
    * IFC axis (so a 3m wall steps 3m, a 0.4m column steps 0.4m).
-   * Geometry is shared with the source via Representation reference
-   * AND mirrored into the renderer's mesh list with the offset
-   * applied — so the duplicate appears in 3D the moment the action
-   * fires, not just in the export overlay. Returns the new entity's
-   * express id, or an error message.
+   * Uses the same complete copy write as Paste and Array: assembly parts,
+   * hosted openings and fillings travel with their host. Source meshes are
+   * mirrored immediately and rebuilt through wasm. The complete copied
+   * graph is one undo step; disconnected parent frames are refused.
+   * Returns the new entity's express id, or an error message.
    */
   duplicateEntity: (
     modelId: string,
@@ -726,12 +722,16 @@ export interface MutationSlice extends CostUndoMethods {
   createChangeSet: (name: string) => string;
   /** Get active change set */
   getActiveChangeSet: () => ChangeSet | null;
-  /** Set active change set */
+  /** Set the change set new edits land in (null: the next edit starts "Unsaved changes"). */
   setActiveChangeSet: (id: string | null) => void;
   /** Export change set as JSON */
   exportChangeSet: (id: string) => string | null;
-  /** Import change set from JSON */
-  importChangeSet: (json: string) => void;
+  /** Rename a change set. */
+  renameChangeSet: (id: string, name: string) => void;
+  /** Drop a change set (the edits stay in the model); clears it as the active set. */
+  deleteChangeSet: (id: string) => void;
+  /** Add a change set from an exported file. Returns its id, or null when the text is not a change set. */
+  importChangeSet: (json: string) => string | null;
 
   // Actions - Query
   /** Check if a model has unsaved changes */
@@ -760,10 +760,6 @@ export interface MutationSlice extends CostUndoMethods {
    * overlay holds thousands of them.
    */
   markModelsDirty: (modelIds: readonly string[]) => void;
-}
-
-function generateChangeSetId(): string {
-  return `cs_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
 }
 
 function getOrCreateStoreEditor(
@@ -831,7 +827,6 @@ function runInStoreElementBuilder(
   modelId: string,
   storeyExpressId: number,
   element: AuthoredElement,
-  build: (editor: StoreEditor, anchor: ReturnType<typeof resolveSpatialAnchor>) => number,
 ): { expressId: number } | { error: string } {
   const denial = mutationDenial(get(), modelId);
   if (denial) return { error: denial };
@@ -846,19 +841,19 @@ function runInStoreElementBuilder(
   const editor = getOrCreateStoreEditor(get, set, modelId);
   if (!editor) return { error: 'Failed to create store editor' };
 
-  // Some source IFC files leave IfcBuildingStorey.ObjectPlacement
-  // null (it's optional in the schema). Without a placement,
-  // resolveSpatialAnchor throws "storey #N has no resolvable
-  // IfcLocalPlacement" — but a fresh IfcLocalPlacement at the
-  // origin is a valid default. Materialise one before the anchor
-  // walk so the user's authoring action doesn't get blocked by
-  // missing-but-recoverable IFC structure.
-  ensureStoreyPlacement(dataStore, editor, storeyExpressId);
-
   let entityId: number;
   try {
-    const anchor = resolveSpatialAnchor(dataStore, storeyExpressId, view);
-    entityId = build(editor, anchor);
+    const prepareAnchor = (draft: StoreEditor) => {
+      // Preserve the UI's existing optional-placement policy, but include its
+      // helper writes in the same transaction as the builder (#6232 D5).
+      ensureStoreyPlacement(dataStore, draft, storeyExpressId);
+      return resolveSpatialAnchor(dataStore, storeyExpressId, draft.getMutationView());
+    };
+    entityId = element.kind === 'door'
+      ? editor.runAtomic(draft => addDoorToStore(draft, prepareAnchor(draft), element.params).doorId)
+      : element.kind === 'window'
+        ? editor.runAtomic(draft => addWindowToStore(draft, prepareAnchor(draft), element.params).windowId)
+        : addOrdinaryElementInStore(editor, prepareAnchor, element);
   } catch (err) {
     return { error: err instanceof Error ? err.message : `Failed to add ${element.kind}` };
   }
@@ -891,6 +886,7 @@ function recordAuthoredElementIn(
   storeyExpressId: number,
   entityId: number,
   element: AuthoredElement,
+  options: { historyRecorded?: boolean } = {},
 ): void {
   const ifcType = authoredIfcType(element);
 
@@ -910,38 +906,19 @@ function recordAuthoredElementIn(
     registerAuthoredElement(dataStore.spatialHierarchy, storeyExpressId, entityId, ifcType, name);
   }
 
-  set((s) => {
-    const newUndoStacks = new Map(s.undoStacks);
-    const stack = newUndoStacks.get(modelId) || [];
-    const mutation: Mutation = {
-      id: `mut_${ifcType.toLowerCase()}_${entityId}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
-      type: 'CREATE_ENTITY',
-      timestamp: Date.now(),
-      modelId,
-      entityId,
-      attributeName: ifcType,
-    };
-    newUndoStacks.set(modelId, [...stack, mutation]);
-
-    const newRedoStacks = new Map(s.redoStacks);
-    newRedoStacks.set(modelId, []);
-
-    const newDirty = new Set(s.dirtyModels);
-    newDirty.add(modelId);
-
-    return {
-      undoStacks: newUndoStacks,
-      redoStacks: newRedoStacks,
-      dirtyModels: newDirty,
-      mutationVersion: s.mutationVersion + 1,
-    };
-  });
+  const mutation: Mutation = {
+    id: `mut_${ifcType.toLowerCase()}_${entityId}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
+    type: 'CREATE_ENTITY',
+    timestamp: Date.now(),
+    modelId,
+    entityId,
+    attributeName: ifcType,
+  };
+  if (!options.historyRecorded) set((s) => recordHistory(s, modelId, [mutation]));
 
   // Real geometry for the new element, from the IFC it was written as; drawn
   // from its parameters where the re-mesh can't mesh it (authoredFallbackMesh.ts).
-  rememberAuthoredElement(dataStore, entityId, storeyExpressId, element);
-  void remeshAuthoredElement(get, modelId, entityId);
-  revealAddedGeometryInModelView(get);
+  completeAuthoredGeometry(get, modelId, dataStore, storeyExpressId, entityId, element);
 }
 
 /**
@@ -956,15 +933,7 @@ function recordEntityRemovalIn(
   expressId: number,
   overlayRecord: NewEntity | null | undefined,
 ): void {
-  syncAuthoredTreeEntry(get(), modelId, expressId, overlayRecord, false);
-  // Drop the entity's mesh out of `geometryResult` (stashed first so
-  // undo can restore it) rather than only hiding it — #4925: a
-  // hide-only mesh desyncs from a split's separate hard removal.
-  // `hideEntities` is a fallback for entities with no mesh to prune.
-  const globalIdForMesh = toGlobalIdFromModels(get().models, modelId, expressId);
-  if (!stashAndPruneEntityMesh(get, set, modelId, expressId)) {
-    get().hideEntities([globalIdForMesh]);
-  }
+  completeEntityRemoval(get, set, modelId, expressId, overlayRecord);
 
   set((state) => {
     const newRemoved = new Map(state.removedNewEntities);
@@ -972,8 +941,6 @@ function recordEntityRemovalIn(
       newRemoved.set(`${modelId}:${expressId}`, overlayRecord);
     }
 
-    const newUndoStacks = new Map(state.undoStacks);
-    const stack = newUndoStacks.get(modelId) || [];
     const mutation: Mutation = {
       id: `mut_del_${expressId}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
       type: 'DELETE_ENTITY',
@@ -981,21 +948,7 @@ function recordEntityRemovalIn(
       modelId,
       entityId: expressId,
     };
-    newUndoStacks.set(modelId, [...stack, mutation]);
-
-    const newRedoStacks = new Map(state.redoStacks);
-    newRedoStacks.set(modelId, []);
-
-    const newDirty = new Set(state.dirtyModels);
-    newDirty.add(modelId);
-
-    return {
-      removedNewEntities: newRemoved,
-      undoStacks: newUndoStacks,
-      redoStacks: newRedoStacks,
-      dirtyModels: newDirty,
-      mutationVersion: state.mutationVersion + 1,
-    };
+    return { removedNewEntities: newRemoved, ...recordHistory(state, modelId, [mutation]) };
   });
 }
 
@@ -1046,8 +999,6 @@ export const createMutationSlice: StateCreator<
       newGeorefMuts.set(modelId, { ...modelMuts, [entity]: entityMuts });
 
       // Track undo
-      const newUndoStacks = new Map(state.undoStacks);
-      const stack = newUndoStacks.get(modelId) || [];
       const nextMutations: Mutation[] = fields.map(entry => ({
         id: `mut_georef_${entity}_${entry.field}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
         type: 'UPDATE_ATTRIBUTE',
@@ -1060,21 +1011,7 @@ export const createMutationSlice: StateCreator<
         propName: entry.field,
         psetName: entity,
       }));
-      newUndoStacks.set(modelId, [...stack, ...nextMutations]);
-
-      const newRedoStacks = new Map(state.redoStacks);
-      newRedoStacks.set(modelId, []);
-
-      const newDirty = new Set(state.dirtyModels);
-      newDirty.add(modelId);
-
-      return {
-        georefMutations: newGeorefMuts,
-        undoStacks: newUndoStacks,
-        redoStacks: newRedoStacks,
-        dirtyModels: newDirty,
-        mutationVersion: state.mutationVersion + 1,
-      };
+      return { georefMutations: newGeorefMuts, ...recordHistory(state, modelId, nextMutations) };
     });
   },
 
@@ -1113,6 +1050,7 @@ export const createMutationSlice: StateCreator<
         state.mutationMeshTranslations,
       );
       return {
+        ...dropFromChangeSets(state, state.undoStacks.get(modelId) ?? []),
         mutationViews: newViews,
         storeEditors: newEditors,
         dirtyModels: newDirty,
@@ -1131,35 +1069,21 @@ export const createMutationSlice: StateCreator<
     const view = get().mutationViews.get(modelId);
     if (!view) return null;
 
+    if (dataType !== undefined) {
+      if (value !== null && typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean') throw new Error('Explicit property declarations require a scalar value');
+      const declaration = validatePropertyDataType(value, dataType);
+      dataType = declaration.dataType;
+      valueType = declaration.valueType;
+    }
     const mutation = view.setProperty(entityId, psetName, propName, value, valueType, undefined, false, dataType);
 
-    set((state) => {
-      // Add to undo stack
-      const newUndoStacks = new Map(state.undoStacks);
-      const stack = newUndoStacks.get(modelId) || [];
-      newUndoStacks.set(modelId, [...stack, mutation]);
-
-      // Clear redo stack on new mutation
-      const newRedoStacks = new Map(state.redoStacks);
-      newRedoStacks.set(modelId, []);
-
-      // Mark model as dirty
-      const newDirty = new Set(state.dirtyModels);
-      newDirty.add(modelId);
-
-      return {
-        undoStacks: newUndoStacks,
-        redoStacks: newRedoStacks,
-        dirtyModels: newDirty,
-        mutationVersion: state.mutationVersion + 1,
-      };
-    });
+    set((state) => recordHistory(state, modelId, [mutation]));
 
     // Mirror into the collab CRDT (no-op without a session, and no-op unless
     // `modelId` is the ROOM's model — the mirror gates itself on the modelId it
     // is handed, so this call site cannot get the subject wrong. See
     // `@/lib/collab/room-model-target`.)
-    get().mirrorPropertyEdit(modelId, entityId, psetName, propName, value, valueType);
+    get().mirrorPropertyEdit(modelId, entityId, psetName, propName, value, valueType, dataType);
 
     return mutation;
   },
@@ -1173,24 +1097,7 @@ export const createMutationSlice: StateCreator<
     const mutation = view.deleteProperty(entityId, psetName, propName);
     if (!mutation) return null;
 
-    set((state) => {
-      const newUndoStacks = new Map(state.undoStacks);
-      const stack = newUndoStacks.get(modelId) || [];
-      newUndoStacks.set(modelId, [...stack, mutation]);
-
-      const newRedoStacks = new Map(state.redoStacks);
-      newRedoStacks.set(modelId, []);
-
-      const newDirty = new Set(state.dirtyModels);
-      newDirty.add(modelId);
-
-      return {
-        undoStacks: newUndoStacks,
-        redoStacks: newRedoStacks,
-        dirtyModels: newDirty,
-        mutationVersion: state.mutationVersion + 1,
-      };
-    });
+    set((state) => recordHistory(state, modelId, [mutation]));
 
     // Mirror into the collab CRDT — room model only, gated in the callee. See
     // the note in `setProperty`.
@@ -1209,24 +1116,7 @@ export const createMutationSlice: StateCreator<
 
     const mutation = view.createPropertySet(entityId, psetName, properties);
 
-    set((state) => {
-      const newUndoStacks = new Map(state.undoStacks);
-      const stack = newUndoStacks.get(modelId) || [];
-      newUndoStacks.set(modelId, [...stack, mutation]);
-
-      const newRedoStacks = new Map(state.redoStacks);
-      newRedoStacks.set(modelId, []);
-
-      const newDirty = new Set(state.dirtyModels);
-      newDirty.add(modelId);
-
-      return {
-        undoStacks: newUndoStacks,
-        redoStacks: newRedoStacks,
-        dirtyModels: newDirty,
-        mutationVersion: state.mutationVersion + 1,
-      };
-    });
+    set((state) => recordHistory(state, modelId, [mutation]));
 
     return mutation;
   },
@@ -1242,24 +1132,7 @@ export const createMutationSlice: StateCreator<
 
     const mutation = view.deletePropertySet(entityId, psetName);
 
-    set((state) => {
-      const newUndoStacks = new Map(state.undoStacks);
-      const stack = newUndoStacks.get(modelId) || [];
-      newUndoStacks.set(modelId, [...stack, mutation]);
-
-      const newRedoStacks = new Map(state.redoStacks);
-      newRedoStacks.set(modelId, []);
-
-      const newDirty = new Set(state.dirtyModels);
-      newDirty.add(modelId);
-
-      return {
-        undoStacks: newUndoStacks,
-        redoStacks: newRedoStacks,
-        dirtyModels: newDirty,
-        mutationVersion: state.mutationVersion + 1,
-      };
-    });
+    set((state) => recordHistory(state, modelId, [mutation]));
 
     return mutation;
   },
@@ -1284,24 +1157,7 @@ export const createMutationSlice: StateCreator<
 
     const mutation = view.setQuantity(entityId, qsetName, quantName, value, quantityType, unit);
 
-    set((state) => {
-      const newUndoStacks = new Map(state.undoStacks);
-      const stack = newUndoStacks.get(modelId) || [];
-      newUndoStacks.set(modelId, [...stack, mutation]);
-
-      const newRedoStacks = new Map(state.redoStacks);
-      newRedoStacks.set(modelId, []);
-
-      const newDirty = new Set(state.dirtyModels);
-      newDirty.add(modelId);
-
-      return {
-        undoStacks: newUndoStacks,
-        redoStacks: newRedoStacks,
-        dirtyModels: newDirty,
-        mutationVersion: state.mutationVersion + 1,
-      };
-    });
+    set((state) => recordHistory(state, modelId, [mutation]));
 
     return mutation;
   },
@@ -1314,24 +1170,7 @@ export const createMutationSlice: StateCreator<
 
     const mutation = view.createQuantitySet(entityId, qsetName, quantities);
 
-    set((state) => {
-      const newUndoStacks = new Map(state.undoStacks);
-      const stack = newUndoStacks.get(modelId) || [];
-      newUndoStacks.set(modelId, [...stack, mutation]);
-
-      const newRedoStacks = new Map(state.redoStacks);
-      newRedoStacks.set(modelId, []);
-
-      const newDirty = new Set(state.dirtyModels);
-      newDirty.add(modelId);
-
-      return {
-        undoStacks: newUndoStacks,
-        redoStacks: newRedoStacks,
-        dirtyModels: newDirty,
-        mutationVersion: state.mutationVersion + 1,
-      };
-    });
+    set((state) => recordHistory(state, modelId, [mutation]));
 
     return mutation;
   },
@@ -1345,24 +1184,7 @@ export const createMutationSlice: StateCreator<
 
     const mutation = view.setAttribute(entityId, attrName, value, oldValue);
 
-    set((state) => {
-      const newUndoStacks = new Map(state.undoStacks);
-      const stack = newUndoStacks.get(modelId) || [];
-      newUndoStacks.set(modelId, [...stack, mutation]);
-
-      const newRedoStacks = new Map(state.redoStacks);
-      newRedoStacks.set(modelId, []);
-
-      const newDirty = new Set(state.dirtyModels);
-      newDirty.add(modelId);
-
-      return {
-        undoStacks: newUndoStacks,
-        redoStacks: newRedoStacks,
-        dirtyModels: newDirty,
-        mutationVersion: state.mutationVersion + 1,
-      };
-    });
+    set((state) => recordHistory(state, modelId, [mutation]));
 
     // Mirror into the collab CRDT — room model only, gated in the callee. See
     // the note in `setProperty`.
@@ -1393,24 +1215,7 @@ export const createMutationSlice: StateCreator<
     // Reflect the new class live (inspector, hover, tree on rebuild).
     syncTypeOverride(get, modelId, entityId);
 
-    set((state) => {
-      const newUndoStacks = new Map(state.undoStacks);
-      const stack = newUndoStacks.get(modelId) || [];
-      newUndoStacks.set(modelId, [...stack, mutation!]);
-
-      const newRedoStacks = new Map(state.redoStacks);
-      newRedoStacks.set(modelId, []);
-
-      const newDirty = new Set(state.dirtyModels);
-      newDirty.add(modelId);
-
-      return {
-        undoStacks: newUndoStacks,
-        redoStacks: newRedoStacks,
-        dirtyModels: newDirty,
-        mutationVersion: state.mutationVersion + 1,
-      };
-    });
+    set((state) => recordHistory(state, modelId, [mutation!]));
 
     return mutation;
   },
@@ -1434,38 +1239,18 @@ export const createMutationSlice: StateCreator<
     const prior = view.getPositionalMutationsForEntity(entityId)?.get(index);
     editor.setPositionalAttribute(entityId, index, value);
 
-    set((state) => {
-      const newUndoStacks = new Map(state.undoStacks);
-      const stack = newUndoStacks.get(modelId) || [];
-      const mutation: Mutation = {
-        id: `mut_pos_${entityId}_${index}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
-        type: 'UPDATE_POSITIONAL_ATTRIBUTE',
-        timestamp: Date.now(),
-        modelId,
-        entityId,
-        attributeName: `@${index}`,
-        oldValue: (prior ?? null) as PropertyValue,
-        newValue: value as PropertyValue,
-      };
-      newUndoStacks.set(modelId, [...stack, mutation]);
-
-      const newRedoStacks = new Map(state.redoStacks);
-      newRedoStacks.set(modelId, []);
-
-      const newDirty = new Set(state.dirtyModels);
-      newDirty.add(modelId);
-
-      return {
-        undoStacks: newUndoStacks,
-        redoStacks: newRedoStacks,
-        dirtyModels: newDirty,
-        mutationVersion: state.mutationVersion + 1,
-      };
-    });
-
-    // Return the mutation we just pushed onto the undo stack.
-    const stack = get().undoStacks.get(modelId);
-    return stack ? stack[stack.length - 1] : null;
+    const mutation: Mutation = {
+      id: `mut_pos_${entityId}_${index}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
+      type: 'UPDATE_POSITIONAL_ATTRIBUTE',
+      timestamp: Date.now(),
+      modelId,
+      entityId,
+      attributeName: `@${index}`,
+      oldValue: (prior ?? null) as PropertyValue,
+      newValue: value as PropertyValue,
+    };
+    set((state) => recordHistory(state, modelId, [mutation]));
+    return mutation;
   },
 
   setPositionalAttributesBatch: (modelId, updates, continuing) => {
@@ -1518,32 +1303,35 @@ export const createMutationSlice: StateCreator<
     // the mutation lands on the undo stack with the standard envelope.
     const mutation = get().setPositionalAttribute(modelId, chain.cartesianPointId, 0, nativeNext);
 
-    // Push the renderer-frame delta so the visible mesh follows
-    // the IFC mutation. IFC is Z-up; renderer is Y-up. Conversion:
-    //   renderer.x =  ifc.x
-    //   renderer.y =  ifc.z
-    //   renderer.z = -ifc.y
-    const globalId = toGlobalIdFromModels(get().models, modelId, expressId);
-    const rendererDelta: [number, number, number] = [delta[0], delta[2], -delta[1]];
-    get().setPendingMeshTranslations(new Map([[globalId, rendererDelta]]));
+    if (!remeshGridPlacementAfterCommit(get, modelId, expressId, mutation, batchId)) {
 
-    // Record the mesh translation against the mutation id so undo /
-    // redo can move the rendered mesh back / forward — the mutation
-    // alone only carries the IfcCartesianPoint coordinate change.
-    // When a `batchId` is supplied (gizmo drag), tag the mutation so
-    // all the drag's per-frame translates collapse to one undo step.
-    if (mutation) {
-      const meshTags = new Map(get().mutationMeshTranslations);
-      meshTags.set(mutation.id, { globalId, rendererDelta });
-      if (batchId) {
-        const batchTags = new Map(get().mutationBatchTags);
-        batchTags.set(mutation.id, batchId);
-        set({ mutationMeshTranslations: meshTags, mutationBatchTags: batchTags });
-      } else {
-        set({ mutationMeshTranslations: meshTags });
+      // Push the renderer-frame delta so the visible mesh follows
+      // the IFC mutation. IFC is Z-up; renderer is Y-up. Conversion:
+      //   renderer.x =  ifc.x
+      //   renderer.y =  ifc.z
+      //   renderer.z = -ifc.y
+      const globalId = toGlobalIdFromModels(get().models, modelId, expressId);
+      const rendererDelta: [number, number, number] = [delta[0], delta[2], -delta[1]];
+      get().setPendingMeshTranslations(new Map([[globalId, rendererDelta]]));
+
+      // Record the mesh translation against the mutation id so undo /
+      // redo can move the rendered mesh back / forward — the mutation
+      // alone only carries the IfcCartesianPoint coordinate change.
+      // When a `batchId` is supplied (gizmo drag), tag the mutation so
+      // all the drag's per-frame translates collapse to one undo step.
+      if (mutation) {
+        const meshTags = new Map(get().mutationMeshTranslations);
+        meshTags.set(mutation.id, { globalId, rendererDelta });
+        if (batchId) {
+          const batchTags = new Map(get().mutationBatchTags);
+          batchTags.set(mutation.id, batchId);
+          set({ mutationMeshTranslations: meshTags, mutationBatchTags: batchTags });
+        } else {
+          set({ mutationMeshTranslations: meshTags });
+        }
       }
-    }
 
+    }
     // Mirror the move to peers as the entity's canonical placement
     // (`usd::xformop`). No-op outside a collab session.
     get().mirrorPlacementEdit(modelId, expressId, delta);
@@ -1591,15 +1379,17 @@ export const createMutationSlice: StateCreator<
     const dz = position[2] - oldZ;
     const mutation = get().setPositionalAttribute(modelId, chain.cartesianPointId, 0, pointToNative(dataStore, position));
     if (dx !== 0 || dy !== 0 || dz !== 0) {
-      const globalId = toGlobalIdFromModels(get().models, modelId, expressId);
-      const rendererDelta: [number, number, number] = [dx, dz, -dy];
-      get().setPendingMeshTranslations(new Map([[globalId, rendererDelta]]));
-      // Record so undo / redo can move the rendered mesh — see the
-      // matching note in `translateEntity`.
-      if (mutation) {
-        const tags = new Map(get().mutationMeshTranslations);
-        tags.set(mutation.id, { globalId, rendererDelta });
-        set({ mutationMeshTranslations: tags });
+      if (!remeshGridPlacementAfterCommit(get, modelId, expressId, mutation)) {
+        const globalId = toGlobalIdFromModels(get().models, modelId, expressId);
+        const rendererDelta: [number, number, number] = [dx, dz, -dy];
+        get().setPendingMeshTranslations(new Map([[globalId, rendererDelta]]));
+        // Record so undo / redo can move the rendered mesh — see the
+        // matching note in `translateEntity`.
+        if (mutation) {
+          const tags = new Map(get().mutationMeshTranslations);
+          tags.set(mutation.id, { globalId, rendererDelta });
+          set({ mutationMeshTranslations: tags });
+        }
       }
       // Mirror the move to peers as the entity's placement (`usd::xformop`).
       get().mirrorPlacementEdit(modelId, expressId, [dx, dy, dz]);
@@ -1633,16 +1423,18 @@ export const createMutationSlice: StateCreator<
           Math.sin(newYaw),
           state.refDirection[2],
         ];
-        get().setPositionalAttribute(modelId, state.refDirectionId, 0, newRatios);
-        // Live-rotate the rendered mesh about its bbox centre (IFC yaw about Z
-        // = renderer yaw about +Y, same angle).
-        const globalId = toGlobalIdFromModels(get().models, modelId, expressId);
-        const meshes = meshesForOwningModel(get(), modelId);
-        const c = getEntityCenter(meshes, globalId);
-        if (c) {
-          get().setPendingMeshRotations(
-            new Map([[globalId, { angle: deltaYaw, pivot: [c.x, c.y, c.z] as [number, number, number] }]]),
-          );
+        const mutation = get().setPositionalAttribute(modelId, state.refDirectionId, 0, newRatios);
+        if (!remeshGridPlacementAfterCommit(get, modelId, expressId, mutation)) {
+          // Live-rotate the rendered mesh about its bbox centre (IFC yaw about Z
+          // = renderer yaw about +Y, same angle).
+          const globalId = toGlobalIdFromModels(get().models, modelId, expressId);
+          const meshes = meshesForOwningModel(get(), modelId);
+          const c = getEntityCenter(meshes, globalId);
+          if (c) {
+            get().setPendingMeshRotations(
+              new Map([[globalId, { angle: deltaYaw, pivot: [c.x, c.y, c.z] as [number, number, number] }]]),
+            );
+          }
         }
         // Mirror to peers as the entity's placement (`usd::xformop` refDirection).
         get().mirrorPlacementEdit(modelId, expressId, [0, 0, 0], deltaYaw);
@@ -1719,7 +1511,7 @@ export const createMutationSlice: StateCreator<
     if (!editor) return { ok: false, reason: 'Failed to resolve store editor' };
     const dataStore = get().models.get(modelId)?.ifcDataStore;
     if (!dataStore) return { ok: false, reason: `No model loaded for id "${modelId}"` };
-    const result = resizeWallMetres(get, { dataStore, view, editor }, modelId, expressId, newStart, newEnd, batchId);
+    const result = resizeWallMetres(api, { dataStore, view, editor }, modelId, expressId, newStart, newEnd, batchId);
     // A drag rebuilds the mesh once, on release; a one-off resize right away.
     if (result.ok && batchId === undefined) get().refreshWallMesh(modelId, expressId);
     return result;
@@ -1761,7 +1553,7 @@ export const createMutationSlice: StateCreator<
   },
 
   splitWallAtDistance: (modelId, expressId, distanceFromStart) =>
-    splitWall(get, (id) => getOrCreateStoreEditor(get, set, id), modelId, expressId, distanceFromStart),
+    splitWall(get, (id) => getOrCreateStoreEditor(get, set, id), modelId, expressId, distanceFromStart, api),
 
   readLinearElementSplitProjection: (modelId, expressId, cursorStoreyLocal) => {
     const ctx = resolveEditReadContext(get, set, modelId);
@@ -1773,7 +1565,7 @@ export const createMutationSlice: StateCreator<
   },
 
   splitLinearElementAtDistance: (modelId, expressId, distanceFromStart) =>
-    splitLinear(get, (id) => getOrCreateStoreEditor(get, set, id), modelId, expressId, distanceFromStart),
+    splitLinear(get, (id) => getOrCreateStoreEditor(get, set, id), modelId, expressId, distanceFromStart, api),
 
   readSlabFootprint: (modelId, expressId) => {
     const ctx = resolveEditReadContext(get, set, modelId);
@@ -1786,7 +1578,7 @@ export const createMutationSlice: StateCreator<
   },
 
   splitSlabByLine: (modelId, expressId, cutA, cutB) =>
-    splitSlab(get, (id) => getOrCreateStoreEditor(get, set, id), modelId, expressId, cutA, cutB),
+    splitSlab(get, (id) => getOrCreateStoreEditor(get, set, id), modelId, expressId, cutA, cutB, api),
 
   removeEntity: (modelId, expressId, opts) => {
     if (!canMutate(get(), modelId)) return false;
@@ -1818,59 +1610,51 @@ export const createMutationSlice: StateCreator<
 
   addColumn: (modelId, storeyExpressId, params) => runInStoreElementBuilder(
     get, set, modelId, storeyExpressId, { kind: 'column', params },
-    (editor, anchor) => addColumnToStore(editor, anchor, params).columnId,
   ),
 
   addWall: (modelId, storeyExpressId, params) => runInStoreElementBuilder(
     get, set, modelId, storeyExpressId, { kind: 'wall', params },
-    (editor, anchor) => addWallToStore(editor, anchor, params).wallId,
   ),
 
   addSlab: (modelId, storeyExpressId, params) => runInStoreElementBuilder(
     get, set, modelId, storeyExpressId, { kind: 'slab', params },
-    (editor, anchor) => addSlabToStore(editor, anchor, params).slabId,
   ),
 
   addBeam: (modelId, storeyExpressId, params) => runInStoreElementBuilder(
     get, set, modelId, storeyExpressId, { kind: 'beam', params },
-    (editor, anchor) => addBeamToStore(editor, anchor, params).beamId,
   ),
 
   addDoor: (modelId, storeyExpressId, params) => runInStoreElementBuilder(
     get, set, modelId, storeyExpressId, { kind: 'door', params },
-    (editor, anchor) => addDoorToStore(editor, anchor, params).doorId,
   ),
 
   addWindow: (modelId, storeyExpressId, params) => runInStoreElementBuilder(
     get, set, modelId, storeyExpressId, { kind: 'window', params },
-    (editor, anchor) => addWindowToStore(editor, anchor, params).windowId,
   ),
+
+  addHostedFill: (modelId, hostExpressId, spec, batchId) => addHostedFillIn(api, modelId, hostExpressId, spec, { batchId }),
 
   addSpace: (modelId, storeyExpressId, params) => runInStoreElementBuilder(
     get, set, modelId, storeyExpressId, { kind: 'space', params },
-    (editor, anchor) => addSpaceToStore(editor, anchor, params).spaceId,
   ),
 
   addRoof: (modelId, storeyExpressId, params) => runInStoreElementBuilder(
     get, set, modelId, storeyExpressId, { kind: 'roof', params },
-    (editor, anchor) => addRoofToStore(editor, anchor, params).roofId,
   ),
 
   addPlate: (modelId, storeyExpressId, params) => runInStoreElementBuilder(
     get, set, modelId, storeyExpressId, { kind: 'plate', params },
-    (editor, anchor) => addPlateToStore(editor, anchor, params).plateId,
   ),
 
   addMember: (modelId, storeyExpressId, params) => runInStoreElementBuilder(
     get, set, modelId, storeyExpressId, { kind: 'member', params },
-    (editor, anchor) => addMemberToStore(editor, anchor, params).memberId,
   ),
 
-  recordAuthoredElement: (modelId, storeyExpressId, entityId, element) => {
+  recordAuthoredElement: (modelId, storeyExpressId, entityId, element, options) => {
     const dataStore = authoredDataStore(get(), modelId);
     const view = get().mutationViews.get(modelId);
     if (!dataStore || !view) return;
-    recordAuthoredElementIn(get, set, modelId, dataStore, view, storeyExpressId, entityId, element);
+    recordAuthoredElementIn(get, set, modelId, dataStore, view, storeyExpressId, entityId, element, options);
   },
 
   generateSpacesFromWalls: (modelId, storeyExpressId, options) => {
@@ -1914,35 +1698,16 @@ export const createMutationSlice: StateCreator<
     // dryRun → nothing emitted; skip undo / dirty bookkeeping.
     if (!result.emitted.length) return result;
 
-    set((s) => {
-      const newUndoStacks = new Map(s.undoStacks);
-      const stack = [...(newUndoStacks.get(modelId) ?? [])];
-      const ts = Date.now();
-      for (const e of result.emitted) {
-        stack.push({
-          id: `mut_ifcspace_${e.result.spaceId}_${ts}_${Math.random().toString(36).substring(2, 9)}`,
-          type: 'CREATE_ENTITY',
-          timestamp: ts,
-          modelId,
-          entityId: e.result.spaceId,
-          attributeName: 'IFCSPACE',
-        });
-      }
-      newUndoStacks.set(modelId, stack);
-
-      const newRedoStacks = new Map(s.redoStacks);
-      newRedoStacks.set(modelId, []);
-
-      const newDirty = new Set(s.dirtyModels);
-      newDirty.add(modelId);
-
-      return {
-        undoStacks: newUndoStacks,
-        redoStacks: newRedoStacks,
-        dirtyModels: newDirty,
-        mutationVersion: s.mutationVersion + 1,
-      };
-    });
+    const ts = Date.now();
+    const spaces: Mutation[] = result.emitted.map((e) => ({
+      id: `mut_ifcspace_${e.result.spaceId}_${ts}_${Math.random().toString(36).substring(2, 9)}`,
+      type: 'CREATE_ENTITY',
+      timestamp: ts,
+      modelId,
+      entityId: e.result.spaceId,
+      attributeName: 'IFCSPACE',
+    }));
+    set((s) => recordHistory(s, modelId, spaces));
 
     return result;
   },
@@ -1959,89 +1724,57 @@ export const createMutationSlice: StateCreator<
     const view = state.mutationViews.get(modelId);
     if (!view) return { error: 'Model has no editable mutation view yet' };
 
-    const editor = getOrCreateStoreEditor(get, set, modelId);
-    if (!editor) return { error: 'Failed to create store editor' };
+    const sources = copySources(state, modelId, [sourceExpressId]);
+    if ('refusal' in sources) return { error: sources.refusal };
 
     // Source's bounding box drives the offset magnitude; meshes are keyed by globalId, so they must
     // come from the EDITED model, not the active model's top-level mirror (#4929).
     // Read in the MODEL frame, not the live baked bytes: the rotation bake turns the appended copy once (#4873).
-    const sourceGlobalId = toGlobalIdFromModels(state.models, modelId, sourceExpressId);
-    const meshes = meshesForOwningModel(state, modelId)?.filter((m) => m.expressId === sourceGlobalId).map((m) => modelRotationBaker.inModelFrame(m));
-    const sourceBounds = getEntityBounds(meshes ?? null, sourceGlobalId);
+    const shown = withHostedFillings(state, modelId, [sourceExpressId]);
+    const shownGlobalIds = shown.map((id) => toGlobalIdFromModels(state.models, modelId, id));
+    const shownSet = new Set(shownGlobalIds);
+    const owningGeometry = geometryForOwningModel(state, modelId);
+    const owningMeshes = owningGeometry?.meshes.filter((m) => shownSet.has(m.expressId)).map((m) => modelRotationBaker.inModelFrame(m));
+    const sourceBounds = unionEntityBounds(owningMeshes ?? null, shownGlobalIds, (id) => {
+      const box = owningGeometry && modelRotationBaker.instancedBoundsInModelFrame(owningGeometry, id);
+      if (!box || ![...box.min, ...box.max].every(Number.isFinite)) return null;
+      return { min: { x: box.min[0], y: box.min[1], z: box.min[2] }, max: { x: box.max[0], y: box.max[1], z: box.max[2] } };
+    });
     const bbox: ViewerBox = sourceBounds
-      ? {
-          size: {
-            x: Math.max(sourceBounds.max.x - sourceBounds.min.x, 0),
-            y: Math.max(sourceBounds.max.y - sourceBounds.min.y, 0),
-            z: Math.max(sourceBounds.max.z - sourceBounds.min.z, 0),
-          },
-        }
+      ? { size: {
+          x: Math.max(sourceBounds.max.x - sourceBounds.min.x, 0),
+          y: Math.max(sourceBounds.max.y - sourceBounds.min.y, 0),
+          z: Math.max(sourceBounds.max.z - sourceBounds.min.z, 0),
+        } }
       : { size: { x: DUPLICATE_FALLBACK_STEP, y: DUPLICATE_FALLBACK_STEP, z: DUPLICATE_FALLBACK_STEP } };
 
     const ifcDelta = ifcOffsetForDirection(direction, bbox);
     const viewerDelta = viewerDeltaFromIfc(ifcDelta);
 
-    let newId: number;
+    const batchId = newMutationBatchId();
+    let copied: ReturnType<typeof copyElements>;
     try {
-      const source = resolveDuplicateSource(dataStore, sourceExpressId, editor);
-      const result = duplicateInStore(editor, source, { ...options, offset: ifcDelta });
-      newId = result.newId;
+      copied = copyElements(api, modelId, [sourceExpressId], [{ offset: ifcDelta }], { batchId, duplicate: options ?? {} });
     } catch (err) {
       return { error: err instanceof Error ? err.message : 'Failed to duplicate' };
     }
-
-    // Alias the duplicate to its source for base property / quantity
-    // reads — so the property panel shows the source's psets without
-    // us eagerly cloning them. The duplicate's own override slots
-    // remain scoped to the new id.
-    view.setEntityAlias(newId, sourceExpressId);
-
+    const newId = copied.copies[0];
     const newGlobalId = toGlobalIdFromModels(state.models, modelId, newId);
 
-    // Mirror the source's meshes into the geometry result with the
-    // offset applied so the duplicate is visible immediately. Without
-    // this the entity exists only in the export overlay — STEP-correct
-    // but invisible — and the user can't tell anything happened.
-    const clonedMeshes = cloneMeshesWithOffset(meshes, sourceGlobalId, newGlobalId, viewerDelta);
+    revealAddedGeometryInModelView(get);
 
-    set((s) => {
-      const newUndoStacks = new Map(s.undoStacks);
-      const stack = newUndoStacks.get(modelId) || [];
-      const mutation: Mutation = {
-        id: `mut_dup_${newId}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
-        type: 'CREATE_ENTITY',
-        timestamp: Date.now(),
-        modelId,
-        entityId: newId,
-        attributeName: 'DUPLICATE',
-      };
-      newUndoStacks.set(modelId, [...stack, mutation]);
-
-      const newRedoStacks = new Map(s.redoStacks);
-      newRedoStacks.set(modelId, []);
-
-      const newDirty = new Set(s.dirtyModels);
-      newDirty.add(modelId);
-
-      return {
-        undoStacks: newUndoStacks,
-        redoStacks: newRedoStacks,
-        dirtyModels: newDirty,
-        mutationVersion: s.mutationVersion + 1,
-      };
-    });
-
-    // Append cloned meshes via the existing data slice action so the
-    // renderer picks them up via its standard tick.
-    if (clonedMeshes.length > 0) {
-      const cross = get() as unknown as {
-        appendGeometryBatch?: (modelId: string, batch: MeshData[]) => void;
-      };
-      cross.appendGeometryBatch?.(modelId, clonedMeshes);
-      // #4970: inModelFrame leaves alignment baked in; correct the slot.
+    // Immediate translated source geometry; the canonical wasm re-mesh below
+    // replaces it from the copied IFC, including all parts and hosted fillings.
+    for (const id of copied.meshed) {
+      const source = copied.copiedFrom.get(id);
+      if (source === undefined) continue;
+      const sourceGlobalId = toGlobalIdFromModels(state.models, modelId, source);
+      const clonedMeshes = cloneMeshesWithOffset(owningMeshes, sourceGlobalId, toGlobalIdFromModels(state.models, modelId, id), viewerDelta);
+      if (clonedMeshes.length === 0) continue;
+      get().appendGeometryBatch(modelId, clonedMeshes);
       applyDuplicatePreAlignmentBaseline(set, modelId, sourceGlobalId, clonedMeshes.length, viewerDelta);
-      revealAddedGeometryInModelView(get);
     }
+    remeshAfterCommit(get, modelId, batchId, copied.meshed, 'created');
 
     return { expressId: newId, globalId: newGlobalId };
   },
@@ -2061,25 +1794,18 @@ export const createMutationSlice: StateCreator<
     return stack ? stack.length > 0 : false;
   },
 
-  invalidateHistoryForEntity: (modelId, entityId) => set((s) => invalidateHistoryPatch(s.undoStacks, s.redoStacks, s.mutationBatchTags, s.mutationMeshTranslations, modelId, entityId)),
-  // Change Sets
+  invalidateHistoryForEntity: (modelId, entityId) => set((s) => {
+    const patch = invalidateHistoryPatch(s.undoStacks, s.redoStacks, s.mutationBatchTags, s.mutationMeshTranslations, modelId, entityId);
+    // Whatever the patch removed from this model's undo stack also leaves its change sets.
+    if (!patch.undoStacks) return patch;
+    const kept = new Set((patch.undoStacks.get(modelId) ?? []).map((m) => m.id));
+    return { ...patch, ...dropFromChangeSets(s, (s.undoStacks.get(modelId) ?? []).filter((m) => !kept.has(m.id))) };
+  }),
+  // Change Sets (#6232 D4). Edits are filed by `recordHistory`.
   createChangeSet: (name) => {
-    const id = generateChangeSetId();
-    const changeSet: ChangeSet = {
-      id,
-      name,
-      createdAt: Date.now(),
-      mutations: [],
-      applied: false,
-    };
-
-    set((state) => {
-      const newChangeSets = new Map(state.changeSets);
-      newChangeSets.set(id, changeSet);
-      return { changeSets: newChangeSets, activeChangeSetId: id };
-    });
-
-    return id;
+    const changeSet = newChangeSet(name);
+    set((state) => ({ changeSets: new Map(state.changeSets).set(changeSet.id, changeSet), activeChangeSetId: changeSet.id }));
+    return changeSet.id;
   },
 
   getActiveChangeSet: () => {
@@ -2089,8 +1815,21 @@ export const createMutationSlice: StateCreator<
   },
 
   setActiveChangeSet: (id) => {
+    if (id !== null && !get().changeSets.has(id)) return;
     set({ activeChangeSetId: id });
   },
+
+  renameChangeSet: (id, name) => set((state) => {
+    const changeSet = state.changeSets.get(id);
+    return changeSet ? { changeSets: new Map(state.changeSets).set(id, { ...changeSet, name }) } : {};
+  }),
+
+  deleteChangeSet: (id) => set((state) => {
+    if (!state.changeSets.has(id)) return {};
+    const changeSets = new Map(state.changeSets);
+    changeSets.delete(id);
+    return { changeSets, activeChangeSetId: state.activeChangeSetId === id ? null : state.activeChangeSetId };
+  }),
 
   exportChangeSet: (id) => {
     const changeSet = get().changeSets.get(id);
@@ -2104,24 +1843,10 @@ export const createMutationSlice: StateCreator<
   },
 
   importChangeSet: (json) => {
-    try {
-      const data = JSON.parse(json);
-      if (!data.changeSet) return;
-
-      const changeSet: ChangeSet = {
-        ...data.changeSet,
-        id: generateChangeSetId(),
-        applied: false,
-      };
-
-      set((state) => {
-        const newChangeSets = new Map(state.changeSets);
-        newChangeSets.set(changeSet.id, changeSet);
-        return { changeSets: newChangeSets };
-      });
-    } catch {
-      console.error('Failed to import change set');
-    }
+    const changeSet = parseChangeSetFile(json);
+    if (!changeSet) return null;
+    set((state) => ({ changeSets: new Map(state.changeSets).set(changeSet.id, changeSet) }));
+    return changeSet.id;
   },
 
   // Query
@@ -2234,6 +1959,7 @@ export const createMutationSlice: StateCreator<
         removedMeshes: newRemovedMeshes,
         storeEditors: newEditors,
         mutationVersion: state.mutationVersion + 1,
+        ...dropFromChangeSets(state, state.undoStacks.get(modelId) ?? []),
       };
     });
   },
@@ -2248,6 +1974,7 @@ export const createMutationSlice: StateCreator<
     cross.clearGeneratedSchedule?.();
 
     set((state) => ({
+      ...dropFromChangeSets(state, [...state.undoStacks.values()].flat()),
       undoStacks: new Map(),
       redoStacks: new Map(),
       dirtyModels: new Set(),

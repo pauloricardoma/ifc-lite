@@ -13,9 +13,26 @@ import { buildStoreyWorkplane } from './workplane.js';
 import { BEAM_PLACE } from './commands/beam-place.js';
 import { COLUMN_PLACE } from './commands/column-place.js';
 import { ELEMENT_SPLIT } from './commands/element-split.js';
+import { ELEMENT_MOVE } from './commands/element-move.js';
+import { ELEMENT_ROTATE } from './commands/element-rotate.js';
+import { ROOM_PLACE } from './commands/room-place.js';
+import { SPACE_ENVELOPE } from './commands/space-envelope.js';
+import { DOOR_PLACE, OPENING_PLACE, WINDOW_PLACE } from './commands/hosted-place.js';
 import { SLAB_PLACE } from './commands/slab-place.js';
 import { WALL_MOVE_ENDPOINT } from './commands/wall-move-endpoint.js';
 import { WALL_PLACE } from './commands/wall-place.js';
+import { HOSTED_SLIDE } from './commands/hosted-slide.js';
+import { PLAN_MOVE } from './commands/plan-move.js';
+import { ELEMENT_ARRAY } from './commands/element-array.js';
+import { ELEMENT_PASTE } from './commands/element-paste.js';
+import { STAIR_PLACE } from './commands/stair-place.js';
+import { RAILING_PLACE } from './commands/railing-place.js';
+import { SPLIT_MULTI } from './commands/multi-split.js';
+import { ELEMENT_ALIGN } from './commands/element-align.js';
+import { ELEMENT_PUSH_PULL } from './commands/element-push-pull.js';
+import { CURTAINWALL_PLACE } from './commands/curtainwall-place.js';
+import { GRID_PLACE } from './commands/grid-place.js';
+import { ELEMENT_TRIM_EXTEND } from './commands/trim-extend.js';
 import type { ModelingCommand } from './types.js';
 
 /** A re-evaluated module (dev HMR) finds its commands already registered. */
@@ -29,6 +46,25 @@ registerOnce(WALL_MOVE_ENDPOINT);
 registerOnce(SLAB_PLACE);
 registerOnce(COLUMN_PLACE);
 registerOnce(BEAM_PLACE);
+registerOnce(ROOM_PLACE);
+registerOnce(SPACE_ENVELOPE);
+registerOnce(OPENING_PLACE);
+registerOnce(DOOR_PLACE);
+registerOnce(WINDOW_PLACE);
+registerOnce(HOSTED_SLIDE);
+registerOnce(PLAN_MOVE);
+registerOnce(ELEMENT_PASTE);
+registerOnce(ELEMENT_ARRAY);
+registerOnce(ELEMENT_MOVE);
+registerOnce(ELEMENT_ROTATE);
+registerOnce(STAIR_PLACE);
+registerOnce(RAILING_PLACE);
+registerOnce(SPLIT_MULTI);
+registerOnce(ELEMENT_PUSH_PULL);
+registerOnce(ELEMENT_ALIGN);
+registerOnce(CURTAINWALL_PLACE);
+registerOnce(GRID_PLACE);
+registerOnce(ELEMENT_TRIM_EXTEND);
 
 setWorkplaneResolver((s, modelId, spec) => (spec.kind === 'storey'
   ? buildStoreyWorkplane(s, modelId, spec.storeyId, spec.offset)

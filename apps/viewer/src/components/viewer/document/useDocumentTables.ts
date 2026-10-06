@@ -24,19 +24,11 @@ import type { ListDefinition } from '@ifc-lite/lists';
 import { useViewerStore } from '@/store';
 import type { DocumentSpec, ListTableSource, TableBlock, ValidationTableSource } from '@/lib/document/types';
 import type { TableState } from '@/lib/document/resolve-table';
+import { resolveComparisonTableState } from '@/lib/document/resolve-comparison-table';
 import { resolveValidationTableState } from '@/lib/document/resolve-validation-table';
-import { runListFederated } from '@/lib/lists/run-list';
-import { evaluatorModelsFromState } from '@/lib/model-tags/evaluator-models';
-import { buildExportModel } from '@/lib/lists/export/model';
-import { detectNumericColumns } from '../lists/list-table-utils';
+import { prepareListTable } from '@/lib/document/prepare-list-table';
 import { useListProviders } from '../lists/useListProviders';
-
-/** What a run is keyed by: the list's content, minus what cannot change its rows. */
-export function listFingerprint(list: ListDefinition): string {
-  const { id: _id, name: _name, description: _description, createdAt: _c, updatedAt: _u, ...content } = list;
-  void _id; void _name; void _description; void _c; void _u;
-  return JSON.stringify(content);
-}
+import { listFingerprint } from '@/lib/document/list-fingerprint';
 
 /** `true` when a list reads world coordinates, whose values move with the geometry and render frame. */
 export function listReadsGeometry(list: ListDefinition): boolean {
@@ -160,22 +152,8 @@ export function useDocumentTables(document: DocumentSpec | null): ReadonlyMap<st
           // exactly as the Lists panel builds it for its own export.
           const live = providersRef.current;
           const storeState = useViewerStore.getState();
-          const result = await runListFederated(list, live.pairs, storeState, {
-            evaluatorModels: evaluatorModelsFromState(storeState), signal: controller.signal,
-          });
+          state = await prepareListTable(list, live.pairs, live.modelUnits, storeState, { signal: controller.signal });
           if (cancelled) return;
-          const model = buildExportModel({
-            title: list.name,
-            columns: result.columns,
-            rows: result.rows,
-            grouping: list.grouping,
-            numericCols: detectNumericColumns(result.columns, result.rows),
-            columnWidths: [],
-            generatedAt: new Date().toLocaleString(),
-            modelUnits: live.modelUnits,
-            unitDisplayOverrides: useViewerStore.getState().unitDisplayOverrides,
-          });
-          state = { status: 'ok', model };
         } catch (err) {
           if (cancelled) return;
           // Shown in the block (preview and PDF), like the Lists panel's error box (#4317).
@@ -197,6 +175,9 @@ export function useDocumentTables(document: DocumentSpec | null): ReadonlyMap<st
     const out = new Map<string, TableState>();
     for (const [blockId, fp] of fingerprints) out.set(blockId, hasData ? (current.get(fp) ?? RESOLVING) : NO_MODEL);
     for (const [blockId, state] of validationStates) out.set(blockId, state);
+    for (const block of document?.blocks ?? []) {
+      if (block.kind === 'table' && block.source.kind === 'comparison') out.set(block.id, resolveComparisonTableState(block.source.comparison));
+    }
     return out;
-  }, [fingerprints, current, hasData, validationStates]);
+  }, [fingerprints, current, hasData, validationStates, document]);
 }

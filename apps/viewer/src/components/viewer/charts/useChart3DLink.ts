@@ -155,6 +155,7 @@ export function presentChartIds(ids: number[], mode: ChartFocusMode): void {
       idsFocusVisibilityOwned: null,
       clashVisibilityOwned: null,
       basketVisibilityOwned: null,
+      listVisibilityOwned: null,
       chartVisibilityOwned: { channel: 'ghost', ids: installed },
       chartVisibilityRevision: visibilityRevision,
     });
@@ -168,6 +169,7 @@ export function presentChartIds(ids: number[], mode: ChartFocusMode): void {
       idsFocusVisibilityOwned: null,
       clashVisibilityOwned: null,
       basketVisibilityOwned: null,
+      listVisibilityOwned: null,
       chartVisibilityOwned: { channel: 'isolate', ids: installed },
       chartVisibilityRevision: visibilityRevision,
     });
@@ -275,7 +277,7 @@ export function useChart3DLink(): Chart3DLink {
       current.chartSlice !== chartSlice
       || current.chartSelectionRevision !== chartSelectionRevision
       || current.selectionRevision !== selectionRevision
-      // A content-preserving owner may replay the same channel (Space Sketch
+      // A content-preserving owner may replay the same channel (a view snapshot
       // captures/restores it), advancing visibilityRevision while the chart's
       // verified ownership record deliberately survives. That is still safe
       // to re-present on a focus-mode change. With no live claim, the revision

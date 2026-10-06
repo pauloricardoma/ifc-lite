@@ -18,10 +18,14 @@
  */
 
 import { parseCapabilities } from '@ifc-lite/extensions';
-import { runFlow, type FlowDocument, type MemoCache, type RunResult } from '@ifc-lite/flow';
-import { BROWSER_FEATURES, createStandardRegistry, invalidateGlobalIdIndex, referencedSecrets, type FlowHost } from '@ifc-lite/flow-nodes';
+import { runFlow, checkAvailability, type HostFeatures, type FlowDocument, type MemoCache, type RunResult } from '@ifc-lite/flow';
+import { BROWSER_FEATURES, AUTOMATION_FEATURES, createStandardRegistry, invalidateGlobalIdIndex, referencedSecrets, type FlowHost } from '@ifc-lite/flow-nodes';
 import type { BimContext } from '@ifc-lite/sdk';
 import { BrowserTrackingStore } from './persistence.js';
+import { createViewerBcfWriteGateway } from '../bcf-publication/flow-gateway.js';
+
+/** BCF write nodes share the viewer's durable publication outbox (#6896). */
+const bcfWrites = createViewerBcfWriteGateway();
 
 let registry: ReturnType<typeof createStandardRegistry> | undefined;
 
@@ -43,6 +47,7 @@ export interface ViewerRunInput {
   readonly tables?: FlowHost['tables'];
   /** Loads a model for `model.openFromSource` through `addModel` — see `open-model.ts`. */
   readonly openModel?: FlowHost['openModel'];
+  readonly automation?: FlowHost['automation'];
 }
 
 export class FlowCapabilityError extends Error {
@@ -85,15 +90,20 @@ export async function runFlowInViewer(input: ViewerRunInput): Promise<RunResult>
     grants: parsed.value,
     networkGrants: parsed.value,
     defaultModelId: input.bim.model.activeId() ?? undefined,
+    bcfWrites,
     ...(input.tables ? { tables: input.tables } : {}),
     ...(input.openModel ? { openModel: input.openModel } : {}),
+    ...(input.automation ? { automation: input.automation } : {}),
   };
+  const features = viewerFlowFeatures(!!input.automation);
+  const unavailable = checkAvailability(input.doc, flowRegistry(), features).filter((n) => n.status === 'unknown' || n.status === 'unavailable');
+  if (unavailable.length) throw new Error(unavailable.map((n) => `${n.nodeId}: ${n.reasons.join(', ')}`).join('; '));
   const tracking = new BrowserTrackingStore(input.doc.id, input.pin);
   const result = await input.bim.mutate.batchAsync(`flow:${input.doc.name}`, () =>
     runFlow(input.doc, {
       host,
       registry: flowRegistry(),
-      features: BROWSER_FEATURES,
+      features,
       cache: input.cache,
       tracking,
       inputs: input.inputs,
@@ -108,6 +118,10 @@ export async function runFlowInViewer(input: ViewerRunInput): Promise<RunResult>
     ok: false,
     log: [...result.log, { nodeId: TRACKING_NODE_ID, laneKey: null, level: 'error', message: `tracked sets could not be saved to browser storage: ${tracking.persistError}` }],
   };
+}
+
+export function viewerFlowFeatures(automation: boolean): HostFeatures {
+  return { ...BROWSER_FEATURES, backend: new Set([...BROWSER_FEATURES.backend, ...(automation ? AUTOMATION_FEATURES : [])]) };
 }
 
 /** Log entries about the tracking store itself carry this in place of a node id. */

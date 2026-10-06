@@ -23,7 +23,12 @@ import { AUTHORED_KINDS, occurrencesOf } from '@/lib/commands/modeling/authored-
 import type { AuthoringTransaction, ModelingCommand } from '@/lib/commands/modeling/types';
 import type { AuthoredElementKind } from '@/store/slices/authoringDefaultsSlice';
 import { detachFromType, recordModellingEdit } from '@/store/slices/mutation-modelling-records';
+import { commitElementSize } from '@/lib/element-size-commit';
+import type { ElementSizePatch } from '@/store/slices/mutation-element-size';
 import { setWallSection, type WallSection } from '@/store/slices/mutation-wall-section';
+import { editHostedFillIn, moveHostedFillIn, type HostedFillPosition } from '@/store/slices/mutation-hosted-fill';
+import { setElementProfile } from '@/store/slices/mutation-element-profile';
+import { editStairDimensionsInStore, type HostedElementSize, type ProfileSection, type StairDimensionEdit } from '@ifc-lite/create';
 
 /**
  * Run one inspector edit as one undo step. `edit` writes through
@@ -81,12 +86,68 @@ export function createElementType(modelId: string, kind: AuthoredElementKind, na
   return ok ? typeId : null;
 }
 
+/**
+ * A wall's, slab's, column's or beam's size, in metres: the one write the
+ * push / pull handles make too (`setElementSize`), so the two cannot differ.
+ * A wall's openings follow it in the same step.
+ */
+export function setElementDimensions(modelId: string, expressId: number, patch: ElementSizePatch): boolean {
+  return runInspectorEdit(modelId, (tx) => {
+    const outcome = commitElementSize(useViewerStore, tx.modelId, expressId, patch);
+    if (!outcome.ok) throw new Error(outcome.reason);
+    return outcome.remesh;
+  });
+}
+
 /** A wall's thickness and/or height, in metres. */
 export function setWallDimensions(modelId: string, expressId: number, section: WallSection): boolean {
+  return setElementDimensions(modelId, expressId, { kind: 'wall', ...section });
+}
+
+/**
+ * A beam's, column's or member's cross-section (`setElementProfile`): a new
+ * kind (I, L, T, U, C, circle, hollow) or new dimensions of the kind, in
+ * metres. One undo step; the element re-meshes with its new section.
+ */
+export function setElementProfileSection(modelId: string, expressId: number, section: ProfileSection): boolean {
   return runInspectorEdit(modelId, (tx) => {
-    const outcome = setWallSection(() => tx.store, tx.modelId, expressId, section);
+    const outcome = setElementProfile(() => tx.store, tx.modelId, expressId, section);
     if (!outcome.ok) throw new Error(outcome.reason);
-    return [expressId];
+    return outcome.remesh;
+  });
+}
+
+/**
+ * A door's, window's or opening's offset along its host and its sill, in
+ * metres: one write to the opening's placement, which the filling follows.
+ * The host re-meshes with the moved void.
+ */
+export function moveHostedElement(modelId: string, expressId: number, position: HostedFillPosition): boolean {
+  return runInspectorEdit(modelId, (tx) => {
+    const moved = moveHostedFillIn(useViewerStore, tx.modelId, expressId, position);
+    if (!moved.ok) throw new Error(moved.reason);
+    return moved.remesh;
+  });
+}
+
+/** Occurrence-only window/door size, using the same hosted fit and overlap
+ * core as placement, Offset/Sill and the plan slide handle. */
+export function setHostedElementDimensions(modelId: string, expressId: number, size: Partial<HostedElementSize>): boolean {
+  return runInspectorEdit(modelId, tx => {
+    const edited = editHostedFillIn(useViewerStore, tx.modelId, expressId, size);
+    if (!edited.ok) throw new Error(edited.reason);
+    return edited.remesh;
+  });
+}
+
+/** Parent or selected flight, occurrence-only stepped dimensions. */
+export function setStairDimensions(modelId: string, expressId: number, patch: StairDimensionEdit): boolean {
+  return runInspectorEdit(modelId, tx => {
+    const dataStore = tx.store.models.get(tx.modelId)?.ifcDataStore;
+    if (!dataStore) throw new Error(`No model loaded for id "${tx.modelId}"`);
+    const edited = recordModellingEdit(useViewerStore, tx.modelId, (_methods, draft) =>
+      editStairDimensionsInStore(dataStore, draft, expressId, patch), tx.batchId);
+    return [edited.stairId, edited.flightId];
   });
 }
 
@@ -145,8 +206,9 @@ export function applyMaterialLayers(modelId: string, spec: ApplyLayersSpec): num
     }
     if (elementId === undefined) return [];
     if (kind === 'wall') {
-      const section = setWallSection(() => tx.store, tx.modelId, elementId, { thickness: total });
+      const section = setWallSection(tx.api, tx.modelId, elementId, { thickness: total });
       if (!section.ok) throw new Error(section.reason);
+      return section.remesh;
     }
     return [elementId];
   });

@@ -11,20 +11,31 @@
  *
  * The shape is plain JSON: it is what `.ifclite-document.json` carries.
  */
-import { validateChartSpec, type ChartSpec, type ReportPageSetup } from '@ifc-lite/charts';
+import { DOCUMENT_VERSION } from './document-version.js';
+export { DOCUMENT_VERSION } from './document-version.js';
+import { validateBlockTitle, type BlockTitle } from './block-title.js';
+import { isRgbColor } from '../color-contrast';
+import type { GroupOrder } from '../lists/group-sort';
+import { isSavedComparison, type SavedComparison } from '../compare/savedComparisonSchema';
+import { CHART_FONT_SIZE, validateChartSpec, type ChartSpec, type ReportPageSetup } from '@ifc-lite/charts';
 import { isSavedListShape, type ListDefinition } from '@ifc-lite/lists';
 import { isFilterGroup } from '@ifc-lite/rules';
 import { migrateDocumentListBlocks } from './document-list-migration.js';
+import { validateManualReportBlock, type ManualReportBlock } from './manual-report-types.js';
+import { validateIdsReportBlock, type IdsReportBlock } from './ids-report-types.js';
+import { isDocumentImageDataUrl, validatePageBand, type PageBand } from './page-band.js';
+import { validatePageHeading, type PageHeading } from './page-heading.js';
+import { validateTextTypography, type TextFont } from './text-typography.js';
+export { TEXT_SIZE_MIN, TEXT_SIZE_MAX } from './text-typography.js';
+export type { TextFont } from './text-typography.js';
 
-export const DOCUMENT_VERSION = 6;
+export { reportBlockSourceKind } from './ids-report-types.js';
+export type { IdsReportBlock, IdsReportCardinality, IdsReportCheckSummary, IdsReportRuleSummary, IdsReportSetRow, IdsReportVariant, ReportSourceKind } from './ids-report-types.js';
 
 /** A block that can sit two-up in a row (#4940); an unpaired half block prints full width. */
 export type BlockWidth = 'full' | 'half';
-export type TextFont = 'helvetica' | 'times' | 'courier';
-export const TEXT_SIZE_MIN = 6;
-export const TEXT_SIZE_MAX = 48;
 
-export interface TextBlock {
+export interface TextBlock extends BlockTitle {
   kind: 'text';
   id: string;
   /** Template text; `{path}` placeholders resolve against the model (see `bindings.ts`). */
@@ -33,10 +44,15 @@ export interface TextBlock {
   /** Optional overrides of the chosen style; PDF standard fonts need no embedded asset. */
   font?: TextFont;
   fontSize?: number;
+  /** Optional sRGB colours in #RRGGBB form; absent means style ink / transparent paper. */
+  textColor?: string;
+  backgroundColor?: string;
   width?: BlockWidth;
+  /** Whole-block size, 0.5-2 (#6548): scales the block's text and graphics together; absent is 1. */
+  scale?: number;
 }
 
-export interface ImageBlock {
+export interface ImageBlock extends BlockTitle {
   kind: 'image';
   id: string;
   /** `data:image/png;base64,…` or `data:image/jpeg;base64,…` — a logo travels with the file. */
@@ -47,9 +63,11 @@ export interface ImageBlock {
   caption?: string;
   /** `'half'` pairs this block with the next half text/chart/image into one row (#4940). Default `'full'`. */
   width?: BlockWidth;
+  /** Whole-block size, 0.5-2 (#6548): scales the block's text and graphics together; absent is 1. */
+  scale?: number;
 }
 
-export interface ChartBlock {
+export interface ChartBlock extends BlockTitle {
   kind: 'chart';
   id: string;
   /** A copy of the chart spec, so the document does not depend on a dashboard still existing. */
@@ -58,67 +76,23 @@ export interface ChartBlock {
   snapshot: boolean;
   /** Printed height in points, 120-600 (#4940). Default 220. */
   height?: number;
+  /** Base chart text size, 6–24; absent preserves the renderer's default typography. */
+  fontSize?: number;
   /** `'half'` pairs this block with the next half text/chart/image into one row (#4940). Default `'full'`. */
   width?: BlockWidth;
+  /** Whole-block size, 0.5-2 (#6548): scales the block's text and graphics together; absent is 1. */
+  scale?: number;
 }
 
-/**
- * One check (IDS specification, or a future rule-set's equivalent) inside an
- * IDS report block (#5125): the counts and description the issue asks for,
- * taken straight off `SpecificationResult` — `shortDescription` is the
- * specification's `name`, `longDescription` its optional `description`, so
- * neither is invented here.
- */
-export interface IdsReportCheckSummary {
-  id: string;
-  shortDescription: string;
-  longDescription?: string;
-  checked: number;
-  passed: number;
-  failed: number;
-  /** 0-100, floor-rounded; 100 when `checked` is 0 (no applicable entities) — matches `SpecificationResult.passRate`. */
-  passRate: number;
-  rules: IdsReportRuleSummary[];
-}
-
-/** A requirement under one IDS specification. Null metrics mean the source
- * report omitted passing entities, so an exact per-rule count is unavailable. */
-export interface IdsReportRuleSummary {
-  id: string;
-  shortDescription: string;
-  longDescription?: string;
-  checked: number;
-  passed: number | null;
-  failed: number | null;
-  passRate: number | null;
-}
-
-/**
- * A frozen snapshot of an IDS/rule-set validation report (#5125), taken from
- * the live `ValidationReport` when the block is added or refreshed — like a
- * table block's list copy, it travels with the document instead of reading
- * the store, so a saved document still prints the run that produced it.
- *
- * Each check carries a child row for its IDS requirements (#5125).
- */
-export interface IdsReportBlock {
-  kind: 'ids-report';
-  id: string;
-  /** IDS document title, or rule-set name, printed as the block's heading. */
-  sourceName: string;
-  /** When the snapshotted run finished (`ValidationReport.timestamp`, ISO). */
-  generatedAt: string;
-  summary: { checked: number; passed: number; failed: number; passRate: number };
-  checks: IdsReportCheckSummary[];
-}
-
-export interface TopicBlock {
+export interface TopicBlock extends BlockTitle {
   kind: 'topic';
   id: string;
   /** BCF topic GUID — survives a new IFC revision, and a re-imported BCF. */
   guid: string;
   /** Whether to print the topic's first viewpoint snapshot. */
   snapshot: boolean;
+  /** Whole-block size, 0.5-2 (#6548): scales the block's text and graphics together; absent is 1. */
+  scale?: number;
 }
 
 /** Blank vertical space between blocks, in points (#4940). Reuses the move/remove block UI; no other content. */
@@ -126,6 +100,12 @@ export interface SpacerBlock {
   kind: 'spacer';
   id: string;
   height: number;
+}
+
+/** Start the next content block on a fresh page (#6485); adjacent/edge breaks coalesce. */
+export interface PageBreakBlock {
+  kind: 'page-break';
+  id: string;
 }
 
 /** Data rows a table block prints before its "… n more rows" line (#5142): one A4 portrait page by default. */
@@ -137,7 +117,13 @@ export const TABLE_ROWS_MAX = 500;
  * store's live validation report (#5138) — the discriminator #5142 left
  * room for.
  */
-export type TableSource = ListTableSource | ValidationTableSource;
+export type TableSource = ListTableSource | ValidationTableSource | ComparisonTableSource;
+
+/** Portable immutable report copy: deleting the library entry never breaks a document. */
+export interface ComparisonTableSource {
+  kind: 'comparison';
+  comparison: SavedComparison;
+}
 
 export interface ListTableSource {
   kind: 'list';
@@ -182,7 +168,7 @@ export interface ValidationTableSource {
  * Version 4 introduced validation sources; the version bump makes older
  * readers report "newer version" instead of misdiagnosing the block as a
  * broken list (review finding, #5138). */
-export interface TableBlock {
+export interface TableBlock extends BlockTitle {
   kind: 'table';
   id: string;
   source: TableSource;
@@ -191,20 +177,43 @@ export interface TableBlock {
   caption?: string;
   /** Data rows printed before "… n more rows"; 1..TABLE_ROWS_MAX, default TABLE_ROWS_DEFAULT. */
   maxRows?: number;
+  /** Group ordering at every nesting level; absent retains count-descending defaults. */
+  groupOrder?: GroupOrder;
+  /** Optional opaque table-header background; absent uses the default slate. */
+  headerBackground?: string;
+  /** Optional opaque header ink; absent chooses black or white for contrast. */
+  headerTextColor?: string;
+  /** Whole-block size, 0.5-2 (#6548): scales the block's text and graphics together; absent is 1. */
+  scale?: number;
 }
 
-export type DocumentBlock = TextBlock | ImageBlock | ChartBlock | TopicBlock | SpacerBlock | TableBlock | IdsReportBlock;
+export type DocumentBlock = TextBlock | ImageBlock | ChartBlock | TopicBlock | SpacerBlock | PageBreakBlock | TableBlock | IdsReportBlock | ManualReportBlock;
 export type DocumentBlockKind = DocumentBlock['kind'];
 
 export const CHART_BLOCK_HEIGHT_MIN = 120;
 export const CHART_BLOCK_HEIGHT_MAX = 600;
 export const CHART_BLOCK_HEIGHT_DEFAULT = 220;
 
+/** Whole-block size bounds (#6548): below 0.5 printed text is unreadable, above 2 a block cannot share a page with anything. */
+export const BLOCK_SCALE_MIN = 0.5;
+export const BLOCK_SCALE_MAX = 2;
+
+/** The factor a block is laid out at: absent, non-finite or out-of-range reads as 1, like `chartFontScale`. */
+export function blockScale(block: { kind: string; scale?: number }): number {
+  // A spacer is blank space with its own height, and a page break has no content: neither scales.
+  const scale = block.kind === 'spacer' || block.kind === 'page-break' ? undefined : block.scale;
+  return typeof scale === 'number' && Number.isFinite(scale) && scale >= BLOCK_SCALE_MIN && scale <= BLOCK_SCALE_MAX ? scale : 1;
+}
+
 export interface DocumentSpec {
   version: typeof DOCUMENT_VERSION;
   id: string;
   name: string;
   page: ReportPageSetup;
+  /** Independent printed heading; absence retains the library name and default style. */
+  pageHeading?: PageHeading;
+  /** Optional repeated footer; absence keeps the generated receipt and counter. */
+  pageFooter?: PageBand;
   blocks: DocumentBlock[];
 }
 
@@ -214,21 +223,22 @@ export function isHalfPairable<T extends { kind: string }>(block: T): block is T
 }
 
 /**
- * `.ifclite-document.json` version 1 -> 2 (#4940) -> 3 (#5142) -> 4 (#5138) -> 5 (#5125) -> 6 (#4940 follow ups):
- * the version steps are additive for existing blocks/sources (v2 added optional
- * `width`/`height` on chart/image, text styles and the spacer block; v3
- * added the table block over a list; v4 added the table block's validation
- * source; v5 added the separate IDS report block; v6 adds text font, size,
- * and half-width layout). Embedded v1 Lists conditions are also normalized
- * into Rules groups (#5894), including in a document already at version 6.
- * The version bump makes an older viewer refuse a block/source it cannot print
- * instead of misreporting it as broken (see the comment on `TableBlock`).
- * Anything that is not a recognizable older document passes through
- * unchanged so `validateDocumentSpec` reports the real problem.
+ * `.ifclite-document.json` version 1 -> 2 (#4940) -> 3 (#5142) -> 4 (#5138) -> 5 (#5125) -> 6 (#4940 follow ups) -> 7 (#6401) -> 8 (#6485) -> 9 (#6506) -> 10 (#6507) -> 11 (#6548) -> 12 (#6610):
+ * every step is additive (v2: chart/image `width`/`height`, text styles, spacer; v3: table
+ * over a list; v4: its validation source; v5: IDS report block; v6: text font, size and
+ * half-width layout; v7: manual-validation report block; v8: explicit page-break block; v9: saved comparison tables; v10: live manual checklist
+ * identity and optional compact/benchmark presentation; v11: optional whole-block `scale`). The report block's optional
+ * `sourceKind` (#6372) is additive within v6: an absent value reads as `'ids'`, the label
+ * every earlier block printed. An older file only has its version raised. Embedded v1 Lists
+ * conditions are also normalized into Rules groups (#5894), including in a document already
+ * at the current version. The bump makes an older viewer refuse a block it cannot print
+ * instead of misreporting it as broken (see `TableBlock`). Anything that is not a
+ * recognizable older document passes through unchanged so `validateDocumentSpec` reports
+ * the real problem.
  */
 export function migrateDocumentSpec(raw: unknown): unknown {
   if (!isRecord(raw)) return raw;
-  const version = raw.version === 1 || raw.version === 2 || raw.version === 3 || raw.version === 4 || raw.version === 5
+  const version = raw.version === 1 || raw.version === 2 || raw.version === 3 || raw.version === 4 || raw.version === 5 || raw.version === 6 || raw.version === 7 || raw.version === 8 || raw.version === 9 || raw.version === 10 || raw.version === 11
     ? DOCUMENT_VERSION : raw.version;
   return { ...raw, version, blocks: migrateDocumentListBlocks(raw.blocks) };
 }
@@ -254,6 +264,8 @@ export function validateDocumentSpec(input: unknown): DocumentValidationError[] 
   }
   if (!isString(input.id) || input.id.length === 0) errors.push({ path: 'id', message: 'expected a non-empty string' });
   if (!isString(input.name)) errors.push({ path: 'name', message: 'expected a string' });
+  if (input.pageHeading !== undefined) errors.push(...validatePageHeading(input.pageHeading));
+  if (input.pageFooter !== undefined) errors.push(...validatePageBand(input.pageFooter, 'pageFooter'));
   const page = input.page;
   if (!isRecord(page) || (page.size !== 'A4' && page.size !== 'A3') || (page.orientation !== 'portrait' && page.orientation !== 'landscape')) {
     errors.push({ path: 'page', message: 'expected { size: A4 | A3, orientation: portrait | landscape }' });
@@ -276,16 +288,21 @@ export function validateDocumentSpec(input: unknown): DocumentValidationError[] 
     if (!isString(block.id) || block.id.length === 0) errors.push({ path: `${at}.id`, message: 'expected a non-empty string' });
     else if (ids.has(block.id)) errors.push({ path: `${at}.id`, message: `duplicate block id "${block.id}"` });
     else ids.add(block.id);
+    if (block.kind !== 'ids-report' && block.kind !== 'manual-report' && block.kind !== 'spacer' && block.kind !== 'page-break') validateBlockTitle(block, at, errors);
+    if (block.kind !== 'spacer' && block.kind !== 'page-break' && block.scale !== undefined
+      && (typeof block.scale !== 'number' || !Number.isFinite(block.scale) || block.scale < BLOCK_SCALE_MIN || block.scale > BLOCK_SCALE_MAX)) {
+      errors.push({ path: `${at}.scale`, message: `expected a number between ${BLOCK_SCALE_MIN} and ${BLOCK_SCALE_MAX}` });
+    }
     switch (block.kind) {
       case 'text':
         if (!isString(block.text)) errors.push({ path: `${at}.text`, message: 'expected a string' });
         if (!TEXT_STYLE_NAMES.includes(block.style as string)) errors.push({ path: `${at}.style`, message: `expected ${TEXT_STYLE_NAMES.join(' | ')}` });
-        if (block.font !== undefined && block.font !== 'helvetica' && block.font !== 'times' && block.font !== 'courier') errors.push({ path: `${at}.font`, message: 'expected helvetica | times | courier' });
-        if (block.fontSize !== undefined && (typeof block.fontSize !== 'number' || !Number.isFinite(block.fontSize) || block.fontSize < TEXT_SIZE_MIN || block.fontSize > TEXT_SIZE_MAX)) errors.push({ path: `${at}.fontSize`, message: `expected a number between ${TEXT_SIZE_MIN} and ${TEXT_SIZE_MAX}` });
+        errors.push(...validateTextTypography(block, at));
+        if (block.backgroundColor !== undefined && !isRgbColor(block.backgroundColor)) errors.push({ path: `${at}.backgroundColor`, message: 'expected an RGB colour in #RRGGBB form' });
         checkWidth(block, at);
         break;
       case 'image':
-        if (!isString(block.dataUrl) || !/^data:image\/(png|jpeg);base64,/.test(block.dataUrl)) errors.push({ path: `${at}.dataUrl`, message: 'expected a PNG or JPEG data URL' });
+        if (!isDocumentImageDataUrl(block.dataUrl)) errors.push({ path: `${at}.dataUrl`, message: 'expected a PNG or JPEG data URL' });
         if (typeof block.height !== 'number' || !(block.height > 0)) errors.push({ path: `${at}.height`, message: 'expected a positive number' });
         if (block.align !== 'left' && block.align !== 'center' && block.align !== 'right') errors.push({ path: `${at}.align`, message: 'expected left | center | right' });
         if (block.caption !== undefined && !isString(block.caption)) errors.push({ path: `${at}.caption`, message: 'expected a string' });
@@ -294,6 +311,9 @@ export function validateDocumentSpec(input: unknown): DocumentValidationError[] 
       case 'chart':
         for (const error of validateChartSpec(block.chart)) errors.push({ path: `${at}.chart${error.path}`, message: error.message });
         if (typeof block.snapshot !== 'boolean') errors.push({ path: `${at}.snapshot`, message: 'expected a boolean' });
+        if (block.fontSize !== undefined && (typeof block.fontSize !== 'number' || !Number.isFinite(block.fontSize) || block.fontSize < CHART_FONT_SIZE.min || block.fontSize > CHART_FONT_SIZE.max)) {
+          errors.push({ path: `${at}.fontSize`, message: `expected a number between ${CHART_FONT_SIZE.min} and ${CHART_FONT_SIZE.max}` });
+        }
         if (block.height !== undefined && (typeof block.height !== 'number' || !Number.isFinite(block.height) || block.height < CHART_BLOCK_HEIGHT_MIN || block.height > CHART_BLOCK_HEIGHT_MAX)) {
           errors.push({ path: `${at}.height`, message: `expected a number between ${CHART_BLOCK_HEIGHT_MIN} and ${CHART_BLOCK_HEIGHT_MAX}` });
         }
@@ -309,14 +329,16 @@ export function validateDocumentSpec(input: unknown): DocumentValidationError[] 
         // height in the preview (review finding).
         if (typeof block.height !== 'number' || !Number.isFinite(block.height) || !(block.height > 0)) errors.push({ path: `${at}.height`, message: 'expected a positive number' });
         break;
+      case 'page-break': break;
       case 'table':
         validateTableBlock(block, at, errors);
         break;
       case 'ids-report':
         validateIdsReportBlock(block, at, errors);
         break;
+      case 'manual-report': validateManualReportBlock(block, at, errors); break;
       default:
-        errors.push({ path: `${at}.kind`, message: 'expected text | image | chart | topic | spacer | table | ids-report' });
+        errors.push({ path: `${at}.kind`, message: 'expected text | image | chart | topic | spacer | page-break | table | ids-report | manual-report' });
     }
   });
   return errors;
@@ -327,8 +349,8 @@ const VALIDATION_ROWS_MODES = ['failed', 'passed', 'all', 'sets'];
 /** Structural check of a table block (#5142, #5138); the list engine / validation report reading validates the definition's meaning at run time. */
 function validateTableBlock(block: Record<string, unknown>, at: string, errors: DocumentValidationError[]): void {
   const source = block.source;
-  if (!isRecord(source) || (source.kind !== 'list' && source.kind !== 'validation')) {
-    errors.push({ path: `${at}.source`, message: 'expected source.kind list | validation' });
+  if (!isRecord(source) || (source.kind !== 'list' && source.kind !== 'validation' && source.kind !== 'comparison')) {
+    errors.push({ path: `${at}.source`, message: 'expected source.kind list | validation | comparison' });
   } else if (source.kind === 'list') {
     const list = source.list;
     if (!isSavedListShape(list) || !Array.isArray(list.groups) || !list.groups.every(isFilterGroup)) {
@@ -337,6 +359,8 @@ function validateTableBlock(block: Record<string, unknown>, at: string, errors: 
       errors.push({ path: `${at}.source.list.expressIdsByModel`, message: 'not allowed in a document' });
     }
     if (source.fromListId !== undefined && !isString(source.fromListId)) errors.push({ path: `${at}.source.fromListId`, message: 'expected a string' });
+  } else if (source.kind === 'comparison') {
+    if (!isSavedComparison(source.comparison)) errors.push({ path: `${at}.source.comparison`, message: 'expected a saved comparison report' });
   } else {
     if (source.ruleId !== undefined && !isString(source.ruleId)) errors.push({ path: `${at}.source.ruleId`, message: 'expected a string' });
     if (!VALIDATION_ROWS_MODES.includes(source.rows as string)) errors.push({ path: `${at}.source.rows`, message: `expected ${VALIDATION_ROWS_MODES.join(' | ')}` });
@@ -344,52 +368,13 @@ function validateTableBlock(block: Record<string, unknown>, at: string, errors: 
       errors.push({ path: `${at}.source.columns`, message: `expected a non-empty array of ${TABLE_COLUMN_IDS.join(' | ')}` });
     }
   }
-  if (block.title !== undefined && !isString(block.title)) errors.push({ path: `${at}.title`, message: 'expected a string' });
   if (block.caption !== undefined && !isString(block.caption)) errors.push({ path: `${at}.caption`, message: 'expected a string' });
+  if (block.groupOrder !== undefined && block.groupOrder !== 'count' && block.groupOrder !== 'label') errors.push({ path: `${at}.groupOrder`, message: 'expected count | label' });
+  if (block.headerBackground !== undefined && !isRgbColor(block.headerBackground)) errors.push({ path: `${at}.headerBackground`, message: 'expected an RGB colour in #RRGGBB form' });
+  if (block.headerTextColor !== undefined && !isRgbColor(block.headerTextColor)) errors.push({ path: `${at}.headerTextColor`, message: 'expected an RGB colour in #RRGGBB form' });
   if (block.maxRows !== undefined && (!Number.isInteger(block.maxRows) || (block.maxRows as number) < 1 || (block.maxRows as number) > TABLE_ROWS_MAX)) {
     errors.push({ path: `${at}.maxRows`, message: `expected an integer between 1 and ${TABLE_ROWS_MAX}` });
   }
-}
-
-/** Structural check of an IDS report block (#5125): a finite, non-negative count and a 0-100 pass rate at both the block and every check. */
-function validateIdsReportBlock(block: Record<string, unknown>, at: string, errors: DocumentValidationError[]): void {
-  const isCount = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0;
-  const isRate = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 100;
-  if (!isString(block.sourceName)) errors.push({ path: `${at}.sourceName`, message: 'expected a string' });
-  if (!isString(block.generatedAt)) errors.push({ path: `${at}.generatedAt`, message: 'expected a string' });
-  const summary = block.summary;
-  if (!isRecord(summary) || !isCount(summary.checked) || !isCount(summary.passed) || !isCount(summary.failed) || !isRate(summary.passRate)) {
-    errors.push({ path: `${at}.summary`, message: 'expected { checked, passed, failed: non-negative numbers; passRate: 0-100 }' });
-  }
-  if (!Array.isArray(block.checks)) {
-    errors.push({ path: `${at}.checks`, message: 'expected an array' });
-    return;
-  }
-  block.checks.forEach((check: unknown, i) => {
-    const checkAt = `${at}.checks[${i}]`;
-    if (!isRecord(check)) { errors.push({ path: checkAt, message: 'expected an object' }); return; }
-    if (!isString(check.id) || check.id.length === 0) errors.push({ path: `${checkAt}.id`, message: 'expected a non-empty string' });
-    if (!isString(check.shortDescription)) errors.push({ path: `${checkAt}.shortDescription`, message: 'expected a string' });
-    if (check.longDescription !== undefined && !isString(check.longDescription)) errors.push({ path: `${checkAt}.longDescription`, message: 'expected a string' });
-    if (!isCount(check.checked) || !isCount(check.passed) || !isCount(check.failed)) errors.push({ path: `${checkAt}`, message: 'expected checked/passed/failed: non-negative numbers' });
-    if (!isRate(check.passRate)) errors.push({ path: `${checkAt}.passRate`, message: 'expected a number between 0 and 100' });
-    if (!Array.isArray(check.rules)) {
-      errors.push({ path: `${checkAt}.rules`, message: 'expected an array' });
-      return;
-    }
-    check.rules.forEach((rule: unknown, j) => {
-      const ruleAt = `${checkAt}.rules[${j}]`;
-      if (!isRecord(rule)) { errors.push({ path: ruleAt, message: 'expected an object' }); return; }
-      if (!isString(rule.id) || rule.id.length === 0) errors.push({ path: `${ruleAt}.id`, message: 'expected a non-empty string' });
-      if (!isString(rule.shortDescription)) errors.push({ path: `${ruleAt}.shortDescription`, message: 'expected a string' });
-      if (rule.longDescription !== undefined && !isString(rule.longDescription)) errors.push({ path: `${ruleAt}.longDescription`, message: 'expected a string' });
-      if (!isCount(rule.checked)) errors.push({ path: `${ruleAt}.checked`, message: 'expected a non-negative number' });
-      const unavailable = rule.passed === null && rule.failed === null && rule.passRate === null;
-      if (!unavailable && (!isCount(rule.passed) || !isCount(rule.failed) || !isRate(rule.passRate))) {
-        errors.push({ path: ruleAt, message: 'expected passed/failed: non-negative numbers and passRate: 0-100, or all null' });
-      }
-    });
-  });
 }
 
 /** The copy of a list a table block stores: a fresh id, no selection snapshot (see `ListTableSource.list`). */

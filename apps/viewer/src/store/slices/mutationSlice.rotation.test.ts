@@ -7,7 +7,7 @@
  *
  * The rotation baker treats every mesh it has never seen as pristine — in the
  * model's own unrotated frame — and turns it once. That is right for a streamed
- * batch and for an element built from its IFC parameters (add-element, and the
+ * batch and for an element built from its IFC parameters (a new authored element, and the
  * wall / slab split, which rebuild their halves through `addWall` / `addSlab`).
  * It is wrong for a mesh DERIVED from the live, already-baked vertices, which is
  * what duplicating an element did: the copy arrived turned and was turned again.
@@ -20,6 +20,8 @@ import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { GeometryResult, MeshData } from '@ifc-lite/geometry';
 import { IfcParser } from '@ifc-lite/parser';
+// #6592: ancestor validation also reads the parsed storey's placement; use the real app reader.
+import '@/lib/placement-edit.boot';
 import { MutablePropertyView } from '@ifc-lite/mutations';
 import { useViewerStore, type FederatedModel } from '@/store';
 import { fixtureModel, fixtureModels } from '@/test/store-fixture';

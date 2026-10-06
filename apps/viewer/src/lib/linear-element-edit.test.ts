@@ -103,6 +103,7 @@ describe('linear-element-edit', () => {
     assert.strictEqual(chain.depth, 4);
     assert.strictEqual(chain.profileWidth, 0.3);
     assert.strictEqual(chain.profileHeight, 0.5);
+    assert.strictEqual(chain.profileId, 92, 'the section profile a size edit writes (#6232 C4)');
     assert.deepStrictEqual(chain.axisDirection, [1, 0, 0]);
     assert.deepStrictEqual(chain.startCoordinates, [1, 0, 0]);
   });
@@ -115,6 +116,41 @@ describe('linear-element-edit', () => {
     assert.ok(chain);
     assert.strictEqual(chain.elementType, 'IfcColumn');
     assert.deepStrictEqual(chain.axisDirection, [0, 0, 1]);
+  });
+
+  it('a rectangle carries no section, and its sides may be `{ real }`-wrapped as the profile builders write them (#6232 D2)', () => {
+    const entities = makeBeamFixture();
+    entities.find((e) => e.expressId === 92)!.attributes = ['.AREA.', null, null, { real: 0.3 }, { real: 0.5 }];
+    const editor = new StubStoreEditor(entities) as unknown as Parameters<typeof resolveLinearElementChain>[2];
+    const view = new StubView() as unknown as Parameters<typeof resolveLinearElementChain>[1];
+    const chain = resolveLinearElementChain(dataStoreStub, view, editor, 100);
+    assert.ok(chain);
+    assert.strictEqual(chain.profile, null);
+    assert.deepStrictEqual([chain.profileWidth, chain.profileHeight], [0.3, 0.5]);
+    assert.strictEqual(chain.profileId, 92);
+  });
+
+  it('a picker section (an I) is carried as the section, with its outer size as the profile size (#6232 D2)', () => {
+    const entities = makeBeamFixture();
+    const profile = entities.find((e) => e.expressId === 92)!;
+    profile.type = 'IFCISHAPEPROFILEDEF';
+    profile.attributes = ['.AREA.', null, null, { real: 0.2 }, { real: 0.4 }, { real: 0.01 }, { real: 0.016 }, null, null, null];
+    const editor = new StubStoreEditor(entities) as unknown as Parameters<typeof resolveLinearElementChain>[2];
+    const view = new StubView() as unknown as Parameters<typeof resolveLinearElementChain>[1];
+    const chain = resolveLinearElementChain(dataStoreStub, view, editor, 100);
+    assert.ok(chain);
+    assert.deepStrictEqual(chain.profile, { Type: 'I', OverallWidth: 0.2, OverallDepth: 0.4, WebThickness: 0.01, FlangeThickness: 0.016 });
+    assert.deepStrictEqual([chain.profileWidth, chain.profileHeight], [0.2, 0.4]);
+  });
+
+  it('a profile that is not the rectangle or a picker section is refused, not read as a rectangle (#6232 D2)', () => {
+    for (const type of ['IFCARBITRARYCLOSEDPROFILEDEF', 'IFCZSHAPEPROFILEDEF', 'IFCELLIPSEPROFILEDEF']) {
+      const entities = makeBeamFixture();
+      entities.find((e) => e.expressId === 92)!.type = type;
+      const editor = new StubStoreEditor(entities) as unknown as Parameters<typeof resolveLinearElementChain>[2];
+      const view = new StubView() as unknown as Parameters<typeof resolveLinearElementChain>[1];
+      assert.strictEqual(resolveLinearElementChain(dataStoreStub, view, editor, 100), null, type);
+    }
   });
 
   it('rejects non-linear element types', () => {

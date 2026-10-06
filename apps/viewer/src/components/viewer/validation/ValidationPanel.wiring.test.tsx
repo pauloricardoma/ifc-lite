@@ -21,7 +21,8 @@
  */
 
 import '@/test/setup-dom.js';
-import { afterEach, describe, it } from 'node:test';
+import { waitForValidationReportsCommit } from '@/test/content-fixture.js';
+import { beforeEach, afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { act } from 'react';
 import { IfcParser, type IfcDataStore } from '@ifc-lite/parser';
@@ -29,8 +30,10 @@ import type { IDSDocument } from '@ifc-lite/ids';
 import { advance, cleanup, click, mouseDown, press, render, type as typeInput } from '@/test/render.js';
 import { useViewerStore, type FederatedModel } from '@/store';
 import { addRecentRuleSet } from '@/lib/validation/recent-rule-sets';
+import { loadDefinitionLibrary } from '@/lib/validation/definition-library';
 import { setValidationSourceChoice } from '@/lib/validation/validation-source-choice';
 import { ValidationPanel } from './ValidationPanel.js';
+import { loadValidationReports, VALIDATION_REPORTS_STORAGE_KEY } from '@/lib/validation/reports/persistence';
 
 const WALLS_IFC = `ISO-10303-21;
 HEADER;
@@ -123,8 +126,15 @@ async function waitFor(condition: () => boolean, timeoutMs = 5000): Promise<void
 
 const initial = useViewerStore.getState();
 
+beforeEach(() => {
+  localStorage.clear();
+  useViewerStore.setState({ validationDefinitions: loadDefinitionLibrary().library, validationRuleSetDraft: null, validationRuleSetEditing: false });
+  setValidationSourceChoice(null);
+});
+
 afterEach(() => {
   cleanup();
+  localStorage.clear();
   setValidationSourceChoice(null);
   useViewerStore.setState({
     ...initial,
@@ -144,7 +154,7 @@ describe('ValidationPanel wiring (#5138)', () => {
     setValidationSourceChoice('ids');
     const ui = render(<ValidationPanel />);
     const tabs = [...ui.querySelectorAll<HTMLElement>('[role="tab"]')];
-    assert.equal(tabs.length, 2);
+    assert.equal(tabs.length, 3); // IDS, Information, Manual validation (#6401)
     tabs[0].focus();
     press(tabs[0], 'ArrowRight');
     await advance(5);
@@ -166,7 +176,7 @@ describe('ValidationPanel wiring (#5138)', () => {
       });
 
       const first = render(<ValidationPanel />);
-      const fileInput = first.querySelector('input[type="file"]');
+      const fileInput = first.querySelector('input[type="file"][accept=".rules.json,.json"]');
       assert.ok(fileInput);
       await selectFile(fileInput as HTMLInputElement, ruleSetFile());
       await waitFor(() => first.querySelector('input[aria-label="Rule set name"]') !== null);
@@ -199,7 +209,7 @@ describe('ValidationPanel wiring (#5138)', () => {
     const parsed = await parseWalls();
     useViewerStore.setState({ models: new Map([['m1', federatedModel('m1', parsed)]]) });
     const first = render(<ValidationPanel />);
-    const fileInput = first.querySelector('input[type="file"]');
+    const fileInput = first.querySelector('input[type="file"][accept=".rules.json,.json"]');
     assert.ok(fileInput);
     await selectFile(fileInput as HTMLInputElement, ruleSetFile());
     cleanup();
@@ -213,7 +223,7 @@ describe('ValidationPanel wiring (#5138)', () => {
   it('the IDS validation entry card mounts the existing IDSPanel empty state', () => {
     const ui = render(<ValidationPanel />);
     const entry = ui.querySelector('[data-testid="validation-entry-ids"]');
-    assert.ok(entry, 'expected the IDS validation entry card');
+    assert.ok(entry, `expected the IDS validation entry card; visible state: ${ui.textContent}`);
     click(entry as Element);
     // IDSPanel's own title is suppressed when embedded (ValidationPanel's
     // header + toggle is the only chrome) — its EMPTY-STATE BODY still is.
@@ -222,11 +232,12 @@ describe('ValidationPanel wiring (#5138)', () => {
   });
 
   it('opening and running a real two-rule rule set lands a source.kind: "rules" report the panel renders', async () => {
+    localStorage.removeItem(VALIDATION_REPORTS_STORAGE_KEY);
     const store = await parseWalls();
-    useViewerStore.setState({ models: new Map([['m1', federatedModel('m1', store)]]) });
+    useViewerStore.setState({ models: new Map([['m1', federatedModel('m1', store)]]), savedValidationReports: [], currentValidationReport: null });
 
     const ui = render(<ValidationPanel />);
-    const fileInput = ui.querySelector('input[type="file"]');
+    const fileInput = ui.querySelector('input[type="file"][accept=".rules.json,.json"]');
     assert.ok(fileInput, 'expected the "Open .rules.json" hidden file input');
     await selectFile(fileInput as HTMLInputElement, ruleSetFile());
 
@@ -245,6 +256,21 @@ describe('ValidationPanel wiring (#5138)', () => {
     assert.ok(report);
     assert.strictEqual(report!.source.kind, 'rules');
     assert.strictEqual(report!.specificationResults.length, 2);
+    // #6568: running a check creates no history; its toolbar saves explicitly.
+    assert.equal(useViewerStore.getState().savedValidationReports.length, 0);
+    assert.equal(localStorage.getItem(VALIDATION_REPORTS_STORAGE_KEY), null);
+    const save = [...ui.querySelectorAll('button')].find((button) => button.textContent === 'Save report');
+    assert.ok(save);
+    click(save);
+    click(save);
+    await waitForValidationReportsCommit();
+    assert.equal((await loadValidationReports()).length, 1);
+    const saved = (await loadValidationReports()).at(-1);
+    assert.ok(saved);
+    assert.equal(saved.snapshot.kind, 'ids-report');
+    assert.deepEqual(saved.snapshot.reportModels, [{ name: 'm1.ifc' }]);
+    assert.equal(saved.snapshot.kind === 'ids-report' && saved.snapshot.sourceKind, 'rules');
+
 
     const text = ui.textContent ?? '';
     assert.match(text, /Fire rating set/);
@@ -260,6 +286,23 @@ describe('ValidationPanel wiring (#5138)', () => {
     assert.ok(rule2);
     assert.strictEqual(rule2!.setResults?.length, 1);
     assert.strictEqual(rule2!.setResults?.[0]?.passed, false);
+
+    // Rechecking information keeps the saved result and requires another
+    // explicit save, just like IDS. This runs the actual two-rule engine.
+    const editForRerun = [...ui.querySelectorAll('button')].find((button) => button.textContent === 'Edit rules');
+    assert.ok(editForRerun);
+    click(editForRerun);
+    const runAgain = [...ui.querySelectorAll('button')].find((button) => button.textContent === 'Run');
+    assert.ok(runAgain);
+    click(runAgain);
+    await waitFor(() => useViewerStore.getState().idsValidationReport !== report);
+    assert.equal((await loadValidationReports()).length, 1);
+    const saveAgain = [...ui.querySelectorAll('button')].find((button) => button.textContent === 'Save report');
+    assert.ok(saveAgain);
+    click(saveAgain);
+    await waitForValidationReportsCommit();
+    assert.equal((await loadValidationReports()).length, 2);
+    assert.notEqual((await loadValidationReports())[0].id, (await loadValidationReports())[1].id);
 
     // "Edit rules" is offered from the results state, keeping the report.
     assert.match(text, /Edit rules/);

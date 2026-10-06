@@ -60,7 +60,7 @@ export { QuantityExtractor } from './quantity-extractor.js';
 export { RelationshipExtractor } from './relationship-extractor.js';
 export { SpatialHierarchyBuilder } from './spatial-hierarchy-builder.js';
 export {
-  extractLengthUnitScale,
+  SI_PREFIX_MULTIPLIERS, extractLengthUnitScale,
   resolveEntityLengthUnitScale,
   resolveOwningIfcProjectId,
 } from './unit-extractor.js';
@@ -112,13 +112,13 @@ export {
 
 // New extractors with 100% schema coverage
 export { extractMaterials, getMaterialForElement, getMaterialNameForElement, type MaterialsData, type Material, type MaterialLayer, type MaterialLayerSet } from './material-extractor.js';
-export { extractGeoreferencing, transformToWorld, transformToLocal, getCoordinateSystemDescription, computeAngleToGridNorth, type GeoreferenceInfo, type MapConversion, type ProjectedCRS } from './georef-extractor.js';
+export { extractGeoreferencing, computeTransformMatrix, transformToWorld, transformToLocal, getCoordinateSystemDescription, computeAngleToGridNorth, type GeoreferenceInfo, type MapConversion, type ProjectedCRS } from './georef-extractor.js';
 export { extractClassifications, getClassificationsForElement, getClassificationCodeForElement, getClassificationPath, groupElementsByClassification, type ClassificationsData, type Classification, type ClassificationReference } from './classification-extractor.js';
 
 // 4D scheduling extractor: tasks, sequences, schedules, calendars and recurrence data.
 export {
   extractScheduleOnDemand,
-  parseIso8601Duration,
+  parseIso8601Duration, taskProductExpressIds, taskProductGlobalIds,
   type ScheduleExtraction,
   type ScheduleTaskInfo,
   type ScheduleTaskTimeInfo,

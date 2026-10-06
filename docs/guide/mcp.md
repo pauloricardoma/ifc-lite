@@ -103,6 +103,11 @@ Tools are grouped by capability. Everything below is registered in the default t
 | Clash | `clash_check`, `clash_matrix` |
 | Validation | `ids_validate`, `ids_explain`, `model_audit`, `gherkin_check` *(planned)* |
 | Mutation | `entity_set_property`, `entity_delete_property`, `entity_set_attribute`, `entity_create`, `entity_delete`, `mutation_batch`, `mutation_undo`, `mutation_diff`, `model_save` |
+| Hosted modelling | `place_opening`, `place_door`, `place_window` |
+| Physical edits | `edit_hosted_element`, `edit_element_geometry`, `copy_elements`, `duplicate_element`, `array_elements` |
+| Native Room | `query_rooms`, `room_command` |
+| Design modelling | `place_curtain_wall`, `place_grid`, `place_grid_column` |
+| Wall joins | `join_walls` |
 | BCF | `bcf_topic_list`, `bcf_topic_create`, `bcf_topic_update`, `bcf_topic_close`, `bcf_viewpoint_create`, `bcf_export` |
 | bSDD | `bsdd_search`, `bsdd_class`, `bsdd_property_sets`, `bsdd_match` |
 | Diff | `model_diff`, `quantity_diff` |
@@ -110,6 +115,21 @@ Tools are grouped by capability. Everything below is registered in the default t
 | Flow | `describe_flow`, `run_flow` |
 | Viewer | `viewer_ask`, `viewer_open`, `viewer_close`, `viewer_status`, `viewer_colorize`, `viewer_isolate`, `viewer_hide`, `viewer_show`, `viewer_reset`, `viewer_fly_to`, `viewer_set_section`, `viewer_clear_section`, `viewer_color_by_storey`, `viewer_color_by_property`, `viewer_get_selection`, `viewer_wait_for_selection`, `viewer_describe_selection` |
 | Draft layers & review | `create_draft_layer`, `draft_apply_ops`, `publish_layer`, `diff_layer`, `dry_run_merge`, `list_conflicts`, `request_review`, `add_review_feedback`, `get_review_feedback`, `add_review_topic`, `respond_to_review` |
+
+`join_walls` takes `a_express_id`, `b_express_id`, optional `model_id` and optional `options` (`Name`, `priority: 'a' | 'b'`, `tolerance` in metres and `priorities: { a?: number[]; b?: number[] }`). It uses `bim.store.joinWalls` and the canonical Model workspace core. Both walls must be straight and in the same placement frame. Unreadable hosted cuts, or an opening stranded by either joined end face, refuse atomically. One `mutation_undo` restores the complete earlier wall graph and any replaced relationship. The IFC export contains the join; headless geometry queries continue to read parsed geometry.
+
+`place_opening`, `place_door` and `place_window` run the same hosted creation core as the Model workspace and `bim.store.addOpening` / `addHostedDoor` / `addHostedWindow`. Supply `host_express_id` within the chosen `model_id` and PascalCase `params`. Offsets, sills and dimensions are metres in the wall's local frame; windows require `Sill`. Cuts outside the wall, overlapping source or overlay openings, and unreadable opening geometry are refused without a partial graph. One `mutation_undo` removes the complete placement. IFC2X3, IFC4 and IFC4X3 are supported. The exported STEP carries the void/fill graph; MCP geometry tools still read parsed geometry.
+
+```json
+{
+  "name": "place_door",
+  "arguments": {
+    "model_id": "building",
+    "host_express_id": 1222,
+    "params": { "Offset": 8, "Width": 0.9, "Height": 2.1, "Name": "D1" }
+  }
+}
+```
 
 !!! tip "Pinning the GlobalId of a created entity"
     `entity_create` takes an optional `global_id`: the GlobalId of the new
@@ -256,11 +276,18 @@ Tools are grouped by capability. Everything below is registered in the default t
     output downstream of it comes back with no data rather than reporting the
     half-applied model as a success.
 
-    Element-creation node types (`element.column`, `model.addElement`, …) are
-    not yet runnable through `run_flow`: the MCP server's in-session store
-    adapter does not implement `addColumn`/`addWall`/`addSlab`/`addBeam` (use
-    `entity_create` for those today). A property-writing graph, like the
-    shipped fire-rating-audit example, runs normally.
+    `element.wall`, `element.column`, `element.slab`, `element.beam`,
+    `element.stair` and `element.railing` specs
+    connected to `model.addElement` create geometry in the selected loaded
+    model through the same atomic builders as the SDK and viewer. The supplied
+    storey must have a readable placement; dimensions are metres. Each creation
+    is one compound operation for `mutation_undo`. A failed creation leaves no
+    partial helper graph or journal entries. Stair/railing specs use the same
+    canonical parameters as their SDK methods; stairs aggregate one flight.
+    Each call has fresh tracking, so persistent update/remove needs a caller
+    retaining a `TrackingStore`. This does not roll back earlier
+    successful nodes in the flow. Free door/window placement remains unsupported
+    by this adapter; use the hosted placement tools with an actual host.
 
 !!! note "Planned tools return a clean error"
     `geometry_get`, `raycast`, `gherkin_check`, and `export_pdf_report` are
@@ -392,6 +419,27 @@ const transport = new StdioTransport();
 await transport.connect(server);
 ```
 
+A model returned by `loadIfcModel` exposes the existing SDK methods
+`bim.store.addElementType`, `assignType`, `addMaterial`, `addMaterialLayerSet`,
+`addMaterialLayerSetUsage` and `assignMaterial`. These embedded methods use
+`@ifc-lite/create`'s shared schema-aware writers; they are not new JSON-RPC tool
+names. Each successful call records one complete operation for the public
+`mutation_undo` tool. A refused layer or layer-set field creates no orphan
+helpers. Thicknesses and offsets are metres, converted to the model's units;
+IFC2X3 uses its live `IfcOwnerHistory` and rejects IFC4-only fields such as
+layer/set `Description`.
+
+```ts
+import { loadIfcModel } from '@ifc-lite/mcp';
+
+const loaded = await loadIfcModel('./model.ifc', { modelId: 'building' });
+const material = loaded.bim.store.addMaterial(loaded.id, { Name: 'Concrete' });
+const { expressId: layerSetId } = loaded.bim.store.addMaterialLayerSet(loaded.id, {
+  LayerSetName: 'Concrete layer',
+  MaterialLayers: [{ Material: material.expressId, LayerThickness: 0.2 }],
+});
+```
+
 For an in-process host (no child process, no sockets), use `InProcessTransport` and send JSON-RPC envelopes directly:
 
 ```ts
@@ -424,3 +472,73 @@ MCP is the richest integration: stateful sessions, live viewer control, subscrip
 Reach for MCP when you want the model held open across a conversation, the viewer in the loop, or scoped permissions. Reach for the CLI when a one-shot command answers the question. Both share the same kernel, so results are consistent either way.
 
 See the [`@ifc-lite/mcp` README](https://github.com/LTplus-AG/ifc-lite/tree/main/packages/mcp) for the complete tool and resource catalogue.
+
+### Loaded-model design placement
+
+`place_curtain_wall`, `place_grid` and `place_grid_column` create elements in
+an existing model through the same builders as the Model workspace and typed
+SDK. Supply `storey_express_id`, canonical PascalCase `params`, and `model_id`
+when more than one model is loaded. `place_grid_column` also requires
+`binding: { GridId, IntersectingAxes: [axisIdA, axisIdB] }`; its storey-local
+`Position` must match the live crossing. Profiled columns may supply `Profile`
+instead of `Width`/`Depth`.
+
+Each call creates a new element and records one `mutation_undo` batch,
+including all curtain-wall parts or grid-placement helpers. Lengths are
+metres; grid `Direction` is radians. These tools require mutation scope.
+
+`edit_hosted_element` edits an existing wall-hosted opening, door or window
+through the shared Model workspace core. Supply `express_id`, `model_id` when
+federated, and a nonempty `patch` containing `OverallWidth`, `OverallHeight`,
+`Offset` and/or `Sill` in metres. It resizes or moves the actual cut and filling
+without replacing identity or relationships. Unsupported, overlapping and
+out-of-host changes leave the graph unchanged. The tool requires mutation scope;
+one `mutation_undo` restores the previous graph.
+
+### Physical command edits
+
+`copy_elements` and `array_elements` copy selections with their hosted
+dependants, fresh GlobalIds and the viewer array policy. `duplicate_element`
+accepts an `express_id`, explicit IFC `offset` and optional `Name`; it preserves
+the viewer Duplicate naming policy and copies the complete hosted graph.
+`edit_element_geometry` accepts a discriminated `operation`: `transform`
+(move/rotate), `align`, `size`, `wall_endpoints`, `split`, or `trim_extend`. Coordinates
+are IFC storey-local metres; rotation angles are radians. Dimension names
+retain their IFC spelling (`Depth`, `XDim`, `YDim`).
+
+Supply `model_id` when multiple models are loaded. These tools require mutation
+scope. Each write records one `mutation_undo` batch including its graph helpers.
+Unsupported shapes, independent hosted copies, unsafe shared geometry, read-only
+access and ambiguous model routing refuse without partial IFC writes.
+
+For `align`, provide `reference_id`, `express_ids` and `mode` (`left`, `centre`,
+`right`, `top`, `middle` or `bottom`). The reference and targets must occupy one
+storey. Bounds come from fresh native meshes, including current overlay edits;
+install the WASM runtime. Each target receives its own storey-local translation
+in one atomic batch. A selected host governs its placement dependants, which move once; joined neighbours follow and
+one Undo restores the entire graph. A fixed reference joined to a target, or
+hosted/joined targets requiring incompatible shifts, refuses before writing.
+
+### Native Room operations
+
+`room_command` accepts `storey_express_id` and `command` with `query`, `auto`,
+`pick`, `footprint`, `update` or `edit`. It uses current native wall/space
+geometry and the retained native Room topology; install the WASM runtime.
+Supply `model_id` when multiple models are loaded. Each write records one
+`mutation_undo` batch including synchronized spaces. Unsupported shapes,
+occupied Footprint, read-only access, and ambiguous routing refuse without
+partial writes. Preparation refuses stale model state and observes request
+cancellation before committing. Session termination and model removal release
+the retained native layout handles.
+
+`query_rooms` is available with read-only tokens. It accepts `storey_express_id`,
+optional `model_id`, and optional `settings` (`weld`, `minArea`, `boundary`),
+and delegates to the same native candidate service without IFC or Undo writes.
+Write actions remain protected by `room_command`'s mutation scope. Unchanged
+headless storeys reuse prepared geometry; source, overlay or journal changes
+invalidate it, and model removal releases the cache.
+
+Cancelled requests return `CANCELLED`; concurrent changes or preparation ownership
+return `STATE_CHANGED`, both with `details.retryable: true`. An unavailable native
+runtime returns `UNSUPPORTED_OPERATION` with reason `NATIVE_RUNTIME_UNAVAILABLE`.
+Malformed commands and unsupported input shapes retain `INVALID_INPUT`.

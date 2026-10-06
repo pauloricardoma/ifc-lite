@@ -13,7 +13,7 @@
  *   - entity_set_attribute                         — direct IFC attributes
  *   - entity_create / entity_delete                — STEP-level entity ops
  *   - mutation_batch                               — apply N ops in order
- *   - mutation_undo                                — pop last N entries
+ *   - mutation_undo                                — revert last N operations
  *   - mutation_diff                                — pending changes summary
  *
  * The actual save lives in `tools/export.ts::export_ifc` (and the
@@ -38,6 +38,14 @@ import { ToolErrorCode, ToolExecutionError } from '../errors.js';
 import { resolveSafePath } from '../safe-path.js';
 import { validateInput } from '../validate.js';
 import { propertyValueTypeOf } from '@ifc-lite/sdk';
+import { undoPendingMutations } from './mutation-undo.js';
+import { hostedPlaceTools } from './hosted-place.js';
+import { joinWallsTool } from './wall-join.js';
+import { hostedEditTool } from './hosted-edit.js';
+import { copyElementsTools } from './copy-elements.js';
+import { physicalEditTool } from './physical-edit.js';
+import { roomCommandTool } from './room-command.js';
+import { designPlaceTools } from './design-place.js';
 
 interface MutationContext {
   m: ReturnType<typeof resolveModel>;
@@ -290,69 +298,9 @@ const mutationDiff: Tool = {
   },
 };
 
-type MutationView = NonNullable<ReturnType<HeadlessLikeBackend['getMutationView']>>;
-
-/**
- * Apply the inverse of one mutation-history entry to the live overlay.
- *
- * `MutablePropertyView.mutationHistory` is deliberately append-only (see the
- * package's own docs on `getMutations()` / `hasChanges()`) — popping it, on
- * its own, reverts nothing. This mirrors the inverse-mutation dispatch the
- * viewer's undo stack applies (`apps/viewer/src/store/slices/mutationSlice.ts`),
- * scoped to the mutation types this package's own tools can produce.
- * `skipHistory: true` throughout so reverting a mutation does not itself
- * grow the history mutation_undo just trimmed it from.
- */
-function revertMutation(view: MutationView, mutation: Mutation): void {
-  switch (mutation.type) {
-    case 'CREATE_PROPERTY':
-      if (mutation.psetName && mutation.propName) {
-        view.deleteProperty(mutation.entityId, mutation.psetName, mutation.propName, true);
-      }
-      return;
-    case 'UPDATE_PROPERTY':
-    case 'DELETE_PROPERTY':
-      if (mutation.psetName && mutation.propName && mutation.oldValue !== undefined) {
-        view.setProperty(
-          mutation.entityId,
-          mutation.psetName,
-          mutation.propName,
-          mutation.oldValue,
-          mutation.valueType,
-          undefined,
-          true,
-        );
-      }
-      return;
-    case 'UPDATE_ATTRIBUTE':
-      if (mutation.attributeName) {
-        if (mutation.oldValue !== undefined && mutation.oldValue !== null) {
-          view.setAttribute(mutation.entityId, mutation.attributeName, String(mutation.oldValue), undefined, true);
-        } else {
-          view.removeAttributeMutation(mutation.entityId, mutation.attributeName);
-        }
-      }
-      return;
-    case 'CREATE_ENTITY':
-      view.deleteEntity(mutation.entityId);
-      return;
-    case 'DELETE_ENTITY':
-      view.restoreFromTombstone(mutation.entityId);
-      return;
-    default:
-      // Types this package's tools never emit (quantities, positional attrs,
-      // retype) — surfaced rather than silently dropped, so a future tool
-      // that starts emitting one of these does not get a no-op undo.
-      throw new ToolExecutionError({
-        code: ToolErrorCode.INVALID_INPUT,
-        message: `mutation_undo: '${mutation.type}' mutations are not revertible by this tool.`,
-      });
-  }
-}
-
 const mutationUndo: Tool = {
   name: 'mutation_undo',
-  description: 'Revert the last N pending mutations on this session, restoring the overlay to what it held before them — not just trimming the mutation log.',
+  description: 'Revert the last N pending operations on this session. A hosted placement or wall join is one operation including its complete IFC graph; other mutations count individually.',
   scope: 'mutate',
   inputSchema: {
     type: 'object',
@@ -368,16 +316,7 @@ const mutationUndo: Tool = {
     const view = backend.getMutationView();
     if (!view) return okResult('Nothing to undo.', { undone: 0 });
     const n = (input.n as number | undefined) ?? 1;
-    const history = (view as unknown as { mutationHistory?: Mutation[] }).mutationHistory ?? [];
-    const undone = Math.min(n, history.length);
-    const toUndo = history.slice(history.length - undone);
-    // Reverse chronological order — most recent mutation reverts first, same
-    // as an undo stack, so an entity edited twice unwinds to its
-    // second-to-last state before its first.
-    for (let i = toUndo.length - 1; i >= 0; i -= 1) {
-      revertMutation(view, toUndo[i]);
-    }
-    history.splice(history.length - undone, undone);
+    const undone = undoPendingMutations(view, n);
     return okResult(`Undone ${undone} mutation(s).`, { undone });
   },
 };
@@ -412,6 +351,13 @@ const modelSave: Tool = {
 };
 
 export const mutationTools: Tool[] = [
+  ...hostedPlaceTools,
+  ...designPlaceTools,
+  hostedEditTool,
+  ...copyElementsTools,
+  physicalEditTool,
+  roomCommandTool,
+  joinWallsTool,
   entitySetProperty,
   entityDeleteProperty,
   entitySetAttribute,

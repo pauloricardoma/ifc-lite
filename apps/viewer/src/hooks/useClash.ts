@@ -11,6 +11,7 @@
  */
 
 import { useCallback, useRef } from 'react';
+import { clashElementCache } from '@/lib/clash/element-cache';
 import { beginAbortableRun, cancelClashRun, invalidateAbortableRun } from './analysisRunCancellation';
 import { captureAnalysisStamp, stampAnalysisReport, type AnalysisStamp } from './useAnalysisStaleness';
 import { rememberPlacementSnapshot, jobPlacementIsCurrent } from '@/lib/model-placement/placement-snapshot';
@@ -30,7 +31,6 @@ import {
   type ClashResult,
   type ClashReviewStatus,
   type ClashRule,
-  type ClashSeverity,
   type ExclusionSet,
 } from '@ifc-lite/clash';
 import { elementsFromStep } from '@ifc-lite/clash/step';
@@ -50,6 +50,7 @@ import {
 import { clashFramingBounds } from '@/lib/clash/clash-framing';
 import { contactLineList } from '@/lib/clash/contact-lines';
 import { filterResultBySeverity } from '@/lib/clash/severity-filter';
+import type { ClashBcfConfig } from '@/lib/clash/bcf-export-config';
 import { withResolvedClashSetFilters } from '@/lib/clash/set-filter-resolve';
 import { computeClashIntersectionSolid } from '@/lib/clash/intersection-solid';
 import { restoreOverridesForGhosting } from '@/lib/clash/ghost-color-overrides';
@@ -150,21 +151,7 @@ interface SelectionRef {
  */
 export type { ClashFocusMode };
 
-/** How clashes collapse into BCF topics. `storey` is omitted — Clash has no
- *  storey, so it degrades to `rule` (see grouping.ts) and would only confuse. */
-export type ClashBcfGroupBy = 'cluster' | 'rule' | 'typePair' | 'element';
-
-/** User-controllable settings for a BCF export — "what gets created". */
-export interface ClashBcfConfig {
-  /** Grouping dimension → one BCF topic per group. */
-  groupBy: ClashBcfGroupBy;
-  /** Only clashes of these severities become topics. */
-  severities: ClashSeverity[];
-  /** Render each topic's viewpoint offscreen and embed a PNG snapshot. */
-  includeSnapshots: boolean;
-  /** Safety cap on topic count; overflow is recorded in one marker topic. */
-  maxTopics: number;
-}
+export type { ClashBcfConfig, ClashBcfGroupBy } from '@/lib/clash/bcf-export-config';
 
 /** Dark, neutral background for offscreen snapshot captures (Tokyo Night base). */
 const SNAPSHOT_CLEAR_COLOR: [number, number, number, number] = [0.04, 0.05, 0.1, 1];
@@ -212,10 +199,9 @@ export function useClash() {
   // deliberately SHARED across every occurrence of a GPU-instanced entity, while
   // `key` folds in `mesh.occurrenceKey` to stay distinct per physical occurrence
   // (#2865). Keying this cache by `ref` collapsed multiple occurrences onto one
-  // map entry (last-write-wins), so `focusClash` below could build the contact
-  // interface / intersection solid from the WRONG occurrence's geometry whenever
-  // two instanced copies of one element actually clashed.
-  const elementsByIdentity = useRef(new Map<string, ClashElement>());
+  // map entry (last-write-wins), so `focusClash` could build the contact interface /
+  // solid from the WRONG occurrence's geometry when two instanced copies clashed.
+  const elementsByIdentity = clashElementCache; // shared across hook instances
   const elementIdentity = (element: Pick<ClashElement, 'model' | 'key'>): string =>
     JSON.stringify([element.model, element.key]);
 
@@ -262,7 +248,7 @@ export function useClash() {
     useViewerStore.setState({
       isolatedEntities: ids, ghostExceptEntities: null,
       hiddenEntities: new Set<number>(),
-      idsFocusVisibilityOwned: null, basketVisibilityOwned: null, chartVisibilityOwned: null,
+      idsFocusVisibilityOwned: null, basketVisibilityOwned: null, chartVisibilityOwned: null, listVisibilityOwned: null,
       clashVisibilityOwned: { channel: 'isolate', ids },
     });
   }, []);
@@ -272,7 +258,7 @@ export function useClash() {
   const installClashGhost = useCallback((ids: Set<number>): void => {
     useViewerStore.setState({
       isolatedEntities: null, ghostExceptEntities: ids,
-      idsFocusVisibilityOwned: null, basketVisibilityOwned: null, chartVisibilityOwned: null,
+      idsFocusVisibilityOwned: null, basketVisibilityOwned: null, chartVisibilityOwned: null, listVisibilityOwned: null,
       clashVisibilityOwned: { channel: 'ghost', ids },
     });
   }, []);
@@ -282,7 +268,7 @@ export function useClash() {
    * that. Isolation or ghosting established by another feature (#2532 / #2531
    * / spaces X-ray) no longer content-matches the ownership record, so it
    * survives a clash run untouched - while a clash focus that round-tripped
-   * through a snapshot/restore flow (Space Sketch open/close) still matches
+   * through a snapshot/restore flow (a view snapshot's open/close) still matches
    * and is discarded (#2662 P2).
    *
    * The predicate is `releaseOwnedClashVisibility`, shared verbatim with the
@@ -371,7 +357,7 @@ export function useClash() {
         federation,
         meshIdOffset: model.idOffset ?? 0,
       });
-      elements.push(...built.elements);
+      for (const element of built.elements) elements.push(element); // #6575: avoid JS argument limits.
       for (const key of built.exclusions) exclusions.add(key);
       // Only models that actually CONTRIBUTED elements — the condition the
       // module doc's correctness argument is stated on, so it is checked here
@@ -1135,7 +1121,7 @@ export function useClash() {
     const state = useViewerStore.getState();
     const current = state.clashResult;
     if (!current) return { clashes: 0, topics: 0 };
-    const filtered = filterResultBySeverity(current, new Set(config.severities));
+    const filtered = filterResultBySeverity(current, new Set(config.severities), config.clashIds);
     if (filtered.clashes.length === 0) return { clashes: 0, topics: 0 };
     const groups = groupClashes(filtered, { by: config.groupBy, epsilon: state.clashClusterEpsilon });
     const capped = Math.min(groups.length, config.maxTopics);
@@ -1158,7 +1144,7 @@ export function useClash() {
       const state = useViewerStore.getState();
       const current = state.clashResult;
       if (!current) return;
-      const filtered = filterResultBySeverity(current, new Set(config.severities));
+      const filtered = filterResultBySeverity(current, new Set(config.severities), config.clashIds);
       if (filtered.clashes.length === 0) return;
       const groups = groupClashes(filtered, { by: config.groupBy, epsilon: state.clashClusterEpsilon });
 

@@ -76,16 +76,17 @@ function titleCaseProvider(rawProvider: string): string {
     .join(' ');
 }
 
-function humanizeModelSlug(slug: string): string {
+/** `z-ai/glm-5.3-flash` → `GLM 5.3 Flash`: version dots between digits are kept. */
+export function humanizeModelSlug(slug: string): string {
   const withoutTier = slug.split(':')[0] ?? slug;
   return withoutTier
-    .replace(/[._-]+/g, ' ')
+    .replace(/[_-]+|(?<!\d)\.|\.(?!\d)/g, ' ')
     .split(' ')
     .filter(Boolean)
     .map((word) => {
       if (/^[0-9.]+$/.test(word)) return word;
       const upper = word.toUpperCase();
-      if (upper === 'GPT' || upper === 'OSS' || upper === 'R1') return upper;
+      if (upper === 'GPT' || upper === 'GLM' || upper === 'OSS' || upper === 'R1') return upper;
       if (word.length <= 2) return upper;
       return word.charAt(0).toUpperCase() + word.slice(1);
     })
@@ -239,8 +240,9 @@ const OPENAI_BYOK_MODELS: LLMModel[] = [
 export const BYOK_MODELS: LLMModel[] = [...ANTHROPIC_BYOK_MODELS, ...OPENAI_BYOK_MODELS];
 export const ALL_MODELS = [...FREE_MODELS, ...BYOK_MODELS];
 
+export const UNCONFIGURED_MODEL_ID = 'llm-model-missing';
 const FALLBACK_MODEL: LLMModel = {
-  id: 'llm-model-missing',
+  id: UNCONFIGURED_MODEL_ID,
   name: 'No model configured',
   provider: 'Unknown',
   tier: 'free',

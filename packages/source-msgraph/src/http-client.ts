@@ -2,7 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-import type { PluginContext } from '@ifc-lite/plugin-api';
+import { readWithProgress } from '@ifc-lite/plugin-api';
+import type { DownloadOptions, PluginContext, SourceFileRef } from '@ifc-lite/plugin-api';
 
 import { decodeCollectionPage } from './msgraph-types.js';
 
@@ -60,7 +61,16 @@ export class GraphHttpError extends Error {
   }
 }
 
-export class BrowserGraphApiClient {
+/** Read-only client boundary for the signed-in user's own OneDrive. */
+export interface GraphApiClient {
+  get(path: string, params?: Record<string, string>, signal?: AbortSignal): Promise<unknown>;
+  /** Direct SDK clients download the vendor's signed URL anonymously. */
+  getPublicBinary?(url: string, options?: DownloadOptions, sizeBytes?: number): Promise<ArrayBuffer>;
+  /** Hosted clients download by item reference without exposing vendor credentials. */
+  downloadItem?(ref: SourceFileRef, options?: DownloadOptions): Promise<ArrayBuffer>;
+}
+
+export class BrowserGraphApiClient implements GraphApiClient {
   constructor(
     private readonly accessToken: string,
     private readonly ctx: PluginContext,
@@ -108,8 +118,13 @@ export class BrowserGraphApiClient {
    * `provider.ts` for why: these URLs are pre-authenticated, invalidated by
    * an `Authorization` header, and hosted on a tenant-specific CDN host
    * outside `permissions.network`.
+   *
+   * The body is streamed through `readWithProgress`; `sizeBytes` (the item's
+   * `size`, as a listing reports it) is the progress total when the CDN
+   * response carries no usable `Content-Length`.
    */
-  async getPublicBinary(url: string, signal?: AbortSignal): Promise<ArrayBuffer> {
+  async getPublicBinary(url: string, options?: DownloadOptions, sizeBytes?: number): Promise<ArrayBuffer> {
+    const signal = options?.signal;
     // Logged without its query string — see `forLog`. The full URL is still
     // what gets fetched; only what is written to the log is trimmed.
     const loggableUrl = forLog(url);
@@ -123,7 +138,7 @@ export class BrowserGraphApiClient {
       throw new GraphHttpError(`Microsoft Graph download ${response.status}: ${response.statusText} — ${truncate(body)}`, response.status);
     }
 
-    return response.arrayBuffer();
+    return readWithProgress(response, options?.onProgress, sizeBytes);
   }
 }
 
@@ -144,7 +159,7 @@ export interface GraphPageResult {
  * first row.
  */
 export async function fetchPage(
-  client: BrowserGraphApiClient,
+  client: GraphApiClient,
   endpointOrCursor: string,
   params: Record<string, string>,
   signal?: AbortSignal,

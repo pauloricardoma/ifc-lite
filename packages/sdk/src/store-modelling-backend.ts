@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * Builds `bim.store`'s opening, hosted door/window, type and material methods
+ * Builds `bim.store`'s wall-join, hosted element, type and material methods
  * (#6232), for the
  * same reason `createStructuralStoreBackend` exists: every host implementing
  * `StoreBackendMethods` (CLI headless backend, viewer store adapter) spreads
@@ -15,12 +15,19 @@
  */
 
 import {
+  copyBatchInStore, arrayCopyTransforms,
+  editHostedElementInStore,
+  addCurtainWallToStore,
+  addGridToStore,
+  addColumnOnGridToStore,
   addElementTypeToStore,
   addMaterialLayerSetToStore,
   addMaterialLayerSetUsageToStore,
   addMaterialToStore,
   assignMaterialInStore,
   assignTypeInStore,
+  joinWallsInStore,
+  resolveWallJoinAnchor,
   liveEntityConforms,
   liveEntityType,
   readRelatedLists,
@@ -29,26 +36,28 @@ import {
   type MaterialInStoreParams,
   type MaterialLayerSetInStoreParams,
   type MaterialLayerSetUsageInStoreParams,
-  addHostedDoorToStore,
-  addHostedWindowToStore,
-  addOpeningToStore,
-  resolveHostAnchor,
+  addHostedElementInStore,
   type HostedDoorInStoreParams,
   type HostedWindowInStoreParams,
   type OpeningInStoreParams,
+  type WallJoinApplyOptions,
+  addStairToStore,
+  addRailingToStore,
+  resolveSpatialAnchor,
+  type StairInStoreParams,
+  type RailingInStoreParams,
+  removeStairInStore,
+  replaceElementInStore,
 } from '@ifc-lite/create';
 import type { CostStoreModelResolution } from './cost-store-backend.js';
 import type { ModellingStoreBackendMethods } from './store-modelling-types.js';
 import type { EntityRef } from './types.js';
+import { createPhysicalStoreBackend } from './store-physical-backend.js';
 
 /** Same per-call resolution the cost and structural factories take. */
 export type ModellingStoreModelResolver = (modelId?: string) => CostStoreModelResolution;
 
 export function createModellingStoreBackend(resolve: ModellingStoreModelResolver): ModellingStoreBackendMethods {
-  const host = (modelId: string, hostExpressId: number) => {
-    const model = resolve(modelId);
-    return { model, anchor: resolveHostAnchor(model.store, hostExpressId, model.mutationView) };
-  };
   const ref = (modelId: string, expressId: number): EntityRef => ({ modelId, expressId });
   const authoring = (modelId: string) => {
     const model = resolve(modelId);
@@ -70,17 +79,94 @@ export function createModellingStoreBackend(resolve: ModellingStoreModelResolver
   };
 
   return {
+    ...createPhysicalStoreBackend(resolve),
+    copyElements(modelId, expressIds, transforms) {
+      const model = resolve(modelId);
+      return copyBatchInStore(model.store, model.editor, expressIds, transforms)
+        .map(result => ref(model.modelId, result.copyId));
+    },
+    duplicateElement(entity, options) {
+      const model = resolve(entity.modelId);
+      const [result] = copyBatchInStore(model.store, model.editor, [entity.expressId], [{ offset: options.offset }],
+        { duplicate: { name: options.Name } });
+      return ref(model.modelId, result.copyId);
+    },
+    arrayElements(modelId, expressIds, params) {
+      const transforms = arrayCopyTransforms(params);
+      if (!transforms) throw new Error('Array requires an anchor and a nonzero linear direction');
+      const model = resolve(modelId);
+      return copyBatchInStore(model.store, model.editor, expressIds, transforms)
+        .map(result => ref(model.modelId, result.copyId));
+    },
+    editHostedElement(entity, patch) {
+      const model = resolve(entity.modelId);
+      editHostedElementInStore(model.store, model.editor, entity.expressId, patch);
+      return ref(model.modelId, entity.expressId);
+    },
+    addCurtainWall(modelId, storeyExpressId, params) {
+      const model = resolve(modelId);
+      const built = model.editor.runAtomic(draft => addCurtainWallToStore(
+        draft, resolveSpatialAnchor(model.store, storeyExpressId, draft.getMutationView()), params,
+      ));
+      return ref(model.modelId, built.curtainWallId);
+    },
+    addGrid(modelId, storeyExpressId, params) {
+      const model = resolve(modelId);
+      const built = model.editor.runAtomic(draft => addGridToStore(
+        draft, resolveSpatialAnchor(model.store, storeyExpressId, draft.getMutationView()), params,
+      ));
+      return ref(model.modelId, built.gridId);
+    },
+    addColumnOnGrid(modelId, storeyExpressId, params, binding) {
+      const model = resolve(modelId);
+      const built = model.editor.runAtomic(draft => addColumnOnGridToStore(
+        draft, model.store, resolveSpatialAnchor(model.store, storeyExpressId, draft.getMutationView()), params, binding,
+      ));
+      return ref(model.modelId, built.columnId);
+    },
+    replaceElement(entity, storeyExpressId, element) {
+      const model = resolve(entity.modelId);
+      const built = replaceElementInStore(model.store, model.editor, entity.expressId,
+        draft => resolveSpatialAnchor(model.store, storeyExpressId, draft.getMutationView()), element);
+      return ref(model.modelId, built.expressId);
+    },
+    removeStair(entity: EntityRef): boolean {
+      const model = resolve(entity.modelId);
+      removeStairInStore(model.store, model.editor, entity.expressId);
+      return true;
+    },
+    addStair(modelId: string, storeyExpressId: number, params: StairInStoreParams): EntityRef {
+      const model = resolve(modelId);
+      const built = model.editor.runAtomic(draft => addStairToStore(
+        draft, resolveSpatialAnchor(model.store, storeyExpressId, draft.getMutationView()), params,
+      ));
+      return ref(model.modelId, built.stairId);
+    },
+    addRailing(modelId: string, storeyExpressId: number, params: RailingInStoreParams): EntityRef {
+      const model = resolve(modelId);
+      const built = model.editor.runAtomic(draft => addRailingToStore(
+        draft, resolveSpatialAnchor(model.store, storeyExpressId, draft.getMutationView()), params,
+      ));
+      return ref(model.modelId, built.railingId);
+    },
+    joinWalls(modelId: string, aExpressId: number, bExpressId: number, options: WallJoinApplyOptions = {}): EntityRef {
+      const model = resolve(modelId);
+      const joined = model.editor.runAtomic(draft => joinWallsInStore(
+        draft, model.store, resolveWallJoinAnchor(model.store, draft.getMutationView()), aExpressId, bExpressId, options,
+      ));
+      return ref(model.modelId, joined.relId);
+    },
     addOpening(modelId: string, hostExpressId: number, params: OpeningInStoreParams): EntityRef {
-      const { model, anchor } = host(modelId, hostExpressId);
-      return ref(model.modelId, addOpeningToStore(model.editor, anchor, params).openingId);
+      const model = resolve(modelId);
+      return ref(model.modelId, addHostedElementInStore(model.store, model.editor, hostExpressId, { kind: 'opening', params }).expressId);
     },
     addHostedDoor(modelId: string, hostExpressId: number, params: HostedDoorInStoreParams): EntityRef {
-      const { model, anchor } = host(modelId, hostExpressId);
-      return ref(model.modelId, addHostedDoorToStore(model.editor, anchor, params).fillingId);
+      const model = resolve(modelId);
+      return ref(model.modelId, addHostedElementInStore(model.store, model.editor, hostExpressId, { kind: 'door', params }).expressId);
     },
     addHostedWindow(modelId: string, hostExpressId: number, params: HostedWindowInStoreParams): EntityRef {
-      const { model, anchor } = host(modelId, hostExpressId);
-      return ref(model.modelId, addHostedWindowToStore(model.editor, anchor, params).fillingId);
+      const model = resolve(modelId);
+      return ref(model.modelId, addHostedElementInStore(model.store, model.editor, hostExpressId, { kind: 'window', params }).expressId);
     },
     addElementType(modelId: string, params: ElementTypeInStoreParams): EntityRef {
       const { model, anchor } = authoring(modelId);

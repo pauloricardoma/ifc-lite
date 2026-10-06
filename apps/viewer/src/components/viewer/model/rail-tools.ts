@@ -11,14 +11,15 @@
  */
 
 import type { ComponentType } from 'react';
-import { LogOut, MousePointer2, Slice } from 'lucide-react';
-import { BeamIcon, ColumnIcon, SlabIcon, WallIcon } from './model-icons';
+import { AlignHorizontalJustifyStart, ArrowRightToLine, ArrowUpFromLine, CopyPlus, LogOut, MousePointer2, Move, RotateCw, ScissorsLineDashed, Slice } from 'lucide-react';
+import { BeamIcon, ColumnIcon, CurtainWallIcon, DoorIcon, GridIcon, OpeningIcon, RoomIcon, SlabIcon, WallIcon, WindowIcon } from './model-icons';
+import { RailingIcon, StairIcon } from './stair-railing-icons';
 import type { TranslationKey } from '@/i18n';
 import type { KeyCommandId } from '@/lib/commands/keyboard-commands';
 import { launchModelCommand } from '@/lib/commands/modeling/keys-workspace';
 import { useViewerStore, type ViewerState } from '@/store';
 
-type RailGroup = 'select' | 'build' | 'host' | 'edit';
+type RailGroup = 'select' | 'build' | 'host' | 'edit' | 'circulation';
 
 export interface RailTool {
   /** The command id it starts, or `select`. Also its tour anchor. */
@@ -69,11 +70,105 @@ export const RAIL_TOOLS: readonly RailTool[] = [
     run: () => { launchModelCommand('beam.place'); },
   },
   {
+    id: 'room.place', group: 'build', labelKey: 'roomTool.label', Icon: RoomIcon,
+    shortcut: 'model.room', drawsOnWorkplane: true,
+    isActive: commandActive('room.place'),
+    run: () => { launchModelCommand('room.place'); },
+  },
+  {
+    id: 'curtainwall.place', group: 'build', labelKey: 'curtainWall.label', Icon: CurtainWallIcon,
+    shortcut: 'model.curtainWall', drawsOnWorkplane: true,
+    isActive: commandActive('curtainwall.place'),
+    run: () => { launchModelCommand('curtainwall.place'); },
+  },
+  {
+    id: 'grid.place', group: 'build', labelKey: 'grid.label', Icon: GridIcon,
+    shortcut: 'model.grid', drawsOnWorkplane: true,
+    isActive: commandActive('grid.place'),
+    run: () => { launchModelCommand('grid.place'); },
+  },
+  {
+    id: 'opening.place', group: 'host', labelKey: 'hostedPlace.tool.opening', Icon: OpeningIcon,
+    shortcut: 'model.opening', drawsOnWorkplane: true,
+    isActive: commandActive('opening.place'),
+    run: () => { launchModelCommand('opening.place'); },
+  },
+  {
+    id: 'door.place', group: 'host', labelKey: 'hostedPlace.tool.door', Icon: DoorIcon,
+    shortcut: 'model.door', drawsOnWorkplane: true,
+    isActive: commandActive('door.place'),
+    run: () => { launchModelCommand('door.place'); },
+  },
+  {
+    id: 'window.place', group: 'host', labelKey: 'hostedPlace.tool.window', Icon: WindowIcon,
+    shortcut: 'model.window', drawsOnWorkplane: true,
+    isActive: commandActive('window.place'),
+    run: () => { launchModelCommand('window.place'); },
+  },
+  {
     id: 'element.split', group: 'edit', labelKey: 'modelWorkspace.tool.split', Icon: Slice,
     shortcut: 'tool.split', drawsOnWorkplane: false,
     isActive: commandActive('element.split'),
     blockedKey: (s) => (s.selectedEntityId === null ? 'modelWorkspace.blocked.split' : null),
     run: () => { launchModelCommand('element.split', { drawsOnWorkplane: false }); },
+  },
+  {
+    id: 'element.array', group: 'edit', labelKey: 'copyArray.tool.array', Icon: CopyPlus,
+    shortcut: 'model.array', drawsOnWorkplane: true,
+    isActive: commandActive('element.array'),
+    blockedKey: (s) => (s.selectedEntityId === null && s.selectedEntityIds.size === 0 ? 'copyArray.blocked.array' : null),
+    run: () => { launchModelCommand('element.array'); },
+  },
+  {
+    id: 'element.move', group: 'edit', labelKey: 'moveRotate.tool.move', Icon: Move,
+    shortcut: 'model.move', drawsOnWorkplane: true,
+    isActive: commandActive('element.move'),
+    blockedKey: (s) => (s.selectedEntityId === null ? 'moveRotate.noSelection' : null),
+    run: () => { launchModelCommand('element.move'); },
+  },
+  {
+    id: 'element.rotate', group: 'edit', labelKey: 'moveRotate.tool.rotate', Icon: RotateCw,
+    shortcut: 'model.rotate', drawsOnWorkplane: true,
+    isActive: commandActive('element.rotate'),
+    blockedKey: (s) => (s.selectedEntityId === null ? 'moveRotate.noSelection' : null),
+    run: () => { launchModelCommand('element.rotate'); },
+  },
+  {
+    id: 'split.multi', group: 'edit', labelKey: 'multiSplit.tool', Icon: ScissorsLineDashed,
+    shortcut: 'model.splitMulti', drawsOnWorkplane: true,
+    isActive: commandActive('split.multi'),
+    run: () => { launchModelCommand('split.multi'); },
+  },
+  {
+    id: 'stair.place', group: 'circulation', labelKey: 'stairRailing.tool.stair', Icon: StairIcon,
+    shortcut: 'model.stair', drawsOnWorkplane: true,
+    isActive: commandActive('stair.place'),
+    run: () => { launchModelCommand('stair.place'); },
+  },
+  {
+    id: 'railing.place', group: 'circulation', labelKey: 'stairRailing.tool.railing', Icon: RailingIcon,
+    shortcut: 'model.railing', drawsOnWorkplane: true,
+    isActive: commandActive('railing.place'),
+    run: () => { launchModelCommand('railing.place'); },
+  },
+  {
+    id: 'element.pushPull', group: 'edit', labelKey: 'modelWorkspace.tool.pushPull', Icon: ArrowUpFromLine,
+    shortcut: 'model.pushPull', drawsOnWorkplane: false,
+    isActive: commandActive('element.pushPull'),
+    blockedKey: (s) => (s.selectedEntityId === null ? 'modelWorkspace.blocked.pushPull' : null),
+    run: () => { launchModelCommand('element.pushPull', { drawsOnWorkplane: false }); },
+  },
+  {
+    id: 'element.align', group: 'edit', labelKey: 'modelWorkspace.tool.align', Icon: AlignHorizontalJustifyStart,
+    shortcut: 'model.align', drawsOnWorkplane: true,
+    isActive: commandActive('element.align'),
+    run: () => { launchModelCommand('element.align'); },
+  },
+  {
+    id: 'element.trimExtend', group: 'edit', labelKey: 'trimExtend.tool', Icon: ArrowRightToLine,
+    shortcut: 'model.trimExtend', drawsOnWorkplane: true,
+    isActive: commandActive('element.trimExtend'),
+    run: () => { launchModelCommand('element.trimExtend'); },
   },
 ];
 

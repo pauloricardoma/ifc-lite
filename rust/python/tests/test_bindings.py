@@ -496,6 +496,42 @@ def test_issue_6305_rebar_preflight_reports_values_and_skips():
         ifclite_geom.rebar_schedule_with_preflight(source, float("nan"), 0.0, ids=set())
 
 
+def test_issue_5797_fabrication_policy_status_and_provenance():
+    source = read(REBAR)
+    row = ifclite_geom.rebar_schedule_with_fabrication_precheck(
+        source, min_inside_bend_radius_m=0.09,
+        min_bend_angle_rad=0.0, max_bend_angle_rad=3.2,
+        max_nominal_geometric_diameter_delta_m=0.001,
+    )["rows"][125]
+    report = row["sweeps"][0]["fabrication_precheck"]
+    assert report["outcome"] == "precheck_only"
+    assert "physical_bar_count" in report["unchecked_factors"]
+    bend = next(item for item in report["checks"] if item["kind"] == "inside_bend_radius")
+    assert bend["status"] == "fail"
+    assert bend["measured"] == pytest.approx(0.087)
+    assert bend["reason"]
+    assert bend["bar_id"] == 125 and bend["segment_index"] == 1
+    diameter = next(item for item in report["checks"] if item["kind"] == "nominal_geometric_diameter_delta")
+    assert diameter["authored_source"] == "occurrence"
+    assert diameter["authored_source_id"] == 125
+    assert "fabrication_precheck" not in ifclite_geom.rebar_schedule(source)["rows"][125]["sweeps"][0]
+
+    absent = source.decode().replace(
+        "#125=IFCREINFORCINGBAR('0Test0000000000000Ubar',$,'U-bar',$,$,#33,#124,$,$,29.,",
+        "#125=IFCREINFORCINGBAR('0Test0000000000000Ubar',$,'U-bar',$,$,#33,#124,$,$,$,",
+    ).encode()
+    missing = ifclite_geom.rebar_schedule_with_fabrication_precheck(
+        absent, max_nominal_geometric_diameter_delta_m=0.001,
+    )["rows"][125]["sweeps"][0]["fabrication_precheck"]["checks"][0]
+    assert missing["status"] == "uncheckable" and "NominalDiameter" in missing["reason"]
+    with pytest.raises(ValueError, match="supplied together"):
+        ifclite_geom.rebar_schedule_with_fabrication_precheck(source, ids=set(), min_bend_angle_rad=0.0)
+    with pytest.raises(ValueError, match="finite nonnegative ordered"):
+        ifclite_geom.rebar_schedule_with_fabrication_precheck(
+            source, ids=set(), min_bend_angle_rad=2.0, max_bend_angle_rad=1.0,
+        )
+
+
 def test_issue_5758_invalid_check_options_raise_even_when_no_ids_selected():
     for options in (
         {"zero_length_tolerance_m": float("nan")},
@@ -878,3 +914,20 @@ def test_a_type_only_property_survives_a_set_name_collision():
     # The occurrence still wins Shared, AND the type-only property arrives.
     assert merged == {"Shared": "from-occurrence", "TypeOnly": "kept"}
     assert set(merged) > set(own_only)
+
+
+def test_issue_6601_per_face_colors_match_json_and_preserve_transparency():
+    source = (REPO / "rust/processing/tests/fixtures/issue_6601_multicolor_element.ifc").read_bytes()
+    buffers = ifclite_geom.geometry_data_buffers(source)
+    document = json.loads(ifclite_geom.geometry_data_json(source))
+    assert len(buffers["elements"]) == 1
+    for step_id, element in buffers["elements"].items():
+        encoded = document["elements"][str(step_id)]
+        indices = struct.unpack(f"<{len(element['face_colors']) // 8}Q", element["face_colors"])
+        assert len(indices) == len(element["faces"]) // 12
+        assert list(indices) == encoded["face_colors"]
+        assert len(element["palette"]) == 2
+        assert set(indices) == {0, 1}
+        assert sorted(c[3] for c in element["palette"]) == pytest.approx([0.25, 1.0])
+        for actual, expected in zip(element["palette"], encoded["palette"]):
+            assert actual == pytest.approx(expected)

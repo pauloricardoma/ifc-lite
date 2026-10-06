@@ -13,6 +13,7 @@ import { registerKeyboardCommand } from '@/lib/commands/dispatcher';
 import { useViewerStore } from '@/store';
 import type { CommandId } from './types.js';
 import { sessionWorkplaneBlock, stepSessionStorey } from './workspace-storeys.js';
+import { copyShortcut, pasteShortcut } from './copy-keys.js';
 
 /**
  * Start a modeling command from the workspace (rail, key, palette, welcome
@@ -24,8 +25,6 @@ export function launchModelCommand(id: CommandId, opts: { drawsOnWorkplane?: boo
   if (s.workspaceMode !== 'model' && !s.enterModelWorkspace()) return false;
   const now = useViewerStore.getState();
   if ((opts.drawsOnWorkplane ?? true) && sessionWorkplaneBlock(now)) return false;
-  // Not the Add Element panel's wall: the panel stays closed.
-  now.setAddElementDrawsWall(false);
   now.startCommand(id);
   return useViewerStore.getState().session?.activeCommandId === id;
 }
@@ -42,8 +41,26 @@ export function bindModelWorkspaceKeys(): () => void {
     registerKeyboardCommand('model.slab', () => launchModelCommand('slab.place'), { active }),
     registerKeyboardCommand('model.column', () => launchModelCommand('column.place'), { active }),
     registerKeyboardCommand('model.beam', () => launchModelCommand('beam.place'), { active }),
+    registerKeyboardCommand('model.room', () => launchModelCommand('room.place'), { active }),
+    registerKeyboardCommand('model.curtainWall', () => launchModelCommand('curtainwall.place'), { active }),
+    registerKeyboardCommand('model.grid', () => launchModelCommand('grid.place'), { active }),
+    registerKeyboardCommand('model.opening', () => launchModelCommand('opening.place'), { active }),
+    registerKeyboardCommand('model.door', () => launchModelCommand('door.place'), { active }),
+    registerKeyboardCommand('model.window', () => launchModelCommand('window.place'), { active }),
+    registerKeyboardCommand('model.splitMulti', () => launchModelCommand('split.multi'), { active }),
     registerKeyboardCommand('model.storeyUp', () => stepSessionStorey(useViewerStore.getState(), 1), { active }),
     registerKeyboardCommand('model.storeyDown', () => stepSessionStorey(useViewerStore.getState(), -1), { active }),
+    registerKeyboardCommand('model.copy', () => copyShortcut(), { active }),
+    registerKeyboardCommand('model.paste', () => pasteShortcut(launchModelCommand, false), { active }),
+    registerKeyboardCommand('model.pasteInPlace', () => pasteShortcut(launchModelCommand, true), { active }),
+    registerKeyboardCommand('model.array', () => launchModelCommand('element.array'), { active }),
+    registerKeyboardCommand('model.move', () => launchModelCommand('element.move'), { active }),
+    registerKeyboardCommand('model.rotate', () => launchModelCommand('element.rotate'), { active }),
+    registerKeyboardCommand('model.stair', () => launchModelCommand('stair.place'), { active }),
+    registerKeyboardCommand('model.railing', () => launchModelCommand('railing.place'), { active }),
+    registerKeyboardCommand('model.pushPull', () => launchModelCommand('element.pushPull', { drawsOnWorkplane: false }), { active }),
+    registerKeyboardCommand('model.align', () => launchModelCommand('element.align'), { active }),
+    registerKeyboardCommand('model.trimExtend', () => launchModelCommand('element.trimExtend'), { active }),
   ];
   return () => { for (const dispose of disposers) dispose(); };
 }

@@ -17,7 +17,10 @@
  * report agree.
  */
 import { format } from 'echarts/core';
+import { CATEGORY_LABEL_FONT_SIZE, layoutCategoryLabels } from './category-labels.js';
 import { elementFieldLabel } from './element-field.js';
+import { chartFontScale } from './chart-typography.js';
+import { packLegend } from './legend-layout.js';
 import type { Aggregation, Bucket, ChartItem } from './types.js';
 
 /** The tokens a host reads off its stylesheet; ECharts has no CSS variables. */
@@ -39,6 +42,8 @@ export const DEFAULT_THEME: ChartTheme = {
   fontFamily: 'system-ui, sans-serif',
 };
 
+export { truncateMiddle } from './category-labels.js';
+
 export interface BuildOptionArgs {
   aggregation: Aggregation;
   theme?: ChartTheme;
@@ -50,6 +55,8 @@ export interface BuildOptionArgs {
   width?: number;
   /** Height available to the chart in px; print mode uses it to keep a pie's legend from overflowing a short chart. */
   height?: number;
+  /** Base chart text size (6–24, default 12); scales labels and their measured layout. Invalid values use the default. */
+  fontSize?: number;
   /**
    * SSR (PDF / preview) rendering, not the interactive canvas (#4940): the
    * pie legend's `type: 'scroll'` has nothing to scroll in a static SVG and
@@ -63,13 +70,19 @@ export interface BuildOptionArgs {
 const DEFAULT_WIDTH = 600;
 /** Fallback height when the host has not measured yet. */
 const DEFAULT_HEIGHT = 320;
-/** Print mode caps the pie's legend to this many rows; extra categories still slice the pie, just without a name in the legend (#4940 review: an unbounded legend overflowed a short chart with many categories). */
-const PRINT_LEGEND_MAX_ROWS = 4;
 
 /** A plain-object ECharts option; typed loosely so this module needs no ECharts import. */
 export type EChartsOptionObject = Record<string, unknown>;
 
-function formatValue(value: number, unit?: string): string {
+/** A host measurement usable as a size; anything else (unset, 0, NaN, Infinity) falls back. */
+function positiveOr(value: number | undefined, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function formatValue(value: unknown, unit?: string): string {
+  // ECharts also formats missing values and category strings (#4945).
+  if (value == null || (typeof value === 'number' && !Number.isFinite(value))) return '—';
+  if (typeof value !== 'number') return typeof value === 'string' ? value : '—';
   const text = Number.isInteger(value) ? String(value) : value.toFixed(2);
   return unit ? `${text} ${unit}` : text;
 }
@@ -77,66 +90,6 @@ function formatValue(value: number, unit?: string): string {
 /** A screen legend label past this many characters is truncated with an ellipsis; the full name is in the tooltip. */
 const LEGEND_LABEL_MAX_CHARS = 24;
 const truncateLegendLabel = (name: string): string => (name.length > LEGEND_LABEL_MAX_CHARS ? `${name.slice(0, LEGEND_LABEL_MAX_CHARS - 1)}…` : name);
-
-const PRINT_LEGEND_SYMBOL_WIDTH = 10;
-const PRINT_LEGEND_SYMBOL_TEXT_GAP = 5;
-const PRINT_LEGEND_ITEM_GAP = 6;
-
-/**
- * Middle-ellipsis truncation for axis labels (#4940 review): `IfcSlab`, `IfcSpace` and
- * `IfcSpatialZone` share the "Ifc" + a capital prefix, so tail-only truncation (ECharts'
- * `overflow: 'truncate'`, and the legend's own `truncateLegendLabel`) collapses all three to
- * "IfcS…" — indistinguishable on the axis, where there is no tooltip to recover the full name.
- * Keeping a short head and a short tail instead survives the common-prefix case far more often.
- */
-export function truncateMiddle(text: string, maxChars: number): string {
-  if (maxChars <= 0) return '';
-  if (text.length <= maxChars) return text;
-  if (maxChars === 1) return '…';
-  if (maxChars < 4) return `${text.slice(0, maxChars - 1)}…`;
-  const keep = maxChars - 1;
-  const head = Math.ceil(keep * 0.6);
-  const tail = keep - head;
-  return `${text.slice(0, head)}…${text.slice(text.length - tail)}`;
-}
-
-/**
- * Pack the fixed print legend using the same public ECharts text metrics as
- * the SVG renderer. The 10px font must be included in both truncation and
- * measurement: measuring a full label and rendering an ellipsis is what let
- * a single wide label miscount its row in the first place.
- */
-function packPrintLegend(labels: readonly string[], width: number, font: string): {
-  shownItems: number;
-  rows: number;
-  legendH: number;
-  formatter: (name: string) => string;
-} {
-  const maxTextWidth = Math.max(0, width - PRINT_LEGEND_SYMBOL_WIDTH - PRINT_LEGEND_SYMBOL_TEXT_GAP - PRINT_LEGEND_ITEM_GAP);
-  const formatter = (name: string) => format.truncateText(name, maxTextWidth, font, '…');
-  const rowHeight = Math.max(PRINT_LEGEND_SYMBOL_WIDTH, format.getTextRect('M', font).height);
-  let rows = labels.length > 0 ? 1 : 0;
-  let rowWidth = 0;
-  let shownItems = 0;
-  for (const label of labels) {
-    const text = formatter(label);
-    const itemWidth = PRINT_LEGEND_SYMBOL_WIDTH + PRINT_LEGEND_SYMBOL_TEXT_GAP + format.getTextRect(text, font).width;
-    const nextWidth = rowWidth === 0 ? itemWidth : rowWidth + PRINT_LEGEND_ITEM_GAP + itemWidth;
-    if (nextWidth > width && rowWidth > 0) {
-      rows += 1;
-      rowWidth = 0;
-    }
-    if (rows > PRINT_LEGEND_MAX_ROWS) break;
-    rowWidth = rowWidth === 0 ? itemWidth : nextWidth;
-    shownItems += 1;
-  }
-  return {
-    shownItems,
-    rows,
-    legendH: rows > 0 ? rows * rowHeight + (rows - 1) * PRINT_LEGEND_ITEM_GAP : 0,
-    formatter,
-  };
-}
 
 function measureLabel(aggregation: Aggregation): string {
   const { measure } = aggregation.spec;
@@ -189,14 +142,16 @@ export function buildEChartsOption(args: BuildOptionArgs): EChartsOptionObject {
   const { spec, categories } = aggregation;
   const flags = selectedFlags(categories.length, 0, selected);
   const unit = spec.measure.agg === 'sum' ? aggregation.unit : undefined;
+  const textScale = chartFontScale(args.fontSize);
+  const textSize = (defaultSize: number) => textScale === 1 ? {} : { fontSize: defaultSize * textScale };
 
   const base: EChartsOptionObject = {
     backgroundColor: theme.background,
-    textStyle: { color: theme.text, fontFamily: theme.fontFamily },
+    textStyle: { color: theme.text, fontFamily: theme.fontFamily, ...textSize(12) },
     // Only components that are actually used may appear as keys: ECharts
     // reports an `undefined` `title` as a missing TitleComponent.
-    ...(args.showTitle ? { title: { text: spec.title, left: 'center', textStyle: { color: theme.text, fontSize: 13 } } } : {}),
-    tooltip: { trigger: 'item', valueFormatter: (v: number) => formatValue(v, unit) },
+    ...(args.showTitle ? { title: { text: spec.title, left: 'center', textStyle: { color: theme.text, fontSize: 13 * textScale } } } : {}),
+    tooltip: { trigger: 'item', valueFormatter: (v: unknown) => formatValue(v, unit), ...(textScale === 1 ? {} : { textStyle: textSize(14) }) },
     animation: false,
   };
 
@@ -215,15 +170,15 @@ export function buildEChartsOption(args: BuildOptionArgs): EChartsOptionObject {
       // clipped scroll list. A FIXED radius/center overflowed a short chart (e.g. 120pt) with many
       // categories, because nothing reserved room for however tall the wrapped legend grew — size
       // and position the pie from the room actually left after capping the legend to
-      // PRINT_LEGEND_MAX_ROWS rows (categories beyond the cap still slice the pie; they just have
+      // four rows (categories beyond the cap still slice the pie; they just have
       // no legend entry, the same trade-off label truncation already makes for long names).
       // A non-finite or non-positive measurement (0, NaN, Infinity — a host mid-measure, or a bad
       // value round-tripped through JSON) must fall back too, not just `undefined` (review finding):
       // it would otherwise divide/multiply its way into a NaN or Infinity radius percentage.
       const width = typeof args.width === 'number' && Number.isFinite(args.width) && args.width > 0 ? args.width : DEFAULT_WIDTH;
       const height = typeof args.height === 'number' && Number.isFinite(args.height) && args.height > 0 ? args.height : DEFAULT_HEIGHT;
-      const printLegendFont = `10px ${theme.fontFamily}`;
-      const { shownItems, legendH, formatter } = packPrintLegend(categories.map((category) => category.label), width, printLegendFont);
+      const printLegendFont = `${10 * textScale}px ${theme.fontFamily}`;
+      const { shownItems, legendH, formatter, itemWidth, itemHeight, itemGap } = packLegend(categories.map((category) => category.label), width, printLegendFont, textScale, 10, 10, 6, textScale === 1 ? undefined : height * 0.45);
       const pieAreaH = Math.max(40, height - legendH - 8);
       const pieDiameter = Math.min(width * 0.7, pieAreaH) * 0.92;
       const box = Math.min(width, height);
@@ -237,13 +192,13 @@ export function buildEChartsOption(args: BuildOptionArgs): EChartsOptionObject {
       crowded = pieDiameter < 200 || categories.length > 8;
       legend = {
         type: 'plain', orient: 'horizontal', left: 'center', bottom: 0,
-        itemWidth: PRINT_LEGEND_SYMBOL_WIDTH, itemHeight: PRINT_LEGEND_SYMBOL_WIDTH, itemGap: PRINT_LEGEND_ITEM_GAP,
-        padding: 0, textStyle: { color: theme.mutedText, fontSize: 10, fontFamily: theme.fontFamily }, formatter, tooltip: { show: true },
+        itemWidth, itemHeight, itemGap,
+        padding: 0, textStyle: { color: theme.mutedText, fontSize: 10 * textScale, fontFamily: theme.fontFamily }, formatter, tooltip: { show: true },
         // Fewer legend entries than categories: cap `data` so the wrapped legend cannot grow past its reserved rows.
         ...(shownItems < categories.length ? { data: categories.slice(0, shownItems).map((c) => c.label) } : {}),
       };
     } else {
-      legend = { type: 'scroll', orient: 'vertical', right: 0, top: 'middle', textStyle: { color: theme.mutedText }, formatter: truncateLegendLabel, tooltip: { show: true } };
+      legend = { type: 'scroll', orient: 'vertical', right: 0, top: 'middle', textStyle: { color: theme.mutedText, ...textSize(12) }, formatter: truncateLegendLabel, tooltip: { show: true } };
     }
     return {
       ...base,
@@ -259,7 +214,7 @@ export function buildEChartsOption(args: BuildOptionArgs): EChartsOptionObject {
         selectedMode: 'multiple',
         selectedOffset: 6,
         emphasis: { focus: 'self' },
-        label: crowded ? { show: false } : { color: theme.mutedText, formatter: '{b}' },
+        label: crowded ? { show: false } : { color: theme.mutedText, formatter: '{b}', ...textSize(12) },
         labelLine: crowded ? { show: false } : {},
       }],
     };
@@ -277,7 +232,7 @@ export function buildEChartsOption(args: BuildOptionArgs): EChartsOptionObject {
         data: itemData(categories, flags),
         selectedMode: 'multiple',
         emphasis: { focus: 'self' },
-        label: { color: '#fff' },
+        label: { color: '#fff', ...textSize(12) },
       }],
     };
   }
@@ -286,7 +241,11 @@ export function buildEChartsOption(args: BuildOptionArgs): EChartsOptionObject {
     const value = aggregation.total;
     const width = typeof args.width === 'number' && Number.isFinite(args.width) && args.width > 0 ? args.width : DEFAULT_WIDTH;
     const height = typeof args.height === 'number' && Number.isFinite(args.height) && args.height > 0 ? args.height : DEFAULT_HEIGHT;
-    const fontSize = Math.max(36, Math.min(72, Math.floor(Math.min(width, height) / 6)));
+    let fontSize = Math.max(36, Math.min(72, Math.floor(Math.min(width, height) / 6))) * textScale;
+    if (textScale !== 1) {
+      const rect = format.getTextRect(value.toLocaleString(), `bold ${fontSize}px ${theme.fontFamily}`);
+      fontSize *= Math.min(1, Math.max(1, width - 16) / rect.width, Math.max(1, height - 16) / rect.height);
+    }
     return {
       ...base,
       graphic: {
@@ -311,39 +270,44 @@ export function buildEChartsOption(args: BuildOptionArgs): EChartsOptionObject {
   // bar / stackedBar / histogram / timeline: category x, measure y
   const stacked = spec.type === 'stackedBar';
   const labels = categories.map((c) => c.label);
-  // Long IFC class names ("IfcBuildingElementProxy") would collide upright
-  // and `hideOverlap` would then drop a neighbour outright. Each label gets
-  // its share of the width and is truncated with an ellipsis instead — the
-  // full name is in the tooltip and the legend. Past eight buckets the
-  // shares are too narrow to read, so the labels tilt.
-  const share = Math.floor((args.width ?? DEFAULT_WIDTH) / Math.max(1, categories.length)) - 6;
-  const rotate = categories.length > 8 ? 30 : 0;
-  // Tilted labels overlap far less, so they may run past their share.
-  const labelWidth = rotate ? Math.max(60, share * 2) : Math.max(36, share);
+  // Long IFC class names ("IfcBuildingElementProxy") would collide upright and `hideOverlap`
+  // would then drop a neighbour outright, so the labels are measured and tilted / shortened to
+  // fit (#6480); the full name is in the tooltip. The grid reserves the room they take.
+  const label = layoutCategoryLabels({
+    labels,
+    width: positiveOr(args.width, DEFAULT_WIDTH),
+    height: positiveOr(args.height, DEFAULT_HEIGHT),
+    font: `${CATEGORY_LABEL_FONT_SIZE * textScale}px ${theme.fontFamily}`,
+  });
   // A count needs no axis title; a sum says what it sums, and gets room for it.
   const yName = spec.measure.agg === 'sum' ? measureLabel(aggregation) : '';
+  const resizedLegend = stacked && textScale !== 1
+    ? packLegend(aggregation.series.map((s) => s.label), positiveOr(args.width, DEFAULT_WIDTH), `${12 * textScale}px ${theme.fontFamily}`, textScale, 25, 14, 10, positiveOr(args.height, DEFAULT_HEIGHT) * 0.4)
+    : null;
   return {
     ...base,
     // ECharts 6 keeps axis labels inside the grid's outer bounds by default
     // (`containLabel` is the removed v5 way of saying the same).
-    grid: { left: 8, right: 8, top: stacked ? 32 : yName ? 28 : 12, bottom: 8 },
-    ...(stacked ? { legend: { top: 0, textStyle: { color: theme.mutedText }, formatter: truncateLegendLabel, tooltip: { show: true } } } : {}),
+    grid: { left: 8, right: 8, top: resizedLegend ? resizedLegend.legendH + 8 * textScale + (yName ? 16 * textScale : 0) : (stacked ? 32 : yName ? 28 : 12) * textScale, bottom: 8 },
+    ...(stacked ? { legend: { top: 0, textStyle: { color: theme.mutedText, ...textSize(12) }, formatter: resizedLegend?.formatter ?? truncateLegendLabel, tooltip: { show: true },
+      ...(resizedLegend ? { type: 'plain', left: 0, right: 0, padding: 0, itemWidth: resizedLegend.itemWidth, itemHeight: resizedLegend.itemHeight, itemGap: resizedLegend.itemGap,
+        data: aggregation.series.slice(0, resizedLegend.shownItems).map((s) => s.label) } : {}) } } : {}),
     xAxis: {
       type: 'category',
       data: labels,
       axisLine: { lineStyle: { color: theme.axis } },
-      // A character-count estimate (no DOM/canvas measure available here), same order as the
-      // other size-based heuristics in this module; `overflow: 'truncate'` stays as a backstop if
-      // the estimate runs long. Middle-ellipsis, not ECharts' own tail truncation (#4940 review,
-      // headed-Chrome finding): `IfcSlab`/`IfcSpace`/`IfcSpatialZone` share a prefix and all
-      // truncated to the same "IfcS…" on a narrow half-width chart.
-      axisLabel: { color: theme.mutedText, interval: 0, rotate, width: labelWidth, overflow: 'truncate', hideOverlap: true, formatter: (name: string) => truncateMiddle(name, Math.max(4, Math.floor(labelWidth / 6.5))) },
+      // `formatter` shortens from the middle (see `truncateMiddle`); `overflow: 'truncate'` stays
+      // as a backstop. `triggerEvent` + `tooltip` show the full name on hover.
+      axisLabel: { color: theme.mutedText, fontSize: CATEGORY_LABEL_FONT_SIZE * textScale, interval: 0, rotate: label.rotate, width: label.width, overflow: 'truncate', hideOverlap: true, formatter: label.formatter },
+      triggerEvent: true,
+      // ECharts' default axis tooltip shows the already-shortened label; `value` is the category name.
+      tooltip: { show: true, formatter: (params: { value?: unknown }) => format.encodeHTML(String(params.value ?? '')) },
     },
     yAxis: {
       type: 'value',
       name: yName,
-      nameTextStyle: { color: theme.mutedText },
-      axisLabel: { color: theme.mutedText },
+      nameTextStyle: { color: theme.mutedText, ...textSize(12) },
+      axisLabel: { color: theme.mutedText, ...textSize(12) },
       splitLine: { lineStyle: { color: theme.grid } },
     },
     series: barSeries(aggregation, selected, stacked),

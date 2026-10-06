@@ -168,6 +168,22 @@ export function commandPointerDown(snap: SnapResult): void {
   applyStep(command.pointerDown(moved, snap, ctx));
 }
 
+/** A button release, for a command that follows one (a drag); refreshed like a down. */
+export function commandPointerUp(snap: SnapResult): void {
+  const { command, ctx } = state;
+  if (!command?.pointerUp || !ctx) return;
+  const moved = command.pointerMove(state.gesture, snap, ctx);
+  publish({ gesture: moved, snap });
+  applyStep(command.pointerUp(moved, snap, ctx));
+}
+
+/** A press that ended without a release (cancelled, or its pointer capture was lost). */
+export function commandPointerCancel(): void {
+  const { command, ctx } = state;
+  if (!command?.pointerCancel || !ctx) return;
+  publish({ gesture: command.pointerCancel(state.gesture, ctx) });
+}
+
 /**
  * The second click of a double-click: the command's `doubleClick` (close a
  * polygon), else a plain down. The pointer sources (3D, plan) call this for
@@ -246,7 +262,9 @@ function undoCommandPoint(): boolean {
 export function requestFieldEdit(target: number | 'next', draft?: string): boolean {
   const fields = state.command?.fields ?? [];
   const count = fields.length;
-  const shown = (i: number) => !fields[i].hidden?.(state.gesture);
+  const { ctx } = state;
+  if (!ctx) return false;
+  const shown = (i: number) => !fields[i].hidden?.(state.gesture, ctx);
   if (!fields.some((_, i) => shown(i))) return false;
   let index = target === 'next' ? ((state.activeField ?? -1) + 1) % count : Math.min(Math.max(target, 0), count - 1);
   while (!shown(index)) index = (index + 1) % count;

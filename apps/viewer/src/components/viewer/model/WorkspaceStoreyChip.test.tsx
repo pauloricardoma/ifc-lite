@@ -20,8 +20,12 @@ import { useViewerStore } from '@/store';
 import { toGlobalIdFromModels } from '@/store/globalId';
 import { cleanup, click, render } from '@/test/render.js';
 import { MODEL_ID, STOREY, UPPER_STOREY, seedModelingSession } from '@/test/modeling-session-fixture';
+import { MutablePropertyView } from '@ifc-lite/mutations';
+import { fixtureModels } from '@/test/store-fixture';
+import type { SnapResult } from '@/lib/snap/types';
 import '@/lib/commands/modeling/builtin';
-import { getCommandRuntime } from '@/lib/commands/modeling/runtime';
+import { commandPointerDown, commandPointerMove, getCommandRuntime } from '@/lib/commands/modeling/runtime';
+import { setRequestRemesh } from '@/lib/commands/modeling/transaction';
 import { ViewportHud } from '../../viewport-ui/hud';
 import { WorkspaceStoreyChip } from './WorkspaceStoreyChip';
 
@@ -68,9 +72,49 @@ describe('Workspace storey chip (#6232 M2.1)', () => {
     assert.equal(getCommandRuntime().ctx?.storeyId, UPPER_STOREY, '…on the new storey');
   });
 
+  it('picking another parsed model targets new writes there, retaining the command and isolation (#6531)', async () => {
+    const first = useViewerStore.getState().models.get(MODEL_ID)!;
+    const firstView = useViewerStore.getState().mutationViews.get(MODEL_ID)!;
+    await seedModelingSession({ unit: 'millimetre', storeyOffset: [3, 3] });
+    const parsedSecond = useViewerStore.getState().models.get(MODEL_ID)!;
+    const second = { ...parsedSecond, id: 'structural', name: 'Structural', idOffset: 1_000_000 };
+    const secondView = new MutablePropertyView(second.ifcDataStore!.properties, second.id);
+    act(() => {
+      useViewerStore.setState({
+        ...fixtureModels(first, second),
+        mutationViews: new Map([[first.id, firstView], [second.id, secondView]]),
+      });
+      useViewerStore.getState().enterModelWorkspace({ modelId: first.id, storeyId: STOREY, command: 'wall.place' });
+    });
+    const eye = topLeft()!.querySelector('button[aria-label="Show only this storey"]')!;
+    act(() => click(eye));
+    openList();
+    const pick = document.querySelector('[data-storey-picker] ul[aria-label="Structural"] button')!;
+    assert.ok(pick, 'both editable model groups are exposed by the existing picker');
+    act(() => click(pick));
+    assert.equal(getCommandRuntime().command?.id, 'wall.place');
+    assert.equal(getCommandRuntime().ctx?.modelId, second.id);
+    assert.equal(getCommandRuntime().ctx?.storeyId, UPPER_STOREY);
+    assert.deepEqual(useViewerStore.getState().selectedStoreys, new Set([toGlobalIdFromModels(useViewerStore.getState().models, second.id, UPPER_STOREY)]));
+    const at = (x: number, y: number): SnapResult => ({ local: [x, y], winner: null, guides: [], locked: false, metresPerPixel: 0.02 });
+    const restore = setRequestRemesh(() => {});
+    try {
+      act(() => { commandPointerMove(at(0, 0)); commandPointerDown(at(0, 0)); });
+      act(() => { commandPointerMove(at(4, 0)); commandPointerDown(at(4, 0)); });
+      const written = secondView.getNewEntities().filter((entity) => entity.type === 'IfcWall');
+      assert.equal(written.length, 1, 'the real command writes a wall only to the chosen model');
+      assert.equal(firstView.getNewEntities().length, 0, 'the first model stays untouched');
+      assert.equal(useViewerStore.getState().undoStacks.get(second.id)?.length, 1);
+      act(() => { useViewerStore.getState().undo(second.id); });
+      assert.equal(secondView.getNewEntities().filter((entity) => entity.type === 'IfcWall').length, 0);
+    } finally {
+      restore();
+    }
+  });
+
   it('the eye isolates the storey, follows a storey change, and shows all again', () => {
     act(() => { useViewerStore.getState().enterModelWorkspace({ storeyId: STOREY }); });
-    const eye = () => topLeft()!.querySelector('button[aria-label]:not([data-workspace-storey-chip])') as HTMLButtonElement;
+    const eye = () => topLeft()!.querySelector('button[aria-label]:not([data-workspace-storey-chip]):not([data-storey-context])') as HTMLButtonElement;
     const soloOn = (storeyId: number) => {
       const s = useViewerStore.getState();
       return s.levelDisplayMode === 'solo' && s.selectedStoreys.has(toGlobalIdFromModels(s.models, MODEL_ID, storeyId));
@@ -86,6 +130,27 @@ describe('Workspace storey chip (#6232 M2.1)', () => {
     act(() => click(eye()));
     assert.equal(useViewerStore.getState().levelDisplayMode, 'stacked');
     assert.equal(useViewerStore.getState().selectedStoreys.size, 0);
+  });
+
+  it('the context control picks hide / ghost / show for the storeys above, remembered for the session (#6232 D9)', () => {
+    act(() => { useViewerStore.getState().setStoreyContextMode('hide'); });
+    act(() => { useViewerStore.getState().enterModelWorkspace({ storeyId: STOREY }); });
+    const control = () => topLeft()!.querySelector('[data-storey-context]') as HTMLButtonElement;
+    assert.equal(control().getAttribute('aria-label'), 'Storeys above: hidden', 'hidden by default');
+    act(() => {
+      control().dispatchEvent(new window.PointerEvent('pointerdown', { bubbles: true, button: 0 }));
+      click(control());
+    });
+    const options = [...document.body.querySelectorAll('[role="radiogroup"] [role="radio"]')] as HTMLButtonElement[];
+    assert.deepEqual(options.map((o) => o.textContent), ['Hide above', 'Ghost above', 'Show all']);
+    assert.equal(options[0].getAttribute('aria-checked'), 'true');
+    act(() => click(options[1]));
+    assert.equal(useViewerStore.getState().storeyContextMode, 'ghost');
+    assert.equal(control().getAttribute('aria-label'), 'Storeys above: ghosted');
+    assert.equal(window.sessionStorage.getItem('ifc-lite:model-workspace:storey-context'), 'ghost', 'kept for the browser session');
+    act(() => click(options[2]));
+    assert.equal(useViewerStore.getState().storeyContextMode, 'all');
+    act(() => { useViewerStore.getState().setStoreyContextMode('hide'); });
   });
 
   it('a model without a storey reads "No storey" and raises a notice', () => {

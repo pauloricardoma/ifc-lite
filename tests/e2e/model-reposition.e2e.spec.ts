@@ -2,23 +2,103 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 import { test, expect, type BrowserContext, type Page } from '@playwright/test';
-import { existsSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
 import type { ViewerState } from '../../apps/viewer/src/store';
+import type { SceneOwnerSnapshot } from '../../apps/viewer/src/lib/viewport-debug-hooks';
 import { snapshotRenderedPointCloud } from './federation-control-triplet.rendering';
+import { DEVICE_LOST_SIGNAL, GPU_STRICT, skipForGpuDeviceLoss, watchGpuDeviceLoss } from './gpu-device-loss';
 
 declare global {
   var __ifc_lite_viewer_store__: { getState(): ViewerState };
   var __ifc_lite_point_cloud_recovery_omitted__: boolean | undefined;
+  var __ifc_lite_scene_owner__: (globalId: number) => SceneOwnerSnapshot;
 }
 const IFC = 'tests/models/ara3d/AC20-FZK-Haus.ifc';
 const OFFSET = [10_000, 20_000, 30_000];
 
+/** #6515 numerical oracle: two valid Float32 triangles, 1 µm and 1 km apart.
+ * This is a diagnostic GLB, not the unavailable original telemetry model. */
+function widePrecisionGlb(): Buffer {
+  const positions = new Float32Array([0, 0, 0, 0.000001, 0, 0, 0, 1, 0, 1000, 0, 0, 1010, 0, 0, 1000, 10, 0]);
+  const normals = new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1]);
+  const indices = new Uint32Array([0, 1, 2, 3, 4, 5]);
+  const bin = Buffer.concat([Buffer.from(positions.buffer), Buffer.from(normals.buffer), Buffer.from(indices.buffer)]);
+  const json = Buffer.from(JSON.stringify({
+    asset: { version: '2.0', generator: 'ifc-lite #6515 Float32 invariant' },
+    scene: 0, scenes: [{ nodes: [0] }],
+    nodes: [{ mesh: 0, extras: { expressId: 19 }, translation: [155_000, 0, 5_500_000] }],
+    meshes: [{ primitives: [{ attributes: { POSITION: 0, NORMAL: 1 }, indices: 2, material: 0 }] }],
+    materials: [{ doubleSided: true, pbrMetallicRoughness: { baseColorFactor: [0.2, 0.6, 0.9, 1], metallicFactor: 0, roughnessFactor: 1 } }],
+    accessors: [
+      { bufferView: 0, componentType: 5126, count: 6, type: 'VEC3', min: [0, 0, 0], max: [1010, 10, 0] },
+      { bufferView: 1, componentType: 5126, count: 6, type: 'VEC3' },
+      { bufferView: 2, componentType: 5125, count: 6, type: 'SCALAR' },
+    ],
+    bufferViews: [
+      { buffer: 0, byteOffset: 0, byteLength: positions.byteLength, target: 34962 },
+      { buffer: 0, byteOffset: positions.byteLength, byteLength: normals.byteLength, target: 34962 },
+      { buffer: 0, byteOffset: positions.byteLength + normals.byteLength, byteLength: indices.byteLength, target: 34963 },
+    ],
+    buffers: [{ byteLength: bin.length }],
+  }));
+  const jsonLength = Math.ceil(json.length / 4) * 4;
+  const out = Buffer.alloc(12 + 8 + jsonLength + 8 + bin.length);
+  out.writeUInt32LE(0x46546c67, 0); out.writeUInt32LE(2, 4); out.writeUInt32LE(out.length, 8);
+  out.writeUInt32LE(jsonLength, 12); out.writeUInt32LE(0x4e4f534a, 16);
+  out.fill(0x20, 20, 20 + jsonLength); json.copy(out, 20);
+  out.writeUInt32LE(bin.length, 20 + jsonLength); out.writeUInt32LE(0x004e4942, 24 + jsonLength);
+  bin.copy(out, 28 + jsonLength);
+  return out;
+}
+
+test('GLB imports preserve valid triangles that a bounding-box frame would collapse (#6515)', async ({ page }, info) => {
+  const gpu = await watchGpuDeviceLoss(page);
+  const errors: string[] = [];
+  captureDiagnostics(page, errors);
+  await page.goto('/');
+  await load(page, { name: 'precision-invariant-6515.glb', mimeType: 'model/gltf-binary', buffer: widePrecisionGlb() }, 1);
+  await expect.poll(() => page.evaluate(() => globalThis.__ifc_lite_scene_owner__(19).flat?.reduce((count, part) => count + part.triangles, 0))).toBe(2);
+  const owner = await page.evaluate(() => globalThis.__ifc_lite_scene_owner__(19));
+  expect(owner.corners).toHaveLength(18);
+  expect(owner.corners[3] - owner.corners[0], 'the uploaded owner retains its 1 µm edge').toBeCloseTo(Math.fround(0.000001), 9);
+  expect(consoleLines.filter(line => /topology-safe GPU frame|GPU upload failed/.test(line))).toEqual([]);
+  await info.attach('GLB precision invariant scene', { body: JSON.stringify(owner, null, 2), contentType: 'application/json' });
+  await gpu.requireLiveGpu('GLB precision viewport pick and color readback', async () => {
+    // The normal load fits with a 300 ms animation; let it finish before
+    // installing an immediate diagnostic viewpoint.
+    await page.waitForTimeout(400);
+    // Look squarely at the distant triangle. The automatic long-model camera
+    // is edge-on to this intentionally flat numerical diagnostic.
+    await page.evaluate(() => globalThis.__ifc_lite_viewer_store__.getState().cameraCallbacks.applyViewpoint!({
+      position: { x: 156_003, y: 3, z: 5_500_030 }, target: { x: 156_003, y: 3, z: 5_500_000 },
+      up: { x: 0, y: 1, z: 0 }, fov: Math.PI / 4, projectionMode: 'perspective',
+    }, false));
+    await page.waitForTimeout(300);
+    const farTriangle = await page.evaluate(() => globalThis.__ifc_lite_viewer_store__.getState().cameraCallbacks.projectToScreen!({ x: 156_003, y: 3, z: 5_500_000 }));
+    expect(farTriangle).not.toBeNull();
+    const canvas = await page.locator('canvas').first().boundingBox();
+    expect(canvas).not.toBeNull();
+    await page.mouse.click(canvas!.x + farTriangle!.x, canvas!.y + farTriangle!.y);
+    await expect.poll(() => page.evaluate(() => globalThis.__ifc_lite_viewer_store__.getState().selectedEntityId)).toBe(19);
+    expect(errors).toEqual([]);
+    // SwiftShader may discard compositor canvas pixels; the production renderer
+    // readback is the color witness (the DOM screenshot records UI only).
+    const colorFrame = await page.evaluate(() => globalThis.__ifc_lite_capture_color_frame__?.());
+    expect(colorFrame).toMatch(/^data:image\/png;base64,/);
+    const colorPath = info.outputPath('glb-precision-invariant-6515-rendered.png');
+    writeFileSync(colorPath, Buffer.from(colorFrame!.split(',')[1]!, 'base64'));
+    await info.attach('GLB precision invariant rendered color', { path: colorPath, contentType: 'image/png' });
+    await page.screenshot({ path: info.outputPath('glb-precision-invariant-6515.png') });
+  });
+});
+
 /** The viewer's own point-cloud error when the GPU device died mid-load
  * (apps/viewer/src/hooks/useIfcLoader.ts). */
 const DEVICE_LOST_ERROR = /graphics device was lost during the load/;
-// The final alternative is the renderer's documented device-loss race: the
-// device can disappear after whenReady() resolves but before stream creation.
-const DEVICE_LOST_CONSOLE = /\[WebGPU\] Device lost:|\[Renderer\] GPU device lost|CONTEXT_LOST_WEBGL|Renderer not initialized\. Call init\(\) first\./;
+// The shared viewer signal, plus two load-specific ones. The final alternative
+// is the renderer's documented device-loss race: the device can disappear
+// after whenReady() resolves but before stream creation.
+const DEVICE_LOST_CONSOLE = new RegExp(`${DEVICE_LOST_SIGNAL.source}|CONTEXT_LOST_WEBGL|Renderer not initialized\\. Call init\\(\\) first\\.`);
 
 async function load(page: Page, file: string | { name: string; mimeType: string; buffer: Buffer }, count: number) {
   const consoleStart = consoleLines.length;
@@ -92,10 +172,7 @@ async function load(page: Page, file: string | { name: string; mimeType: string;
   // own, so the documented skip never fired and the flake read as a failure.
   const softwareDeviceLost = outcome === 'device-lost'
     || [...consoleLines, ...pageErrorLines].some((line) => DEVICE_LOST_CONSOLE.test(line));
-  if (softwareDeviceLost && process.env.E2E_GPU_STRICT === '0') {
-    console.warn(`[e2e] E2E_GPU_STRICT=0 — skipping: software-GPU device lost during load(${name}, ${count})`);
-    test.skip(true, `hosted software-GPU device lost during load(${name}, ${count}): ${detail}`);
-  }
+  if (softwareDeviceLost) skipForGpuDeviceLoss(`load(${name}, ${count})`, detail);
   throw new Error(`load(${name}, ${count}) ${outcome === 'device-lost' ? 'aborted: GPU device lost' : 'did not settle'}: ${detail}`);
 }
 
@@ -164,6 +241,9 @@ for (const scanFirst of [false, true]) test(`reposition IFC and diagnostic scan,
   pageErrorLines = [];
   consoleLines = [];
   captureDiagnostics(page, errors);
+  // Watches only the page under test: the scan-first seed page below is closed
+  // (and destroys its own device) before this page loads anything.
+  const gpu = await watchGpuDeviceLoss(page);
   // #6257: a successful recovery toast is independent evidence that the renderer
   // discarded transient point-cloud handles. Record it before loading either
   // model: the toast expires after three seconds and may be gone by assertion.
@@ -180,12 +260,13 @@ for (const scanFirst of [false, true]) test(`reposition IFC and diagnostic scan,
     new MutationObserver(observe).observe(document, { childList: true, subtree: true, characterData: true });
   });
   await page.setViewportSize({ width: 1440, height: 1000 });
+  let scan: { name: string; mimeType: string; buffer: Buffer };
   if (scanFirst) {
     // The scan is synthetic and derived from the real IFC fixture. Generate it
     // in a disposable page so the workflow under test genuinely starts with a
     // fresh viewer and the scan first; reloading a live GPU page tests teardown
     // timing instead of federation load order.
-    const scan = { name: 'known-offset.xyz', mimeType: 'text/plain', buffer: await deriveDiagnosticScan(context, errors) };
+    scan = { name: 'known-offset.xyz', mimeType: 'text/plain', buffer: await deriveDiagnosticScan(context, errors) };
     // The seed page is closed now and logged its own `[WebGPU] Device lost:
     // Device was destroyed` on the way out; the device-loss verdict in load()
     // must only ever see what the page under test logs.
@@ -197,14 +278,16 @@ for (const scanFirst of [false, true]) test(`reposition IFC and diagnostic scan,
   } else {
     await page.goto('/');
     await load(page, IFC, 1);
-    const scan = { name: 'known-offset.xyz', mimeType: 'text/plain', buffer: await diagnosticScan(page) };
+    scan = { name: 'known-offset.xyz', mimeType: 'text/plain', buffer: await diagnosticScan(page) };
     await load(page, scan, 2);
   }
-  await openScanMove(page);
-  for (const [i, axis] of ['X', 'Y', 'Z'].entries()) await page.getByLabel(`Delta ${axis}`, { exact: true }).fill(String(-OFFSET[i]));
-  await page.getByRole('button', { name: 'Preview values', exact: true }).click();
-  await page.getByRole('button', { name: 'Apply', exact: true }).click();
-  await page.getByRole('button', { name: 'Frame both', exact: true }).click();
+  await gpu.requireLiveGpu('the reposition dialog', async () => {
+    await openScanMove(page);
+    for (const [i, axis] of ['X', 'Y', 'Z'].entries()) await page.getByLabel(`Delta ${axis}`, { exact: true }).fill(String(-OFFSET[i]));
+    await page.getByRole('button', { name: 'Preview values', exact: true }).click();
+    await page.getByRole('button', { name: 'Apply', exact: true }).click();
+    await page.getByRole('button', { name: 'Frame both', exact: true }).click();
+  });
   const placement = await page.evaluate(() => {
     const s = globalThis.__ifc_lite_viewer_store__.getState();
     // The streamed GPU handle is intentionally transient: hosted software-GPU
@@ -216,11 +299,15 @@ for (const scanFirst of [false, true]) test(`reposition IFC and diagnostic scan,
       fixed: [...s.models].filter(([, model]) => !isScan(model)).map(([id]) => s.modelPlacement.placements.get(id)?.translation ?? [0, 0, 0]), count: s.pointCloudAssetCount };
   });
   expect(placement.translations).toEqual([OFFSET.map((v) => -v)]);
-  if (placement.count === 0 && process.env.E2E_GPU_STRICT === '0') {
+  if (placement.count === 0 && !GPU_STRICT) {
     // reportDeviceRecovery deliberately clears streamed point-cloud handles.
     // A missing asset is permitted only when this page actually reported that
-    // successful recovery and named point-clouds among the omitted layers.
-    expect(await page.evaluate(() => globalThis.__ifc_lite_point_cloud_recovery_omitted__)).toBe(true);
+    // successful recovery and named point-clouds among the omitted layers, or
+    // (skip) when the device was lost and never came back.
+    const omitted = await page.evaluate(() => globalThis.__ifc_lite_point_cloud_recovery_omitted__);
+    const lost = omitted ? null : await gpu.lost();
+    if (lost !== null) skipForGpuDeviceLoss('the reposition (no point-cloud asset after the loss)', lost);
+    expect(omitted).toBe(true);
   } else {
     expect(placement.count).toBe(1);
   }
@@ -229,7 +316,7 @@ for (const scanFirst of [false, true]) test(`reposition IFC and diagnostic scan,
   expect(placement.fixed).toEqual([[0, 0, 0]]);
   // Match the existing smoke suite: hosted SwiftShader devices are unstable.
   // CPU assertions above still gate CI; strict local runs exercise actual GPU picks.
-  if (process.env.E2E_GPU_STRICT === '0') { info.annotations.push({ type: 'GPU coverage', description: 'Picking requires a healthy WebGPU device; run locally without E2E_GPU_STRICT=0.' }); return; }
+  if (!GPU_STRICT) { info.annotations.push({ type: 'GPU coverage', description: 'Picking requires a healthy WebGPU device; run locally without E2E_GPU_STRICT=0.' }); return; }
 
   const previewRun = await page.evaluate(async () => {
     const initial = globalThis.__ifc_lite_viewer_store__.getState();

@@ -58,10 +58,12 @@ import { EpsgLookupError } from './EpsgLookupError.js';
 import { TaskEditCard } from './TaskEditCard.js';
 
 // This oracle mounts the established property cards below. SweptDiskInspection
-// has its own rendered locale-switch witness; including its unmounted keys
-// would misattribute shared English words such as "Yes" to this render.
+// and ExtrusionInspection have their own rendered locale-switch witnesses;
+// including their unmounted keys would misattribute shared English words such
+// as "Yes" to this render.
 const CATALOGUE: Catalogue = Object.fromEntries(Object.entries(en).filter(([key]) =>
-  key.startsWith('properties.') && !key.startsWith('properties.sweptDisk.')));
+  key.startsWith('properties.') && !key.startsWith('properties.sweptDisk.')
+    && !key.startsWith('properties.extrusion.')));
 const HAS_CATALOGUE = 'properties.assemblyBadge.label' in en;
 
 type PropertiesKey = keyof typeof CATALOGUE;
@@ -446,11 +448,11 @@ describe('Properties panel localization (#4918 slice 4)', () => {
     const cancelScale = container.querySelector('button[aria-label="Cancel editing Scale"]');
     assert.ok(cancelScale);
     click(cancelScale);
-    const angleLabel = [...container.querySelectorAll('span')].find((span) => span.textContent?.includes('Angle to Grid North'));
+    const angleLabel = [...container.querySelectorAll('span')].find((span) => span.textContent?.includes('Model rotation in map coordinates'));
     assert.ok(angleLabel?.parentElement);
     clickRow(angleLabel.parentElement);
-    assert.ok(container.querySelector('button[aria-label="Save Angle to Grid North"]'));
-    assert.ok(container.querySelector('button[aria-label="Cancel editing Angle to Grid North"]'));
+    assert.ok(container.querySelector('button[aria-label="Save Model rotation in map coordinates"]'));
+    assert.ok(container.querySelector('button[aria-label="Cancel editing Model rotation in map coordinates"]'));
   });
 
   catalogueIt('formats coordinate and terrain measurements with the active locale', () => {
@@ -589,7 +591,7 @@ describe('Properties panel localization (#4918 slice 4)', () => {
     const operation = [...container.querySelectorAll('button')].find((button) => button.textContent?.includes('Coordinate Operation'));
     assert.ok(operation);
     click(operation);
-    const angleLabel = [...container.querySelectorAll('span')].find((span) => span.textContent?.includes('Angle to Grid North'));
+    const angleLabel = [...container.querySelectorAll('span')].find((span) => span.textContent?.includes('Model rotation in map coordinates'));
     assert.ok(angleLabel?.parentElement);
     clickRow(angleLabel.parentElement);
     const input = angleLabel.parentElement.querySelector<HTMLInputElement>('input');

@@ -57,6 +57,7 @@ function Harness() {
       selectedContainer={folder}
       onSelectContainer={() => {}}
       sortedFolders={[folder]}
+      favouriteFolders={favourites.favouriteFolders}
       allFiles={[file]}
       gateEmptyFolders={false}
       loadingFolders={false}
@@ -67,7 +68,9 @@ function Harness() {
       downloadedRecords={new Map()}
       loadedModelNamesByFileId={new Map()}
       syncingFileIds={new Set()}
+      syncStatesByFileId={new Map()}
       onSyncLoadedFile={() => {}}
+      downloadStates={new Map()}
       busy={false}
       onLoad={() => {}}
       foldersHaveMore={false}

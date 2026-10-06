@@ -11,8 +11,9 @@
  * hosts stay in lock-step.
  */
 
+import { AssistantSourceContext } from '@/components/viewer/assistant/AssistantAction';
 import { lazy, Suspense, type ReactNode } from 'react';
-import type { WorkspacePanelId } from './registry';
+import { panelModelGateMode, type WorkspacePanelId } from './registry';
 import { ChunkErrorBoundary } from '@/components/ChunkErrorBoundary';
 import { HierarchyPanel } from '@/components/viewer/HierarchyPanel';
 import { PropertiesPanel } from '@/components/viewer/PropertiesPanel';
@@ -29,12 +30,15 @@ import { RoomPanel } from '@/components/viewer/RoomPanel';
 import { ZonesPanel } from '@/components/viewer/ZonesPanel';
 import { LoadReportPanel } from '@/components/viewer/LoadReportPanel';
 import { ChangesPanel } from '@/components/viewer/ChangesPanel';
+import { ChangeSetPanel } from '@/components/viewer/change-sets/ChangeSetPanel';
 import { CostPanel } from '@/components/viewer/CostPanel';
 import { EnvironmentPanel } from '@/components/viewer/EnvironmentPanel';
 import { PointCloudPanel } from '@/components/viewer/PointCloudPanel';
 import { MeasurementsPanel } from '@/components/viewer/MeasurementsPanel';
 import { PlacementPanel } from '@/components/viewer/placement/PlacementPanel';
 import { ModelInspectorPanel } from '@/components/viewer/model-inspector/ModelInspectorPanel';
+import { PanelModelGate } from '@/components/viewer/PanelModelGate';
+import { TOUR_ANCHORS, tourAnchor } from '@/lib/tours/anchors';
 import { useViewerStore } from '@/store';
 // Lazy: the Layers panel pulls in @ifc-lite/merge (engine + blake3); a
 // dynamic chunk keeps it out of the initial bundle until first opened.
@@ -57,6 +61,13 @@ const FlowPanel = lazy(() => import('@/components/viewer/flow/FlowPanel').then((
 const DrawingPanel = lazy(() => import('@/components/viewer/drawing/DrawingPanel').then((m) => ({ default: m.DrawingPanel })));
 // Lazy: the filmstrip of saved basket views (#5508), out of the first-paint bundle like the other bottom panels.
 const PresentationPanel = lazy(() => import('@/components/viewer/presentation/PresentationPanel').then((m) => ({ default: m.PresentationPanel })));
+
+const AssistantPanel = lazy(() => import('@/components/viewer/assistant/AssistantPanel').then(m => ({ default: m.AssistantPanel })));
+
+const SemanticPanel = lazy(() => import('@/components/viewer/SemanticPanel').then(m => ({ default: m.SemanticPanel })));
+function SemanticPanelBody() {
+  return <ChunkErrorBoundary label="Linked records panel"><Suspense fallback={null}><SemanticPanel /></Suspense></ChunkErrorBoundary>;
+}
 
 const AppearancePanel = lazy(() => import('@/components/viewer/appearance/AppearancePanel').then(m => ({ default: m.AppearancePanel })));
 
@@ -127,12 +138,22 @@ function PointCloudPanelBody({ onClose }: { onClose: () => void }) {
  * retired in favour of the strip header's single Close.
  */
 export function renderPanelBody(id: WorkspacePanelId, onClose: () => void): ReactNode {
+  const body = panelBody(id, onClose);
+  const gate = panelModelGateMode(id);
+  return <AssistantSourceContext panel={id}>{gate ? <PanelModelGate id={id} mode={gate} onClose={onClose}>{body}</PanelModelGate> : body}</AssistantSourceContext>;
+}
+
+function panelBody(id: WorkspacePanelId, onClose: () => void): ReactNode {
   switch (id) {
     // Hierarchy's home is the left slot (#1267); it is never routed to the right
     // pane / float / pop-out, but the case keeps the id to body map exhaustive.
+    case 'assistant': return <ChunkErrorBoundary label="Assistant panel"><Suspense fallback={null}><AssistantPanel /></Suspense></ChunkErrorBoundary>;
     case 'appearance': return <AppearancePanelBody />;
     case 'hierarchy': return <HierarchyPanel />;
-    case 'properties': return <PropertiesPanel />;
+    // The anchor wraps every Information branch (entity, model metadata,
+    // multi-selection, empty): the welcome tour's "Read its data" step broke
+    // whenever the panel showed one of the branches that lacked it.
+    case 'properties': return <div {...tourAnchor(TOUR_ANCHORS.propertiesPanel)} className="h-full"><PropertiesPanel /></div>;
     case 'compare': return <ComparePanel onClose={onClose} />;
     case 'bcf': return <BCFPanel onClose={onClose} />;
     case 'validation': return <ValidationPanel onClose={onClose} />;
@@ -159,5 +180,7 @@ export function renderPanelBody(id: WorkspacePanelId, onClose: () => void): Reac
     case 'measurements': return <MeasurementsPanel onClose={onClose} />;
     case 'placement': return <PlacementPanel onClose={onClose} />;
     case 'model': return <ModelInspectorPanel onClose={onClose} />;
+    case 'semantic': return <SemanticPanelBody />;
+    case 'changeSets': return <ChangeSetPanel onClose={onClose} />;
   }
 }

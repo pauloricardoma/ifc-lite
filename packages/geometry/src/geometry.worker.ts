@@ -9,8 +9,11 @@ import { publishPrepassFingerprint, runPrepassWithFingerprint } from './prepass-
 import { canReuseWorkerSource, type BytePrepassApi, type SourcePrepassApi, type FinalizeStyleArgs } from './worker-prepass-source.js';
 import { applyStyleFinishes } from './style-finishes.js';
 import init, { initSync, IfcAPI } from '@ifc-lite/wasm';
+import * as wasmBindings from '@ifc-lite/wasm';
+import { createInCallHeartbeat, installInCallHeartbeat, postWorkerHeartbeat } from './in-call-heartbeat.js';
 import { initWasmWithRetry } from './wasm-init-retry.js';
 import { largeFilePrepassError } from './huge-file-error.js';
+import { isWasmRuntimeTrap } from './wasm-runtime-trap.js';
 import { freeWasmInstanceQuietly } from './wasm-instance-free.js';
 import type { MeshData, TessellationQuality } from './types.js';
 import {
@@ -32,6 +35,7 @@ import {
   type BatchSizingConfig,
 } from './batch-sizing.js';
 import { takeWasmPanicStash } from './wasm-panic-forward.js';
+import { traceGeometryWorkerMessage, meterTypedArrayArgs, countCopy, postPrepassEvent } from './worker-trace.js'; // #6956 spans, #6957 counters
 import { isColumnLengthRefusal } from './wasm-column-refusal.js';
 
 export interface GeometryWorkerInitMessage {
@@ -496,7 +500,8 @@ let cachedWasmUrl: string | undefined = undefined;
 async function ensureInit(): Promise<IfcAPI> {
   if (api) return api;
   await initWasmWithRetry(() => init(cachedWasmUrl), { label: 'geometry.worker' });
-  api = new IfcAPI();
+  installInCallHeartbeat(wasmBindings, inCallHeartbeat);
+  api = meterTypedArrayArgs(new IfcAPI(), 'wasm'); // #6957: bytes copied into wasm (identity unless traced)
   mergeLayersApplied = false;
   applyMergeLayersToApi();
   geometryHashApplied = false;
@@ -730,7 +735,7 @@ function viewSharedBytes(sharedBuffer: SharedArrayBuffer): Uint8Array {
 /** Fallback path: copy SAB into a fresh ArrayBuffer-backed Uint8Array. */
 function materialiseSharedBytes(sharedBuffer: SharedArrayBuffer): Uint8Array {
   const local = new Uint8Array(sharedBuffer.byteLength);
-  local.set(new Uint8Array(sharedBuffer));
+  local.set(countCopy('source.materialise', new Uint8Array(sharedBuffer)));
   return local;
 }
 
@@ -740,10 +745,11 @@ function materialiseSharedBytes(sharedBuffer: SharedArrayBuffer): Uint8Array {
  * materialises a *file-sized* copy in this worker. The shard entry points are
  * called once per slice, so the notice is latched — once per worker, not once
  * per shard. The streaming-prepass paths warn on their own (they run once per
- * load); this only covers the shard/finalise paths that were silent.
+ * load); shard/finalise retries first reject runtime traps, then warn once.
  */
 let sabViewFallbackWarned = false;
-function warnSabViewFallbackOnce(context: string, err: unknown): void {
+function prepareSabViewRetry(context: string, err: unknown): void {
+  if (isWasmRuntimeTrap(err)) throw err;
   if (sabViewFallbackWarned) return;
   sabViewFallbackWarned = true;
   console.warn(
@@ -811,12 +817,7 @@ let activeSession: ProcessingSession | null = null;
 let batchSizing: BatchSizingConfig = DEFAULT_BATCH_SIZING;
 let adaptiveBatchJobs = batchSizing.maxJobs;
 
-/** Liveness ping (no slice context) for recovery paths that recurse/re-init. */
-function postWorkerHeartbeat(): void {
-  (self as unknown as Worker).postMessage(
-    { type: 'progress', processedJobs: 0, totalJobs: 0 } as GeometryWorkerProgressMessage,
-  );
-}
+const inCallHeartbeat = createInCallHeartbeat(postWorkerHeartbeat);
 
 function startSession(input: {
   sharedBuffer: SharedArrayBuffer;
@@ -1229,7 +1230,7 @@ async function processBatch(session: ProcessingSession, jobs: Uint32Array): Prom
     // entities could therefore blow the silent-window budget invisibly
     // (#1097, secondary window). Ping liveness before we recurse / re-init.
     postWorkerHeartbeat();
-    if (!session.sabFallbackTaken && session.localBytes.buffer instanceof SharedArrayBuffer) {
+    if (!isWasmRuntimeTrap(err) && !session.sabFallbackTaken && session.localBytes.buffer instanceof SharedArrayBuffer) {
       session.sabFallbackTaken = true;
       console.warn(`[Worker] processGeometryBatch rejected SAB view (${msg}), falling back to copy`);
       session.localBytes = materialiseSharedBytes(session.sharedBuffer);
@@ -1285,7 +1286,7 @@ async function processSliceStreaming(session: ProcessingSession, jobsFlat: Uint3
       { type: 'progress', processedJobs: jobOffset, totalJobs, seq, callJobs: jobsThisBatch, diagnostics } as GeometryWorkerProgressMessage,
     );
     const callStart = performance.now();
-    await processBatch(session, jobsFlat.subarray(start, end));
+    await inCallHeartbeat.run(() => processBatch(session, jobsFlat.subarray(start, end)));
     flushPending(session);
     // Resize the next call from this one's measured throughput so the silent
     // window stays near TARGET_BATCH_MS regardless of CSG density (#1097).
@@ -1341,7 +1342,7 @@ function emitSessionEnd(session: ProcessingSession): void {
 let messageTail: Promise<void> = Promise.resolve();
 
 self.onmessage = (rawEvent: MessageEvent<GeometryWorkerRequest>) => {
-  messageTail = messageTail.then(() => handleMessage(rawEvent)).catch((err) => {
+  messageTail = messageTail.then(() => traceGeometryWorkerMessage(rawEvent.data, () => handleMessage(rawEvent))).catch((err) => {
     // #2527 follow-up: forward this realm's panic-location stash (if the
     // failure was a wasm trap) so the main thread can re-plant it on ITS
     // global for `attachWasmPanicLocation`. Read AFTER the throw, so a panic
@@ -1374,7 +1375,7 @@ async function handleMessage(e: MessageEvent<GeometryWorkerRequest>): Promise<vo
             : styleApi.resolveStyledItemsShard(viewSharedBytes(sharedBuffer), spans);
         } catch (err) {
           // SAB-view rejection fallback (see scan-shard above).
-          warnSabViewFallbackOnce('resolve-styles-shard', err);
+          prepareSabViewRetry('resolve-styles-shard', err);
           res = styleApi.resolveStyledItemsShard(materialiseSharedBytes(sharedBuffer), spans);
         }
         (self as unknown as Worker).postMessage(
@@ -1390,6 +1391,7 @@ async function handleMessage(e: MessageEvent<GeometryWorkerRequest>): Promise<vo
           [res.orphanIds.buffer, res.orphanColors.buffer, res.geomIds.buffer, res.geomColors.buffer, ...(res.geomFinishes ? [res.geomFinishes.buffer] : [])],
         );
       } catch (err) {
+        if (isWasmRuntimeTrap(err)) throw err;
         (self as unknown as Worker).postMessage({
           type: 'styles-shard-result',
           sliceIndex,
@@ -1414,7 +1416,7 @@ async function handleMessage(e: MessageEvent<GeometryWorkerRequest>): Promise<vo
       const skipTypeGeometry = e.data.skipTypeGeometry === true;
       const onEvent = (event: unknown) => {
         publishPrepassFingerprint(sourceFingerprint, sharedBuffer.byteLength, event);
-        (self as unknown as Worker).postMessage({ type: 'prepass-stream', event });
+        postPrepassEvent(event);
       };
       const run = (
         bytes: Uint8Array,
@@ -1426,6 +1428,7 @@ async function handleMessage(e: MessageEvent<GeometryWorkerRequest>): Promise<vo
         run(viewSharedBytes(sharedBuffer), indexIds, indexStarts, indexLengths, indexClasses);
       } catch (err) {
         if (isColumnLengthRefusal(err)) throw err;
+        if (isWasmRuntimeTrap(err)) throw largeFilePrepassError(err, sharedBuffer.byteLength) ?? err;
         const msg = err instanceof Error ? err.message : String(err);
         console.warn(`[Worker] Sharded streaming prepass with SAB view failed (${msg}), retrying with copy`);
         try {
@@ -1470,7 +1473,7 @@ async function handleMessage(e: MessageEvent<GeometryWorkerRequest>): Promise<vo
       } catch (err) {
         if (isColumnLengthRefusal(err)) throw err;
         // SAB-view rejection fallback (see scan-shard above).
-        warnSabViewFallbackOnce('finalize-prepass-styles', err);
+        prepareSabViewRetry('finalize-prepass-styles', err);
         stashFinishes();
         payload = finalizeApi.finalizePrepassStyles(materialiseSharedBytes(m.sharedBuffer), ...args);
       }
@@ -1480,8 +1483,6 @@ async function handleMessage(e: MessageEvent<GeometryWorkerRequest>): Promise<vo
 
     if (e.data.type === 'prepass-streaming') {
       const ifcApi = await ensureInit();
-      // Heartbeat: lets the host watchdog know the worker is alive even
-      // before the first chunk lands.
       (self as unknown as Worker).postMessage({ type: 'prepass-progress', phase: 'parsing' });
       const sharedBuffer = e.data.sharedBuffer;
       const sourceFingerprint = e.data.sourceFingerprint;
@@ -1496,22 +1497,20 @@ async function handleMessage(e: MessageEvent<GeometryWorkerRequest>): Promise<vo
       // wasm-bindgen rejects the view.
       const onEvent = (event: unknown) => {
         publishPrepassFingerprint(sourceFingerprint, sharedBuffer.byteLength, event);
-        (self as unknown as Worker).postMessage({ type: 'prepass-stream', event });
+        postPrepassEvent(event);
       };
       const runPrepass = (bytes: Uint8Array) =>
         runPrepassWithFingerprint(ifcApi, [bytes, onEvent, chunkSize, disabledTypes, skipTypeGeometry], sourceFingerprint);
       try {
-        // Zero-copy SAB view first; wasm-bindgen copies it into linear memory.
         runPrepass(viewSharedBytes(sharedBuffer));
       } catch (err) {
+        if (isWasmRuntimeTrap(err)) throw largeFilePrepassError(err, sharedBuffer.byteLength) ?? err;
         const msg = err instanceof Error ? err.message : String(err);
         console.warn(`[Worker] Streaming prepass with SAB view failed (${msg}), retrying with copy`);
         try {
           runPrepass(materialiseSharedBytes(sharedBuffer));
         } catch (retryErr) {
-          // Both paths trapped — on a very large model this is the wasm32 4GB
-          // limit; surface an actionable error instead of `unreachable executed`.
-          throw largeFilePrepassError(retryErr, sharedBuffer.byteLength) ?? retryErr;
+            throw largeFilePrepassError(retryErr, sharedBuffer.byteLength) ?? retryErr;
         }
       }
       return;
@@ -1550,7 +1549,7 @@ async function handleMessage(e: MessageEvent<GeometryWorkerRequest>): Promise<vo
       } catch (err) {
         // Some runtimes reject SAB-backed views at the wasm boundary (same
         // fallback the streaming pre-pass ships) — retry with a copy.
-        warnSabViewFallbackOnce('scan-entity-index-shard', err);
+        prepareSabViewRetry('scan-entity-index-shard', err);
         sourceBytesApplied = false;
         shard = scan(materialiseSharedBytes(sharedBuffer));
       }
@@ -1581,7 +1580,8 @@ async function handleMessage(e: MessageEvent<GeometryWorkerRequest>): Promise<vo
         // `undefined` and threw `new WebAssembly.Module(undefined)`, which is
         // why the shared-module path was never actually taken.
         initSync({ module: e.data.wasmModule });
-        api = new IfcAPI();
+        installInCallHeartbeat(wasmBindings, inCallHeartbeat);
+        api = meterTypedArrayArgs(new IfcAPI(), 'wasm'); // #6957: bytes copied into wasm (identity unless traced)
         mergeLayersApplied = false;
         applyMergeLayersToApi();
         geometryHashApplied = false;

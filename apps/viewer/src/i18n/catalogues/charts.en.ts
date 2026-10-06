@@ -29,6 +29,14 @@ import type { TranslationValue } from '../types';
  * copy and its `FIELDS` title-block label table, for the same reason.
  */
 export const chartsEn = {
+  'chartComparison.label': 'Saved comparison',
+  'chartComparison.choose': 'Choose a completed saved comparison',
+  'chartComparison.pending': 'Source (choose a saved comparison)',
+  'chartComparison.legacy': 'Latest comparison (existing chart)',
+  'chartComparison.unavailable': 'Saved comparison unavailable',
+  'chartComparison.none': 'Complete and save a model comparison to use it here.',
+  'chartComparison.missing': 'Saved comparison unavailable in this browser. Choose another saved comparison; the latest run is not substituted.',
+  'chartComparison.recorded': 'Saved comparison: {name}. Recorded report rows; 3D selection and snapshots are unavailable.',
   // ChartEditor.tsx — Source filter field (#4946)
   'chartEditor.sourceFilterLabel': 'Source filter (selector)',
   'chartEditor.sourceFilterAriaLabel': 'Source filter',
@@ -45,6 +53,9 @@ export const chartsEn = {
   'chartCard.frameAriaLabel': 'Frame {title}',
   'chartCard.editChartTitle': 'Edit chart',
   'chartCard.editAriaLabel': 'Edit {title}',
+  'chartCard.duplicateChartTitle': 'Duplicate chart',
+  'chartCard.duplicateAriaLabel': 'Duplicate {title}',
+  'chartCard.copyName': '{name} (copy)',
   'chartCard.removeChartTitle': 'Remove chart',
   'chartCard.removeAriaLabel': 'Remove {title}',
   'chartCard.nothingToBucket': 'Nothing to bucket — every row is without a value for this dimension.',

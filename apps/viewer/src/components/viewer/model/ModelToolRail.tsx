@@ -5,7 +5,8 @@
 /**
  * The Model workspace's tool rail (charter #6232, M2 §1.3): a 48 px column
  * on the viewport's left edge, styled like the sidebar's activity bar, with
- * one button per `RAIL_TOOLS` row and Leave in the footer. Rendered only
+ * one button per `RAIL_TOOLS` row, grouped menus when the rows do not fit,
+ * and Leave in the footer. Rendered only
  * while the workspace is open, and only on desktop (phones reach the same
  * tools through the palette).
  *
@@ -13,7 +14,7 @@
  * for the drawing tools, no selection for Split.
  */
 
-import { useMemo, type ComponentType, type ReactNode } from 'react';
+import { useLayoutEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { cn } from '@/lib/utils';
@@ -22,7 +23,48 @@ import { useTranslation, type TranslationKey } from '@/i18n';
 import { shortcutLabel, type KeyCommandId } from '@/lib/commands/shortcut-label';
 import { tourAnchor, toolAnchor } from '@/lib/tours/anchors';
 import { sessionWorkplaneBlock } from '@/lib/commands/modeling/workspace-storeys';
+import { GitBranch, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 import { LEAVE_TOOL, RAIL_TOOLS, type RailTool } from './rail-tools';
+import { effectiveModelLayout, splitFits, useSplitWidth } from './model-layout';
+import { CompactRailGroup } from './CompactRailGroup';
+
+const TOOL_GROUPS = [...new Set(RAIL_TOOLS.map((tool) => tool.group))];
+const DIVIDERS = RAIL_TOOLS.filter((tool, i) => i > 0 && tool.group !== RAIL_TOOLS[i - 1].group).length;
+
+/** Measure the same buttons, gaps and footer used by the full rail; grouping must not oscillate as rows disappear. */
+function useCompactRail(open: boolean) {
+  const ref = useRef<HTMLElement>(null);
+  const [compact, setCompact] = useState(false);
+  useLayoutEffect(() => {
+    const rail = ref.current;
+    if (!open || !rail) return;
+    const list = rail.querySelector<HTMLElement>('[data-rail-list]');
+    const footer = rail.querySelector<HTMLElement>('[data-rail-footer]');
+    if (!list || !footer) return;
+    const measure = () => {
+      const button = rail.querySelector<HTMLElement>('[data-rail-tool="select"]');
+      const divider = rail.querySelector<HTMLElement>('[data-rail-divider]');
+      const rowHeight = button?.getBoundingClientRect().height ?? 0;
+      const height = rail.getBoundingClientRect().height;
+      if (!rowHeight || !height) return;
+      const style = getComputedStyle(list);
+      const pixels = (value: string) => Number.parseFloat(value) || 0;
+      const lineStyle = divider && getComputedStyle(divider);
+      const lineHeight = divider && lineStyle
+        ? divider.getBoundingClientRect().height + pixels(lineStyle.marginTop) + pixels(lineStyle.marginBottom) : 0;
+      const needed = RAIL_TOOLS.length * rowHeight + DIVIDERS * lineHeight
+        + (RAIL_TOOLS.length + DIVIDERS - 1) * pixels(style.rowGap)
+        + pixels(style.paddingTop) + pixels(style.paddingBottom) + footer.getBoundingClientRect().height;
+      setCompact(height < needed);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(rail);
+    observer.observe(footer);
+    return () => observer.disconnect();
+  }, [open]);
+  return { ref, compact };
+}
 
 /** Why the drawing tools are off: no storey, or the builder's refusal. */
 function useWorkplaneBlockText(): string | null {
@@ -46,25 +88,37 @@ export function ModelToolRail() {
   const workplaneBlock = useWorkplaneBlockText();
   // Per row: is it active, and its own reason to be off (flat, so shallow-equal).
   const rows = useViewerStore(useShallow((s) => RAIL_TOOLS.flatMap((tool) => [tool.isActive(s), tool.blockedKey?.(s) ?? null])));
+  const { ref, compact } = useCompactRail(open);
   if (!open) return null;
+
+  const tools = RAIL_TOOLS.map((tool, i) => {
+    const blockedKey = rows[2 * i + 1] as TranslationKey | null;
+    return { tool, active: rows[2 * i] === true,
+      reason: tool.drawsOnWorkplane && workplaneBlock ? workplaneBlock : blockedKey ? t(blockedKey) : null };
+  });
 
   let previous: RailTool['group'] | null = null;
   return (
     <nav
+      ref={ref}
       data-model-tool-rail
+      data-rail-layout={compact ? 'grouped' : 'full'}
       aria-label={t('modelWorkspace.rail.aria')}
       className="relative flex h-full w-12 shrink-0 flex-col items-center border-r border-border bg-background"
     >
-      <div className="flex min-h-0 w-full flex-1 flex-col items-center gap-0.5 overflow-y-auto overflow-x-hidden py-1.5">
-        {RAIL_TOOLS.map((tool, i) => {
+      <div data-rail-list className="flex min-h-0 w-full flex-1 flex-col items-center gap-0.5 overflow-y-auto overflow-x-hidden py-1.5">
+        {compact ? TOOL_GROUPS.map((group, i) => (
+          <div key={group} className="contents">
+            {i > 0 && <span data-rail-divider aria-hidden className="my-1 h-px w-6 shrink-0 bg-border/70" />}
+            {group === 'select' ? <RailButton id="select" labelKey={tools[0].tool.labelKey} Icon={tools[0].tool.Icon} shortcut={tools[0].tool.shortcut} active={tools[0].active} disabledReason={tools[0].reason} onClick={tools[0].tool.run} />
+              : <CompactRailGroup group={group} tools={tools.filter(({ tool }) => tool.group === group)} />}
+          </div>
+        )) : tools.map(({ tool, active, reason }) => {
           const divider = previous !== null && tool.group !== previous;
           previous = tool.group;
-          const active = rows[2 * i] === true;
-          const blockedKey = rows[2 * i + 1] as TranslationKey | null;
-          const reason = tool.drawsOnWorkplane && workplaneBlock ? workplaneBlock : blockedKey ? t(blockedKey) : null;
           return (
             <div key={tool.id} className="contents">
-              {divider && <span aria-hidden className="my-1 h-px w-6 shrink-0 bg-border/70" />}
+              {divider && <span data-rail-divider aria-hidden className="my-1 h-px w-6 shrink-0 bg-border/70" />}
               <RailButton
                 id={tool.id}
                 labelKey={tool.labelKey}
@@ -78,7 +132,9 @@ export function ModelToolRail() {
           );
         })}
       </div>
-      <div className="flex w-full shrink-0 flex-col items-center border-t border-border py-1.5">
+      <div data-rail-footer className="flex w-full shrink-0 flex-col items-center gap-0.5 border-t border-border py-1.5">
+        <ChangeSetsButton />
+        <PlanToggle />
         <RailButton
           id={LEAVE_TOOL.id}
           labelKey={LEAVE_TOOL.labelKey}
@@ -93,17 +149,56 @@ export function ModelToolRail() {
   );
 }
 
+/** Show / hide the plan beside 3D (M2.4); off, with the reason, while the split has no room for it. */
+function PlanToggle() {
+  const { t } = useTranslation();
+  const pick = useViewerStore((s) => s.modelLayout);
+  const setModelLayout = useViewerStore((s) => s.setModelLayout);
+  const width = useSplitWidth();
+  const shown = effectiveModelLayout(pick, width) !== '3d';
+  return (
+    <RailButton
+      id="plan"
+      labelKey={shown ? 'modelWorkspace.plan.hide' : 'modelWorkspace.plan.show'}
+      Icon={shown ? PanelLeftClose : PanelLeftOpen}
+      active={shown}
+      disabledReason={shown || splitFits(width) ? null : t('modelWorkspace.plan.noRoom')}
+      onClick={() => setModelLayout(shown ? '3d' : 'split')}
+    />
+  );
+}
+
+/** Opens the Change sets panel (#6232 D4); the tooltip names the set new edits land in. */
+function ChangeSetsButton() {
+  const { t } = useTranslation();
+  const open = useViewerStore((s) => s.sidebarActivePanel === 'changeSets');
+  const activeName = useViewerStore((s) => (s.activeChangeSetId ? s.changeSets.get(s.activeChangeSetId)?.name : undefined));
+  return (
+    <RailButton
+      id="change-sets"
+      labelKey="changeSets.rail.label"
+      Icon={GitBranch}
+      active={open}
+      detail={activeName ? t('changeSets.rail.active', { name: activeName }) : t('changeSets.rail.none')}
+      disabledReason={null}
+      onClick={() => useViewerStore.getState().toggleWorkspacePanel('changeSets', 'rail')}
+    />
+  );
+}
+
 interface RailButtonProps {
   id: string;
   labelKey: TranslationKey;
   Icon: ComponentType<{ className?: string }>;
-  shortcut: KeyCommandId;
+  shortcut?: KeyCommandId;
+  /** A second tooltip line that states the button's current state. */
+  detail?: string;
   active: boolean;
   disabledReason: string | null;
   onClick: () => void;
 }
 
-function RailButton({ id, labelKey, Icon, shortcut, active, disabledReason, onClick }: RailButtonProps) {
+function RailButton({ id, labelKey, Icon, shortcut, detail, active, disabledReason, onClick }: RailButtonProps) {
   const { t } = useTranslation();
   const label = t(labelKey);
   const disabled = disabledReason !== null;
@@ -131,7 +226,8 @@ function RailButton({ id, labelKey, Icon, shortcut, active, disabledReason, onCl
   const tip: ReactNode = (
     <>
       {label}
-      <span className="ml-1 text-muted-foreground">{t('modelWorkspace.tool.shortcutHint', { key: shortcutLabel(shortcut) })}</span>
+      {shortcut && <span className="ml-1 text-muted-foreground">{t('modelWorkspace.tool.shortcutHint', { key: shortcutLabel(shortcut) })}</span>}
+      {detail && <span className="block text-muted-foreground">{detail}</span>}
       {disabledReason && <span className="block text-muted-foreground">{disabledReason}</span>}
     </>
   );

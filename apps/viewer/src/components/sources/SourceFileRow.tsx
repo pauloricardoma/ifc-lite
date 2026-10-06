@@ -4,16 +4,25 @@
 
 import type { SourceFile } from '@ifc-lite/plugin-api';
 import type { DownloadedSourceFileStatus } from '@/lib/sources/persistence';
-import { FileBox, RefreshCw, Star } from 'lucide-react';
+import type { SourceDownloadState } from '@/lib/sources/downloadProgress';
+import { FileBox, Star } from 'lucide-react';
 import { useTranslation } from '@/i18n';
+import { SourceResourceDetails } from './SourceResourceDetails';
+import type { ComponentProps } from 'react';
+import { SourceDownloadStatus, SourceSyncIcon } from './SourceDownloadStatus';
 
 interface SourceFileRowProps {
   file: SourceFile;
+  details?: Omit<ComponentProps<typeof SourceResourceDetails>, 'file'>;
   selected: boolean;
   onToggle: () => void;
   loadedModelNames: readonly string[];
   syncingFile: boolean;
+  /** Download progress of the running Sync, once it has reached the download. */
+  syncState?: SourceDownloadState;
   onSyncLoadedFile: () => void;
+  /** This file's place in the running Load batch; absent when it is not in one. */
+  downloadState?: SourceDownloadState;
   downloadedStatus: DownloadedSourceFileStatus;
   favourited: boolean;
   onToggleFavourite: () => void;
@@ -21,11 +30,14 @@ interface SourceFileRowProps {
 
 export function SourceFileRow({
   file,
+  details,
   selected,
   onToggle,
   loadedModelNames,
   syncingFile,
+  syncState,
   onSyncLoadedFile,
+  downloadState,
   downloadedStatus,
   favourited,
   onToggleFavourite,
@@ -45,6 +57,7 @@ export function SourceFileRow({
           type="checkbox"
           className="mt-0.5 shrink-0"
           checked={selected}
+          disabled={Boolean(file.unavailableReason)}
           onChange={onToggle}
           aria-label={
             selected
@@ -56,6 +69,7 @@ export function SourceFileRow({
           type="button"
           className="flex min-w-0 flex-1 items-start gap-2 text-left"
           onClick={onToggle}
+          disabled={Boolean(file.unavailableReason)}
         >
           <FileBox
             className={`mt-0.5 h-4 w-4 shrink-0 ${
@@ -64,6 +78,7 @@ export function SourceFileRow({
           />
           <span className="min-w-0 flex-1">
             <span className="block min-w-0 flex-1 truncate">{file.name}</span>
+            {file.unavailableReason && <span className="block text-xs text-muted-foreground">{file.unavailableReason}</span>}
             <span
               className={`mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs ${
                 isUpdateAvailable ? 'text-orange-500/90 dark:text-orange-300' : 'text-muted-foreground'
@@ -80,6 +95,7 @@ export function SourceFileRow({
             </span>
           </span>
         </button>
+        {downloadState && <SourceDownloadStatus name={file.name} state={downloadState} />}
         <button
           type="button"
           className={`mt-0.5 shrink-0 rounded p-0.5 hover:bg-accent hover:text-foreground ${
@@ -111,14 +127,15 @@ export function SourceFileRow({
               type="button"
               className="rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground"
               aria-label={t('sources.sourceFileRow.syncAria', { name: file.name })}
-              disabled={syncingFile}
+              disabled={syncingFile || Boolean(file.unavailableReason)}
               onClick={onSyncLoadedFile}
             >
-              <RefreshCw className={`h-3.5 w-3.5 ${syncingFile ? 'animate-spin' : ''}`} />
+              <SourceSyncIcon name={file.name} syncing={syncingFile} state={syncState} />
             </button>
           </span>
         )}
       </div>
+      {details && <SourceResourceDetails {...details} file={file} />}
     </li>
   );
 }

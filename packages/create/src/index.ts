@@ -57,188 +57,8 @@ export type { StationEquationParams } from './ifc-creator-alignment-referents.js
 export type * from './landxml/source-types.js';
 export type * from './landxml/result-types.js';
 
-// In-store builders — emit elements into an existing parsed IfcDataStore
-// via a `StoreEditor` overlay (closes the merge-roundtrip gap from #592).
-export { addColumnToStore, type ColumnInStoreParams, type ColumnBuildResult } from './in-store/column.js';
-export { addWallToStore, type WallInStoreParams, type WallBuildResult } from './in-store/wall.js';
-export { addSlabToStore, type SlabInStoreParams, type SlabRectangleParams, type SlabPolygonParams, type SlabBuildResult } from './in-store/slab.js';
-export { addBeamToStore, type BeamInStoreParams, type BeamBuildResult } from './in-store/beam.js';
-export { addDoorToStore, type DoorInStoreParams, type DoorBuildResult } from './in-store/door.js';
-export { addWindowToStore, type WindowInStoreParams, type WindowBuildResult } from './in-store/window.js';
-export {
-  addOpeningToStore,
-  type OpeningInStoreParams,
-  type WallOpeningInStoreParams,
-  type SlabOpeningInStoreParams,
-  type OpeningBuildResult,
-} from './in-store/opening.js';
-export {
-  addHostedDoorToStore,
-  addHostedWindowToStore,
-  type HostedDoorInStoreParams,
-  type HostedWindowInStoreParams,
-  type HostedFillBuildResult,
-} from './in-store/hosted-fill.js';
-export {
-  addElementTypeToStore,
-  assignTypeInStore,
-  type AuthoringAnchor,
-  type ElementTypeInStoreParams,
-  type ElementTypeBuildResult,
-} from './in-store/element-type.js';
-export {
-  addMaterialToStore,
-  addMaterialLayerSetToStore,
-  addMaterialLayerSetUsageToStore,
-  assignMaterialInStore,
-  type MaterialInStoreParams,
-  type MaterialLayerInStoreParams,
-  type MaterialLayerSetInStoreParams,
-  type MaterialLayerSetBuildResult,
-  type MaterialLayerSetUsageInStoreParams,
-} from './in-store/material.js';
-export type { OneToManyResult } from './in-store/relate.js';
-export { resolveAuthoringAnchor, readRelatedLists, liveEntityType, liveEntityConforms } from './in-store/resolve-relations.js';
-export { addSpaceToStore, type SpaceInStoreParams, type SpaceRectangleParams, type SpacePolygonParams, type SpaceBuildResult } from './in-store/space.js';
-export {
-  addSpatialZonesToStore,
-  spatialZonesSupported,
-  type SpatialZoneInput,
-  type SpatialZoneInStoreParams,
-  type SpatialZoneBuildResult,
-  type SpatialZoneType,
-} from './in-store/spatial-zone.js';
-export {
-  applyStylesInStore,
-  collectLeafRepresentationItems,
-  type ApplyStyleOptions,
-  type ApplyStyleResult,
-  type StyleBatch,
-  type SurfaceStyleColor,
-} from './in-store/apply-style.js';
-export { addRoofToStore, type RoofInStoreParams, type RoofRectangleParams, type RoofPolygonParams, type RoofBuildResult } from './in-store/roof.js';
-export { addPlateToStore, type PlateInStoreParams, type PlateRectangleParams, type PlatePolygonParams, type PlateBuildResult } from './in-store/plate.js';
-export { addMemberToStore, type MemberInStoreParams, type MemberBuildResult } from './in-store/member.js';
-export {
-  addCostScheduleToStore, addCostItemToStore, addCostValueToStore, addCostQuantityToStore,
-  nestCostItemsInStore, assignCostItemsToScheduleInStore, assignObjectsToCostItemInStore,
-  attachCostValuesToItemInStore,
-  type CostAnchor, type ExistingRelatedList,
-} from './in-store/cost.js';
-export { removeCostEntityInStore, type CostRemovalReferrers } from './in-store/cost-removal.js';
-export { resolveSpatialAnchor } from './in-store/resolve-anchor.js';
-export { resolveHostAnchor } from './in-store/resolve-host.js';
-export { toNativeLength, fromNativeLength } from './in-store/anchor.js';
-export type { SpatialAnchor, HostAnchor, HostBounds, HostKind } from './in-store/anchor.js';
-export {
-  duplicateInStore,
-  type SourceAttributes,
-  type DuplicateInStoreOptions,
-  type DuplicateBuildResult,
-  type Vec3 as DuplicateVec3,
-} from './in-store/duplicate.js';
-export { resolveDuplicateSource } from './in-store/resolve-source.js';
-export {
-  detectEnclosedAreas,
-  type Vec2 as AutoSpaceVec2,
-  type Segment as AutoSpaceSegment,
-  type DetectedSpace,
-  type DetectOptions as AutoSpaceDetectOptions,
-} from './in-store/auto-space-detect.js';
-export {
-  extractWallSegmentsForStorey,
-  existingSpaceFootprintsByStorey,
-  type OverlayWallReader,
-  type WallExtractionResult,
-} from './in-store/extract-walls.js';
-export {
-  storeyPlanFrame,
-  toStoreyLocal,
-  fromStoreyLocal,
-  type StoreyPlanFrame,
-} from './in-store/storey-plan-frame.js';
-export {
-  generateSpacesFromWalls,
-  offsetRoomFootprint,
-  GENERATED_SPACE_OBJECTTYPE,
-  type GenerateSpacesOptions,
-  type GenerateSpacesResult,
-  type BoundaryMode,
-} from './in-store/generate-spaces.js';
-export {
-  generateSpaces,
-  listStoreys,
-  type GenerateSpacesAllOptions,
-  type GenerateSpacesAllResult,
-  type GenerateSpacesStoreyResult,
-  type StoreyInfo,
-} from './in-store/generate-spaces-all.js';
-// Structural analysis authoring (#5167 task S.1) — IfcStructuralAnalysisModel
-// and its members/connections/loads/relationships.
-export {
-  addStructuralAnalysisModelToStore,
-  type StructuralAnalysisModelInStoreParams,
-  type StructuralAnalysisModelBuildResult,
-  type StructuralAnalysisModelType,
-} from './in-store/structural-analysis-model.js';
-export {
-  addStructuralCurveMemberToStore,
-  type StructuralCurveMemberInStoreParams,
-  type StructuralCurveMemberBuildResult,
-  type StructuralCurveMemberType,
-} from './in-store/structural-curve-member.js';
-export {
-  addStructuralPointConnectionToStore,
-  type StructuralPointConnectionInStoreParams,
-  type StructuralPointConnectionBuildResult,
-  type StructuralBoundaryConditionParams,
-} from './in-store/structural-point-connection.js';
-export {
-  addStructuralLoadGroupToStore,
-  type StructuralLoadGroupInStoreParams,
-  type StructuralLoadGroupBuildResult,
-  type StructuralLoadGroupType,
-  type StructuralActionType,
-  type StructuralActionSourceType,
-} from './in-store/structural-load-group.js';
-export {
-  addStructuralPointActionToStore,
-  addStructuralLinearActionToStore,
-  type StructuralPointActionInStoreParams,
-  type StructuralPointActionBuildResult,
-  type StructuralLinearActionInStoreParams,
-  type StructuralLinearActionBuildResult,
-  type StructuralGlobalOrLocal,
-} from './in-store/structural-action.js';
-export {
-  connectStructuralMemberToConnectionInStore,
-  connectStructuralActivityToItemInStore,
-  assignToStructuralGroupInStore,
-} from './in-store/structural-relationships.js';
-
-export {
-  addDrawingMarkupToStore,
-  addMeasureMarkupToStore,
-  addPolygonAreaMarkupToStore,
-  addTextMarkupToStore,
-  addCloudMarkupToStore,
-  DRAWING_MARKUP_OBJECTTYPE,
-  DRAWING_MARKUP_PSET_NAME,
-  DRAWING_MARKUP_QSET_NAME,
-  type DrawingMarkupObjectType,
-  type MarkupAnchor,
-  type MarkupPoint2D,
-  type MeasureMarkupParams,
-  type MeasureMarkupResult,
-  type PolygonAreaMarkupParams,
-  type PolygonAreaMarkupResult,
-  type TextMarkupParams,
-  type TextMarkupResult,
-  type CloudMarkupParams,
-  type CloudMarkupResult,
-  type DrawingMarkupBatchInput,
-  type DrawingMarkupBatchResult,
-} from './in-store/drawing-markup.js';
+// In-store authoring API, kept separate from create-from-scratch types.
+export * from './in-store/index.js';
 
 export type {
   // Geometry primitives
@@ -341,7 +161,6 @@ export type {
   CreatedEntity,
   CreateResult,
 } from './types.js';
-
 // Cost / 5D authoring (IfcCostSchedule, IfcCostItem, IfcCostValue)
 export type {
   CostArithmeticOperator,
@@ -357,3 +176,31 @@ export type {
   CostValueParams,
   SIUnitParams,
 } from './types-cost.js';
+
+export { copyBatchInStore, copySourcesInStore, copiedProductsInStore } from './in-store/copy-batch.js';
+export { arrayCopyTransforms, type CopyArrayParams } from './in-store/copy-array.js';
+export type { CopyTransform } from './in-store/copy-product.js';
+
+export { setElementSizeInStore } from './in-store/element-size-edit.js';
+export { resizeWallInStore } from './in-store/wall-size-edit.js';
+
+export { transformElementsInStore, type ElementTransformInput, type StoreyTransformOp } from './in-store/element-transform-edit.js';
+export { splitElementsInStore, type ElementSplitRequest, type ElementSplitOptions } from './in-store/element-split.js';
+
+export { trimExtendElementInStore, type ElementTrimExtendParams } from './in-store/element-trim-extend.js';
+
+export { RoomLayoutCache } from './in-store/room-layout-cache.js';
+export { readFaces, applyLayoutOp, filterRoomFaces, type LayoutOp, type RoomPlateFactory } from './in-store/room-layout-core.js';
+export { roomOutline, roomCandidatesFromFaces, occupancyTest, type RoomCandidate, type RoomBoundary } from './in-store/room-candidates.js';
+export { createRoomsInStore, updateRoomOutlineInStore, syncRoomLayoutInStore } from './in-store/room-store.js';
+export { storeyFootprintFaceInStore, type RoomWallRect } from './in-store/room-footprint-native.js';
+export { planRoomCreation } from './in-store/room-creation-plan.js';
+
+export { wallRectsFromMeshes, roomFrameToModelWorld, roomFramePlanOffsets } from './in-store/room-wall-rects.js';
+export { floorToFloorHeight } from './in-store/room-floor-height.js';
+export { effectiveStoreyElevation } from './in-store/room-storey-elevation.js';
+export { effectiveStoreyIds } from './in-store/edit/effective-storeys.js';
+export { spaceMeshTriangles } from './in-store/room-space-meshes.js';
+
+export { ALIGN_MODES, alignsAlongU, planBoxOf, pickBox, edgeOf, alignShift, shiftBox, alignMoves, type AlignMode, type PlanBox } from './in-store/align-boxes.js';
+export { alignmentStoreyInStore, alignElementsInStore, type ElementAlignParams } from './in-store/element-align.js';

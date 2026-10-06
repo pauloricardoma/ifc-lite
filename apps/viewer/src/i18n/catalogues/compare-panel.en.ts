@@ -26,6 +26,21 @@ import type { TranslationValue } from '../types';
  * not UI copy.
  */
 export const comparePanelEn = {
+  'comparePanel.setup.save': 'Save comparison setup',
+  'comparePanel.setup.open': 'Open comparison setup',
+  'comparePanel.setup.opened': 'Setup opened. Click Run comparison to execute it.',
+  'comparePanel.saved.title': 'Saved comparisons',
+  'comparePanel.saved.name': 'Comparison name',
+  'comparePanel.saved.save': 'Save comparison',
+  'comparePanel.saved.pick': 'Saved comparison',
+  'comparePanel.saved.placeholder': 'Choose a saved comparison ({count})',
+  'comparePanel.saved.renameName': 'Rename saved comparison',
+  'comparePanel.saved.rename': 'Rename',
+  'comparePanel.saved.delete': 'Delete saved comparison',
+  'comparePanel.saved.storageFailed': 'Comparison changes are in memory, but browser storage is unavailable or full. Download the report before closing this tab.',
+  'comparePanel.saved.hint': '{count} report rows saved. Preview shows the first 100; downloads and Documentation use the saved report. Historical rows do not select current 3D elements.',
+  'comparePanel.saved.change': 'Change',
+
   // ComparePanel
   'comparePanel.panel.title': 'Compare models',
   'comparePanel.panel.rerunTitle': 'Re-run the comparison',
@@ -36,6 +51,13 @@ export const comparePanelEn = {
   'comparePanel.panel.backToChangesTitle': 'Back to changes',
   'comparePanel.panel.topicFor': 'Topic for',
   'comparePanel.panel.countUnchanged': 'Unchanged',
+  // Shared result view (#6925): source, population and coverage lines.
+  'comparePanel.result.source': 'Comparison · {scope} scope',
+  'comparePanel.result.population': { one: '{countDisplay} element compared', other: '{countDisplay} elements compared' },
+  // "differences", not "changed": the Changed badge counts modified elements only.
+  'comparePanel.result.counts': { one: '{countDisplay} difference · {unchanged} unchanged', other: '{countDisplay} differences · {unchanged} unchanged' },
+  'comparePanel.result.noShapeChanges': 'Shape changes are not detected (no mesh fingerprints); placement moves and data are compared.',
+  'comparePanel.result.noGeometryChanges': 'Geometry changes are not detected: a model has no geometry fingerprints.',
 
   // Shared across CompareMatchGroups / CompareResultsList / CompareSuggestions
   'comparePanel.moreNotShown': '+{count} more not shown',

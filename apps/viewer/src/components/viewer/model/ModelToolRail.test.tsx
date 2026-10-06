@@ -4,7 +4,7 @@
 
 /**
  * The Model tool rail (charter #6232, M2.1): only in the workspace; Wall
- * starts `wall.place` without reopening the Add Element panel; a tool that
+ * starts `wall.place`; a tool that
  * cannot start is disabled with its reason; Leave leaves.
  */
 
@@ -19,7 +19,6 @@ import { cleanup, click, render } from '@/test/render.js';
 import { MODEL_ID, STOREY, seedModelingSession } from '@/test/modeling-session-fixture';
 import '@/lib/commands/modeling/builtin';
 import { launchModelCommand } from '@/lib/commands/modeling/keys-workspace';
-import { selectAddElementPanelOpen } from '../add-element-wall-command';
 import { TOOL_SURFACE_COMMANDS } from '../surface-commands-tools';
 import { ModelToolRail } from './ModelToolRail';
 
@@ -33,7 +32,7 @@ function mount(): HTMLElement {
 
 beforeEach(async () => {
   await seedModelingSession();
-  useViewerStore.setState({ editEnabled: false, selectedEntityId: null, addElementDrawsWall: false });
+  useViewerStore.setState({ editEnabled: false, selectedEntityId: null });
 });
 afterEach(() => {
   cleanup();
@@ -41,40 +40,65 @@ afterEach(() => {
 });
 
 describe('Model tool rail (#6232 M2.1)', () => {
-  it('shows only while the workspace is open, with Select, the build tools, Split and Leave', () => {
+  it('shows only while the workspace is open, with Select, the build tools, Split, Array, Move, Rotate, Trim/Extend, Change sets (D4), the plan toggle (M2.4) and Leave', () => {
     const ui = mount();
     assert.equal(ui.querySelector('[data-model-tool-rail]'), null, 'no rail while viewing');
     act(() => { useViewerStore.getState().enterModelWorkspace(); });
     const ids = [...ui.querySelectorAll('[data-rail-tool]')].map((b) => b.getAttribute('data-rail-tool'));
-    assert.deepEqual(ids, ['select', 'wall.place', 'slab.place', 'column.place', 'beam.place', 'element.split', 'leave']);
+    assert.deepEqual(ids, ['select', 'wall.place', 'slab.place', 'column.place', 'beam.place', 'room.place', 'curtainwall.place', 'grid.place', 'opening.place', 'door.place', 'window.place', 'element.split', 'element.array', 'element.move', 'element.rotate', 'split.multi', 'stair.place', 'railing.place', 'element.pushPull', 'element.align', 'element.trimExtend', 'change-sets', 'plan', 'leave']);
     assert.equal(tool(ui, 'select')?.getAttribute('aria-pressed'), 'true');
   });
 
-  it('Wall starts wall.place on the session storey, and the Add Element panel stays shut', () => {
-    // A stale panel launch must not make the rail's wall reopen the panel.
-    useViewerStore.setState({ addElementDrawsWall: true });
+  it('#6232 D4 Change sets opens and closes the Change sets panel', () => {
+    const ui = mount();
+    act(() => { useViewerStore.getState().enterModelWorkspace(); });
+    act(() => click(tool(ui, 'change-sets')!));
+    assert.equal(useViewerStore.getState().sidebarActivePanel, 'changeSets');
+    assert.equal(tool(ui, 'change-sets')?.getAttribute('aria-pressed'), 'true');
+    act(() => click(tool(ui, 'change-sets')!));
+    assert.notEqual(useViewerStore.getState().sidebarActivePanel, 'changeSets');
+  });
+
+  it('Wall starts wall.place on the session storey', () => {
     const ui = mount();
     act(() => { useViewerStore.getState().enterModelWorkspace(); });
     act(() => click(tool(ui, 'wall.place')!));
     const s = useViewerStore.getState();
     assert.equal(s.session?.activeCommandId, 'wall.place');
     assert.equal(s.session?.storeyId, STOREY);
-    assert.equal(selectAddElementPanelOpen(s), false);
     assert.equal(tool(ui, 'wall.place')?.getAttribute('aria-pressed'), 'true');
     act(() => click(tool(ui, 'select')!));
     assert.equal(useViewerStore.getState().session?.activeCommandId ?? null, null, 'Select ends the command');
   });
 
-  it('Split is disabled with its reason until something is selected', () => {
+  it('Split and Array are disabled with their reason until something is selected', () => {
     const ui = mount();
     act(() => { useViewerStore.getState().enterModelWorkspace(); });
-    assert.equal(tool(ui, 'element.split')?.disabled, true);
-    assert.ok(ui.querySelector('[data-rail-disabled="element.split"]'), 'a live tooltip trigger wraps the disabled button');
+    for (const id of ['element.split', 'element.array']) {
+      assert.equal(tool(ui, id)?.disabled, true, id);
+      assert.ok(ui.querySelector(`[data-rail-disabled="${id}"]`), `${id}: a live tooltip trigger wraps the disabled button`);
+    }
     act(() => {
       const s = useViewerStore.getState();
       s.setSelectedEntityId(toGlobalIdFromModels(s.models, MODEL_ID, STOREY));
     });
     assert.equal(tool(ui, 'element.split')?.disabled, false);
+    assert.equal(tool(ui, 'element.array')?.disabled, false);
+  });
+
+  it('Move and Rotate are disabled until something is selected, then start on it (#6232 C2)', () => {
+    const ui = mount();
+    act(() => { useViewerStore.getState().enterModelWorkspace(); });
+    for (const id of ['element.move', 'element.rotate']) assert.equal(tool(ui, id)?.disabled, true, id);
+    act(() => {
+      const s = useViewerStore.getState();
+      s.setSelectedEntityId(toGlobalIdFromModels(s.models, MODEL_ID, STOREY));
+    });
+    for (const id of ['element.move', 'element.rotate']) {
+      assert.equal(tool(ui, id)?.disabled, false, id);
+      act(() => click(tool(ui, id)!));
+      assert.equal(useViewerStore.getState().session?.activeCommandId, id);
+    }
   });
 
   it('with no storey to draw on, every build tool is disabled and refuses to start', () => {
@@ -107,6 +131,17 @@ describe('Model tool rail (#6232 M2.1)', () => {
     ['slab.place', 'tool:slab', 'model.slab'],
     ['column.place', 'tool:column', 'model.column'],
     ['beam.place', 'tool:beam', 'model.beam'],
+    // #6232 D3: curtain wall and grid.
+    ['curtainwall.place', 'tool:curtain-wall', 'model.curtainWall'],
+    ['grid.place', 'tool:grid', 'model.grid'],
+    // #6232 A1: the hosted tools.
+    ['opening.place', 'tool:opening', 'model.opening'],
+    ['door.place', 'tool:door', 'model.door'],
+    ['window.place', 'tool:window', 'model.window'],
+    // #6232 C5: one cut line through everything.
+    ['split.multi', 'tool:split-multi', 'model.splitMulti'],
+    // #6232 C4: Align picks its own reference and targets, so it needs only a plane.
+    ['element.align', 'tool:align', 'model.align'],
   ] as const) {
     it(`${id}: the rail button and the palette row start it on the session storey`, () => {
       const ui = mount();
@@ -125,6 +160,27 @@ describe('Model tool rail (#6232 M2.1)', () => {
       assert.equal(useViewerStore.getState().session?.activeCommandId, id);
     });
   }
+
+  it('Push / Pull is disabled with its reason until something is selected, then the rail button, key and palette row start it (#6232 C4)', () => {
+    const ui = mount();
+    act(() => { useViewerStore.getState().enterModelWorkspace(); });
+    assert.equal(tool(ui, 'element.pushPull')?.disabled, true);
+    assert.ok(ui.querySelector('[data-rail-disabled="element.pushPull"]'), 'a live tooltip trigger wraps the disabled button');
+    act(() => {
+      const s = useViewerStore.getState();
+      s.setSelectedEntityId(toGlobalIdFromModels(s.models, MODEL_ID, STOREY));
+    });
+    assert.equal(tool(ui, 'element.pushPull')?.disabled, false);
+    act(() => click(tool(ui, 'element.pushPull')!));
+    assert.equal(useViewerStore.getState().session?.activeCommandId, 'element.pushPull');
+    act(() => { useViewerStore.getState().endCommand('cancel'); });
+
+    const row = TOOL_SURFACE_COMMANDS.find((command) => command.id === 'tool:push-pull') as { shortcut?: string; run: () => void } | undefined;
+    assert.equal(row?.shortcut, 'model.pushPull', 'the palette names the rail key');
+    useViewerStore.setState({ selectedEntity: { modelId: MODEL_ID, expressId: STOREY } });
+    act(() => { row!.run(); });
+    assert.equal(useViewerStore.getState().session?.activeCommandId, 'element.pushPull');
+  });
 
   it('Leave closes the workspace, and the rail with it', () => {
     const ui = mount();

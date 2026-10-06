@@ -15,14 +15,10 @@
  *   - session lifecycle (`startCollab` / `stopCollab`),
  *   - status + presence subscriptions feeding the store.
  *
- * What it deliberately stubs for later milestones (TODOs inline):
- *   - `seedFromStep` model seeding into the Y.Doc (plan §4.2, M1),
- *   - mutation binding + remote→local apply (plan §7.5, M2),
- *   - presence overlay mounting in the viewport (plan §7.4 — done at mount
- *     time in the viewport component, not here).
  */
 
 import type { StateCreator } from 'zustand';
+import { attachRoomSpatialContextMirror } from '@/lib/collab/room-spatial-context-mirror';
 // IMPORTANT: only *type* imports from '@ifc-lite/collab' at module scope. The
 // collab runtime (yjs, automerge, providers) is heavy and must stay out of the
 // main bundle so the feature ships dark — it is lazy-imported inside
@@ -263,6 +259,7 @@ export interface CollabSlice {
     propName: string,
     value: unknown,
     valueType: PropertyValueType,
+    dataType?: string,
   ) => void;
   mirrorPropertyDelete: (
     modelId: string,
@@ -509,7 +506,7 @@ let remoteApplyTeardown: (() => void) | null = null;
 // Teardown for the recipient's live re-reconstruction observer.
 let recipientLiveTeardown: (() => void) | null = null;
 
-export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> = (set, get) => ({
+export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> = (set, get, api) => ({
   // Initial state
   collabSession: null,
   collabStatus: 'disconnected',
@@ -854,7 +851,7 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
       console.warn('[collab] rejected remote write:', rejected);
       set({ collabGeometryNotice: `A collaborative edit could not be applied: ${rejected}` });
     };
-    remoteApplyTeardown = attachRemoteApply(docApi!, session, (path) => roomEntityTargetForPath(get(), path), {
+    const detachRemoteApply = attachRemoteApply(docApi!, session, (path) => roomEntityTargetForPath(get(), path), {
       // Consulted by the bridge's single tombstone guard before any write (#5187).
       isLocallyDeleted: (modelId, entityId) => roomMutationViewFor(get(), modelId)?.isDeleted(entityId) ?? false,
       onRejectedWrite: rejectRemoteWrite,
@@ -864,10 +861,10 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
           rejectRemoteWrite, sourceExpressId))
           set((s) => ({ mutationVersion: s.mutationVersion + 1 }));
       },
-      onProperty: (modelId, entityId, pset, prop, value, type) => {
+      onProperty: (modelId, entityId, pset, prop, value, type, dataType) => {
         const view = roomMutationViewFor(get(), modelId);
         if (!view) return;
-        view.setProperty(entityId, pset, prop, value, type);
+        view.setProperty(entityId, pset, prop, value, type, undefined, false, dataType);
         get().invalidateHistoryForEntity(modelId, entityId); // clear stale history for this entity (#5223)
         set((s) => ({ mutationVersion: s.mutationVersion + 1 }));
       },
@@ -927,6 +924,9 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
         set((s) => ({ mutationVersion: s.mutationVersion + 1 }));
       },
     });
+
+    const detachSpatial = attachRoomSpatialContextMirror(api, session);
+    remoteApplyTeardown = () => { detachRemoteApply(); detachSpatial(); };
 
     // Annotation (markup) sync: reflect peers' pins into the local slice, and
     // seed our existing local pins into the room ("share existing + new").
@@ -1084,11 +1084,11 @@ export const createCollabSlice: StateCreator<ViewerState, [], [], CollabSlice> =
   // real path of the SHARED model and the mirror writes it onto an unrelated
   // peer's entity. Gating in the callee (not at the call site) means a new
   // caller cannot forget.
-  mirrorPropertyEdit: (modelId, entityId, psetName, propName, value, valueType) => {
+  mirrorPropertyEdit: (modelId, entityId, psetName, propName, value, valueType, dataType) => {
     const session = get().collabSession;
     const store = roomStoreFor(get(), modelId);
     if (!session || !store || !docApi) return;
-    mirrorProperty(docApi, session, store, entityId, psetName, propName, value, valueType);
+    mirrorProperty(docApi, session, store, entityId, psetName, propName, value, valueType, dataType);
   },
 
   mirrorPropertyDelete: (modelId, entityId, psetName, propName) => {

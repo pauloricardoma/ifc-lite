@@ -67,6 +67,7 @@ import { listTeardown } from './slices/listSlice.js';
 import { pinboardTeardown } from './slices/pinboardSlice.teardown.js';
 import { lensTeardown } from './slices/lensSlice.js';
 import { compareTeardown } from './slices/compareSlice.js';
+import { compareRunsTeardown } from './slices/compareRunsSlice.js';
 import { scriptTeardown } from './slices/scriptSlice.teardown.js';
 import { chatTeardown } from './slices/chatSlice.teardown.js';
 import { cesiumTeardown } from './slices/cesiumSlice.teardown.js';
@@ -74,7 +75,6 @@ import { scheduleTeardown } from './slices/scheduleSlice.teardown.js';
 import { playbackTeardown } from './slices/playbackSlice.js';
 import { searchTeardown } from './slices/searchSlice.teardown.js';
 import { annotationsTeardown } from './slices/annotationsSlice.teardown.js';
-import { addElementTeardown } from './slices/addElementSlice.teardown.js';
 import { authoringSessionTeardown } from './slices/authoringSessionSlice.js';
 import { authoringDefaultsTeardown } from './slices/authoringDefaultsSlice.js';
 import { modelPlacementTeardown } from './slices/modelPlacementSlice.js';
@@ -111,6 +111,7 @@ export const viewerTeardownRegistry: readonly AnySliceTeardown[] = createTeardow
   pinboardTeardown,
   lensTeardown,
   compareTeardown,
+  compareRunsTeardown,
   scriptTeardown,
   chatTeardown,
   cesiumTeardown,
@@ -118,7 +119,6 @@ export const viewerTeardownRegistry: readonly AnySliceTeardown[] = createTeardow
   playbackTeardown,
   searchTeardown,
   annotationsTeardown,
-  addElementTeardown,
   authoringSessionTeardown,
   authoringDefaultsTeardown,
   pointCloudTeardown,

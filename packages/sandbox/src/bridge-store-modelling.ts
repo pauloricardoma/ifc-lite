@@ -91,6 +91,33 @@ const LAYER = '{ Material?: number; LayerThickness: number; IsVentilated?: boole
 /** Openings, wall-hosted doors/windows, type objects and materials. */
 export function buildStoreModellingMethods(): MethodSchema[] {
   return [
+    {
+      name: 'alignElements',
+      doc: 'Align real native mesh edges or centres in one storey workplane. Fresh geometry and an atomic transaction preserve hosted cuts, joined neighbours and one Undo.',
+      args: ['string', 'number', 'dump', 'string'],
+      paramNames: ['modelId', 'reference', 'targets', 'mode'],
+      tsParamTypes: ['string', 'number', 'readonly number[]', 'BimCreate.AlignMode'],
+      tsReturn: `Promise<${ENTITY_REF}[]>`,
+      returns: 'value',
+      call: (sdk, args) => sdk.store.alignElements(args[0] as string, requireId('alignElements', 'reference', args[1]), args[2] as number[], args[3] as Parameters<typeof sdk.store.alignElements>[3]),
+    },
+    {
+      name: 'joinWalls',
+      doc: 'Join two straight walls in the same placement frame through IfcRelConnectsPathElements. Uses the Model workspace core, preserving readable hosted openings and refusing a cut stranded by a joined end face.',
+      args: ['string', 'number', 'number', 'dump'],
+      paramNames: ['modelId', 'aExpressId', 'bExpressId', 'options?'],
+      tsParamTypes: ['string', 'number', 'number', 'BimCreate.WallJoinApplyOptions'],
+      tsReturn: ENTITY_REF,
+      returns: 'value',
+      call: (sdk, args) => {
+        const a = requireId('joinWalls', 'aExpressId', args[1]);
+        const b = requireId('joinWalls', 'bExpressId', args[2]);
+        if (args[3] !== undefined && (!args[3] || typeof args[3] !== 'object' || Array.isArray(args[3]))) {
+          throw new Error('bim.store.joinWalls: options must be an object');
+        }
+        return sdk.store.joinWalls(args[0] as string, a, b, args[3] as Parameters<typeof sdk.store.joinWalls>[3]);
+      },
+    },
     hostedMethod(
       'addOpening',
       'Cut an IfcOpeningElement (IfcRelVoidsElement) into an existing IfcWall or IfcSlab. Metres, in the host placement frame.',

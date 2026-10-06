@@ -20,7 +20,7 @@ import type { StateCreator, StoreApi } from 'zustand';
 import type { ViewerState } from '../index.js';
 import { defineSliceTeardown } from '../teardown.js';
 import { fromGlobalIdFromModels } from '../globalId.js';
-import { selectEffectiveStoreyId } from '@/components/viewer/add-element-storeys';
+import { selectEffectiveStoreyId } from '@/lib/commands/modeling/effective-storeys';
 import { getModelingCommand, resolveWorkplane } from '@/lib/commands/modeling/registry';
 import {
   beginCommandRuntime,
@@ -31,7 +31,7 @@ import {
 import type { CommandId, SnapProfileId, WorkplaneSpec } from '@/lib/commands/modeling/types';
 import {
   loadModelLayout, persistModelLayout, restoreSidebar, showModelInspector,
-  type ModelLayout, type SidebarRestore,
+  type ModelLayout, type ModelLayoutPick, type SidebarRestore,
 } from './authoringSessionSidebar.js';
 
 export type WorkspaceMode = 'view' | 'model';
@@ -58,8 +58,8 @@ export interface EnterModelWorkspaceOptions {
 export interface AuthoringSessionSlice {
   workspaceMode: WorkspaceMode;
   session: AuthoringSession | null;
-  /** Plan ‖ 3D split of the Model workspace's viewport (persisted per browser). */
-  modelLayout: ModelLayout;
+  /** Plan ‖ 3D split of the Model workspace's viewport as the user picked it (persisted per browser). */
+  modelLayout: ModelLayoutPick;
   setModelLayout: (layout: ModelLayout) => void;
   /** False when refused (collab role, no editable model). */
   enterModelWorkspace: (opts?: EnterModelWorkspaceOptions) => boolean;
@@ -75,7 +75,7 @@ type Set = StoreApi<ViewerState>['setState'];
 type Get = () => ViewerState;
 
 function resolveModelId(s: ViewerState, preferred: string | undefined): string | null {
-  const candidates = [preferred, s.addElementModelId ?? undefined, s.activeModelId ?? undefined, s.models.keys().next().value];
+  const candidates = [preferred, s.activeModelId ?? undefined, s.models.keys().next().value];
   return candidates.find((id): id is string => id !== undefined && s.models.get(id)?.ifcDataStore != null) ?? null;
 }
 
@@ -106,9 +106,11 @@ function launch(set: Set, get: Get, api: StoreApi<ViewerState>, id: CommandId): 
   patchSession(set, { activeCommandId: id, phase: 'idle' });
   const built = session.workplane ? resolveWorkplane(get(), session.modelId, session.workplane) : null;
   if (built && 'refused' in built) console.warn(`[modeling] No workplane: ${built.refused}`);
+  const ctx = { get, modelId: session.modelId, storeyId: session.storeyId, workplane: built && !('refused' in built) ? built : null };
+  if (command.workplane) ctx.workplane = command.workplane(ctx);
   beginCommandRuntime(
     command,
-    { get, modelId: session.modelId, storeyId: session.storeyId, workplane: built && !('refused' in built) ? built : null },
+    ctx,
     api,
     {
       onPhase: (phase) => { if (get().session?.phase !== phase) patchSession(set, { phase }); },
@@ -163,8 +165,8 @@ export const createAuthoringSessionSlice: StateCreator<ViewerState, [], [], Auth
       const modelId = resolveModelId(s, opts.modelId ?? selectedRef(s)?.modelId);
       const store = modelId ? s.models.get(modelId)?.ifcDataStore : null;
       if (!modelId || !store) return false;
-      // Storey: explicit → the selection's → the Add Element panel's → the first.
-      const preferred = opts.storeyId ?? selectionStorey(s, modelId) ?? s.addElementStoreyId;
+      // Storey: explicit → the selection's → the first.
+      const preferred = opts.storeyId ?? selectionStorey(s, modelId) ?? null;
       const storeyId = selectEffectiveStoreyId(store, s.mutationViews.get(modelId), preferred);
       // Re-entering on another model keeps the panel the FIRST entry took over.
       const sidebarRestore = s.session ? s.session.sidebarRestore : showModelInspector(s);

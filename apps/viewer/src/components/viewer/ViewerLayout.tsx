@@ -11,8 +11,6 @@ import { styleInterpolatedValues } from '@/i18n/richInterpolate';
 import { MobileToolbar } from './MobileToolbar';
 import { RibbonToolbar } from './ribbon/RibbonToolbar';
 import { HierarchyPanel } from './HierarchyPanel';
-import { AddElementPanel } from './AddElementPanel';
-import { selectAddElementPanelOpen } from './add-element-wall-command';
 import { StatusBar } from './StatusBar';
 import { ViewportContainer } from './ViewportContainer';
 import { ModelToolRail } from './model/ModelToolRail';
@@ -46,6 +44,7 @@ import { LEFT_PANEL_DEFAULT_SIZE } from '@/store/layoutReset';
 import { useOverlayCompositor } from './schedule/useOverlayCompositor';
 import { CommandPalette } from './CommandPalette';
 import { SearchModal } from './SearchModal';
+import { FlowStartupPrompt } from './flow/FlowStartupPrompt';
 import { TourHost } from '@/components/tours/TourHost';
 import { SidebarDock } from './sidebar/SidebarDock';
 import { FloatingPanelHost } from './dock/FloatingPanelHost';
@@ -159,9 +158,6 @@ export function ViewerLayout() {
   const rightPanelCollapsed = useViewerStore((s) => s.rightPanelCollapsed);
   const setLeftPanelCollapsed = useViewerStore((s) => s.setLeftPanelCollapsed);
   const setRightPanelCollapsed = useViewerStore((s) => s.setRightPanelCollapsed);
-  // The Add Element sheet also stays up while its wall type's command draws.
-  const activeTool = useViewerStore((s) => (selectAddElementPanelOpen(s) ? 'addElement' : s.activeTool));
-  const setActiveTool = useViewerStore((s) => s.setActiveTool);
   // Which bottom panel the flags say is open (table precedence), and whether
   // it is actually docked here rather than floating / popped out.
   const bottomPanel = activeBottomPanel(useBottomPanelFlags());
@@ -213,10 +209,9 @@ export function ViewerLayout() {
 
   const mobileSheet = useMemo(() => resolveMobileSheet({
     hasAnalysisExtension: activeAnalysisExtension !== null && activeAnalysisExtension !== undefined,
-    activeTool,
     bottomPanel,
     sidebarActivePanel,
-  }), [activeAnalysisExtension, activeTool, bottomPanel, sidebarActivePanel]);
+  }), [activeAnalysisExtension, bottomPanel, sidebarActivePanel]);
 
   // Panel ref for programmatic collapse/expand (command palette, keyboard
   // shortcuts). The right region is the unified sidebar (#1208), which owns its
@@ -250,7 +245,6 @@ export function ViewerLayout() {
 
   useThemeDocumentClass();
   const safeMode = isSafeMode();
-
   return (
     <TooltipProvider delayDuration={300}>
       <div className="flex flex-col h-screen h-[100dvh] w-screen overflow-hidden bg-background text-foreground">
@@ -275,13 +269,13 @@ export function ViewerLayout() {
         <CommandPalette open={commandPaletteOpen} onOpenChange={setCommandPaletteOpen} />
         <SearchModal />
         <TourHost />
+        <FlowStartupPrompt />
         {/* Trigger-less: this instance exists so the entity context menu's
             "Export anonymized…" (which only sets `anonymizedExportRequested`,
             no trigger of its own) has a mounted dialog regardless of whether the export toolbar
             dropdown is open. Same host pattern as `FlavorDialog` in
             `StatusBar.tsx`; `toolbar/export-commands.ts` owns the `trigger` one. */}
         <AnonymizedExportDialog surface="context_menu" />
-
         {/* The compact mobile controls and the desktop ribbon share command homes. */}
         {isMobile
           ? <MobileToolbar />
@@ -337,11 +331,11 @@ export function ViewerLayout() {
                         // (tabs, maximize, close), just placed here instead of
                         // spanning the strip below.
                         <PanelGroup orientation="horizontal" className="h-full w-full">
-                          <Panel id="viewport-3d-panel" defaultSize={60} minSize={20}>
+                          <Panel id="viewport-3d-panel" defaultSize="60%" minSize="20%">
                             <ViewportContainer />
                           </Panel>
                           <PanelResizeHandle className="w-1.5 bg-border hover:bg-primary/50 active:bg-primary/70 transition-colors cursor-col-resize" />
-                          <Panel id="drawing-side-panel" defaultSize={40} minSize={20}>
+                          <Panel id="drawing-side-panel" defaultSize="40%" minSize="20%">
                             <BottomStrip
                               dockedPanel={dockedBottomPanel}
                               analysisExtension={null}
@@ -413,21 +407,18 @@ export function ViewerLayout() {
             )}
 
             {/* Mobile Bottom Sheet — whichever single panel is open.
-                Analysis extensions and the Add Element tool are not registry
-                panels, so they keep their own branches; everything else routes
+                Analysis extensions are not registry
+                panels, so they keep their own branch; everything else routes
                 through `renderPanelBody`, the same map the sidebar, the
                 floating host and the pop-out windows render from. */}
             {!rightPanelCollapsed && (
               <MobileBottomSheet
-                title={mobileSheet.kind === 'extension' ? (activeAnalysisExtension?.label ?? t('shellChrome.layout.analysisFallback')) : mobileSheet.kind === 'addElement' ? t('shellChrome.layout.addElementLabel') : t(getPanelDef(mobileSheet.id)?.titleKey ?? 'properties.panel.title')}
+                title={mobileSheet.kind === 'extension' ? (activeAnalysisExtension?.label ?? t('shellChrome.layout.analysisFallback')) : t(getPanelDef(mobileSheet.id)?.titleKey ?? 'properties.panel.title')}
                 bottomInset={bottomViewportInset}
                 onClose={() => {
                   setRightPanelCollapsed(true);
-                  // Close ONLY what the sheet is showing. The close chain used to
-                  // close the underlying sidebar panel too, so dismissing Add
-                  // Element took an unrelated panel down with it.
+                  // Close ONLY what the sheet is showing.
                   if (mobileSheet.kind === 'extension') closeActiveAnalysisExtension();
-                  else if (mobileSheet.kind === 'addElement') setActiveTool('select');
                   // Clears the dock flag AND float/pop-out channels, so closing
                   // the sheet can't leave the panel open where the phone has no room to show it.
                   else closePanel(mobileSheet.id);
@@ -436,8 +427,6 @@ export function ViewerLayout() {
                 {mobileSheet.kind === 'extension' ? (
                   (activeBottomAnalysisExtension ?? activeRightAnalysisExtension)
                     ?.renderPanel({ onClose: closeActiveAnalysisExtension })
-                ) : mobileSheet.kind === 'addElement' ? (
-                  <AddElementPanel onClose={() => setActiveTool('select')} />
                 ) : (
                   renderPanelBody(mobileSheet.id, () => closePanel(mobileSheet.id))
                 )}

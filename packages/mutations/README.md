@@ -60,6 +60,29 @@ Edits accumulate in the same overlay used by `setProperty` / `setAttribute`
 and materialise the next time you call
 `StepExporter.export({ applyMutations: true })`.
 
+For a query that needs to revisit source entities whose attributes changed,
+`view.getAttributeOverrideEntityIds()` returns a snapshot of the current named,
+positional and type override IDs, including edits made without history records.
+It is a candidate set: use effective entity reads to check deletion, the live
+type and attribute layout. Created entities are enumerated separately by
+`iterateEffectiveEntityIds`.
+
+### Compound undo records
+
+`recordCompoundMutation(view, draft => ...)` runs a synchronous edit atomically
+and records the complete earlier overlay as one operation. Write through the
+supplied draft. This supports commands that replace profiles or axes and forget
+entities created earlier in the session, as well as commands that create graphs.
+
+`undoRecordedMutationOperations(view, count, revertRaw)` restores the last
+`count` operations atomically. Recorded compounds restore their whole earlier
+graph and journal; `revertRaw(draft, mutation)` handles other journal entries.
+The result counts mutation records reverted. A thrown inverse leaves both IFC
+state and compound history unchanged. Both edit and inverse callbacks must be synchronous.
+Retained history stores only changed overlay entries and removed journal records;
+unchanged graph and journal prefixes are not copied per operation. Allocated express IDs remain monotonic.
+This in-memory history belongs to the live view and does not survive serialization.
+
 ### Whole numbers on REAL-typed attributes
 
 ISO 10303-21 requires a REAL-typed attribute (`IfcLengthMeasure` coordinates,

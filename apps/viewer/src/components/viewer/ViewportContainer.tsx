@@ -8,12 +8,14 @@ import { modelIndices } from '@/lib/model-placement/model-indices';
 import { useMemo, useRef, useState, useCallback, useEffect, useSyncExternalStore } from 'react';
 import { createPortal } from 'react-dom';
 import { useLevelDisplayEffect } from '@/hooks/useLevelDisplayEffect';
+import { useAuthoredGridOverlay } from './useAuthoredGridOverlay';
 import { ingestDxfFiles, splitDxfFiles } from '@/hooks/ingest/dxfIngest';
 import { Viewport } from './Viewport';
 import { useWindowFileDrop } from './useWindowFileDrop';
 import { ViewportOverlays } from './ViewportOverlays';
 import { WebGpuTroubleshootingDetails, webGpuBannerBlurb } from './WebGpuTroubleshooting';
 import { ViewportWelcomeCard } from './ViewportWelcomeCard';
+import { useReloadResume } from '@/hooks/useReloadResume';
 import { ViewportLoadErrorCard } from './ViewportLoadErrorCard';
 import { WelcomeFooterChips } from './WelcomeFooterChips';
 import { useTranslation } from '@/i18n';
@@ -37,7 +39,8 @@ import { useSolarSweep } from '@/hooks/useSolarSweep';
 import { getViewerStoreApi, useViewerStore } from '@/store';
 import { isTypeVisible } from '@/store/typeVisibilityFilter';
 import { hasInstancedShards } from '@/store/instancedShardModels';
-import { computeVisibilityIsolation, isVisibleResultEmpty } from '@/lib/visibility/effective-empty';
+import { isVisibleResultEmpty } from '@/lib/visibility/effective-empty';
+import { useVisibilityIsolation } from '@/hooks/useVisibilityIsolation';
 import { EmptyVisibilityNotice } from './EmptyVisibilityNotice';
 import { useIfc } from '@/hooks/useIfc';
 import { useWebGpuOpenGuard } from '@/hooks/useWebGpuOpenGuard';
@@ -68,28 +71,29 @@ import { type IfcDataStore, type MapConversion } from '@ifc-lite/parser';
 import { getEffectiveGeoreference } from '@/lib/geo/effective-georef';
 import { isMeshVisibleInViewMode, meshClassIsPlaced, meshIsNonOccurrence } from '@/lib/type-view-visibility';
 
+/**
+ * The primary container for the 3D viewport, managing IFC model loading,
+ * geometry streaming, scene overlays, and interaction tools.
+ */
 export function ViewportContainer() {
   // Drive Stacked / Solo / Exploded level display from the slice.
   // Mount-once hook — it self-gates on mode + gap + model changes.
   useLevelDisplayEffect();
+  // Grids authored this session are lines the mesher does not draw (#6232 D3).
+  useAuthoredGridOverlay();
 
   const { loadFile, loading, clearAllModels, loadFilesSequentially, addModel } = useIfc();
   // Resolves a source provider's display title for toasts; null outside the
   // SourceHostProvider tree (tests), in which case the machine name is shown.
   const sourceHost = useOptionalSourceHost();
   const releaseGeometryMemory = useViewerStore((s) => s.releaseGeometryMemory);
-  const selectedStoreys = useViewerStore((s) => s.selectedStoreys);
   const typeVisibility = useViewerStore((s) => s.typeVisibility);
   const typeViewMode = useViewerStore((s) => s.typeViewMode);
   const setHasTypeGeometry = useViewerStore((s) => s.setHasTypeGeometry);
-  const isolatedEntities = useViewerStore((s) => s.isolatedEntities);
-  const classFilter = useViewerStore((s) => s.classFilter);
   const hiddenEntities = useViewerStore((s) => s.hiddenEntities);
-  const resolveGlobalIdFromModels = useViewerStore((s) => s.resolveGlobalIdFromModels);
   const resetViewerState = useViewerStore((s) => s.resetViewerState);
   const bcfOverlayVisible = useViewerStore((s) => s.bcfOverlayVisible);
   const cesiumEnabled = useViewerStore((s) => s.cesiumEnabled);
-  const solarEnabled = useViewerStore((s) => s.solarEnabled);
   const cesiumPlacementDraft = useViewerStore((s) => s.cesiumPlacementDraft);
   const cesiumPlacementDraftModelId = useViewerStore((s) => s.cesiumPlacementDraftModelId);
   const anchorModelIdOverride = useViewerStore((s) => s.anchorModelIdOverride);
@@ -161,13 +165,9 @@ export function ViewportContainer() {
     return collected;
   }, [storeModels, geometryResult, modelIdToIndex, typeVisibility]);
 
-  // Extract georeferencing info merged with any live mutations (for Cesium overlay).
-  // Reacts to: model load, Cesium toggle, and every georef field edit.
-  // Also computed while the solar study runs without Cesium — the WebGPU sun
-  // needs the site's lat/lon + map rotation to track the studied instant.
+  // Keep the placement panel context available regardless of map/solar toggles.
+  // The Cesium overlay and solar study also consume this effective georeference.
   const georef = useMemo(() => {
-    if (!cesiumEnabled && !solarEnabled) return null;
-
     const applyPlacementDraft = <T extends { mapConversion?: MapConversion }>(
       modelId: string,
       effective: T,
@@ -196,8 +196,8 @@ export function ViewportContainer() {
     // The ungated `selectAnchorGeoref` (lib/geo/useAnchorGeoreference) shares this
     // "pinned anchor, else first model with a usable map-conversion georef"
     // selection for the basepoint overlay and the measure-tool XYZ readout. This
-    // memo stays bespoke on purpose: it is gated on Cesium/solar, iterates in the
-    // store's insertion order (not loadedAt), and layers the placement-draft
+    // memo stays bespoke on purpose: it iterates in the store's insertion order
+    // (not loadedAt), and layers the placement-draft
     // preview + storey elevations that only the Cesium bridge consumes.
     const orderedModels = (() => {
       if (!anchorModelIdOverride) return Array.from(storeModels);
@@ -252,8 +252,6 @@ export function ViewportContainer() {
 
     return null;
   }, [
-    cesiumEnabled,
-    solarEnabled,
     storeModels,
     ifcDataStore,
     georefMutations,
@@ -516,13 +514,19 @@ export function ViewportContainer() {
     prepareAndRoute(files, supported.map((o) => o.handle));
   }, [prepareAndRoute, isSupportedFile, guardWebGpu]);
 
+  // After a stale-deployment reload, reopen what was open (or ask for it).
+  useReloadResume(webgpu.supported && !webgpu.checking, routeLoad, () => { void handleOpenClick(); });
+
   const handleStartBlank = useCallback(async () => {
     if (!guardWebGpu(() => { void handleStartBlank(); })) return;
     const file = createBlankIfcFile();
+    const modelId = crypto.randomUUID();
     // Must await: loadFile() calls resetViewerState() internally, which
     // closes any Model workspace session; entering before that races.
-    await loadFile(file);
-    launchModelCommand('wall.place'); // straight into drawing walls (#6232)
+    await loadFile(file, { kind: 'primary', modelId });
+    const state = useViewerStore.getState();
+    if (state.activeModelId !== modelId || state.models.get(modelId)?.loadState !== 'complete') return;
+    if (state.enterModelWorkspace({ modelId })) launchModelCommand('wall.place'); // #6232
   }, [guardWebGpu, loadFile]);
 
   // Issue #540 "Merge Multilayer Walls" reload. The setting changes the produced
@@ -781,12 +785,7 @@ export function ViewportContainer() {
   }, [mergedGeometryResult, filteredGeometry, geometryVersion]);
 
   // Shared pure intersection for the renderer and the empty-result notice.
-  const computedIsolatedIds = useMemo(() => {
-    return computeVisibilityIsolation({
-      models: storeModels, ifcDataStore, selectedStoreys, isolatedEntities,
-      classFilter, resolveGlobalIdFromModels,
-    });
-  }, [storeModels, ifcDataStore, selectedStoreys, isolatedEntities, classFilter, resolveGlobalIdFromModels]);
+  const computedIsolatedIds = useVisibilityIsolation();
 
   const visibleResultEmpty = useMemo(() => isVisibleResultEmpty({
     models: storeModels, geometryResult, hiddenEntities,
@@ -986,7 +985,7 @@ export function ViewportContainer() {
           storeyElevations={georef.storeyElevations}
         />
       )}
-      {cesiumEnabled && georef?.mapConversion && georef.baseMapConversion && (
+      {georef?.mapConversion && georef.baseMapConversion && (
         <CesiumPlacementGizmo
           modelId={georef.sourceModelId}
           mapConversion={georef.mapConversion}

@@ -1,6 +1,6 @@
 {
   "name": "@ifc-lite/sandbox",
-  "version": "2.8.0",
+  "version": "2.10.0",
   "description": "QuickJS-in-WASM sandboxed script execution for ifc-lite",
   "type": "module",
   "main": "./dist/index.js",
@@ -14,6 +14,10 @@
     "./schema": {
       "import": "./dist/bridge-schema.js",
       "types": "./dist/bridge-schema.d.ts"
+    },
+    "./network": {
+      "types": "./dist/network-request.d.ts",
+      "import": "./dist/network-request.js"
     }
   },
   "scripts": {
@@ -29,6 +33,8 @@
     "quickjs-emscripten": "^0.32.0"
   },
   "devDependencies": {
+    "@ifc-lite/create": "workspace:^",
+    "@ifc-lite/mutations": "workspace:^",
     "@ifc-lite/parser": "workspace:^",
     "typescript": "^6.0.3",
     "vitest": "^5.0.2"

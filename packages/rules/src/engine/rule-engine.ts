@@ -18,6 +18,7 @@ import type { IfcDataStore } from '@ifc-lite/parser';
 import { exactTypeName } from '@ifc-lite/data';
 import { iterateEffectiveEntityIds } from '@ifc-lite/mutations';
 import {
+  boundedPassRate,
   calculateSummary,
   type EntityResult,
   type IDSCardinalityResult,
@@ -199,7 +200,9 @@ function finalizeSpecification(
   outcome: SetCheckOutcome,
   error?: string,
 ): SpecificationResult {
-  const specification = { id: rule.id, name: rule.name, description: rule.description };
+  // `severity` travels with the result (#6372) so a report consumer — the
+  // CLI's exit code, the viewer's report block — never needs the rule file.
+  const specification = { id: rule.id, name: rule.name, description: rule.description, severity: rule.severity ?? 'error' };
   if (error !== undefined) {
     // Existing IDS convention (`packages/ids/src/report-types.ts`'s
     // `SpecificationResult.error` doc): an unevaluable rule is `status:
@@ -241,7 +244,7 @@ function finalizeSpecification(
   // element arithmetic at 100 (or has nothing to rate). `status` and
   // `passRate` must never disagree, so a failing spec never reads 100: the
   // same rule `@ifc-lite/ids`'s `validateSpecification` applies (#5212).
-  const elementRate = applicableCount > 0 ? Math.floor((passedCount / applicableCount) * 100) : 100;
+  const elementRate = applicableCount > 0 ? boundedPassRate(passedCount, applicableCount) : 100;
   const passRate = status === 'fail' && elementRate === 100 ? 0 : elementRate;
 
   return {

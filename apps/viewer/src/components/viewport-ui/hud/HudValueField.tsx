@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-import { useImperativeHandle, useRef, useState, type KeyboardEvent, type PointerEvent, type Ref } from 'react';
+import { useEffect, useImperativeHandle, useRef, useState, type KeyboardEvent, type PointerEvent, type Ref } from 'react';
 import { cn } from '@/lib/utils';
 import { capturePointer, releasePointer } from '@/lib/pointer-capture';
 
@@ -15,6 +15,7 @@ export interface HudValueFieldHandle {
 export interface HudValueFieldProps {
   ref?: Ref<HudValueFieldHandle>;
   value: number;
+  disabled?: boolean;
   onChange: (next: number) => void;
   /** Displayed after the number, e.g. "m" — never localized here, the
    *  caller passes the already-translated unit string. */
@@ -68,6 +69,7 @@ const CLICK_SLOP_PX = 2;
 export function HudValueField({
   ref,
   value,
+  disabled = false,
   onChange,
   unit = '',
   step = 1,
@@ -90,9 +92,23 @@ export function HudValueField({
   // its face, #5480's inset) is zero to the user.
   const shown = Math.abs(value) < 0.5 * 10 ** -precision ? 0 : value;
   const [draft, setDraft] = useState('');
+  // Whether the user typed into this edit session. Only a typed draft
+  // commits: a field opened by Tab (or a click) and left untouched keeps its
+  // value, so blurring it — say, by clicking in the viewport — writes nothing.
+  const typed = useRef(false);
   const dragRef = useRef<{ pointerId: number; startX: number; startValue: number; moved: boolean } | null>(
     null,
   );
+
+  const controlRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!disabled) return;
+    const drag = dragRef.current;
+    if (drag && controlRef.current) releasePointer(controlRef.current, drag.pointerId);
+    dragRef.current = null;
+    if (drag?.moved) onScrubEnd?.();
+    typed.current = false; setEditing(false);
+  }, [disabled, onScrubEnd]);
 
   const clamp = (next: number): number => Math.min(max, Math.max(min, next));
   // Nearest snap wins when several catchments overlap; outside every
@@ -109,28 +125,34 @@ export function HudValueField({
   };
 
   function startEdit(initial?: string): void {
+    if (disabled) return;
     setDraft(initial ?? value.toFixed(precision));
+    // A caller-supplied draft is a digit the user typed elsewhere.
+    typed.current = initial !== undefined;
     setEditing(true);
   }
 
   useImperativeHandle(ref, () => ({ beginEdit: startEdit }));
 
-  /** The typed value, clamped; null when the draft is not a number. */
+  /** The typed value, clamped; null when the draft is not a number or was never typed. */
   function commitDraft(): number | null {
+    setEditing(false);
+    if (disabled || !typed.current) return null;
+    typed.current = false;
     const parsed = Number.parseFloat(draft);
     const next = Number.isFinite(parsed) ? clamp(parsed) : null;
     if (next !== null) onChange(next);
-    setEditing(false);
     return next;
   }
 
   function handlePointerDown(e: PointerEvent<HTMLDivElement>): void {
-    if (e.button !== 0) return;
+    if (disabled || e.button !== 0) return;
     dragRef.current = { pointerId: e.pointerId, startX: e.clientX, startValue: value, moved: false };
     capturePointer(e.currentTarget, e.pointerId);
   }
 
   function handlePointerMove(e: PointerEvent<HTMLDivElement>): void {
+    if (disabled) return;
     const drag = dragRef.current;
     if (!drag || drag.pointerId !== e.pointerId) return;
     const dx = e.clientX - drag.startX;
@@ -156,6 +178,7 @@ export function HudValueField({
   }
 
   function handleKeyDown(e: KeyboardEvent<HTMLDivElement>): void {
+    if (disabled) return;
     const mult = e.shiftKey ? shiftMultiplier : 1;
     if (e.key === 'ArrowUp' || e.key === 'ArrowRight') {
       e.preventDefault();
@@ -170,16 +193,20 @@ export function HudValueField({
   }
 
   function handleInputKeyDown(e: KeyboardEvent<HTMLInputElement>): void {
+    if (disabled) return;
     if (e.key === 'Enter') {
       e.preventDefault();
+      const wasTyped = typed.current;
       const next = commitDraft();
-      if (next !== null) onSubmit?.(next);
+      // Enter on an untouched field still submits, with the value as shown.
+      if (next !== null || !wasTyped) onSubmit?.(next ?? value);
     } else if (e.key === 'Tab' && onTab) {
       e.preventDefault();
       commitDraft();
       onTab(e.shiftKey);
     } else if (e.key === 'Escape') {
       e.preventDefault();
+      typed.current = false;
       setEditing(false);
     }
   }
@@ -187,11 +214,12 @@ export function HudValueField({
   if (editing) {
     return (
       <input
+        disabled={disabled}
         type="text"
         inputMode="decimal"
         autoFocus
         value={draft}
-        onChange={(e) => setDraft(e.target.value)}
+        onChange={(e) => { typed.current = true; setDraft(e.target.value); }}
         onKeyDown={handleInputKeyDown}
         onBlur={commitDraft}
         aria-label={aria['aria-label']}
@@ -205,8 +233,10 @@ export function HudValueField({
 
   return (
     <div
+      ref={controlRef}
       role="spinbutton"
-      tabIndex={0}
+      aria-disabled={disabled || undefined}
+      tabIndex={disabled ? -1 : 0}
       aria-label={aria['aria-label']}
       aria-valuenow={value}
       aria-valuemin={Number.isFinite(min) ? min : undefined}
@@ -219,6 +249,7 @@ export function HudValueField({
       onKeyDown={handleKeyDown}
       className={cn(
         'inline-flex cursor-ew-resize select-none items-center gap-0.5 rounded-sm px-1 py-0.5 text-xs tabular-nums outline-none focus-visible:ring-1 focus-visible:ring-ring',
+        disabled && 'cursor-default opacity-50',
         className,
       )}
     >

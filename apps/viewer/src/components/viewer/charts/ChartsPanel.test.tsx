@@ -30,7 +30,6 @@ import { useColorOverlaySync } from '@/components/viewer/useColorOverlaySync.js'
 import { useIDS, type UseIDSResult } from '@/hooks/useIDS.js';
 import { useClash } from '@/hooks/useClash.js';
 import { installIdsFocusVisibility } from '@/hooks/ids-focus-visibility.js';
-import { useSpaceSceneFraming } from '@/components/viewer/tools/space-sketch/useSpaceSceneFraming.js';
 import { modelOverviewDashboard, newChartSpec } from '@/lib/charts/presets.js';
 import { useViewerStore } from '@/store/index.js';
 import type { FederatedModel } from '@/store/types.js';
@@ -258,6 +257,22 @@ describe('ChartsPanel over a parsed model (#3944)', () => {
     await act(async () => { added.events.onSelect({ items: [{ seriesIndex: 0, dataIndex: 0 }] }); });
     await settle();
     assert.deepEqual([...useViewerStore.getState().selectedEntityIds].sort(), [GID(41), GID(42)]);
+  });
+
+  it('duplicates a chart next to the original, persists it, and opens the copy in the editor (#6474)', async () => {
+    const { renderer } = recordingRenderer();
+    const ui = render(<ChartsPanel renderer={renderer} />);
+    await settle();
+    const before = useViewerStore.getState().dashboards[0].charts;
+    click(ui.querySelector<HTMLButtonElement>(`button[aria-label="Duplicate ${before[0].title}"]`)!);
+    await settle();
+    const after = useViewerStore.getState().dashboards[0];
+    assert.equal(after.charts.length, before.length + 1);
+    assert.equal(after.charts[1].title, `${before[0].title} (copy)`);
+    assert.notEqual(after.charts[1].id, before[0].id);
+    assert.equal(after.layout.length, after.charts.length);
+    assert.ok(ui.querySelector('select[aria-label="Chart type"]'), 'the copy opens in the editor');
+    assert.equal(ui.querySelectorAll('[data-chart-id]').length, before.length + 1);
   });
 
   it('enables IFC field discovery when an existing non-element chart switches to Elements (#4833)', async () => {
@@ -685,11 +700,21 @@ describe('ChartsPanel over a parsed model (#3944)', () => {
     assert.equal(s.chartVisibilityOwned?.channel, 'isolate');
   });
 
-  it('re-presents after Space Sketch captures and restores the chart-owned ghost (#4832)', async () => {
+  it('re-presents after a view snapshot flow captures and restores the chart-owned ghost (#4832)', async () => {
     const { renderer, charts } = recordingRenderer();
+    /** A tool that captures the prior 3D view on open and replays it on close (cloned sets, one atomic restore). */
     function MountedSpaceChart() {
       const [spaceOpen, setSpaceOpen] = useState(false);
-      useSpaceSceneFraming({ enabled: spaceOpen, existingSpaceIds: [] });
+      useEffect(() => {
+        if (!spaceOpen) return;
+        const now = useViewerStore.getState();
+        const prior = {
+          isolated: now.isolatedEntities ? new Set(now.isolatedEntities) : null,
+          ghostExcept: now.ghostExceptEntities ? new Set(now.ghostExceptEntities) : null,
+          hidden: new Set(now.hiddenEntities),
+        };
+        return () => useViewerStore.getState().restoreVisibilityState(prior);
+      }, [spaceOpen]);
       return <>
         <button type="button" onClick={() => setSpaceOpen((open) => !open)}>Space</button>
         <ChartsPanel renderer={renderer} />
@@ -709,7 +734,7 @@ describe('ChartsPanel over a parsed model (#3944)', () => {
     assert.notEqual(
       replayed.chartVisibilityRevision,
       replayed.visibilityRevision,
-      'the real Space Sketch restore is a content-preserving foreign replay',
+      'the snapshot restore is a content-preserving foreign replay',
     );
 
     const focus = ui.querySelector<HTMLSelectElement>('select[aria-label="Focus mode"]')!;
@@ -1945,6 +1970,69 @@ describe('overlapping chart bucket paint (#4832)', () => {
   });
 });
 
+describe('ChartsPanel "Visible elements" scope under Isolate focus (#6473)', () => {
+  const TYPES: Record<number, string> = { 41: 'IfcWall', 42: 'IfcWall', 43: 'IfcWall', 44: 'IfcDoor', 45: 'IfcDoor' };
+
+  beforeEach(async () => {
+    const parsed = await parsedModel();
+    // `visible` scope needs mesh candidates: one mesh per element, in global-id space.
+    const model = {
+      ...parsed,
+      geometryResult: { meshes: Object.entries(TYPES).map(([id, ifcType]) => ({ expressId: GID(Number(id)), ifcType })) },
+    } as unknown as FederatedModel;
+    const dashboard = modelOverviewDashboard();
+    dashboard.scope = { kind: 'visible' };
+    useViewerStore.setState({
+      models: new Map([[model.id, model]]),
+      activeModelId: model.id,
+      dashboards: [dashboard],
+      activeDashboardId: dashboard.id,
+      chartFocusMode: 'isolate',
+      chartColorIn3D: false,
+      chartSlice: null,
+      chartSliceSource: null,
+      chartSliceBuckets: null,
+      chartSelectionRevision: null,
+      selectionRevision: 0,
+      chartVisibilityOwned: null,
+      chartVisibilityRevision: null,
+      selectedEntityIds: new Set(),
+      selectedEntityId: null,
+      selectedEntitiesSet: new Set(),
+      selectedEntities: [],
+      isolatedEntities: null,
+      ghostExceptEntities: null,
+      hiddenEntities: new Set(),
+      cameraCallbacks: {},
+    });
+  });
+  afterEach(() => cleanup());
+
+  it('a bucket click isolates the bucket without collapsing the chart to it', async () => {
+    const { renderer, charts } = recordingRenderer();
+    render(<ChartsPanel renderer={renderer} />);
+    await settle();
+    assert.deepEqual(barData(charts[0].options.at(-1)!).map(([n, v]) => [n, v]), [['IfcWall', 3], ['IfcDoor', 2]]);
+
+    await act(async () => { charts[0].events.onSelect({ items: [{ seriesIndex: 0, dataIndex: 0 }] }); });
+    await settle();
+    const s = useViewerStore.getState();
+    assert.deepEqual([...(s.isolatedEntities ?? [])].sort(), [GID(41), GID(42), GID(43)], 'the walls are isolated in 3D');
+    assert.equal(s.chartVisibilityOwned?.channel, 'isolate');
+    // The chart still aggregates every bucket, with the clicked one selected.
+    assert.deepEqual(barData(charts[0].options.at(-1)!), [['IfcWall', 3, true], ['IfcDoor', 2, false]]);
+  });
+
+  it('an isolation another feature installed still narrows the chart', async () => {
+    const { renderer, charts } = recordingRenderer();
+    render(<ChartsPanel renderer={renderer} />);
+    await settle();
+    await act(async () => { useViewerStore.setState({ isolatedEntities: new Set([GID(44), GID(45)]) }); });
+    await settle();
+    assert.deepEqual(barData(charts[0].options.at(-1)!).map(([n, v]) => [n, v]), [['IfcDoor', 2]]);
+  });
+});
+
 describe('report export from the panel (#3944)', () => {
   beforeEach(async () => {
     const model = await parsedModel();
@@ -1962,7 +2050,7 @@ describe('report export from the panel (#3944)', () => {
         let pages = 1;
         return {
           addPage: () => { pages += 1; },
-          setFont: () => {}, setFontSize: () => {}, setTextColor: () => {},
+          setFont: () => {}, setFontSize: () => {}, setTextColor: () => {}, fillRect: () => {},
           text: (t) => { drawn.push(`text:${t}`); },
           addImage: () => { drawn.push('image'); },
           svg: async (svg) => { drawn.push(`svg:${svg.length > 100 ? 'ok' : 'short'}`); },

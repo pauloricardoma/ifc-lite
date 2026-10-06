@@ -27,14 +27,10 @@
  * tracked set yet — out of scope here; a future MCP-side sidecar (keyed per
  * session or per model) would close that gap.
  *
- * Element-creation node types (`element.column`, `model.addElement`, …)
- * currently fail when run through MCP: `HeadlessLikeBackend`'s
- * `store.addColumn`/`addWall`/`addSlab`/`addBeam`/… all throw "not supported
- * in MCP v0.1; use entity_create" (`headless-backend.ts`). That is a
- * pre-existing MCP limitation, not something this change introduces — a
- * property-writing graph (like the shipped fire-rating-audit example) runs
- * fine; a column-authoring graph will report a failed node until that
- * backend gap is closed separately.
+ * Wall/column/slab/beam/stair/railing creation nodes use the shared SDK
+ * backend and create-package builders. Each creation is recorded as one
+ * compound mutation for public mutation_undo, retaining earlier overlay work.
+ * Stair/railing specs use their canonical builders; tracking remains per call.
  *
  * `run_flow` is the OTHER caller (besides `ifc-lite flow run`) allowed to
  * read `process.env` for a flow graph (#5167 phase 3.5), following the same
@@ -52,6 +48,7 @@
 
 import { readFile } from 'node:fs/promises';
 import {
+  checkAvailability,
   declaredInputKeys,
   describeFlowIO,
   migrateFlowDocument,
@@ -144,12 +141,14 @@ const describeFlow: Tool = {
     // validating clean and producing nothing at run time.
     const diagnostics = validateFlowWiring(doc, registry);
     const io = describeFlowIO(doc, registry);
-    const ok = diagnostics.length === 0;
+    const availability = checkAvailability(doc, registry, headlessFeatures(usableSecretNames(process.env)));
+    const unavailable = availability.filter((node) => node.status === 'unknown' || node.status === 'unavailable');
+    const ok = diagnostics.length === 0 && unavailable.length === 0;
     return okResult(
       ok
         ? `Flow '${io.name}' (${io.id}): ${io.inputs.length} input(s), ${io.outputs.length} output(s).`
-        : `Flow '${io.name}' (${io.id}) has ${diagnostics.length} wiring problem(s).`,
-      { ok, ...io, diagnostics },
+        : `Flow '${io.name}' (${io.id}) has ${diagnostics.length} wiring problem(s) and ${unavailable.length} unavailable node(s).`,
+      { ok, ...io, diagnostics, availability },
     );
   },
 };
@@ -266,6 +265,14 @@ const runFlowTool: Tool = {
         message: `${secretErrors.length} secret reference problem(s): ${secretErrors.map((e) => e.message).join('; ')}`,
       });
     }
+    const unavailable = checkAvailability(doc, registry, headlessFeatures(usableSecretNames(process.env)))
+      .filter((node) => node.status === 'unknown' || node.status === 'unavailable');
+    if (unavailable.length) throw new ToolExecutionError({
+      code: ToolErrorCode.UNSUPPORTED_OPERATION,
+      message: `Flow cannot run on this host: ${unavailable.map((node) => `${node.nodeId}: ${node.reasons.join('; ')}`).join(' | ')}`,
+      details: { availability: unavailable },
+    });
+
     const secretValues = resolveSecretValues(doc, process.env);
     const redaction = buildRedactionMap(secretValues);
     const runDoc = interpolateSecrets(doc, secretValues);

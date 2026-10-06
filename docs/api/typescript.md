@@ -50,15 +50,18 @@ ifc-lite ships its public npm packages under the `@ifc-lite/*` scope, plus the `
 | [`@ifc-lite/documents-api`](https://www.npmjs.com/package/@ifc-lite/documents-api) | OpenCDE Documents API 1.0 client: select, download, query and upload documents against a buildingSMART Documents API server |
 | [`@ifc-lite/flow`](https://www.npmjs.com/package/@ifc-lite/flow) | Keyed-data graph runtime for BIM workflows: typed ports, item/list/group lifting, memoised evaluation, and element tracking for re-runnable graphs |
 | [`@ifc-lite/flow-nodes`](https://www.npmjs.com/package/@ifc-lite/flow-nodes) | Standard node library for @ifc-lite/flow over the ifc-lite SDK: model reads and writes, tables, viewer, and a sandboxed Script node |
+| [`@ifc-lite/load-trace`](https://www.npmjs.com/package/@ifc-lite/load-trace) | Dependency-free load-trace spans: performance.measure plus a per-load, cross-thread span tree with worker clock alignment and Chrome-trace export |
 | [`@ifc-lite/merge`](https://www.npmjs.com/package/@ifc-lite/merge) | Three-way merge engine for IFCX layers — MergePlan with auto-merged ops and explicit conflict records, merge-layer emission, rebase, and revert. |
 | [`@ifc-lite/oauth-pkce`](https://www.npmjs.com/package/@ifc-lite/oauth-pkce) | Browser OAuth 2.0 Authorization Code + PKCE flow, shared by ifc-lite's file-source providers |
 | [`@ifc-lite/opencde-foundation`](https://www.npmjs.com/package/@ifc-lite/opencde-foundation) | buildingSMART OpenCDE Foundation API client: version discovery, auth discovery, OAuth2 flows and the shared HTTP client used by every OpenCDE service client |
 | [`@ifc-lite/plugin-api`](https://www.npmjs.com/package/@ifc-lite/plugin-api) | Dependency-free type surface for ifc-lite file-source plugins |
 | [`@ifc-lite/regex-guard`](https://www.npmjs.com/package/@ifc-lite/regex-guard) | A shared, dependency-free guard against catastrophic-backtracking (ReDoS) regex patterns compiled from untrusted input |
 | [`@ifc-lite/rules`](https://www.npmjs.com/package/@ifc-lite/rules) | Filter-rule vocabulary, evaluator and .rules.json information-validation engine for IFC-Lite |
+| [`@ifc-lite/semantic`](https://www.npmjs.com/package/@ifc-lite/semantic) | Portable semantic datasets, profiles, validation and IFC identity resolution |
+| [`@ifc-lite/source-autodesk`](https://www.npmjs.com/package/@ifc-lite/source-autodesk) | Autodesk Forma and Data Exchange cloud-source provider for ifc-lite |
 | [`@ifc-lite/source-dalux`](https://www.npmjs.com/package/@ifc-lite/source-dalux) | Dalux Build (Box) file-source provider for ifc-lite |
 | [`@ifc-lite/source-dropbox`](https://www.npmjs.com/package/@ifc-lite/source-dropbox) | Dropbox file-source provider for ifc-lite |
-| [`@ifc-lite/source-msgraph`](https://www.npmjs.com/package/@ifc-lite/source-msgraph) | Microsoft Graph (OneDrive/SharePoint) file-source provider for ifc-lite |
+| [`@ifc-lite/source-msgraph`](https://www.npmjs.com/package/@ifc-lite/source-msgraph) | Microsoft Graph file-source provider for the signed-in user's own OneDrive |
 | [`@ifc-lite/wasm-lifecycle`](https://www.npmjs.com/package/@ifc-lite/wasm-lifecycle) | Shared WASM engine load-retry classification and cross-realm panic-forwarding, used by @ifc-lite/geometry and @ifc-lite/parser |
 <!-- END GENERATED: package-index -->
 
@@ -851,6 +854,10 @@ For editing an **already-parsed** `IfcDataStore`, the package exposes anchored b
 `addColumnToStore`, `addWallToStore`, `addSlabToStore`, `addBeamToStore`, `addDoorToStore`, `addWindowToStore`, `addSpaceToStore`, `addRoofToStore`, `addPlateToStore`, `addMemberToStore`.
 
 Hosted builders take a `HostAnchor` from `resolveHostAnchor(dataStore, hostExpressId, mutationView)` instead: `addOpeningToStore` (IfcOpeningElement + IfcRelVoidsElement in an IfcWall or IfcSlab), `addHostedDoorToStore` and `addHostedWindowToStore` (the opening plus an IfcDoor / IfcWindow filling it through IfcRelFillsElement).
+
+`addHostedElementInStore(dataStore, editor, hostExpressId, spec)` is the atomic hosted command operation used by the viewer, SDK and MCP. A spec chooses `kind: 'opening' | 'door' | 'window'` and the corresponding builder `params`. It resolves the live anchor and refuses wall cuts outside the host, overlapping existing openings, or having unreadable geometry. `readHostOpeningExtents(dataStore, hostExpressId, mutationView)` returns host-frame native-unit bounds and reports unreadable openings.
+
+`bim.store.joinWalls(modelId, aExpressId, bExpressId, options?)` exposes the existing `joinWallsInStore` core through SDK, sandbox and MCP. It returns the new `IfcRelConnectsPathElements` reference. The core now atomically protects hosted cuts against both joined end faces and refuses unreadable cut geometry. `recordCompoundMutation` and `undoRecordedMutationOperations` in `@ifc-lite/mutations` record and restore complete compound overlay graphs, including forgotten earlier entities, as one operation.
 
 Type objects and materials take the storey-free anchor from `resolveAuthoringAnchor(dataStore, mutationView)`: `addElementTypeToStore` and `assignTypeInStore` (IfcRelDefinesByType), and `addMaterialToStore`, `addMaterialLayerSetToStore`, `addMaterialLayerSetUsageToStore` and `assignMaterialInStore` (IfcRelAssociatesMaterial). The `assign*` builders take the model's existing relationships from `readRelatedLists`.
 

@@ -24,6 +24,7 @@ import { endClashScenePresentation, type ClashSceneTeardown } from '@/lib/clash/
 import { markupTransitionPatch } from './drawing2DSlice.markupTransition.js';
 import { isolateModelsPatch, modelFieldPatch, modelsVisibilityPatch } from './modelSlice.visibility.js';
 import { upsertModelPatch } from './modelSlice.upsert.js';
+import { clearModelLayouts } from '@/lib/rooms/room-layout';
 import { endChartVisibilityPresentation } from '@/lib/charts/visibility-ownership';
 import { toPublishedGlobalIdFromState } from '../federation-overlay-publication.js';
 
@@ -135,10 +136,9 @@ function mutationViewsOf(
  * The model slice, typed over the WHOLE store.
  *
  * There used to be a `ModelCrossSliceState` here: sixteen fields owned by
- * `dataSlice`, `selectionSlice`, `visibilitySlice`, `pinboardSlice` and
- * `addElementSlice`, declared on this slice purely so `removeModel` and
- * `clearAllModels` could type-check their reach into all five. Teardown no
- * longer reaches: it returns a patch composed by the owning slices
+ * `dataSlice`, `selectionSlice`, `visibilitySlice` and `pinboardSlice`,
+ * declared on this slice purely so `removeModel` and `clearAllModels` could
+ * type-check their reach into all of them. Teardown no longer reaches: it returns a patch composed by the owning slices
  * (`store/teardown-registry.ts`), so the interface is gone.
  *
  * What is left is real and is not teardown: `addModel`, `upsertModel`,
@@ -233,7 +233,7 @@ export const createModelSlice: StateCreator<ViewerState, [], [], ModelSlice> = (
       setPointCloudDeviationComputed?: (computed: boolean) => void;
     };
     cross.clearMutations?.(modelId);
-    cross.clearMutationView?.(modelId);
+    cross.clearMutationView?.(modelId); clearModelLayouts(modelId); // the Room tool's filed layouts (wasm plates)
     // Drop the model's cloud-source provenance tag (sourcesSlice) so the
     // sources UI stops offering "Sync from source" for a model that no
     // longer exists and the tag map cannot grow without bound.
@@ -417,10 +417,7 @@ export const createModelSlice: StateCreator<ViewerState, [], [], ModelSlice> = (
     endIdsRowFocusPresentation(get() as unknown as IDSRowFocusPresentation);
     // Clear the federation registry
     federationRegistry.clear();
-    // Same dangling reference as `removeModel`'s `addElementModelId` cleanup,
-    // just for every model at once: with `models` about to become empty there
-    // is no federated model left for the AddElement panel's pin to name, so it
-    // and the model-local storey id go too. Same for every global-id set
+    // With `models` about to become empty every global-id set
     // `removeModel` purges by range (selection, hidden, isolated, ghost, class
     // filter, and the per-model maps): with zero survivors every id in them is
     // stale by definition, so the composed teardown at the end of this function

@@ -6,6 +6,7 @@
 import { expect, type Page } from '@playwright/test';
 import { inflateSync } from 'node:zlib';
 import type { ViewerState } from '../../apps/viewer/src/store';
+import { noteSoftwareGpuSkip } from './gpu-device-loss';
 
 declare global {
   var __ifc_lite_viewer_store__: { getState(): ViewerState };
@@ -20,7 +21,7 @@ type Point3 = readonly [number, number, number];
 type ControlPoint = { id: string; local: Point3 };
 type RenderPoint = (point: Point3) => { x: number; y: number; z: number };
 
-interface DecodedPng { width: number; height: number; rgba: Uint8Array }
+export interface DecodedPng { width: number; height: number; rgba: Uint8Array }
 interface PixelDifference { regionPixels: number; changedPixels: number }
 
 export interface RenderedModelEvidence {
@@ -39,7 +40,7 @@ export interface OrdinarySelection {
 }
 
 /** Decode Chrome's 8-bit non-interlaced RGB/RGBA screenshots without a dependency. */
-function decodePng(png: Uint8Array): DecodedPng {
+export function decodePng(png: Uint8Array): DecodedPng {
   const view = new DataView(png.buffer, png.byteOffset, png.byteLength);
   let offset = 8, width = 0, height = 0, channels = 0;
   const idat: Uint8Array[] = [];
@@ -132,23 +133,25 @@ async function showOnlyModelAndFrame(page: Page, modelId: string): Promise<void>
  * work completes. Playwright canvas screenshots read compositor state, which
  * SwiftShader may discard; they are not a color-raster witness.
  */
-async function rendererColorFrame(page: Page): Promise<Buffer> {
+export async function rendererColorFrame(page: Page): Promise<Buffer> {
   const dataUrl = await page.evaluate(async () => globalThis.__ifc_lite_capture_color_frame__?.() ?? null);
   expect(dataUrl, 'renderer color capture is available after the viewport submits a frame').not.toBeNull();
   const encoded = dataUrl!.match(/^data:image\/png;base64,(.+)$/);
   expect(encoded, 'renderer color capture is a PNG data URL').not.toBeNull();
   return Buffer.from(encoded![1]!, 'base64');
 }
-export async function assertIsolatedRenderedContent(page: Page, modelId: string, gpuStrict: boolean): Promise<RenderedModelEvidence> {
+export async function assertIsolatedRenderedContent(page: Page, modelId: string, gpuStrict: boolean,
+  hideRenderedContent?: () => Promise<void>): Promise<RenderedModelEvidence> {
   await showOnlyModelAndFrame(page, modelId);
   if (!gpuStrict) {
-    console.log(`[e2e] E2E_GPU_STRICT=0 — skipping ${modelId} isolated pixel assertion (software WebGPU)`);
+    noteSoftwareGpuSkip(`${modelId} isolated pixel assertion`);
     return { modelId, regionPixels: null, changedPixels: null, backgroundChangedPixels: null, evidence: 'skipped' };
   }
   await expect(page.locator('canvas[data-viewport="main"]'), 'viewer canvas').toBeVisible();
   const renderedPng = await rendererColorFrame(page);
   const rendered = decodePng(renderedPng);
-  await page.evaluate(() => {
+  if (hideRenderedContent) await hideRenderedContent();
+  else await page.evaluate(() => {
     const state = globalThis.__ifc_lite_viewer_store__.getState();
     state.setModelsVisibility([...state.models.keys()], false);
   });
@@ -170,7 +173,7 @@ export async function ordinaryGpuSelectControl(
 ): Promise<OrdinarySelection> {
   await showOnlyModelAndFrame(page, modelId);
   if (!gpuStrict) {
-    console.log(`[e2e] E2E_GPU_STRICT=0 — skipping ${modelId} ordinary GPU selection assertion (software WebGPU)`);
+    noteSoftwareGpuSkip(`${modelId} ordinary GPU selection assertion`);
     return page.evaluate(selectionSnapshot);
   }
   const projected = await page.evaluate((point) => globalThis.__ifc_lite_viewer_store__.getState()

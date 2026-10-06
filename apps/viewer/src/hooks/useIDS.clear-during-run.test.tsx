@@ -31,6 +31,7 @@
  */
 
 import '@/test/setup-dom.js';
+import '@/test/content-fixture.js';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { act } from 'react';
@@ -40,6 +41,8 @@ import { parseIDS } from '@ifc-lite/ids';
 import type { GeometryResult } from '@ifc-lite/geometry';
 import { useViewerStore, type FederatedModel } from '@/store';
 import { useIDS } from './useIDS.js';
+import { SaveValidationReportButton } from '@/components/viewer/validation/SaveValidationReportButton';
+import { loadValidationReports } from '@/lib/validation/reports/persistence';
 
 function ifc4(body: string): string {
   return [
@@ -117,9 +120,9 @@ function model(id: string, store: IfcDataStore, idOffset = 0): FederatedModel {
 type IdsApi = ReturnType<typeof useIDS>;
 let api: IdsApi | null = null;
 
-function Probe(): null {
+function Probe() {
   api = useIDS();
-  return null;
+  return api.report ? <SaveValidationReportButton report={api.report} /> : null;
 }
 
 let root: Root | null = null;
@@ -134,6 +137,8 @@ async function seed(modelCount: 1 | 2 = 1): Promise<void> {
     activeModelId: 'Slow',
     idsDocument: idsDoc,
     idsValidationReport: null,
+    currentValidationReport: null,
+    savedValidationReports: [],
     idsError: null,
     idsLoading: false,
     idsProgress: null,
@@ -149,6 +154,7 @@ async function seed(modelCount: 1 | 2 = 1): Promise<void> {
 
 beforeEach(() => {
   api = null;
+  localStorage.clear();
 });
 
 afterEach(async () => {
@@ -175,6 +181,10 @@ describe('useIDS — clearing during an in-flight runValidation (PR #2837 review
       await act(async () => { resolved = await pending; });
       assert.equal(resolved, null, 'a cancelled run must not return an unpublished report');
       assert.equal(useViewerStore.getState().idsValidationReport, null, 'late completion must not publish');
+      // #6568: a cancelled check supplies neither saved nor saveable evidence.
+      assert.equal(useViewerStore.getState().currentValidationReport, null);
+      assert.equal((await loadValidationReports()).length, 0);
+      assert.equal([...document.querySelectorAll('button')].some((button) => button.textContent === 'Save report'), false);
     });
   }
 

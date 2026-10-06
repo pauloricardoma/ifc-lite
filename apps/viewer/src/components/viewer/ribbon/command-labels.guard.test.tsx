@@ -28,6 +28,46 @@ afterEach(() => {
   act(() => useViewerStore.setState(initialState));
 });
 
+it('#6604 federation setup stays compact beside the prominent IFC export and Save dispatches once', (t) => {
+  setCollabEnabledOverride(false);
+  act(() => useViewerStore.setState({ ribbonTab: 'file', ribbonCollapsed: false }));
+  const container = render(<RibbonToolbar />);
+  const setupIds = ['file:save-federation-setup', 'file:open-federation-setup', 'file:model-tags'];
+  const setupButtons = setupIds.map((id) => {
+    const button = container.querySelector<HTMLButtonElement>(`button[data-command-id="${id}"]`);
+    assert.ok(button, `${id} is mounted`);
+    return button;
+  });
+  const [save, open, tags] = setupButtons;
+  assert.ok(save && open && tags);
+  assert.ok(save.parentElement);
+  assert.ok(save.parentElement === open.parentElement, 'Save and Open Setup share the compact stack');
+  assert.deepEqual([...save.parentElement.querySelectorAll('[data-command-id]')]
+    .map((button) => button.getAttribute('data-command-id')), setupIds.slice(0, 2));
+  for (const button of setupButtons) {
+    assert.ok(button.classList.contains('min-h-6'), 'compact setup targets preserve the 24px minimum');
+    const icon = button.querySelector('svg');
+    assert.ok(icon);
+    assert.ok(icon.classList.contains('h-3.5'), 'setup icons use the small ribbon size');
+    assert.ok(icon.classList.contains('w-3.5'));
+  }
+  assert.ok(save.querySelector('svg[data-testid="icon-stub"]'),
+    'Save uses the viewer collection rather than the Lucide fallback');
+  assert.equal(save.querySelector('span')?.textContent,
+    resolve('commandPalette.file.saveFederationSetup.label'), 'the compact row displays the full label');
+  const ifcIcon = container.querySelector('[data-export-command="ifc"] svg');
+  assert.ok(ifcIcon);
+  assert.ok(ifcIcon.classList.contains('h-8'), 'IFC export retains its large icon');
+  assert.ok(ifcIcon.classList.contains('w-8'));
+
+  let saves = 0;
+  const onSave = () => { saves++; };
+  window.addEventListener('ifc-lite:save-federation-setup', onSave);
+  t.after(() => window.removeEventListener('ifc-lite:save-federation-setup', onSave));
+  click(save);
+  assert.equal(saves, 1, 'the compact Save control invokes the registered action exactly once');
+});
+
 it('#5878 File Share invokes its mounted host once through the registry', () => {
   setCollabEnabledOverride(true);
   let shareOpens = 0;
@@ -197,7 +237,7 @@ it('#5878 keyboard opening of the class filter emits one registered command even
   ]);
 });
 
-it('#5878 Author edit and Space Sketch execute through registered ribbon controls', (t) => {
+it('#5878 Author edit executes through a registered ribbon control; every kind is a Model command, so no free-standing create button remains (#6232)', (t) => {
   // Edit mode is the Model workspace (#6232), which opens on a loaded model.
   act(() => useViewerStore.setState({
     ...fixtureModels(fixtureModel('m')),
@@ -218,8 +258,10 @@ it('#5878 Author edit and Space Sketch execute through registered ribbon control
   };
   click(control('tool:edit-mode'));
   assert.equal(useViewerStore.getState().editEnabled, true);
-  click(control('author:space-sketch'));
-  assert.equal(useViewerStore.getState().activeTool, 'spaceSketch');
+  // The Model workspace's rail owns every kind: the ribbon's own author controls are only these.
+  const authorControls = [...container.querySelectorAll<HTMLButtonElement>('button[data-command-id^="author:"]')]
+    .map((b) => b.dataset.commandId).sort();
+  assert.deepEqual(authorControls, ['author:bulk-properties', 'author:import-data', 'author:redo', 'author:undo']);
   assert.equal(control('author:bulk-properties').dataset.commandTrigger, 'true');
   assert.equal(control('author:import-data').dataset.commandTrigger, 'true');
 });

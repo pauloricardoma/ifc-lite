@@ -8,7 +8,11 @@ from typing import Any, Dict, List, Literal, Optional, Set, TypedDict, Union, ov
 
 Quality = Literal["lowest", "low", "medium", "high", "highest"]
 
-class ElementBuffers(TypedDict):
+class ElementColorBuffers(TypedDict, total=False):
+    palette: List[List[float]]  # distinct RGBA; present only for multi-color elements
+    face_colors: bytes  # u64 little-endian palette index per face
+
+class ElementBuffers(ElementColorBuffers):
     ifc_type: str
     global_id: Optional[str]
     name: Optional[str]
@@ -287,6 +291,7 @@ class AuthoredRebarAttribute(TypedDict):
 
 class RebarSweepPreflightFields(TypedDict, total=False):
     preflight: RebarPreflightReport
+    fabrication_precheck: RebarFabricationReport
 
 class RebarSweep(RebarSweepPreflightFields):
     occurrence_index: int
@@ -313,8 +318,34 @@ class RebarPreflightReport(TypedDict):
     comparisons: Optional[List[RebarPreflightComparison]]
     unassessed_reasons: List[str]
 
+class RebarFabricationCheck(TypedDict):
+    kind: Literal["inside_bend_radius", "straight_segment_length", "bend_angle", "nominal_geometric_diameter_delta", "developed_centreline_length"]
+    status: Literal["pass", "fail", "uncheckable"]
+    bar_id: int
+    solid_id: int
+    directrix_id: int
+    segment_index: Optional[int]
+    measured: Optional[float]
+    minimum: Optional[float]
+    maximum: Optional[float]
+    units: Literal["m", "rad"]
+    reason: Optional[str]
+    authored_source: Optional[Literal["occurrence", "type"]]
+    authored_source_id: Optional[int]
+    nominal_diameter_m: Optional[float]
+    geometric_diameter_m: Optional[float]
+
+class RebarFabricationReport(TypedDict):
+    outcome: Literal["precheck_only"]
+    mapping_path: List[int]
+    source_modified: bool
+    checks: List[RebarFabricationCheck]
+    limitations: List[str]
+    unchecked_factors: List[str]
+
 class RebarRowPreflightFields(TypedDict, total=False):
     preflight_skipped_reason: str
+    fabrication_precheck_skipped_reason: str
 
 class RebarScheduleRow(RebarRowPreflightFields):
     GlobalId: Optional[str]
@@ -547,6 +578,21 @@ def rebar_schedule_with_preflight(
     tangent_tolerance_rad: float = 1e-6,
 ) -> RebarSchedule: ...
 
+def rebar_schedule_with_fabrication_precheck(
+    ifc_bytes: bytes,
+    ids: Optional[Set[int]] = None,
+    *,
+    min_inside_bend_radius_m: Optional[float] = None,
+    min_straight_segment_length_m: Optional[float] = None,
+    min_bend_angle_rad: Optional[float] = None,
+    max_bend_angle_rad: Optional[float] = None,
+    max_nominal_geometric_diameter_delta_m: Optional[float] = None,
+    max_developed_centreline_length_m: Optional[float] = None,
+    zero_length_tolerance_m: float = 1e-9,
+    gap_tolerance_m: float = 1e-6,
+    tangent_tolerance_rad: float = 1e-6,
+) -> RebarSchedule: ...
+
 def entity_data(
     ifc_bytes: bytes,
     placements: bool = False,
@@ -629,4 +675,36 @@ def entity_data(
     Raises:
         RuntimeError: the extraction pipeline failed.
     """
+    ...
+
+class AlignmentSample(TypedDict):
+    geometric_horizontal_distance_m: float
+    point: List[float]  # absolute world IFC Z-up metres, f64
+    tangent: List[float]  # unit world-space tangent
+
+class SampledAlignmentAxis(TypedDict):
+    express_id: int
+    GlobalId: Optional[str]
+    Name: Optional[str]
+    geometric_horizontal_length_m: float
+    samples: List[AlignmentSample]
+
+class AlignmentSamplingDiagnostic(TypedDict):
+    express_id: Optional[int]
+    code: Literal["unit_resolution", "invalid_axis", "approximate_curve", "axis_sample_limit", "total_sample_limit"]
+    message: str
+
+class AlignmentAxes(TypedDict):
+    axes: Dict[int, SampledAlignmentAxis]
+    diagnostics: List[AlignmentSamplingDiagnostic]
+    diagnostics_omitted: int
+
+def alignment_axes(
+    ifc_bytes: bytes,
+    *,
+    spacing_m: float = ...,
+    max_samples_per_axis: int = ...,
+    max_total_samples: int = ...,
+) -> AlignmentAxes:
+    """Bounded samples in geometric horizontal metres from each physical start, not authored chainage."""
     ...

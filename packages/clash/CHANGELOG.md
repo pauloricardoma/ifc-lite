@@ -1,5 +1,32 @@
 # @ifc-lite/clash
 
+## 2.4.4
+
+### Patch Changes
+
+- [#6579](https://github.com/LTplus-AG/ifc-lite/pull/6579) [`d92c25d`](https://github.com/LTplus-AG/ifc-lite/commit/d92c25da46cc45ac65028ccb452dc3f1703f5615) Thanks [@louistrue](https://github.com/louistrue)! - Compare large clash runs without exceeding JavaScript's call-argument limit when appending revision buckets. Preserve every occurrence and deterministic ordering while avoiding temporary copies of reloaded bucket ranges.
+- Updated dependencies [[`1051a74`](https://github.com/LTplus-AG/ifc-lite/commit/1051a74edca83eb3e6104562a7a65e0e645ac45b), [`89be760`](https://github.com/LTplus-AG/ifc-lite/commit/89be760d4eb8adba93e9f5660f6e4ceda0c507d5), [`6dace7b`](https://github.com/LTplus-AG/ifc-lite/commit/6dace7b05927505e9a9529674c635a505ce0c887), [`7780cb0`](https://github.com/LTplus-AG/ifc-lite/commit/7780cb05878c574ebd2a9f631ca6757233e845d3), [`dd8e27c`](https://github.com/LTplus-AG/ifc-lite/commit/dd8e27cccbfd27cc6c16f09d66542c1c9bd17075), [`e01487f`](https://github.com/LTplus-AG/ifc-lite/commit/e01487ff2f40fa758b73b3ec9a6abba9f9ff646b), [`526a91b`](https://github.com/LTplus-AG/ifc-lite/commit/526a91bdf33e2be2d6167df95a68db343b5337c0), [`4c0ebf2`](https://github.com/LTplus-AG/ifc-lite/commit/4c0ebf24c8c7b8470602300d56f0b1bd7c2a01e0), [`ec983d3`](https://github.com/LTplus-AG/ifc-lite/commit/ec983d378bfccc2b65fb636a76e321a2c9482aa4)]:
+  - @ifc-lite/geometry@7.7.0
+  - @ifc-lite/wasm@10.3.0
+  - @ifc-lite/parser@9.2.0
+
+## 2.4.3
+
+### Patch Changes
+
+- [#6022](https://github.com/LTplus-AG/ifc-lite/pull/6022) [`46efab7`](https://github.com/LTplus-AG/ifc-lite/commit/46efab72317a6f9603f236f6f4784e1c7bdb6be4) Thanks [@louistrue](https://github.com/louistrue)! - A through-penetration between two boxes no longer reports a depth larger than the distance that actually separates them.
+  
+  When one box pierces clean through another (a duct through a wall, two crossing walls), the engine reports the bounding-box estimate instead of the exact box depth, because the exact depth is inflated by the piercing member's own length. For rotated boxes that estimate is inflated too, and when a member pokes out of the far face by only microns, float32 rounding decides per placement whether the pair counts as a through-penetration. A 26 mm overlap was reported as 0.026 m at one position and 0.786 m at another, depending only on where the model sat.
+  
+  The reported depth of a through-penetration between two boxes is now capped by the exact box depth. That distance is proven to separate the pair, so a larger number over-reports it. In the case above, both sides of the tie now report the same 26 mm, and the result is still labelled an estimate. A thin member through a thick element, where the estimate is smaller than the exact depth, is unchanged. On 11 sample models (about 370 clash records), no reported depth or label changes.
+- Updated dependencies [[`f8303f2`](https://github.com/LTplus-AG/ifc-lite/commit/f8303f2ef22706718b616a20b4c04d22c86d5e4d), [`46efab7`](https://github.com/LTplus-AG/ifc-lite/commit/46efab72317a6f9603f236f6f4784e1c7bdb6be4), [`05a2221`](https://github.com/LTplus-AG/ifc-lite/commit/05a222113355eea2e89d81acab74c62a5e77aa3f), [`cd11f20`](https://github.com/LTplus-AG/ifc-lite/commit/cd11f203e11701ce8a9d0364baa4255b71a2fd0e), [`888a9a7`](https://github.com/LTplus-AG/ifc-lite/commit/888a9a72e1b1f59a0692942b15612a62c87033cb), [`8ac81f7`](https://github.com/LTplus-AG/ifc-lite/commit/8ac81f7346ac346d2b8279b44df72a1679d105f3), [`438f9f8`](https://github.com/LTplus-AG/ifc-lite/commit/438f9f89c86ee8d36fc51aa6affa1c400d0657b4), [`64fc00a`](https://github.com/LTplus-AG/ifc-lite/commit/64fc00a700124a9a2ee73a778110704fe49ca36a), [`c1bff6c`](https://github.com/LTplus-AG/ifc-lite/commit/c1bff6c774cc6fbc51d0600d337ad516f3e60a21), [`443e013`](https://github.com/LTplus-AG/ifc-lite/commit/443e013ac6c1b5664a43c9b5df2e5600219c706b), [`d3d2d6f`](https://github.com/LTplus-AG/ifc-lite/commit/d3d2d6fd64ef66ffb6dc4f117c188661ecfa05a5), [`c2b72b7`](https://github.com/LTplus-AG/ifc-lite/commit/c2b72b78ac6da3830267eec5f32cc6baf22055d8), [`1edec99`](https://github.com/LTplus-AG/ifc-lite/commit/1edec99fb723acf61863cb6cf30d480dcb69786f), [`509a65e`](https://github.com/LTplus-AG/ifc-lite/commit/509a65e267ea45a4f5e8285a1e34b9b54fa70dbb), [`9bd4d3c`](https://github.com/LTplus-AG/ifc-lite/commit/9bd4d3c88336de33eb20d3d405989c1f2d8297cf), [`d0d79ed`](https://github.com/LTplus-AG/ifc-lite/commit/d0d79ed15415c7391640ad0660ad17f8d5ebbb5b), [`17bbdf2`](https://github.com/LTplus-AG/ifc-lite/commit/17bbdf29a624072119c22cc1a50538f9edef5ad5), [`88b454a`](https://github.com/LTplus-AG/ifc-lite/commit/88b454a10da0f27b90799cbc1469fccf9d70a2c7), [`05a2221`](https://github.com/LTplus-AG/ifc-lite/commit/05a222113355eea2e89d81acab74c62a5e77aa3f), [`72b6b77`](https://github.com/LTplus-AG/ifc-lite/commit/72b6b77e3ef810c5ea9d22b9e9df178e749094c3), [`3f38367`](https://github.com/LTplus-AG/ifc-lite/commit/3f383676a094ad28724b4fd789e240740a865d64), [`1eb821b`](https://github.com/LTplus-AG/ifc-lite/commit/1eb821b9e6223fdf0243d3ad3dd7e0ca14e84e13), [`0476281`](https://github.com/LTplus-AG/ifc-lite/commit/0476281b0476ec65564e65b6fc7cfe729a3982bb), [`773a54f`](https://github.com/LTplus-AG/ifc-lite/commit/773a54ff450d872bc6cd49ec7e0a1108b965cf96), [`da22190`](https://github.com/LTplus-AG/ifc-lite/commit/da22190245789a7e3240b8dbb6de5717415ac448), [`eb09636`](https://github.com/LTplus-AG/ifc-lite/commit/eb096369e13edcbb933c989ab87372d5062e975b), [`9828849`](https://github.com/LTplus-AG/ifc-lite/commit/9828849515862f0649f31a6433a5870e77249709), [`59b0668`](https://github.com/LTplus-AG/ifc-lite/commit/59b06685f2a0604c0ff305b63d831a81ecaff199), [`10b3a44`](https://github.com/LTplus-AG/ifc-lite/commit/10b3a44ea325740562be7cafab14e28beebd3180), [`673cb3f`](https://github.com/LTplus-AG/ifc-lite/commit/673cb3f38c1eea117c2176565b6937538c3dfaa5), [`0ae5784`](https://github.com/LTplus-AG/ifc-lite/commit/0ae5784d8251134aab778e9c86e787f2f77286cd)]:
+  - @ifc-lite/parser@9.1.0
+  - @ifc-lite/wasm@10.2.0
+  - @ifc-lite/geometry@7.6.0
+  - @ifc-lite/ifcx@4.3.0
+  - @ifc-lite/query@2.5.2
+  - @ifc-lite/encoding@2.3.0
+
 ## 2.4.2
 
 ### Patch Changes

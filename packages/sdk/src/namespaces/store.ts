@@ -5,8 +5,6 @@
 import { isInstantiable, isKnownType, normalizeIfcTypeName } from '@ifc-lite/parser';
 import type {
   CostItemParams, CostQuantityParams, CostScheduleParams, CostValueParams,
-  HostedDoorInStoreParams, HostedWindowInStoreParams, OpeningInStoreParams, ElementTypeInStoreParams,
-  MaterialInStoreParams, MaterialLayerSetInStoreParams, MaterialLayerSetUsageInStoreParams,
   StructuralAnalysisModelInStoreParams,
   StructuralCurveMemberInStoreParams,
   StructuralLinearActionInStoreParams,
@@ -15,19 +13,18 @@ import type {
   StructuralPointConnectionInStoreParams,
 } from '@ifc-lite/create';
 import type {
-  AddBeamInStoreParams,
-  AddColumnInStoreParams,
   AddDoorInStoreParams,
-  AddMemberInStoreParams,
   AddPlateInStoreParams,
   AddRoofInStoreParams,
   AddSlabInStoreParams,
   AddSpaceInStoreParams,
   AddWallInStoreParams,
   AddWindowInStoreParams,
-  BimBackend,
   EntityRef,
+  StoreBackendMethods,
 } from '../types.js';
+
+import { StoreModellingNamespace } from './store-modelling.js';
 
 /**
  * `bim.store` — document-level edits on a parsed model.
@@ -44,9 +41,7 @@ import type {
  * Changes accumulate in a per-model overlay and are flushed to the IFC
  * file on the next `bim.export.ifc({ applyMutations: true })`.
  */
-export class StoreNamespace {
-  constructor(private backend: BimBackend) {}
-
+export class StoreNamespace extends StoreModellingNamespace {
   /**
    * Inject a new entity into the active model. Returns an `EntityRef`
    * pointing at the freshly-allocated expressId.
@@ -135,8 +130,9 @@ export class StoreNamespace {
    * so the column appears next to the existing model on export.
    *
    * `Position` is the base centre in storey-local coordinates (metres),
-   * `Width`×`Depth` is the centred rectangular cross-section, and
-   * `Height` is the +Z extrusion length.
+   * `Width`×`Depth` selects a centred rectangle; `Profile` selects the
+   * canonical parameterised section. `RefDirection` turns its local X axis
+   * in the storey plane, and `Height` is the +Z extrusion length.
    *
    * @example
    *   const storeyId = bim.query.byType('IfcBuildingStorey')[0].ref.expressId;
@@ -146,7 +142,7 @@ export class StoreNamespace {
    *     Name: 'Column 1',
    *   });
    */
-  addColumn(modelId: string, storeyExpressId: number, params: AddColumnInStoreParams): EntityRef {
+  addColumn(modelId: string, storeyExpressId: number, params: Parameters<StoreBackendMethods['addColumn']>[2]): EntityRef {
     return this.backend.store.addColumn(modelId, storeyExpressId, params);
   }
 
@@ -175,11 +171,11 @@ export class StoreNamespace {
   }
 
   /**
-   * Add an IfcBeam between `Start` and `End` with a centred rectangular
-   * cross-section (`Width` × `Height`). Local Z is the beam axis so the
-   * extrusion runs along the beam.
+   * Add an IfcBeam between `Start` and `End` with a centred rectangle
+   * (`Width` × `Height`) or parameterised `Profile`. Local Z is the beam
+   * axis so the extrusion runs along the beam.
    */
-  addBeam(modelId: string, storeyExpressId: number, params: AddBeamInStoreParams): EntityRef {
+  addBeam(modelId: string, storeyExpressId: number, params: Parameters<StoreBackendMethods['addBeam']>[2]): EntityRef {
     return this.backend.store.addBeam(modelId, storeyExpressId, params);
   }
 
@@ -223,60 +219,11 @@ export class StoreNamespace {
 
   /**
    * Add an IfcMember (generic structural member — brace, post, strut)
-   * between `Start` and `End`. Same axial extrusion as `addBeam`;
-   * choose the PredefinedType to disambiguate the role.
+   * between `Start` and `End`. Same rectangular or parameterised Profile
+   * extrusion as `addBeam`; choose PredefinedType to disambiguate the role.
    */
-  addMember(modelId: string, storeyExpressId: number, params: AddMemberInStoreParams): EntityRef {
+  addMember(modelId: string, storeyExpressId: number, params: Parameters<StoreBackendMethods['addMember']>[2]): EntityRef {
     return this.backend.store.addMember(modelId, storeyExpressId, params);
-  }
-
-  // -- Openings, hosted fillings, types and materials (#6232 M3) -------------
-  // Hosts are existing IfcWall/IfcSlab; params are metres in the host's frame.
-  /** Cut an IfcOpeningElement (IfcRelVoidsElement) into a wall (`Offset`, `Sill`, `Width`, `Height`) or
-   *  slab (`Position` [x, y], `Width`, `Depth`); the cut spans the host body + 50 mm per face unless `CutDepth`. */
-  addOpening(modelId: string, hostExpressId: number, params: OpeningInStoreParams): EntityRef {
-    return this.backend.store.addOpening(modelId, hostExpressId, params);
-  }
-
-  /** Add an IfcDoor filling a new opening in a wall (IfcRelFillsElement). `Sill` defaults to 0. */
-  addHostedDoor(modelId: string, hostExpressId: number, params: HostedDoorInStoreParams): EntityRef {
-    return this.backend.store.addHostedDoor(modelId, hostExpressId, params);
-  }
-
-  /** Add an IfcWindow filling a new opening in a wall (IfcRelFillsElement), bottom edge at `Sill`. */
-  addHostedWindow(modelId: string, hostExpressId: number, params: HostedWindowInStoreParams): EntityRef {
-    return this.backend.store.addHostedWindow(modelId, hostExpressId, params);
-  }
-
-  // IFC4 practice: IfcMaterialLayerSet on the type, a usage of it on each occurrence.
-  /** Add an IfcElementType subtype (e.g. `{ Type: 'IfcWallType', Name, PredefinedType }`), laid out for the model's schema. */
-  addElementType(modelId: string, params: ElementTypeInStoreParams): EntityRef {
-    return this.backend.store.addElementType(modelId, params);
-  }
-
-  /** Type objects via IfcRelDefinesByType; an object already typed moves to this type. Returns the relationship. */
-  assignType(modelId: string, typeExpressId: number, objectExpressIds: number[]): EntityRef {
-    return this.backend.store.assignType(modelId, typeExpressId, objectExpressIds);
-  }
-
-  /** Add an IfcMaterial. */
-  addMaterial(modelId: string, params: MaterialInStoreParams): EntityRef {
-    return this.backend.store.addMaterial(modelId, params);
-  }
-
-  /** Add an IfcMaterialLayerSet of IfcMaterialLayers (`MaterialLayers[i].LayerThickness` in metres). */
-  addMaterialLayerSet(modelId: string, params: MaterialLayerSetInStoreParams): EntityRef {
-    return this.backend.store.addMaterialLayerSet(modelId, params);
-  }
-
-  /** Add an IfcMaterialLayerSetUsage (default AXIS2/POSITIVE; `OffsetFromReferenceLine` in metres). */
-  addMaterialLayerSetUsage(modelId: string, params: MaterialLayerSetUsageInStoreParams): EntityRef {
-    return this.backend.store.addMaterialLayerSetUsage(modelId, params);
-  }
-
-  /** Associate a material with objects via IfcRelAssociatesMaterial, replacing their previous one. Returns the relationship. */
-  assignMaterial(modelId: string, materialExpressId: number, objectExpressIds: number[]): EntityRef {
-    return this.backend.store.assignMaterial(modelId, materialExpressId, objectExpressIds);
   }
 
   // -- Cost / 5D authoring on a loaded model (#4857 PR A) --------------------

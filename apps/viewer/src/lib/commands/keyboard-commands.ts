@@ -34,8 +34,6 @@ export type KeyContext =
   | 'overlay'
   | 'tool.walk'
   | 'tool.measure'
-  | 'tool.addElement'
-  | 'tool.spaceSketch'
   /** While a modeling command runs (Model workspace, charter #6232). */
   | 'command'
   /** One modeling command's own keys, e.g. `command.wall.place`. */
@@ -106,16 +104,12 @@ export const KEY_COMMANDS = [
   { id: 'tool.split', labelKey: 'commands.tool.split', category: 'tools', when: 'global', keys: [k('k')] },
   { id: 'walk.move', labelKey: 'commands.walk.move', category: 'tools', when: 'tool.walk', keys: [k('w'), k('a'), k('s'), k('d')] },
   { id: 'walk.moveArrows', labelKey: 'commands.walk.moveArrows', category: 'tools', when: 'tool.walk', keys: [k('arrowup'), k('arrowleft'), k('arrowdown'), k('arrowright')] },
+  { id: 'walk.jump', labelKey: 'commands.walk.jump', category: 'tools', when: 'tool.walk', keys: [k(' ')] },
+  { id: 'walk.crouch', labelKey: 'commands.walk.crouch', category: 'tools', when: 'tool.walk', keys: [k('z')] },
+  { id: 'walk.toggleCollision', labelKey: 'commands.walk.toggleCollision', category: 'tools', when: 'tool.walk', keys: [k('g')] },
   { id: 'measure.toggleSnap', labelKey: 'commands.measure.toggleSnap', category: 'tools', when: 'tool.measure', keys: [k('s')] },
   { id: 'measure.cancel', labelKey: 'commands.measure.cancel', category: 'tools', when: 'tool.measure', keys: [k('escape')] },
   { id: 'measure.finish', labelKey: 'commands.measure.finish', category: 'tools', when: 'tool.measure', keys: [k('enter')] },
-  { id: 'addElement.commit', labelKey: 'commands.addElement.commit', category: 'tools', when: 'tool.addElement', keys: [k('enter')] },
-  { id: 'addElement.clearPending', labelKey: 'commands.addElement.clearPending', category: 'tools', when: 'tool.addElement', keys: [k('escape')] },
-  { id: 'addElement.toggleSnap', labelKey: 'commands.addElement.toggleSnap', category: 'tools', when: 'tool.addElement', keys: [k('s')] },
-  { id: 'spaceSketch.undo', labelKey: 'commands.spaceSketch.undo', category: 'tools', when: 'tool.spaceSketch', keys: [k('z', { mod: true })] },
-  { id: 'spaceSketch.redo', labelKey: 'commands.spaceSketch.redo', category: 'tools', when: 'tool.spaceSketch', keys: [k('z', { mod: true, shift: true })] },
-  { id: 'spaceSketch.commit', labelKey: 'commands.spaceSketch.commit', category: 'tools', when: 'tool.spaceSketch', keys: [k('enter')] },
-  { id: 'spaceSketch.cancel', labelKey: 'commands.spaceSketch.cancel', category: 'tools', when: 'tool.spaceSketch', keys: [k('escape')] },
   { id: 'command.commit', labelKey: 'commands.command.commit', category: 'tools', when: 'command', keys: [k('enter')] },
   { id: 'command.cancel', labelKey: 'commands.command.cancel', category: 'tools', when: 'command', keys: [k('escape')] },
   { id: 'command.undoPoint', labelKey: 'commands.command.undoPoint', category: 'tools', when: 'command', keys: [k('backspace')] },
@@ -127,8 +121,27 @@ export const KEY_COMMANDS = [
   { id: 'model.slab', labelKey: 'commands.model.slab', category: 'tools', when: 'workspace.model', keys: [k('s', { shift: true })] },
   { id: 'model.column', labelKey: 'commands.model.column', category: 'tools', when: 'workspace.model', keys: [k('c', { shift: true })] },
   { id: 'model.beam', labelKey: 'commands.model.beam', category: 'tools', when: 'workspace.model', keys: [k('b', { shift: true })] },
+  { id: 'model.room', labelKey: 'commands.model.room', category: 'tools', when: 'workspace.model', keys: [k('o', { shift: true })] },
+  { id: 'model.curtainWall', labelKey: 'commands.model.curtainWall', category: 'tools', when: 'workspace.model', keys: [k('u', { shift: true })] },
+  { id: 'model.grid', labelKey: 'commands.model.grid', category: 'tools', when: 'workspace.model', keys: [k('g', { shift: true })] },
+  { id: 'model.opening', labelKey: 'commands.model.opening', category: 'tools', when: 'workspace.model', keys: [k('h', { shift: true })] },
+  { id: 'model.door', labelKey: 'commands.model.door', category: 'tools', when: 'workspace.model', keys: [k('d', { shift: true })] },
+  { id: 'model.window', labelKey: 'commands.model.window', category: 'tools', when: 'workspace.model', keys: [k('w', { shift: true })] },
+  { id: 'model.splitMulti', labelKey: 'commands.model.splitMulti', category: 'tools', when: 'workspace.model', keys: [k('k', { shift: true })] },
   { id: 'model.storeyUp', labelKey: 'commands.model.storeyUp', category: 'tools', when: 'workspace.model', keys: [k('pageup')] },
   { id: 'model.storeyDown', labelKey: 'commands.model.storeyDown', category: 'tools', when: 'workspace.model', keys: [k('pagedown')] },
+  { id: 'model.copy', labelKey: 'commands.model.copy', category: 'editing', when: 'workspace.model', keys: [k('c', { mod: true })] },
+  { id: 'model.paste', labelKey: 'commands.model.paste', category: 'editing', when: 'workspace.model', keys: [k('v', { mod: true })] },
+  { id: 'model.pasteInPlace', labelKey: 'commands.model.pasteInPlace', category: 'editing', when: 'workspace.model', keys: [k('v', { mod: true, shift: true })] },
+  { id: 'model.array', labelKey: 'commands.model.array', category: 'tools', when: 'workspace.model', keys: [k('a', { shift: true })] },
+  { id: 'model.move', labelKey: 'commands.model.move', category: 'tools', when: 'workspace.model', keys: [k('m', { shift: true })] },
+  { id: 'model.rotate', labelKey: 'commands.model.rotate', category: 'tools', when: 'workspace.model', keys: [k('q', { shift: true })] },
+  { id: 'command.element.rotate.pivot', labelKey: 'commands.command.rotatePivot', category: 'tools', when: 'command.element.rotate', keys: [k('p')] },
+  { id: 'model.stair', labelKey: 'commands.model.stair', category: 'tools', when: 'workspace.model', keys: [k('t', { shift: true })] },
+  { id: 'model.railing', labelKey: 'commands.model.railing', category: 'tools', when: 'workspace.model', keys: [k('l', { shift: true })] },
+  { id: 'model.pushPull', labelKey: 'commands.model.pushPull', category: 'tools', when: 'workspace.model', keys: [k('p', { shift: true })] },
+  { id: 'model.align', labelKey: 'commands.model.align', category: 'tools', when: 'workspace.model', keys: [k('j', { shift: true })] },
+  { id: 'model.trimExtend', labelKey: 'commands.model.trimExtend', category: 'tools', when: 'workspace.model', keys: [k('e', { shift: true })] },
   { id: 'drawing2d.cancel', labelKey: 'commands.drawing2d.cancel', category: 'tools', when: 'drawing2d', keys: [k('escape')] },
   { id: 'drawing2d.delete', labelKey: 'commands.drawing2d.delete', category: 'tools', when: 'drawing2d', keys: [k('delete'), k('backspace')] },
   { id: 'drawing2d.orthogonal', labelKey: 'commands.drawing2d.orthogonal', category: 'tools', when: 'drawing2d', keys: [k('shift')] },
