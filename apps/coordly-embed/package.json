@@ -16,8 +16,8 @@
     "@ifc-lite/clash": "workspace:*",
     "@ifc-lite/geometry": "workspace:*",
     "@ifc-lite/server-client": "workspace:*",
-    "apache-arrow": "^21.1.0",
-    "parquet-wasm": "^0.7.1"
+    "apache-arrow": "21.2.0",
+    "parquet-wasm": "0.7.2"
   },
   "devDependencies": {
     "typescript": "^6.0.3",

@@ -206,10 +206,10 @@ importers:
         specifier: workspace:*
         version: link:../../packages/server-client
       apache-arrow:
-        specifier: ^21.1.0
+        specifier: 21.2.0
         version: 21.2.0
       parquet-wasm:
-        specifier: ^0.7.1
+        specifier: 0.7.2
         version: 0.7.2
     devDependencies:
       typescript:
