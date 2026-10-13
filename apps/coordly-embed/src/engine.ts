@@ -307,6 +307,7 @@ export class ViewerEngine {
   private renderer!: Renderer;
   private camera: any;
   private disposed = false;
+  private resizeObserver: ResizeObserver | null = null;
   private aborter = new AbortController();
   private restoreErrorLogged = false;
   private restoreConsole: (() => void) | null = null;
@@ -2160,6 +2161,8 @@ export class ViewerEngine {
     this.releaseDataStores();
     window.removeEventListener('keydown', this.onKeyDown);
     window.removeEventListener('resize', this.onWindowResize);
+    this.resizeObserver?.disconnect();
+    this.resizeObserver = null;
     this.measure?.dispose();
     this.measure = null;
     this.restoreConsole?.();
@@ -2296,6 +2299,11 @@ export class ViewerEngine {
       this.renderer.requestRender();
     }, { passive: false });
     window.addEventListener('resize', this.onWindowResize);
+    // O container muda de tamanho sem resize da janela: CSS do host aplicado
+    // depois do mount (canvas medido sem altura, preso no topo) ou drawer do
+    // federado abrindo e fechando.
+    this.resizeObserver = new ResizeObserver(this.onWindowResize);
+    this.resizeObserver.observe(this.canvas);
   }
 
   private readonly onWindowResize = () => {
