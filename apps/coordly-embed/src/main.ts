@@ -105,6 +105,8 @@ export function initCoordly3DViewer(config: BimConfig): BimInstance {
     // Seleção da árvore → 3D (o inverso já sai por 'bim-selection-changed').
     select: (expressId: number | null, opts?: { frame?: boolean; additive?: boolean; modelIndex?: number }) =>
       engine.selectEntity(expressId, opts ?? {}),
+    selectEntities: (expressIds: number[], opts?: { frame?: boolean; modelIndex?: number }) =>
+      engine.selectEntities(expressIds, opts ?? {}),
     clearSelection: () => engine.clearSelection(),
     // Modo "adicionar à seleção" (o botão da toolbar); Ctrl/Shift no clique
     // fazem o mesmo pontualmente.
@@ -224,6 +226,7 @@ declare global {
         modelIndex?: number,
       ): Promise<{ globalId: string; expressId: number }[]>;
       select(expressId: number | null, opts?: { frame?: boolean; additive?: boolean; modelIndex?: number }): void;
+      selectEntities(expressIds: number[], opts?: { frame?: boolean; modelIndex?: number }): void;
       clearSelection(): void;
       setMultiSelect(enabled: boolean): void;
       setGhostMode(enabled: boolean): void;

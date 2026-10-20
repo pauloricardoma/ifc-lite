@@ -1714,6 +1714,27 @@ export class ViewerEngine {
     this.emitSelection();
   }
 
+  /**
+   * Seleção em lote vinda da árvore (pavimento, grupo de tipo): pinta todos os
+   * elementos do nó, sem um elemento principal. Substitui a seleção atual.
+   */
+  selectEntities(
+    localIds: number[],
+    opts: { frame?: boolean; modelIndex?: number } = {},
+  ): void {
+    if (this.disposed || !this.renderer) { return; }
+    if (localIds.length === 0) { this.clearSelection(); return; }
+
+    const sceneIds = this.models.size === 0 ? localIds : this.sceneIds(localIds, opts.modelIndex);
+    this.selectedIds = new Set(sceneIds);
+    this.selectedId = null;
+    this.selectedModelIndex = opts.modelIndex;
+
+    if (opts.frame) { this.frameEntities(localIds, opts.modelIndex); }
+    this.renderer.requestRender();
+    this.emitSelection();
+  }
+
   clearSelection(): void {
     this.selectedIds.clear();
     this.selectedId = null;
