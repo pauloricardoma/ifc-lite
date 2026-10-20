@@ -386,7 +386,7 @@ export class ViewerEngine {
     // Esc: a medição vem primeiro — é o que o usuário está fazendo. Sai da ação
     // inteira (traçado + ferramenta), por isso o cursor volta junto.
     if (this.measure?.cancel()) {
-      this.canvas.style.cursor = '';
+      this.canvas.style.cursor = this.baseCursor();
       this.renderer?.requestRender();
       return;
     }
@@ -2087,7 +2087,7 @@ export class ViewerEngine {
    */
   setMeasureMode(mode: MeasureMode): void {
     this.measure?.setMode(mode);
-    this.canvas.style.cursor = mode === 'none' ? '' : 'crosshair';
+    this.canvas.style.cursor = this.baseCursor();
     this.renderer?.requestRender();
   }
 
@@ -2242,6 +2242,11 @@ export class ViewerEngine {
     requestAnimationFrame(frame);
   }
 
+  /** Cursor fora de um arrasto: o da ferramenta ativa. */
+  private baseCursor(): string {
+    return this.measure?.isActive() ? 'crosshair' : '';
+  }
+
   private wireControls(): void {
     const c = this.canvas;
     let dragging = false, lastX = 0, lastY = 0, button = 0, moved = 0;
@@ -2252,6 +2257,7 @@ export class ViewerEngine {
     });
     c.addEventListener('pointerup', (e) => {
       dragging = false;
+      c.style.cursor = this.baseCursor();
       if (button !== 0 || moved >= CLICK_DRAG_PX) { return; }
       // Medindo, o clique é ponto de medida — não seleção. Orbitar continua
       // valendo (o arrasto nem chega aqui).
@@ -2285,7 +2291,11 @@ export class ViewerEngine {
       const dx = e.clientX - lastX, dy = e.clientY - lastY;
       lastX = e.clientX; lastY = e.clientY;
       moved += Math.abs(dx) + Math.abs(dy);
-      if (button === 2 || e.shiftKey) { this.camera.pan(dx, dy); } else { this.camera.orbit(dx, dy); }
+      // Pan só pelo botão direito/do meio: Shift e Ctrl são da seleção múltipla.
+      const pan = button === 1 || button === 2;
+      // Troca só depois do limiar, senão o cursor pisca a cada clique de seleção.
+      if (moved >= CLICK_DRAG_PX) { c.style.cursor = pan ? 'grabbing' : 'move'; }
+      if (pan) { this.camera.pan(dx, dy); } else { this.camera.orbit(dx, dy); }
       this.renderer.requestRender();
     });
     c.addEventListener('pointerleave', () => {
