@@ -1709,6 +1709,7 @@ export class ViewerEngine {
     // faz as propriedades saírem do data model do arquivo clicado.
     this.selectedModelIndex = opts.modelIndex;
 
+    this.syncOrbitPivot();
     if (opts.frame) { this.frameEntities([expressId], opts.modelIndex); }
     this.renderer.requestRender();
     this.emitSelection();
@@ -1730,6 +1731,7 @@ export class ViewerEngine {
     this.selectedId = null;
     this.selectedModelIndex = opts.modelIndex;
 
+    this.syncOrbitPivot();
     if (opts.frame) { this.frameEntities(localIds, opts.modelIndex); }
     this.renderer.requestRender();
     this.emitSelection();
@@ -1739,6 +1741,7 @@ export class ViewerEngine {
     this.selectedIds.clear();
     this.selectedId = null;
     this.selectedModelIndex = undefined;
+    this.camera?.setOrbitCenter(null);
     // O X-Ray do foco existe pra destacar a seleção e sai com ela. O ghost do
     // modelo, pedido na toolbar, fica: é modo de visualização.
     this.ghost = this.ghostPinned;
@@ -1974,13 +1977,25 @@ export class ViewerEngine {
   /** Enquadra a união dos bounding boxes das entidades (zoom-to-selection). */
   frameEntities(localIds: number[], modelIndex?: number): void {
     if (this.disposed || !this.renderer || localIds.length === 0) { return; }
-    const scene = this.renderer.getScene();
     // Aceita id do arquivo OU da cena: `frameEntities` é chamada tanto pelo app
     // (árvore) quanto internamente pelo foco, que já trabalha com id da cena.
     const expressIds = this.models.size === 0
       ? localIds
       : this.sceneIds(localIds, modelIndex).concat(localIds);
 
+    // Sem geometria carregada pra esses ids (elemento sem representação, ou
+    // ainda não decodificado): melhor não mover a câmera do que mandá-la pro
+    // infinito.
+    const bounds = this.boundsOf(expressIds);
+    if (!bounds) { return; }
+
+    void this.camera.frameBounds(bounds.min, bounds.max);
+    this.renderer.requestRender();
+  }
+
+  /** AABB somada dos ids da cena; `null` se nenhum tem geometria. */
+  private boundsOf(expressIds: Iterable<number>): { min: Vec3; max: Vec3 } | null {
+    const scene = this.renderer.getScene();
     let min = { x: Infinity, y: Infinity, z: Infinity };
     let max = { x: -Infinity, y: -Infinity, z: -Infinity };
     let found = false;
@@ -1991,13 +2006,18 @@ export class ViewerEngine {
       min = { x: Math.min(min.x, box.min.x), y: Math.min(min.y, box.min.y), z: Math.min(min.z, box.min.z) };
       max = { x: Math.max(max.x, box.max.x), y: Math.max(max.y, box.max.y), z: Math.max(max.z, box.max.z) };
     }
-    // Sem geometria carregada pra esses ids (elemento sem representação, ou
-    // ainda não decodificado): melhor não mover a câmera do que mandá-la pro
-    // infinito.
-    if (!found) { return; }
+    return found ? { min, max } : null;
+  }
 
-    void this.camera.frameBounds(min, max);
-    this.renderer.requestRender();
+  /**
+   * O orbit gira em volta do centro da seleção; sem seleção (ou sem geometria),
+   * volta pro `camera.target`. O motor já desloca o pivô junto no pan/zoom.
+   */
+  private syncOrbitPivot(): void {
+    const b = this.selectedIds.size > 0 ? this.boundsOf(this.selectedIds) : null;
+    this.camera.setOrbitCenter(b && {
+      x: (b.min.x + b.max.x) / 2, y: (b.min.y + b.max.y) / 2, z: (b.min.z + b.max.z) / 2,
+    });
   }
 
   /**
@@ -2169,6 +2189,7 @@ export class ViewerEngine {
       // renderer compara no highlight; quem sai pra fora é o id do arquivo.
       this.selectedId = this.selectedIds.has(hit.expressId) ? hit.expressId : null;
       this.selectedModelIndex = hit.modelIndex;
+      this.syncOrbitPivot();
       if (opts.focus) { this.focusSelection(); }
       this.renderer.requestRender();
       this.emitSelection();
