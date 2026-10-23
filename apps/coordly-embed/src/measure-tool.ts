@@ -62,17 +62,19 @@ export class MeasureTool {
       'position:absolute', 'inset:0', 'width:100%', 'height:100%',
       'pointer-events:none', 'overflow:visible',
     ].join(';'));
-    // O container do viewer não é posicionado por padrão; sem isto o overlay
-    // ancoraria no primeiro pai posicionado, que pode ser a página inteira.
-    if (getComputedStyle(deps.container).position === 'static') {
-      deps.container.style.position = 'relative';
-    }
     deps.container.appendChild(this.svg);
   }
 
   isActive(): boolean { return this.mode !== 'none'; }
 
   setMode(mode: MeasureMode): void {
+    // Sem container posicionado o overlay ancoraria no primeiro pai posicionado,
+    // que pode ser a página inteira. A checagem fica aqui, e não no mount: no F5
+    // o CSS do host ainda não chegou, o container parece `static` e o `relative`
+    // inline venceria o `position: absolute` dele, deixando o canvas sem altura.
+    if (mode !== 'none' && getComputedStyle(this.deps.container).position === 'static') {
+      this.deps.container.style.position = 'relative';
+    }
     this.mode = mode;
     this.points = [];
     this.cursor = null;
