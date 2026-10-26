@@ -358,6 +358,8 @@ export class ViewerEngine {
   // o mesmo Set todo frame não invalida cache.
   private hiddenIds = new Set<number>();
   private isolatedIds: Set<number> | null = null;
+  /** Isolamento pedido por modelo (cada árvore do federado); a cena isola a união. */
+  private isolatedByModel = new Map<number, Set<number>>();
   private section: SectionPlane | null = null;
   // Criada no init(), quando já existe câmera para projetar o overlay.
   private measure: MeasureTool | null = null;
@@ -1151,6 +1153,7 @@ export class ViewerEngine {
     // valer se a faixa fosse reusada.
     for (const id of model.ids) { this.hiddenIds.delete(id); this.ghostedIds.delete(id); }
     this.ghostRender = null;
+    this.isolatedByModel.delete(model.index);
     if (this.isolatedIds) {
       for (const id of model.ids) { this.isolatedIds.delete(id); }
       if (this.isolatedIds.size === 0) { this.isolatedIds = null; }
@@ -1408,6 +1411,7 @@ export class ViewerEngine {
     this.ghostedIds.clear();
     this.ghostRender = null;
     this.isolatedIds = null;
+    this.isolatedByModel.clear();
     this.section = null;
     this.dataStore = null;
     this.renderer?.requestRender();
@@ -1955,7 +1959,11 @@ export class ViewerEngine {
     this.selectedModelIndex = indices.size === 1 ? sides[0].model.index : undefined;
 
     // O isolamento de um foco anterior não sobrevive ao próximo.
-    if (mode === 'isolate') { this.isolatedIds = new Set(sceneIds); this.clashIsolated = true; }
+    if (mode === 'isolate') {
+      this.isolatedIds = new Set(sceneIds);
+      this.isolatedByModel.clear();
+      this.clashIsolated = true;
+    }
     else if (this.clashIsolated) { this.isolatedIds = null; this.clashIsolated = false; }
     this.ghost = mode === 'ghost' || this.ghostPinned;
 
@@ -2041,15 +2049,30 @@ export class ViewerEngine {
     return out;
   }
 
-  /** `null`/vazio desliga o isolamento. */
-  isolate(expressIds: number[] | null): void {
-    const ids = expressIds && expressIds.length > 0 ? this.sceneIds(expressIds) : [];
-    this.isolatedIds = ids.length > 0 ? new Set(ids) : null;
+  /**
+   * `null`/vazio desliga o isolamento. Com `modelIndex`, troca só o isolamento
+   * daquele modelo e a cena mostra a união dos modelos isolados — é o que deixa
+   * as árvores do federado isolarem ao mesmo tempo sem uma apagar a outra.
+   */
+  isolate(expressIds: number[] | null, modelIndex?: number): void {
+    const ids = expressIds && expressIds.length > 0 ? this.sceneIds(expressIds, modelIndex) : [];
+    if (modelIndex === undefined) {
+      this.isolatedByModel.clear();
+      this.isolatedIds = ids.length > 0 ? new Set(ids) : null;
+    } else {
+      if (ids.length > 0) { this.isolatedByModel.set(modelIndex, new Set(ids)); }
+      else { this.isolatedByModel.delete(modelIndex); }
+      const union = new Set<number>();
+      for (const modelIds of this.isolatedByModel.values()) {
+        for (const id of modelIds) { union.add(id); }
+      }
+      this.isolatedIds = union.size > 0 ? union : null;
+    }
     this.renderer?.requestRender();
   }
 
-  hide(localIds: number[]): void {
-    const expressIds = this.sceneIds(localIds);
+  hide(localIds: number[], modelIndex?: number): void {
+    const expressIds = this.sceneIds(localIds, modelIndex);
     for (const id of expressIds) { this.hiddenIds.add(id); }
     this.ghostRender = null;
     // Diagnóstico: "sumiu mais do que eu selecionei" quase sempre é o conjunto
@@ -2062,8 +2085,8 @@ export class ViewerEngine {
     this.renderer?.requestRender();
   }
 
-  show(localIds: number[]): void {
-    for (const id of this.sceneIds(localIds)) { this.hiddenIds.delete(id); }
+  show(localIds: number[], modelIndex?: number): void {
+    for (const id of this.sceneIds(localIds, modelIndex)) { this.hiddenIds.delete(id); }
     this.ghostRender = null;
     this.renderer?.requestRender();
   }
@@ -2092,6 +2115,7 @@ export class ViewerEngine {
     this.ghostedIds.clear();
     this.ghostRender = null;
     this.isolatedIds = null;
+    this.isolatedByModel.clear();
     this.renderer?.requestRender();
   }
 

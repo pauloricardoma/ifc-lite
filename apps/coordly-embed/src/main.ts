@@ -115,9 +115,10 @@ export function initCoordly3DViewer(config: BimConfig): BimInstance {
     setGhostMode: (enabled: boolean) => engine.setGhostMode(enabled),
     focusSelection: () => engine.focusSelection(),
     frameEntities: (expressIds: number[], modelIndex?: number) => engine.frameEntities(expressIds, modelIndex),
-    isolate: (expressIds: number[] | null) => engine.isolate(expressIds),
-    hide: (expressIds: number[]) => engine.hide(expressIds),
-    show: (expressIds: number[]) => engine.show(expressIds),
+    // `modelIndex` escopa ao modelo (árvore federada): ids são locais a cada arquivo.
+    isolate: (expressIds: number[] | null, modelIndex?: number) => engine.isolate(expressIds, modelIndex),
+    hide: (expressIds: number[], modelIndex?: number) => engine.hide(expressIds, modelIndex),
+    show: (expressIds: number[], modelIndex?: number) => engine.show(expressIds, modelIndex),
     // Ghost na seleção: translúcido, mas ainda clicável (ocultar tira do pick).
     ghost: (expressIds: number[]) => engine.ghostEntities(expressIds),
     // Desfaz só o fantasma; o que o olho da árvore escondeu continua escondido.
@@ -232,9 +233,9 @@ declare global {
       setGhostMode(enabled: boolean): void;
       focusSelection(): void;
       frameEntities(expressIds: number[], modelIndex?: number): void;
-      isolate(expressIds: number[] | null): void;
-      hide(expressIds: number[]): void;
-      show(expressIds: number[]): void;
+      isolate(expressIds: number[] | null, modelIndex?: number): void;
+      hide(expressIds: number[], modelIndex?: number): void;
+      show(expressIds: number[], modelIndex?: number): void;
       ghost(expressIds: number[]): void;
       clearGhost(): void;
       showAll(): void;
