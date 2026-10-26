@@ -28,6 +28,12 @@ export interface BimTreeNode {
   elementCount: number;
   /** Só em `type-group`: os elementos do grupo. Nó espacial agrega pelos filhos. */
   expressIds?: number[];
+  /**
+   * Só em `type-group`: elemento → peças que o compõem (IfcRelAggregates, todos
+   * os níveis). Parede composta do Archicad tem a geometria nas
+   * IfcBuildingElementPart, que não estão contidas em pavimento nenhum.
+   */
+  parts?: Record<number, number[]>;
   children: BimTreeNode[];
 }
 
@@ -236,6 +242,8 @@ export class ModelDataStore {
     private readonly entities: EntityIndex,
     private readonly spatial: Map<number, RawSpatialNode>,
     private readonly roots: number[],
+    /** montagem → peças diretas. */
+    private readonly partsOf: Map<number, number[]>,
   ) {}
 
   /**
@@ -261,7 +269,10 @@ export class ModelDataStore {
     const entities = ModelDataStore.readEntities(table(entitiesData));
     onProgress?.(25);
     const { spatial, roots } = ModelDataStore.readSpatial(spatialData);
-    const store = new ModelDataStore(entities, spatial, roots);
+    // As relações entram antes da árvore só pelas peças; o laço pesado sobre elas
+    // (Psets) continua depois.
+    const relationships = table(relationshipsData);
+    const store = new ModelDataStore(entities, spatial, roots, ModelDataStore.readParts(relationships, spatial));
     const treeMs = Math.round(performance.now() - t0);
     onProgress?.(TREE_READY_AT);
 
@@ -275,9 +286,7 @@ export class ModelDataStore {
           onProgress?.(50);
           const qtos = table(quantitiesData);
           onProgress?.(55);
-          store.sets = ModelDataStore.readSets(props, qtos, rangeReporter(onProgress, 55, 90));
-          const relationships = table(relationshipsData);
-          onProgress?.(93);
+          store.sets = ModelDataStore.readSets(props, qtos, rangeReporter(onProgress, 55, 93));
           store.setsOf = ModelDataStore.readSetLinks(
             relationships, store.sets, rangeReporter(onProgress, 93, 100),
           );
@@ -394,6 +403,39 @@ export class ModelDataStore {
       if (current) { current.push(setId); } else { links.set(element, [setId]); }
     }
     return links;
+  }
+
+  /** IfcRelAggregates entre elementos; o desmembramento espacial já vem na seção espacial. */
+  private static readParts(t: arrow.Table, spatial: Map<number, RawSpatialNode>): Map<number, number[]> {
+    const relTypes = (col<string[]>(t, 'rel_type') ?? []) as string[];
+    const relating = col<Uint32Array>(t, 'relating_id') ?? new Uint32Array(0);
+    const related = col<Uint32Array>(t, 'related_id') ?? new Uint32Array(0);
+
+    const partsOf = new Map<number, number[]>();
+    for (let i = 0; i < relating.length; i++) {
+      if ((relTypes[i] ?? '').toUpperCase() !== 'IFCRELAGGREGATES') { continue; }
+      const whole = relating[i];
+      if (spatial.has(whole) || spatial.has(related[i])) { continue; }
+      const current = partsOf.get(whole);
+      if (current) { current.push(related[i]); } else { partsOf.set(whole, [related[i]]); }
+    }
+    return partsOf;
+  }
+
+  /** Peças de todos os níveis (montagem → viga → peça). */
+  private allPartsOf(expressId: number): number[] {
+    const out: number[] = [];
+    const seen = new Set<number>([expressId]);
+    const stack = [...(this.partsOf.get(expressId) ?? [])];
+    while (stack.length > 0) {
+      const id = stack.pop()!;
+      if (seen.has(id)) { continue; }
+      seen.add(id);
+      out.push(id);
+      const next = this.partsOf.get(id);
+      if (next) { stack.push(...next); }
+    }
+    return out;
   }
 
   private static readClashLinks(t: arrow.Table): ClashLinks {
@@ -541,15 +583,26 @@ export class ModelDataStore {
 
     return [...byType.entries()]
       .sort(([a], [b]) => a.localeCompare(b))
-      .map(([ifcType, ids]) => ({
-        key: `g:${parentId}:${ifcType}`,
-        kind: 'type-group' as const,
-        name: ifcType,
-        ifcType,
-        elementCount: ids.length,
-        expressIds: ids,
-        children: [],
-      }));
+      .map(([ifcType, ids]) => {
+        const node: BimTreeNode = {
+          key: `g:${parentId}:${ifcType}`,
+          kind: 'type-group',
+          name: ifcType,
+          ifcType,
+          elementCount: ids.length,
+          expressIds: ids,
+          children: [],
+        };
+        const parts: Record<number, number[]> = {};
+        let hasParts = false;
+        for (const id of ids) {
+          if (!this.partsOf.has(id)) { continue; }
+          parts[id] = this.allPartsOf(id);
+          hasParts = true;
+        }
+        if (hasParts) { node.parts = parts; }
+        return node;
+      });
   }
 
   /** Rótulos sob demanda: a árvore trafega só ids; o nome vem quando expande. */
